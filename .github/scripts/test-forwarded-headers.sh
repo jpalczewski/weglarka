@@ -14,7 +14,7 @@ untrusted_conf=$2
 net=wg-fwd-test
 fail=0
 
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2329,SC2317 # invoked by the EXIT trap
 cleanup() {
   status=$?
   if [ "$status" -ne 0 ]; then
