@@ -5,16 +5,31 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use weglarka_api::DoctorCheck;
+use weglarka_core::app::AppsFile;
 use weglarka_core::config::{IngressMode, PlatformKind};
 
 use super::host::{CmdOutput, FileKind, Host};
-use super::parse::{apt_installed_from, can_write, gids_of, parse_major_minor, subid_total};
+use super::parse::{
+    apt_installed_from, can_write, gids_of, parse_major_minor, parse_proc_net_tcp, subid_total,
+};
 use super::{Check, Context, RuntimeUser, fail, ok, warn};
 
 /// Minimalny łączny rozmiar zakresów subuid/subgid usera dla `userns=auto`.
 /// 65536 to standardowy zakres rootless Podmana (obrazy z uid > 0 mieszczą się w nim);
 /// poniżej tego `userns=auto` i zwykłe obrazy zaczną zawodzić.
 pub const MIN_SUBID_COUNT: u64 = 65_536;
+
+/// Zalecany rozmiar zakresu: `userns=auto` przydziela każdemu kontenerowi osobny blok
+/// (domyślnie 1024 id, obrazy z dużymi uid potrzebują więcej), więc 65536 starcza na jedną-dwie
+/// apki. Rola Ansible `weglarka_host` daje 2 000 000; poniżej 1 000 000 ostrzegamy.
+pub const RECOMMENDED_SUBID_COUNT: u64 = 1_000_000;
+
+// Poniższe nazwy/ścieżki to konwencja roli Ansible `weglarka_host` (repo niechybnie),
+// nie część konfiguracji Węglarki — zmiana tam wymaga zmiany tutaj.
+/// Polityka walidatora synchronizacji pliku Traefika (JSON, root-owa).
+pub const TRAEFIK_POLICY_PATH: &str = "/etc/weglarka/traefik-policy.json";
+/// Unit systemd, który po zmianie pliku Węglarki waliduje go polityką i kopiuje do Traefika.
+pub const TRAEFIK_SYNC_UNIT: &str = "weglarka-traefik-sync.path";
 
 /// Źródło, z którego ma pochodzić Podman (repo OBS `home:alvistack`, decyzja z notatki MVP).
 pub const PINNED_PODMAN_SOURCE: &str = "alvistack";
@@ -111,7 +126,7 @@ impl Check for SubIds {
             Err(c) => return c,
         };
         let hint = format!(
-            "dodaj zakres: `usermod --add-{}s <start>-<koniec> {}` (≥ {MIN_SUBID_COUNT} id)",
+            "dodaj zakres: `usermod --add-{}s <start>-<koniec> {}` (≥ {RECOMMENDED_SUBID_COUNT} id zalecane, {MIN_SUBID_COUNT} minimum)",
             if self.file.ends_with("subuid") {
                 "sub-uid"
             } else {
@@ -131,6 +146,14 @@ impl Check for SubIds {
                     self.id,
                     format!(
                         "only {n} ids for {} in {} (need ≥ {MIN_SUBID_COUNT})",
+                        user.name, self.file
+                    ),
+                    hint,
+                ),
+                n if n < RECOMMENDED_SUBID_COUNT => warn(
+                    self.id,
+                    format!(
+                        "{n} ids for {} in {} (recommended ≥ {RECOMMENDED_SUBID_COUNT} for userns=auto)",
                         user.name, self.file
                     ),
                     hint,
@@ -455,6 +478,71 @@ impl Check for Pasta {
     }
 }
 
+/// Ubuntu 24.04: przy `kernel.apparmor_restrict_unprivileged_userns=1` rootless Podman
+/// działa tylko z załadowanym profilem `podman` (attach do binarki, z `userns,`).
+pub struct AppArmorUserns;
+impl AppArmorUserns {
+    const SYSCTL: &'static str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+    const PROFILES: &'static str = "/sys/kernel/security/apparmor/profiles";
+    const PROFILE_FILE: &'static str = "/etc/apparmor.d/podman";
+}
+impl Check for AppArmorUserns {
+    fn id(&self) -> &'static str {
+        "runtime.apparmor_userns"
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        match cx.host.read_to_string(Path::new(Self::SYSCTL)) {
+            Err(_) => {
+                return ok(
+                    self.id(),
+                    "AppArmor userns restriction not present (skipped)",
+                );
+            }
+            Ok(v) if v.trim() != "1" => {
+                return ok(self.id(), "AppArmor does not restrict unprivileged userns");
+            }
+            Ok(_) => {}
+        }
+        let hint = "załaduj profil podman: `apparmor_parser -r /etc/apparmor.d/podman` (pakiet podman z alvistack/Ubuntu go dostarcza; \
+                    profil musi mieć `userns,`) albo ustaw sysctl `kernel.apparmor_restrict_unprivileged_userns=0`";
+        match cx.host.read_to_string(Path::new(Self::PROFILES)) {
+            Ok(src) => {
+                let loaded = src
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some("podman"));
+                if loaded {
+                    ok(
+                        self.id(),
+                        "apparmor_restrict_unprivileged_userns=1 and profile podman is loaded",
+                    )
+                } else {
+                    fail(
+                        self.id(),
+                        "apparmor_restrict_unprivileged_userns=1, but no AppArmor profile `podman` is loaded",
+                        hint,
+                    )
+                }
+            }
+            // Lista profili jest czytelna tylko dla roota — nie zgadujemy.
+            Err(e) => {
+                let file = cx.host.stat(Path::new(Self::PROFILE_FILE)).is_ok();
+                warn(
+                    self.id(),
+                    format!(
+                        "cannot verify AppArmor profile `podman` ({e}); profile file {}",
+                        if file { "exists" } else { "is missing" }
+                    ),
+                    if file {
+                        "uruchom preflight jako root, by potwierdzić załadowanie profilu (`aa-status`)"
+                    } else {
+                        hint
+                    },
+                )
+            }
+        }
+    }
+}
+
 pub struct TraefikFile;
 impl Check for TraefikFile {
     fn id(&self) -> &'static str {
@@ -569,6 +657,191 @@ impl Check for BindAddress {
             )
         }
     }
+}
+
+/// Port z `ingress.bind` nie może być zajęty przez cudzy proces. Właściciela gniazda czytamy
+/// z `/proc/net/tcp*` (kolumna uid): gniazdo usera runtime'u to nginx Węglarki (pasta/rootlessport).
+pub struct BindFree;
+impl Check for BindFree {
+    fn id(&self) -> &'static str {
+        "ingress.bind_free"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.config.is_some()
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        let bind = cx.config.as_ref().expect("applies").ingress.bind;
+        let IpAddr::V4(ip) = bind.ip() else {
+            return ok(self.id(), format!("{bind}: IPv6 bind, port check skipped"));
+        };
+        let mut listeners = match cx.host.read_to_string(Path::new("/proc/net/tcp")) {
+            Ok(src) => parse_proc_net_tcp(&src, false),
+            Err(e) => {
+                return warn(
+                    self.id(),
+                    format!("cannot read /proc/net/tcp: {e}"),
+                    "nie można sprawdzić zajętości portu",
+                );
+            }
+        };
+        if let Ok(src) = cx.host.read_to_string(Path::new("/proc/net/tcp6")) {
+            listeners.extend(parse_proc_net_tcp(&src, true));
+        }
+        let holders: Vec<_> = listeners
+            .iter()
+            .filter(|l| {
+                l.port == bind.port()
+                    && (l.addr.is_none() || ip.is_unspecified() || l.addr == Some(ip))
+            })
+            .collect();
+        if holders.is_empty() {
+            return ok(self.id(), format!("port {} is free on {ip}", bind.port()));
+        }
+        let ours = cx.user.as_ref().map(|u| u.uid);
+        if holders.iter().all(|l| Some(l.uid) == ours) {
+            return ok(
+                self.id(),
+                format!("{bind} is held by the runtime user (nginx Węglarki running)"),
+            );
+        }
+        let other = holders
+            .iter()
+            .find(|l| Some(l.uid) != ours)
+            .expect("non-empty");
+        fail(
+            self.id(),
+            format!(
+                "port {} is already in use by uid {}",
+                bind.port(),
+                other.uid
+            ),
+            "wybierz wolny port w [ingress] bind (np. 8088; na niechybnie 8080 zajmuje Traefik z Coolify) — sprawdź `ss -ltnp`",
+        )
+    }
+}
+
+/// Tryb `behind` na systemd: root-owy `weglarka-traefik-sync.path` waliduje plik Węglarki
+/// polityką i kopiuje go do Traefika; domeny apek muszą być na allowliście polityki.
+pub struct TraefikSync;
+impl Check for TraefikSync {
+    fn id(&self) -> &'static str {
+        "ingress.traefik_sync"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.platform == PlatformKind::Systemd
+            && cx
+                .config
+                .as_ref()
+                .is_some_and(|c| c.ingress.mode == IngressMode::Behind)
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        let policy = match cx.host.read_to_string(Path::new(TRAEFIK_POLICY_PATH)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return ok(
+                    self.id(),
+                    format!("no {TRAEFIK_POLICY_PATH} — Traefik sync not in use"),
+                );
+            }
+            Err(e) => {
+                return warn(
+                    self.id(),
+                    format!("cannot read {TRAEFIK_POLICY_PATH}: {e}"),
+                    "uruchom preflight z dostępem do pliku polityki",
+                );
+            }
+        };
+        match cx.host.run("systemctl", &["is-active", TRAEFIK_SYNC_UNIT]) {
+            Ok(out) if out.stdout.trim() == "active" => {}
+            Ok(out) => {
+                return fail(
+                    self.id(),
+                    format!(
+                        "{TRAEFIK_SYNC_UNIT} is {} — zmiany pliku Traefika nie będą publikowane",
+                        out.stdout.trim()
+                    ),
+                    format!(
+                        "`systemctl enable --now {TRAEFIK_SYNC_UNIT}` (rola Ansible weglarka_host)"
+                    ),
+                );
+            }
+            Err(_) => {
+                return warn(
+                    self.id(),
+                    "cannot query systemd (`systemctl` unavailable)",
+                    format!("sprawdź ręcznie `systemctl is-active {TRAEFIK_SYNC_UNIT}`"),
+                );
+            }
+        }
+        let Some(allowed) = allowed_domains(&policy) else {
+            return warn(
+                self.id(),
+                format!(
+                    "{TRAEFIK_SYNC_UNIT} active, but {TRAEFIK_POLICY_PATH} has no readable domain allowlist"
+                ),
+                "oczekiwana tablica stringów `allowed_domains` (albo `domains`) w polityce",
+            );
+        };
+        let apps = match cx.host.read_to_string(&cx.apps_path) {
+            Ok(src) => match toml::from_str::<AppsFile>(&src) {
+                Ok(a) => a,
+                Err(e) => {
+                    return warn(
+                        self.id(),
+                        format!(
+                            "{TRAEFIK_SYNC_UNIT} active; cannot parse {}: {e}",
+                            cx.apps_path.display()
+                        ),
+                        "popraw apps.toml, by sprawdzić domeny względem polityki",
+                    );
+                }
+            },
+            Err(_) => {
+                return ok(
+                    self.id(),
+                    format!(
+                        "{TRAEFIK_SYNC_UNIT} active, policy present (apps.toml not available locally)"
+                    ),
+                );
+            }
+        };
+        let mut rejected: Vec<&str> = apps
+            .apps
+            .values()
+            .flat_map(|a| a.domains.iter().map(String::as_str))
+            .filter(|d| !allowed.iter().any(|a| a.eq_ignore_ascii_case(d)))
+            .collect();
+        rejected.sort_unstable();
+        rejected.dedup();
+        if rejected.is_empty() {
+            ok(
+                self.id(),
+                format!("{TRAEFIK_SYNC_UNIT} active; all app domains are allowed by policy"),
+            )
+        } else {
+            warn(
+                self.id(),
+                format!(
+                    "domains not on the policy allowlist (validator would reject them): {}",
+                    rejected.join(", ")
+                ),
+                format!(
+                    "dodaj domeny do `weglarka_allowed_domains` w roli Ansible i wdróż politykę ({TRAEFIK_POLICY_PATH})"
+                ),
+            )
+        }
+    }
+}
+
+fn allowed_domains(policy_json: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(policy_json).ok()?;
+    ["allowed_domains", "domains"].iter().find_map(|k| {
+        v.get(k)?
+            .as_array()?
+            .iter()
+            .map(|d| d.as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 pub struct SecretsFile;

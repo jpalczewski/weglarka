@@ -39,6 +39,7 @@ pub struct Context<'a> {
     pub platform: PlatformKind,
     pub user: Option<RuntimeUser>,
     pub secrets_path: PathBuf,
+    pub apps_path: PathBuf,
 }
 
 impl<'a> Context<'a> {
@@ -60,15 +61,14 @@ impl<'a> Context<'a> {
             .as_ref()
             .map_or(PlatformKind::Systemd, |c| c.platform.kind);
         let user = parse::lookup_user(host, &runtime.user);
-        let secrets_path = secrets_file.unwrap_or_else(|| {
-            let config_dir = config_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let dir = config
-                .as_ref()
-                .map_or_else(|| config_dir.to_owned(), |c| c.state.dir_or(config_dir));
-            dir.join("secrets.toml")
-        });
+        let config_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let state_dir = config
+            .as_ref()
+            .map_or_else(|| config_dir.to_owned(), |c| c.state.dir_or(config_dir));
+        let secrets_path = secrets_file.unwrap_or_else(|| state_dir.join("secrets.toml"));
+        let apps_path = state_dir.join("apps.toml");
         Self {
             host,
             config_path,
@@ -78,6 +78,7 @@ impl<'a> Context<'a> {
             platform,
             user,
             secrets_path,
+            apps_path,
         }
     }
 
@@ -117,8 +118,11 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(PodmanSource),
         Box::new(Netavark),
         Box::new(Pasta),
+        Box::new(AppArmorUserns),
         Box::new(TraefikFile),
         Box::new(BindAddress),
+        Box::new(BindFree),
+        Box::new(TraefikSync),
         Box::new(SecretsFile),
     ]
 }

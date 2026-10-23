@@ -44,7 +44,13 @@ sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
 ```
 
 Każde `warn`/`fail` ma podpowiedź naprawy (`runtime.subuid`, `runtime.linger`, `runtime.podman_source`,
-`ingress.traefik_file`, `state.secrets_file`, …). Kody wyjścia: 0 ok, 1 warn, 2 fail.
+`ingress.traefik_file`, `state.secrets_file`, …).
+Wybrane sprawdzenia hosta:
+`runtime.subuid`/`subgid` (warn < 1 000 000 id, fail < 65 536), `runtime.apparmor_userns` (Ubuntu 24.04:
+profil `podman` załadowany, gdy `apparmor_restrict_unprivileged_userns=1`; pełny wynik tylko jako root),
+`ingress.bind_free` (port `bind` nie zajęty przez cudzy proces, np. Traefika), `ingress.traefik_sync`
+(tryb `behind`: aktywny `weglarka-traefik-sync.path`, gdy istnieje `/etc/weglarka/traefik-policy.json`;
+domeny z `apps.toml` na allowliście polityki, klucz `allowed_domains`). Reguły firewalla nie są sprawdzane. Kody wyjścia: 0 ok, 1 warn, 2 fail.
 
 ## 2. Konfiguracja hosta
 
