@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+
+  # Testy integracyjne z prawdziwym Podmanem 6.1 — decyzja: docs/decisions/0002-podman-in-ci.md.
+  # Podman z OBS `home:alvistack` na ubuntu-24.04 (lustro hosta). Testy (sesja a) czytają
+  # WEGLARKA_PODMAN_SOCKET i same się pomijają, gdy zmienna nie jest ustawiona.
+  integration-podman:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Podman 6 from OBS home:alvistack
+        run: |
+          set -euo pipefail
+          base="https://download.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
+          curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
+          echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
+            | sudo tee /etc/apt/sources.list.d/alvistack.list
+          # Pinning: stos Podmana tylko z alvistack (jak na hoście `niechybnie`).
+          sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
+          Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
+          Pin: origin download.opensuse.org
+          Pin-Priority: 1001
+          PIN
+          sudo apt-get update
+          sudo apt-get install -y podman netavark passt uidmap
+          podman --version
+      - name: Start rootless podman service
+        run: |
+          set -euo pipefail
+          sock="$XDG_RUNTIME_DIR/podman/podman.sock"
+          mkdir -p "$(dirname "$sock")"
+          podman system service --time 0 "unix://$sock" &
+          for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
+          echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p weglarka-podman

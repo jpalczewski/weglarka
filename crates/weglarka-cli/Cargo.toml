@@ -1,0 +1,24 @@
+[package]
+name = "weglarka-cli"
+description = "Węglarka: CLI (cienki klient admin API + doctor --preflight)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "weglarka"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+weglarka-api.workspace = true
+weglarka-core.workspace = true

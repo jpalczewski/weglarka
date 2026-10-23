@@ -1,0 +1,15 @@
+---
+source: crates/weglarka-api/src/types.rs
+expression: list
+---
+[
+  "Get /v1/status",
+  "Get /v1/apps",
+  "Post /v1/apps",
+  "Get /v1/apps/{name}",
+  "Delete /v1/apps/{name}",
+  "Post /v1/apps/{name}/deploy",
+  "Get /v1/apps/{name}/secrets",
+  "Put /v1/apps/{name}/secrets/{secret}",
+  "Get /v1/doctor"
+]

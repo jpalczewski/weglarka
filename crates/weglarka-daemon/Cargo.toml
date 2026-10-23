@@ -1,0 +1,26 @@
+[package]
+name = "weglarka-daemon"
+description = "Węglarka: demon (admin API, webhooki, reconcile)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "weglarka-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+weglarka-api.workspace = true
+weglarka-core.workspace = true
+weglarka-ingress.workspace = true
+weglarka-podman.workspace = true

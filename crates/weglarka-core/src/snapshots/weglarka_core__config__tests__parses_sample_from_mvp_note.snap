@@ -1,0 +1,24 @@
+---
+source: crates/weglarka-core/src/config.rs
+expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
+---
+{
+  "runtime": {
+    "user": "weglarka"
+  },
+  "ingress": {
+    "mode": "behind",
+    "bind": "172.17.0.1:8080",
+    "traefik_dynamic_file": "/data/coolify/proxy/dynamic/weglarka.yml"
+  },
+  "admin": {
+    "socket": "/run/user/1001/weglarka/admin.sock"
+  },
+  "webhook": {
+    "listen": "0.0.0.0:9180",
+    "domain": "weglarka.descriptortable.eu"
+  },
+  "platform": {
+    "kind": "systemd"
+  }
+}
