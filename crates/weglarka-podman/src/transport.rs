@@ -214,6 +214,9 @@ pub(crate) fn error_from_status(status: u16, body: &[u8]) -> PodmanError {
     };
     match status {
         404 => PodmanError::NotFound(message),
+        // libpod answers 500 (not 404) when a container vanishes mid-operation, e.g. while it
+        // walks a network's member list: "no container with ID <id> found in database: no such container".
+        500 if message.contains("no such container") => PodmanError::NotFound(message),
         _ => PodmanError::Api { status, message },
     }
 }
@@ -340,6 +343,11 @@ mod tests {
         assert!(matches!(
             error_from_status(404, body),
             PodmanError::NotFound(m) if m.contains("no container")
+        ));
+        let vanished = br#"{"message":"no container with ID \"abc\" found in database: no such container","response":500}"#;
+        assert!(matches!(
+            error_from_status(500, vanished),
+            PodmanError::NotFound(_)
         ));
         let err = error_from_status(500, b"plain text boom\n");
         assert!(

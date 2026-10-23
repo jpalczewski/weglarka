@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
-use weglarka_core::podman::PodmanClient;
+use weglarka_core::podman::{PodmanClient, PodmanError};
 use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
 use weglarka_core::secrets::FileSecretStore;
 use weglarka_core::state::{self, StatePaths};
@@ -186,4 +186,73 @@ async fn nginx_lifecycle() {
     );
     assert!(fake.container_inspect("weglarka-nginx").await.is_ok());
     assert!(manager2.last_error().is_none());
+}
+
+/// Regression: `apps remove` raced with `apply` — libpod failed the stale-network disconnect with
+/// "no container with ID …" and the whole apply aborted before the Traefik file dropped the router.
+#[tokio::test]
+async fn failed_network_detach_does_not_block_traefik_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let traefik = root.join("traefik.yml");
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"behind\"\nbind=\"127.0.0.1:18080\"\ntraefik_dynamic_file=\"{}\"\n[admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+        traefik.display(),
+        root.display()
+    ))
+    .unwrap();
+    let paths = StatePaths::in_dir(root);
+    let fake = FakePodman::new();
+    let engine = Arc::new(Reconciler::new(
+        fake.clone(),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        paths.clone(),
+        ReconcilerOptions::default(),
+    ));
+    let manager = IngressManager::new(engine, host, root.join("nginx"));
+    let mut file = state::load_apps(&paths.apps).unwrap();
+    file.apps
+        .insert(InstanceName::new("blog").unwrap(), spec("blog.example.eu"));
+    state::save_apps(&paths.apps, &file).unwrap();
+    manager.apply().await.unwrap();
+    assert!(
+        std::fs::read_to_string(&traefik)
+            .unwrap()
+            .contains("blog.example.eu")
+    );
+
+    // Remove the app while libpod fails the disconnect with a 500, as observed in CI.
+    fake.fail_next_disconnect(
+        "net-blog",
+        PodmanError::Api {
+            status: 500,
+            message: "no container with ID \"abc\" found in database: no such container".into(),
+        },
+    );
+    file.apps.clear();
+    state::save_apps(&paths.apps, &file).unwrap();
+    manager
+        .apply()
+        .await
+        .expect("apply succeeds despite the failed detach");
+    assert!(
+        !std::fs::read_to_string(&traefik)
+            .unwrap()
+            .contains("blog.example.eu")
+    );
+    assert!(
+        !std::fs::read_to_string(manager.conf_path())
+            .unwrap()
+            .contains("blog.example.eu")
+    );
+    let nginx = fake.container_inspect("weglarka-nginx").await.unwrap();
+    assert!(
+        nginx.networks.contains(&"net-blog".to_owned()),
+        "still attached"
+    );
+
+    // The next apply (scheduled shortly by `run`) finishes the detach.
+    manager.apply().await.unwrap();
+    let nginx = fake.container_inspect("weglarka-nginx").await.unwrap();
+    assert_eq!(nginx.networks, ["net-weglarka"]);
 }
