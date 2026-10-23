@@ -216,7 +216,9 @@ Skrypt dotyka tylko instancji `wg-canary` (domyślnie) oraz `wg-webhook`/`wg-rol
 (kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`, `--json` (raport
 maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa tego CI).
 Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
-Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`.
+Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`. Opcjonalne `--with-volume` (też w CI; wymaga `tar`) dodaje krok
+wolumenu na instancji `wg-volume`: import obcego tara, dane i zakres UID przeżywają `apps remove` + `apps add`,
+eksport z właścicielem `uid_range.start + 1000`, `--purge-volumes`.
 
 **Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
 zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
@@ -281,6 +283,81 @@ Repozytorium `jpalczewski/ntfy.zig` → Settings → Webhooks → Add webhook:
 Po pierwszym pushu sprawdź *Recent Deliveries*: `latest` → **202**, `sha-…` → 204 (apka śledzi `:latest`); 401 =
 zły sekret, 204 dla `latest` = niezgodna nazwa obrazu. Nazwy pól payloadu są jeszcze niepotwierdzone na prawdziwym
 pushu (0004) — pierwsza dostawa jest też testem.
+
+## 6a. Wolumeny, zakresy UID i import z Coolify (iteracja 2)
+
+Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md).
+
+**Każdy kontener Węglarki dostaje własny zakres UID** z puli subuid użytkownika runtime'u (`userns: private` +
+jawne `UIDMap`/`GIDMap`): apka — 65 536 UID, nginx ingressu — 4 096. Zakres jest przydzielany raz (w `state.toml`:
+`uid_range`, `ingress_uid_range`) i **nigdy nie zmienia się** dla istniejącej instancji, więc pliki w wolumenie mają
+tego samego właściciela po każdym deployu i rollbacku. Pulę Węglarka pyta u Podmana (`GET /info`), nie czyta
+`/etc/subuid` (demon w kontenerze go nie widzi). Pula 2 000 000 mieści zakres ingressu i 30 apek; brak miejsca =
+instancja zablokowana z komunikatem w logu reconcile (powiększ `subuid` w Ansible, rozmiar zakresu się nie zmienia).
+Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi właścicielami (czas i miejsce w
+`~/.local/share/containers` przy pierwszym starcie obrazu w nowym zakresie).
+
+### Wolumeny w spec apki
+
+```toml
+# apps.toml / --spec
+volumes = [{ name = "data", target = "/data" }]   # read_only = true dla montowania tylko do odczytu
+```
+
+Wolumen `<instancja>.<nazwa>` (np. `szklana-pogoda.data`) powstaje przy deployu z etykietą `weglarka.instance`.
+`weglarka volumes list <apka>` pokazuje deklarowane wolumeny. `apps remove` **nie usuwa danych** (wolumeny i zakres
+UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właścicielem). Usunięcie danych:
+`weglarka apps remove <apka> --purge-volumes` (kasuje kontener i wolumeny, zwalnia zakres UID — bez odwrotu).
+Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów.
+
+### Import danych z Coolify (np. szklana.pogoda)
+
+Tar z Coolify ma UID-y z obrazu (np. 1000). Importuj go trybem domyślnym (**obcy** tar): UID-y są mapowane przez
+zakres apki, więc pliki należą do właściwego użytkownika w kontenerze.
+
+```sh
+# Na hoście Coolify: sam plik z wolumenu, nieskompresowany tar (rozpakuj .tar.gz przez gunzip)
+tar -cf szklana-data.tar -C /var/lib/docker/volumes/<wolumen>/_data .
+
+# Po stronie Węglarki: apka dodana ze spec z volumes i wdrożona RAZ (potrzebny obraz i zakres UID)
+weglarka apps add szklana-pogoda --spec szklana.toml && weglarka deploy szklana-pogoda
+weglarka volumes import szklana-pogoda data --from szklana-data.tar    # lub: < szklana-data.tar
+```
+
+Import zatrzymuje kontener apki, wypakowuje tar (robi to Podman w pomocniczym, niestartowanym kontenerze tego
+samego obrazu — Węglarka niczego nie rozpakowuje) i uruchamia apkę z powrotem. Pliki o tej samej ścieżce są
+nadpisywane, pozostałe zostają; przerwany import zostawia część plików. Limit jednego importu: 8 GiB.
+
+**Własne kopie** (`volumes export`) wracają **tylko** z `--own` i tylko do apki o tym samym zakresie UID:
+
+```sh
+weglarka volumes export szklana-pogoda data --out backup.tar
+weglarka volumes import szklana-pogoda data --from backup.tar --own
+```
+
+Nie myl trybów: obcy tar zaimportowany z `--own` ląduje **po cichu** na złych UID-ach; eksport Węglarki
+zaimportowany bez `--own` kończy się błędem (UID-y spoza zakresu).
+
+### Aktualizacja Węglarki do wersji z zakresami UID (jednorazowo)
+
+Kontenery stworzone przez starszą Węglarkę (ntfy, nginx) działają na wspólnej domyślnej mapie Podmana (root w
+kontenerze = użytkownik `weglarka` na hoście). Po aktualizacji demon przydziela im zakresy i **odtwarza je
+jednorazowo**:
+
+1. Zrób `podman ps` i zapisz stan; upewnij się, że masz świeży rollback (poprzedni obraz Węglarki).
+2. Zaktualizuj Węglarkę (`podman pull … && systemctl --user restart weglarka.service`).
+3. Przy starcie: nginx dostaje zakres (`ingress_uid_range`) i jest odtwarzany — **krótka przerwa ruchu** (kilka
+   sekund); pierwszy start obrazu w nowym zakresie jest wolniejszy (kopia warstw).
+4. Reconcile przydziela zakres `ntfy`, wykrywa brak etykiety `weglarka.uid-range` na kontenerze i odtwarza go raz
+   (bez rollbacku — ten sam digest; ntfy nie ma wolumenów). Kolejne przebiegi nic nie zmieniają.
+5. Sprawdź: `podman exec ntfy cat /proc/self/uid_map` (oczekiwane: `0 <start> 65536`, gdzie `<start>` to
+   `uid_range.start` z `weglarka apps show ntfy`), `weglarka doctor`, `scripts/acceptance.sh` (obowiązkowo).
+6. Gdyby ntfy nie wstał po bramce zdrowia: `journalctl --user -u weglarka` / `weglarka apps show ntfy`; powrót do
+   poprzedniej Węglarki zostawia kontenery z zakresami — nginx i ntfy wrócą na domyślną mapę dopiero przy ich
+   następnym odtworzeniu przez starą wersję.
+
+Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być czytelne dla „obcych” UID-ów
+(0644 w katalogu 0755 — tak je zapisuje demon).
 
 ## 7. Weryfikacja i rollback
 

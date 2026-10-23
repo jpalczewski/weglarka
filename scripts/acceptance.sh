@@ -2,8 +2,8 @@
 # Acceptance script for Węglarka on a real host (docs/install.md, "Odbiór na hoście").
 #
 # Run as the runtime user (`weglarka`) with XDG_RUNTIME_DIR set; dependencies:
-# weglarka, curl, openssl, jq, podman. Touches only the instances `wg-canary`, `wg-webhook`
-# and `wg-rollback` and the `wg-accept-registry` container (local test registry) — never any other apps.
+# weglarka, curl, openssl, jq, podman (+ tar for --with-volume). Touches only the instances `wg-canary`,
+# `wg-webhook`, `wg-rollback` and `wg-volume` and the `wg-accept-registry` container (local test registry) — never any other apps.
 #
 #   scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
 #
@@ -18,6 +18,7 @@ REGISTRY_IMAGE='docker.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa0
 CANARY=wg-canary
 WEBHOOK_APP=wg-webhook
 ROLLBACK_APP=wg-rollback
+VOLUME_APP=wg-volume
 REGISTRY_CONTAINER=wg-accept-registry
 
 CONFIG=/etc/weglarka/weglarka.toml
@@ -27,6 +28,7 @@ WEBHOOK_BASE=
 DIRECT=
 KEEP=0
 LOCAL_REGISTRY=0
+WITH_VOLUME=0
 SKIP_ROLLBACK=0
 SKIP_PREFLIGHT=0
 STRICT=0
@@ -52,6 +54,8 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
                          Stawia tymczasowy rejestr na 127.0.0.1:<port>; usługa Podmana użytkownika musi
                          mieć wpis `insecure` dla tego adresu w registries.conf (robi to CI; na produkcji
                          nie zalecane). Bez flagi te kroki są pomijane (SKIP).
+  --with-volume          dodatkowo: wolumen (import tara obcego, remove + add zachowuje dane i zakres UID,
+                         eksport, --purge-volumes). Używa instancji wg-volume na obrazie kanarka. Wymaga tar.
   --skip-rollback        pomiń test wymuszonego rollbacku
   --skip-preflight       pomiń `doctor --preflight` (np. gdy host to nie docelowy układ)
   --strict               ostrzeżenia `doctor` traktuj jak błąd
@@ -81,6 +85,7 @@ while [ $# -gt 0 ]; do
     --direct) DIRECT=${2:?--direct wymaga wartości}; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --with-local-registry) LOCAL_REGISTRY=1; shift ;;
+    --with-volume) WITH_VOLUME=1; shift ;;
     --skip-rollback) SKIP_ROLLBACK=1; shift ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
     --strict) STRICT=1; shift ;;
@@ -199,6 +204,7 @@ cleanup_helpers() {
   for app in "$WEBHOOK_APP" "$ROLLBACK_APP"; do
     wg apps remove --ignore-missing "$app" >/dev/null 2>&1 || true
   done
+  wg apps remove --purge-volumes --ignore-missing "$VOLUME_APP" >/dev/null 2>&1 || true
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman rmi -f "$REG/wg-accept/wh:t" "$REG/wg-accept/rb:t" >/dev/null 2>&1 || true
 }
@@ -529,6 +535,55 @@ step_rollback() {
   note "kod 6, powrót do $good, kanarek nadal 200"
 }
 
+# Volumes (iteration 2): a foreign tar (uid 1000, as a Coolify backup would have) is imported into a
+# fresh volume, `apps remove` + `apps add` keep the data and the uid range, the export carries the file
+# at namespace uid <range start> + 1000, and `--purge-volumes` leaves nothing behind.
+add_volume_app() {
+  cat >"$WORK/vol-spec.toml" <<EOF
+image = "$IMAGE"
+port = 80
+volumes = [{ name = "data", target = "/data" }]
+
+[health]
+attempts = 2
+window_secs = ${HEALTH_WINDOW:-4}
+EOF
+  wg apps add "$VOLUME_APP" --spec "$WORK/vol-spec.toml" >/dev/null
+  wg --json deploy "$VOLUME_APP" >/dev/null || die "deploy $VOLUME_APP nie przeszedł"
+}
+
+step_volume() {
+  local start start2 expect
+  wg apps remove --purge-volumes --ignore-missing "$VOLUME_APP" >/dev/null
+  add_volume_app
+  [ "$(wg --json volumes list "$VOLUME_APP" | jq -r '.volumes[0].exists')" = true ] \
+    || die "wolumen nie istnieje po deployu"
+  start=$(show_field "$VOLUME_APP" '.state.uid_range.start // empty')
+  case $start in '' | *[!0-9]*) die "brak zakresu UID w stanie ($start)" ;; esac
+
+  mkdir -p "$WORK/vol-src"
+  printf 'v1\n' >"$WORK/vol-src/f"
+  tar -cf "$WORK/vol-in.tar" -C "$WORK/vol-src" --owner=1000 --group=1000 --numeric-owner f
+  wg volumes import "$VOLUME_APP" data --from "$WORK/vol-in.tar" >/dev/null || die "volumes import nie przeszedł"
+  [ "$(show_field "$VOLUME_APP" .runtime)" = running ] || die "aplikacja nie działa po imporcie (powinna wstać ponownie)"
+
+  wg apps remove "$VOLUME_APP" >/dev/null
+  podman volume exists "$VOLUME_APP.data" || die "apps remove skasował wolumen"
+  add_volume_app
+  start2=$(show_field "$VOLUME_APP" '.state.uid_range.start // empty')
+  [ "$start2" = "$start" ] || die "zakres UID się zmienił po remove + add ($start → $start2)"
+
+  wg volumes export "$VOLUME_APP" data --out "$WORK/vol-out.tar" 2>/dev/null || die "volumes export nie przeszedł"
+  expect=$((start + 1000))
+  tar -tvf "$WORK/vol-out.tar" --numeric-owner \
+    | awk -v want="$expect/$expect" '$2 == want && $NF ~ /(^|\/)f$/ { found = 1 } END { exit !found }' \
+    || die "w eksporcie brak pliku f z właścicielem $expect (zakres $start): $(tar -tvf "$WORK/vol-out.tar" --numeric-owner | tr '\n' ';')"
+
+  wg apps remove --purge-volumes "$VOLUME_APP" >/dev/null
+  ! podman volume exists "$VOLUME_APP.data" || die "--purge-volumes zostawił wolumen"
+  note "import obcego tara, dane i zakres $start przeżyły remove + add, eksport z uid $expect, purge czyści"
+}
+
 step_cleanup() {
   local app
   for app in "$WEBHOOK_APP" "$ROLLBACK_APP"; do
@@ -578,6 +633,11 @@ elif [ "$LOCAL_REGISTRY" != 1 ]; then
   skip_step "rollback wymuszony (kod 6)" "wymaga --with-local-registry (pełny test rollbacku jest w CI)"
 else
   run_step rollback "rollback wymuszony (kod 6)" step_rollback registry canary
+fi
+if [ "$WITH_VOLUME" = 1 ]; then
+  run_step volume "wolumen: import, dane i zakres UID, eksport, purge" step_volume doctor
+else
+  skip_step "wolumen: import, dane i zakres UID, eksport, purge" "wymaga --with-volume"
 fi
 if [ "$KEEP" = 1 ]; then
   cleanup_helpers

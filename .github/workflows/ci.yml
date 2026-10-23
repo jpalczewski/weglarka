@@ -170,6 +170,13 @@ jobs:
           insecure = true
           REG
           podman info 2>&1 | head -40
+      - name: Larger subuid pool
+        run: |
+          set -euo pipefail
+          # Each Węglarka instance takes a 65 536-uid range and the CI user has exactly 65 536 subuids
+          # (docs/decisions/0009). Production has 2 000 000; mirror that order of magnitude here.
+          sudo usermod --add-subuids 1000000-1999999 --add-subgids 1000000-1999999 "$USER"
+          grep "^$USER:" /etc/subuid /etc/subgid
       - name: Start rootless podman service
         run: |
           set -euo pipefail
