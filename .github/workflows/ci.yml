@@ -65,6 +65,10 @@ jobs:
           PIN
           # download.opensuse.org przekierowuje na mirrory ze starymi plikami ("unexpected size");
           # downloadcontent.opensuse.org jest bez mirrorów. Ponowienia na wszelki wypadek.
+          # Runner ma preinstalowany Podman 4.9 z Ubuntu; jego golang-github-containers-common
+          # koliduje plikami (/etc/containers/policy.json) z containers-common z alvistack.
+          sudo apt-get purge -y podman buildah skopeo crun conmon \
+            golang-github-containers-common golang-github-containers-image || true
           for attempt in 1 2 3 4; do
             sudo apt-get update
             sudo apt-get install -y -o Acquire::Retries=3 podman netavark passt uidmap && break

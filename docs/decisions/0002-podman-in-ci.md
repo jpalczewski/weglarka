@@ -21,3 +21,9 @@ Status: przyjęta (fundament, 2026-10-23); do potwierdzenia pierwszym zielonym p
 mirrory, które potrafiły serwować pliki `.deb` o innym rozmiarze niż indeks (`File has unexpected
 size`) i `apt install` padał powtarzalnie. Używamy `downloadcontent.opensuse.org` (serwer
 OBS bez mirrorów). **Ta sama uwaga dotyczy zadania Ansible dla hosta `niechybnie`.**
+
+**Kolizja pakietów (zmierzone w CI).** Ubuntowy `golang-github-containers-common` (zależność
+Podmana 4.9, preinstalowanego na runnerze) nie ma `Replaces` względem `containers-common` z alvistack
+— `dpkg` odmawia nadpisania `/etc/containers/policy.json`. Przed instalacją trzeba odinstalować
+ubuntowy stos (`apt purge podman buildah skopeo crun conmon golang-github-containers-*`).
+Na hoście `niechybnie` Podmana nie ma, więc nie dotyczy — ale zadanie Ansible niech to zapewni.
