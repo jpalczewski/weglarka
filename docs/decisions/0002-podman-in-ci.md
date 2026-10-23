@@ -16,3 +16,8 @@ Status: przyjęta (fundament, 2026-10-23); do potwierdzenia pierwszym zielonym p
 **Kontrakt z testami (sesja a).** Job uruchamia `podman system service` i eksportuje
 `WEGLARKA_PODMAN_SOCKET`. Testy integracyjne czytają tę zmienną i pomijają się, gdy jej brak
 (lokalnie `cargo test` zostaje szybki i bez Podmana).
+
+**Uwaga operacyjna (zmierzone w CI, 2026-10-23).** `download.opensuse.org` przekierowuje na
+mirrory, które potrafiły serwować pliki `.deb` o innym rozmiarze niż indeks (`File has unexpected
+size`) i `apt install` padał powtarzalnie. Używamy `downloadcontent.opensuse.org` (serwer
+OBS bez mirrorów). **Ta sama uwaga dotyczy zadania Ansible dla hosta `niechybnie`.**
