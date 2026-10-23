@@ -29,7 +29,7 @@ pub fn load_config(path: &Path) -> Result<HostConfig, CliError> {
             format!("invalid config {}: {e}", path.display()),
         )
         .with_hint(
-            "wymagane sekcje: [ingress], [admin], [webhook]; przykład: notatka MVP (pF8HCwa)",
+            "wymagane sekcje: [ingress], [admin], [webhook]; przykład: docs/install.md (sekcja 2)",
         )
     })
 }

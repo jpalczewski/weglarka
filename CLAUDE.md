@@ -4,20 +4,11 @@ Własny deploy-tool w Ruście (zastępca Coolify): demon zarządza rootless Podm
 po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za Traefikiem
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
-**Decyzje projektowe żyją w Kajecie** (MCP Kajet, workspace `Projekty`, folder `niechybnie/Węglarka`),
-nie w repo. Przed zmianą zakresu czytaj; po nowej decyzji — zapisz tam, nie tutaj. W repo trzymamy
-tylko decyzje implementacyjne w `docs/decisions/`.
-
-| Notatka | note_id |
-|---|---|
-| MVP — zakres i decyzje (źródło prawdy) | `pF8HCwa` |
-| Zasady architektury | `QlBT25G` |
-| Runtime Podman | `IugYcG4` |
-| Sieć i ingress | `d3xhzyZ` |
-| Sekrety i env | `OJiFhA4` |
-| Model apek i stan | `WVzILNR` |
-| Deploy i źródła wersji | `megyqW6` |
-| Host i platforma | `U0heZWo` |
+**Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0010).
+Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
+issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
+organizacji, tokenów).
 
 Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny kod (traity/adaptery) → oszczędność RAM.**
 
@@ -33,48 +24,42 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 - Testy: snapshoty `insta` (pliki `.snap` commitujemy; aktualizacja: `INSTA_UPDATE=always cargo test`, potem przejrzyj diff).
 - Przed commitem: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 - Sekrety nigdy w logach, `Debug` ani TOML-u apek (są tylko referencjami po nazwie).
-- Git: commituj tylko pliki swojego crate'a (patrz niżej); nie ruszaj cudzych.
+- Git: PR do `main`, merge przez squash po zielonym CI; odwołuj się do issues (`#NN`), nie do prywatnych notatek.
 - **Język: README i komentarze w kodzie po angielsku** (decyzja Jacka, 2026-10-23) — dotyczy wszystkich `README.md`
   (root i crate'ów), komentarzy `//`, doc-commentów `///`/`//!` oraz komentarzy w skryptach i workflowach.
   Nowy i zmieniany kod piszesz od razu po angielsku; istniejące polskie komentarze w plikach, których nie dotykasz,
   tłumaczy osobne zadanie (nie mieszaj tłumaczeń z niezwiązanymi zmianami w PR).
 
-## Mapa crate'ów i własność plików
+## Mapa crate'ów
 
 Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → api, core`; `daemon → wszystko`.
 
-| Crate | Zawartość | Właściciel |
-|---|---|---|
-| `weglarka-core` | typy domenowe, traity, fake | **sesja b** (iteracja 2: patrz sekcja niżej) |
-| ↳ `src/{reconcile,deploy,state,secrets}.rs` | logika (zalążki) | b |
-| ↳ `src/{app,config,hash,labels,platform,webhook,secret_store}.rs` | kontrakt/typy domenowe z fundamentu | b (zmiany addytywne; łamiące — świadomie, z poprawką wszystkich konsumentów) |
-| ↳ `src/podman.rs`, `src/testing/` | kontrakt `PodmanClient` + fake | współdzielone a/b: **a** może dodawać pola/metody potrzebne klientowi, **b** fake'a; zmiany tylko addytywne i zawsze z aktualizacją `FakePodman` |
-| `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne | **sesja a** |
-| `weglarka-ingress` | generatory `nginx`, `traefik` (czyste, snapshoty) | **sesja c** |
-| `weglarka-cli` | komendy, `doctor --preflight` | **sesja d** |
-| `weglarka-api` | kontrakt admin API (typy, endpointy, `DoctorReport`) | fundament; zmiany tylko addytywne, uzgodnione z b/d |
-| `weglarka-daemon` | szkielet `main` | krok 3 (składanie: axum, webhooki, `Platform` systemd) |
-| `.github/`, `docs/`, `Cargo.toml` (workspace), `CLAUDE.md` | infra repo | krok 4 (pakowanie); inni dopisują tylko w swoim obszarze |
+| Crate | Zawartość |
+|---|---|
+| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID, sekrety, traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
+| `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
+| `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
+| `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
+| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet) |
+| `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
 
-Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo.toml` (jedna linijka,
-mała szansa na konflikt) i odwołaj się przez `.workspace = true`.
+Przy pracy równoległej kilku agentów: jeden crate/obszar na agenta, a zmiany w kontrakcie (`app.rs`, `podman.rs`,
+`weglarka-api`) tylko addytywne i zawsze z aktualizacją `FakePodman`.
+Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo.toml` i odwołaj się przez `.workspace = true`.
 
-## Iteracja 2 — własność plików (sesje 1–3 równolegle)
+## Wnioski z wdrożeń (obowiązują)
 
-Kontrakt (krok 0) jest w `main`; źródło prawdy zakresu: Kajet `brpDCgX`, decyzja o UID: `docs/decisions/0009-volume-ownership.md`.
-Każda sesja pisze **tylko w swoich plikach**; w plikach współdzielonych (`deploy.rs`, `admin.rs`, `cli.rs`,
-`commands.rs`) wolno dodać **jedną linię-hak** (wywołanie / `mod` / wariant / `.merge(...)`) — logika zostaje w pliku sesji.
-
-| Sesja | Zakres | Pliki własne |
-|---|---|---|
-| **1 — wolumeny** | tworzenie/podpinanie przy deployu, strategia UID z ADR 0009, import/eksport, `--purge-volumes` | `core/src/volumes.rs`, `daemon/src/volumes.rs`, `cli/src/volumes.rs`, `weglarka-podman/tests/volumes.rs` |
-| **2 — limity + health** | limity w spec kontenera, `health.command`, sonda HTTP w bramce | `core/src/limits.rs`, `daemon/src/health_probe.rs`, w `weglarka-podman/src/wire.rs` tylko bloki `resource_limits` / `healthconfig` |
-| **3 — CLI/API** | `apps update`, stan „czeka na sekret”, docs `secrets set < plik` | `daemon/src/update.rs`, `cli/src/update.rs`, `docs/install.md` |
-
-Hooki jednoliniowe (kto je dodaje): `deploy.rs` — wywołanie `volumes::ensure_volumes`/`attachments` i `limits::container_healthcheck` przy budowie `ContainerSpec` (1, 2); gate zdrowia w `deploy.rs` woła sondę HTTP z `health_probe.rs` (2);
-`admin.rs::router` — `.merge(volumes::routes())` (1), `put(update::update_app)` na trasie `APPS_SHOW` (3); `cli.rs`/`commands.rs` — wariant `Volumes` (1), wariant `apps update` (3).
-Stan „czeka na sekret”: `AppState::waiting_for_secrets` (3 ustawia, 1 i 2 nie dotykają). Zmiany kontraktu (`app.rs`, `podman.rs`, `api/`) —
-tylko addytywne i uzgodnione z autorem kroku 0 (sesja zlecająca); `FakePodman` aktualizuje ten, kto dodaje metodę.
+- **Nowe pola `AppSpec` / `ContainerSpec` są opcjonalne i nie zmieniają `spec_hash`, gdy nie są ustawione**
+  (`skip_serializing_if` w `HashInput`) — inaczej aktualizacja Węglarki odtworzy wszystkie działające apki.
+- **TOML-e mają `deny_unknown_fields`:** nowe pole w `state.toml`/`apps.toml` łamie rollback do starszego demona —
+  opisz to w PR i w notatce do wdrożenia.
+- **libpod zwraca czasem 500 zamiast 404** (np. `no such container` w trakcie usuwania) — klient mapuje je na
+  `NotFound`; operacje sprzątające (disconnect, remove) są best effort i idempotentne.
+- **Ingress:** każda zmiana generatorów przechodzi snapshoty, `nginx -t`, test nagłówków `X-Forwarded-*`
+  (`.github/scripts/test-forwarded-headers.sh`) i `scripts/acceptance.sh`. Pamiętaj o obu entrypointach (http i https).
+- **Import danych SQLite:** WAL — `volumes import --replace`, weryfikacja razem z `-wal`/`-shm`; kopia przez `.backup`.
+- **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
+  (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 
 ## Testy
 
@@ -86,3 +71,7 @@ tylko addytywne i uzgodnione z autorem kroku 0 (sesja zlecająca); `FakePodman` 
   (`docs/decisions/0002-podman-in-ci.md`). Job podnosi pulę subuid do ~1 M (zakres instancji = 65 536 UID, ADR 0009);
   `engine_ranges_volumes_secrets_import_migration_and_purge` przechodzi przez cały silnik na prawdziwym Podmanie.
 - Build statyczny: `cargo build --release --target x86_64-unknown-linux-musl` (CI: job `musl`).
+- Odbiór na hoście / w CI: `scripts/acceptance.sh` (kanarek, ruch, webhook 202/401/204, sprzątanie;
+  `--with-local-registry` dodaje deploy z webhooka i wymuszony rollback — tylko w CI). Smoke testy obrazu:
+  `.github/scripts/smoke-image.sh` i `smoke-quadlet.sh` (argumenty z `platform install`).
+- CI na PR buduje profilem `ci` (thin LTO), `main` i tagi — pełnym `release` (`docs/decisions/0008`).

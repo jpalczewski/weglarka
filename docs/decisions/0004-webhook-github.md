@@ -23,7 +23,7 @@ tolerancyjny (`#[serde(default)]`), ale nazwy pól (`registry_package.package_ve
 `package_url`) pochodzą z dokumentacji, nie z obserwacji. CI ntfy.zig pcha dwa tagi (`latest` i `sha-…`), więc
 oczekujemy dwóch dostaw na push; `sha-…` nie pasuje do apki śledzącej `:latest` i kończy się 204.
 
-**Fan-out (świadoma decyzja, Kajet „Model apek i stan”).** Webhook obrazu X aktualizuje *wszystkie* instancje
+**Fan-out (świadoma decyzja projektowa).** Webhook obrazu X aktualizuje *wszystkie* instancje
 śledzące X z `auto_update = true` (`Reconciler::handle_webhook`). Trade-off: podpis jednej instancji może
 wyzwolić deploy innych instancji tego samego obrazu. Ryzyko jest ograniczone: zdarzenie przechodzi tylko, gdy
 `image_ref` z payloadu pasuje do obrazu/tagu **uwierzytelnionej** instancji (inaczej 204, nic się nie dzieje),
