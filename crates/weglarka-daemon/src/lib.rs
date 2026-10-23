@@ -1,0 +1,261 @@
+//! Demon Węglarki — składanie całości: admin API (unix socket), listener webhooków (TCP),
+//! pętla reconcile z `weglarka-core`, ingress (nginx + Traefik) i `Platform` systemd.
+//!
+//! Demon jest generyczny po `PodmanClient` (trait nie jest dyn-compatible), więc testy
+//! uruchamiają go na `FakePodman`, a binarka na `LibpodClient`.
+
+pub mod admin;
+pub mod app;
+pub mod doctor;
+pub mod github;
+pub mod ingress;
+pub mod platform;
+pub mod settings;
+pub mod webhook;
+
+use std::net::SocketAddr;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use weglarka_core::podman::PodmanClient;
+use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
+use weglarka_core::secret_store::SecretStore;
+use weglarka_core::secrets::FileSecretStore;
+use weglarka_core::state;
+
+pub use app::Daemon;
+pub use settings::{Paths, Settings, SettingsError};
+
+use ingress::IngressManager;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error(transparent)]
+    State(#[from] state::StateError),
+    #[error(transparent)]
+    Secret(#[from] weglarka_core::secret_store::SecretError),
+    #[error("{what}: {source}")]
+    Io {
+        what: String,
+        source: std::io::Error,
+    },
+}
+
+fn io(what: impl Into<String>) -> impl FnOnce(std::io::Error) -> StartError {
+    let what = what.into();
+    move |source| StartError::Io { what, source }
+}
+
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Działający demon; `stop` kończy go łagodnie.
+pub struct Running<P: PodmanClient + 'static> {
+    pub daemon: Arc<Daemon<P>>,
+    pub admin_socket: PathBuf,
+    pub webhook_addr: SocketAddr,
+    shutdown: watch::Sender<bool>,
+    admin: JoinHandle<()>,
+    webhook: JoinHandle<()>,
+    ingress: JoinHandle<()>,
+    reconcile: JoinHandle<()>,
+}
+
+fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(mode)
+        .create(dir)
+        .map_err(io(format!("create {}", dir.display())))
+}
+
+/// Binduje socket admin API: usuwa tylko stary *socket*, prawa 0600 od razu po bindzie.
+fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent, 0o700)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => {
+            std::fs::remove_file(path).map_err(io(format!("remove stale {}", path.display())))?;
+        }
+        Ok(_) => {
+            return Err(StartError::Io {
+                what: format!("admin socket {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "path exists and is not a socket",
+                ),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(format!("stat {}", path.display()))(e)),
+    }
+    let listener = UnixListener::bind(path).map_err(io(format!("bind {}", path.display())))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(io(format!("chmod {}", path.display())))?;
+    Ok(listener)
+}
+
+pub async fn start<P: PodmanClient + 'static>(
+    settings: Settings,
+    podman: P,
+) -> Result<Running<P>, StartError> {
+    let Settings { host, paths, .. } = settings;
+    ensure_dir(&paths.state_dir, 0o755)?;
+
+    // Sekrety: pusty plik 0600, jeśli go nie ma; luźne prawa = odmowa startu.
+    let secrets = Arc::new(FileSecretStore::new(&paths.secrets));
+    secrets.init()?;
+    secrets.check_permissions()?;
+    // Uszkodzone TOML-e wychodzą od razu, a nie dopiero w pierwszym reconcile.
+    state::load_apps(&paths.state.apps)?;
+    state::load_state(&paths.state.state)?;
+
+    let engine = Arc::new(Reconciler::new(
+        podman,
+        secrets.clone() as Arc<dyn SecretStore>,
+        paths.state.clone(),
+        ReconcilerOptions::default(),
+    ));
+    let ingress = Arc::new(IngressManager::new(
+        engine.clone(),
+        host.clone(),
+        paths.nginx_conf_dir.clone(),
+    ));
+    let (trigger_tx, trigger_rx) = mpsc::channel(8);
+    let daemon = Arc::new(Daemon {
+        host: host.clone(),
+        paths: paths.clone(),
+        engine: engine.clone(),
+        secrets,
+        ingress: ingress.clone(),
+        github: Box::new(github::GitHub),
+        desired_lock: tokio::sync::Mutex::new(()),
+        triggers: trigger_tx,
+        webhook_addr: OnceLock::new(),
+        tasks: Mutex::new(JoinSet::new()),
+    });
+
+    let admin_listener = bind_admin(&host.admin.socket)?;
+    let webhook_listener = TcpListener::bind(host.webhook.listen)
+        .await
+        .map_err(io(format!("bind {}", host.webhook.listen)))?;
+    let webhook_addr = webhook_listener
+        .local_addr()
+        .map_err(io("webhook local_addr"))?;
+    let _ = daemon.webhook_addr.set(webhook_addr);
+
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let wait = |mut rx: watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|stop| *stop).await;
+    };
+    let admin = tokio::spawn({
+        let app = admin::router(daemon.clone());
+        let rx = shutdown_rx.clone();
+        async move {
+            if let Err(e) = axum::serve(admin_listener, app)
+                .with_graceful_shutdown(wait(rx))
+                .await
+            {
+                tracing::error!(error = %e, "admin API server stopped");
+            }
+        }
+    });
+    let webhook = tokio::spawn({
+        let app = webhook::router(daemon.clone());
+        let rx = shutdown_rx.clone();
+        async move {
+            if let Err(e) = axum::serve(webhook_listener, app)
+                .with_graceful_shutdown(wait(rx))
+                .await
+            {
+                tracing::error!(error = %e, "webhook server stopped");
+            }
+        }
+    });
+
+    let period = Duration::from_secs(host.runtime.reconcile_interval_secs.max(1));
+    let ingress_task = tokio::spawn({
+        let ingress = ingress.clone();
+        let rx = shutdown_rx.clone();
+        async move { ingress.run(period, rx).await }
+    });
+    let reconcile = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run(trigger_rx, period).await }
+    });
+
+    tracing::info!(
+        admin = %host.admin.socket.display(),
+        webhook = %webhook_addr,
+        "weglarka-daemon started"
+    );
+    Ok(Running {
+        daemon,
+        admin_socket: host.admin.socket.clone(),
+        webhook_addr,
+        shutdown,
+        admin,
+        webhook,
+        ingress: ingress_task,
+        reconcile,
+    })
+}
+
+impl<P: PodmanClient + 'static> Running<P> {
+    /// Łagodne zatrzymanie: serwery przestają przyjmować żądania, trwające deploye z webhooków
+    /// kończą się (do limitu), pętla reconcile wychodzi po zamknięciu kanału triggerów.
+    pub async fn stop(self) {
+        let Running {
+            daemon,
+            shutdown,
+            admin,
+            webhook,
+            ingress,
+            reconcile,
+            admin_socket,
+            ..
+        } = self;
+        let _ = shutdown.send(true);
+        for (name, handle) in [("admin", admin), ("webhook", webhook), ("ingress", ingress)] {
+            if tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(task = name, "did not stop in time");
+            }
+        }
+
+        let mut tasks =
+            std::mem::take(&mut *daemon.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(TASK_DRAIN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!("aborting webhook tasks still running");
+            tasks.abort_all();
+        }
+
+        // Ostatnia referencja do `Daemon` niesie nadawcę triggerów — jej zwolnienie kończy pętlę.
+        drop(daemon);
+        let abort = reconcile.abort_handle();
+        if tokio::time::timeout(TASK_DRAIN_TIMEOUT, reconcile)
+            .await
+            .is_err()
+        {
+            tracing::warn!("aborting reconcile loop");
+            abort.abort();
+        }
+        let _ = std::fs::remove_file(admin_socket);
+        tracing::info!("weglarka-daemon stopped");
+    }
+}

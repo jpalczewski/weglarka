@@ -26,7 +26,12 @@ pub struct ServiceSpec {
     pub run_as_user: String,
     /// Zmienne środowiskowe i montowania podaje demon; Platform tylko je serializuje.
     pub env: Vec<(String, String)>,
+    /// `(źródło na hoście, ścieżka w kontenerze)`; opcje (np. `:ro`) dopisuje się do ścieżki kontenera.
     pub mounts: Vec<(String, String)>,
+    /// Sieci Podmana, do których dołącza kontener (np. `net-weglarka`).
+    pub networks: Vec<String>,
+    /// Argumenty polecenia kontenera (po entrypoincie obrazu).
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

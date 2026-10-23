@@ -51,9 +51,16 @@ pub struct RuntimeConfig {
     /// Socket libpod; domyślnie wyznacza go `Platform::runtime_socket`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<PathBuf>,
+    /// Okres pętli reconcile (sekundy); dodatkowo reconcile ruszają zmiany stanu pożądanego.
+    #[serde(default = "RuntimeConfig::default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
 }
 
 impl RuntimeConfig {
+    fn default_reconcile_interval_secs() -> u64 {
+        60
+    }
+
     fn default_user() -> String {
         "weglarka".to_owned()
     }
@@ -64,6 +71,7 @@ impl Default for RuntimeConfig {
         Self {
             user: Self::default_user(),
             socket: None,
+            reconcile_interval_secs: Self::default_reconcile_interval_secs(),
         }
     }
 }
