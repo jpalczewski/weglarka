@@ -122,12 +122,15 @@ pub async fn start<P: PodmanClient + 'static>(
     state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
 
-    let engine = Arc::new(Reconciler::new(
-        podman,
-        secrets.clone() as Arc<dyn SecretStore>,
-        paths.state.clone(),
-        ReconcilerOptions::default(),
-    ));
+    let engine = Arc::new(
+        Reconciler::new(
+            podman,
+            secrets.clone() as Arc<dyn SecretStore>,
+            paths.state.clone(),
+            ReconcilerOptions::default(),
+        )
+        .with_http_prober(Arc::new(health_probe::NginxProber::default_target())),
+    );
     let ingress = Arc::new(IngressManager::new(
         engine.clone(),
         host.clone(),

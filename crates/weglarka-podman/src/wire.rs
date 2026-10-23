@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{Digest, SecretTarget};
+use weglarka_core::app::{Digest, Resources, SecretTarget};
 use weglarka_core::podman::{
-    ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, IdRange, ImageInfo,
-    NetworkInfo, NetworkSpec, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result,
-    VersionInfo, VolumeInfo, VolumeSpec,
+    ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
+    IdRange, ImageInfo, NetworkInfo, NetworkSpec, PodmanError, PodmanEvent, PullEvent,
+    RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -80,6 +80,84 @@ pub(crate) struct CreateContainer<'a> {
     secret_env: BTreeMap<&'a str, &'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mounts: Vec<BindMountBody<'a>>,
+    /// OCI `LinuxResources`; omitted entirely when the spec sets no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_limits: Option<ResourceLimits>,
+    /// `Schema2HealthConfig`; omitted keeps the image's own HEALTHCHECK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    healthconfig: Option<HealthConfig<'a>>,
+}
+
+#[derive(Serialize)]
+struct ResourceLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<MemoryResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pids: Option<PidsResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<CpuResources>,
+}
+
+#[derive(Serialize)]
+struct MemoryResources {
+    limit: u64,
+}
+
+#[derive(Serialize)]
+struct PidsResources {
+    limit: i64,
+}
+
+#[derive(Serialize)]
+struct CpuResources {
+    quota: i64,
+    period: u64,
+}
+
+/// CFS period used for `cpus` (the kernel default); `quota = cpus * period`.
+const CPU_PERIOD_US: u64 = 100_000;
+
+impl ResourceLimits {
+    fn from_spec(r: &Resources) -> Option<Self> {
+        if r.is_unlimited() {
+            return None;
+        }
+        Some(Self {
+            memory: r.memory.map(|m| MemoryResources { limit: m.bytes() }),
+            pids: r.pids_limit.map(|l| PidsResources {
+                limit: i64::from(l),
+            }),
+            cpu: r.cpus.map(|c| CpuResources {
+                // millis / 1000 CPUs * period.
+                quota: i64::from(c.millis()) * 100,
+                period: CPU_PERIOD_US,
+            }),
+        })
+    }
+}
+
+/// Go `Schema2HealthConfig` (no json tags besides `omitempty` — PascalCase); durations are nanoseconds.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct HealthConfig<'a> {
+    test: Vec<&'a str>,
+    interval: u64,
+    timeout: u64,
+    retries: u32,
+}
+
+impl<'a> HealthConfig<'a> {
+    fn from_spec(h: &'a ContainerHealthcheck) -> Self {
+        const NANOS: u64 = 1_000_000_000;
+        Self {
+            test: std::iter::once("CMD")
+                .chain(h.command.iter().map(String::as_str))
+                .collect(),
+            interval: u64::from(h.interval_secs) * NANOS,
+            timeout: u64::from(h.timeout_secs) * NANOS,
+            retries: h.retries,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -208,10 +286,6 @@ impl<'a> CreateContainer<'a> {
                     options: if v.read_only { vec!["ro"] } else { vec![] },
                 })
                 .collect(),
-            // TODO(session 2, docs/CLAUDE.md map): `spec.resources` -> libpod `resource_limits`
-            // (memory.limit, pids.limit, cpu.quota/period) and `spec.healthcheck` -> `healthconfig`.
-            // Deliberately not serialized yet; limits and the configured healthcheck have no effect
-            // until session 2 maps them.
             // `Networks` works only with bridge mode.
             netns: (!spec.networks.is_empty()).then_some(Namespace { nsmode: "bridge" }),
             networks: spec
@@ -231,6 +305,8 @@ impl<'a> CreateContainer<'a> {
                 .collect(),
             secrets,
             secret_env,
+            resource_limits: ResourceLimits::from_spec(&spec.resources),
+            healthconfig: spec.healthcheck.as_ref().map(HealthConfig::from_spec),
             mounts: spec
                 .mounts
                 .iter()
@@ -827,6 +903,50 @@ mod tests {
             }),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn create_container_limits_and_healthcheck() {
+        use weglarka_core::app::{CpuLimit, MemoryLimit};
+        use weglarka_core::podman::ContainerHealthcheck;
+        let spec = ContainerSpec {
+            name: "a".into(),
+            image: "i".into(),
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: false,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Resources {
+                memory: Some(MemoryLimit::parse("256m").unwrap()),
+                pids_limit: Some(200),
+                cpus: Some(CpuLimit::try_from(1.5).unwrap()),
+            },
+            healthcheck: Some(ContainerHealthcheck {
+                command: vec!["/app".into(), "-health".into()],
+                interval_secs: 30,
+                timeout_secs: 5,
+                retries: 3,
+            }),
+            id_mapping: None,
+        };
+        insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn partial_limits_send_only_what_is_set() {
+        use weglarka_core::app::MemoryLimit;
+        let r = Resources {
+            memory: Some(MemoryLimit::parse("1g").unwrap()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(ResourceLimits::from_spec(&r).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"memory": {"limit": 1u64 << 30}}));
+        assert!(ResourceLimits::from_spec(&Resources::default()).is_none());
     }
 
     #[test]

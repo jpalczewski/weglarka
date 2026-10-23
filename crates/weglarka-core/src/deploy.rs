@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use crate::app::{AppSpec, AppsFile, Digest, HealthGate, InstanceName};
+use crate::app::{AppSpec, AppsFile, Digest, InstanceName};
 use crate::events::Event;
 use crate::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use crate::labels;
@@ -302,8 +302,8 @@ impl<P: PodmanClient> Reconciler<P> {
             userns_auto: true,
             mounts: vec![],
             volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
+            resources: spec.resources.clone(),
+            healthcheck: crate::limits::container_healthcheck(&spec.health),
             id_mapping: None,
         };
         let started = async {
@@ -312,16 +312,19 @@ impl<P: PodmanClient> Reconciler<P> {
         }
         .await;
         let health = match started {
-            Ok(()) => self.health_gate(&name, &spec.health).await,
+            Ok(()) => self.health_gate(&name, spec).await,
             Err(e) => Err(format!("cannot start container: {e}")),
         };
         Ok(Launched { hash, health })
     }
 
-    /// Health gate: `attempts` tries within `window_secs`. The container must keep running throughout;
-    /// if the image has a healthcheck, the first `Healthy` ends the gate in success, and no `Healthy`
-    /// after all attempts is a failure. Without a healthcheck, success = running for the whole window.
-    async fn health_gate(&self, name: &str, gate: &HealthGate) -> Result<(), String> {
+    /// Health gate: `attempts` tries within `window_secs`. The container must keep running throughout.
+    /// Probes: the container healthcheck (the spec's `health.command` or, absent that, the image's own)
+    /// and the daemon-side `health.http`. In one attempt every configured probe must pass; the first
+    /// such attempt ends the gate in success and none after all attempts is a failure. With no probe
+    /// at all, success = running for the whole window.
+    async fn health_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
+        let gate = &spec.health;
         let attempts = gate.attempts.max(1);
         let step = Duration::from_millis(gate.window_secs.max(1) * 1000 / u64::from(attempts));
         let mut last = String::from("no attempt made");
@@ -338,14 +341,21 @@ impl<P: PodmanClient> Reconciler<P> {
                     None => format!("container not running ({:?})", info.state),
                 });
             }
-            if info.health.is_none() {
-                last = "running".into();
-                continue;
+            let mut results = Vec::new();
+            if gate.command.is_some() || info.health.is_some() {
+                results.push(match self.podman.healthcheck_run(name).await {
+                    Ok(HealthStatus::Healthy) => Ok(()),
+                    Ok(s) => Err(format!("healthcheck {s:?}")),
+                    Err(e) => Err(format!("healthcheck error: {e}")),
+                });
             }
-            match self.podman.healthcheck_run(name).await {
-                Ok(HealthStatus::Healthy) => return Ok(()),
-                Ok(s) => last = format!("healthcheck {s:?}"),
-                Err(e) => last = format!("healthcheck error: {e}"),
+            if let Some(probe) = &gate.http {
+                results.push(self.http_probe(spec, probe).await);
+            }
+            match crate::limits::attempt_verdict(results) {
+                None => last = "running".into(),
+                Some(Ok(())) => return Ok(()),
+                Some(Err(e)) => last = e,
             }
         }
         if last == "running" {
@@ -355,6 +365,20 @@ impl<P: PodmanClient> Reconciler<P> {
                 "health gate failed after {attempts} attempts: {last}"
             ))
         }
+    }
+
+    async fn http_probe(
+        &self,
+        spec: &AppSpec,
+        probe: &crate::app::HttpProbe,
+    ) -> Result<(), String> {
+        let (Some(prober), Some(host)) = (&self.http_prober, spec.domains.first()) else {
+            return Err("http probe needs an HTTP prober and a domain".into());
+        };
+        prober
+            .probe(host, probe)
+            .await
+            .map_err(|e| format!("http probe: {e}"))
     }
 
     pub(crate) async fn deploy_locked(
