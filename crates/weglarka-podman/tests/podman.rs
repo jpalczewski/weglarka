@@ -112,6 +112,10 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         restart: RestartPolicy::No,
         userns_auto: true,
         mounts: vec![],
+        volumes: vec![],
+        resources: Default::default(),
+        healthcheck: None,
+        id_mapping: None,
     }
 }
 

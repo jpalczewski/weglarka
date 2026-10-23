@@ -1,0 +1,45 @@
+---
+source: crates/weglarka-core/src/app.rs
+expression: parsed
+---
+{
+  "apps": {
+    "pogoda": {
+      "image": "ghcr.io/x/pogoda:latest",
+      "domains": [],
+      "port": 3000,
+      "env": {},
+      "secrets": [],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30,
+        "command": [
+          "/app",
+          "-health"
+        ],
+        "http": {
+          "path": "/healthz",
+          "expect_status": 200,
+          "timeout_secs": 5
+        }
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data"
+        },
+        {
+          "name": "cfg",
+          "target": "/cfg",
+          "read_only": true
+        }
+      ],
+      "resources": {
+        "memory": "256m",
+        "pids_limit": 200,
+        "cpus": 1.5
+      },
+      "auto_update": true
+    }
+  }
+}

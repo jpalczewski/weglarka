@@ -9,9 +9,11 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use bytes::Bytes;
 use futures_core::Stream;
+use futures_util::stream::BoxStream;
 
-use crate::app::{Digest, SecretTarget};
+use crate::app::{Digest, Resources, SecretTarget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PodmanError {
@@ -67,6 +69,48 @@ pub struct BindMount {
     pub read_only: bool,
 }
 
+/// Named volume mounted into a container (iteration 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeAttachment {
+    /// Podman volume name (`labels::volume_name`).
+    pub volume: String,
+    pub target: String,
+    pub read_only: bool,
+    /// Mount option `idmap` (ID-mapped mount; path (b) of docs/decisions/0009).
+    pub idmap: bool,
+    /// Mount option `U`: chown the volume to the container user on start (docs/decisions/0009).
+    pub chown: bool,
+}
+
+/// One line of a uid/gid map: container ids `container_id..+size` ↔ ids `host_id..+size` of the
+/// namespace the Podman user runs in (rootless: 0 = the user itself, `1..` = its subuids in order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdRange {
+    pub container_id: u32,
+    pub host_id: u32,
+    pub size: u32,
+}
+
+/// Explicit user-namespace mapping; when set it replaces `userns_auto` (path (a) of
+/// docs/decisions/0009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdMapping {
+    pub uid_map: Vec<IdRange>,
+    pub gid_map: Vec<IdRange>,
+}
+
+/// Healthcheck defined by the spec (`health.command`), overriding the image's `HEALTHCHECK`.
+/// The deploy gate runs it with `healthcheck_run`; `interval_secs` only matters for the container's
+/// own periodic runs. Mapping to libpod: session 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerHealthcheck {
+    /// Exec form, no shell.
+    pub command: Vec<String>,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    pub retries: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub name: String,
@@ -83,7 +127,39 @@ pub struct ContainerSpec {
     pub userns_auto: bool,
     /// Host bind mounts (empty list for ordinary apps).
     pub mounts: Vec<BindMount>,
+    /// Named volumes (iteration 2).
+    pub volumes: Vec<VolumeAttachment>,
+    /// Resource limits; unlimited unless set (iteration 2).
+    pub resources: Resources,
+    /// Healthcheck from the spec; `None` keeps the image's own (iteration 2).
+    pub healthcheck: Option<ContainerHealthcheck>,
+    /// Explicit uid/gid maps; replaces `userns_auto` when set (iteration 2).
+    pub id_mapping: Option<IdMapping>,
 }
+
+/// Named volume to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSpec {
+    pub name: String,
+    /// Includes `weglarka.instance` (labels::INSTANCE).
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    /// Host path of the volume data, if reported.
+    pub mountpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeFilter {
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Tar bytes in transit (volume import/export): streamed so a large volume never sits in RAM.
+pub type TarStream = BoxStream<'static, Result<Bytes>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
@@ -247,6 +323,22 @@ pub trait PodmanClient: Send + Sync {
     fn secret_create(&self, name: &str, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
     fn secret_remove(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
 
+    // Volumes (iteration 2). Session 1 owns the callers; the libpod client implements all of these.
+    /// Idempotent: an existing volume with that name → `Ok` (labels are not changed).
+    fn volume_create(&self, spec: &VolumeSpec) -> impl Future<Output = Result<()>> + Send;
+    /// `PodmanError::NotFound` if missing.
+    fn volume_inspect(&self, name: &str) -> impl Future<Output = Result<VolumeInfo>> + Send;
+    fn volume_list(
+        &self,
+        filter: &VolumeFilter,
+    ) -> impl Future<Output = Result<Vec<VolumeInfo>>> + Send;
+    /// Extracts a tar archive into the volume (`POST /libpod/volumes/{name}/import`).
+    fn volume_import(&self, name: &str, tar: TarStream) -> impl Future<Output = Result<()>> + Send;
+    /// The volume's contents as a tar archive (`GET /libpod/volumes/{name}/export`).
+    fn volume_export(&self, name: &str) -> impl Future<Output = Result<TarStream>> + Send;
+    /// `PodmanError::NotFound` if missing; `force` also removes it while containers use it.
+    fn volume_remove(&self, name: &str, force: bool) -> impl Future<Output = Result<()>> + Send;
+
     /// One-shot healthcheck invocation (the deploy gate calls it itself — no systemd timers).
     fn healthcheck_run(&self, container: &str)
     -> impl Future<Output = Result<HealthStatus>> + Send;
@@ -274,6 +366,10 @@ mod fake_tests {
             restart: RestartPolicy::Always,
             userns_auto: true,
             mounts: vec![],
+            volumes: vec![],
+            resources: Resources::default(),
+            healthcheck: None,
+            id_mapping: None,
         }
     }
 

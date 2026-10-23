@@ -34,6 +34,8 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         env: Default::default(),
         secrets: vec![],
         health: Default::default(),
+        volumes: vec![],
+        resources: Default::default(),
         auto_update: true,
     };
     spec.domains.shrink_to_fit();

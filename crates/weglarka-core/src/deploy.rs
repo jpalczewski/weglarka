@@ -301,6 +301,10 @@ impl<P: PodmanClient> Reconciler<P> {
             restart: RestartPolicy::Always,
             userns_auto: true,
             mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
         };
         let started = async {
             self.podman.container_create(&container).await?;

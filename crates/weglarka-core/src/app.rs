@@ -125,8 +125,52 @@ pub struct SecretBinding {
     pub target: SecretTarget,
 }
 
-/// Post-deploy health gate: the new container must be running (and healthy, if the image has a
-/// healthcheck) — up to `attempts` tries of `healthcheck run` within `window_secs`; otherwise rollback.
+/// Daemon-side HTTP probe (iteration 2): for `scratch` images without curl/wget. The daemon requests
+/// `GET path` through the ingress nginx (the same route as real traffic), so no extra network is needed.
+/// Owner: session 2 (`weglarka-daemon/src/health_probe.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpProbe {
+    /// Request path, starts with `/`.
+    #[serde(default = "HttpProbe::default_path")]
+    pub path: String,
+    /// Status that counts as healthy.
+    #[serde(default = "HttpProbe::default_expect_status")]
+    pub expect_status: u16,
+    /// Per-request timeout.
+    #[serde(default = "HttpProbe::default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl HttpProbe {
+    fn default_path() -> String {
+        "/".to_owned()
+    }
+    fn default_expect_status() -> u16 {
+        200
+    }
+    fn default_timeout_secs() -> u64 {
+        5
+    }
+}
+
+impl Default for HttpProbe {
+    fn default() -> Self {
+        Self {
+            path: Self::default_path(),
+            expect_status: Self::default_expect_status(),
+            timeout_secs: Self::default_timeout_secs(),
+        }
+    }
+}
+
+/// Post-deploy health gate: the new container must be running (and healthy, if it has a
+/// healthcheck) — up to `attempts` tries within `window_secs`; otherwise rollback.
+///
+/// Probes (iteration 2): `command` is a container healthcheck (overrides the image's `HEALTHCHECK`,
+/// run by `healthcheck run`); `http` is a probe the daemon makes through the ingress. **Both may be set
+/// and the gate passes only when every configured probe passes.** With neither set the behaviour is
+/// the pre-iteration-2 one (the image's own healthcheck, if any).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthGate {
@@ -134,6 +178,12 @@ pub struct HealthGate {
     pub attempts: u32,
     #[serde(default = "HealthGate::default_window_secs")]
     pub window_secs: u64,
+    /// Container healthcheck command (`["CMD", ...]` is implied; exec form, no shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Daemon-side HTTP probe; requires `port` in the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpProbe>,
 }
 
 impl HealthGate {
@@ -150,7 +200,147 @@ impl Default for HealthGate {
         Self {
             attempts: Self::default_attempts(),
             window_secs: Self::default_window_secs(),
+            command: None,
+            http: None,
         }
+    }
+}
+
+/// Named Podman volume mounted into the app container. The Podman volume is called
+/// `<instance>.<name>` ([`crate::labels::volume_name`]) and carries the `weglarka.instance` label.
+/// `apps remove` keeps volumes unless purged explicitly. Owner: session 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeMount {
+    /// Volume name within the instance (`[a-z0-9-]`, 1–63 chars).
+    pub name: String,
+    /// Absolute path in the container.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+/// Volume name within an instance: `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen.
+pub fn valid_volume_name(name: &str) -> bool {
+    InstanceName::new(name).is_ok()
+}
+
+/// Memory limit in bytes. TOML accepts an integer (bytes) or a string with a binary suffix
+/// (`"256m"`, `"1g"`); serialized in the largest exact unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MemoryRepr", into = "String")]
+pub struct MemoryLimit(u64);
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MemoryRepr {
+    Bytes(u64),
+    Text(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid memory limit {0:?}: expected bytes or <n>[k|m|g], > 0")]
+pub struct InvalidMemoryLimit(pub String);
+
+impl MemoryLimit {
+    pub fn from_bytes(bytes: u64) -> Result<Self, InvalidMemoryLimit> {
+        if bytes == 0 {
+            Err(InvalidMemoryLimit("0".into()))
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+
+    pub fn parse(text: &str) -> Result<Self, InvalidMemoryLimit> {
+        let err = || InvalidMemoryLimit(text.to_owned());
+        let lower = text.trim().to_ascii_lowercase();
+        let (digits, shift) = match lower.chars().last() {
+            Some('k') => (&lower[..lower.len() - 1], 10),
+            Some('m') => (&lower[..lower.len() - 1], 20),
+            Some('g') => (&lower[..lower.len() - 1], 30),
+            _ => (lower.as_str(), 0),
+        };
+        let n: u64 = digits.parse().map_err(|_| err())?;
+        Self::from_bytes(n.checked_mul(1 << shift).ok_or_else(err)?).map_err(|_| err())
+    }
+}
+
+impl TryFrom<MemoryRepr> for MemoryLimit {
+    type Error = InvalidMemoryLimit;
+    fn try_from(value: MemoryRepr) -> Result<Self, Self::Error> {
+        match value {
+            MemoryRepr::Bytes(b) => Self::from_bytes(b),
+            MemoryRepr::Text(t) => Self::parse(&t),
+        }
+    }
+}
+
+impl From<MemoryLimit> for String {
+    fn from(value: MemoryLimit) -> Self {
+        let b = value.0;
+        for (shift, suffix) in [(30, "g"), (20, "m"), (10, "k")] {
+            if b.is_multiple_of(1 << shift) {
+                return format!("{}{suffix}", b >> shift);
+            }
+        }
+        b.to_string()
+    }
+}
+
+/// CPU limit in thousandths of a CPU (`cpus = 1.5` → 1500). TOML accepts a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct CpuLimit(u32);
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid cpu limit {0}: expected a number in (0, 1024]")]
+pub struct InvalidCpuLimit(pub f64);
+
+impl CpuLimit {
+    pub fn millis(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for CpuLimit {
+    type Error = InvalidCpuLimit;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        let millis = (value * 1000.0).round();
+        if value.is_finite() && (1.0..=1_024_000.0).contains(&millis) {
+            // Range-checked above.
+            Ok(Self(millis as u32))
+        } else {
+            Err(InvalidCpuLimit(value))
+        }
+    }
+}
+
+impl From<CpuLimit> for f64 {
+    fn from(value: CpuLimit) -> Self {
+        f64::from(value.0) / 1000.0
+    }
+}
+
+/// Per-app resource limits. **No limit by default**: every field is `None` unless set in the spec.
+/// Part of the spec hash only when something is set. Owner: session 2 (`weglarka-core/src/limits.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<CpuLimit>,
+}
+
+impl Resources {
+    pub fn is_unlimited(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -174,6 +364,12 @@ pub struct AppSpec {
     pub secrets: Vec<SecretBinding>,
     #[serde(default)]
     pub health: HealthGate,
+    /// Named volumes (iteration 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeMount>,
+    /// Resource limits (iteration 2); all unlimited by default.
+    #[serde(default, skip_serializing_if = "Resources::is_unlimited")]
+    pub resources: Resources,
     /// `false` — webhook/reconcile does not swap the image on its own.
     #[serde(default = "default_true")]
     pub auto_update: bool,
@@ -200,6 +396,67 @@ mod tests {
         assert!(InstanceName::new("ntfy-zig").is_ok());
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"x".repeat(64)] {
             assert!(InstanceName::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn iteration2_fields_parse_and_roundtrip() {
+        let toml_src = r#"
+[apps.pogoda]
+image = "ghcr.io/x/pogoda:latest"
+port = 3000
+volumes = [{ name = "data", target = "/data" }, { name = "cfg", target = "/cfg", read_only = true }]
+resources = { memory = "256m", pids_limit = 200, cpus = 1.5 }
+health = { command = ["/app", "-health"], http = { path = "/healthz" } }
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        insta::assert_json_snapshot!(parsed);
+        let again: AppsFile = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn old_specs_stay_unlimited_and_serialize_without_new_fields() {
+        let spec: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
+        assert!(spec.resources.is_unlimited() && spec.volumes.is_empty());
+        let text = toml::to_string(&spec).unwrap();
+        assert!(
+            !text.contains("volumes") && !text.contains("resources") && !text.contains("command"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn memory_limit_forms() {
+        for (src, bytes) in [
+            ("256m", 256 << 20),
+            ("1G", 1 << 30),
+            ("64k", 64 << 10),
+            ("1000", 1000),
+        ] {
+            assert_eq!(MemoryLimit::parse(src).unwrap().bytes(), bytes, "{src}");
+        }
+        for bad in [
+            "",
+            "0",
+            "0m",
+            "m",
+            "1.5g",
+            "-1",
+            "1t",
+            "99999999999999999999g",
+        ] {
+            assert!(MemoryLimit::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(String::from(MemoryLimit::parse("1024m").unwrap()), "1g");
+        assert_eq!(String::from(MemoryLimit::from_bytes(1500).unwrap()), "1500");
+    }
+
+    #[test]
+    fn cpu_limit_forms() {
+        assert_eq!(CpuLimit::try_from(0.5).unwrap().millis(), 500);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 2000.0] {
+            assert!(CpuLimit::try_from(bad).is_err(), "{bad}");
         }
     }
 

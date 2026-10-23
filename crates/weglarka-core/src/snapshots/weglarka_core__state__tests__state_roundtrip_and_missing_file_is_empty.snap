@@ -10,3 +10,7 @@ previous = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 [apps.ntfy.failed]
 digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 reason = "unhealthy"
+
+[apps.ntfy.uid_range]
+start = 1
+size = 65536

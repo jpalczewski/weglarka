@@ -8,6 +8,7 @@ use weglarka_core::app::{Digest, SecretTarget};
 use weglarka_core::podman::{
     ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, ImageInfo, NetworkInfo,
     NetworkSpec, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
+    VolumeInfo, VolumeSpec,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -284,6 +285,43 @@ impl InspectContainer {
 #[serde(default, rename_all = "PascalCase")]
 pub(crate) struct HealthReport {
     pub(crate) status: String,
+}
+
+// ---- volumes ----
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CreateVolume<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    label: &'a BTreeMap<String, String>,
+}
+
+impl<'a> CreateVolume<'a> {
+    pub(crate) fn new(spec: &'a VolumeSpec) -> Self {
+        Self {
+            name: &spec.name,
+            label: &spec.labels,
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub(crate) struct WireVolume {
+    name: String,
+    labels: Option<BTreeMap<String, String>>,
+    mountpoint: String,
+}
+
+impl WireVolume {
+    pub(crate) fn into_domain(self) -> VolumeInfo {
+        VolumeInfo {
+            name: self.name,
+            labels: self.labels.unwrap_or_default(),
+            mountpoint: (!self.mountpoint.is_empty()).then_some(self.mountpoint),
+        }
+    }
 }
 
 // ---- images ----
@@ -674,6 +712,10 @@ mod tests {
             restart: RestartPolicy::Always,
             userns_auto: true,
             mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -691,6 +733,10 @@ mod tests {
             restart: RestartPolicy::No,
             userns_auto: false,
             mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }

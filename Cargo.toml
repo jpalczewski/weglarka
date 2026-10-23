@@ -27,6 +27,7 @@ weglarka-ingress = { path = "crates/weglarka-ingress" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 clap = { version = "4", features = ["derive"] }
+bytes = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"

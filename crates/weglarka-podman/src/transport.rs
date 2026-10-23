@@ -4,15 +4,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::{Bytes, Incoming};
+use futures_util::StreamExt;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::client::conn::http1;
 use hyper::header::{CONTENT_TYPE, HOST};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::UnixStream;
-use weglarka_core::podman::{PodmanError, Result};
+use weglarka_core::podman::{PodmanError, Result, TarStream};
 
 /// API version in the path — forces v6 semantics regardless of the server's default version.
 pub(crate) const API_PREFIX: &str = "/v6.0.0/libpod";
@@ -40,7 +42,7 @@ impl Transport {
         &self,
         method: Method,
         path: &str,
-        body: Option<(&'static str, Bytes)>,
+        body: Option<(&'static str, UnsyncBoxBody<Bytes, std::io::Error>)>,
     ) -> Result<(StatusCode, Incoming)> {
         let unreachable = |what: &str, e: &dyn std::fmt::Display| {
             PodmanError::Unreachable(format!("{}: {what}: {e}", self.socket.display()))
@@ -62,14 +64,14 @@ impl Transport {
             .uri(format!("{API_PREFIX}{path}"))
             .header(HOST, "podman");
         let payload = match body {
-            Some((content_type, bytes)) => {
+            Some((content_type, body)) => {
                 request = request.header(CONTENT_TYPE, content_type);
-                bytes
+                body
             }
-            None => Bytes::new(),
+            None => whole(Bytes::new()),
         };
         let request = request
-            .body(Full::new(payload))
+            .body(payload)
             .map_err(|e| PodmanError::Protocol(format!("building request: {e}")))?;
         let response = sender
             .send_request(request)
@@ -85,6 +87,7 @@ impl Transport {
         path: &str,
         body: Option<(&'static str, Bytes)>,
     ) -> Result<Bytes> {
+        let body = body.map(|(content_type, bytes)| (content_type, whole(bytes)));
         let (status, incoming) = self.open(method, path, body).await?;
         if is_success(status) {
             read_limited(incoming, MAX_BODY).await
@@ -105,6 +108,54 @@ impl Transport {
             .await
     }
 
+    /// Call with a streamed *request* body (volume import); the small response is read whole.
+    pub(crate) async fn call_streaming_body(
+        &self,
+        method: Method,
+        path: &str,
+        content_type: &'static str,
+        body: TarStream,
+    ) -> Result<Bytes> {
+        let frames = body.map(|chunk| {
+            chunk
+                .map(Frame::data)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+        let body = StreamBody::new(frames).boxed_unsync();
+        let (status, incoming) = self.open(method, path, Some((content_type, body))).await?;
+        if is_success(status) {
+            read_limited(incoming, MAX_BODY).await
+        } else {
+            Err(error_from_response(status, incoming).await)
+        }
+    }
+
+    /// Call with a raw streamed *response* (volume export): chunks are passed on as they arrive.
+    pub(crate) async fn bytes_stream(&self, method: Method, path: &str) -> Result<TarStream> {
+        let (status, incoming) = self.open(method, path, None).await?;
+        if !is_success(status) {
+            return Err(error_from_response(status, incoming).await);
+        }
+        let stream = futures_util::stream::unfold(Some(incoming), |state| async move {
+            let mut body = state?;
+            loop {
+                match body.frame().await {
+                    None => return None,
+                    Some(Err(e)) => {
+                        let error = PodmanError::Unreachable(format!("stream interrupted: {e}"));
+                        return Some((Err(error), None));
+                    }
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            return Some((Ok(data), Some(body)));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(stream.boxed())
+    }
+
     /// Call with a streamed response (JSON lines).
     pub(crate) async fn lines(&self, method: Method, path: &str) -> Result<Lines> {
         let (status, incoming) = self.open(method, path, None).await?;
@@ -114,6 +165,12 @@ impl Transport {
             Err(error_from_response(status, incoming).await)
         }
     }
+}
+
+fn whole(bytes: Bytes) -> UnsyncBoxBody<Bytes, std::io::Error> {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 fn is_success(status: StatusCode) -> bool {

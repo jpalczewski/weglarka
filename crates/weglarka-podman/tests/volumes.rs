@@ -242,6 +242,16 @@ impl Spike {
             .map(str::to_owned)
     }
 
+    /// Contents of a file in the volume, read from the host side.
+    fn host_file(&self, volume: &str, file: &str) -> String {
+        let Some(mp) = self.mountpoint(volume) else {
+            return "no-mountpoint".into();
+        };
+        fs::read_to_string(format!("{mp}/{file}"))
+            .map(|t| one_line(&t))
+            .unwrap_or_else(|e| format!("read error: {e}"))
+    }
+
     /// Host-side `uid:gid` of a file in the volume (as seen from outside the user namespace).
     fn host_owner(&self, volume: &str, file: &str) -> String {
         let Some(mp) = self.mountpoint(volume) else {
@@ -409,10 +419,9 @@ async fn scenario(socket: &str, variant: &Variant, user: Option<&str>) {
                 .args(["-tvf", out.to_str().unwrap(), "--numeric-owner"])
                 .output()
                 .unwrap();
-            eprintln!(
-                "SPIKE {label} [{who}]: export listing:\n{}",
-                String::from_utf8_lossy(&listing.stdout)
-            );
+            for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                eprintln!("SPIKE {label} [{who}]: export entry: {line}");
+            }
         }
     }
     let _ = fs::remove_dir_all(&dir);
@@ -566,5 +575,113 @@ async fn spike_a_isolation() {
             "other range cannot create files in a's volume",
             write != 0,
         );
+    }
+}
+
+/// Path (a) + `U`: explicit private maps, volume chowned to the container user on every start —
+/// would make `import` independent of the offset without rewriting tar headers.
+#[tokio::test]
+async fn spike_a_fixed_range_chown_u() {
+    let Some(socket) = socket() else { return };
+    let v = Variant {
+        label: "a-private-U",
+        userns: Some(json!({"nsmode": "private"})),
+        idmappings: Some(explicit_maps(1, 4096)),
+        volume_options: vec!["U"],
+    };
+    for u in USERS {
+        scenario(&socket, &v, u).await;
+    }
+}
+
+/// What does `userns: auto` do under rootless Podman? Two concurrent containers per mode; their
+/// `/proc/self/uid_map` is written to a volume and read back from the host.
+#[tokio::test]
+async fn spike_diag_userns_modes() {
+    let Some(socket) = socket() else { return };
+    let mut s = Spike::new(socket.clone());
+    s.pull();
+    let id = run_id();
+    let modes: [(&str, Option<Value>); 3] = [
+        ("auto", Some(json!({"nsmode": "auto"}))),
+        ("private", Some(json!({"nsmode": "private"}))),
+        ("unset", None),
+    ];
+    for (label, userns) in modes {
+        let mut vols = Vec::new();
+        for n in ["x", "y"] {
+            let vol = format!("weglarka-spike-diag-{label}-{n}-{id}");
+            s.cleanup.volumes.push(vol.clone());
+            raw(
+                &socket,
+                "POST",
+                "/volumes/create",
+                Some(&json!({"Name": vol})),
+                &[],
+            )
+            .unwrap();
+            let name = format!("spike-diag-{label}-{n}-{id}");
+            let mut body = json!({
+                "name": name, "image": ALPINE, "command": ["sleep", "3600"],
+                "volumes": [{"Name": vol, "Dest": "/out", "Options": []}],
+            });
+            if let Some(u) = &userns {
+                body["userns"] = u.clone();
+            }
+            match s.start(&body) {
+                Err(e) => eprintln!("SPIKE diag {label}/{n}: start -> FAIL ({})", one_line(&e)),
+                Ok(()) => {
+                    let code = s
+                        .sh(&name, "cat /proc/self/uid_map > /out/uid_map; id -u > /out/uid; chmod 644 /out/*")
+                        .await;
+                    let inspect = raw(
+                        &socket,
+                        "GET",
+                        &format!("/containers/{name}/json"),
+                        None,
+                        &[],
+                    )
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+                    let mode = inspect
+                        .as_ref()
+                        .map(|j| j["HostConfig"]["UsernsMode"].to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "SPIKE diag {label}/{n}: exec={code} HostConfig.UsernsMode={mode} uid_map=[{}]",
+                        s.host_file(&vol, "uid_map")
+                    );
+                    vols.push(vol);
+                }
+            }
+        }
+    }
+    // Is `idmap` on a volume honored? (mount options of /data as the container sees them)
+    let vol = format!("weglarka-spike-diag-idmap-{id}");
+    s.cleanup.volumes.push(vol.clone());
+    raw(
+        &socket,
+        "POST",
+        "/volumes/create",
+        Some(&json!({"Name": vol})),
+        &[],
+    )
+    .unwrap();
+    let name = format!("spike-diag-idmap-{id}");
+    let body = json!({
+        "name": name, "image": ALPINE, "command": ["sleep", "3600"],
+        "userns": {"nsmode": "auto"},
+        "volumes": [{"Name": vol, "Dest": "/data", "Options": ["idmap"]}],
+    });
+    match s.start(&body) {
+        Err(e) => eprintln!("SPIKE diag idmap: start -> FAIL ({})", one_line(&e)),
+        Ok(()) => {
+            s.sh(
+                &name,
+                "grep ' /data ' /proc/self/mountinfo > /data/mi; chmod 644 /data/mi",
+            )
+            .await;
+            eprintln!("SPIKE diag idmap: mountinfo=[{}]", s.host_file(&vol, "mi"));
+        }
     }
 }

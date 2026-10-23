@@ -8,9 +8,12 @@ pub mod admin;
 pub mod app;
 pub mod doctor;
 pub mod github;
+pub mod health_probe;
 pub mod ingress;
 pub mod platform;
 pub mod settings;
+pub mod update;
+pub mod volumes;
 pub mod webhook;
 
 use std::net::SocketAddr;

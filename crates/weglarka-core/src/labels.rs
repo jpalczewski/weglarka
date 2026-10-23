@@ -31,3 +31,9 @@ pub fn container_name(instance: &InstanceName) -> String {
 pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")
 }
+
+/// Podman volume name of an instance's volume. `.` cannot occur in an instance or volume name,
+/// so `<instance>.<volume>` is unambiguous.
+pub fn volume_name(instance: &InstanceName, volume: &str) -> String {
+    format!("{instance}.{volume}")
+}

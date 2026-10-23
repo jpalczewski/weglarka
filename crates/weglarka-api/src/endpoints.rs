@@ -1,4 +1,4 @@
-//! Endpoint list. Paths contain `{name}` / `{secret}` parameters.
+//! Endpoint list. Paths contain `{name}` / `{secret}` / `{volume}` parameters.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -34,7 +34,14 @@ pub const APPS_SHOW: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}",
 };
-/// `DELETE` → 204
+/// `PUT` [`UpdateAppRequest`](crate::UpdateAppRequest) → [`UpdateAppResponse`](crate::UpdateAppResponse).
+/// Full spec replacement (see the request type). Owner: session 3.
+pub const APPS_UPDATE: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/apps/{name}",
+};
+/// `DELETE` → 204. Query [`RemoveAppQuery`](crate::RemoveAppQuery): `?purge_volumes=true` also removes
+/// the instance's volumes (kept by default).
 pub const APPS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/apps/{name}",
@@ -55,6 +62,22 @@ pub const SECRETS_SET: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/secrets/{secret}",
 };
+/// `GET` → [`ListVolumesResponse`](crate::ListVolumesResponse): volumes declared in the app's spec.
+pub const VOLUMES_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/apps/{name}/volumes",
+};
+/// `GET` → `application/x-tar`, streamed. `{volume}` is the volume's name within the instance.
+pub const VOLUMES_EXPORT: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/apps/{name}/volumes/{volume}/export",
+};
+/// `PUT` a streamed `application/x-tar` body → 204. Extracts into the volume (existing files with the
+/// same path are overwritten; others are kept). Ownership of the extracted files: docs/decisions/0009.
+pub const VOLUMES_IMPORT: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/apps/{name}/volumes/{volume}/import",
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -66,9 +89,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_LIST,
     APPS_ADD,
     APPS_SHOW,
+    APPS_UPDATE,
     APPS_REMOVE,
     APPS_DEPLOY,
     SECRETS_LIST,
     SECRETS_SET,
+    VOLUMES_LIST,
+    VOLUMES_EXPORT,
+    VOLUMES_IMPORT,
     DOCTOR,
 ];

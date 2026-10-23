@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
