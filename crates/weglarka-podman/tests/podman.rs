@@ -111,6 +111,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         publish: vec![],
         restart: RestartPolicy::No,
         userns_auto: true,
+        mounts: vec![],
     }
 }
 

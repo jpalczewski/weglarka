@@ -9,7 +9,8 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
   "ingress": {
     "mode": "behind",
     "bind": "172.17.0.1:8080",
-    "traefik_dynamic_file": "/data/coolify/proxy/dynamic/weglarka.yml"
+    "traefik_dynamic_file": "/data/coolify/proxy/dynamic/weglarka.yml",
+    "nginx_image": "docker.io/library/nginx:1-alpine"
   },
   "admin": {
     "socket": "/run/user/1001/weglarka/admin.sock"
@@ -20,5 +21,6 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
   },
   "platform": {
     "kind": "systemd"
-  }
+  },
+  "state": {}
 }

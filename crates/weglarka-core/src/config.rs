@@ -1,7 +1,7 @@
 //! `weglarka.toml` — konfiguracja hosta. Pisze człowiek/Ansible, demon tylko czyta.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,11 +15,30 @@ pub struct HostConfig {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub platform: PlatformConfig,
+    #[serde(default)]
+    pub state: StateConfig,
 }
 
 impl HostConfig {
     pub fn from_toml_str(src: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(src)
+    }
+}
+
+/// Lokalizacja plików stanu: `apps.toml`, `state.toml`, `secrets.toml` (i katalog nginxa).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    /// Katalog danych; domyślnie katalog, w którym leży `weglarka.toml` (ustala to wywołujący,
+    /// bo `HostConfig` nie zna ścieżki własnego pliku).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+}
+
+impl StateConfig {
+    /// Katalog stanu: `[state] dir` albo `fallback` (zwykle katalog configu).
+    pub fn dir_or(&self, fallback: &Path) -> PathBuf {
+        self.dir.clone().unwrap_or_else(|| fallback.to_owned())
     }
 }
 
@@ -67,6 +86,18 @@ pub struct IngressConfig {
     /// Plik dynamicznej konfiguracji Traefika (tryb `behind`), nadpisywany w miejscu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traefik_dynamic_file: Option<PathBuf>,
+    /// Obraz kontenera nginx zarządzanego przez demona.
+    #[serde(default = "IngressConfig::default_nginx_image")]
+    pub nginx_image: String,
+    /// Katalog hosta z `nginx.conf` (montowany do kontenera nginx); domyślnie `<state dir>/nginx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nginx_conf_dir: Option<PathBuf>,
+}
+
+impl IngressConfig {
+    pub fn default_nginx_image() -> String {
+        "docker.io/library/nginx:1-alpine".to_owned()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

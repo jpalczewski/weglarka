@@ -7,14 +7,15 @@ use futures_util::stream;
 use hyper::Method;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
-    NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result, VersionInfo,
+    NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result,
+    VersionInfo,
 };
 
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateNetwork, CreatedContainer, HealthReport,
-    InspectContainer, InspectImage, ListedContainer, PullLine, PullReport, Version, WireEvent,
-    decode, health_status,
+    InspectContainer, InspectImage, InspectNetwork, ListedContainer, PullLine, PullReport, Version,
+    WireEvent, decode, health_status,
 };
 
 /// Klient libpod po unix sockecie. Tani w klonowaniu (współdzieli tylko ścieżkę socketu);
@@ -86,6 +87,16 @@ impl PodmanClient for LibpodClient {
     async fn container_remove(&self, name: &str, force: bool) -> Result<()> {
         let path = format!("/containers/{}?force={force}", path_name(name)?);
         self.transport.call(Method::DELETE, &path, None).await?;
+        Ok(())
+    }
+
+    async fn container_kill(&self, name: &str, signal: &str) -> Result<()> {
+        let path = format!(
+            "/containers/{}/kill?signal={}",
+            path_name(name)?,
+            encode_component(signal)
+        );
+        self.transport.call(Method::POST, &path, None).await?;
         Ok(())
     }
 
@@ -170,6 +181,12 @@ impl PodmanClient for LibpodClient {
             .call_json(Method::POST, &path, &ConnectNetwork { container })
             .await?;
         Ok(())
+    }
+
+    async fn network_inspect(&self, name: &str) -> Result<NetworkInfo> {
+        let path = format!("/networks/{}/json", path_name(name)?);
+        let body = self.transport.call(Method::GET, &path, None).await?;
+        Ok(decode::<InspectNetwork>(&body)?.into_domain())
     }
 
     async fn secret_create(&self, name: &str, data: &[u8]) -> Result<()> {

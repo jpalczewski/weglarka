@@ -59,6 +59,14 @@ pub struct SecretAttachment {
     pub target: SecretTarget,
 }
 
+/// Bind mount katalogu/pliku z hosta (np. `nginx.conf` ingressu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub name: String,
@@ -73,6 +81,8 @@ pub struct ContainerSpec {
     pub restart: RestartPolicy,
     /// `--userns=auto` (decyzja: od początku).
     pub userns_auto: bool,
+    /// Bind mounty z hosta (pusta lista dla zwykłych apek).
+    pub mounts: Vec<BindMount>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +169,13 @@ pub struct EventFilter {
     pub since: Option<i64>,
 }
 
+/// Dane sieci potrzebne ingressowi: adresy bramek, pod którymi nasłuchuje DNS sieci (aardvark).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInfo {
+    pub name: String,
+    pub gateways: Vec<std::net::IpAddr>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerFilter {
     pub labels: BTreeMap<String, String>,
@@ -178,6 +195,8 @@ pub trait PodmanClient: Send + Sync {
         timeout_secs: u32,
     ) -> impl Future<Output = Result<()>> + Send;
     fn container_remove(&self, name: &str, force: bool) -> impl Future<Output = Result<()>> + Send;
+    /// Wysyła sygnał (nazwa bez `SIG`, np. `HUP`) do działającego kontenera — przeładowanie nginxa.
+    fn container_kill(&self, name: &str, signal: &str) -> impl Future<Output = Result<()>> + Send;
     /// `PodmanError::NotFound`, gdy brak.
     fn container_inspect(&self, name: &str) -> impl Future<Output = Result<ContainerInfo>> + Send;
     fn container_list(
@@ -202,6 +221,9 @@ pub trait PodmanClient: Send + Sync {
         network: &str,
         container: &str,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// `PodmanError::NotFound`, gdy brak sieci.
+    fn network_inspect(&self, name: &str) -> impl Future<Output = Result<NetworkInfo>> + Send;
 
     // Sekrety (Podman secrets); `create` nadpisuje istniejący o tej nazwie.
     fn secret_create(&self, name: &str, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
@@ -233,6 +255,7 @@ mod fake_tests {
             publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
+            mounts: vec![],
         }
     }
 

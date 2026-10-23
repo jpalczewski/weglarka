@@ -11,7 +11,8 @@ use sha2::{Digest as _, Sha256};
 use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result, VersionInfo,
+    ImageInfo, NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result,
+    VersionInfo,
 };
 
 /// Zapis wywołania — do asercji kolejności operacji w testach reconcile/deploy.
@@ -21,6 +22,10 @@ pub enum Call {
     ContainerStart(String),
     ContainerStop(String),
     ContainerRemove(String),
+    ContainerKill {
+        name: String,
+        signal: String,
+    },
     ImagePull(String),
     ImageTag {
         id: String,
@@ -246,6 +251,20 @@ impl PodmanClient for FakePodman {
         Ok(())
     }
 
+    async fn container_kill(&self, name: &str, signal: &str) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerKill {
+            name: name.to_owned(),
+            signal: signal.to_owned(),
+        });
+        if s.container_mut(name)?.state != ContainerState::Running {
+            return Err(PodmanError::Conflict(format!(
+                "container {name} is not running"
+            )));
+        }
+        Ok(())
+    }
+
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
         self.lock()
             .containers
@@ -364,6 +383,21 @@ impl PodmanClient for FakePodman {
             members.push(container.to_owned());
         }
         Ok(())
+    }
+
+    async fn network_inspect(&self, name: &str) -> Result<NetworkInfo> {
+        let s = self.lock();
+        let index = s
+            .networks
+            .keys()
+            .position(|n| n == name)
+            .ok_or_else(|| PodmanError::NotFound(name.to_owned()))?;
+        // Deterministyczna „bramka” z numeru sieci (jak 10.89.N.1 w netavark).
+        let octet = u8::try_from(index % 250).unwrap_or(0);
+        Ok(NetworkInfo {
+            name: name.to_owned(),
+            gateways: vec![std::net::IpAddr::from([10, 89, octet, 1])],
+        })
     }
 
     async fn secret_create(&self, name: &str, data: &[u8]) -> Result<()> {
