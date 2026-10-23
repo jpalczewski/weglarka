@@ -1,4 +1,4 @@
-//! Container labels — the reconcile contract (`Zasady architektury`, QlBT25G).
+//! Container labels — the reconcile contract.
 
 use std::collections::BTreeMap;
 
