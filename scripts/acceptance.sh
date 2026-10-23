@@ -110,7 +110,9 @@ TRAEFIK_FILE=$(toml_get traefik_dynamic_file)
 REG=127.0.0.1:$REGISTRY_PORT
 WORK=$(mktemp -d)
 : >"$WORK/results.tsv"
-REGISTRIES_DROPIN="${XDG_CONFIG_HOME:-$HOME/.config}/containers/registries.conf.d/zz-weglarka-acceptance.conf"
+REGISTRIES_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/containers"
+REGISTRIES_DROPIN="$REGISTRIES_DIR/registries.conf.d/zz-weglarka-acceptance.conf"
+REGISTRIES_CONF="$REGISTRIES_DIR/registries.conf"
 
 # Repo i tag kanarka (do payloadu webhooka): `repo:tag[@digest]` → `repo:tag`.
 canary_ref=${IMAGE%%@*}
@@ -186,6 +188,8 @@ cleanup_helpers() {
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman rmi -f "$REG/wg-accept/wh:t" "$REG/wg-accept/rb:t" >/dev/null 2>&1 || true
   rm -f "$REGISTRIES_DROPIN"
+  # Plik zakładamy tylko wtedy, gdy go nie było (patrz step_registry); wtedy znamy jego treść.
+  if [ -f "$WORK/registries_conf_created" ]; then rm -f "$REGISTRIES_CONF"; fi
 }
 
 on_exit() {
@@ -365,7 +369,7 @@ step_traffic() {
   done
   log "200 po ~${i}s"
   grep -qi "^X-Forwarded-Host: $CANARY_DOMAIN\$" "$WORK/body" \
-    || die "brak X-Forwarded-Host: $CANARY_DOMAIN w odpowiedzi whoami (nginx/Traefik nie przekazały nagłówka)"
+    || { sed 's/^/  | /' "$WORK/body"; die "brak X-Forwarded-Host: $CANARY_DOMAIN w odpowiedzi whoami (nginx/Traefik nie przekazały nagłówka)"; }
   grep -qi '^X-Forwarded-For:' "$WORK/body" || die "brak X-Forwarded-For w odpowiedzi whoami"
   if [ -z "$DIRECT" ]; then
     grep -qi '^X-Forwarded-Proto: https' "$WORK/body" || die "brak X-Forwarded-Proto: https (nginx nie ufa Traefikowi?)"
@@ -379,7 +383,12 @@ step_registry() {
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman run -d --name "$REGISTRY_CONTAINER" -p "127.0.0.1:$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
   # Demon ciągnie obrazy przez usługę Podmana tego usera — rejestr po http musi być jawnie „insecure”.
+  # containers/image czyta `registries.conf.d` użytkownika tylko wtedy, gdy istnieje jego `registries.conf`.
   mkdir -p "$(dirname "$REGISTRIES_DROPIN")"
+  if [ ! -e "$REGISTRIES_CONF" ]; then
+    : >"$REGISTRIES_CONF"
+    : >"$WORK/registries_conf_created"
+  fi
   cat >"$REGISTRIES_DROPIN" <<EOF
 [[registry]]
 location = "$REG"
@@ -502,6 +511,7 @@ step_cleanup() {
   done
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   rm -f "$REGISTRIES_DROPIN"
+  if [ -f "$WORK/registries_conf_created" ]; then rm -f "$REGISTRIES_CONF"; fi
   wg apps remove "$CANARY" >/dev/null || die "apps remove $CANARY nie powiodło się"
   wg --json apps list | jq -e --arg n "$CANARY" '[.apps[].name] | index($n) | not' >/dev/null \
     || die "kanarek nadal na liście apek"
