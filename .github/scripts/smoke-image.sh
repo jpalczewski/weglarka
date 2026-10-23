@@ -2,12 +2,16 @@
 # Smoke test obrazu Węglarki na rootless Podmanie 6: demon wstaje, CLI odpowiada przez socket
 # admina, `doctor` zwraca wynik, a ingress podnosi kontener nginx (tryb `behind`, plik Traefika w tempdir).
 #
-#   smoke-image.sh <obraz> <ścieżka-do-binarki-weglarka> <socket-podmana>
+#   smoke-image.sh <obraz> <ścieżka-do-binarki-weglarka> <socket-podmana> [skrypt-odbioru]
+#
+# Z czwartym argumentem (scripts/acceptance.sh) na tym samym demonie biegnie skrypt odbioru:
+# kanarek, ruch przez nginx (bez Traefika/TLS), webhooki, rollback, sprzątanie.
 set -euo pipefail
 
 image=$1
 cli=$2
 podman_sock=$3
+acceptance=${4:-}
 
 dir=$(mktemp -d)
 chmod 755 "$dir"
@@ -46,7 +50,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Ścieżki montujemy 1:1 (jak w quadlecie); root kontenera = ten sam użytkownik co na hoście.
-podman run -d --pull=never --name weglarka-smoke \
+podman run -d --pull=never --name weglarka-smoke -p 127.0.0.1:19180:9180 \
   -v "$podman_sock:$podman_sock" -v "$dir:$dir" \
   "$image" run --config "$dir/weglarka.toml"
 
@@ -75,3 +79,13 @@ set -e
 cat "$dir/doctor.json"
 [ "$rc" -le 2 ] || { echo "doctor failed to run (exit $rc)"; exit 1; }
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dir/doctor.json"
+
+if [ -n "$acceptance" ]; then
+  echo "--- skrypt odbioru (acceptance.sh) na demonie ze smoke testu"
+  # Bez Traefika i TLS: ruch bezpośrednio do nginx (Host: domena), webhooki prosto na listener demona;
+  # preflight pomijamy — runner CI to nie docelowy układ hosta.
+  PATH="$(cd "$(dirname "$cli")" && pwd):$PATH" "$acceptance" --config "$dir/weglarka.toml" \
+    --canary-domain wg-canary.example.test \
+    --direct http://127.0.0.1:18080 --webhook-base http://127.0.0.1:19180 \
+    --skip-preflight
+fi

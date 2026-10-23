@@ -10,6 +10,12 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -x scripts/*.sh .github/scripts/*.sh
+
   fmt:
     runs-on: ubuntu-24.04
     steps:
@@ -154,7 +160,7 @@ jobs:
           podman images
       - run: cargo build -p weglarka-cli
       - name: Smoke test obrazu
-        run: .github/scripts/smoke-image.sh localhost/weglarka:ci target/debug/weglarka "$WEGLARKA_PODMAN_SOCKET"
+        run: .github/scripts/smoke-image.sh localhost/weglarka:ci target/debug/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true
