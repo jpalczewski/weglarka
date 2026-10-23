@@ -1,1 +1,318 @@
 //! Config nginx: server per apka, `proxy_pass` po nazwie w sieci apki, JSON access log z `app`; **Własność: sesja c.**
+//!
+//! Punkty rozszerzeń: [`ModeProfile`] (to, co różni tryby `behind`/`edge`: nagłówki zaufania,
+//! `listen`, TLS/ACME) oraz [`Backend`] (dziś tylko proxy do kontenera; strony statyczne to
+//! kolejny wariant). Tryb `edge` zwraca na razie [`IngressError::UnsupportedMode`].
+
+use std::fmt::Write as _;
+use std::net::IpAddr;
+
+use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::config::{HostConfig, IngressMode};
+
+use crate::plan::{Cidr, Domain, IngressError, Plan, WEBHOOK_UPSTREAM_HOST};
+use std::collections::BTreeMap;
+
+/// Ustawienia generatora, które nie należą do `HostConfig`/`AppSpec`.
+#[derive(Debug, Clone)]
+pub struct NginxOptions {
+    /// Adresy resolverów (aardvark-dns sieci Podmana); wymagany co najmniej jeden.
+    pub resolvers: Vec<IpAddr>,
+    /// Port, na którym nginx słucha *wewnątrz* kontenera (publikowany na `ingress.bind`).
+    pub listen_port: u16,
+    /// Sieci, którym ufamy co do `X-Forwarded-*` (tryb `behind`: sieć Dockera z Traefikiem).
+    pub trusted_proxies: Vec<Cidr>,
+    /// Prefiksy ścieżek webhooków (zaczynają się i kończą `/`); reszta domeny → 404.
+    pub webhook_paths: Vec<String>,
+    /// Limit ciała żądania webhooka.
+    pub webhook_max_body_bytes: u32,
+    /// Limit ciała żądania do apek.
+    pub app_max_body_bytes: u64,
+}
+
+impl NginxOptions {
+    pub fn new(resolvers: Vec<IpAddr>) -> Self {
+        Self {
+            resolvers,
+            listen_port: 8080,
+            trusted_proxies: vec![Cidr::new(IpAddr::from([172, 16, 0, 0]), 12).expect("static")],
+            webhook_paths: vec!["/webhook/".to_owned()],
+            webhook_max_body_bytes: 1024 * 1024,
+            app_max_body_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    fn validate(&self) -> Result<(), IngressError> {
+        let bad = |name, reason: &str| IngressError::InvalidOption {
+            name,
+            reason: reason.to_owned(),
+        };
+        if self.resolvers.is_empty() {
+            return Err(bad("resolvers", "at least one resolver required"));
+        }
+        if self.listen_port == 0 {
+            return Err(bad("listen_port", "must not be 0"));
+        }
+        if self.webhook_paths.is_empty() {
+            return Err(bad("webhook_paths", "at least one path required"));
+        }
+        for p in &self.webhook_paths {
+            let ok = p.len() <= 128
+                && p.starts_with('/')
+                && p.ends_with('/')
+                && !p.contains("//")
+                && !p.split('/').any(|seg| seg == "." || seg == "..")
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'));
+            if !ok {
+                return Err(bad(
+                    "webhook_paths",
+                    "expected '/'-delimited prefix of [A-Za-z0-9_.-]",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Dokąd nginx przekazuje ruch. Dziś tylko kontener; strony statyczne dojdą jako kolejny wariant.
+enum Backend<'a> {
+    Container { host: &'a str, port: u16 },
+}
+
+impl Backend<'_> {
+    fn write_location(&self, c: &mut Conf) {
+        match self {
+            Backend::Container { host, port } => {
+                // Zmienna w `proxy_pass` wymusza resolve w runtime (przez `resolver`): brak
+                // kontenera daje 502, a nie błąd startu; nowe IP po recreate łapiemy po TTL.
+                c.block("location /", |c| {
+                    c.line(&format!("set $upstream \"http://{host}:{port}\";"));
+                    c.line("proxy_pass $upstream;");
+                });
+            }
+        }
+    }
+}
+
+/// To, czym różnią się tryby ingressu. `behind` jest zaimplementowany; `edge` (TLS, ACME
+/// `/.well-known/acme-challenge/`, `listen 80/443`) dojdzie jako druga implementacja.
+trait ModeProfile {
+    /// Dyrektywy na poziomie `http {}`: zaufanie do proxy, zmienna `$weglarka_proto`.
+    fn http_prelude(&self, c: &mut Conf);
+    /// `listen` serwera.
+    fn listen(&self, c: &mut Conf, default_server: bool);
+}
+
+struct Behind<'a>(&'a NginxOptions);
+
+impl ModeProfile for Behind<'_> {
+    fn http_prelude(&self, c: &mut Conf) {
+        for net in &self.0.trusted_proxies {
+            c.line(&format!("set_real_ip_from {net};"));
+        }
+        c.line("real_ip_header X-Forwarded-For;");
+        c.line("real_ip_recursive on;");
+        c.blank();
+        // `X-Forwarded-Proto` honorujemy tylko od zaufanego peera (Traefik terminuje TLS).
+        c.block("geo $realip_remote_addr $weglarka_trusted", |c| {
+            c.line("default 0;");
+            for net in &self.0.trusted_proxies {
+                c.line(&format!("{net} 1;"));
+            }
+        });
+        c.block(
+            "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_proto",
+            |c| {
+                c.line("default $scheme;");
+                c.line("\"1:https\" https;");
+                c.line("\"1:http\" http;");
+            },
+        );
+    }
+
+    fn listen(&self, c: &mut Conf, default_server: bool) {
+        let suffix = if default_server {
+            " default_server"
+        } else {
+            ""
+        };
+        c.line(&format!("listen {}{suffix};", self.0.listen_port));
+    }
+}
+
+/// Generuje pełny `nginx.conf` dla kontenera nginx Węglarki.
+pub fn generate(
+    host: &HostConfig,
+    apps: &BTreeMap<InstanceName, AppSpec>,
+    options: &NginxOptions,
+) -> Result<String, IngressError> {
+    options.validate()?;
+    let plan = Plan::build(host, apps)?;
+    match plan.mode {
+        IngressMode::Behind => Ok(render(&plan, options, &Behind(options))),
+        mode @ IngressMode::Edge => Err(IngressError::UnsupportedMode(mode)),
+    }
+}
+
+/// Format JSON access logu. `path` to `$uri` (bez query stringu — tokeny w URL-ach nie
+/// trafiają do logów); `upstream_response_time` jako string (`-` lub lista przy retry).
+const LOG_FORMAT: &str = concat!(
+    "{\"time\":\"$time_iso8601\",\"app\":\"$app\",\"host\":\"$host\",",
+    "\"remote_addr\":\"$remote_addr\",\"method\":\"$request_method\",\"path\":\"$uri\",",
+    "\"status\":$status,\"bytes_sent\":$body_bytes_sent,\"request_time\":$request_time,",
+    "\"upstream_response_time\":\"$upstream_response_time\",\"request_id\":\"$request_id\",",
+    "\"user_agent\":\"$http_user_agent\"}"
+);
+
+fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
+    let mut c = Conf::default();
+    c.line("# Generated by weglarka — do not edit.");
+    c.line("worker_processes 1;");
+    c.line("pid /tmp/nginx.pid;");
+    c.line("error_log /dev/stderr warn;");
+    c.blank();
+    c.block("events", |c| c.line("worker_connections 1024;"));
+    c.blank();
+
+    c.block("http", |c| {
+        c.line("server_tokens off;");
+        c.line("client_body_temp_path /tmp/client_body;");
+        c.line("proxy_temp_path /tmp/proxy;");
+        c.line("fastcgi_temp_path /tmp/fastcgi;");
+        c.line("uwsgi_temp_path /tmp/uwsgi;");
+        c.line("scgi_temp_path /tmp/scgi;");
+        c.blank();
+        let resolvers: Vec<String> = o
+            .resolvers
+            .iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => v4.to_string(),
+                IpAddr::V6(v6) => format!("[{v6}]"),
+            })
+            .collect();
+        c.line(&format!(
+            "resolver {} valid=5s ipv6=off;",
+            resolvers.join(" ")
+        ));
+        c.line("resolver_timeout 2s;");
+        c.blank();
+
+        mode.http_prelude(c);
+        c.blank();
+
+        c.block("map $http_upgrade $connection_upgrade", |c| {
+            c.line("default upgrade;");
+            c.line("'' close;");
+        });
+        c.blank();
+        c.line("# Nazwa apki dla access logu; ustawiana w każdym `server`.");
+        c.line("log_format weglarka escape=json");
+        c.line(&format!("    '{LOG_FORMAT}';"));
+        c.line("access_log /dev/stdout weglarka;");
+        c.blank();
+
+        c.line("proxy_http_version 1.1;");
+        c.line("proxy_set_header Host $host;");
+        c.line("proxy_set_header X-Real-IP $remote_addr;");
+        c.line("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
+        c.line("proxy_set_header X-Forwarded-Proto $weglarka_proto;");
+        c.line("proxy_set_header X-Forwarded-Host $host;");
+        c.line("proxy_set_header X-Request-Id $request_id;");
+        c.line("proxy_set_header Upgrade $http_upgrade;");
+        c.line("proxy_set_header Connection $connection_upgrade;");
+        c.line("add_header X-Request-Id $request_id always;");
+        c.blank();
+
+        // Domyślny server: obcy Host nie dostaje niczego.
+        c.block("server", |c| {
+            mode.listen(c, true);
+            c.line("server_name _;");
+            c.line("set $app \"-\";");
+            c.line("return 444;");
+        });
+
+        // Webhooki: tylko wskazane prefiksy, POST, mały limit ciała.
+        c.blank();
+        c.block("server", |c| {
+            mode.listen(c, false);
+            c.line(&format!("server_name {};", plan.webhook.domain));
+            c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
+            c.line(&format!(
+                "client_max_body_size {};",
+                o.webhook_max_body_bytes
+            ));
+            for path in &o.webhook_paths {
+                c.block(&format!("location ^~ {path}"), |c| {
+                    c.block("limit_except POST", |c| c.line("deny all;"));
+                    c.line(&format!(
+                        "set $upstream \"http://{WEBHOOK_UPSTREAM_HOST}:{}\";",
+                        plan.webhook.upstream_port
+                    ));
+                    c.line("proxy_pass $upstream;");
+                });
+            }
+            c.block("location /", |c| c.line("return 404;"));
+        });
+
+        for app in &plan.apps {
+            c.blank();
+            c.block("server", |c| {
+                mode.listen(c, false);
+                c.line(&format!("server_name {};", join_domains(&app.domains)));
+                c.line(&format!("set $app \"{}\";", app.instance));
+                c.line(&format!("client_max_body_size {};", o.app_max_body_bytes));
+                Backend::Container {
+                    host: app.instance.as_str(),
+                    port: app.port,
+                }
+                .write_location(c);
+            });
+        }
+    });
+    c.finish()
+}
+
+fn join_domains(domains: &[Domain]) -> String {
+    let mut s = String::new();
+    for (i, d) in domains.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        let _ = write!(s, "{d}");
+    }
+    s
+}
+
+/// Mały builder z wcięciami (4 spacje).
+#[derive(Default)]
+struct Conf {
+    buf: String,
+    depth: usize,
+}
+
+impl Conf {
+    fn line(&mut self, text: &str) {
+        for _ in 0..self.depth {
+            self.buf.push_str("    ");
+        }
+        self.buf.push_str(text);
+        self.buf.push('\n');
+    }
+
+    fn blank(&mut self) {
+        self.buf.push('\n');
+    }
+
+    fn block(&mut self, header: &str, body: impl FnOnce(&mut Self)) {
+        self.line(&format!("{header} {{"));
+        self.depth += 1;
+        body(self);
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    fn finish(self) -> String {
+        self.buf
+    }
+}

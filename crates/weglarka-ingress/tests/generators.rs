@@ -1,0 +1,196 @@
+mod common;
+
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+use common::*;
+use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_ingress::nginx::{self, NginxOptions};
+use weglarka_ingress::traefik::{self, TraefikOptions};
+use weglarka_ingress::{Cidr, IngressError};
+
+fn opts() -> NginxOptions {
+    NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+}
+
+fn layouts() -> Vec<(&'static str, BTreeMap<InstanceName, AppSpec>)> {
+    vec![
+        ("no_apps", BTreeMap::new()),
+        ("one_app", apps(ONE_APP)),
+        ("many_apps_multi_domain", apps(MANY_APPS)),
+    ]
+}
+
+#[test]
+fn nginx_snapshots() {
+    for (name, apps) in layouts() {
+        let conf = nginx::generate(&host(), &apps, &opts()).unwrap();
+        insta::assert_snapshot!(format!("nginx_{name}"), conf);
+    }
+}
+
+#[test]
+fn traefik_snapshots() {
+    for (name, apps) in layouts() {
+        let yml = traefik::generate(&host(), &apps, &TraefikOptions::default()).unwrap();
+        insta::assert_snapshot!(format!("traefik_{name}"), yml);
+    }
+}
+
+#[test]
+fn output_is_deterministic() {
+    let a = apps(MANY_APPS);
+    assert_eq!(
+        nginx::generate(&host(), &a, &opts()).unwrap(),
+        nginx::generate(&host(), &a, &opts()).unwrap()
+    );
+}
+
+#[test]
+fn traefik_without_cert_resolver() {
+    let o = TraefikOptions {
+        cert_resolver: None,
+        ..Default::default()
+    };
+    insta::assert_snapshot!(traefik::generate(&host(), &apps(ONE_APP), &o).unwrap());
+}
+
+#[test]
+fn nginx_ipv6_resolver_and_extra_trust() {
+    let mut o = opts();
+    o.resolvers = vec!["fd00::1".parse::<IpAddr>().unwrap()];
+    o.trusted_proxies
+        .push("10.0.0.0/8".parse::<Cidr>().unwrap());
+    let conf = nginx::generate(&host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("resolver [fd00::1] valid=5s ipv6=off;"));
+    assert!(conf.contains("set_real_ip_from 10.0.0.0/8;"));
+}
+
+#[test]
+fn rejects_malicious_domains() {
+    let evil = [
+        "a.com; return 200",
+        "a.com\nserver {",
+        "a.com{",
+        "a b.com",
+        "a.com`) || Host(`b.com",
+        "*.example.com",
+        "A.com",
+        "a.com.",
+        "localhost",
+        "-a.com",
+        "a..com",
+        "a.com\"\n",
+        "1.2.3.4",
+        "ą.pl",
+        "",
+    ];
+    for d in evil {
+        let apps = app_with(&[d], Some(80));
+        assert!(
+            matches!(
+                nginx::generate(&host(), &apps, &opts()),
+                Err(IngressError::InvalidDomain { .. })
+            ),
+            "nginx accepted {d:?}"
+        );
+        assert!(
+            traefik::generate(&host(), &apps, &TraefikOptions::default()).is_err(),
+            "traefik accepted {d:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_bad_webhook_domain() {
+    let mut h = host();
+    h.webhook.domain = "x.com; evil".into();
+    assert!(nginx::generate(&h, &BTreeMap::new(), &opts()).is_err());
+    assert!(traefik::generate(&h, &BTreeMap::new(), &TraefikOptions::default()).is_err());
+}
+
+#[test]
+fn rejects_port_problems_and_duplicates() {
+    let h = host();
+    assert!(matches!(
+        nginx::generate(&h, &app_with(&["a.example.eu"], None), &opts()),
+        Err(IngressError::MissingPort(_))
+    ));
+    assert!(matches!(
+        nginx::generate(&h, &app_with(&["a.example.eu"], Some(0)), &opts()),
+        Err(IngressError::InvalidPort(_))
+    ));
+    assert!(matches!(
+        nginx::generate(
+            &h,
+            &app_with(&["a.example.eu", "a.example.eu"], Some(80)),
+            &opts()
+        ),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    assert!(matches!(
+        nginx::generate(&h, &app_with(&["weglarka.example.eu"], Some(80)), &opts()),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+}
+
+#[test]
+fn rejects_instance_shadowing_webhook_upstream() {
+    let mut a = apps(ONE_APP);
+    let spec = a.remove(&"ntfy".to_owned().try_into().unwrap()).unwrap();
+    a.insert("weglarka".to_owned().try_into().unwrap(), spec);
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::ReservedName(_))
+    ));
+}
+
+#[test]
+fn rejects_bad_options() {
+    let h = host();
+    let a = apps(ONE_APP);
+    let mut o = opts();
+    o.resolvers.clear();
+    assert!(nginx::generate(&h, &a, &o).is_err());
+    for p in [
+        "/hook;", "/a/../b/", "webhook/", "/webhook", "/a//b/", "/a b/", "/x\n/",
+    ] {
+        let mut o = opts();
+        o.webhook_paths = vec![p.into()];
+        assert!(nginx::generate(&h, &a, &o).is_err(), "accepted path {p:?}");
+    }
+    for bad in ["x;y", "a b", "x\ny", "", "x`"] {
+        let o = TraefikOptions {
+            cert_resolver: Some(bad.into()),
+            ..Default::default()
+        };
+        assert!(traefik::generate(&h, &a, &o).is_err(), "resolver {bad:?}");
+        let o = TraefikOptions {
+            entrypoint: bad.into(),
+            ..Default::default()
+        };
+        assert!(traefik::generate(&h, &a, &o).is_err(), "entrypoint {bad:?}");
+        let o = TraefikOptions {
+            upstream_host: bad.into(),
+            ..Default::default()
+        };
+        assert!(traefik::generate(&h, &a, &o).is_err(), "host {bad:?}");
+    }
+    assert!("1.2.3.4/33".parse::<Cidr>().is_err());
+    assert!("1.2.3.4".parse::<Cidr>().is_err());
+    assert!("1.2.3.4/8; deny".parse::<Cidr>().is_err());
+}
+
+#[test]
+fn edge_mode_is_not_supported_yet() {
+    let mut h = host();
+    h.ingress.mode = weglarka_core::config::IngressMode::Edge;
+    assert!(matches!(
+        nginx::generate(&h, &BTreeMap::new(), &opts()),
+        Err(IngressError::UnsupportedMode(_))
+    ));
+    assert!(matches!(
+        traefik::generate(&h, &BTreeMap::new(), &TraefikOptions::default()),
+        Err(IngressError::UnsupportedMode(_))
+    ));
+}
