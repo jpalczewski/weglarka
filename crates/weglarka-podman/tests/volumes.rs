@@ -442,3 +442,232 @@ async fn plain_userns_auto_is_a_noop_rootless() {
     assert_ne!(maps[0], maps[2], "AutoUserNs changes the map: {maps:?}");
     assert!(maps[2].ends_with(" 1024"), "{maps:?}");
 }
+
+/// Removes what the engine test creates, also on panic.
+struct EngineCleanup {
+    socket: String,
+    instance: String,
+}
+
+impl Drop for EngineCleanup {
+    fn drop(&mut self) {
+        let (s, i) = (&self.socket, &self.instance);
+        for path in [
+            format!("/containers/{i}?force=true&timeout=0"),
+            format!("/containers/wg-import.{i}?force=true&timeout=0"),
+            format!("/volumes/{i}.data?force=true"),
+            format!("/networks/net-{i}?force=true"),
+            format!("/secrets/{i}.tok"),
+        ] {
+            let _ = raw(s, "DELETE", &path, None);
+        }
+    }
+}
+
+/// The whole iteration-2 flow through the engine on a real Podman: range assignment, volumes
+/// surviving a recreate, Podman secrets of type `mount` readable by root and by a non-root user in the
+/// new mapping, both import modes, migration of a container created on the default map, purge.
+#[tokio::test]
+async fn engine_ranges_volumes_secrets_import_migration_and_purge() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use weglarka_core::app::InstanceName;
+    use weglarka_core::labels;
+    use weglarka_core::podman::{ContainerSpec, ContainerState, RestartPolicy};
+    use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
+    use weglarka_core::secret_store::{SecretStore, SecretValue};
+    use weglarka_core::secrets::FileSecretStore;
+    use weglarka_core::state::{StatePaths, load_state, save_state};
+    use weglarka_core::volumes::ImportMode;
+
+    let Some(socket) = socket() else { return };
+    let instance = format!("wgit-{}", run_id());
+    let _cleanup = EngineCleanup {
+        socket: socket.clone(),
+        instance: instance.clone(),
+    };
+    let name = InstanceName::new(&instance).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StatePaths::in_dir(dir.path());
+    fs::write(
+        &paths.apps,
+        format!(
+            r#"
+[apps.{instance}]
+image = "docker.io/library/nginx:1-alpine"
+health = {{ attempts = 1, window_secs = 2 }}
+volumes = [{{ name = "data", target = "/data" }}]
+secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 0o444 }}]
+"#
+        ),
+    )
+    .unwrap();
+    let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+    store.init().unwrap();
+    store
+        .set(&format!("{instance}.tok"), SecretValue::new("s3cret"))
+        .unwrap();
+    let client = LibpodClient::new(&socket);
+    let rec = Reconciler::new(
+        client.clone(),
+        store,
+        paths.clone(),
+        ReconcilerOptions::default(),
+    );
+    let sh = |script: &'static str| {
+        let (client, instance) = (client.clone(), instance.clone());
+        async move {
+            client
+                .container_exec(
+                    &instance,
+                    &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                )
+                .await
+                .unwrap()
+        }
+    };
+    const WAIT: Duration = Duration::from_secs(5);
+
+    // First deploy: range 1+65536 (the whole CI pool), explicit map, volume created and labelled.
+    let report = rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    let range = load_state(&paths.state).unwrap().apps[&name]
+        .uid_range
+        .unwrap();
+    assert_eq!((range.start, range.size), (1, 65_536));
+    assert_eq!(
+        sh(r"grep -Eq '^ *0 +1 +65536 *$' /proc/self/uid_map").await,
+        0
+    );
+    let vols = client
+        .volume_list(&VolumeFilter {
+            labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.clone())]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(vols.len(), 1);
+
+    // Secrets of type `mount` are readable in the new mapping, by root and by a non-root user.
+    assert_eq!(sh("grep -q s3cret /run/secrets/tok").await, 0, "root");
+    assert_eq!(
+        sh("su -s /bin/sh daemon -c 'grep -q s3cret /run/secrets/tok'").await,
+        0,
+        "non-root"
+    );
+
+    // Data survives a forced redeploy (new container, same range).
+    assert_eq!(sh("echo v1 > /data/f && chmod 600 /data/f").await, 0);
+    rec.deploy(&name, true).await.unwrap();
+    assert_eq!(sh("grep -q v1 /data/f && echo v2 > /data/f").await, 0);
+
+    // Foreign tar (uid 1000, as made by Coolify) is chowned to the container user (root for nginx); the app is restarted.
+    let foreign = make_tar("imported.txt", "from-coolify\n", "1000");
+    rec.import_volume(&name, "data", ImportMode::Foreign, chunked(foreign), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.container_inspect(&instance).await.unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(
+        sh("test -f /data/imported.txt").await,
+        0,
+        "imported file exists"
+    );
+    assert_eq!(
+        sh("grep -q coolify /data/imported.txt").await,
+        0,
+        "imported file content"
+    );
+    assert_eq!(
+        sh("test \"$(stat -c %u /data/imported.txt)\" = 0").await,
+        0,
+        "foreign files are owned by the container user (root), not by the tar's uid 1000"
+    );
+    assert!(
+        client
+            .container_inspect(&format!("wg-import.{instance}"))
+            .await
+            .is_err(),
+        "helper gone"
+    );
+
+    // Own export → import round trip is lossless.
+    let mut tar = client
+        .volume_export(&format!("{instance}.data"))
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = tar.next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(sh("echo gone > /data/f").await, 0);
+    rec.import_volume(&name, "data", ImportMode::Own, chunked(bytes), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        sh(r#"grep -q v2 /data/f && test "$(stat -c %u /data/f)" = 0"#).await,
+        0
+    );
+
+    // Migration: a container left on the default map (what the MVP created) and no range in state
+    // is recreated once, now with the explicit map.
+    let info = client.container_inspect(&instance).await.unwrap();
+    let mut legacy_labels = info.labels.clone();
+    legacy_labels.remove(labels::UID_RANGE);
+    client.container_stop(&instance, 1).await.unwrap();
+    client.container_remove(&instance, true).await.unwrap();
+    client
+        .container_create(&ContainerSpec {
+            name: instance.clone(),
+            image: info.image.clone(),
+            labels: legacy_labels,
+            env: BTreeMap::new(),
+            networks: info.networks.clone(),
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::Always,
+            userns_auto: true,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+        })
+        .await
+        .unwrap();
+    client.container_start(&instance).await.unwrap();
+    assert_eq!(
+        sh(r"grep -Eq '^ *0 +1 +65536 *$' /proc/self/uid_map").await,
+        1,
+        "legacy map"
+    );
+    let mut st = load_state(&paths.state).unwrap();
+    st.apps.get_mut(&name).unwrap().uid_range = None;
+    save_state(&paths.state, &st).unwrap();
+    let report = rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(
+        sh(r"grep -Eq '^ *0 +1 +65536 *$' /proc/self/uid_map").await,
+        0,
+        "migrated"
+    );
+    assert_eq!(
+        sh("grep -q v2 /data/f").await,
+        0,
+        "data readable after the migration recreate"
+    );
+
+    // Purge: container, volume and range are gone.
+    rec.remove_app_with_volumes(&name, true).await.unwrap();
+    assert!(client.container_inspect(&instance).await.is_err());
+    assert!(
+        client
+            .volume_inspect(&format!("{instance}.data"))
+            .await
+            .is_err()
+    );
+    assert!(!load_state(&paths.state).unwrap().apps.contains_key(&name));
+}

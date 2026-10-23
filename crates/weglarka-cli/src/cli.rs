@@ -44,6 +44,9 @@ pub enum Command {
     Secrets(SecretsCommand),
     /// Self-diagnosis; `--preflight` runs locally, without the daemon.
     Doctor(DoctorArgs),
+    /// App volumes (list/export/import).
+    #[command(subcommand)]
+    Volumes(crate::volumes::VolumesCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,6 +102,10 @@ pub struct RemoveArgs {
     /// A missing app is not an error (idempotent removal).
     #[arg(long)]
     pub ignore_missing: bool,
+    /// Also delete the app's volumes (its data!) and release its uid range. Without it the volumes
+    /// stay, and `apps add` of the same name picks them up again.
+    #[arg(long)]
+    pub purge_volumes: bool,
     /// Remove nothing; check that the app exists and show the request.
     #[arg(long)]
     pub dry_run: bool,

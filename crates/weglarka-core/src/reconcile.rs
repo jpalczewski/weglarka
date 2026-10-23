@@ -35,6 +35,17 @@ pub enum EngineError {
     UnknownInstance(InstanceName),
     #[error("cannot resolve image digest for {0}")]
     NoDigest(String),
+    /// No free uid range of `size` left in the rootless user's subuid pool (docs/decisions/0009).
+    #[error(
+        "no free uid range of {size} in the subuid pool of {pool}; enlarge the runtime user's subuid range"
+    )]
+    UidPoolExhausted { pool: u64, size: u32 },
+    /// The engine lock was not obtained in time (a deploy is in progress).
+    #[error("engine is busy (deploy in progress)")]
+    Busy,
+    /// A volume operation the request cannot be served for (unknown volume, app not deployed yet…).
+    #[error("{0}")]
+    Volume(String),
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),
@@ -79,6 +90,9 @@ pub struct Target {
     /// Leave this instance alone in this pass (e.g. missing secret, failed first deploy
     /// awaiting manual intervention). Its containers are not orphans.
     pub blocked: bool,
+    /// Expected `weglarka.uid-range` label (`Some` iff `pinned`, `None` = not checked). A mismatch —
+    /// notably a container created before ranges existed — recreates the container once.
+    pub uid_range: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +164,10 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
             }),
             Some(c)
                 if c.labels.get(labels::SPEC_HASH).map(String::as_str)
-                    != Some(expected.as_str()) =>
+                    != Some(expected.as_str())
+                    || t.uid_range.as_ref().is_some_and(|r| {
+                        c.labels.get(labels::UID_RANGE).map(String::as_str) != Some(r.as_str())
+                    }) =>
             {
                 actions.push(Action::Recreate {
                     instance: t.instance.clone(),
@@ -284,6 +301,7 @@ impl<P: PodmanClient> Reconciler<P> {
     pub async fn reconcile(&self) -> Result<ReconcileReport, EngineError> {
         let _g = self.lock.lock().await;
         let apps = state::load_apps(&self.paths.apps)?;
+        let unranged = self.adopt_uid_ranges(&apps).await;
         let mut st = state::load_state(&self.paths.state)?;
         let observed: Vec<ContainerInfo> = self
             .podman
@@ -314,6 +332,9 @@ impl<P: PodmanClient> Reconciler<P> {
             if !missing.is_empty() {
                 blocked = true;
                 report.waiting.push((name.clone(), missing));
+            } else if let Some(why) = unranged.get(name) {
+                blocked = true;
+                report.blocked.push((name.clone(), why.clone()));
             } else if let Some(d) = &pinned {
                 match self.desired_hash(name, spec, d).await {
                     Ok(h) => expected_hash = Some(h),
@@ -330,11 +351,16 @@ impl<P: PodmanClient> Reconciler<P> {
                     "first deploy failed; run deploy manually".into(),
                 ));
             }
+            let uid_range = pinned
+                .as_ref()
+                .and_then(|_| app_state.and_then(|s| s.uid_range))
+                .map(labels::uid_range_label);
             targets.push(Target {
                 instance: name.clone(),
                 pinned,
                 expected_hash,
                 blocked,
+                uid_range,
             });
         }
 
@@ -350,9 +376,9 @@ impl<P: PodmanClient> Reconciler<P> {
         }
 
         // We clean up orphan state after their containers are removed.
-        let before = st.apps.len();
-        st.apps.retain(|k, _| apps.apps.contains_key(k));
-        if st.apps.len() != before {
+        // The actions above saved state.toml themselves; settle on a fresh copy, not on `st`.
+        let mut st = state::load_state(&self.paths.state)?;
+        if self.settle_orphan_state(&mut st, &apps).await {
             state::save_state(&self.paths.state, &st)?;
         }
         Ok(report)
@@ -436,6 +462,7 @@ mod tests {
                 pinned: pinned.map(digest),
                 expected_hash: pinned.map(|_| h.clone()),
                 blocked: false,
+                uid_range: None,
             },
             h,
         )

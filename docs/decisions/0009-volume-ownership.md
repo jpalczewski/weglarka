@@ -1,6 +1,7 @@
 # 0009 — File ownership of named volumes under rootless Podman
 
-Status: proposed (iteration 2, step 0 spike, 2026-10-23). Needs Jacek's confirmation, see "Open questions".
+Status: accepted (iteration 2, 2026-10-23: Jacek confirmed (a), 65 536-uid ranges, ranges for existing containers
+in this iteration). Implementation notes at the end.
 
 ## Problem
 
@@ -98,3 +99,27 @@ Rules for session 1:
 3. Finding 1 means every app and the ingress nginx on `niechybnie` currently runs container root as
    the `weglarka` user. Confirm with `podman exec ntfy cat /proc/self/uid_map` (expect `0 <uid> 1`).
    Should adopting ranges for existing apps be part of iteration 2 (recommended) or later?
+
+## Implementation notes (session 1)
+
+- **Pool size** comes from Podman (`PodmanClient::subuid_pool`, `GET /info` → `host.idMappings.uidmap`, the sum of
+  the non-zero lines), not from `/etc/subuid`: the daemon runs in a container that does not see the host file.
+- **Range lifecycle.** Assigned under the engine lock before the first container of an instance is created, kept in
+  `state.toml` for the instance's lifetime. `apps remove` keeps the volumes and therefore a state entry holding only
+  `uid_range`; the entry is dropped when the instance has no labelled volumes left (`--purge-volumes` does it at
+  once, the reconcile pass notices volumes removed by hand). Allocation is first-fit, so a freed range is reused
+  first. Pool exhausted → the instance is blocked with a message, other instances are unaffected.
+- **Identity.** The range is the container label `weglarka.uid-range` (`<start>+<size>`), compared by the reconcile
+  plan and by deploy's "unchanged" check next to `spec-hash`; nginx folds it into `ingress_hash`. A container
+  without the label (created by Węglarka before this change) is recreated once; instances that run without a range
+  get one at the next reconcile.
+- **Import** stops a running app, then either `volume_import` (own export, `ImportMode::Own`) or `container_archive_put`
+  on a created, never started helper container `wg-import.<instance>` of the instance's image with the volume mounted
+  (foreign tar, `ImportMode::Foreign`, the default in the CLI), and starts the app again. Węglarka unpacks nothing:
+  Podman extracts the archive in its own chroot, so Węglarka's only guard is a byte cap (8 GiB) on the stream.
+  Foreign is the CLI default because it is the migration case and its wrong-choice failure is the milder one: a
+  Węglarka export imported as foreign only loses its owners (all files go to the app user), while a foreign tar
+  imported as own lands on wrong uids the app cannot use.
+- **Foreign import flattens ownership**: `archive_put` chowns to the container's configured user (finding 9), so a tar
+  with several owners ends up with one. Verified in `engine_ranges_volumes_secrets_import_migration_and_purge`.
+- CI subuid pool is enlarged to ~1 M (the instance range alone is 65 536).

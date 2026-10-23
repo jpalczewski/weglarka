@@ -32,6 +32,46 @@ struct Component {
     details: BTreeMap<String, String>,
 }
 
+/// `GET /info`: only the rootless uid map is used.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Info {
+    host: InfoHost,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoHost {
+    #[serde(rename = "idMappings")]
+    id_mappings: InfoIdMappings,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoIdMappings {
+    uidmap: Vec<InfoIdRange>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoIdRange {
+    container_id: u64,
+    size: u64,
+}
+
+impl Info {
+    /// Subuids available to the rootless user: every uid map line except `0 → the user itself`.
+    pub(crate) fn subuid_pool(&self) -> u64 {
+        self.host
+            .id_mappings
+            .uidmap
+            .iter()
+            .filter(|r| r.container_id >= 1)
+            .map(|r| r.size)
+            .sum()
+    }
+}
+
 impl Version {
     /// The top-level `ApiVersion` is the compat version ("1.41"); the libpod version is in the Podman Engine component.
     pub(crate) fn into_domain(self) -> VersionInfo {
@@ -826,6 +866,20 @@ mod tests {
             (events[3].action.as_str(), events[3].id.as_str()),
             ("die", "zz")
         );
+    }
+
+    #[test]
+    fn subuid_pool_sums_the_subuid_lines_but_not_the_user_itself() {
+        let info: Info = decode(
+            br#"{"host":{"idMappings":{"uidmap":[
+                {"container_id":0,"host_id":1001,"size":1},
+                {"container_id":1,"host_id":1000000,"size":1000000}
+            ],"gidmap":[]},"other":1},"version":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(info.subuid_pool(), 1_000_000);
+        // Rootful or unknown layout: no pool rather than a guess.
+        assert_eq!(decode::<Info>(b"{}").unwrap().subuid_pool(), 0);
     }
 
     #[test]

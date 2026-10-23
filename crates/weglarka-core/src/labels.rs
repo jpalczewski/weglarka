@@ -8,6 +8,12 @@ use crate::hash::SpecHash;
 pub const INSTANCE: &str = "weglarka.instance";
 pub const GENERATION: &str = "weglarka.generation";
 pub const SPEC_HASH: &str = "weglarka.spec-hash";
+/// uid range the container was created with (`<start>+<size>`, [`uid_range_label`]). Part of the
+/// container's identity next to `spec-hash`, but kept out of the hash: it is state, not spec.
+pub const UID_RANGE: &str = "weglarka.uid-range";
+/// Marks the short-lived container that carries a foreign tar into a volume (`volumes::ImportMode::Foreign`).
+/// Deliberately not [`INSTANCE`], so reconcile never mistakes it for a duplicate of the app.
+pub const IMPORT_FOR: &str = "weglarka.import-for";
 
 /// Set of labels that reconcile applies to an instance's container.
 pub fn container_labels(
@@ -36,4 +42,16 @@ pub fn network_name(instance: &InstanceName) -> String {
 /// so `<instance>.<volume>` is unambiguous.
 pub fn volume_name(instance: &InstanceName, volume: &str) -> String {
     format!("{instance}.{volume}")
+}
+
+/// Value of the [`UID_RANGE`] label.
+pub fn uid_range_label(range: crate::uid_range::UidRange) -> String {
+    format!("{}+{}", range.start, range.size)
+}
+
+/// Name of the helper container used to import a foreign tar into an instance's volume. The `.`
+/// cannot occur in an instance name (and container names are instance names), so the helper never
+/// collides with — and force-removing it never touches — another instance's container.
+pub fn import_container_name(instance: &InstanceName) -> String {
+    format!("wg-import.{instance}")
 }

@@ -1019,6 +1019,7 @@ name = "weglarka-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1058,6 +1059,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "futures-util",
  "hex",
@@ -1104,6 +1106,7 @@ dependencies = [
  "insta",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

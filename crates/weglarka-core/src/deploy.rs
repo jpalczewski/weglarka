@@ -275,6 +275,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
+        let prepared = self.prepare_container(instance, spec).await?; // uid range + volumes
 
         let name = labels::container_name(instance);
         match self
@@ -290,7 +291,7 @@ impl<P: PodmanClient> Reconciler<P> {
             Err(e) => return Err(e.into()),
         }
 
-        let container = ContainerSpec {
+        let mut container = ContainerSpec {
             name: name.clone(),
             image,
             labels: labels::container_labels(instance, generation, &hash),
@@ -306,6 +307,7 @@ impl<P: PodmanClient> Reconciler<P> {
             healthcheck: crate::limits::container_healthcheck(&spec.health),
             id_mapping: None,
         };
+        prepared.apply(&mut container);
         let started = async {
             self.podman.container_create(&container).await?;
             self.podman.container_start(&name).await
@@ -387,6 +389,7 @@ impl<P: PodmanClient> Reconciler<P> {
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st: StateFile = state::load_state(&self.paths.state)?;
         self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
@@ -534,6 +537,7 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(c) => {
                 c.state == ContainerState::Running
                     && c.labels.get(labels::SPEC_HASH).map(String::as_str) == Some(hash.as_str())
+                    && self.uid_range_matches(instance, &c.labels)
             }
             Err(_) => false,
         }
@@ -547,6 +551,7 @@ impl<P: PodmanClient> Reconciler<P> {
         reason: RecreateReason,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st = state::load_state(&self.paths.state)?;
         let cur = st.apps.get(instance).cloned().unwrap_or_default();
         let digest = cur

@@ -83,5 +83,6 @@ tylko addytywne i uzgodnione z autorem kroku 0 (sesja zlecająca); `FakePodman` 
   (skryptowalne digesty pulla, błędy w środku pulla, kolejka wyników healthchecka, log wywołań).
 - Integracyjne z prawdziwym Podmanem 6.1 (`weglarka-podman/tests/`): wymagają `WEGLARKA_PODMAN_SOCKET`
   (CI ustawia je w jobie `integration-podman`); bez zmiennej testy się pomijają
-  (`docs/decisions/0002-podman-in-ci.md`).
+  (`docs/decisions/0002-podman-in-ci.md`). Job podnosi pulę subuid do ~1 M (zakres instancji = 65 536 UID, ADR 0009);
+  `engine_ranges_volumes_secrets_import_migration_and_purge` przechodzi przez cały silnik na prawdziwym Podmanie.
 - Build statyczny: `cargo build --release --target x86_64-unknown-linux-musl` (CI: job `musl`).

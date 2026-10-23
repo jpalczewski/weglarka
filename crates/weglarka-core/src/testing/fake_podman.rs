@@ -81,7 +81,12 @@ struct State {
     disconnect_failures: BTreeMap<String, PodmanError>,
     calls: Vec<Call>,
     next_id: u64,
+    /// Subuid pool reported by `subuid_pool` (`None` = [`DEFAULT_SUBUID_POOL`]).
+    uid_pool: Option<u64>,
 }
+
+/// Production-sized subuid pool (`niechybnie`: `1000000:2000000`).
+pub const DEFAULT_SUBUID_POOL: u64 = 2_000_000;
 
 /// Cloning yields a handle to the same state (`Arc`).
 #[derive(Clone, Default)]
@@ -96,6 +101,12 @@ impl FakePodman {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("fake podman mutex poisoned")
+    }
+
+    /// Subuid pool reported to the allocator (default [`DEFAULT_SUBUID_POOL`]); tests shrink it to
+    /// model exhaustion.
+    pub fn set_subuid_pool(&self, size: u64) {
+        self.lock().uid_pool = Some(size);
     }
 
     /// Digest returned by subsequent pulls of a reference (default: hash of the reference).
@@ -230,6 +241,10 @@ impl PodmanClient for FakePodman {
             version: "6.1.0-fake".into(),
             api_version: "6.0.0".into(),
         })
+    }
+
+    async fn subuid_pool(&self) -> Result<u64> {
+        Ok(self.lock().uid_pool.unwrap_or(DEFAULT_SUBUID_POOL))
     }
 
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {

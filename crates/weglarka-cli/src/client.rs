@@ -4,13 +4,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use futures_util::{Stream, StreamExt};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame};
 use hyper::header::{CONTENT_TYPE, HOST};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use weglarka_api::{ApiError, Endpoint, Method};
 
@@ -95,16 +97,7 @@ impl ApiClient {
             .body(Full::new(Bytes::from(payload)))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
 
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket))
-            .await
-            .map_err(|_| self.unreachable("connection timed out"))?
-            .map_err(|e| self.unreachable(&e.to_string()))?;
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|e| self.unreachable(&e.to_string()))?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+        let mut sender = self.connect().await?;
 
         let exchange = async {
             let resp = sender.send_request(req).await?;
@@ -122,6 +115,139 @@ impl ApiClient {
         } else {
             Err(error_from_response(status, &bytes))
         }
+    }
+
+    /// One HTTP/1.1 connection to the admin socket (the connection task is spawned).
+    async fn connect<B>(&self) -> Result<hyper::client::conn::http1::SendRequest<B>, CliError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket))
+            .await
+            .map_err(|_| self.unreachable("connection timed out"))?
+            .map_err(|e| self.unreachable(&e.to_string()))?;
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| self.unreachable(&e.to_string()))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sender)
+    }
+
+    /// Call without a response body (204), with a query string (`a=b&c`) appended to the path.
+    pub async fn call_empty_query(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        query: &str,
+    ) -> Result<(), CliError> {
+        let path = format!("{}?{query}", expand_path(endpoint, params));
+        let req = Request::builder()
+            .method(method_str(endpoint.method))
+            .uri(path)
+            .header(HOST, "weglarka")
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let mut sender = self.connect().await?;
+        let exchange = async {
+            let resp = sender.send_request(req).await?;
+            let status = resp.status();
+            Ok::<_, hyper::Error>((status, resp.into_body().collect().await?.to_bytes()))
+        };
+        let (status, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+            .await
+            .map_err(|_| CliError::internal("request to daemon timed out"))?
+            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from_response(status, &bytes))
+        }
+    }
+
+    /// Streams `body` as the request body (`application/x-tar`) and expects an empty success
+    /// response. No overall timeout: a volume can be large; Ctrl-C aborts.
+    pub async fn upload(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        query: &str,
+        body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    ) -> Result<(), CliError> {
+        let mut path = expand_path(endpoint, params);
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(query);
+        }
+        let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
+        let req = Request::builder()
+            .method(method_str(endpoint.method))
+            .uri(path)
+            .header(HOST, "weglarka")
+            .header(CONTENT_TYPE, "application/x-tar")
+            .body(body)
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let mut sender = self.connect().await?;
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| CliError::internal(format!("upload to daemon failed: {e}")))?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| CliError::internal(format!("upload to daemon failed: {e}")))?
+            .to_bytes();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from_response(status, &bytes))
+        }
+    }
+
+    /// Streams a successful response body into `sink`; returns the number of bytes written.
+    pub async fn download(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        sink: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<u64, CliError> {
+        let req = Request::builder()
+            .method(method_str(endpoint.method))
+            .uri(expand_path(endpoint, params))
+            .header(HOST, "weglarka")
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let mut sender = self.connect().await?;
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
+        let status = resp.status();
+        let mut body = resp.into_body();
+        if !status.is_success() {
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
+                .to_bytes();
+            return Err(error_from_response(status, &bytes));
+        }
+        let io = |e: &dyn std::fmt::Display| CliError::internal(format!("download failed: {e}"));
+        let mut written = 0u64;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| io(&e))?;
+            if let Some(data) = frame.data_ref() {
+                sink.write_all(data).await.map_err(|e| io(&e))?;
+                written += data.len() as u64;
+            }
+        }
+        sink.flush().await.map_err(|e| io(&e))?;
+        Ok(written)
     }
 
     fn unreachable(&self, cause: &str) -> CliError {

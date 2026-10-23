@@ -27,6 +27,8 @@ use weglarka_core::podman::{
 };
 use weglarka_core::reconcile::Reconciler;
 use weglarka_core::state::{self, write_atomic};
+use weglarka_core::uid_range::UidRange;
+use weglarka_core::volumes;
 use weglarka_ingress::{nginx, traefik};
 
 /// Network joined by both the Węglarka and nginx containers (webhooks: `proxy_pass http://weglarka:<port>`).
@@ -47,6 +49,8 @@ pub enum IngressApplyError {
     Generate(#[from] weglarka_ingress::IngressError),
     #[error("podman: {0}")]
     Podman(#[from] PodmanError),
+    #[error("uid range for nginx: {0}")]
+    Engine(#[from] weglarka_core::reconcile::EngineError),
     #[error("i/o on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -272,7 +276,10 @@ impl<P: PodmanClient> IngressManager<P> {
         let podman = self.engine.podman();
         let image = &self.host.ingress.nginx_image;
         let bind = self.host.ingress.bind;
-        let hash = ingress_hash(image, &bind.to_string(), listen_port);
+        // The range is part of the container's identity: nginx created before ranges existed is
+        // recreated once, now on its own map instead of libpod's shared default (docs/decisions/0009).
+        let range = self.engine.ensure_ingress_range().await?;
+        let hash = ingress_hash(image, &bind.to_string(), listen_port, range);
 
         let existing = podman
             .container_list(&ContainerFilter::default())
@@ -282,7 +289,7 @@ impl<P: PodmanClient> IngressManager<P> {
 
         let existed = existing.is_some();
         let Some(existing) = existing.filter(|c| c.labels.get(HASH_LABEL) == Some(&hash)) else {
-            self.create_nginx(networks, listen_port, hash, existed)
+            self.create_nginx(networks, listen_port, hash, range, existed)
                 .await?;
             return Ok(if existed {
                 NginxAction::Recreated
@@ -345,6 +352,7 @@ impl<P: PodmanClient> IngressManager<P> {
         networks: &[String],
         listen_port: u16,
         hash: String,
+        range: UidRange,
         replace: bool,
     ) -> Result<(), IngressApplyError> {
         let podman = self.engine.podman();
@@ -376,7 +384,7 @@ impl<P: PodmanClient> IngressManager<P> {
                     container_port: listen_port,
                 }],
                 restart: RestartPolicy::Always,
-                userns_auto: true,
+                userns_auto: false,
                 mounts: vec![BindMount {
                     source: self.conf_dir.display().to_string(),
                     target: NGINX_CONF_MOUNT.to_owned(),
@@ -385,7 +393,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 volumes: vec![],
                 resources: Default::default(),
                 healthcheck: None,
-                id_mapping: None,
+                id_mapping: Some(volumes::id_mapping(range)),
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;
@@ -410,13 +418,15 @@ impl<P: PodmanClient> IngressManager<P> {
 
 /// Spec hash of the nginx container: only what cannot change on a live container. The set of app
 /// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
-fn ingress_hash(image: &str, bind: &str, listen_port: u16) -> String {
+fn ingress_hash(image: &str, bind: &str, listen_port: u16, range: UidRange) -> String {
     let mut h = Sha256::new();
     for part in [image, bind] {
         h.update(part.as_bytes());
         h.update([0]);
     }
     h.update(listen_port.to_be_bytes());
+    h.update(range.start.to_be_bytes());
+    h.update(range.size.to_be_bytes());
     hex::encode(&h.finalize()[..8])
 }
 
@@ -463,11 +473,27 @@ mod tests {
     }
 
     #[test]
-    fn hash_covers_image_bind_and_port() {
-        let a = ingress_hash("i", "x", 80);
-        assert_eq!(a, ingress_hash("i", "x", 80));
-        assert_ne!(a, ingress_hash("j", "x", 80));
-        assert_ne!(a, ingress_hash("i", "y", 80));
-        assert_ne!(a, ingress_hash("i", "x", 81));
+    fn hash_covers_image_bind_port_and_uid_range() {
+        let r = UidRange {
+            start: 1,
+            size: 4096,
+        };
+        let a = ingress_hash("i", "x", 80, r);
+        assert_eq!(a, ingress_hash("i", "x", 80, r));
+        assert_ne!(a, ingress_hash("j", "x", 80, r));
+        assert_ne!(a, ingress_hash("i", "y", 80, r));
+        assert_ne!(a, ingress_hash("i", "x", 81, r));
+        assert_ne!(
+            a,
+            ingress_hash(
+                "i",
+                "x",
+                80,
+                UidRange {
+                    start: 4097,
+                    size: 4096
+                }
+            )
+        );
     }
 }
