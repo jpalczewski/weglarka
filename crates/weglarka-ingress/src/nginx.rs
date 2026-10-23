@@ -296,8 +296,10 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
         c.block("server", |c| {
             mode.listen(c, false);
             c.line(&format!("server_name {};", plan.webhook.domain));
-            mode.https_redirect(c);
+            // `set` before the redirect: rewrite directives run in order, and the access log needs
+            // `$app` also for the 301.
             c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
+            mode.https_redirect(c);
             c.line(&format!(
                 "client_max_body_size {};",
                 o.webhook_max_body_bytes
@@ -320,8 +322,8 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
             c.block("server", |c| {
                 mode.listen(c, false);
                 c.line(&format!("server_name {};", join_domains(&app.domains)));
-                mode.https_redirect(c);
                 c.line(&format!("set $app \"{}\";", app.instance));
+                mode.https_redirect(c);
                 c.line(&format!("client_max_body_size {};", o.app_max_body_bytes));
                 Backend::Container {
                     host: app.instance.as_str(),

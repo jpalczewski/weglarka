@@ -54,6 +54,12 @@ pub struct ImportArgs {
     /// whatever the tar says (a Węglarka export imported that way loses its owners).
     #[arg(long)]
     pub own: bool,
+    /// Empty the volume first (it is removed and created again), so files missing from the tar do
+    /// not survive — e.g. a stale SQLite `-wal`/`-shm` that would otherwise be replayed onto the
+    /// imported database. The app's container is recreated. Without it, only the tar's paths are
+    /// overwritten and everything else in the volume stays.
+    #[arg(long)]
+    pub replace: bool,
     /// Send nothing; show the request.
     #[arg(long)]
     pub dry_run: bool,
@@ -147,16 +153,22 @@ struct Imported {
 async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliError> {
     let app = instance(&a.app)?;
     let params = [("name", app.as_str()), ("volume", a.volume.as_str())];
-    let (query, mode) = if a.own {
-        ("", "own")
+    let (mut query, mode) = if a.own {
+        (String::new(), "own")
     } else {
-        ("foreign=true", "foreign")
+        ("foreign=true".to_owned(), "foreign")
     };
+    if a.replace {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str("replace=true");
+    }
     if a.dry_run {
         let mut dry = DryRun::new(endpoints::VOLUMES_IMPORT, &params, None);
         if !query.is_empty() {
             dry.path.push('?');
-            dry.path.push_str(query);
+            dry.path.push_str(&query);
         }
         dry.print(json);
         return Ok(exit::OK);
@@ -179,7 +191,7 @@ async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliErro
         }
     };
     client
-        .upload(endpoints::VOLUMES_IMPORT, &params, query, body)
+        .upload(endpoints::VOLUMES_IMPORT, &params, &query, body)
         .await?;
     let out = Imported {
         app: app.to_string(),
@@ -286,17 +298,23 @@ mod tests {
         let payload: Vec<u8> = (0..CHUNK * 2 + 17).map(|i| (i % 251) as u8).collect();
         std::fs::write(&file, &payload).unwrap();
 
-        let args = |own| ImportArgs {
+        let args = |own, replace| ImportArgs {
             app: "szklana".into(),
             volume: "data".into(),
             from: Some(file.clone()),
             own,
+            replace,
             dry_run: false,
         };
-        import(true, &overrides(&socket), args(false))
+        import(true, &overrides(&socket), args(false, false))
             .await
             .unwrap();
-        import(true, &overrides(&socket), args(true)).await.unwrap();
+        import(true, &overrides(&socket), args(true, false))
+            .await
+            .unwrap();
+        import(true, &overrides(&socket), args(false, true))
+            .await
+            .unwrap();
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].0, "PUT");
@@ -308,6 +326,10 @@ mod tests {
         assert_eq!(
             seen[1].1, "/v1/apps/szklana/volumes/data/import",
             "--own sends no foreign flag"
+        );
+        assert_eq!(
+            seen[2].1,
+            "/v1/apps/szklana/volumes/data/import?foreign=true&replace=true"
         );
         let _ = std::fs::remove_file(file);
     }

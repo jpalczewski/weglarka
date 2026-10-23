@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use weglarka_core::app::{Digest, Resources, SecretTarget};
 use weglarka_core::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
-    IdRange, ImageInfo, NetworkInfo, NetworkSpec, PodmanError, PodmanEvent, PullEvent,
-    RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec,
+    IdRange, ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError, PodmanEvent,
+    PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -274,9 +274,13 @@ struct MountSecret<'a> {
     uid: u32,
     #[serde(rename = "GID")]
     gid: u32,
-    /// 0 = Podman's default 0444.
+    /// Sent explicitly: libpod takes 0 literally (mode `000`), unlike `podman run --secret`.
     mode: u32,
 }
+
+/// Mode of a mounted secret when the spec sets none: readable by any user in the container, like
+/// the `podman run --secret` default. Root-only `000` broke images that run as a non-root user.
+const DEFAULT_SECRET_MODE: u32 = 0o444;
 
 impl<'a> CreateContainer<'a> {
     pub(crate) fn new(spec: &'a ContainerSpec) -> Self {
@@ -292,7 +296,7 @@ impl<'a> CreateContainer<'a> {
                     target: path,
                     uid: 0,
                     gid: 0,
-                    mode: mode.unwrap_or(0),
+                    mode: mode.unwrap_or(DEFAULT_SECRET_MODE),
                 }),
             }
         }
@@ -613,6 +617,30 @@ impl<'a> CreateNetwork<'a> {
     }
 }
 
+/// Element of `GET /libpod/networks/json` (only the used fields).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct ListedNetwork {
+    name: String,
+    labels: Option<BTreeMap<String, String>>,
+}
+
+impl ListedNetwork {
+    pub(crate) fn into_domain(self) -> NetworkSummary {
+        NetworkSummary {
+            name: self.name,
+            labels: self.labels.unwrap_or_default(),
+        }
+    }
+}
+
+/// Element of the `DELETE /libpod/networks/{name}` response: an error can come with HTTP 200.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub(crate) struct NetworkRmReport {
+    pub(crate) err: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct InspectNetwork {
@@ -916,6 +944,34 @@ mod tests {
             id_mapping: None,
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn mounted_secret_without_mode_is_world_readable_not_000() {
+        let spec = ContainerSpec {
+            name: "a".into(),
+            image: "i".into(),
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            secrets: vec![SecretAttachment {
+                secret: "a.config".into(),
+                target: SecretTarget::Mount {
+                    path: "/config.json".into(),
+                    mode: None,
+                },
+            }],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: false,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+        };
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(body["secrets"][0]["Mode"], 0o444);
     }
 
     #[test]

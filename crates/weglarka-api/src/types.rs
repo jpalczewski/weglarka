@@ -11,6 +11,9 @@ pub enum ErrorCode {
     AlreadyExists,
     InvalidRequest,
     Conflict,
+    /// The engine is busy with another mutation (e.g. a deploy behind the health gate). Transient:
+    /// the CLI retries the same request for a while before giving up.
+    Busy,
     Internal,
 }
 
@@ -20,6 +23,7 @@ impl ErrorCode {
             Self::NotFound => 404,
             Self::AlreadyExists | Self::Conflict => 409,
             Self::InvalidRequest => 400,
+            Self::Busy => 503,
             Self::Internal => 500,
         }
     }

@@ -82,6 +82,8 @@ pub struct CliError {
     pub kind: Kind,
     pub message: String,
     pub hint: Option<String>,
+    /// The daemon answered `busy`: the same request may succeed a moment later.
+    busy: bool,
 }
 
 impl CliError {
@@ -90,7 +92,13 @@ impl CliError {
             kind,
             message: message.into(),
             hint: None,
+            busy: false,
         }
+    }
+
+    /// Whether the daemon refused the request only because another mutation is running.
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -124,6 +132,10 @@ impl CliError {
                 Kind::Conflict,
                 Some("operacja koliduje z trwającą inną — spróbuj ponownie za chwilę"),
             ),
+            ErrorCode::Busy => (
+                Kind::Conflict,
+                Some("demon wciąż jest zajęty (trwa deploy) — spróbuj ponownie za chwilę"),
+            ),
             ErrorCode::InvalidRequest => (Kind::InvalidRequest, None),
             ErrorCode::Internal => (
                 Kind::Internal,
@@ -132,6 +144,7 @@ impl CliError {
         };
         let mut err = Self::new(kind, message);
         err.hint = hint.map(str::to_owned);
+        err.busy = code == ErrorCode::Busy;
         err
     }
 }

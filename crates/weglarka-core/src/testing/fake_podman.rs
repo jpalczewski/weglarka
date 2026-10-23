@@ -12,8 +12,8 @@ use sha2::{Digest as _, Sha256};
 use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result,
-    TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent,
+    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -43,6 +43,7 @@ pub enum Call {
         network: String,
         container: String,
     },
+    NetworkRemove(String),
     ContainerExec {
         name: String,
         cmd: Vec<String>,
@@ -552,6 +553,36 @@ impl PodmanClient for FakePodman {
             gateways: vec![std::net::IpAddr::from([10, 89, octet, 1])],
             subnets: vec![format!("10.89.{octet}.0/24")],
         })
+    }
+
+    async fn network_list(&self) -> Result<Vec<NetworkSummary>> {
+        let s = self.lock();
+        Ok(s.networks
+            .values()
+            .map(|(spec, _)| NetworkSummary {
+                name: spec.name.clone(),
+                labels: spec.labels.clone(),
+            })
+            .collect())
+    }
+
+    async fn network_remove(&self, name: &str) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::NetworkRemove(name.to_owned()));
+        // Like libpod without force: refuses while a container is attached (via connect or create).
+        let connected = s.networks.get(name).is_some_and(|(_, m)| !m.is_empty());
+        let created_on = s
+            .container_specs
+            .values()
+            .any(|c| c.networks.iter().any(|n| n == name));
+        if connected || created_on {
+            return Err(PodmanError::Api {
+                status: 500,
+                message: format!("network {name} is being used"),
+            });
+        }
+        s.networks.remove(name);
+        Ok(())
     }
 
     async fn secret_create(&self, name: &str, data: &[u8]) -> Result<()> {

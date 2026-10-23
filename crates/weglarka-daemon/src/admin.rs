@@ -71,7 +71,7 @@ impl From<EngineError> for Fail {
             EngineError::UnknownInstance(n) => Fail::not_found(format!("unknown app: {n}")),
             EngineError::Volume(m) => Fail::invalid(m),
             EngineError::Busy => Fail(
-                ErrorCode::Conflict,
+                ErrorCode::Busy,
                 "daemon is busy (deploy in progress); retry shortly".into(),
             ),
             e @ EngineError::MissingSecrets(_) => Fail(
@@ -102,7 +102,7 @@ async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>>) -> ApiRe
     match tokio::time::timeout(MUTATION_TIMEOUT, fut).await {
         Ok(r) => Ok(r?),
         Err(_) => Err(Fail(
-            ErrorCode::Conflict,
+            ErrorCode::Busy,
             "daemon is busy (deploy in progress); retry shortly".into(),
         )),
     }

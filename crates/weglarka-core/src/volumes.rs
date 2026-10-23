@@ -29,7 +29,7 @@ use crate::podman::{
     ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, RestartPolicy,
     Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
 };
-use crate::reconcile::{EngineError, Reconciler};
+use crate::reconcile::{EngineError, Reconciler, RecreateReason};
 use crate::state::{self, AppState, StateFile};
 use crate::uid_range::{DEFAULT_RANGE_SIZE, INFRA_RANGE_SIZE, UidRange, allocate};
 
@@ -306,6 +306,26 @@ impl<P: PodmanClient> Reconciler<P> {
         tar: TarStream,
         lock_wait: Duration,
     ) -> Result<(), EngineError> {
+        self.import_volume_with(instance, volume, mode, false, tar, lock_wait)
+            .await
+    }
+
+    /// [`Self::import_volume`] with `replace`: the volume is emptied first (removed and created
+    /// again), so files that are not in the tar do not survive the import. A plain import only
+    /// overwrites the paths present in the tar — e.g. a stale SQLite `-wal`/`-shm` left in the
+    /// volume by an earlier start would then be replayed onto the imported database.
+    ///
+    /// Emptying needs the volume free, so the app's container is removed; if it was running it is
+    /// created again right after the import (even a failed one — then on an empty volume).
+    pub async fn import_volume_with(
+        &self,
+        instance: &InstanceName,
+        volume: &str,
+        mode: ImportMode,
+        replace: bool,
+        tar: TarStream,
+        lock_wait: Duration,
+    ) -> Result<(), EngineError> {
         // Only the wait for the lock is bounded; the upload itself may take as long as it takes.
         let _g = tokio::time::timeout(lock_wait, self.lock.lock())
             .await
@@ -344,6 +364,18 @@ impl<P: PodmanClient> Reconciler<P> {
                 .container_stop(&app_container, self.options.stop_timeout_secs)
                 .await?;
         }
+        if replace {
+            match self.podman.container_remove(&app_container, true).await {
+                Ok(()) | Err(PodmanError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let podman_name = labels::volume_name(instance, volume);
+            match self.podman.volume_remove(&podman_name, false).await {
+                Ok(()) | Err(PodmanError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            ensure_volumes(&self.podman, instance, &spec).await?;
+        }
         let result = match mode {
             ImportMode::Own => self
                 .podman
@@ -356,7 +388,12 @@ impl<P: PodmanClient> Reconciler<P> {
             }
         };
         if was_running {
-            self.podman.container_start(&app_container).await?;
+            if replace {
+                self.recreate_locked(instance, RecreateReason::Missing)
+                    .await?;
+            } else {
+                self.podman.container_start(&app_container).await?;
+            }
         }
         result
     }
@@ -838,6 +875,55 @@ health = { attempts = 2, window_secs = 2 }
             e.fake.container_spec("wg-import.szklana").is_none(),
             "helper is cleaned up"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replace_import_empties_the_volume_and_recreates_the_running_app() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let app = labels::container_name(&name("szklana"));
+        let vol = labels::volume_name(&name("szklana"), "data");
+        let before = e.fake.calls().len();
+
+        e.rec
+            .import_volume_with(
+                &name("szklana"),
+                "data",
+                ImportMode::Foreign,
+                true,
+                tar(),
+                WAIT,
+            )
+            .await
+            .unwrap();
+
+        let calls = e.fake.calls()[before..].to_vec();
+        let pos = |want: &Call| calls.iter().position(|c| c == want).expect("call made");
+        let removed = pos(&Call::ContainerRemove(app.clone()));
+        let vol_removed = pos(&Call::VolumeRemove(vol.clone()));
+        // `ensure_volumes` already ran (idempotently) before the removal; look for the re-creation.
+        let vol_created = vol_removed
+            + calls[vol_removed..]
+                .iter()
+                .position(|c| c == &Call::VolumeCreate(vol.clone()))
+                .expect("volume created again");
+        let put = pos(&Call::ContainerArchivePut {
+            name: "wg-import.szklana".into(),
+            path: "/data".into(),
+        });
+        let recreated = calls
+            .iter()
+            .rposition(|c| c == &Call::ContainerCreate(app.clone()))
+            .expect("app recreated");
+        assert!(removed < vol_removed && vol_removed < vol_created && vol_created < put);
+        assert!(put < recreated);
+        let running = e
+            .fake
+            .containers()
+            .into_iter()
+            .find(|c| c.name == app)
+            .expect("app container exists");
+        assert_eq!(running.state, ContainerState::Running, "the app runs again");
     }
 
     #[tokio::test(start_paused = true)]

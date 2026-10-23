@@ -1,6 +1,7 @@
 //! Engine tests (reconcile + deploy + secrets) on `FakePodman`. Virtual time (`start_paused`),
 //! so the health gate does not really wait.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::app::{Digest, InstanceName};
 use crate::deploy::DeployOutcome;
 use crate::events::{Event, VecSink};
 use crate::labels;
-use crate::podman::{ContainerState, HealthStatus, PodmanClient};
+use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient};
 use crate::reconcile::{
     Action, ActionOutcome, EngineError, ReconcileReport, Reconciler, ReconcilerOptions,
     RecreateReason, SecretChangePolicy, Trigger,
@@ -390,6 +391,38 @@ async fn removed_app_is_pruned_with_its_state() {
         h.rec.remove_app(&name("ntfy")).await,
         Err(crate::reconcile::EngineError::UnknownInstance(_))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_app_network_is_cleaned_up_but_other_networks_stay() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    assert!(h.fake.networks().contains(&"net-ntfy".to_owned()));
+    // Not ours (no Węglarka label) and Węglarka's own network: both must survive the cleanup.
+    for (net, labels) in [
+        ("net-foreign", BTreeMap::new()),
+        (
+            crate::labels::INGRESS_NETWORK,
+            BTreeMap::from([("weglarka.managed".to_owned(), "ingress".to_owned())]),
+        ),
+    ] {
+        h.fake
+            .network_create(&NetworkSpec {
+                name: net.to_owned(),
+                internal: false,
+                labels,
+            })
+            .await
+            .unwrap();
+    }
+
+    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec.reconcile().await.unwrap();
+    let nets = h.fake.networks();
+    assert!(!nets.contains(&"net-ntfy".to_owned()), "{nets:?}");
+    assert!(nets.contains(&"net-foreign".to_owned()));
+    assert!(nets.contains(&crate::labels::INGRESS_NETWORK.to_owned()));
 }
 
 const WITH_SECRET: &str = r#"
