@@ -1,0 +1,83 @@
+name: Spike (temporary)
+
+# TEMPORARY: iteration 2 volume-ownership spike (docs/decisions/0009). Removed before merge; the
+# winning scenario moves into the `integration-podman` job of ci.yml.
+
+on:
+  pull_request:
+    paths: [".github/workflows/spike.yml", "crates/weglarka-podman/tests/volumes.rs"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  spike-volumes:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add the alvistack repository
+        run: |
+          set -euo pipefail
+          base="https://downloadcontent.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
+          curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
+          echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
+            | sudo tee /etc/apt/sources.list.d/alvistack.list
+          sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
+          Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
+          Pin: origin downloadcontent.opensuse.org
+          Pin-Priority: 1001
+          PIN
+          sudo apt-get purge -y podman buildah skopeo crun conmon \
+            golang-github-containers-common golang-github-containers-image || true
+          for attempt in 1 2 3 4; do
+            sudo apt-get update && break
+            [ "$attempt" = 4 ] && exit 1
+            sleep 15
+          done
+      - name: Install Podman 6
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4; do
+            sudo apt-get install -y -o Acquire::Retries=3 podman netavark passt uidmap && break
+            [ "$attempt" = 4 ] && exit 1
+            sleep 15
+          done
+          podman --version
+      - name: Configure rootless containers
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.config/containers"
+          cat > "$HOME/.config/containers/storage.conf" <<STORAGE
+          [storage]
+          driver = "overlay"
+          graphroot = "$HOME/.local/share/containers/storage"
+          runroot = "$XDG_RUNTIME_DIR/containers"
+          STORAGE
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
+          uname -r
+          findmnt -no FSTYPE,OPTIONS "$HOME/.local/share" || true
+          grep "^$USER:" /etc/subuid /etc/subgid
+      - name: Start rootless podman service
+        run: |
+          set -euo pipefail
+          sock="$XDG_RUNTIME_DIR/podman/podman.sock"
+          mkdir -p "$(dirname "$sock")"
+          podman system service --time 0 "unix://$sock" 2>"$RUNNER_TEMP/podman-service.log" &
+          for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
+          echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
+          podman version
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          save-if: false
+      # Tests run one after another so the SPIKE lines of different scenarios do not interleave.
+      - name: Spike
+        run: cargo test -p weglarka-podman --test volumes -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/spike.log"
+      - name: Summary
+        if: always()
+        run: grep -E '^SPIKE|^test ' "$RUNNER_TEMP/spike.log" || true
+      - name: Podman service log
+        if: always()
+        run: cat "$RUNNER_TEMP/podman-service.log" || true
