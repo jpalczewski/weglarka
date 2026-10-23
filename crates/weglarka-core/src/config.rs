@@ -1,4 +1,4 @@
-//! `weglarka.toml` — konfiguracja hosta. Pisze człowiek/Ansible, demon tylko czyta.
+//! `weglarka.toml` — host configuration. Written by a human/Ansible; the daemon only reads it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,33 +25,33 @@ impl HostConfig {
     }
 }
 
-/// Lokalizacja plików stanu: `apps.toml`, `state.toml`, `secrets.toml` (i katalog nginxa).
+/// Location of the state files: `apps.toml`, `state.toml`, `secrets.toml` (and the nginx directory).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
-    /// Katalog danych; domyślnie katalog, w którym leży `weglarka.toml` (ustala to wywołujący,
-    /// bo `HostConfig` nie zna ścieżki własnego pliku).
+    /// Data directory; defaults to the directory containing `weglarka.toml` (set by the caller,
+    /// since `HostConfig` does not know the path of its own file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
 }
 
 impl StateConfig {
-    /// Katalog stanu: `[state] dir` albo `fallback` (zwykle katalog configu).
+    /// State directory: `[state] dir` or `fallback` (usually the config directory).
     pub fn dir_or(&self, fallback: &Path) -> PathBuf {
         self.dir.clone().unwrap_or_else(|| fallback.to_owned())
     }
 }
 
-/// Rootless Podman pod konfigurowalnym userem (nazwa nie jest nigdzie zaszyta w kodzie).
+/// Rootless Podman under a configurable user (the name is not hard-coded anywhere).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "RuntimeConfig::default_user")]
     pub user: String,
-    /// Socket libpod; domyślnie wyznacza go `Platform::runtime_socket`.
+    /// libpod socket; by default determined by `Platform::runtime_socket`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<PathBuf>,
-    /// Okres pętli reconcile (sekundy); dodatkowo reconcile ruszają zmiany stanu pożądanego.
+    /// Reconcile loop period (seconds); reconcile is additionally triggered by desired-state changes.
     #[serde(default = "RuntimeConfig::default_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
 }
@@ -79,7 +79,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngressMode {
-    /// nginx Węglarki trzyma 80/443 (ACME — poza MVP).
+    /// Węglarka's nginx holds 80/443 (ACME is out of the MVP).
     Edge,
     /// nginx na wysokim porcie za Traefikiem z Coolify.
     Behind,
@@ -89,15 +89,15 @@ pub enum IngressMode {
 #[serde(deny_unknown_fields)]
 pub struct IngressConfig {
     pub mode: IngressMode,
-    /// Adres publikacji nginx na hoście, np. `172.17.0.1:8080`.
+    /// nginx publish address on the host, e.g. `172.17.0.1:8080`.
     pub bind: SocketAddr,
     /// Plik dynamicznej konfiguracji Traefika (tryb `behind`), nadpisywany w miejscu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traefik_dynamic_file: Option<PathBuf>,
-    /// Obraz kontenera nginx zarządzanego przez demona.
+    /// Image of the nginx container managed by the daemon.
     #[serde(default = "IngressConfig::default_nginx_image")]
     pub nginx_image: String,
-    /// Katalog hosta z `nginx.conf` (montowany do kontenera nginx); domyślnie `<state dir>/nginx`.
+    /// Host directory with `nginx.conf` (mounted into the nginx container); defaults to `<state dir>/nginx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nginx_conf_dir: Option<PathBuf>,
 }
@@ -111,16 +111,16 @@ impl IngressConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
-    /// Socket unix admin API (nigdy wystawiany przez nginx).
+    /// Unix socket of the admin API (never exposed through nginx).
     pub socket: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
-    /// Adres listenera webhooków (wewnątrz kontenera Węglarki).
+    /// Webhook listener address (inside the Węglarka container).
     pub listen: SocketAddr,
-    /// Domena publiczna; wystawiane tylko ścieżki webhooków.
+    /// Public domain; only the webhook paths are exposed.
     pub domain: String,
 }
 

@@ -1,4 +1,4 @@
-//! Binarka demona: `run` (domyślnie) oraz `platform install|remove|status`.
+//! The daemon binary: `run` (default) and `platform install|remove|status`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -80,11 +80,11 @@ fn systemd(settings: &Settings) -> Result<SystemdPlatform> {
     }
 }
 
-/// Wszystkie ścieżki montujemy pod tą samą nazwą co na hoście, żeby `weglarka.toml` był
-/// poprawny po obu stronach (CLI na hoście czyta ten sam plik).
 /// Env var carrying the Podman socket path resolved on the host: the (`scratch`) container has no `/etc/passwd`.
 const SOCKET_ENV: &str = "WEGLARKA_PODMAN_SOCKET";
 
+/// All paths are mounted under the same name as on the host so that `weglarka.toml` is
+/// valid on both sides (the host CLI reads the same file).
 fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> ServiceSpec {
     let s = |p: &std::path::Path| p.display().to_string();
     let same = |p: &std::path::Path| (s(p), s(p));
@@ -102,7 +102,7 @@ fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> S
         mounts.push(same(&settings.paths.nginx_conf_dir));
     }
     if let Some(f) = &settings.host.ingress.traefik_dynamic_file {
-        // Pojedynczy plik: zapis w miejscu zachowuje inode, więc Traefik widzi zmianę.
+        // A single file: an in-place write preserves the inode, so Traefik sees the change.
         mounts.push(same(f));
     }
     ServiceSpec {
@@ -187,7 +187,7 @@ async fn run_daemon(settings: Settings) -> Result<()> {
         _ = term.recv() => tracing::info!("SIGTERM received"),
         _ = int.recv() => tracing::info!("SIGINT received"),
     }
-    // Trzeci sygnał w trakcie zatrzymania wymusza wyjście.
+    // A third signal during shutdown forces an exit.
     tokio::select! {
         () = running.stop() => {}
         _ = term.recv() => tracing::warn!("second signal, exiting immediately"),

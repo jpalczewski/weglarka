@@ -1,5 +1,5 @@
-//! Trait `Platform` — różnice między systemami init (MVP: systemd; później OpenRC/Alpine).
-//! Zdarzenia Podmana i healthchecki są wspólne dla obu; tu tylko serwis Węglarki i socket.
+//! Trait `Platform` — differences between init systems (MVP: systemd; later OpenRC/Alpine).
+//! Podman events and healthchecks are shared by both; this covers only the Węglarka service and the socket.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -18,19 +18,19 @@ pub enum PlatformError {
 
 pub type Result<T, E = PlatformError> = std::result::Result<T, E>;
 
-/// Opis serwisu uruchamiającego kontener Węglarki (quadlet usera / skrypt OpenRC).
+/// Description of the service that runs the Węglarka container (user quadlet / OpenRC script).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSpec {
     pub name: String,
     pub image: String,
     pub run_as_user: String,
-    /// Zmienne środowiskowe i montowania podaje demon; Platform tylko je serializuje.
+    /// Environment variables and mounts are supplied by the daemon; Platform only serializes them.
     pub env: Vec<(String, String)>,
-    /// `(źródło na hoście, ścieżka w kontenerze)`; opcje (np. `:ro`) dopisuje się do ścieżki kontenera.
+    /// `(host source, path in the container)`; options (e.g. `:ro`) are appended to the container path.
     pub mounts: Vec<(String, String)>,
-    /// Sieci Podmana, do których dołącza kontener (np. `net-weglarka`).
+    /// Podman networks the container joins (e.g. `net-weglarka`).
     pub networks: Vec<String>,
-    /// Argumenty polecenia kontenera (po entrypoincie obrazu).
+    /// Arguments of the container command (after the image entrypoint).
     pub args: Vec<String>,
     pub hardening: Hardening,
 }
@@ -72,7 +72,7 @@ pub enum ServiceStatus {
 pub trait Platform: Send + Sync {
     fn kind(&self) -> PlatformKind;
 
-    /// Socket libpod dla usera runtime'u (np. `/run/user/<uid>/podman/podman.sock`).
+    /// libpod socket for the runtime user (e.g. `/run/user/<uid>/podman/podman.sock`).
     fn runtime_socket(&self, runtime_user: &str) -> impl Future<Output = Result<PathBuf>> + Send;
 
     fn install_service(&self, spec: &ServiceSpec) -> impl Future<Output = Result<()>> + Send;

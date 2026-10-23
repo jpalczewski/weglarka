@@ -1,6 +1,6 @@
-//! `Platform` dla systemd: quadlet usera (`~/.config/containers/systemd/<nazwa>.container`).
-//! Quadlet to opcja na czas współistnienia z Coolify; interfejs (`Platform`) zostaje gotowy na
-//! OpenRC — wystarczy druga implementacja traitu.
+//! `Platform` for systemd: user quadlet (`~/.config/containers/systemd/<name>.container`).
+//! Quadlet is an option for the period of coexistence with Coolify; the `Platform` interface stays ready for
+//! OpenRC — a second implementation of the trait is all that is needed.
 
 use std::fmt::Write as _;
 use std::io;
@@ -68,10 +68,10 @@ fn lookup(passwd: &Path, user: &str) -> Result<PasswdEntry> {
 }
 
 pub struct SystemdPlatform<R: CommandRunner = TokioRunner> {
-    /// Użytkownik runtime'u, w którego systemd-user działa serwis.
+    /// Runtime user under whose systemd-user the service runs.
     user: String,
     passwd: PathBuf,
-    /// Nadpisanie katalogu quadletów (testy); domyślnie `<home>/.config/containers/systemd`.
+    /// Override of the quadlet directory (tests); defaults to `<home>/.config/containers/systemd`.
     quadlet_dir: Option<PathBuf>,
     runner: R,
 }
@@ -82,7 +82,7 @@ impl SystemdPlatform<TokioRunner> {
     }
 }
 
-/// Plik quadleta: nazwa pliku i treść.
+/// A quadlet file: file name and contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitFile {
     pub file_name: String,
@@ -169,7 +169,7 @@ pub fn run_args(spec: &ServiceSpec) -> Result<Vec<String>> {
     Ok(a)
 }
 
-/// Pliki quadleta dla serwisu: `<nazwa>.container` + `.network` dla każdej sieci.
+/// Quadlet files for the service: `<name>.container` + `.network` for each network.
 pub fn render(spec: &ServiceSpec) -> Result<Vec<UnitFile>> {
     check_value("service name", &spec.name)?;
     check_value("image", &spec.image)?;
@@ -288,7 +288,7 @@ impl<R: CommandRunner> SystemdPlatform<R> {
             .map_err(|e| PlatformError::Command(format!("systemctl: {e}")))
     }
 
-    /// Instalacja przebiega jako user runtime'u (jest właścicielem katalogu quadletów).
+    /// Installation runs as the runtime user (the owner of the quadlet directory).
     fn entry(&self) -> Result<PasswdEntry> {
         lookup(&self.passwd, &self.user)
     }
@@ -342,7 +342,7 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(PlatformError::Io(format!("{}: {e}", path.display()))),
         }
-        // Pliki `.network` zostają (mogą być współdzielone); sprząta je operator.
+        // The `.network` files stay (they may be shared); the operator cleans them up.
         self.systemctl(&entry, &["daemon-reload"]).await.map(drop)
     }
 

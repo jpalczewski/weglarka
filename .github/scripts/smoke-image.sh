@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Smoke test obrazu Węglarki na rootless Podmanie 6: demon wstaje, CLI odpowiada przez socket
-# admina, `doctor` zwraca wynik, a ingress podnosi kontener nginx (tryb `behind`, plik Traefika w tempdir).
+# Smoke test of the Węglarka image on rootless Podman 6: the daemon starts, the CLI answers over the admin
+# socket, `doctor` returns a result, and ingress brings up the nginx container (`behind` mode, Traefik file in a tempdir).
 #
-#   smoke-image.sh <obraz> <ścieżka-do-binarki-weglarka> <socket-podmana> [skrypt-odbioru]
+#   smoke-image.sh <image> <path-to-weglarka-binary> <podman-socket> [acceptance-script]
 #
-# Z czwartym argumentem (scripts/acceptance.sh) na tym samym demonie biegnie skrypt odbioru:
-# kanarek, ruch przez nginx (bez Traefika/TLS), webhooki, rollback, sprzątanie.
+# With a fourth argument (scripts/acceptance.sh) the acceptance script runs against the same daemon:
+# canary, traffic through nginx (no Traefik/TLS), webhooks, rollback, cleanup.
 set -euo pipefail
 
 image=$1
@@ -49,7 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Ścieżki montujemy 1:1 (jak w quadlecie); root kontenera = ten sam użytkownik co na hoście.
+# Paths are mounted 1:1 (as in the quadlet); the container root = the same user as on the host.
 podman run -d --pull=never --name weglarka-smoke -p 127.0.0.1:19180:9180 \
   -v "$podman_sock:$podman_sock" -v "$dir:$dir" \
   "$image" run --config "$dir/weglarka.toml"
@@ -82,8 +82,8 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dir/doctor.json"
 
 if [ -n "$acceptance" ]; then
   echo "--- skrypt odbioru (acceptance.sh) na demonie ze smoke testu"
-  # Bez Traefika i TLS: ruch bezpośrednio do nginx (Host: domena), webhooki prosto na listener demona;
-  # preflight pomijamy — runner CI to nie docelowy układ hosta.
+  # No Traefik and no TLS: traffic goes straight to nginx (Host: domain), webhooks straight to the daemon listener;
+  # preflight is skipped — the CI runner is not the target host layout.
   PATH="$(cd "$(dirname "$cli")" && pwd):$PATH" "$acceptance" --config "$dir/weglarka.toml" \
     --canary-domain wg-canary.example.test \
     --direct http://127.0.0.1:18080 --webhook-base http://127.0.0.1:19180 \
