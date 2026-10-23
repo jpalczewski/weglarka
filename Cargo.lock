@@ -989,8 +989,12 @@ dependencies = [
 name = "weglarka-podman"
 version = "0.0.1"
 dependencies = [
+ "futures-core",
+ "futures-util",
+ "http-body-util",
  "hyper",
  "hyper-util",
+ "insta",
  "serde",
  "serde_json",
  "thiserror",

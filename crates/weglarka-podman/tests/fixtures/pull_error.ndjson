@@ -1,0 +1,2 @@
+{"status":"pulling","stream":"Trying to pull ghcr.io/x/bad:latest...\n"}
+{"status":"error","error":"copying system image from manifest list: reading blob: unauthorized"}
