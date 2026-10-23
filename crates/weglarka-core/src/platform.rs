@@ -32,6 +32,33 @@ pub struct ServiceSpec {
     pub networks: Vec<String>,
     /// Argumenty polecenia kontenera (po entrypoincie obrazu).
     pub args: Vec<String>,
+    pub hardening: Hardening,
+}
+
+/// Hardening of the Węglarka container; Platform translates it into quadlet / `podman run` options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardening {
+    /// Read-only root filesystem (writes only to mounts and `tmpfs`).
+    pub read_only: bool,
+    pub drop_all_capabilities: bool,
+    pub no_new_privileges: bool,
+    pub tmpfs: Vec<String>,
+    /// Memory limit (e.g. `128M`), also applies to swap.
+    pub memory: Option<String>,
+    pub pids_limit: Option<u32>,
+}
+
+impl Default for Hardening {
+    fn default() -> Self {
+        Self {
+            read_only: true,
+            drop_all_capabilities: true,
+            no_new_privileges: true,
+            tmpfs: vec!["/tmp".to_owned()],
+            memory: None,
+            pids_limit: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

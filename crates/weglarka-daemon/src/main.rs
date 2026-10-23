@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 use weglarka_core::config::PlatformKind;
-use weglarka_core::platform::{Platform, ServiceSpec};
+use weglarka_core::platform::{Hardening, Platform, ServiceSpec};
 use weglarka_daemon::ingress::WEBHOOK_NETWORK;
-use weglarka_daemon::platform::{SystemdPlatform, render};
+use weglarka_daemon::platform::{SystemdPlatform, render, run_args};
 use weglarka_daemon::{Settings, start};
 use weglarka_podman::LibpodClient;
 
@@ -54,6 +54,12 @@ enum PlatformAction {
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
+    /// Prints the `podman run` arguments equivalent to the quadlet (one per line) — for CI tests.
+    RunArgs {
+        /// Węglarka container image.
+        #[arg(long, default_value = DEFAULT_IMAGE)]
+        image: String,
+    },
     /// Usuwa plik serwisu.
     Remove,
     /// Pokazuje stan serwisu.
@@ -76,6 +82,9 @@ fn systemd(settings: &Settings) -> Result<SystemdPlatform> {
 
 /// Wszystkie ścieżki montujemy pod tą samą nazwą co na hoście, żeby `weglarka.toml` był
 /// poprawny po obu stronach (CLI na hoście czyta ten sam plik).
+/// Env var carrying the Podman socket path resolved on the host: the (`scratch`) container has no `/etc/passwd`.
+const SOCKET_ENV: &str = "WEGLARKA_PODMAN_SOCKET";
+
 fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> ServiceSpec {
     let s = |p: &std::path::Path| p.display().to_string();
     let same = |p: &std::path::Path| (s(p), s(p));
@@ -100,21 +109,39 @@ fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> S
         name: SERVICE_NAME.to_owned(),
         image,
         run_as_user: settings.host.runtime.user.clone(),
-        env: vec![("RUST_LOG".to_owned(), "info".to_owned())],
+        env: vec![
+            ("RUST_LOG".to_owned(), "info".to_owned()),
+            (SOCKET_ENV.to_owned(), s(&podman_socket)),
+        ],
         mounts,
         networks: vec![WEBHOOK_NETWORK.to_owned()],
         args: vec!["run".to_owned(), "--config".to_owned(), s(conf)],
+        hardening: Hardening {
+            memory: Some(settings.host.platform.memory.clone()),
+            pids_limit: Some(settings.host.platform.pids_limit),
+            ..Hardening::default()
+        },
     }
+}
+
+async fn host_socket(settings: &Settings, platform: &SystemdPlatform) -> Result<PathBuf> {
+    Ok(match &settings.host.runtime.socket {
+        Some(s) => s.clone(),
+        None => platform.runtime_socket(&settings.host.runtime.user).await?,
+    })
 }
 
 async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> {
     let platform = systemd(&settings)?;
     match action {
+        PlatformAction::RunArgs { image } => {
+            let socket = host_socket(&settings, &platform).await?;
+            for a in run_args(&service_spec(&settings, socket, image))? {
+                println!("{a}");
+            }
+        }
         PlatformAction::Install { dry_run, image } => {
-            let socket = match &settings.host.runtime.socket {
-                Some(s) => s.clone(),
-                None => platform.runtime_socket(&settings.host.runtime.user).await?,
-            };
+            let socket = host_socket(&settings, &platform).await?;
             let spec = service_spec(&settings, socket, image);
             if dry_run {
                 for f in render(&spec)? {
@@ -140,17 +167,17 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
     Ok(())
 }
 
+/// The daemon (usually in a `scratch` container) never guesses the socket from `/etc/passwd`: it takes it from
+/// `[runtime] socket` or from the variable set by the quadlet (`platform install` resolves it on the host).
 async fn run_daemon(settings: Settings) -> Result<()> {
-    let socket = match &settings.host.runtime.socket {
-        Some(s) => s.clone(),
-        None => match settings.host.platform.kind {
-            PlatformKind::Systemd => {
-                SystemdPlatform::new(settings.host.runtime.user.clone())
-                    .runtime_socket(&settings.host.runtime.user)
-                    .await?
-            }
-            other => bail!("platform {other:?} is not supported yet; set [runtime] socket"),
-        },
+    let socket = match (&settings.host.runtime.socket, std::env::var_os(SOCKET_ENV)) {
+        (Some(s), _) => s.clone(),
+        (None, Some(v)) if !v.is_empty() => PathBuf::from(v),
+        (None, _) => bail!(
+            "unknown Podman socket: set [runtime] socket in {} or the {SOCKET_ENV} variable \
+             (`platform install` sets it in the quadlet)",
+            settings.config_path.display()
+        ),
     };
     let running = start(settings, LibpodClient::new(socket)).await?;
 

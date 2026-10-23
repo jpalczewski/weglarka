@@ -77,7 +77,17 @@ domain = "weglarka.descriptortable.eu"                     # wystawiane są tylk
 
 [state]
 dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
+
+[platform]
+kind = "systemd"
+memory = "128M"                                            # limit pamięci kontenera Węglarki (z swapem); domyślnie 128M
+pids_limit = 256                                           # limit procesów/wątków; domyślnie 256
 ```
+
+`[runtime] socket` **nie jest potrzebny**: `platform install` wylicza socket na hoście (`/run/user/<uid>/podman/podman.sock`)
+i przekazuje go kontenerowi zmienną `WEGLARKA_PODMAN_SOCKET` w quadlecie. Jawne `socket` ma pierwszeństwo przed zmienną.
+Demon w kontenerze nie czyta `/etc/passwd` (obraz jest na `scratch`); bez socketu w configu i bez zmiennej kończy się
+czytelnym błędem.
 
 ## 3. Binarki na hoście (`platform install`)
 
@@ -126,6 +136,31 @@ systemctl --user status weglarka.service
 podman logs weglarka                                                              # JSON, bez sekretów
 ```
 
+Wygenerowany quadlet (przykład dla `weglarka`, UID 1004) jest utwardzony: root FS tylko do odczytu (`ReadOnly=true`,
+`Tmpfs=/tmp`), `DropCapability=ALL`, `NoNewPrivileges=true`, limit pamięci (`PodmanArgs=--memory=128M --memory-swap=128M`)
+i `PidsLimit=256`:
+
+```ini
+[Container]
+Image=ghcr.io/jpalczewski/weglarka:latest
+ContainerName=weglarka
+Network=net-weglarka.network
+Volume=/run/user/1004/podman/podman.sock:/run/user/1004/podman/podman.sock
+Volume=/var/lib/weglarka:/var/lib/weglarka
+Volume=/etc/weglarka/weglarka.toml:/etc/weglarka/weglarka.toml:ro
+Environment=RUST_LOG=info
+Environment=WEGLARKA_PODMAN_SOCKET=/run/user/1004/podman/podman.sock
+ReadOnly=true
+Tmpfs=/tmp
+DropCapability=ALL
+NoNewPrivileges=true
+PodmanArgs=--memory=128M --memory-swap=128M
+PidsLimit=256
+Exec=run --config /etc/weglarka/weglarka.toml
+```
+
+(pełny plik: `platform install --dry-run`; te same opcje jako argumenty `podman run`: `platform run-args`).
+
 Quadlet ma `WantedBy=default.target` — z lingerem usługa wstaje po restarcie hosta. Przy starcie demon zakłada
 sieć `net-weglarka`, ciągnie i uruchamia kontener `weglarka-nginx` na `bind` i zapisuje plik Traefika.
 Aktualizacja samej Węglarki (poza MVP: automat): `podman pull <obraz> && systemctl --user restart weglarka.service`.
@@ -159,6 +194,37 @@ export WEGLARKA_SOCKET=~/.weglarka/admin.sock
 weglarka status
 weglarka doctor            # autodiagnoza przez API (--json dla maszyn)
 ```
+
+## Odbiór na hoście (`scripts/acceptance.sh`)
+
+Test łańcucha na prawdziwym hoście: preflight i `doctor`, kanarek `traefik/whoami` na domenie testowej
+(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204) i sprzątanie. Uruchamiaj **po instalacji**
+i **po każdej aktualizacji Węglarki** (zanim ruszysz prawdziwą apkę), jako użytkownik runtime'u:
+
+```sh
+sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
+  scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
+```
+
+Wymaganie: domena kanarka jest w DNS (wskazuje na host) **i na allowliście walidatora**
+(`weglarka_allowed_domains`) — bez tego Traefik nie dostanie routera i krok „ruch” skończy się timeoutem.
+Skrypt dotyka tylko instancji `wg-canary` (domyślnie) oraz `wg-webhook`/`wg-rollback` i kontenera
+`wg-accept-registry` z `--with-local-registry` — nigdy `ntfy`. Opcje: `--canary-image`, `--webhook-base`, `--keep`
+(kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`, `--json` (raport
+maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa tego CI).
+Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
+Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`.
+
+**Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
+zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
+oraz webhook z realnym deployem i duplikatem dostarczenia biegną w CI (`integration-podman`); na hoście są
+opcjonalne (`--with-local-registry`) — wymagają tymczasowego rejestru na `127.0.0.1:15099` i wpisu
+`[[registry]] location = "127.0.0.1:15099" insecure = true` w `registries.conf` użytkownika **przed startem**
+usługi Podmana (czyta go przy starcie). Skrypt sam niczego nie konfiguruje; bez wpisu deploy kończy się FAIL
+z podpowiedzią. Na produkcji nie zalecane.
+
+Uwaga: `secrets.toml` zachowuje sekret `webhook-hmac` kanarka po jego usunięciu (jednorazowa wartość testowa,
+nadpisywana przy kolejnym uruchomieniu).
 
 ## 6. Pierwsza apka: ntfy.zig
 

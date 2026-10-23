@@ -16,6 +16,12 @@ Network=net-weglarka.network
 Volume=/run/user/1001/podman/podman.sock:/run/user/1001/podman/podman.sock
 Volume=/etc/weglarka/weglarka.toml:/etc/weglarka/weglarka.toml:ro
 Environment=RUST_LOG=info
+ReadOnly=true
+Tmpfs=/tmp
+DropCapability=ALL
+NoNewPrivileges=true
+PodmanArgs=--memory=128M --memory-swap=128M
+PidsLimit=256
 Exec=run --config /etc/weglarka/weglarka.toml
 
 [Service]
