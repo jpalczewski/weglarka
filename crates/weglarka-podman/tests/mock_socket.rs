@@ -155,6 +155,7 @@ async fn not_found_and_name_conflict() {
         publish: vec![],
         restart: weglarka_core::podman::RestartPolicy::No,
         userns_auto: false,
+        mounts: vec![],
     };
     assert!(
         matches!(client.container_create(&spec).await, Err(PodmanError::Conflict(m)) if m.contains("already in use"))

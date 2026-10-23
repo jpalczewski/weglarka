@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{Digest, SecretTarget};
 use weglarka_core::podman::{
-    ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, ImageInfo, NetworkSpec,
-    PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
+    ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, ImageInfo, NetworkInfo,
+    NetworkSpec, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -71,6 +71,17 @@ pub(crate) struct CreateContainer<'a> {
     secrets: Vec<MountSecret<'a>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     secret_env: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mounts: Vec<BindMountBody<'a>>,
+}
+
+#[derive(Serialize)]
+struct BindMountBody<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    source: &'a str,
+    destination: &'a str,
+    options: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -151,6 +162,16 @@ impl<'a> CreateContainer<'a> {
                 .collect(),
             secrets,
             secret_env,
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|m| BindMountBody {
+                    kind: "bind",
+                    source: &m.source,
+                    destination: &m.target,
+                    options: if m.read_only { vec!["ro"] } else { vec![] },
+                })
+                .collect(),
         }
     }
 }
@@ -351,6 +372,32 @@ impl<'a> CreateNetwork<'a> {
             internal: spec.internal,
             dns_enabled: true,
             labels: &spec.labels,
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct InspectNetwork {
+    name: String,
+    subnets: Vec<Subnet>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Subnet {
+    gateway: String,
+}
+
+impl InspectNetwork {
+    pub(crate) fn into_domain(self) -> NetworkInfo {
+        NetworkInfo {
+            name: self.name,
+            gateways: self
+                .subnets
+                .iter()
+                .filter_map(|s| s.gateway.parse().ok())
+                .collect(),
         }
     }
 }
@@ -573,6 +620,7 @@ mod tests {
             publish: vec![DomainPort { host_ip: Some("172.17.0.1".into()), host_port: 8085, container_port: 8085 }],
             restart: RestartPolicy::Always,
             userns_auto: true,
+            mounts: vec![],
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -589,6 +637,7 @@ mod tests {
             publish: vec![],
             restart: RestartPolicy::No,
             userns_auto: false,
+            mounts: vec![],
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }

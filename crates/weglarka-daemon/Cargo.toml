@@ -11,16 +11,38 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "weglarka_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "weglarka-daemon"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+axum.workspace = true
+clap = { workspace = true, features = ["env"] }
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "fs", "process", "io-util"] }
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 weglarka-api.workspace = true
 weglarka-core.workspace = true
 weglarka-ingress.workspace = true
 weglarka-podman.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+insta.workspace = true
+tempfile.workspace = true
+weglarka-core = { workspace = true, features = ["testing"] }

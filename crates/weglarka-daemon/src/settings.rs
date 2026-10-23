@@ -1,0 +1,113 @@
+//! Wczytanie `weglarka.toml` i wyznaczenie ścieżek (stan, sekrety, katalog nginxa).
+
+use std::path::{Path, PathBuf};
+
+use weglarka_core::config::HostConfig;
+use weglarka_core::state::StatePaths;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid {path}: {message}")]
+    Parse { path: PathBuf, message: String },
+}
+
+/// Ścieżki plików, które demon czyta i pisze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paths {
+    pub state_dir: PathBuf,
+    pub state: StatePaths,
+    pub secrets: PathBuf,
+    /// Katalog hosta z `nginx.conf` (montowany do kontenera nginx).
+    pub nginx_conf_dir: PathBuf,
+}
+
+impl Paths {
+    pub fn resolve(host: &HostConfig, config_path: &Path) -> Self {
+        let config_dir = config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let state_dir = host.state.dir_or(config_dir);
+        Self {
+            state: StatePaths::in_dir(&state_dir),
+            secrets: state_dir.join("secrets.toml"),
+            nginx_conf_dir: host
+                .ingress
+                .nginx_conf_dir
+                .clone()
+                .unwrap_or_else(|| state_dir.join("nginx")),
+            state_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub host: HostConfig,
+    pub config_path: PathBuf,
+    pub paths: Paths,
+}
+
+impl Settings {
+    pub fn load(config_path: impl Into<PathBuf>) -> Result<Self, SettingsError> {
+        let config_path = config_path.into();
+        let src = std::fs::read_to_string(&config_path).map_err(|source| SettingsError::Read {
+            path: config_path.clone(),
+            source,
+        })?;
+        let host = HostConfig::from_toml_str(&src).map_err(|e| SettingsError::Parse {
+            path: config_path.clone(),
+            message: e.to_string(),
+        })?;
+        Ok(Self::from_host(host, config_path))
+    }
+
+    pub fn from_host(host: HostConfig, config_path: PathBuf) -> Self {
+        let paths = Paths::resolve(&host, &config_path);
+        Self {
+            host,
+            config_path,
+            paths,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOST: &str = r#"
+[ingress]
+mode = "behind"
+bind = "172.17.0.1:8080"
+[admin]
+socket = "/run/x/admin.sock"
+[webhook]
+listen = "0.0.0.0:9180"
+domain = "w.example.eu"
+"#;
+
+    #[test]
+    fn paths_default_next_to_config() {
+        let host = HostConfig::from_toml_str(HOST).unwrap();
+        let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
+        assert_eq!(p.state.apps, Path::new("/etc/weglarka/apps.toml"));
+        assert_eq!(p.secrets, Path::new("/etc/weglarka/secrets.toml"));
+        assert_eq!(p.nginx_conf_dir, Path::new("/etc/weglarka/nginx"));
+    }
+
+    #[test]
+    fn state_dir_overrides_default() {
+        let host =
+            HostConfig::from_toml_str(&format!("{HOST}\n[state]\ndir = \"/var/lib/weglarka\"\n"))
+                .unwrap();
+        let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
+        assert_eq!(p.state.state, Path::new("/var/lib/weglarka/state.toml"));
+        assert_eq!(p.secrets, Path::new("/var/lib/weglarka/secrets.toml"));
+    }
+}

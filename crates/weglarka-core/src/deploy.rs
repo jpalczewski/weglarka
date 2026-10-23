@@ -271,6 +271,7 @@ impl<P: PodmanClient> Reconciler<P> {
             publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
+            mounts: vec![],
         };
         let started = async {
             self.podman.container_create(&container).await?;

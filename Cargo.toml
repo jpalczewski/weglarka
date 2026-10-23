@@ -25,10 +25,12 @@ weglarka-ingress = { path = "crates/weglarka-ingress" }
 
 # zewnętrzne
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 clap = { version = "4", features = ["derive"] }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
+hmac = "0.13"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }

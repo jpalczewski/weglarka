@@ -61,10 +61,13 @@ impl<'a> Context<'a> {
             .map_or(PlatformKind::Systemd, |c| c.platform.kind);
         let user = parse::lookup_user(host, &runtime.user);
         let secrets_path = secrets_file.unwrap_or_else(|| {
-            config_path
+            let config_dir = config_path
                 .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("secrets.toml")
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let dir = config
+                .as_ref()
+                .map_or_else(|| config_dir.to_owned(), |c| c.state.dir_or(config_dir));
+            dir.join("secrets.toml")
         });
         Self {
             host,
