@@ -1,0 +1,132 @@
+name: Release
+
+# main → ghcr.io/jpalczewski/weglarka:main + :sha-<7>; tag v* → :<wersja> + :latest oraz assety GitHub Release.
+# Decyzje: docs/decisions/0006-pakowanie-obrazy-i-release.md
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  IMAGE: ghcr.io/jpalczewski/weglarka
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless (OIDC GitHub)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag zgodny z wersją workspace
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver=$(awk -F'"' '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f&&/^version/{print $2}' Cargo.toml)
+          [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != workspace version v$ver"; exit 1; }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+      - uses: sigstore/cosign-installer@v3
+      - name: Podpis obrazu (keyless)
+        run: cosign sign --yes "$IMAGE@${{ steps.build.outputs.digest }}"
+      - name: SBOM (SPDX) jako atestacja cosign
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+      - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE@${{ steps.build.outputs.digest }}"
+
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            packages: "-p weglarka-cli -p weglarka-daemon"
+            files: "weglarka weglarka-daemon"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            packages: "-p weglarka-cli"
+            files: "weglarka"
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
+      - name: Pakowanie
+        run: |
+          set -euo pipefail
+          name="weglarka-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          for f in ${{ matrix.files }}; do cp "target/${{ matrix.target }}/release/$f" "dist/$name/"; done
+          cp LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [image, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # GitHub Release
+      id-token: write # cosign sign-blob
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: Sumy SHA-256
+        working-directory: dist
+        run: sha256sum ./*.tar.gz | tee SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Podpis SHA256SUMS (keyless)
+        working-directory: dist
+        run: cosign sign-blob --yes --output-signature SHA256SUMS.sig --output-certificate SHA256SUMS.pem SHA256SUMS
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag dist/*

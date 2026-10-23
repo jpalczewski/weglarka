@@ -4,7 +4,7 @@ Lekki deploy-tool w Ruście zarządzający **rootless Podmanem 6**: deklaratywny
 pętla reconcile, nginx w kontenerze, auto-update po webhooku GitHub (GHCR), health gate z rollbackiem.
 Alternatywa dla Coolify na małym VPS-ie (priorytety: bezpieczeństwo, rozszerzalny kod, mało RAM-u).
 
-Status: **fundament** — typy domenowe, traity, kontrakt API i szkielety crate'ów; logika w drodze.
+Status: **MVP** — demon, CLI, klient Podmana, ingress i pakowanie gotowe; wdrożenie na hoście w toku.
 
 ## Workspace
 
@@ -17,6 +17,12 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 ```
 
 Konwencje i podział pracy: [CLAUDE.md](CLAUDE.md). Decyzje implementacyjne: [docs/decisions](docs/decisions).
+
+## Instalacja
+
+Obraz `ghcr.io/jpalczewski/weglarka` (kontener rootless Podmana, quadlet systemd) + CLI `weglarka`
+z assetów GitHub Release: wymagania hosta, `weglarka.toml`, start, CLI przez tunel SSH, pierwsza apka
+(ntfy.zig), webhook GitHub, weryfikacja podpisu i rollback — [docs/install.md](docs/install.md).
 
 ## Licencja
 
