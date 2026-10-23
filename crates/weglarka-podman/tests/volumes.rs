@@ -571,7 +571,21 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
         client.container_inspect(&instance).await.unwrap().state,
         ContainerState::Running
     );
-    assert_eq!(sh(r#"test "$(stat -c %u /data/imported.txt)" = 1000 && grep -q coolify /data/imported.txt"#).await, 0);
+    assert_eq!(
+        sh("test -f /data/imported.txt").await,
+        0,
+        "imported file exists"
+    );
+    assert_eq!(
+        sh("grep -q coolify /data/imported.txt").await,
+        0,
+        "imported file content"
+    );
+    assert_eq!(
+        sh("test \"$(stat -c %u /data/imported.txt)\" = 1000").await,
+        0,
+        "owner is uid 1000"
+    );
     assert!(
         client
             .container_inspect(&format!("wg-import.{instance}"))
