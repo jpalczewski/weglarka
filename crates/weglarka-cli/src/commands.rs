@@ -159,6 +159,8 @@ fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         env: a.env.iter().cloned().collect(),
         secrets,
         health: HealthGate::default(),
+        volumes: vec![],
+        resources: Default::default(),
         auto_update: !a.no_auto_update,
     })
 }

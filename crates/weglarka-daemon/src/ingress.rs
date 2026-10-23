@@ -365,6 +365,10 @@ impl<P: PodmanClient> IngressManager<P> {
                     target: NGINX_CONF_MOUNT.to_owned(),
                     read_only: true,
                 }],
+                volumes: vec![],
+                resources: Default::default(),
+                healthcheck: None,
+                id_mapping: None,
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;

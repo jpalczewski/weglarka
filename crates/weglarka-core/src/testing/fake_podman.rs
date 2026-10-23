@@ -4,15 +4,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use bytes::Bytes;
 use futures_core::Stream;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use sha2::{Digest as _, Sha256};
 
 use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
     ImageInfo, NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result,
-    VersionInfo,
+    TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -49,6 +50,14 @@ pub enum Call {
     SecretCreate(String),
     SecretRemove(String),
     HealthcheckRun(String),
+    VolumeCreate(String),
+    VolumeImport(String),
+    VolumeExport(String),
+    VolumeRemove(String),
+    ContainerArchivePut {
+        name: String,
+        path: String,
+    },
 }
 
 #[derive(Default)]
@@ -60,6 +69,10 @@ struct State {
     pull_failures: BTreeMap<String, String>,
     networks: BTreeMap<String, (NetworkSpec, Vec<String>)>,
     secrets: BTreeMap<String, Vec<u8>>,
+    /// Volumes with the tar bytes last imported (the fake does not model file contents).
+    volumes: BTreeMap<String, (VolumeInfo, Vec<u8>)>,
+    /// The spec each live container was created from.
+    container_specs: BTreeMap<String, ContainerSpec>,
     /// Exit code returned by `container_exec` (default 0).
     exec_exit_codes: BTreeMap<String, i32>,
     health_scripts: BTreeMap<String, VecDeque<HealthStatus>>,
@@ -135,6 +148,19 @@ impl FakePodman {
     pub fn containers(&self) -> Vec<ContainerInfo> {
         let s = self.lock();
         s.containers.values().map(|c| s.with_networks(c)).collect()
+    }
+
+    /// The spec the container was created from (iteration 2: mounts, limits, healthcheck, id map).
+    pub fn container_spec(&self, name: &str) -> Option<ContainerSpec> {
+        self.lock().container_specs.get(name).cloned()
+    }
+
+    pub fn volumes(&self) -> Vec<VolumeInfo> {
+        self.lock()
+            .volumes
+            .values()
+            .map(|(v, _)| v.clone())
+            .collect()
     }
 
     pub fn has_secret(&self, name: &str) -> bool {
@@ -227,6 +253,20 @@ impl PodmanClient for FakePodman {
             }
         }
         let id = s.next_id();
+        // Like Podman, a named volume that does not exist yet is created implicitly (no labels).
+        for att in &spec.volumes {
+            s.volumes.entry(att.volume.clone()).or_insert_with(|| {
+                (
+                    VolumeInfo {
+                        name: att.volume.clone(),
+                        labels: BTreeMap::new(),
+                        mountpoint: Some(format!("/fake/volumes/{}/_data", att.volume)),
+                    },
+                    Vec::new(),
+                )
+            });
+        }
+        s.container_specs.insert(spec.name.clone(), spec.clone());
         for net in &spec.networks {
             if let Some((_, members)) = s.networks.get_mut(net) {
                 members.push(spec.name.clone());
@@ -277,6 +317,7 @@ impl PodmanClient for FakePodman {
             )));
         }
         s.containers.remove(name);
+        s.container_specs.remove(name);
         for (_, members) in s.networks.values_mut() {
             members.retain(|m| m != name);
         }
@@ -317,6 +358,24 @@ impl PodmanClient for FakePodman {
             )));
         }
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
+    }
+
+    async fn container_archive_put(
+        &self,
+        name: &str,
+        path: &str,
+        mut tar: TarStream,
+    ) -> Result<()> {
+        while let Some(chunk) = tar.next().await {
+            chunk?;
+        }
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerArchivePut {
+            name: name.to_owned(),
+            path: path.to_owned(),
+        });
+        s.container_mut(name)?;
+        Ok(())
     }
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
@@ -481,6 +540,95 @@ impl PodmanClient for FakePodman {
             .remove(name)
             .map(|_| ())
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))
+    }
+
+    async fn volume_create(&self, spec: &VolumeSpec) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::VolumeCreate(spec.name.clone()));
+        s.volumes.entry(spec.name.clone()).or_insert_with(|| {
+            (
+                VolumeInfo {
+                    name: spec.name.clone(),
+                    labels: spec.labels.clone(),
+                    mountpoint: Some(format!("/fake/volumes/{}/_data", spec.name)),
+                },
+                Vec::new(),
+            )
+        });
+        Ok(())
+    }
+
+    async fn volume_inspect(&self, name: &str) -> Result<VolumeInfo> {
+        self.lock()
+            .volumes
+            .get(name)
+            .map(|(v, _)| v.clone())
+            .ok_or_else(|| PodmanError::NotFound(format!("volume {name}")))
+    }
+
+    async fn volume_list(&self, filter: &VolumeFilter) -> Result<Vec<VolumeInfo>> {
+        Ok(self
+            .lock()
+            .volumes
+            .values()
+            .map(|(v, _)| v)
+            .filter(|v| {
+                filter
+                    .labels
+                    .iter()
+                    .all(|(k, val)| v.labels.get(k) == Some(val))
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn volume_import(&self, name: &str, mut tar: TarStream) -> Result<()> {
+        // The stream is drained outside the lock: a producer may be slow.
+        let mut data = Vec::new();
+        while let Some(chunk) = tar.next().await {
+            data.extend_from_slice(&chunk?);
+        }
+        let mut s = self.lock();
+        s.calls.push(Call::VolumeImport(name.to_owned()));
+        let (_, stored) = s
+            .volumes
+            .get_mut(name)
+            .ok_or_else(|| PodmanError::NotFound(format!("volume {name}")))?;
+        *stored = data;
+        Ok(())
+    }
+
+    async fn volume_export(&self, name: &str) -> Result<TarStream> {
+        let mut s = self.lock();
+        s.calls.push(Call::VolumeExport(name.to_owned()));
+        let (_, data) = s
+            .volumes
+            .get(name)
+            .ok_or_else(|| PodmanError::NotFound(format!("volume {name}")))?;
+        // Two chunks, so consumers are exercised with a real stream.
+        let (head, tail) = data.split_at(data.len() / 2);
+        let chunks = vec![
+            Ok(Bytes::copy_from_slice(head)),
+            Ok(Bytes::copy_from_slice(tail)),
+        ];
+        Ok(stream::iter(chunks).boxed())
+    }
+
+    async fn volume_remove(&self, name: &str, force: bool) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::VolumeRemove(name.to_owned()));
+        if !s.volumes.contains_key(name) {
+            return Err(PodmanError::NotFound(format!("volume {name}")));
+        }
+        let in_use = s
+            .container_specs
+            .values()
+            .any(|c| c.volumes.iter().any(|v| v.volume == name));
+        if in_use && !force {
+            return Err(PodmanError::Conflict(format!("volume {name} is in use")));
+        }
+        s.volumes.remove(name);
+        Ok(())
     }
 
     async fn healthcheck_run(&self, container: &str) -> Result<HealthStatus> {

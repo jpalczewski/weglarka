@@ -1,0 +1,44 @@
+---
+source: crates/weglarka-podman/src/wire.rs
+expression: "CreateContainer::new(&spec)"
+---
+{
+  "name": "pogoda",
+  "image": "i",
+  "restart_policy": "always",
+  "userns": {
+    "nsmode": "private"
+  },
+  "idmappings": {
+    "UIDMap": [
+      {
+        "container_id": 0,
+        "host_id": 65537,
+        "size": 65536
+      }
+    ],
+    "GIDMap": [
+      {
+        "container_id": 0,
+        "host_id": 65537,
+        "size": 65536
+      }
+    ],
+    "HostUIDMapping": false,
+    "HostGIDMapping": false
+  },
+  "volumes": [
+    {
+      "Name": "pogoda.data",
+      "Dest": "/data",
+      "Options": []
+    },
+    {
+      "Name": "pogoda.cfg",
+      "Dest": "/cfg",
+      "Options": [
+        "ro"
+      ]
+    }
+  ]
+}

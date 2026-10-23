@@ -7,15 +7,16 @@ use futures_util::stream;
 use hyper::Method;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
-    NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result,
-    VersionInfo,
+    NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result, TarStream,
+    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
-    ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreatedContainer, CreatedExec,
-    DisconnectNetwork, HealthReport, InspectContainer, InspectExec, InspectImage, InspectNetwork,
-    ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent, decode, health_status,
+    ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
+    CreatedExec, DisconnectNetwork, HealthReport, InspectContainer, InspectExec, InspectImage,
+    InspectNetwork, ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent,
+    WireVolume, decode, health_status,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -134,6 +135,18 @@ impl PodmanClient for LibpodClient {
         Err(PodmanError::Protocol(format!(
             "exec in {name} did not finish in time"
         )))
+    }
+
+    async fn container_archive_put(&self, name: &str, path: &str, tar: TarStream) -> Result<()> {
+        let path = format!(
+            "/containers/{}/archive?path={}",
+            path_name(name)?,
+            encode_component(path)
+        );
+        self.transport
+            .call_streaming_body(Method::PUT, &path, "application/x-tar", tar)
+            .await?;
+        Ok(())
     }
 
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
@@ -259,6 +272,55 @@ impl PodmanClient for LibpodClient {
 
     async fn secret_remove(&self, name: &str) -> Result<()> {
         let path = format!("/secrets/{}", path_name(name)?);
+        self.transport.call(Method::DELETE, &path, None).await?;
+        Ok(())
+    }
+
+    async fn volume_create(&self, spec: &VolumeSpec) -> Result<()> {
+        match self
+            .transport
+            .call_json(Method::POST, "/volumes/create", &CreateVolume::new(spec))
+            .await
+            .map_err(name_conflict)
+        {
+            // Idempotent — the trait contract.
+            Ok(_) | Err(PodmanError::Conflict(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn volume_inspect(&self, name: &str) -> Result<VolumeInfo> {
+        let path = format!("/volumes/{}/json", path_name(name)?);
+        let body = self.transport.call(Method::GET, &path, None).await?;
+        Ok(decode::<WireVolume>(&body)?.into_domain())
+    }
+
+    async fn volume_list(&self, filter: &VolumeFilter) -> Result<Vec<VolumeInfo>> {
+        let mut path = String::from("/volumes/json");
+        if let Some(filters) = label_filters(&filter.labels) {
+            path.push_str("?filters=");
+            path.push_str(&filters);
+        }
+        let body = self.transport.call(Method::GET, &path, None).await?;
+        let volumes: Vec<WireVolume> = decode(&body)?;
+        Ok(volumes.into_iter().map(WireVolume::into_domain).collect())
+    }
+
+    async fn volume_import(&self, name: &str, tar: TarStream) -> Result<()> {
+        let path = format!("/volumes/{}/import", path_name(name)?);
+        self.transport
+            .call_streaming_body(Method::POST, &path, "application/x-tar", tar)
+            .await?;
+        Ok(())
+    }
+
+    async fn volume_export(&self, name: &str) -> Result<TarStream> {
+        let path = format!("/volumes/{}/export", path_name(name)?);
+        self.transport.bytes_stream(Method::GET, &path).await
+    }
+
+    async fn volume_remove(&self, name: &str, force: bool) -> Result<()> {
+        let path = format!("/volumes/{}?force={force}", path_name(name)?);
         self.transport.call(Method::DELETE, &path, None).await?;
         Ok(())
     }

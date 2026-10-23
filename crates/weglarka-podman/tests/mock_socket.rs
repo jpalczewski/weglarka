@@ -156,6 +156,10 @@ async fn not_found_and_name_conflict() {
         restart: weglarka_core::podman::RestartPolicy::No,
         userns_auto: false,
         mounts: vec![],
+        volumes: vec![],
+        resources: Default::default(),
+        healthcheck: None,
+        id_mapping: None,
     };
     assert!(
         matches!(client.container_create(&spec).await, Err(PodmanError::Conflict(m)) if m.contains("already in use"))
@@ -351,4 +355,66 @@ async fn exec_runs_detached_and_returns_exit_code_and_disconnect_is_idempotent()
             .any(|r| r.contains(r#"{"Cmd":["nginx","-t"]}"#))
     );
     assert!(requests.iter().any(|r| r.contains(r#"{"Detach":true}"#)));
+}
+
+#[tokio::test]
+async fn volume_calls_use_libpod_paths_and_map_results() {
+    use weglarka_core::podman::{VolumeFilter, VolumeSpec};
+    let mock = serve(vec![
+        (
+            "POST /v6.0.0/libpod/volumes/create",
+            201,
+            r#"{"Name":"app.data"}"#,
+        ),
+        (
+            "GET /v6.0.0/libpod/volumes/app.data/json",
+            200,
+            r#"{"Name":"app.data","Mountpoint":"/v/app.data/_data","Labels":{"weglarka.instance":"app"},"Extra":1}"#,
+        ),
+        (
+            "GET /v6.0.0/libpod/volumes/json?filters=",
+            200,
+            r#"[{"Name":"app.data","Labels":null,"Mountpoint":""}]"#,
+        ),
+        (
+            "GET /v6.0.0/libpod/volumes/app.data/export",
+            200,
+            "TARBYTES",
+        ),
+        (
+            "GET /v6.0.0/libpod/volumes/gone/json",
+            404,
+            fixture!("error_404.json"),
+        ),
+        ("DELETE /v6.0.0/libpod/volumes/app.data?force=true", 204, ""),
+    ]);
+    let client = LibpodClient::new(&mock.socket);
+    let labels =
+        std::collections::BTreeMap::from([("weglarka.instance".to_owned(), "app".to_owned())]);
+    client
+        .volume_create(&VolumeSpec {
+            name: "app.data".into(),
+            labels: labels.clone(),
+        })
+        .await
+        .unwrap();
+    let info = client.volume_inspect("app.data").await.unwrap();
+    assert_eq!(info.labels, labels);
+    assert_eq!(info.mountpoint.as_deref(), Some("/v/app.data/_data"));
+    assert!(matches!(
+        client.volume_inspect("gone").await,
+        Err(PodmanError::NotFound(_))
+    ));
+    let listed = client.volume_list(&VolumeFilter { labels }).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].labels.is_empty() && listed[0].mountpoint.is_none());
+    let mut chunks = Vec::new();
+    let mut tar = client.volume_export("app.data").await.unwrap();
+    while let Some(chunk) = tar.next().await {
+        chunks.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(chunks, b"TARBYTES");
+    client.volume_remove("app.data", true).await.unwrap();
+    assert!(client.volume_export("../x").await.is_err());
+    assert!(mock.requests()[0].contains(r#""Name":"app.data""#));
 }

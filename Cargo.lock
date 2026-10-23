@@ -1036,6 +1036,7 @@ dependencies = [
 name = "weglarka-core"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "futures-core",
  "futures-util",
  "hex",
@@ -1094,6 +1095,7 @@ dependencies = [
 name = "weglarka-podman"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "futures-core",
  "futures-util",
  "http-body-util",

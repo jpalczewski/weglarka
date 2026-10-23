@@ -39,6 +39,9 @@ pub enum RuntimeState {
     Stopped,
     Missing,
     Unhealthy,
+    /// No container yet: the deploy waits for secrets bound in the spec that are not set
+    /// (`AppState::waiting_for_secrets` lists them). Setting the last one deploys the app.
+    WaitingForSecret,
 }
 
 /// App summary in a list.
@@ -69,6 +72,51 @@ pub struct ShowAppResponse {
     pub spec: AppSpec,
     pub state: AppState,
     pub runtime: RuntimeState,
+}
+
+/// `PUT /v1/apps/{name}`: **full replacement** of the instance's spec (not a patch). The client reads
+/// the spec (`GET`), changes it and sends it back; omitted optional fields are cleared. Chosen over
+/// `PATCH` because merge semantics for maps, lists and "set to null" are not worth the ambiguity.
+/// The daemon validates, persists to `apps.toml` and reconciles: a changed `spec_hash` recreates the
+/// container (rollback via the health gate as for any deploy); a change of only domains or gate
+/// settings applies without a recreate. Owner: session 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateAppRequest {
+    pub spec: AppSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateAppResponse {
+    pub app: ShowAppResponse,
+    /// `Some` when the update caused a (re)deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<DeployResponse>,
+}
+
+/// Query of `DELETE /v1/apps/{name}`: `?purge_volumes=true` also deletes the instance's named volumes.
+/// Without it volumes are kept (data survives `remove` + `add`). Owner: session 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveAppQuery {
+    #[serde(default)]
+    pub purge_volumes: bool,
+}
+
+/// A volume declared in the app's spec, with what Podman knows about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeSummary {
+    /// Name within the instance (`VolumeMount::name`).
+    pub name: String,
+    /// Mount path in the container.
+    pub target: String,
+    /// Podman volume name (`<instance>.<name>`).
+    pub podman_name: String,
+    /// `false` until the first deploy creates it.
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListVolumesResponse {
+    pub volumes: Vec<VolumeSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

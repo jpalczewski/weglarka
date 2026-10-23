@@ -45,7 +45,7 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → ap
 
 | Crate | Zawartość | Właściciel |
 |---|---|---|
-| `weglarka-core` | typy domenowe, traity, fake | **sesja b** |
+| `weglarka-core` | typy domenowe, traity, fake | **sesja b** (iteracja 2: patrz sekcja niżej) |
 | ↳ `src/{reconcile,deploy,state,secrets}.rs` | logika (zalążki) | b |
 | ↳ `src/{app,config,hash,labels,platform,webhook,secret_store}.rs` | kontrakt/typy domenowe z fundamentu | b (zmiany addytywne; łamiące — świadomie, z poprawką wszystkich konsumentów) |
 | ↳ `src/podman.rs`, `src/testing/` | kontrakt `PodmanClient` + fake | współdzielone a/b: **a** może dodawać pola/metody potrzebne klientowi, **b** fake'a; zmiany tylko addytywne i zawsze z aktualizacją `FakePodman` |
@@ -58,6 +58,23 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → ap
 
 Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo.toml` (jedna linijka,
 mała szansa na konflikt) i odwołaj się przez `.workspace = true`.
+
+## Iteracja 2 — własność plików (sesje 1–3 równolegle)
+
+Kontrakt (krok 0) jest w `main`; źródło prawdy zakresu: Kajet `brpDCgX`, decyzja o UID: `docs/decisions/0009-volume-ownership.md`.
+Każda sesja pisze **tylko w swoich plikach**; w plikach współdzielonych (`deploy.rs`, `admin.rs`, `cli.rs`,
+`commands.rs`) wolno dodać **jedną linię-hak** (wywołanie / `mod` / wariant / `.merge(...)`) — logika zostaje w pliku sesji.
+
+| Sesja | Zakres | Pliki własne |
+|---|---|---|
+| **1 — wolumeny** | tworzenie/podpinanie przy deployu, strategia UID z ADR 0009, import/eksport, `--purge-volumes` | `core/src/volumes.rs`, `daemon/src/volumes.rs`, `cli/src/volumes.rs`, `weglarka-podman/tests/volumes.rs` |
+| **2 — limity + health** | limity w spec kontenera, `health.command`, sonda HTTP w bramce | `core/src/limits.rs`, `daemon/src/health_probe.rs`, w `weglarka-podman/src/wire.rs` tylko bloki `resource_limits` / `healthconfig` |
+| **3 — CLI/API** | `apps update`, stan „czeka na sekret”, docs `secrets set < plik` | `daemon/src/update.rs`, `cli/src/update.rs`, `docs/install.md` |
+
+Hooki jednoliniowe (kto je dodaje): `deploy.rs` — wywołanie `volumes::ensure_volumes`/`attachments` i `limits::container_healthcheck` przy budowie `ContainerSpec` (1, 2); gate zdrowia w `deploy.rs` woła sondę HTTP z `health_probe.rs` (2);
+`admin.rs::router` — `.merge(volumes::routes())` (1), `put(update::update_app)` na trasie `APPS_SHOW` (3); `cli.rs`/`commands.rs` — wariant `Volumes` (1), wariant `apps update` (3).
+Stan „czeka na sekret”: `AppState::waiting_for_secrets` (3 ustawia, 1 i 2 nie dotykają). Zmiany kontraktu (`app.rs`, `podman.rs`, `api/`) —
+tylko addytywne i uzgodnione z autorem kroku 0 (sesja zlecająca); `FakePodman` aktualizuje ten, kto dodaje metodę.
 
 ## Testy
 

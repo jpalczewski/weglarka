@@ -7,6 +7,8 @@ mod error;
 mod output;
 mod preflight;
 mod settings;
+mod update;
+mod volumes;
 
 #[cfg(test)]
 mod tests;
