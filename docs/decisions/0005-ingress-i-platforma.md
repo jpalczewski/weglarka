@@ -33,3 +33,20 @@ Instalacja: `weglarka-daemon platform install [--dry-run]` jako user runtime'u. 
 muteksu silnika; mutacje czekają na niego maks. 30 s, potem 409 (`conflict`) — deploy z bramką zdrowia nie
 zawiesza API. `POST …/deploy` próbuje najpierw zwykłego deployu, a przy znanym złym digeście ponawia z `force`
 (ręczne wywołanie = wola operatora); `image_ref` w żądaniu → 400 (poza MVP); `Failed` → 500 z powodem.
+
+**Aktualizacja: socket Podmana i utwardzenie quadletu (sesja quadlet-fix).**
+- Obraz jest na `scratch` — bez `/etc/passwd`. `weglarka-daemon run` **nigdy** nie czyta plików użytkowników:
+  socket Podmana bierze z `[runtime] socket`, a gdy go brak, ze zmiennej `WEGLARKA_PODMAN_SOCKET`; bez obu kończy
+  się czytelnym błędem. `platform install` (na hoście, gdzie `/etc/passwd` jest) wylicza socket i wpisuje go
+  do quadletu jako `Environment=WEGLARKA_PODMAN_SOCKET=…` — socket jest montowany pod tą samą ścieżką, więc ten sam
+  `weglarka.toml` działa dla demona w kontenerze i dla CLI na hoście, bez `runtime.socket`.
+  Wariant ze stałą ścieżką w kontenerze odrzucony: wymagałby osobnego configu dla CLI.
+- Quadlet: `ReadOnly=true` + `Tmpfs=/tmp`, `DropCapability=ALL`, `NoNewPrivileges=true`,
+  `PodmanArgs=--memory=<M> --memory-swap=<M>` (swap = limit, host swapuje), `PidsLimit=<N>`.
+  Demon pisze tylko w montowanych katalogach (stan, admin socket, nginx.conf, plik Traefika), więc nie potrzebuje
+  zapisu root FS. `[platform] memory` (domyślnie `128M`) i `pids_limit` (256) są konfigurowalne; 128M to szacunek
+  (statyczny demon na tokio, current_thread, kilka–kilkanaście MB RSS) z dużym zapasem, nie pomiar.
+- `weglarka-daemon platform run-args` drukuje te same opcje jako argumenty `podman run`; smoke test w CI
+  (`.github/scripts/smoke-quadlet.sh`) uruchamia obraz dokładnie z nich, z configiem bez `runtime.socket`.
+- Poza zakresem (follow-up): utwardzenie kontenera `weglarka-nginx` tworzonego przez demona (cap drop, limit
+  pamięci) — wymaga rozszerzenia `ContainerSpec` i wire'u libpod.

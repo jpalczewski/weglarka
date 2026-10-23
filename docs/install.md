@@ -77,7 +77,17 @@ domain = "weglarka.descriptortable.eu"                     # wystawiane są tylk
 
 [state]
 dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
+
+[platform]
+kind = "systemd"
+memory = "128M"                                            # limit pamięci kontenera Węglarki (z swapem); domyślnie 128M
+pids_limit = 256                                           # limit procesów/wątków; domyślnie 256
 ```
+
+`[runtime] socket` **nie jest potrzebny**: `platform install` wylicza socket na hoście (`/run/user/<uid>/podman/podman.sock`)
+i przekazuje go kontenerowi zmienną `WEGLARKA_PODMAN_SOCKET` w quadlecie. Jawne `socket` ma pierwszeństwo przed zmienną.
+Demon w kontenerze nie czyta `/etc/passwd` (obraz jest na `scratch`); bez socketu w configu i bez zmiennej kończy się
+czytelnym błędem.
 
 ## 3. Binarki na hoście (`platform install`)
 
@@ -125,6 +135,31 @@ systemctl --user start weglarka.service
 systemctl --user status weglarka.service
 podman logs weglarka                                                              # JSON, bez sekretów
 ```
+
+Wygenerowany quadlet (przykład dla `weglarka`, UID 1004) jest utwardzony: root FS tylko do odczytu (`ReadOnly=true`,
+`Tmpfs=/tmp`), `DropCapability=ALL`, `NoNewPrivileges=true`, limit pamięci (`PodmanArgs=--memory=128M --memory-swap=128M`)
+i `PidsLimit=256`:
+
+```ini
+[Container]
+Image=ghcr.io/jpalczewski/weglarka:latest
+ContainerName=weglarka
+Network=net-weglarka.network
+Volume=/run/user/1004/podman/podman.sock:/run/user/1004/podman/podman.sock
+Volume=/var/lib/weglarka:/var/lib/weglarka
+Volume=/etc/weglarka/weglarka.toml:/etc/weglarka/weglarka.toml:ro
+Environment=RUST_LOG=info
+Environment=WEGLARKA_PODMAN_SOCKET=/run/user/1004/podman/podman.sock
+ReadOnly=true
+Tmpfs=/tmp
+DropCapability=ALL
+NoNewPrivileges=true
+PodmanArgs=--memory=128M --memory-swap=128M
+PidsLimit=256
+Exec=run --config /etc/weglarka/weglarka.toml
+```
+
+(pełny plik: `platform install --dry-run`; te same opcje jako argumenty `podman run`: `platform run-args`).
 
 Quadlet ma `WantedBy=default.target` — z lingerem usługa wstaje po restarcie hosta. Przy starcie demon zakłada
 sieć `net-weglarka`, ciągnie i uruchamia kontener `weglarka-nginx` na `bind` i zapisuje plik Traefika.

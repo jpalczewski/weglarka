@@ -184,6 +184,38 @@ async fn deploy_without_changes_is_unchanged_and_new_digest_moves_pointers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn rollback_uses_local_image_when_registry_cannot_serve_it() {
+    let h = Harness::new(NTFY);
+    let ntfy = name("ntfy");
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+    h.rec.reconcile().await.unwrap();
+
+    // The old version is no longer addressable as repo@digest and the registry no longer serves it.
+    let pinned = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('a'));
+    h.fake.image_remove(&pinned).await.unwrap();
+    h.fake.fail_pull(&pinned, "manifest unknown");
+
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_health(
+        "ntfy",
+        [
+            HealthStatus::Unhealthy,
+            HealthStatus::Unhealthy,
+            HealthStatus::Unhealthy,
+            HealthStatus::Healthy,
+        ],
+    );
+    let out = h.rec.deploy(&ntfy, false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::RolledBack { restored, .. } if *restored == digest('a')),
+        "{out:?}"
+    );
+    assert_eq!(h.state("ntfy").current, Some(digest('a')));
+    assert!(!h.fake.calls().contains(&Call::ImagePull(pinned)));
+}
+
+#[tokio::test(start_paused = true)]
 async fn failed_health_gate_rolls_back_and_marks_state() {
     let h = Harness::new(NTFY);
     let ntfy = name("ntfy");

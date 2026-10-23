@@ -165,9 +165,11 @@ jobs:
           ref=$(podman load -q -i "$RUNNER_TEMP/weglarka-image.tar" | tail -1 | sed 's/^Loaded image[^:]*: //')
           podman tag "$ref" localhost/weglarka:ci
           podman images
-      - run: cargo build -p weglarka-cli
+      - run: cargo build -p weglarka-cli -p weglarka-daemon
       - name: Smoke test obrazu
         run: .github/scripts/smoke-image.sh localhost/weglarka:ci target/debug/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
+      - name: Smoke test obrazu z argumentów quadletu (bez runtime.socket, z utwardzeniem)
+        run: .github/scripts/smoke-quadlet.sh localhost/weglarka:ci target/debug/weglarka target/debug/weglarka-daemon "$WEGLARKA_PODMAN_SOCKET"
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true
