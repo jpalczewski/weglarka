@@ -1,0 +1,26 @@
+---
+source: crates/weglarka-daemon/src/platform.rs
+expression: "run_args(&spec()).unwrap().join(\"\\n\")"
+---
+--name
+weglarka
+--network
+net-weglarka
+--volume
+/run/user/1001/podman/podman.sock:/run/user/1001/podman/podman.sock
+--volume
+/etc/weglarka/weglarka.toml:/etc/weglarka/weglarka.toml:ro
+--env
+RUST_LOG=info
+--read-only
+--tmpfs
+/tmp
+--cap-drop=ALL
+--security-opt=no-new-privileges
+--memory=128M
+--memory-swap=128M
+--pids-limit=256
+ghcr.io/jpalczewski/weglarka:latest
+run
+--config
+/etc/weglarka/weglarka.toml

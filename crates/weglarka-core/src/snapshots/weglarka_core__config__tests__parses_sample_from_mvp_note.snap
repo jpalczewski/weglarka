@@ -21,7 +21,9 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
     "domain": "weglarka.descriptortable.eu"
   },
   "platform": {
-    "kind": "systemd"
+    "kind": "systemd",
+    "memory": "128M",
+    "pids_limit": 256
   },
   "state": {}
 }

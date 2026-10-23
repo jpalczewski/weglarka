@@ -137,11 +137,25 @@ pub enum PlatformKind {
 pub struct PlatformConfig {
     #[serde(default = "PlatformConfig::default_kind")]
     pub kind: PlatformKind,
+    /// Limit pamięci kontenera Węglarki (`podman run --memory`), np. `"128M"`; zawiera też swap.
+    #[serde(default = "PlatformConfig::default_memory")]
+    pub memory: String,
+    /// Limit liczby procesów/wątków kontenera Węglarki (`--pids-limit`).
+    #[serde(default = "PlatformConfig::default_pids_limit")]
+    pub pids_limit: u32,
 }
 
 impl PlatformConfig {
     fn default_kind() -> PlatformKind {
         PlatformKind::Systemd
+    }
+
+    pub fn default_memory() -> String {
+        "128M".to_owned()
+    }
+
+    fn default_pids_limit() -> u32 {
+        256
     }
 }
 
@@ -149,6 +163,8 @@ impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
             kind: Self::default_kind(),
+            memory: Self::default_memory(),
+            pids_limit: Self::default_pids_limit(),
         }
     }
 }
