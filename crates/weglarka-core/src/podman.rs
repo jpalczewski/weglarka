@@ -266,6 +266,11 @@ pub struct ContainerFilter {
 pub trait PodmanClient: Send + Sync {
     fn version(&self) -> impl Future<Output = Result<VersionInfo>> + Send;
 
+    /// Number of subuids the Podman user may hand out (rootless: the sum of the non-zero entries of
+    /// `host.idMappings.uidmap` in `GET /info`). The daemon runs in a container and cannot read the
+    /// host's `/etc/subuid`, so the pool is asked of Podman itself. Feeds [`crate::uid_range::allocate`].
+    fn subuid_pool(&self) -> impl Future<Output = Result<u64>> + Send;
+
     // Containers
     fn container_create(&self, spec: &ContainerSpec)
     -> impl Future<Output = Result<String>> + Send;

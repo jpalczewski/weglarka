@@ -15,7 +15,7 @@ use crate::transport::{Lines, Transport, encode_component, name_conflict, path_n
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, InspectContainer, InspectExec, InspectImage,
-    InspectNetwork, ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent,
+    InspectNetwork, Info, ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent,
     WireVolume, decode, health_status,
 };
 
@@ -59,6 +59,11 @@ impl PodmanClient for LibpodClient {
     async fn version(&self) -> Result<VersionInfo> {
         let body = self.transport.call(Method::GET, "/version", None).await?;
         Ok(decode::<Version>(&body)?.into_domain())
+    }
+
+    async fn subuid_pool(&self) -> Result<u64> {
+        let body = self.transport.call(Method::GET, "/info", None).await?;
+        Ok(decode::<Info>(&body)?.subuid_pool())
     }
 
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {

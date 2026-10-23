@@ -32,6 +32,46 @@ struct Component {
     details: BTreeMap<String, String>,
 }
 
+/// `GET /info`: only the rootless uid map is used.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct Info {
+    host: InfoHost,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoHost {
+    #[serde(rename = "idMappings")]
+    id_mappings: InfoIdMappings,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoIdMappings {
+    uidmap: Vec<InfoIdRange>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoIdRange {
+    container_id: u64,
+    size: u64,
+}
+
+impl Info {
+    /// Subuids available to the rootless user: every uid map line except `0 → the user itself`.
+    pub(crate) fn subuid_pool(&self) -> u64 {
+        self.host
+            .id_mappings
+            .uidmap
+            .iter()
+            .filter(|r| r.container_id >= 1)
+            .map(|r| r.size)
+            .sum()
+    }
+}
+
 impl Version {
     /// The top-level `ApiVersion` is the compat version ("1.41"); the libpod version is in the Podman Engine component.
     pub(crate) fn into_domain(self) -> VersionInfo {
