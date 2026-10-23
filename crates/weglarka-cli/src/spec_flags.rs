@@ -1,5 +1,5 @@
-//! Spec flags shared by `apps add` and `apps update`: resource limits and volumes. Before these
-//! existed, limits and volumes could only be set through `--spec <file.toml>`.
+//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes and hardening.
+//! Before these existed, they could only be set through `--spec <file.toml>`.
 
 use clap::Args;
 use weglarka_core::app::{AppSpec, CpuLimit, MemoryLimit, VolumeMount, valid_volume_name};
@@ -26,6 +26,25 @@ pub struct SpecFlags {
     /// Named volume: NAME=/PATH[:ro] (repeatable; replaces a volume of that name).
     #[arg(long = "volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_volume, conflicts_with = "spec")]
     pub volumes: Vec<VolumeMount>,
+    /// Hardening preset: read-only root, all capabilities dropped, no-new-privileges. Combine with
+    /// --tmpfs for writable paths and --cap-add for what the app really needs.
+    #[arg(long, conflicts_with = "spec")]
+    pub hardened: bool,
+    /// Read-only root filesystem (writable tmpfs on /tmp, /var/tmp, /run).
+    #[arg(long, value_name = "true|false", conflicts_with = "spec")]
+    pub read_only: Option<bool>,
+    /// Extra writable tmpfs mount (repeatable; `none` clears the list).
+    #[arg(long, value_name = "PATH|none", conflicts_with = "spec")]
+    pub tmpfs: Vec<String>,
+    /// Capability to drop, e.g. ALL (repeatable; `none` clears the list).
+    #[arg(long, value_name = "CAP|none", conflicts_with = "spec")]
+    pub cap_drop: Vec<String>,
+    /// Capability to add back after --cap-drop (repeatable; `none` clears the list).
+    #[arg(long, value_name = "CAP|none", conflicts_with = "spec")]
+    pub cap_add: Vec<String>,
+    /// no-new-privileges (setuid and file capabilities cannot raise privileges).
+    #[arg(long, value_name = "true|false", conflicts_with = "spec")]
+    pub no_new_privileges: Option<bool>,
 }
 
 impl SpecFlags {
@@ -34,6 +53,12 @@ impl SpecFlags {
             && self.pids_limit.is_none()
             && self.cpus.is_none()
             && self.volumes.is_empty()
+            && !self.hardened
+            && self.read_only.is_none()
+            && self.tmpfs.is_empty()
+            && self.cap_drop.is_empty()
+            && self.cap_add.is_empty()
+            && self.no_new_privileges.is_none()
     }
 
     /// Applies the flags to `spec`; everything not mentioned is kept.
@@ -46,7 +71,48 @@ impl SpecFlags {
             spec.volumes.retain(|x| x.name != v.name);
             spec.volumes.push(v.clone());
         }
+        let sec = &mut spec.security;
+        if self.hardened {
+            sec.read_only = true;
+            sec.no_new_privileges = true;
+            if !sec.cap_drop.iter().any(|c| c == "ALL") {
+                sec.cap_drop.push("ALL".into());
+            }
+        }
+        if let Some(v) = self.read_only {
+            sec.read_only = v;
+        }
+        if let Some(v) = self.no_new_privileges {
+            sec.no_new_privileges = v;
+        }
+        extend_list(&mut sec.tmpfs, &self.tmpfs);
+        extend_list(&mut sec.cap_drop, &upper(&self.cap_drop));
+        extend_list(&mut sec.cap_add, &upper(&self.cap_add));
     }
+}
+
+/// `none` clears the list; other values are appended once each (the daemon validates them).
+fn extend_list(list: &mut Vec<String>, values: &[String]) {
+    for v in values {
+        if v.eq_ignore_ascii_case("none") {
+            list.clear();
+        } else if !list.contains(v) {
+            list.push(v.clone());
+        }
+    }
+}
+
+/// Capability names are case-insensitive on the command line; the spec stores them upper-case.
+fn upper(caps: &[String]) -> Vec<String> {
+    caps.iter()
+        .map(|c| {
+            if c.eq_ignore_ascii_case("none") {
+                c.clone()
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
 }
 
 fn apply<T: Clone>(slot: &mut Option<T>, flag: &Option<Limit<T>>) {
@@ -150,13 +216,54 @@ resources = { memory = "64m", pids_limit = 10 }
         let flags = SpecFlags {
             memory: Some(Limit::Set(MemoryLimit::parse("128m").unwrap())),
             pids_limit: Some(Limit::Unset),
-            cpus: None,
             volumes: vec![parse_volume("data=/data").unwrap()],
+            ..SpecFlags::default()
         };
         flags.apply(&mut spec);
+        assert!(
+            spec.security.is_default(),
+            "no hardening flags, no hardening"
+        );
         assert_eq!(spec.resources.memory.unwrap().bytes(), 128 << 20);
         assert_eq!(spec.resources.pids_limit, None);
         assert_eq!(spec.volumes.len(), 1);
         assert_eq!(spec.volumes[0].target, "/data");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn spec() -> AppSpec {
+        toml::from_str("image = \"i\"").unwrap()
+    }
+
+    #[test]
+    fn hardened_preset_then_adjustments() {
+        let mut s = spec();
+        SpecFlags {
+            hardened: true,
+            tmpfs: vec!["/cache".into()],
+            cap_add: vec!["net_bind_service".into()],
+            ..SpecFlags::default()
+        }
+        .apply(&mut s);
+        let sec = &s.security;
+        assert!(sec.read_only && sec.no_new_privileges);
+        assert_eq!(sec.cap_drop, ["ALL"]);
+        assert_eq!(sec.cap_add, ["NET_BIND_SERVICE"]);
+        assert_eq!(sec.tmpfs, ["/cache"]);
+
+        // Update: switch one thing off and clear a list.
+        SpecFlags {
+            read_only: Some(false),
+            cap_add: vec!["none".into()],
+            ..SpecFlags::default()
+        }
+        .apply(&mut s);
+        assert!(!s.security.read_only && s.security.no_new_privileges);
+        assert!(s.security.cap_add.is_empty());
+        assert_eq!(s.security.cap_drop, ["ALL"], "untouched");
     }
 }

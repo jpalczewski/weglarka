@@ -325,6 +325,41 @@ impl From<CpuLimit> for f64 {
     }
 }
 
+/// Container hardening, opt-in per app (nothing is applied by default, so existing apps keep their
+/// behaviour). Part of the spec hash only when something is set. Comparable to what Coolify applied
+/// to hardened services (`read_only`, `cap_drop: [ALL]`, `no-new-privileges`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Security {
+    /// Read-only root filesystem. Podman then mounts writable tmpfs on `/tmp`, `/var/tmp` and
+    /// `/run`; volumes and mounted secrets stay as declared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Extra writable tmpfs mounts (absolute paths), e.g. a cache directory under a read-only root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+    /// Capabilities to drop; `ALL` drops every capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// Capabilities to add back after `cap_drop` (e.g. `NET_BIND_SERVICE` to listen below 1024).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// `no-new-privileges`: setuid binaries and file capabilities cannot raise privileges.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
+}
+
+impl Security {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Capability name as accepted in the spec: `ALL` or `[A-Z_]+`, optionally with the `CAP_` prefix.
+pub fn valid_capability(cap: &str) -> bool {
+    !cap.is_empty() && cap.len() <= 64 && cap.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+}
+
 /// Per-app resource limits. **No limit by default**: every field is `None` unless set in the spec.
 /// Part of the spec hash only when something is set. Owner: session 2 (`weglarka-core/src/limits.rs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +405,9 @@ pub struct AppSpec {
     /// Resource limits (iteration 2); all unlimited by default.
     #[serde(default, skip_serializing_if = "Resources::is_unlimited")]
     pub resources: Resources,
+    /// Container hardening; nothing is set by default.
+    #[serde(default, skip_serializing_if = "Security::is_default")]
+    pub security: Security,
     /// `false` — webhook/reconcile does not swap the image on its own.
     #[serde(default = "default_true")]
     pub auto_update: bool,

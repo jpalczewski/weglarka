@@ -160,6 +160,7 @@ async fn not_found_and_name_conflict() {
         resources: Default::default(),
         healthcheck: None,
         id_mapping: None,
+        security: Default::default(),
     };
     assert!(
         matches!(client.container_create(&spec).await, Err(PodmanError::Conflict(m)) if m.contains("already in use"))

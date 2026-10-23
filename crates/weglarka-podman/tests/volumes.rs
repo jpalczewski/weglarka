@@ -635,6 +635,7 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            security: Default::default(),
         })
         .await
         .unwrap();

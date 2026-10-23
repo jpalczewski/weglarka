@@ -394,6 +394,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 resources: Default::default(),
                 healthcheck: None,
                 id_mapping: Some(volumes::id_mapping(range)),
+                security: Default::default(),
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;

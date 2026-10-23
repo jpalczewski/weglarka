@@ -136,6 +136,8 @@ pub struct ContainerSpec {
     pub healthcheck: Option<ContainerHealthcheck>,
     /// Explicit uid/gid maps; replaces `userns_auto` when set (iteration 2).
     pub id_mapping: Option<IdMapping>,
+    /// Hardening from the spec (read-only root, tmpfs, capabilities, no-new-privileges).
+    pub security: crate::app::Security,
 }
 
 /// Named volume to create.
@@ -400,6 +402,7 @@ mod fake_tests {
             resources: Resources::default(),
             healthcheck: None,
             id_mapping: None,
+            security: Default::default(),
         }
     }
 

@@ -306,6 +306,7 @@ impl<P: PodmanClient> Reconciler<P> {
             resources: spec.resources.clone(),
             healthcheck: crate::limits::container_healthcheck(&spec.health),
             id_mapping: None,
+            security: spec.security.clone(),
         };
         prepared.apply(&mut container);
         let started = async {

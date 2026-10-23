@@ -162,6 +162,36 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_iteration2(name, spec)
 }
 
+/// Hardening values end up in the container spec verbatim, so they are checked strictly.
+fn validate_security(name: &InstanceName, sec: &crate::app::Security) -> Result<(), String> {
+    for cap in sec.cap_drop.iter().chain(&sec.cap_add) {
+        if !crate::app::valid_capability(cap) {
+            return Err(format!(
+                "{name}: invalid capability {cap:?} (expected ALL or e.g. NET_BIND_SERVICE)"
+            ));
+        }
+    }
+    if sec.cap_add.iter().any(|c| c == "ALL") {
+        return Err(format!("{name}: cap_add must not be ALL"));
+    }
+    let mut seen = BTreeSet::new();
+    for path in &sec.tmpfs {
+        let ok = path.starts_with('/')
+            && path.len() > 1
+            && !path.split('/').any(|s| s == "." || s == "..")
+            && !path.chars().any(|c| c.is_control() || c == ',' || c == ':');
+        if !ok {
+            return Err(format!(
+                "{name}: tmpfs path {path:?} must be absolute (no '..', ':' or ',')"
+            ));
+        }
+        if !seen.insert(path.trim_end_matches('/')) {
+            return Err(format!("{name}: duplicate tmpfs path {path:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// Rules for the iteration 2 fields (volumes, resources, health probes).
 fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     let mut seen_names = BTreeSet::new();
@@ -190,6 +220,7 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
             return Err(format!("{name}: duplicate volume target {:?}", v.target));
         }
     }
+    validate_security(name, &spec.security)?;
     if spec.resources.pids_limit == Some(0) {
         return Err(format!(
             "{name}: pids_limit must be > 0 (omit it for no limit)"
@@ -302,6 +333,42 @@ mod tests {
 
     fn name(s: &str) -> InstanceName {
         InstanceName::new(s).unwrap()
+    }
+
+    #[test]
+    fn security_values_are_validated() {
+        let ok = |sec: crate::app::Security| {
+            let spec = AppSpec {
+                security: sec,
+                ..toml::from_str("image = \"i\"").unwrap()
+            };
+            validate_app(&name("a"), &spec)
+        };
+        let sec = |f: &dyn Fn(&mut crate::app::Security)| {
+            let mut s = crate::app::Security::default();
+            f(&mut s);
+            s
+        };
+        assert!(
+            ok(sec(&|s| {
+                s.read_only = true;
+                s.tmpfs = vec!["/cache".into()];
+                s.cap_drop = vec!["ALL".into()];
+                s.cap_add = vec!["NET_BIND_SERVICE".into()];
+                s.no_new_privileges = true;
+            }))
+            .is_ok()
+        );
+        assert!(
+            ok(sec(&|s| s.cap_drop = vec!["all".into()])).is_err(),
+            "upper case only"
+        );
+        assert!(ok(sec(&|s| s.cap_drop = vec!["NET_ADMIN,SYS".into()])).is_err());
+        assert!(ok(sec(&|s| s.cap_add = vec!["ALL".into()])).is_err());
+        assert!(ok(sec(&|s| s.tmpfs = vec!["cache".into()])).is_err());
+        assert!(ok(sec(&|s| s.tmpfs = vec!["/a,mode=777".into()])).is_err());
+        assert!(ok(sec(&|s| s.tmpfs = vec!["/a/../b".into()])).is_err());
+        assert!(ok(sec(&|s| s.tmpfs = vec!["/a".into(), "/a/".into()])).is_err());
     }
 
     #[test]

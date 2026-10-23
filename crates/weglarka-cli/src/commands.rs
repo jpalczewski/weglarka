@@ -165,6 +165,7 @@ fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         health: HealthGate::default(),
         volumes: vec![],
         resources: Default::default(),
+        security: Default::default(),
         auto_update: !a.no_auto_update,
     };
     a.spec_flags.apply(&mut spec);

@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::app::{AppSpec, Digest, Resources, SecretBinding, VolumeMount};
+use crate::app::{AppSpec, Digest, Resources, SecretBinding, Security, VolumeMount};
 
 /// Version of the hash input format; bump when fields change (forces recreate of all instances).
 const HASH_FORMAT: &str = "weglarka.spec-hash/v1";
@@ -47,6 +47,9 @@ struct HashInput<'a> {
     resources: &'a Resources,
     #[serde(skip_serializing_if = "Option::is_none")]
     health_command: Option<&'a Vec<String>>,
+    /// Appended after iteration 2 the same way: skipped while the app sets no hardening.
+    #[serde(skip_serializing_if = "Security::is_default")]
+    security: &'a Security,
 }
 
 /// Deterministic hash of the spec + the pinned image digest (hex SHA-256).
@@ -73,6 +76,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         volumes,
         resources: &spec.resources,
         health_command: spec.health.command.as_ref(),
+        security: &spec.security,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -174,6 +178,16 @@ env = { B = "2", A = "1" }
         assert_ne!(
             base,
             hash(&|s| s.health.command = Some(vec!["/app".into(), "-health".into()]))
+        );
+        assert_ne!(
+            base,
+            hash(&|s| s.security.read_only = true),
+            "hardening is a container setting"
+        );
+        assert_eq!(
+            base,
+            hash(&|s| s.security = crate::app::Security::default()),
+            "no hardening hashes as before"
         );
         // Daemon-side gate settings never recreate the container.
         assert_eq!(
