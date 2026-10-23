@@ -174,11 +174,14 @@ impl Env {
         body
     }
 
-    fn start(&mut self, body: &Value) {
+    fn create(&mut self, body: &Value) {
         let name = body["name"].as_str().unwrap().to_owned();
         self.containers.push(name.clone());
         raw(&self.socket, "POST", "/containers/create", Some(body))
             .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+
+    fn begin(&self, name: &str) {
         raw(
             &self.socket,
             "POST",
@@ -186,6 +189,11 @@ impl Env {
             None,
         )
         .unwrap_or_else(|e| panic!("start {name}: {e}"));
+    }
+
+    fn start(&mut self, body: &Value) {
+        self.create(body);
+        self.begin(body["name"].as_str().unwrap());
     }
 
     fn remove(&self, name: &str) {
@@ -309,23 +317,24 @@ async fn fixed_range_keeps_ownership_across_recreate_and_isolates() {
         let vol2 = format!("weglarka-it-vol2-{label}-{id}");
         env.volume(&vol2).await;
         env.client.volume_import(&vol2, chunked(tar)).await.unwrap();
+        // A foreign tar (owned by the image user, e.g. from Coolify) goes in through
+        // `container_archive_put` on a *created, not yet started* container — the app has not opened
+        // its files yet — which maps the ids through the container's namespace.
         let c3 = format!("weglarka-it-c3-{label}-{id}");
-        env.start(&Env::body(&c3, user, &vol2, range));
-        let cmd = r#"test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v2 /data/f"#;
-        assert_eq!(
-            env.sh(&c3, cmd).await,
-            0,
-            "[{label}] own export imports losslessly"
-        );
-
-        // A foreign tar (owned by the image user, e.g. from Coolify): `container_archive_put` maps it
-        // through the container's namespace, so the app owns it.
+        env.create(&Env::body(&c3, user, &vol2, range));
         let owner = user.map_or("0", |u| u.split(':').next().unwrap());
         let foreign = make_tar("imported.txt", "from-tar\n", owner);
         env.client
             .container_archive_put(&c3, "/data", chunked(foreign))
             .await
             .unwrap();
+        env.begin(&c3);
+        let cmd = r#"test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v2 /data/f"#;
+        assert_eq!(
+            env.sh(&c3, cmd).await,
+            0,
+            "[{label}] own export imports losslessly"
+        );
         let cmd = r#"test "$(stat -c %u /data/imported.txt)" = "$(id -u)" && echo more >> /data/imported.txt"#;
         assert_eq!(
             env.sh(&c3, cmd).await,
