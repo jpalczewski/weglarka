@@ -71,6 +71,10 @@ async fn nginx_lifecycle() {
             .contains("h.example.eu")
     );
     assert_eq!(nginx_action(manager.apply().await), None);
+    // Default trust = the webhook network only, never an app network.
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    assert!(conf.contains("set_real_ip_from 10.89.0.0/24;"));
+    assert_eq!(conf.matches("set_real_ip_from").count(), 1);
 
     // A new app with a domain: its network is connected to the running container and the config
     // is validated and reloaded — the container is NOT recreated.

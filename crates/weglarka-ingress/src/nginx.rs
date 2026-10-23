@@ -37,32 +37,21 @@ impl NginxOptions {
         Self {
             resolvers,
             listen_port: 8080,
-            trusted_proxies: Self::default_trusted_proxies(),
+            trusted_proxies: Vec::new(),
             webhook_paths: vec!["/webhook/".to_owned()],
             webhook_max_body_bytes: 1024 * 1024,
             app_max_body_bytes: 64 * 1024 * 1024,
         }
     }
 
-    /// Default trusted peers (`docs/decisions/0007`): rootless Podman's networks `10.88.0.0/15`
-    /// (the address rootlessport connects from, seen as `10.89.x.x`) and Docker's `172.16.0.0/12`
-    /// (a forwarder that preserves the source address, e.g. pasta, shows Traefik's own address).
-    pub fn default_trusted_proxies() -> Vec<Cidr> {
-        [([10, 88, 0, 0], 15), ([172, 16, 0, 0], 12)]
-            .into_iter()
-            .map(|(octets, prefix)| Cidr::new(IpAddr::from(octets), prefix).expect("static"))
-            .collect()
-    }
-
-    /// Replaces the trusted peers with `[ingress] trusted_proxies` (empty keeps the default).
-    /// Entries are CIDRs or bare addresses (a single host).
+    /// Sets the trusted peers (CIDRs or bare addresses). There is deliberately no default: trusting
+    /// a whole Podman address range would let any app container forge `X-Forwarded-*`
+    /// (`docs/decisions/0007`); callers pass the forwarder's network or the configured list.
     pub fn with_trusted_proxies(mut self, entries: &[String]) -> Result<Self, IngressError> {
-        if !entries.is_empty() {
-            self.trusted_proxies = entries
-                .iter()
-                .map(|e| e.parse())
-                .collect::<Result<_, _>>()?;
-        }
+        self.trusted_proxies = entries
+            .iter()
+            .map(|e| e.parse())
+            .collect::<Result<_, _>>()?;
         Ok(self)
     }
 
@@ -75,7 +64,10 @@ impl NginxOptions {
             return Err(bad("resolvers", "at least one resolver required"));
         }
         if self.trusted_proxies.is_empty() {
-            return Err(bad("trusted_proxies", "at least one peer required"));
+            return Err(bad(
+                "trusted_proxies",
+                "at least one peer required (set [ingress] trusted_proxies)",
+            ));
         }
         if self.listen_port == 0 {
             return Err(bad("listen_port", "must not be 0"));

@@ -463,6 +463,7 @@ impl PodmanClient for FakePodman {
         Ok(NetworkInfo {
             name: name.to_owned(),
             gateways: vec![std::net::IpAddr::from([10, 89, octet, 1])],
+            subnets: vec![format!("10.89.{octet}.0/24")],
         })
     }
 

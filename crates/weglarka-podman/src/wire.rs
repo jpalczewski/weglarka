@@ -402,6 +402,7 @@ pub(crate) struct InspectNetwork {
 #[serde(default)]
 struct Subnet {
     gateway: String,
+    subnet: String,
 }
 
 impl InspectNetwork {
@@ -412,6 +413,12 @@ impl InspectNetwork {
                 .subnets
                 .iter()
                 .filter_map(|s| s.gateway.parse().ok())
+                .collect(),
+            subnets: self
+                .subnets
+                .iter()
+                .filter(|s| !s.subnet.is_empty())
+                .map(|s| s.subnet.clone())
                 .collect(),
         }
     }

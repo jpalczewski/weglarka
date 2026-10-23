@@ -14,15 +14,23 @@ untrusted_conf=$2
 net=wg-fwd-test
 fail=0
 
+# shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "::group::nginx logs"; docker logs wg-fwd-nginx 2>&1 || true; echo "::endgroup::"
+    echo "::group::blog logs"; docker logs wg-fwd-blog 2>&1 || true; echo "::endgroup::"
+  fi
   docker rm -f wg-fwd-blog wg-fwd-nginx >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
+  exit "$status"
 }
 trap cleanup EXIT
-cleanup
+docker rm -f wg-fwd-blog wg-fwd-nginx >/dev/null 2>&1 || true
+docker network rm "$net" >/dev/null 2>&1 || true
 
 docker network create "$net" >/dev/null
-docker run -d --name wg-fwd-blog --network "$net" docker.io/traefik/whoami:v1.10.4 --port 3000 >/dev/null
+docker run -d --name wg-fwd-blog --network "$net" --network-alias blog docker.io/traefik/whoami:v1.10.4 --port 3000 >/dev/null
 
 request() { # conf -> whoami body for a request carrying forged forwarded headers
   docker rm -f wg-fwd-nginx >/dev/null 2>&1 || true

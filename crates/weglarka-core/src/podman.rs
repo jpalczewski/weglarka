@@ -176,6 +176,8 @@ pub struct EventFilter {
 pub struct NetworkInfo {
     pub name: String,
     pub gateways: Vec<std::net::IpAddr>,
+    /// Subnets in CIDR notation (`10.89.1.0/24`).
+    pub subnets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

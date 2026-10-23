@@ -174,16 +174,26 @@ impl<P: PodmanClient> IngressManager<P> {
                 .await?;
         }
         let mut resolvers = Vec::new();
+        let mut forwarder_subnets = Vec::new();
         for net in &networks {
             let info = podman.network_inspect(net).await?;
             if info.gateways.is_empty() {
                 return Err(IngressApplyError::NoResolver(net.clone()));
             }
             resolvers.extend(info.gateways);
+            if net == WEBHOOK_NETWORK {
+                forwarder_subnets = info.subnets;
+            }
         }
 
-        let options = nginx::NginxOptions::new(resolvers)
-            .with_trusted_proxies(&self.host.ingress.trusted_proxies)?;
+        // Default trust: only `net-weglarka`, the primary network of the nginx container, where the port
+        // forwarder connects from. App networks are never trusted (docs/decisions/0007).
+        let trusted = if self.host.ingress.trusted_proxies.is_empty() {
+            forwarder_subnets
+        } else {
+            self.host.ingress.trusted_proxies.clone()
+        };
+        let options = nginx::NginxOptions::new(resolvers).with_trusted_proxies(&trusted)?;
         let conf = nginx::generate(&self.host, &apps, &options)?;
         let traefik_yaml = match (
             &self.host.ingress.traefik_dynamic_file,

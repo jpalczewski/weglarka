@@ -11,10 +11,15 @@ nginx sees every client as `10.89.1.2`, an address of the Podman network — nev
 So a `set_real_ip_from` limited to Docker's ranges never matched: no `X-Forwarded-Proto`, no real IPs in the log.
 
 **Decision.**
-- `[ingress] trusted_proxies = ["10.88.0.0/15", …]` in `weglarka.toml` (CIDRs or bare addresses). Empty/absent =
-  default `10.88.0.0/15` (Podman's default `10.88.0.0/16` and the netavark pool `10.89.0.0/16` for user networks;
-  where the forwarder source appears) **plus** `172.16.0.0/12` (Docker; covers a forwarder that preserves the source
-  address, so Traefik's own address shows up). A configured list *replaces* the default.
+- Default trust = the **subnet(s) of `net-weglarka` only**, read from `network_inspect` on every `apply`. nginx's
+  primary (first) network is `net-weglarka`, and that is where the forwarder's connections originate (observed
+  `10.89.1.2`). App networks (`net-<app>`) are **not** trusted, so an app container that reaches nginx over its own
+  network cannot forge `X-Forwarded-*`. Only Węglarka's own container shares `net-weglarka` with nginx.
+  Docker's `172.16.0.0/12` is not in the default: with rootlessport Traefik's address is never the source.
+- `[ingress] trusted_proxies = ["10.89.1.2", …]` (CIDRs or bare addresses) overrides the default entirely, e.g. to
+  pin the single forwarder address. The generator itself has no default and refuses an empty list.
+- If the forwarder's source turned out *not* to be in `net-weglarka`, the symptom is exactly the old one (no
+  `X-Forwarded-Proto` upstream); `scripts/acceptance.sh` fails on it with a pointer to `trusted_proxies`.
 - nginx: `set_real_ip_from` for each entry, `real_ip_header X-Forwarded-For`, `real_ip_recursive on`; the access log
   and `X-Real-IP` carry the real client.
 - Upstream headers: when the original peer (`$realip_remote_addr`) is trusted, `X-Forwarded-Proto/For/Host` are passed
@@ -22,11 +27,8 @@ So a `set_real_ip_from` limited to Docker's ranges never matched: no `X-Forwarde
   values, so a client outside the list cannot forge them. No `$proxy_add_x_forwarded_for` (it would duplicate the client).
 
 **Security reasoning.** In `behind` the published port is reachable only from Traefik (UFW: only the `coolify`
-network → 8088), so trusting the forwarder = trusting Traefik. Residual risk: a container on a Podman network
-in the trusted range (an app, via `net-<app>`) can talk to nginx directly and forge headers *for its own requests* —
-it can neither read other apps' traffic nor change what other clients' requests carry. Narrow the list if that matters
-(e.g. to the exact `net-weglarka` subnet). In `edge` mode (future) the list must stay empty/explicit — direct clients
-are never trusted.
+network → 8088), so trusting the forwarder = trusting Traefik. Because only `net-weglarka` is trusted, apps cannot
+impersonate it. In `edge` mode (future) direct clients must never be trusted.
 
 **Alternative considered: pasta for the nginx container** (`--network pasta` preserves the source address) — it
 cannot be combined with user networks (aardvark DNS, per-app networks `proxy_pass` relies on). Rejected.

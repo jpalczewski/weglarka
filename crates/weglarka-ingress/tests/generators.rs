@@ -11,6 +11,8 @@ use weglarka_ingress::{Cidr, IngressError};
 
 fn opts() -> NginxOptions {
     NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+        .with_trusted_proxies(&["10.89.0.0/24".into()])
+        .unwrap()
 }
 
 fn layouts() -> Vec<(&'static str, BTreeMap<InstanceName, AppSpec>)> {
@@ -204,18 +206,9 @@ fn trusted_proxies_from_config_replace_the_default() {
     let conf = nginx::generate(&host(), &apps(ONE_APP), &o).unwrap();
     assert!(conf.contains("set_real_ip_from 192.0.2.0/24;"));
     assert!(conf.contains("set_real_ip_from 198.51.100.7/32;"));
-    assert!(
-        !conf.contains("10.88.0.0/15"),
-        "default is replaced, not extended"
-    );
-    // Empty list keeps the default, which covers rootlessport's 10.89.x.x source.
-    let conf = nginx::generate(
-        &host(),
-        &apps(ONE_APP),
-        &opts().with_trusted_proxies(&[]).unwrap(),
-    )
-    .unwrap();
-    assert!(conf.contains("set_real_ip_from 10.88.0.0/15;"));
+    // No implicit default: an empty list is refused.
+    let empty = opts().with_trusted_proxies(&[]).unwrap();
+    assert!(nginx::generate(&host(), &apps(ONE_APP), &empty).is_err());
     assert!(
         opts()
             .with_trusted_proxies(&["10.0.0.0/8; deny".into()])

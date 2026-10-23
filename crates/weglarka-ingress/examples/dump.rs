@@ -42,8 +42,10 @@ fn main() {
                 .unwrap_or_else(|| "10.89.0.1".into());
             let trusted: Vec<String> = std::env::args()
                 .nth(3)
-                .map(|t| t.split(',').map(str::to_owned).collect())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "10.89.0.0/24".into())
+                .split(',')
+                .map(str::to_owned)
+                .collect();
             let options = nginx::NginxOptions::new(vec![resolver.parse().expect("resolver")])
                 .with_trusted_proxies(&trusted)
                 .expect("trusted proxies");
