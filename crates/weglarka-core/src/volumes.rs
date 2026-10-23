@@ -22,12 +22,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::app::{AppSpec, AppsFile, InstanceName};
+use crate::app::{AppSpec, AppsFile, Digest, InstanceName, VolumeMount};
 use crate::deploy::pinned_ref;
 use crate::labels;
 use crate::podman::{
-    ContainerSpec, IdMapping, IdRange, PodmanClient, PodmanError, Result, RestartPolicy, TarStream,
-    VolumeAttachment, VolumeFilter, VolumeSpec,
+    ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, RestartPolicy,
+    Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
 };
 use crate::reconcile::{EngineError, Reconciler};
 use crate::state::{self, AppState, StateFile};
@@ -62,7 +62,9 @@ pub async fn ensure_volumes<P: PodmanClient>(
     spec: &AppSpec,
 ) -> Result<()> {
     for v in &spec.volumes {
-        podman.volume_create(&volume_spec(instance, &v.name)).await?;
+        podman
+            .volume_create(&volume_spec(instance, &v.name))
+            .await?;
     }
     Ok(())
 }
@@ -91,9 +93,10 @@ impl Prepared {
         container.userns_auto = false;
         container.id_mapping = Some(id_mapping(self.range));
         container.volumes = self.volumes;
-        container
-            .labels
-            .insert(labels::UID_RANGE.to_owned(), labels::uid_range_label(self.range));
+        container.labels.insert(
+            labels::UID_RANGE.to_owned(),
+            labels::uid_range_label(self.range),
+        );
     }
 }
 
@@ -137,7 +140,11 @@ impl<P: PodmanClient> Reconciler<P> {
         let range = self.allocate_range(&st, INFRA_RANGE_SIZE).await?;
         st.ingress_uid_range = Some(range);
         state::save_state(&self.paths.state, &st)?;
-        tracing::info!(start = range.start, size = range.size, "assigned ingress uid range");
+        tracing::info!(
+            start = range.start,
+            size = range.size,
+            "assigned ingress uid range"
+        );
         Ok(range)
     }
 
@@ -283,18 +290,19 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(())
     }
 
-    /// Imports a tar made elsewhere (Coolify…) into one of the instance's volumes, mapping its uids
-    /// through the instance's namespace: files owned by uid 1000 in the tar end up owned by the
-    /// container's uid 1000. Do **not** use it for Węglarka's own exports — those carry namespace ids
-    /// and go through `volume_import` (docs/decisions/0009, findings 8–9).
+    /// Imports a tar into one of the instance's volumes. The instance must have been deployed once
+    /// (its image and range are needed). If its container is running it is stopped for the import and
+    /// started again afterwards (also when the import failed): files swapped under a running app would
+    /// leave it holding the old inodes. The state of the volume after a failed or interrupted import is
+    /// partial — files already extracted stay.
     ///
-    /// The instance must have been deployed once (its image and range are needed). The tar is
-    /// extracted by Podman into a created, never started helper container that mounts the volume;
-    /// Węglarka unpacks nothing itself.
-    pub async fn import_foreign(
+    /// Which [`ImportMode`] fits depends on where the tar came from; see there. Węglarka unpacks
+    /// nothing itself: Podman extracts the tar in its own chroot.
+    pub async fn import_volume(
         &self,
         instance: &InstanceName,
         volume: &str,
+        mode: ImportMode,
         tar: TarStream,
         lock_wait: Duration,
     ) -> Result<(), EngineError> {
@@ -310,7 +318,9 @@ impl<P: PodmanClient> Reconciler<P> {
             .volumes
             .iter()
             .find(|v| v.name == volume)
-            .ok_or_else(|| EngineError::Volume(format!("{instance} declares no volume {volume:?}")))?;
+            .ok_or_else(|| {
+                EngineError::Volume(format!("{instance} declares no volume {volume:?}"))
+            })?;
         let st = state::load_state(&self.paths.state)?;
         let app = st.apps.get(instance);
         let (Some(digest), Some(range)) = (
@@ -323,7 +333,46 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         ensure_volumes(&self.podman, instance, &spec).await?;
 
-        let reference = pinned_ref(&spec.image, &digest);
+        let app_container = labels::container_name(instance);
+        let was_running = self
+            .podman
+            .container_inspect(&app_container)
+            .await
+            .is_ok_and(|c| c.state == ContainerState::Running);
+        if was_running {
+            self.podman
+                .container_stop(&app_container, self.options.stop_timeout_secs)
+                .await?;
+        }
+        let result = match mode {
+            ImportMode::Own => self
+                .podman
+                .volume_import(&labels::volume_name(instance, volume), tar)
+                .await
+                .map_err(EngineError::from),
+            ImportMode::Foreign => {
+                self.import_through_helper(instance, &spec, mount, &digest, range, tar)
+                    .await
+            }
+        };
+        if was_running {
+            self.podman.container_start(&app_container).await?;
+        }
+        result
+    }
+
+    /// Foreign mode: `container_archive_put` on a created, never started helper container of the
+    /// instance's image, in the instance's range, with the volume mounted read-write.
+    async fn import_through_helper(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        mount: &VolumeMount,
+        digest: &Digest,
+        range: UidRange,
+        tar: TarStream,
+    ) -> Result<(), EngineError> {
+        let reference = pinned_ref(&spec.image, digest);
         let image = match self.podman.image_inspect(&reference).await {
             Ok(_) => reference,
             Err(PodmanError::NotFound(_)) => self
@@ -346,10 +395,13 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(()) | Err(PodmanError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        let mut helper = ContainerSpec {
+        let helper = ContainerSpec {
             name: name.clone(),
             image,
-            labels: BTreeMap::from([(labels::IMPORT_FOR.to_owned(), instance.to_string())]),
+            labels: BTreeMap::from([
+                (labels::IMPORT_FOR.to_owned(), instance.to_string()),
+                (labels::UID_RANGE.to_owned(), labels::uid_range_label(range)),
+            ]),
             env: BTreeMap::new(),
             networks: vec![],
             secrets: vec![],
@@ -358,7 +410,7 @@ impl<P: PodmanClient> Reconciler<P> {
             userns_auto: false,
             mounts: vec![],
             volumes: vec![VolumeAttachment {
-                volume: labels::volume_name(instance, volume),
+                volume: labels::volume_name(instance, &mount.name),
                 target: mount.target.clone(),
                 read_only: false, // the spec's read_only applies to the app, not to the import
             }],
@@ -366,10 +418,6 @@ impl<P: PodmanClient> Reconciler<P> {
             healthcheck: None,
             id_mapping: Some(id_mapping(range)),
         };
-        helper.labels.insert(
-            labels::UID_RANGE.to_owned(),
-            labels::uid_range_label(range),
-        );
         let result = async {
             self.podman.container_create(&helper).await?;
             self.podman
@@ -380,6 +428,18 @@ impl<P: PodmanClient> Reconciler<P> {
         let _ = self.podman.container_remove(&name, true).await;
         Ok(result?)
     }
+}
+
+/// Where a tar being imported came from — the ids inside it mean different things
+/// (docs/decisions/0009, findings 8–9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    /// Made elsewhere (Coolify, `docker cp`…): its uids are *container* uids and are mapped into the
+    /// instance's range. A Węglarka export imported this way fails loudly (ids outside the range).
+    Foreign,
+    /// A Węglarka export (`volume_export`) of the same range: it carries *namespace* ids and is
+    /// restored verbatim. A foreign tar imported this way lands on the wrong uids **silently**.
+    Own,
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -472,7 +532,13 @@ health = { attempts = 2, window_secs = 2 }
         assert!(e.rec.reconcile().await.unwrap().is_clean());
 
         let r = e.range("szklana").unwrap();
-        assert_eq!(r, UidRange { start: 1, size: DEFAULT_RANGE_SIZE });
+        assert_eq!(
+            r,
+            UidRange {
+                start: 1,
+                size: DEFAULT_RANGE_SIZE
+            }
+        );
         assert_eq!(e.mapping("szklana"), id_mapping(r));
         let spec = e.fake.container_spec("szklana").unwrap();
         assert!(!spec.userns_auto);
@@ -497,8 +563,12 @@ health = { attempts = 2, window_secs = 2 }
         assert_eq!(vols.len(), 2);
         assert!(vols.iter().all(|v| v.labels[labels::INSTANCE] == "szklana"));
         let calls = e.fake.calls();
-        let first_volume = calls.iter().position(|c| matches!(c, Call::VolumeCreate(_)));
-        let create = calls.iter().position(|c| matches!(c, Call::ContainerCreate(_)));
+        let first_volume = calls
+            .iter()
+            .position(|c| matches!(c, Call::VolumeCreate(_)));
+        let create = calls
+            .iter()
+            .position(|c| matches!(c, Call::ContainerCreate(_)));
         assert!(first_volume < create);
     }
 
@@ -516,7 +586,11 @@ health = { attempts = 2, window_secs = 2 }
 
         assert_eq!(e.range("szklana"), Some(r));
         assert_eq!(e.mapping("szklana"), id_mapping(r));
-        assert_eq!(e.fake.volumes().len(), 2, "volumes are reused, not duplicated");
+        assert_eq!(
+            e.fake.volumes().len(),
+            2,
+            "volumes are reused, not duplicated"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -524,7 +598,11 @@ health = { attempts = 2, window_secs = 2 }
         let e = env(&format!("{APP}\n{}", PLAIN));
         e.rec.reconcile().await.unwrap();
         let ingress = e.rec.ensure_ingress_range().await.unwrap();
-        assert_eq!(e.rec.ensure_ingress_range().await.unwrap(), ingress, "stable");
+        assert_eq!(
+            e.rec.ensure_ingress_range().await.unwrap(),
+            ingress,
+            "stable"
+        );
 
         let (a, b) = (e.range("ntfy").unwrap(), e.range("szklana").unwrap());
         assert_eq!((a.start, b.start), (1, 65_537));
@@ -539,9 +617,15 @@ health = { attempts = 2, window_secs = 2 }
         e.fake.set_subuid_pool(70_000); // room for exactly one full range
         let report = e.rec.reconcile().await.unwrap();
 
-        assert!(e.range("ntfy").is_some(), "first in alphabetical order wins");
+        assert!(
+            e.range("ntfy").is_some(),
+            "first in alphabetical order wins"
+        );
         assert!(e.range("szklana").is_none());
-        assert!(report.actions.iter().any(|a| a.result.is_err()), "{report:?}");
+        assert!(
+            report.actions.iter().any(|a| a.result.is_err()),
+            "{report:?}"
+        );
         assert!(e.fake.container_spec("szklana").is_none());
         assert!(e.fake.volumes().is_empty());
     }
@@ -566,7 +650,10 @@ health = { attempts = 2, window_secs = 2 }
         assert!(matches!(
             report.actions[..],
             [crate::reconcile::ActionReport {
-                action: Action::Recreate { reason: RecreateReason::SpecDrift, .. },
+                action: Action::Recreate {
+                    reason: RecreateReason::SpecDrift,
+                    ..
+                },
                 result: Ok(ActionOutcome::Recreated(_)),
             }]
         ));
@@ -574,7 +661,10 @@ health = { attempts = 2, window_secs = 2 }
         assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
 
         let again = e.rec.reconcile().await.unwrap();
-        assert!(again.actions.is_empty(), "migration happens once: {again:?}");
+        assert!(
+            again.actions.is_empty(),
+            "migration happens once: {again:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -588,8 +678,17 @@ health = { attempts = 2, window_secs = 2 }
         e.fake.container_start("ntfy").await.unwrap();
 
         let out = e.rec.deploy(&name("ntfy"), false).await.unwrap();
-        assert!(matches!(out, crate::deploy::DeployOutcome::Deployed { .. }), "{out:?}");
-        assert!(e.fake.container_spec("ntfy").unwrap().labels.contains_key(labels::UID_RANGE));
+        assert!(
+            matches!(out, crate::deploy::DeployOutcome::Deployed { .. }),
+            "{out:?}"
+        );
+        assert!(
+            e.fake
+                .container_spec("ntfy")
+                .unwrap()
+                .labels
+                .contains_key(labels::UID_RANGE)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -598,13 +697,22 @@ health = { attempts = 2, window_secs = 2 }
         e.rec.reconcile().await.unwrap();
         let r = e.range("szklana").unwrap();
 
-        e.rec.remove_app_with_volumes(&name("szklana"), false).await.unwrap();
+        e.rec
+            .remove_app_with_volumes(&name("szklana"), false)
+            .await
+            .unwrap();
         e.rec.reconcile().await.unwrap();
         assert!(e.fake.containers().is_empty(), "container pruned");
         assert_eq!(e.fake.volumes().len(), 2, "volumes survive apps remove");
         assert_eq!(e.range("szklana"), Some(r), "range stays reserved");
         let st = e.state();
-        assert_eq!(st.apps[&name("szklana")], AppState { uid_range: Some(r), ..Default::default() });
+        assert_eq!(
+            st.apps[&name("szklana")],
+            AppState {
+                uid_range: Some(r),
+                ..Default::default()
+            }
+        );
 
         // Re-adding the app finds its files owned correctly: same range, same volumes.
         e.set_apps(APP);
@@ -612,7 +720,10 @@ health = { attempts = 2, window_secs = 2 }
         assert_eq!(e.range("szklana"), Some(r));
         assert_eq!(e.mapping("szklana"), id_mapping(r));
 
-        e.rec.remove_app_with_volumes(&name("szklana"), true).await.unwrap();
+        e.rec
+            .remove_app_with_volumes(&name("szklana"), true)
+            .await
+            .unwrap();
         assert!(e.fake.containers().is_empty());
         assert!(e.fake.volumes().is_empty());
         assert_eq!(e.range("szklana"), None, "purge releases the range");
@@ -632,7 +743,12 @@ health = { attempts = 2, window_secs = 2 }
         let st = e.state();
         assert!(st.apps[&name("ntfy")].uid_range.is_some());
         assert!(st.apps[&name("szklana")].uid_range.is_some());
-        assert!(!st.apps[&name("ntfy")].uid_range.unwrap().overlaps(st.apps[&name("szklana")].uid_range.unwrap()));
+        assert!(
+            !st.apps[&name("ntfy")]
+                .uid_range
+                .unwrap()
+                .overlaps(st.apps[&name("szklana")].uid_range.unwrap())
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -640,7 +756,10 @@ health = { attempts = 2, window_secs = 2 }
         let e = env(PLAIN);
         e.rec.reconcile().await.unwrap();
         assert!(e.range("ntfy").is_some());
-        e.rec.remove_app_with_volumes(&name("ntfy"), false).await.unwrap();
+        e.rec
+            .remove_app_with_volumes(&name("ntfy"), false)
+            .await
+            .unwrap();
         e.rec.reconcile().await.unwrap();
         assert!(e.state().apps.is_empty());
     }
@@ -649,7 +768,11 @@ health = { attempts = 2, window_secs = 2 }
     async fn purge_of_unknown_app_is_an_error_and_touches_nothing() {
         let e = env(APP);
         e.rec.reconcile().await.unwrap();
-        let err = e.rec.remove_app_with_volumes(&name("nope"), true).await.unwrap_err();
+        let err = e
+            .rec
+            .remove_app_with_volumes(&name("nope"), true)
+            .await
+            .unwrap_err();
         assert!(matches!(err, EngineError::UnknownInstance(_)));
         assert_eq!(e.fake.volumes().len(), 2);
     }
@@ -657,11 +780,20 @@ health = { attempts = 2, window_secs = 2 }
     #[tokio::test(start_paused = true)]
     async fn foreign_import_goes_through_a_unstarted_helper_container_in_the_instance_range() {
         let e = env(APP);
-        assert!(e.rec.import_foreign(&name("szklana"), "data", tar(), WAIT).await.is_err(), "not deployed");
+        assert!(
+            e.rec
+                .import_volume(&name("szklana"), "data", ImportMode::Foreign, tar(), WAIT)
+                .await
+                .is_err(),
+            "not deployed"
+        );
         e.rec.reconcile().await.unwrap();
         let before = e.fake.calls().len();
 
-        e.rec.import_foreign(&name("szklana"), "data", tar(), WAIT).await.unwrap();
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Foreign, tar(), WAIT)
+            .await
+            .unwrap();
 
         let calls = e.fake.calls()[before..].to_vec();
         assert!(calls.contains(&Call::ContainerCreate("wg-import.szklana".into())));
@@ -669,26 +801,104 @@ health = { attempts = 2, window_secs = 2 }
             name: "wg-import.szklana".into(),
             path: "/data".into()
         }));
-        assert!(!calls.iter().any(|c| matches!(c, Call::ContainerStart(n) if n == "wg-import.szklana")));
-        assert!(!calls.iter().any(|c| matches!(c, Call::VolumeImport(_))), "not the raw volume import");
-        assert!(e.fake.container_spec("wg-import.szklana").is_none(), "helper is cleaned up");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::ContainerStart(n) if n == "wg-import.szklana"))
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::VolumeImport(_))),
+            "not the raw volume import"
+        );
+        assert!(
+            e.fake.container_spec("wg-import.szklana").is_none(),
+            "helper is cleaned up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_import_restores_through_the_raw_volume_endpoint() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Own, tar(), WAIT)
+            .await
+            .unwrap();
+        let calls = e.fake.calls();
+        assert!(calls.contains(&Call::VolumeImport("szklana.data".into())));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::ContainerArchivePut { .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_app_is_stopped_for_the_import_and_started_again_even_on_failure() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let before = e.fake.calls().len();
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Own, tar(), WAIT)
+            .await
+            .unwrap();
+        let calls = e.fake.calls()[before..].to_vec();
+        let pos = |c: Call| calls.iter().position(|x| *x == c).unwrap();
+        let (stop, import, start) = (
+            pos(Call::ContainerStop("szklana".into())),
+            pos(Call::VolumeImport("szklana.data".into())),
+            pos(Call::ContainerStart("szklana".into())),
+        );
+        assert!(stop < import && import < start, "{calls:?}");
+
+        // A tar that dies mid-way: the error is reported, the app is running again.
+        let broken: TarStream = Box::pin(stream::iter([Err(PodmanError::Protocol("cut".into()))]));
+        let err = e
+            .rec
+            .import_volume(&name("szklana"), "data", ImportMode::Own, broken, WAIT)
+            .await;
+        assert!(err.is_err());
+        assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_app_stays_stopped_after_an_import() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        e.fake.container_stop("szklana", 1).await.unwrap();
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Own, tar(), WAIT)
+            .await
+            .unwrap();
+        assert_eq!(e.fake.containers()[0].state, ContainerState::Stopped);
     }
 
     #[tokio::test(start_paused = true)]
     async fn foreign_import_rejects_unknown_volumes() {
         let e = env(APP);
         e.rec.reconcile().await.unwrap();
-        let err = e.rec.import_foreign(&name("szklana"), "nope", tar(), WAIT).await.unwrap_err();
+        let err = e
+            .rec
+            .import_volume(&name("szklana"), "nope", ImportMode::Foreign, tar(), WAIT)
+            .await
+            .unwrap_err();
         assert!(matches!(err, EngineError::Volume(_)), "{err:?}");
     }
 
     #[test]
     fn id_mapping_is_one_line_per_map() {
-        let m = id_mapping(UidRange { start: 65_537, size: 65_536 });
+        let m = id_mapping(UidRange {
+            start: 65_537,
+            size: 65_536,
+        });
         assert_eq!(m.uid_map, m.gid_map);
         assert_eq!(
             m.uid_map,
-            [IdRange { container_id: 0, host_id: 65_537, size: 65_536 }]
+            [IdRange {
+                container_id: 0,
+                host_id: 65_537,
+                size: 65_536
+            }]
         );
     }
 }

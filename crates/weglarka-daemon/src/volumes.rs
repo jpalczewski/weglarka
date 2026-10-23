@@ -6,7 +6,8 @@
 //! module; what it does enforce is a cap on the number of bytes it forwards ([`MAX_IMPORT_BYTES`]).
 //!
 //! Two import modes, because the ids inside a tar mean different things (docs/decisions/0009):
-//! * default — a **Węglarka export** (namespace ids, same range): `volume_import`, lossless;
+//! * default — a **Węglarka export** (namespace ids, same range): `volume_import`, lossless. Mixing
+//!   the modes up is the dangerous error: a foreign tar imported this way lands on wrong uids silently;
 //! * `?foreign=true` — a tar made elsewhere (Coolify, `docker cp`…): extracted through a helper
 //!   container of the instance so its uids are mapped into the instance's range.
 
@@ -24,6 +25,7 @@ use weglarka_core::app::{AppSpec, InstanceName, VolumeMount};
 use weglarka_core::labels;
 use weglarka_core::podman::{PodmanClient, PodmanError, TarStream};
 use weglarka_core::state;
+use weglarka_core::volumes::ImportMode;
 
 use crate::admin::Fail;
 use crate::app::{Daemon, MUTATION_TIMEOUT};
@@ -144,19 +146,20 @@ async fn import_volume<P: PodmanClient + 'static>(
     body: Body,
 ) -> ApiResult<StatusCode> {
     let (name, mount) = declared_volume(&d, &app, &volume)?;
-    let tar = capped(body, MAX_IMPORT_BYTES);
-    if flag(query.as_deref(), "foreign") {
-        d.engine
-            .import_foreign(&name, &mount.name, tar, MUTATION_TIMEOUT)
-            .await?;
+    let mode = if flag(query.as_deref(), "foreign") {
+        ImportMode::Foreign
     } else {
-        let podman_name = labels::volume_name(&name, &mount.name);
-        d.engine
-            .podman()
-            .volume_import(&podman_name, tar)
-            .await
-            .map_err(|e| podman_fail(e, &format!("volume {podman_name}")))?;
-    }
+        ImportMode::Own
+    };
+    d.engine
+        .import_volume(
+            &name,
+            &mount.name,
+            mode,
+            capped(body, MAX_IMPORT_BYTES),
+            MUTATION_TIMEOUT,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

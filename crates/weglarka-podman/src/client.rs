@@ -14,9 +14,9 @@ use weglarka_core::podman::{
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
-    CreatedExec, DisconnectNetwork, HealthReport, InspectContainer, InspectExec, InspectImage,
-    InspectNetwork, Info, ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent,
-    WireVolume, decode, health_status,
+    CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
+    InspectImage, InspectNetwork, ListedContainer, PullLine, PullReport, StartExec, Version,
+    WireEvent, WireVolume, decode, health_status,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);

@@ -457,12 +457,26 @@ mod tests {
 
     #[test]
     fn hash_covers_image_bind_port_and_uid_range() {
-        let r = UidRange { start: 1, size: 4096 };
+        let r = UidRange {
+            start: 1,
+            size: 4096,
+        };
         let a = ingress_hash("i", "x", 80, r);
         assert_eq!(a, ingress_hash("i", "x", 80, r));
         assert_ne!(a, ingress_hash("j", "x", 80, r));
         assert_ne!(a, ingress_hash("i", "y", 80, r));
         assert_ne!(a, ingress_hash("i", "x", 81, r));
-        assert_ne!(a, ingress_hash("i", "x", 80, UidRange { start: 4097, size: 4096 }));
+        assert_ne!(
+            a,
+            ingress_hash(
+                "i",
+                "x",
+                80,
+                UidRange {
+                    start: 4097,
+                    size: 4096
+                }
+            )
+        );
     }
 }

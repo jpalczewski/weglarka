@@ -11,7 +11,7 @@ pub const SPEC_HASH: &str = "weglarka.spec-hash";
 /// uid range the container was created with (`<start>+<size>`, [`uid_range_label`]). Part of the
 /// container's identity next to `spec-hash`, but kept out of the hash: it is state, not spec.
 pub const UID_RANGE: &str = "weglarka.uid-range";
-/// Marks the short-lived container that carries a foreign tar into a volume (`volumes::import_foreign`).
+/// Marks the short-lived container that carries a foreign tar into a volume (`volumes::ImportMode::Foreign`).
 /// Deliberately not [`INSTANCE`], so reconcile never mistakes it for a duplicate of the app.
 pub const IMPORT_FOR: &str = "weglarka.import-for";
 
