@@ -1,0 +1,28 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: render(&r)
+---
+[ OK ] config.file             /etc/weglarka/weglarka.toml parses
+[ OK ] runtime.user            user weglarka exists (uid 1001)
+[FAIL] runtime.subuid          only 1000 ids for weglarka in /etc/subuid (need ≥ 65536)
+                               hint: dodaj zakres: `usermod --add-sub-uids <start>-<koniec> weglarka` (≥ 65536 id)
+[ OK ] runtime.subgid          65536 ids for weglarka in /etc/subgid
+[ OK ] runtime.cgroups         cgroups v2
+[FAIL] runtime.linger          linger disabled for weglarka
+                               hint: `loginctl enable-linger weglarka` — bez tego usługi usera zatrzymają się po wylogowaniu
+[ OK ] runtime.socket          podman socket /run/user/1001/podman/podman.sock responds
+[FAIL] runtime.podman_version  libpod API 5.7 is too old (need ≥ 6.0)
+                               hint: zainstaluj Podmana 6 z repo alvistack (notatka MVP, decyzja 1); v4/v5 nie są wspierane
+[WARN] runtime.podman_source   podman is not installed from alvistack
+                               hint: zainstaluj podman z repo `home:alvistack` i przypnij stos Podmana w apt preferences (źródło musi zawierać „alvistack”)
+[ OK ] runtime.netavark        netavark 2.0.1, firewall driver nftables (NETAVARK_FW)
+[FAIL] runtime.pasta           pasta not found
+                               hint: zainstaluj pakiet `passt` (pasta = domyślna sieć rootless w Podmanie ≥ 5)
+[FAIL] ingress.traefik_file    /data/traefik/weglarka.yml is not writable by weglarka (mode 0644, uid 0)
+                               hint: `chown weglarka /data/traefik/weglarka.yml` i `chmod 0644 /data/traefik/weglarka.yml`
+[FAIL] ingress.bind            172.17.0.1 is not assigned to any host interface
+                               hint: adres musi należeć do interfejsu hosta (dla Traefika z Coolify: gateway docker0, np. 172.17.0.1)
+[FAIL] state.secrets_file      /etc/weglarka/secrets.toml has mode 0644 (expected 0600)
+                               hint: `chmod 0600 /etc/weglarka/secrets.toml`
+
+6 ok, 1 warn, 7 fail

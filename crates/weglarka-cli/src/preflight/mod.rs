@@ -1,0 +1,195 @@
+//! `weglarka doctor --preflight` — sprawdzenia hosta bez demona.
+//!
+//! Każde sprawdzenie to osobny typ za traitem [`Check`] (dyn-compatible, synchroniczny);
+//! dostęp do hosta (pliki, komendy, socket Podmana, env) idzie wyłącznie przez [`Host`],
+//! więc testy podstawiają [`testing::FakeHost`]. Nowy init (OpenRC) = nowe checki +
+//! gałąź w [`all_checks`].
+
+mod checks;
+pub(crate) mod host;
+mod parse;
+#[cfg(test)]
+pub mod testing;
+
+use std::path::PathBuf;
+
+use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
+use weglarka_core::config::{HostConfig, PlatformKind, RuntimeConfig};
+
+pub use host::{Host, RealHost};
+
+use crate::settings::{Overrides, load_config};
+
+/// Wynik ustalenia, kim jest user runtime'u.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeUser {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: PathBuf,
+}
+
+/// Wspólny kontekst sprawdzeń.
+pub struct Context<'a> {
+    pub host: &'a dyn Host,
+    pub config_path: PathBuf,
+    pub config: Option<HostConfig>,
+    pub config_error: Option<String>,
+    pub runtime: RuntimeConfig,
+    pub platform: PlatformKind,
+    pub user: Option<RuntimeUser>,
+    pub secrets_path: PathBuf,
+}
+
+impl<'a> Context<'a> {
+    pub fn build(
+        host: &'a dyn Host,
+        config_path: PathBuf,
+        config: Result<HostConfig, String>,
+        secrets_file: Option<PathBuf>,
+    ) -> Self {
+        let (config, config_error) = match config {
+            Ok(c) => (Some(c), None),
+            Err(e) => (None, Some(e)),
+        };
+        let runtime = config
+            .as_ref()
+            .map(|c| c.runtime.clone())
+            .unwrap_or_default();
+        let platform = config
+            .as_ref()
+            .map_or(PlatformKind::Systemd, |c| c.platform.kind);
+        let user = parse::lookup_user(host, &runtime.user);
+        let secrets_path = secrets_file.unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("secrets.toml")
+        });
+        Self {
+            host,
+            config_path,
+            config,
+            config_error,
+            runtime,
+            platform,
+            user,
+            secrets_path,
+        }
+    }
+
+    /// Socket libpod: `runtime.socket` albo domyślny dla systemd (`/run/user/<uid>/podman/podman.sock`).
+    pub fn podman_socket(&self) -> Option<PathBuf> {
+        if let Some(s) = &self.runtime.socket {
+            return Some(s.clone());
+        }
+        self.user
+            .as_ref()
+            .map(|u| PathBuf::from(format!("/run/user/{}/podman/podman.sock", u.uid)))
+    }
+}
+
+/// Jedno sprawdzenie. Dodanie nowego = nowy typ + wpis w [`all_checks`].
+pub trait Check {
+    /// Stabilny identyfikator (`runtime.subuid`) — trafia do `DoctorCheck::id`.
+    fn id(&self) -> &'static str;
+    /// Czy sprawdzenie ma sens w tej konfiguracji (np. linger tylko dla systemd).
+    fn applies(&self, _cx: &Context<'_>) -> bool {
+        true
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck;
+}
+
+pub fn all_checks() -> Vec<Box<dyn Check>> {
+    use checks::*;
+    vec![
+        Box::new(ConfigFile),
+        Box::new(RuntimeUserExists),
+        Box::new(SubIds::uid()),
+        Box::new(SubIds::gid()),
+        Box::new(CgroupsV2),
+        Box::new(Linger),
+        Box::new(PodmanSocket),
+        Box::new(PodmanApiVersion),
+        Box::new(PodmanSource),
+        Box::new(Netavark),
+        Box::new(Pasta),
+        Box::new(TraefikFile),
+        Box::new(BindAddress),
+        Box::new(SecretsFile),
+    ]
+}
+
+pub fn run_checks(cx: &Context<'_>, checks: &[Box<dyn Check>]) -> DoctorReport {
+    DoctorReport {
+        checks: checks
+            .iter()
+            .filter(|c| c.applies(cx))
+            .map(|c| c.run(cx))
+            .collect(),
+    }
+}
+
+/// Punkt wejścia `doctor --preflight` na prawdziwym hoście.
+pub fn run_local(overrides: &Overrides, secrets_file: Option<PathBuf>) -> DoctorReport {
+    let path = overrides.config_path();
+    let config = load_config(&path).map_err(|e| e.message);
+    let host = RealHost;
+    let cx = Context::build(&host, path, config, secrets_file);
+    run_checks(&cx, &all_checks())
+}
+
+// ---- budowanie wyników ----
+
+pub fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
+    check(id, CheckStatus::Ok, message, None)
+}
+
+pub fn warn(id: &str, message: impl Into<String>, hint: impl Into<String>) -> DoctorCheck {
+    check(id, CheckStatus::Warn, message, Some(hint.into()))
+}
+
+pub fn fail(id: &str, message: impl Into<String>, hint: impl Into<String>) -> DoctorCheck {
+    check(id, CheckStatus::Fail, message, Some(hint.into()))
+}
+
+fn check(
+    id: &str,
+    status: CheckStatus,
+    message: impl Into<String>,
+    hint: Option<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        id: id.to_owned(),
+        status,
+        message: message.into(),
+        hint,
+    }
+}
+
+/// Render tekstowy raportu (wspólny dla `doctor` i `doctor --preflight`).
+pub fn render(report: &DoctorReport) -> String {
+    let width = report.checks.iter().map(|c| c.id.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for c in &report.checks {
+        let tag = match c.status {
+            CheckStatus::Ok => " OK ",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+        };
+        out.push_str(&format!("[{tag}] {:<width$}  {}\n", c.id, c.message));
+        if let Some(h) = &c.hint {
+            out.push_str(&format!("       {:<width$}  hint: {h}\n", ""));
+        }
+    }
+    let (mut ok_n, mut warn_n, mut fail_n) = (0, 0, 0);
+    for c in &report.checks {
+        match c.status {
+            CheckStatus::Ok => ok_n += 1,
+            CheckStatus::Warn => warn_n += 1,
+            CheckStatus::Fail => fail_n += 1,
+        }
+    }
+    out.push_str(&format!("\n{ok_n} ok, {warn_n} warn, {fail_n} fail\n"));
+    out
+}

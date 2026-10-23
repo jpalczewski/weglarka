@@ -1,0 +1,30 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: render(&r)
+---
+[FAIL] config.file             cannot read config /etc/weglarka/weglarka.toml: not found
+                               hint: utwórz weglarka.toml (Ansible) albo wskaż plik przez --config / WEGLARKA_CONFIG; dalsze sprawdzenia używają wartości domyślnych
+[FAIL] runtime.user            user "weglarka" does not exist
+                               hint: utwórz usera (`useradd --create-home --shell /usr/sbin/nologin weglarka`) lub popraw [runtime] user w weglarka.toml
+[WARN] runtime.subuid          skipped: runtime user "weglarka" not found
+                               hint: najpierw napraw `runtime.user`
+[WARN] runtime.subgid          skipped: runtime user "weglarka" not found
+                               hint: najpierw napraw `runtime.user`
+[FAIL] runtime.cgroups         cgroups v2 (unified hierarchy) not detected
+                               hint: uruchom system z `systemd.unified_cgroup_hierarchy=1` (cgroups v2 jest wymagane przez rootless Podmana)
+[WARN] runtime.linger          skipped: runtime user "weglarka" not found
+                               hint: najpierw napraw `runtime.user`
+[WARN] runtime.socket          skipped: socket path unknown (no runtime user)
+                               hint: ustaw [runtime] socket albo popraw usera
+[WARN] runtime.podman_version  skipped: socket path unknown
+                               hint: napraw `runtime.socket`
+[WARN] runtime.podman_source   cannot determine package origin (apt-cache unavailable)
+                               hint: zainstaluj podman z repo `home:alvistack` i przypnij stos Podmana w apt preferences (źródło musi zawierać „alvistack”)
+[FAIL] runtime.netavark        netavark not found
+                               hint: zainstaluj netavark 2 (zależność Podmana 6)
+[FAIL] runtime.pasta           pasta not found
+                               hint: zainstaluj pakiet `passt` (pasta = domyślna sieć rootless w Podmanie ≥ 5)
+[WARN] state.secrets_file      /etc/weglarka/secrets.toml not found
+                               hint: to normalne przed pierwszym `secrets set`; inna lokalizacja: --secrets-file / WEGLARKA_SECRETS_FILE
+
+0 ok, 7 warn, 5 fail
