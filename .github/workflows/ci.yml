@@ -76,6 +76,11 @@ jobs:
             sleep 15
           done
           podman --version
+      - name: Diagnose podman config
+        run: |
+          id; echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} HOME=$HOME"
+          grep -vE '^\s*(#|$)' /etc/containers/containers.conf /etc/containers/storage.conf || true
+          podman info 2>&1 | head -30 || true
       - name: Start rootless podman service
         run: |
           set -euo pipefail
