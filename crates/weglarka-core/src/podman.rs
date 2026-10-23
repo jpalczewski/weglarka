@@ -87,8 +87,9 @@ pub struct IdRange {
     pub size: u32,
 }
 
-/// Explicit user-namespace mapping; when set it replaces `userns_auto` (path (a) of
-/// docs/decisions/0009).
+/// Explicit user-namespace mapping; when set it replaces `userns_auto` (the chosen path, ADR 0009).
+/// libpod needs `userns: private` *and* the maps: `private` alone is rejected, maps alone are silently
+/// ignored — the wire layer always sends the pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdMapping {
     pub uid_map: Vec<IdRange>,
@@ -119,7 +120,11 @@ pub struct ContainerSpec {
     pub secrets: Vec<SecretAttachment>,
     pub publish: Vec<PortMapping>,
     pub restart: RestartPolicy,
-    /// `--userns=auto` (decision: from the start).
+    /// `--userns=auto` as the MVP sends it (`userns: {nsmode: auto}`). **A no-op under rootless Podman**:
+    /// measured on 6.1, the container still gets the default map (`0 → the Podman user`, `1.. → all
+    /// subuids`), shared by every container. Real `auto` needs `idmappings.AutoUserNs` too, which this
+    /// contract does not express on purpose: iteration 2 uses explicit per-instance ranges
+    /// ([`IdMapping`]) instead — see docs/decisions/0009-volume-ownership.md.
     pub userns_auto: bool,
     /// Host bind mounts (empty list for ordinary apps).
     pub mounts: Vec<BindMount>,
@@ -281,6 +286,16 @@ pub trait PodmanClient: Send + Sync {
         name: &str,
         cmd: &[String],
     ) -> impl Future<Output = Result<i32>> + Send;
+    /// Extracts a tar archive into `path` of a container (`PUT /containers/{name}/archive`; works on
+    /// created, not started containers). Unlike `volume_import`, libpod maps the archive's ids through
+    /// the *container's* user namespace, so a foreign tar owned by uid 1000 becomes container uid 1000
+    /// (docs/decisions/0009).
+    fn container_archive_put(
+        &self,
+        name: &str,
+        path: &str,
+        tar: TarStream,
+    ) -> impl Future<Output = Result<()>> + Send;
     fn container_inspect(&self, name: &str) -> impl Future<Output = Result<ContainerInfo>> + Send;
     fn container_list(
         &self,

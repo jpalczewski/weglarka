@@ -1,19 +1,29 @@
-//! SPIKE (iteration 2, step 0): file ownership of named volumes across container recreation under
-//! rootless Podman 6.1 with `--userns=auto`. Drives libpod with raw JSON (curl) so the specgen shape
-//! can be iterated on without touching the typed client. Every observation is printed as a
-//! `SPIKE <label>: ...` line; the decision is recorded in docs/decisions/0009-volume-ownership.md.
+//! Volumes and file ownership against a real rootless Podman 6 (CI job `integration-podman`).
+//! Decision and measurements: docs/decisions/0009-volume-ownership.md. Requires
+//! `WEGLARKA_PODMAN_SOCKET`; skipped without it (docs/decisions/0002-podman-in-ci.md).
 //!
-//! Requires `WEGLARKA_PODMAN_SOCKET`; skipped without it (docs/decisions/0002-podman-in-ci.md).
+//! Volume operations go through the typed client. Containers are created with raw JSON because
+//! `ContainerSpec` has no command/user (an alpine container needs `sleep`, the image-user case needs
+//! `"user"`); the explicit-map body is the exact shape `weglarka-podman`'s wire layer sends.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
-use weglarka_core::podman::PodmanClient;
+use weglarka_core::podman::{
+    PodmanClient, PodmanError, PullEvent, TarStream, VolumeFilter, VolumeSpec,
+};
+use weglarka_core::uid_range::{UidRange, allocate};
 use weglarka_podman::LibpodClient;
 
 const ALPINE: &str = "docker.io/library/alpine:3.20";
+/// Instance range used by the tests; small, but covers uid 1000.
+const RANGE: u32 = 4096;
 
 fn socket() -> Option<String> {
     let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
@@ -33,14 +43,8 @@ fn run_id() -> String {
     format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
 }
 
-/// Raw libpod call; `Err` carries the response body (curl `--fail-with-body`).
-fn raw(
-    socket: &str,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    extra: &[&str],
-) -> Result<String, String> {
+/// Raw libpod call for what `ContainerSpec` cannot express; `Err` carries the response body.
+fn raw(socket: &str, method: &str, path: &str, body: Option<&Value>) -> Result<String, String> {
     let mut cmd = Command::new("curl");
     cmd.args([
         "-sS",
@@ -58,7 +62,6 @@ fn raw(
             &body.to_string(),
         ]);
     }
-    cmd.args(extra);
     cmd.arg(format!("http://d/v6.0.0/libpod{path}"));
     let out = cmd
         .output()
@@ -71,13 +74,35 @@ fn raw(
     }
 }
 
-struct Cleanup {
-    socket: String,
-    containers: Vec<String>,
-    volumes: Vec<String>,
+/// Size of the current user's subuid pool from /etc/subuid.
+fn subuid_pool_size() -> u64 {
+    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fs::read_to_string("/etc/subuid")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split(':');
+            (p.next()? == user).then_some(p.nth(1)?.parse().ok()?)
+        })
+        .next()
+        .expect("the CI user has a /etc/subuid entry")
 }
 
-impl Drop for Cleanup {
+/// Removes everything the test created, also on panic.
+struct Env {
+    socket: String,
+    client: LibpodClient,
+    containers: Vec<String>,
+    volumes: Vec<String>,
+    /// Ranges handed out so far (the allocator under test picks disjoint ones).
+    used: Vec<UidRange>,
+    pool: u64,
+}
+
+impl Drop for Env {
     fn drop(&mut self) {
         for c in &self.containers {
             let _ = raw(
@@ -85,7 +110,6 @@ impl Drop for Cleanup {
                 "DELETE",
                 &format!("/containers/{c}?force=true&v=true&timeout=0"),
                 None,
-                &[],
             );
         }
         for v in &self.volumes {
@@ -94,128 +118,87 @@ impl Drop for Cleanup {
                 "DELETE",
                 &format!("/volumes/{v}?force=true"),
                 None,
-                &[],
             );
         }
     }
 }
 
-/// `(first subuid, count)` of the current user from /etc/subuid.
-fn subuid_pool() -> (u64, u64) {
-    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
-        .unwrap()
-        .trim()
-        .to_owned();
-    let text = fs::read_to_string("/etc/subuid").unwrap_or_default();
-    text.lines()
-        .filter_map(|l| {
-            let mut p = l.split(':');
-            (p.next()? == user).then_some((p.next()?.parse().ok()?, p.next()?.parse().ok()?))
-        })
-        .next()
-        .unwrap_or((0, 0))
-}
+impl Env {
+    async fn new(socket: String) -> Self {
+        let client = LibpodClient::new(&socket);
+        let events: Vec<_> = client.image_pull(ALPINE).collect().await;
+        assert!(
+            matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+            "{events:?}"
+        );
+        Self {
+            client,
+            socket,
+            containers: vec![],
+            volumes: vec![],
+            used: vec![],
+            pool: subuid_pool_size(),
+        }
+    }
 
-/// How a scenario shapes the container's user namespace and volume mount.
-#[derive(Clone)]
-struct Variant {
-    label: &'static str,
-    /// Libpod `userns` object, or `None` to leave it unset.
-    userns: Option<Value>,
-    /// libpod `idmappings` object (explicit uid/gid maps), if any.
-    idmappings: Option<Value>,
-    /// Options of the named-volume mount (`idmap`, `U`, ...).
-    volume_options: Vec<&'static str>,
-}
+    /// A fresh instance range from the pure allocator (no reserved prefix: the CI pool is 65 536).
+    fn range(&mut self) -> UidRange {
+        let r = allocate(&self.used, self.pool, RANGE, 0).expect("subuid pool exhausted");
+        self.used.push(r);
+        r
+    }
 
-impl Variant {
-    fn body(&self, name: &str, user: Option<&str>, volume: &str) -> Value {
-        let mut b = json!({
-            "name": name,
-            "image": ALPINE,
-            "command": ["sleep", "3600"],
-            "volumes": [{"Name": volume, "Dest": "/data", "Options": self.volume_options}],
+    async fn volume(&mut self, name: &str) {
+        self.volumes.push(name.to_owned());
+        self.client
+            .volume_create(&VolumeSpec {
+                name: name.to_owned(),
+                labels: BTreeMap::from([("weglarka.instance".into(), "it".into())]),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Container with an explicit instance range (`private` + maps, as the wire layer sends).
+    fn body(name: &str, user: Option<&str>, volume: &str, range: UidRange) -> Value {
+        let map = json!([{"container_id": 0, "host_id": range.start, "size": range.size}]);
+        let mut body = json!({
+            "name": name, "image": ALPINE, "command": ["sleep", "3600"],
+            "userns": {"nsmode": "private"},
+            "idmappings": {"UIDMap": map, "GIDMap": map, "HostUIDMapping": false, "HostGIDMapping": false},
+            "volumes": [{"Name": volume, "Dest": "/data", "Options": []}],
         });
         if let Some(user) = user {
-            b["user"] = json!(user);
+            body["user"] = json!(user);
         }
-        if let Some(u) = &self.userns {
-            b["userns"] = u.clone();
-        }
-        if let Some(m) = &self.idmappings {
-            b["idmappings"] = m.clone();
-        }
-        b
-    }
-}
-
-fn auto_userns() -> Option<Value> {
-    Some(json!({"nsmode": "auto"}))
-}
-
-/// Explicit maps for one instance: container 0..size → intermediate-namespace ids `offset..offset+size`
-/// (rootless: 0 is the invoking user, 1.. are its subuids in order).
-fn explicit_maps(offset: u64, size: u64) -> Value {
-    let map = json!([{"container_id": 0, "host_id": offset, "size": size}]);
-    json!({"UIDMap": map, "GIDMap": map, "HostUIDMapping": false, "HostGIDMapping": false})
-}
-
-struct Spike {
-    socket: String,
-    client: LibpodClient,
-    cleanup: Cleanup,
-}
-
-impl Spike {
-    fn new(socket: String) -> Self {
-        Self {
-            client: LibpodClient::new(&socket),
-            cleanup: Cleanup {
-                socket: socket.clone(),
-                containers: vec![],
-                volumes: vec![],
-            },
-            socket,
-        }
+        body
     }
 
-    fn pull(&self) {
-        raw(
-            &self.socket,
-            "POST",
-            &format!("/images/pull?reference={ALPINE}"),
-            None,
-            &[],
-        )
-        .expect("pull alpine");
-    }
-
-    /// Creates + starts a container from a raw body; `Err` = verbatim libpod error.
-    fn start(&mut self, body: &Value) -> Result<(), String> {
+    fn start(&mut self, body: &Value) {
         let name = body["name"].as_str().unwrap().to_owned();
-        self.cleanup.containers.push(name.clone());
-        raw(&self.socket, "POST", "/containers/create", Some(body), &[])?;
+        self.containers.push(name.clone());
+        raw(&self.socket, "POST", "/containers/create", Some(body))
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
         raw(
             &self.socket,
             "POST",
             &format!("/containers/{name}/start"),
             None,
-            &[],
         )
-        .map(|_| ())
+        .unwrap_or_else(|e| panic!("start {name}: {e}"));
     }
 
     fn remove(&self, name: &str) {
-        let _ = raw(
+        raw(
             &self.socket,
             "DELETE",
             &format!("/containers/{name}?force=true&v=true&timeout=0"),
             None,
-            &[],
-        );
+        )
+        .unwrap();
     }
 
-    /// Runs a shell snippet in the container; returns the exit code.
+    /// Exit code of a shell snippet run in the container.
     async fn sh(&self, container: &str, script: &str) -> i32 {
         self.client
             .container_exec(
@@ -223,665 +206,230 @@ impl Spike {
                 &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             )
             .await
-            .unwrap_or(-1)
+            .unwrap()
     }
 
-    fn mountpoint(&self, volume: &str) -> Option<String> {
-        let out = raw(
-            &self.socket,
-            "GET",
-            &format!("/volumes/{volume}/json"),
-            None,
-            &[],
-        )
-        .ok()?;
-        serde_json::from_str::<Value>(&out)
-            .ok()?
-            .get("Mountpoint")?
-            .as_str()
-            .map(str::to_owned)
-    }
-
-    /// Contents of a file in the volume, read from the host side.
-    fn host_file(&self, volume: &str, file: &str) -> String {
-        let Some(mp) = self.mountpoint(volume) else {
-            return "no-mountpoint".into();
-        };
-        fs::read_to_string(format!("{mp}/{file}"))
-            .map(|t| one_line(&t))
-            .unwrap_or_else(|e| format!("read error: {e}"))
-    }
-
-    /// Host-side `uid:gid` of a file in the volume (as seen from outside the user namespace).
-    fn host_owner(&self, volume: &str, file: &str) -> String {
-        let Some(mp) = self.mountpoint(volume) else {
-            return "no-mountpoint".into();
-        };
-        match Command::new("stat")
-            .args(["-c", "%u:%g", &format!("{mp}/{file}")])
-            .output()
-        {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
-            Ok(o) => format!("stat failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
-            Err(e) => format!("stat error: {e}"),
+    async fn export(&self, volume: &str) -> Vec<u8> {
+        let mut tar = self.client.volume_export(volume).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(chunk) = tar.next().await {
+            out.extend_from_slice(&chunk.unwrap());
         }
+        out
     }
 }
 
-fn say(label: &str, user: &str, step: &str, ok: bool) {
-    eprintln!(
-        "SPIKE {label} [{user}]: {step} -> {}",
-        if ok { "ok" } else { "FAIL" }
-    );
+/// Splits a buffer into small chunks, so streaming import is exercised for real.
+fn chunked(data: Vec<u8>) -> TarStream {
+    let chunks: Vec<_> = data
+        .chunks(700)
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    stream::iter(chunks).boxed()
 }
 
-/// The full recreate scenario for one variant and one image user (`None` = root in the image).
-async fn scenario(socket: &str, variant: &Variant, user: Option<&str>) {
-    let who = user.unwrap_or("root").to_owned();
-    let (label, who) = (variant.label, who.as_str());
-    let id = run_id();
-    let mut s = Spike::new(socket.to_owned());
-    s.pull();
-    let vol = format!("weglarka-spike-{label}-{id}");
-    s.cleanup.volumes.push(vol.clone());
-    let labels = json!({"Name": vol, "Label": {"weglarka.instance": format!("spike-{id}")}});
-    raw(socket, "POST", "/volumes/create", Some(&labels), &[]).expect("volume create");
-
-    // 1. first container writes a file.
-    let c1 = format!("spike-{label}-1-{id}");
-    if let Err(e) = s.start(&variant.body(&c1, user, &vol)) {
-        eprintln!(
-            "SPIKE {label} [{who}]: create/start c1 -> FAIL (libpod: {})",
-            one_line(&e)
-        );
-        return;
-    }
-    let wrote = s
-        .sh(
-            &c1,
-            "echo v1 > /data/f && chmod 644 /data/f && id -u > /data/uid",
-        )
-        .await
-        == 0;
-    say(label, who, "c1 writes /data/f", wrote);
-    eprintln!(
-        "SPIKE {label} [{who}]: host owner of /data/f after c1 = {}",
-        s.host_owner(&vol, "f")
-    );
-
-    // 2. recreate: remove c1, let a dummy `auto` container take the freed range, create c2.
-    s.remove(&c1);
-    let dummy = format!("spike-dummy-{label}-{id}");
-    // The dummy uses the same user-namespace shape, so with real `auto` it takes c1's range.
-    let mut dummy_body = json!({
-        "name": dummy, "image": ALPINE, "command": ["sleep", "3600"],
-        "userns": variant.userns.clone().unwrap_or(json!({"nsmode": "auto"})),
-    });
-    if label.starts_with("api-auto") {
-        dummy_body["idmappings"] = auto_idmappings();
-    }
-    let dummy_started = s.start(&dummy_body);
-    eprintln!("SPIKE {label} [{who}]: dummy occupying the range started = {dummy_started:?}");
-    let c2 = format!("spike-{label}-2-{id}");
-    if let Err(e) = s.start(&variant.body(&c2, user, &vol)) {
-        eprintln!(
-            "SPIKE {label} [{who}]: create/start c2 -> FAIL (libpod: {})",
-            one_line(&e)
-        );
-        return;
-    }
-    let _ = s
-        .sh(
-            &c2,
-            "cat /proc/self/uid_map > /data/uidmap2; chmod 644 /data/uidmap2",
-        )
-        .await;
-    eprintln!(
-        "SPIKE {label} [{who}]: c2 uid_map = [{}]",
-        s.host_file(&vol, "uidmap2")
-    );
-    // Same uid inside as before?
-    let same_uid = s.sh(&c2, "test \"$(id -u)\" = \"$(cat /data/uid)\"").await == 0;
-    say(label, who, "c2 sees same uid as c1", same_uid);
-    let owner = s
-        .sh(&c2, "test \"$(stat -c %u /data/f)\" = \"$(id -u)\"")
-        .await
-        == 0;
-    say(label, who, "c2: /data/f owned by c2's uid", owner);
-    let read = s.sh(&c2, "grep -q v1 /data/f").await == 0;
-    say(label, who, "c2 reads v1", read);
-    let write = s.sh(&c2, "echo v2 > /data/f && grep -q v2 /data/f").await == 0;
-    say(label, who, "c2 overwrites /data/f", write);
-    eprintln!(
-        "SPIKE {label} [{who}]: host owner of /data/f after c2 = {}",
-        s.host_owner(&vol, "f")
-    );
-
-    // 3. import a tar owned by the image user, then read/write it from the container.
-    let tar_uid = user.map_or("0", |u| u.split(':').next().unwrap());
-    let dir = std::env::temp_dir().join(format!("weglarka-spike-{id}"));
+/// `tar` archive with one file `name` owned by `owner:owner` (numeric).
+fn make_tar(name: &str, content: &str, owner: &str) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!("weglarka-it-tar-{}", run_id()));
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("imported.txt"), "from-tar\n").unwrap();
-    let tar = dir.join("in.tar");
-    let made = Command::new("tar")
-        .args([
-            "-cf",
-            tar.to_str().unwrap(),
-            "-C",
-            dir.to_str().unwrap(),
-            "--owner",
-            tar_uid,
-            "--group",
-            tar_uid,
-            "--numeric-owner",
-            "imported.txt",
-        ])
-        .status()
-        .unwrap()
-        .success();
-    assert!(made, "tar -c");
-    let imp = raw(
-        socket,
-        "POST",
-        &format!("/volumes/{vol}/import"),
-        None,
-        &[
-            "-H",
-            "content-type: application/x-tar",
-            "--data-binary",
-            &format!("@{}", tar.display()),
-        ],
-    );
-    match imp {
-        Err(e) => eprintln!(
-            "SPIKE {label} [{who}]: import -> FAIL (libpod: {})",
-            one_line(&e)
-        ),
-        Ok(_) => {
-            say(label, who, "import tar (owned by image user)", true);
-            eprintln!(
-                "SPIKE {label} [{who}]: host owner of imported.txt = {}",
-                s.host_owner(&vol, "imported.txt")
-            );
-            let o = s
-                .sh(
-                    &c2,
-                    "test \"$(stat -c %u /data/imported.txt)\" = \"$(id -u)\"",
-                )
-                .await
-                == 0;
-            say(label, who, "imported.txt owned by container uid", o);
-            let w = s.sh(&c2, "echo more >> /data/imported.txt").await == 0;
-            say(label, who, "container can write imported.txt", w);
-        }
-    }
-
-    // 4. export streams back a tar containing our files.
-    let out = dir.join("out.tar");
-    let exp = raw(
-        socket,
-        "GET",
-        &format!("/volumes/{vol}/export"),
-        None,
-        &["-o", out.to_str().unwrap()],
-    );
-    match exp {
-        Err(e) => eprintln!(
-            "SPIKE {label} [{who}]: export -> FAIL (libpod: {})",
-            one_line(&e)
-        ),
-        Ok(_) => {
-            let listing = Command::new("tar")
-                .args(["-tvf", out.to_str().unwrap(), "--numeric-owner"])
-                .output()
-                .unwrap();
-            for line in String::from_utf8_lossy(&listing.stdout).lines() {
-                eprintln!("SPIKE {label} [{who}]: export entry: {line}");
-            }
-        }
-    }
-    let _ = fs::remove_dir_all(&dir);
-}
-
-fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-const USERS: [Option<&str>; 2] = [Some("1000:1000"), None];
-
-/// Baseline: what happens today (`auto`, plain volume).
-#[tokio::test]
-async fn spike_baseline_auto() {
-    let Some(socket) = socket() else { return };
-    let v = Variant {
-        label: "base",
-        userns: auto_userns(),
-        idmappings: None,
-        volume_options: vec![],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-}
-
-/// Third option: `auto` + `:U` (chown the volume to the container user on every start).
-#[tokio::test]
-async fn spike_auto_chown_u() {
-    let Some(socket) = socket() else { return };
-    let v = Variant {
-        label: "chownU",
-        userns: auto_userns(),
-        idmappings: None,
-        volume_options: vec!["U"],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-}
-
-/// Path (b): `auto` + volume mounted with `idmap`.
-#[tokio::test]
-async fn spike_b_auto_idmap() {
-    let Some(socket) = socket() else { return };
-    let v = Variant {
-        label: "b-idmap",
-        userns: auto_userns(),
-        idmappings: None,
-        volume_options: vec!["idmap"],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-}
-
-/// Path (a): fixed explicit uid/gid maps for the instance (allocated from the subuid pool).
-#[tokio::test]
-async fn spike_a_fixed_range() {
-    let Some(socket) = socket() else { return };
-    let (base, count) = subuid_pool();
-    eprintln!("SPIKE a: subuid pool of the user = {base}:{count}");
-    // Offsets are in the intermediate namespace: 1.. = subuids in order.
-    let v = Variant {
-        label: "a-private",
-        userns: Some(json!({"nsmode": "private"})),
-        idmappings: Some(explicit_maps(1, 4096)),
-        volume_options: vec![],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-    // Same maps without an explicit nsmode, in case "private" + idmappings is rejected.
-    let v = Variant {
-        label: "a-nomode",
-        userns: None,
-        idmappings: Some(explicit_maps(1, 4096)),
-        volume_options: vec![],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-}
-
-/// Path (a), isolation: two instances with disjoint ranges cannot touch each other's files.
-#[tokio::test]
-async fn spike_a_isolation() {
-    let Some(socket) = socket() else { return };
-    let mut s = Spike::new(socket.clone());
-    s.pull();
-    let id = run_id();
-    let (vol_a, vol_b) = (
-        format!("weglarka-spike-iso-a-{id}"),
-        format!("weglarka-spike-iso-b-{id}"),
-    );
-    s.cleanup.volumes.extend([vol_a.clone(), vol_b.clone()]);
-    for v in [&vol_a, &vol_b] {
-        raw(
-            &socket,
-            "POST",
-            "/volumes/create",
-            Some(&json!({"Name": v})),
-            &[],
-        )
+    fs::write(dir.join(name), content).unwrap();
+    let out = Command::new("tar")
+        .args(["-c", "-C", dir.to_str().unwrap()])
+        .args(["--owner", owner, "--group", owner, "--numeric-owner", name])
+        .output()
         .unwrap();
+    assert!(out.status.success(), "tar -c");
+    let _ = fs::remove_dir_all(&dir);
+    out.stdout
+}
+
+fn tar_names(tar: &[u8]) -> Vec<String> {
+    let mut child = Command::new("tar")
+        .args(["-t"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(tar).unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim_start_matches("./").to_owned())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// The chosen design (ADR 0009): a fixed range per instance keeps file ownership stable across
+/// container recreation (also when other containers come and go), and ranges isolate instances.
+/// Covers both an image running as a non-root user and as root.
+#[tokio::test]
+async fn fixed_range_keeps_ownership_across_recreate_and_isolates() {
+    let Some(socket) = socket() else { return };
+    let mut env = Env::new(socket).await;
+    for (label, user) in [("user", Some("1000:1000")), ("root", None)] {
+        let id = run_id();
+        let (range, other) = (env.range(), env.range());
+        assert!(!range.overlaps(other));
+        let vol = format!("weglarka-it-vol-{label}-{id}");
+        env.volume(&vol).await;
+
+        // First container writes a private file as the image user.
+        let c1 = format!("weglarka-it-c1-{label}-{id}");
+        env.start(&Env::body(&c1, user, &vol, range));
+        let write = "echo v1 > /data/f && chmod 600 /data/f && id -u > /data/uid";
+        assert_eq!(env.sh(&c1, write).await, 0);
+
+        // Recreate (as the deploy does) while another instance is running: ownership must hold.
+        env.remove(&c1);
+        let neighbour = format!("weglarka-it-neighbour-{label}-{id}");
+        let nvol = format!("weglarka-it-nvol-{label}-{id}");
+        env.volume(&nvol).await;
+        env.start(&Env::body(&neighbour, user, &nvol, other));
+        let c2 = format!("weglarka-it-c2-{label}-{id}");
+        env.start(&Env::body(&c2, user, &vol, range));
+        let cmd = r#"test "$(id -u)" = "$(cat /data/uid)" && test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v1 /data/f && echo v2 > /data/f"#;
+        assert_eq!(
+            env.sh(&c2, cmd).await,
+            0,
+            "[{label}] c2 reads and overwrites"
+        );
+
+        // Isolation: a container with the other (disjoint) range cannot touch this volume's files.
+        let intruder = format!("weglarka-it-intruder-{label}-{id}");
+        env.start(&Env::body(&intruder, user, &vol, other));
+        assert_ne!(env.sh(&intruder, "cat /data/f").await, 0, "[{label}] read");
+        let evil = "echo x > /data/evil";
+        assert_ne!(env.sh(&intruder, evil).await, 0, "[{label}] write");
+        env.remove(&intruder);
+
+        // Export, then import into a second volume of the same instance range (streamed, chunked).
+        let tar = env.export(&vol).await;
+        let names = tar_names(&tar);
+        assert!(names.iter().any(|n| n == "f"), "{names:?}");
+        let vol2 = format!("weglarka-it-vol2-{label}-{id}");
+        env.volume(&vol2).await;
+        env.client.volume_import(&vol2, chunked(tar)).await.unwrap();
+        let c3 = format!("weglarka-it-c3-{label}-{id}");
+        env.start(&Env::body(&c3, user, &vol2, range));
+        let cmd = r#"test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v2 /data/f"#;
+        assert_eq!(
+            env.sh(&c3, cmd).await,
+            0,
+            "[{label}] own export imports losslessly"
+        );
+
+        // A foreign tar (owned by the image user, e.g. from Coolify): `container_archive_put` maps it
+        // through the container's namespace, so the app owns it.
+        let owner = user.map_or("0", |u| u.split(':').next().unwrap());
+        let foreign = make_tar("imported.txt", "from-tar\n", owner);
+        env.client
+            .container_archive_put(&c3, "/data", chunked(foreign))
+            .await
+            .unwrap();
+        let cmd = r#"test "$(stat -c %u /data/imported.txt)" = "$(id -u)" && echo more >> /data/imported.txt"#;
+        assert_eq!(
+            env.sh(&c3, cmd).await,
+            0,
+            "[{label}] foreign tar via archive"
+        );
     }
-    let mk = |name: &str, vol: &str, offset: u64, extra: &str| {
-        json!({
-            "name": name, "image": ALPINE, "command": ["sleep", "3600"],
-            "user": "1000:1000",
-            "userns": {"nsmode": "private"},
-            "idmappings": explicit_maps(offset, 4096),
-            "volumes": [{"Name": vol, "Dest": "/data", "Options": []}],
-            "labels": {"spike": extra},
-        })
+}
+
+/// The volume client: idempotent create, labels, label-filtered list, inspect, remove.
+#[tokio::test]
+async fn volume_lifecycle() {
+    let Some(socket) = socket() else { return };
+    let mut env = Env::new(socket).await;
+    let name = format!("weglarka-it-lifecycle-{}", run_id());
+    env.volume(&name).await;
+    env.volume(&name).await; // idempotent
+
+    let info = env.client.volume_inspect(&name).await.unwrap();
+    assert_eq!(info.name, name);
+    assert_eq!(
+        info.labels.get("weglarka.instance").map(String::as_str),
+        Some("it")
+    );
+    assert!(info.mountpoint.is_some());
+
+    let filter = |value: &str| VolumeFilter {
+        labels: BTreeMap::from([("weglarka.instance".into(), value.into())]),
     };
-    let (ca, cb) = (format!("spike-iso-a-{id}"), format!("spike-iso-b-{id}"));
-    let ra = s.start(&mk(&ca, &vol_a, 1, "a"));
-    let rb = s.start(&mk(&cb, &vol_b, 4097, "b"));
-    eprintln!("SPIKE iso: start a = {ra:?}, start b = {rb:?}");
-    if ra.is_err() || rb.is_err() {
-        return;
+    let listed = env.client.volume_list(&filter("it")).await.unwrap();
+    assert!(listed.iter().any(|v| v.name == name));
+    assert!(
+        env.client
+            .volume_list(&filter("no-such"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    env.client.volume_remove(&name, false).await.unwrap();
+    assert!(matches!(
+        env.client.volume_inspect(&name).await,
+        Err(PodmanError::NotFound(_))
+    ));
+    assert!(matches!(
+        env.client.volume_remove(&name, false).await,
+        Err(PodmanError::NotFound(_))
+    ));
+}
+
+/// Finding behind ADR 0009: `userns: {nsmode: auto}` — what the MVP sends — does not engage under
+/// rootless Podman. The container keeps the default map shared by all containers; real `auto` needs
+/// `idmappings.AutoUserNs`. If this test starts failing, Podman changed and the ADR needs a revisit.
+#[tokio::test]
+async fn plain_userns_auto_is_a_noop_rootless() {
+    let Some(socket) = socket() else { return };
+    let mut env = Env::new(socket).await;
+    let id = run_id();
+    let shapes = [
+        ("unset", json!({})),
+        ("auto", json!({"userns": {"nsmode": "auto"}})),
+        (
+            "real-auto",
+            json!({
+                "userns": {"nsmode": "auto"},
+                "idmappings": {"AutoUserNs": true, "AutoUserNsOpts": {"Size": 1024}},
+            }),
+        ),
+    ];
+    let mut maps = Vec::new();
+    for (label, extra) in shapes {
+        let vol = format!("weglarka-it-map-{label}-{id}");
+        env.volume(&vol).await;
+        let mut body = json!({
+            "name": format!("weglarka-it-map-{label}-{id}"),
+            "image": ALPINE, "command": ["sleep", "3600"],
+            "volumes": [{"Name": vol, "Dest": "/out", "Options": []}],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        env.start(&body);
+        let name = body["name"].as_str().unwrap();
+        let script = "cat /proc/self/uid_map | tr -s ' \\n' ' ' > /out/m; chmod 644 /out/m";
+        assert_eq!(env.sh(name, script).await, 0);
+        let mountpoint = env
+            .client
+            .volume_inspect(&vol)
+            .await
+            .unwrap()
+            .mountpoint
+            .unwrap();
+        maps.push(
+            fs::read_to_string(format!("{mountpoint}/m"))
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
     }
     assert_eq!(
-        s.sh(&ca, "echo secret > /data/s && chmod 600 /data/s")
-            .await,
-        0
+        maps[0], maps[1],
+        "plain `auto` equals no userns setting: {maps:?}"
     );
-    // b mounts a's volume (a mistake or an attack): with disjoint ranges it must be unable to read it.
-    s.remove(&cb);
-    let cb2 = format!("spike-iso-b2-{id}");
-    let rb2 = s.start(&json!({
-        "name": cb2, "image": ALPINE, "command": ["sleep", "3600"], "user": "1000:1000",
-        "userns": {"nsmode": "private"},
-        "idmappings": explicit_maps(4097, 4096),
-        "volumes": [{"Name": vol_a, "Dest": "/data", "Options": []}],
-    }));
-    eprintln!("SPIKE iso: b-range container on a's volume start = {rb2:?}");
-    if rb2.is_ok() {
-        let read = s.sh(&cb2, "cat /data/s").await;
-        say(
-            "iso",
-            "1000",
-            "other range cannot read a's 0600 file",
-            read != 0,
-        );
-        let write = s.sh(&cb2, "echo x > /data/evil").await;
-        say(
-            "iso",
-            "1000",
-            "other range cannot create files in a's volume",
-            write != 0,
-        );
-    }
-}
-
-/// Path (a) + `U`: explicit private maps, volume chowned to the container user on every start —
-/// would make `import` independent of the offset without rewriting tar headers.
-#[tokio::test]
-async fn spike_a_fixed_range_chown_u() {
-    let Some(socket) = socket() else { return };
-    let v = Variant {
-        label: "a-private-U",
-        userns: Some(json!({"nsmode": "private"})),
-        idmappings: Some(explicit_maps(1, 4096)),
-        volume_options: vec!["U"],
-    };
-    for u in USERS {
-        scenario(&socket, &v, u).await;
-    }
-}
-
-/// What does `userns: auto` do under rootless Podman? Two concurrent containers per mode; their
-/// `/proc/self/uid_map` is written to a volume and read back from the host.
-#[tokio::test]
-async fn spike_diag_userns_modes() {
-    let Some(socket) = socket() else { return };
-    let mut s = Spike::new(socket.clone());
-    s.pull();
-    let id = run_id();
-    let modes: [(&str, Option<Value>); 4] = [
-        ("auto", Some(json!({"nsmode": "auto"}))),
-        (
-            "auto-size",
-            Some(json!({"nsmode": "auto", "value": "size=1024"})),
-        ),
-        ("private", Some(json!({"nsmode": "private"}))),
-        ("unset", None),
-    ];
-    for (label, userns) in modes {
-        let mut vols = Vec::new();
-        for n in ["x", "y"] {
-            let vol = format!("weglarka-spike-diag-{label}-{n}-{id}");
-            s.cleanup.volumes.push(vol.clone());
-            raw(
-                &socket,
-                "POST",
-                "/volumes/create",
-                Some(&json!({"Name": vol})),
-                &[],
-            )
-            .unwrap();
-            let name = format!("spike-diag-{label}-{n}-{id}");
-            let mut body = json!({
-                "name": name, "image": ALPINE, "command": ["sleep", "3600"],
-                "volumes": [{"Name": vol, "Dest": "/out", "Options": []}],
-            });
-            if let Some(u) = &userns {
-                body["userns"] = u.clone();
-            }
-            match s.start(&body) {
-                Err(e) => eprintln!("SPIKE diag {label}/{n}: start -> FAIL ({})", one_line(&e)),
-                Ok(()) => {
-                    let code = s
-                        .sh(&name, "cat /proc/self/uid_map > /out/uid_map; id -u > /out/uid; chmod 644 /out/*")
-                        .await;
-                    let inspect = raw(
-                        &socket,
-                        "GET",
-                        &format!("/containers/{name}/json"),
-                        None,
-                        &[],
-                    )
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-                    let mode = inspect
-                        .as_ref()
-                        .map(|j| j["HostConfig"]["UsernsMode"].to_string())
-                        .unwrap_or_default();
-                    eprintln!(
-                        "SPIKE diag {label}/{n}: exec={code} HostConfig.UsernsMode={mode} uid_map=[{}]",
-                        s.host_file(&vol, "uid_map")
-                    );
-                    vols.push(vol);
-                }
-            }
-        }
-    }
-    // Is `idmap` on a volume honored? (mount options of /data as the container sees them)
-    let vol = format!("weglarka-spike-diag-idmap-{id}");
-    s.cleanup.volumes.push(vol.clone());
-    raw(
-        &socket,
-        "POST",
-        "/volumes/create",
-        Some(&json!({"Name": vol})),
-        &[],
-    )
-    .unwrap();
-    let name = format!("spike-diag-idmap-{id}");
-    let body = json!({
-        "name": name, "image": ALPINE, "command": ["sleep", "3600"],
-        "userns": {"nsmode": "auto"},
-        "volumes": [{"Name": vol, "Dest": "/data", "Options": ["idmap"]}],
-    });
-    match s.start(&body) {
-        Err(e) => eprintln!("SPIKE diag idmap: start -> FAIL ({})", one_line(&e)),
-        Ok(()) => {
-            s.sh(
-                &name,
-                "grep ' /data ' /proc/self/mountinfo > /data/mi; chmod 644 /data/mi",
-            )
-            .await;
-            eprintln!("SPIKE diag idmap: mountinfo=[{}]", s.host_file(&vol, "mi"));
-        }
-    }
-}
-
-/// Import/export fixes for path (a): (1) `PUT/GET /containers/{name}/archive` (podman cp — maps ids
-/// through the container's user namespace), (2) volume import followed by a container restart with
-/// the `U` volume option.
-#[tokio::test]
-async fn spike_a_archive_and_u() {
-    let Some(socket) = socket() else { return };
-    for user in USERS {
-        let who = user.unwrap_or("root");
-        let tar_uid = user.map_or("0", |u| u.split(':').next().unwrap());
-        let id = run_id();
-        let mut s = Spike::new(socket.clone());
-        s.pull();
-        let dir = std::env::temp_dir().join(format!("weglarka-spike-ar-{id}"));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("imported.txt"), "from-tar\n").unwrap();
-        let tar = dir.join("in.tar");
-        assert!(
-            Command::new("tar")
-                .args(["-cf", tar.to_str().unwrap(), "-C", dir.to_str().unwrap()])
-                .args([
-                    "--owner",
-                    tar_uid,
-                    "--group",
-                    tar_uid,
-                    "--numeric-owner",
-                    "imported.txt"
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
-        for (label, opts) in [("a-archive", vec![]), ("a-U-restart", vec!["U"])] {
-            let v = Variant {
-                label: "a-private",
-                userns: Some(json!({"nsmode": "private"})),
-                idmappings: Some(explicit_maps(1, 4096)),
-                volume_options: opts,
-            };
-            let vol = format!("weglarka-spike-{label}-{id}");
-            s.cleanup.volumes.push(vol.clone());
-            raw(
-                &socket,
-                "POST",
-                "/volumes/create",
-                Some(&json!({"Name": vol})),
-                &[],
-            )
-            .unwrap();
-            let c = format!("spike-{label}-{id}");
-            if let Err(e) = s.start(&v.body(&c, user, &vol)) {
-                eprintln!("SPIKE {label} [{who}]: start -> FAIL ({})", one_line(&e));
-                continue;
-            }
-            if label == "a-archive" {
-                let put = raw(
-                    &socket,
-                    "PUT",
-                    &format!("/containers/{c}/archive?path=/data"),
-                    None,
-                    &[
-                        "-H",
-                        "content-type: application/x-tar",
-                        "--data-binary",
-                        &format!("@{}", tar.display()),
-                    ],
-                );
-                eprintln!(
-                    "SPIKE {label} [{who}]: archive PUT = {:?}",
-                    put.as_ref().map(|_| "ok").map_err(|e| one_line(e))
-                );
-                let o = s
-                    .sh(
-                        &c,
-                        "test \"$(stat -c %u /data/imported.txt)\" = \"$(id -u)\"",
-                    )
-                    .await
-                    == 0;
-                say(label, who, "archive-put file owned by container uid", o);
-                eprintln!(
-                    "SPIKE {label} [{who}]: host owner = {}",
-                    s.host_owner(&vol, "imported.txt")
-                );
-                let out = dir.join("get.tar");
-                let get = raw(
-                    &socket,
-                    "GET",
-                    &format!("/containers/{c}/archive?path=/data/imported.txt"),
-                    None,
-                    &["-o", out.to_str().unwrap()],
-                );
-                if get.is_ok() {
-                    let l = Command::new("tar")
-                        .args(["-tvf", out.to_str().unwrap(), "--numeric-owner"])
-                        .output()
-                        .unwrap();
-                    for line in String::from_utf8_lossy(&l.stdout).lines() {
-                        eprintln!("SPIKE {label} [{who}]: archive GET entry: {line}");
-                    }
-                } else {
-                    eprintln!("SPIKE {label} [{who}]: archive GET -> FAIL");
-                }
-            } else {
-                // volume import while the container is stopped, then start → `U` should chown.
-                raw(
-                    &socket,
-                    "POST",
-                    &format!("/containers/{c}/stop?timeout=0"),
-                    None,
-                    &[],
-                )
-                .unwrap();
-                let imp = raw(
-                    &socket,
-                    "POST",
-                    &format!("/volumes/{vol}/import"),
-                    None,
-                    &[
-                        "-H",
-                        "content-type: application/x-tar",
-                        "--data-binary",
-                        &format!("@{}", tar.display()),
-                    ],
-                );
-                say(label, who, "volume import while stopped", imp.is_ok());
-                eprintln!(
-                    "SPIKE {label} [{who}]: host owner before restart = {}",
-                    s.host_owner(&vol, "imported.txt")
-                );
-                raw(
-                    &socket,
-                    "POST",
-                    &format!("/containers/{c}/start"),
-                    None,
-                    &[],
-                )
-                .unwrap();
-                let o = s
-                    .sh(
-                        &c,
-                        "test \"$(stat -c %u /data/imported.txt)\" = \"$(id -u)\"",
-                    )
-                    .await
-                    == 0;
-                say(label, who, "after restart: file owned by container uid", o);
-                eprintln!(
-                    "SPIKE {label} [{who}]: host owner after restart = {}",
-                    s.host_owner(&vol, "imported.txt")
-                );
-            }
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-fn auto_idmappings() -> Value {
-    json!({"AutoUserNs": true, "AutoUserNsOpts": {"Size": 1024}})
-}
-
-/// `auto` through the API = `userns: auto` + `idmappings: {AutoUserNs}`. Ownership across a recreate
-/// where a dummy container takes the freed range, with and without the `idmap` / `U` volume options.
-#[tokio::test]
-async fn spike_auto_via_api() {
-    let Some(socket) = socket() else { return };
-    for (label, opts) in [
-        ("api-auto", vec![]),
-        ("api-auto-idmap", vec!["idmap"]),
-        ("api-auto-U", vec!["U"]),
-    ] {
-        let v = Variant {
-            label,
-            userns: Some(json!({"nsmode": "auto"})),
-            idmappings: Some(auto_idmappings()),
-            volume_options: opts,
-        };
-        for u in USERS {
-            scenario(&socket, &v, u).await;
-        }
-    }
+    assert!(maps[0].starts_with("0 "), "{maps:?}");
+    assert_ne!(maps[0], maps[2], "AutoUserNs changes the map: {maps:?}");
+    assert!(maps[2].ends_with(" 1024"), "{maps:?}");
 }

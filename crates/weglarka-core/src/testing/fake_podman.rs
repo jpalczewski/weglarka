@@ -54,6 +54,10 @@ pub enum Call {
     VolumeImport(String),
     VolumeExport(String),
     VolumeRemove(String),
+    ContainerArchivePut {
+        name: String,
+        path: String,
+    },
 }
 
 #[derive(Default)]
@@ -354,6 +358,24 @@ impl PodmanClient for FakePodman {
             )));
         }
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
+    }
+
+    async fn container_archive_put(
+        &self,
+        name: &str,
+        path: &str,
+        mut tar: TarStream,
+    ) -> Result<()> {
+        while let Some(chunk) = tar.next().await {
+            chunk?;
+        }
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerArchivePut {
+            name: name.to_owned(),
+            path: path.to_owned(),
+        });
+        s.container_mut(name)?;
+        Ok(())
     }
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {

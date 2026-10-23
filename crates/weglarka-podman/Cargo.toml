@@ -25,6 +25,7 @@ tracing.workspace = true
 weglarka-core.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
 insta.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 weglarka-core = { workspace = true, features = ["testing"] }
