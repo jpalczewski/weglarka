@@ -33,6 +33,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # Wygenerowany config nginx musi przechodzić `nginx -t` (sesja c, weglarka-ingress).
+  nginx-t:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
+      - run: docker run --rm -i nginx:stable-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+
   musl:
     runs-on: ubuntu-24.04
     steps:
