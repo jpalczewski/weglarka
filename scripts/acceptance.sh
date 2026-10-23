@@ -35,6 +35,7 @@ REGISTRY_PORT=15099
 CERT_TIMEOUT=180
 DEPLOY_WAIT=120
 DUP_WAIT=25
+HEALTH_WINDOW=
 
 usage() {
   cat <<'EOF'
@@ -56,6 +57,9 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
   --strict               ostrzeżenia `doctor` traktuj jak błąd
   --registry-port PORT   port lokalnego rejestru testowego na 127.0.0.1 (domyślnie 15099)
   --cert-timeout SEK     ile czekać na certyfikat Traefika (domyślnie 180)
+  --dup-wait SEK         jak długo obserwować, że duplikat dostarczenia nie wdraża (domyślnie 25)
+  --health-window SEK    okno bramki zdrowia kanarka (domyślnie z AppSpec: 30 s); do testów CI,
+                         gdzie wolne czekanie na obraz bez healthchecka nic nie weryfikuje
   --json                 raport maszynowy (JSON) na stdout; opis kroków na stderr
   -h, --help             ta pomoc
 
@@ -82,6 +86,8 @@ while [ $# -gt 0 ]; do
     --strict) STRICT=1; shift ;;
     --registry-port) REGISTRY_PORT=${2:?--registry-port wymaga wartości}; shift 2 ;;
     --cert-timeout) CERT_TIMEOUT=${2:?--cert-timeout wymaga wartości}; shift 2 ;;
+    --dup-wait) DUP_WAIT=${2:?--dup-wait wymaga wartości}; shift 2 ;;
+    --health-window) HEALTH_WINDOW=${2:?--health-window wymaga wartości}; shift 2 ;;
     --json) JSON=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die_usage "nieznana opcja: $1 (--help)" ;;
@@ -348,7 +354,21 @@ step_doctor() {
 step_canary() {
   local out outcome digest runtime rc=0
   wg apps remove --ignore-missing "$CANARY" >/dev/null
-  wg apps add "$CANARY" "$IMAGE" --domain "$CANARY_DOMAIN" --port 80 >/dev/null
+  if [ -n "$HEALTH_WINDOW" ]; then
+    # Same spec as the flags below, plus a shortened health gate (the default window is 30 s).
+    cat >"$WORK/canary-spec.toml" <<EOF
+image = "$IMAGE"
+domains = ["$CANARY_DOMAIN"]
+port = 80
+
+[health]
+attempts = 2
+window_secs = $HEALTH_WINDOW
+EOF
+    wg apps add "$CANARY" --spec "$WORK/canary-spec.toml" >/dev/null
+  else
+    wg apps add "$CANARY" "$IMAGE" --domain "$CANARY_DOMAIN" --port 80 >/dev/null
+  fi
   out=$(wg --json deploy "$CANARY") || rc=$?
   [ "$rc" = 0 ] || die "deploy kanarka zakończył się kodem $rc: $out"
   outcome=$(printf '%s' "$out" | jq -r .outcome)

@@ -12,7 +12,10 @@ env:
   IMAGE: ghcr.io/jpalczewski/weglarka
 
 jobs:
+  # The image is assembled from the binaries built once in `binaries` below (also the release assets):
+  # what is published is exactly what was built there, and the image job compiles nothing.
   image:
+    needs: binaries
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -25,6 +28,10 @@ jobs:
         run: |
           ver=$(awk -F'"' '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f&&/^version/{print $2}' Cargo.toml)
           [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != workspace version v$ver"; exit 1; }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: raw-x86_64-unknown-linux-musl
+          path: bin
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -50,11 +57,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            BIN_SOURCE=prebuilt
             VERSION=${{ steps.meta.outputs.version }}
             REVISION=${{ github.sha }}
           provenance: false
-          cache-from: type=gha,scope=image
-          cache-to: type=gha,scope=image,mode=max
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Podpis obrazu (keyless)
         run: cosign sign --yes "$IMAGE@${{ steps.build.outputs.digest }}"
@@ -67,19 +73,12 @@ jobs:
           upload-artifact: false
       - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE@${{ steps.build.outputs.digest }}"
 
+  # Full `release` profile (docs/decisions/0008). The linux/musl leg runs on every push to main (it feeds the
+  # image); the macOS leg only for tags (release asset only).
   binaries:
-    if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            packages: "-p weglarka-cli -p weglarka-daemon"
-            files: "weglarka weglarka-daemon"
-          - os: macos-15
-            target: aarch64-apple-darwin
-            packages: "-p weglarka-cli"
-            files: "weglarka"
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon","files":"weglarka weglarka-daemon"},{"os":"macos-15","target":"aarch64-apple-darwin","packages":"-p weglarka-cli","files":"weglarka"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon","files":"weglarka weglarka-daemon"}]') }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -93,7 +92,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
-      - name: Pakowanie
+      # Raw binaries for the image job (the very same files that go into the release tarball).
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: raw-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/weglarka
+            target/${{ matrix.target }}/release/weglarka-daemon
+          if-no-files-found: error
+          retention-days: 1
+      - if: startsWith(github.ref, 'refs/tags/v')
+        name: Pakowanie
         run: |
           set -euo pipefail
           name="weglarka-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
@@ -101,13 +111,15 @@ jobs:
           for f in ${{ matrix.files }}; do cp "target/${{ matrix.target }}/release/$f" "dist/$name/"; done
           cp LICENSE-MIT LICENSE-APACHE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ matrix.target }}
           path: dist/*.tar.gz
           retention-days: 1
 
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [image, binaries]
     runs-on: ubuntu-24.04
     permissions:

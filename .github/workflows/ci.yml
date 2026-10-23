@@ -9,48 +9,37 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# A new push to the same PR supersedes the running one; runs on main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  shellcheck:
+  # fmt → clippy → test → nginx -t in ONE job: the toolchain is installed once and the debug `target/`
+  # is shared, instead of four runners each paying for toolchain setup and a cold cache.
+  # The cache is written only on main (`save-if`); PRs restore main's cache read-only.
+  check:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck -x scripts/*.sh .github/scripts/*.sh
-
-  fmt:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
-
-  clippy:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-
-  # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
-  # (IngressConfig::default_nginx_image; docs/decisions/0006).
-  nginx-t:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
-      - run: docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
-      # X-Forwarded-* z zaufanego peera przechodzą, od niezaufanego są nadpisywane (docs/decisions/0007).
-      # Peer żądania na opublikowanym porcie to brama mostu Dockera (172.17.0.1) — raz w trusted, raz nie.
+      # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
+      # (IngressConfig::default_nginx_image; docs/decisions/0006).
+      - name: nginx -t
+        run: |
+          set -euo pipefail
+          cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
+          docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+      # X-Forwarded-* from a trusted peer pass through, from an untrusted one they are overwritten (docs/decisions/0007).
+      # The request peer on the published port is the Docker bridge gateway (172.17.0.1) — once trusted, once not.
       - name: Forwarded headers through nginx
         run: |
           set -euo pipefail
@@ -58,28 +47,37 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 192.0.2.0/24 > "$RUNNER_TEMP/untrusted.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf"
 
-  # Węglarka image (Containerfile) — the artifact goes to the smoke test in `integration-podman`.
-  image:
+  # Static (musl) daemon + CLI — built once and used three ways: build check, image content, and the
+  # binaries run by the smoke test. PRs build the cheap `ci` profile, main the full `release` profile
+  # (docs/decisions/0008).
+  musl:
     runs-on: ubuntu-24.04
+    env:
+      PROFILE: ${{ github.event_name == 'pull_request' && 'ci' || 'release' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Separate key per profile: the two never share artifacts.
+      - uses: Swatinem/rust-cache@v2
         with:
-          context: .
-          file: Containerfile
-          tags: weglarka:ci
-          provenance: false
-          outputs: type=docker,dest=${{ runner.temp }}/weglarka-image.tar
-          cache-from: type=gha,scope=image
-          cache-to: type=gha,scope=image,mode=max
+          shared-key: musl-${{ env.PROFILE }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --profile "$PROFILE" --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli
       - uses: actions/upload-artifact@v4
         with:
-          name: weglarka-image
-          path: ${{ runner.temp }}/weglarka-image.tar
+          name: musl-bin
+          path: |
+            target/x86_64-unknown-linux-musl/${{ env.PROFILE }}/weglarka-daemon
+            target/x86_64-unknown-linux-musl/${{ env.PROFILE }}/weglarka
+          if-no-files-found: error
           retention-days: 1
 
-  musl:
+  # main only: warms the `ci`-profile cache that PRs restore (the `musl` job on main builds `release`,
+  # whose cache is useless to a PR). Off the critical path — nothing depends on it.
+  seed-ci-cache:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -87,17 +85,19 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+        with:
+          shared-key: musl-ci
+      - run: cargo build --profile ci --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli
 
-  # Testy integracyjne z prawdziwym Podmanem 6.1 — decyzja: docs/decisions/0002-podman-in-ci.md.
+  # Integration tests with a real Podman 6.1 — decision: docs/decisions/0002-podman-in-ci.md.
   # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host). The tests (session a) read
   # WEGLARKA_PODMAN_SOCKET and skip themselves when the variable is not set.
   integration-podman:
     runs-on: ubuntu-24.04
-    needs: image
+    needs: musl
     steps:
       - uses: actions/checkout@v4
-      - name: Install Podman 6 from OBS home:alvistack
+      - name: Add the alvistack repository
         run: |
           set -euo pipefail
           base="https://downloadcontent.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
@@ -110,18 +110,42 @@ jobs:
           Pin: origin downloadcontent.opensuse.org
           Pin-Priority: 1001
           PIN
-          # download.opensuse.org przekierowuje na mirrory ze starymi plikami ("unexpected size");
-          # downloadcontent.opensuse.org has no mirrors. Retries just in case.
-          # Runner ma preinstalowany Podman 4.9 z Ubuntu; jego golang-github-containers-common
-          # koliduje plikami (/etc/containers/policy.json) z containers-common z alvistack.
+          # The runner ships Podman 4.9 from Ubuntu; its golang-github-containers-common collides on files
+          # (/etc/containers/policy.json) with containers-common from alvistack.
           sudo apt-get purge -y podman buildah skopeo crun conmon \
             golang-github-containers-common golang-github-containers-image || true
+          # download.opensuse.org redirects to mirrors with stale files ("unexpected size");
+          # downloadcontent.opensuse.org has no mirrors. Retries just in case.
           for attempt in 1 2 3 4; do
-            sudo apt-get update
-            sudo apt-get install -y -o Acquire::Retries=3 podman netavark passt uidmap && break
+            sudo apt-get update && break
             [ "$attempt" = 4 ] && exit 1
             sleep 15
           done
+      # The cache key is the candidate versions of the packages we install, so a new alvistack build
+      # misses the cache and downloads fresh .debs; an empty/missing cache just means a normal install.
+      - name: Resolve Podman package versions
+        id: podman-ver
+        run: |
+          ver=$(apt-cache policy podman netavark passt | awk '/Candidate:/{print $2}' | tr '\n' '_')
+          echo "key=podman-debs-ubuntu2404-$ver" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/podman-debs
+          key: ${{ steps.podman-ver.outputs.key }}
+      - name: Install Podman 6
+        run: |
+          set -euo pipefail
+          debs="$RUNNER_TEMP/podman-debs"
+          sudo mkdir -p "$debs/partial"
+          for attempt in 1 2 3 4; do
+            sudo apt-get install -y -o Acquire::Retries=3 -o "Dir::Cache::archives=$debs" \
+              podman netavark passt uidmap && break
+            [ "$attempt" = 4 ] && exit 1
+            sleep 15
+          done
+          # Keep only the .debs in the cached directory (no lock/partial, readable by the cache action).
+          sudo rm -rf "$debs/partial" "$debs/lock"
+          sudo chmod -R a+rX "$debs"
           podman --version
       - name: Configure rootless containers
         run: |
@@ -157,27 +181,30 @@ jobs:
           podman version
           grep "^$USER:" /etc/subuid /etc/subgid
       - run: rustup show active-toolchain || rustup toolchain install
+      # Read-only: the cache is written by the `check` job on main (same debug target).
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          save-if: false
       # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
       # so `--nocapture` shows that nothing was skipped.
       - run: cargo test -p weglarka-podman -- --nocapture
       # Image smoke test (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
+      # The image is assembled from the exact binaries the `musl` job built (docs/decisions/0008); no compilation here.
       - uses: actions/download-artifact@v4
         with:
-          name: weglarka-image
-          path: ${{ runner.temp }}
-      - name: Załaduj obraz do Podmana
+          name: musl-bin
+          path: bin
+      - name: Build the image from the prebuilt binaries
         run: |
           set -euo pipefail
-          # The buildx archive carries the name `weglarka:ci`; Podman may normalize it (docker.io/library/…).
-          ref=$(podman load -q -i "$RUNNER_TEMP/weglarka-image.tar" | tail -1 | sed 's/^Loaded image[^:]*: //')
-          podman tag "$ref" localhost/weglarka:ci
+          chmod +x bin/weglarka bin/weglarka-daemon
+          podman build -q -t localhost/weglarka:ci -f Containerfile --build-arg BIN_SOURCE=prebuilt .
           podman images
-      - run: cargo build -p weglarka-cli -p weglarka-daemon
-      - name: Smoke test obrazu
-        run: .github/scripts/smoke-image.sh localhost/weglarka:ci target/debug/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
-      - name: Smoke test obrazu z argumentów quadletu (bez runtime.socket, z utwardzeniem)
-        run: .github/scripts/smoke-quadlet.sh localhost/weglarka:ci target/debug/weglarka target/debug/weglarka-daemon "$WEGLARKA_PODMAN_SOCKET"
+      - name: Image smoke test
+        run: .github/scripts/smoke-image.sh localhost/weglarka:ci bin/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
+      - name: Image smoke test from the quadlet arguments (no runtime.socket, hardened)
+        run: .github/scripts/smoke-quadlet.sh localhost/weglarka:ci bin/weglarka bin/weglarka-daemon "$WEGLARKA_PODMAN_SOCKET"
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true

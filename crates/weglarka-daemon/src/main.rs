@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
-use tracing_subscriber::EnvFilter;
+use tracing::level_filters::LevelFilter;
 use weglarka_core::config::PlatformKind;
 use weglarka_core::platform::{Hardening, Platform, ServiceSpec};
 use weglarka_daemon::ingress::WEBHOOK_NETWORK;
@@ -66,10 +66,17 @@ enum PlatformAction {
     Status,
 }
 
+/// `RUST_LOG` is a plain level (`error|warn|info|debug|trace|off`), not a per-target directive list:
+/// the `env-filter` feature pulls in the regex stack, which is not worth the build time and binary size here.
+/// An unset or unparsable value means `info`.
 fn init_tracing() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.trim().parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::INFO);
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_max_level(level)
         .init();
 }
 
