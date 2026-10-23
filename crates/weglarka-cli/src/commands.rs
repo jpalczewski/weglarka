@@ -41,14 +41,15 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
             secrets_list(json, &overrides, &app).await
         }
         Command::Doctor(a) => doctor(json, &overrides, a).await,
+        Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
     }
 }
 
-fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
+pub(crate) fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
     Ok(ApiClient::new(overrides.admin_socket()?))
 }
 
-fn instance(name: &str) -> Result<InstanceName, CliError> {
+pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {
     InstanceName::new(name).map_err(|e| {
         CliError::usage(e.to_string())
             .with_hint("nazwy instancji: małe litery, cyfry i myślniki, np. `ntfy-zig`")
@@ -71,16 +72,16 @@ fn secret_name(name: &str) -> Result<&str, CliError> {
 
 /// Result of `--dry-run`: the request that would be sent (secret values masked).
 #[derive(Debug, Serialize)]
-struct DryRun {
+pub(crate) struct DryRun {
     dry_run: bool,
     method: &'static str,
-    path: String,
+    pub(crate) path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<serde_json::Value>,
 }
 
 impl DryRun {
-    fn new(
+    pub(crate) fn new(
         ep: weglarka_api::Endpoint,
         params: &[(&str, &str)],
         body: Option<serde_json::Value>,
@@ -98,7 +99,7 @@ impl DryRun {
         }
     }
 
-    fn print(&self, json: bool) {
+    pub(crate) fn print(&self, json: bool) {
         emit(json, self, || {
             let mut s = format!("dry-run: {} {}\n", self.method, self.path);
             if let Some(b) = &self.body {
@@ -205,7 +206,14 @@ async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, Cl
         DryRun::new(endpoints::APPS_REMOVE, &params, None).print(json);
         return Ok(exit::OK);
     }
-    let existed = match client.call_empty(endpoints::APPS_REMOVE, &params).await {
+    let removal = if a.purge_volumes {
+        client
+            .call_empty_query(endpoints::APPS_REMOVE, &params, "purge_volumes=true")
+            .await
+    } else {
+        client.call_empty(endpoints::APPS_REMOVE, &params).await
+    };
+    let existed = match removal {
         Ok(()) => true,
         Err(e) if e.kind == Kind::NotFound && a.ignore_missing => false,
         Err(e) => return Err(e),

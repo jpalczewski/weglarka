@@ -17,13 +17,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["env"] }
+futures-util.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "io-std", "fs", "macros", "time"] }
 toml.workspace = true
 weglarka-api.workspace = true
 weglarka-core.workspace = true

@@ -1019,6 +1019,7 @@ name = "weglarka-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
