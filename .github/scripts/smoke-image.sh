@@ -89,7 +89,8 @@ if [ -n "$acceptance" ]; then
   PATH="$(cd "$(dirname "$cli")" && pwd):$PATH" "$acceptance" --config "$dir/weglarka.toml" \
     --canary-domain wg-canary.example.test \
     --direct http://127.0.0.1:18080 --webhook-base http://127.0.0.1:19180 \
-    --skip-preflight --with-local-registry
+    --skip-preflight --with-local-registry \
+    --health-window 4 --dup-wait 5
 fi
 
 # Adding and removing apps (the acceptance canary) only connects/disconnects networks and reloads:

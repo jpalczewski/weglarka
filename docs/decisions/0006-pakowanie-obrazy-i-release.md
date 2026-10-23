@@ -3,7 +3,7 @@
 Status: przyjęta (sesja pakowania, 2026-10-23).
 
 **Obraz Węglarki** (`Containerfile`).
-- Build wieloetapowy: `rust:1.99.1-alpine` (wersja = `rust-toolchain.toml`) → `scratch` z dwoma statycznymi
+- Build wieloetapowy (lokalnie ze źródeł; w CI/release z gotowych binarek, 0008): `rust:1.99.1-alpine` (wersja = `rust-toolchain.toml`) → `scratch` z dwoma statycznymi
   binarkami (musl): `weglarka-daemon` (`ENTRYPOINT`, `CMD ["run"]`) i `weglarka` (CLI, do `podman exec … weglarka status`).
   Rozmiar ≈ 5 MB. Bez shella, bez libc.
 - **Bez bundla CA**: demon rozmawia wyłącznie z socketem Podmana (obrazy ściąga Podman, nie my), a webhooki
@@ -38,8 +38,8 @@ Status: przyjęta (sesja pakowania, 2026-10-23).
   `weglarka-<wersja>-aarch64-apple-darwin.tar.gz` (CLI), `SHA256SUMS` (+ podpis cosign `SHA256SUMS.sig`/`.pem`).
 - Weryfikacja podpisu obrazu: `docs/install.md`.
 
-**CI.** Obraz budowany jest raz w jobie `image` (`ci.yml`, cache GHA wspólny z release'em) i ładowany do Podmana w
-jobie `integration-podman`, gdzie uruchamia się smoke test (`.github/scripts/smoke-image.sh`).
+**CI.** Obraz powstaje z gotowych binarek job-a `musl`, a smoke test (`.github/scripts/smoke-image.sh`) działa w
+`integration-podman` — szczegóły i uzasadnienie: 0008.
 
 **Poza MVP:** `linux/arm64` (Alpine/aarch64), `AutoUpdate=registry` w quadlecie (samoaktualizacja Węglarki),
 automatyczne podbijanie digestu nginxa.
