@@ -39,7 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # Wygenerowany config nginx musi przechodzić `nginx -t` na obrazie, który demon uruchamia domyślnie
+  # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
   # (IngressConfig::default_nginx_image; docs/decisions/0006).
   nginx-t:
     runs-on: ubuntu-24.04
@@ -50,7 +50,7 @@ jobs:
       - run: cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
       - run: docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
 
-  # Obraz Węglarki (Containerfile) — artefakt trafia do smoke testu w `integration-podman`.
+  # Węglarka image (Containerfile) — the artifact goes to the smoke test in `integration-podman`.
   image:
     runs-on: ubuntu-24.04
     steps:
@@ -82,8 +82,8 @@ jobs:
       - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
 
   # Testy integracyjne z prawdziwym Podmanem 6.1 — decyzja: docs/decisions/0002-podman-in-ci.md.
-  # Podman z OBS `home:alvistack` na ubuntu-24.04 (lustro hosta). Testy (sesja a) czytają
-  # WEGLARKA_PODMAN_SOCKET i same się pomijają, gdy zmienna nie jest ustawiona.
+  # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host). The tests (session a) read
+  # WEGLARKA_PODMAN_SOCKET and skip themselves when the variable is not set.
   integration-podman:
     runs-on: ubuntu-24.04
     needs: image
@@ -96,14 +96,14 @@ jobs:
           curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
           echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
             | sudo tee /etc/apt/sources.list.d/alvistack.list
-          # Pinning: stos Podmana tylko z alvistack (jak na hoście `niechybnie`).
+          # Pinning: the Podman stack only from alvistack (as on the `niechybnie` host).
           sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
           Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
           Pin: origin downloadcontent.opensuse.org
           Pin-Priority: 1001
           PIN
           # download.opensuse.org przekierowuje na mirrory ze starymi plikami ("unexpected size");
-          # downloadcontent.opensuse.org jest bez mirrorów. Ponowienia na wszelki wypadek.
+          # downloadcontent.opensuse.org has no mirrors. Retries just in case.
           # Runner ma preinstalowany Podman 4.9 z Ubuntu; jego golang-github-containers-common
           # koliduje plikami (/etc/containers/policy.json) z containers-common z alvistack.
           sudo apt-get purge -y podman buildah skopeo crun conmon \
@@ -118,8 +118,8 @@ jobs:
       - name: Configure rootless containers
         run: |
           set -euo pipefail
-          # Pakiet alvistack nie dostarcza /etc/containers/*.conf (zmierzone w CI: brak plików,
-          # Podman schodzi na domyślny rootful graphroot). Konfiguracja użytkownika jest jawna.
+          # The alvistack package ships no /etc/containers/*.conf (measured in CI: no files,
+          # Podman falls back to the default rootful graphroot). The user configuration is explicit.
           dpkg -l | grep -E 'podman|containers-common|crun|netavark|passt' || true
           ls -la /etc/containers /usr/share/containers 2>&1 || true
           mkdir -p "$HOME/.config/containers"
@@ -130,8 +130,8 @@ jobs:
           runroot = "$XDG_RUNTIME_DIR/containers"
           STORAGE
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
-          # Lokalny rejestr skryptu odbioru (scripts/acceptance.sh --with-local-registry) działa po http;
-          # usługa Podmana czyta registries.conf przy starcie, więc wpis musi być przed jej startem.
+          # The acceptance script's local registry (scripts/acceptance.sh --with-local-registry) runs over http;
+          # the Podman service reads registries.conf at startup, so the entry must be there before it starts.
           cat > "$HOME/.config/containers/registries.conf" <<'REG'
           [[registry]]
           location = "127.0.0.1:15099"
@@ -150,10 +150,10 @@ jobs:
           grep "^$USER:" /etc/subuid /etc/subgid
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # Bez WEGLARKA_PODMAN_SOCKET testy same się pomijają — tu zmienna jest ustawiona,
-      # więc `--nocapture` pokazuje, że nic się nie pominęło.
+      # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
+      # so `--nocapture` shows that nothing was skipped.
       - run: cargo test -p weglarka-podman -- --nocapture
-      # Smoke test obrazu (docs/decisions/0006): demon w kontenerze, CLI przez socket, doctor, nginx.
+      # Image smoke test (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
       - uses: actions/download-artifact@v4
         with:
           name: weglarka-image
@@ -161,7 +161,7 @@ jobs:
       - name: Załaduj obraz do Podmana
         run: |
           set -euo pipefail
-          # Archiwum buildx niesie nazwę `weglarka:ci`; Podman może ją znormalizować (docker.io/library/…).
+          # The buildx archive carries the name `weglarka:ci`; Podman may normalize it (docker.io/library/…).
           ref=$(podman load -q -i "$RUNNER_TEMP/weglarka-image.tar" | tail -1 | sed 's/^Loaded image[^:]*: //')
           podman tag "$ref" localhost/weglarka:ci
           podman images

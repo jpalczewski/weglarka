@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Skrypt odbioru Węglarki na prawdziwym hoście (docs/install.md, „Odbiór na hoście”).
+# Acceptance script for Węglarka on a real host (docs/install.md, "Odbiór na hoście").
 #
-# Uruchamiany jako użytkownik runtime'u (`weglarka`) z ustawionym XDG_RUNTIME_DIR; zależności:
-# weglarka, curl, openssl, jq, podman. Dotyka wyłącznie instancji `wg-canary`, `wg-webhook`
-# i `wg-rollback` oraz kontenera `wg-accept-registry` (lokalny rejestr testowy) — nigdy innych apek.
+# Run as the runtime user (`weglarka`) with XDG_RUNTIME_DIR set; dependencies:
+# weglarka, curl, openssl, jq, podman. Touches only the instances `wg-canary`, `wg-webhook`
+# and `wg-rollback` and the `wg-accept-registry` container (local test registry) — never any other apps.
 #
 #   scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
 #
-# Kody wyjścia: 0 wszystko PASS, 1 przynajmniej jeden FAIL, 64 błędne wywołanie / brak zależności.
+# Exit codes: 0 all PASS, 1 at least one FAIL, 64 invalid invocation / missing dependency.
 set -euo pipefail
 
-# traefik/whoami v1.10.4 (index wieloarchitekturowy) — przypięty po digeście.
+# traefik/whoami v1.10.4 (multi-arch index) — pinned by digest.
 DEFAULT_CANARY_IMAGE='docker.io/traefik/whoami:v1.10.4@sha256:1699d99cb4b9acc17f74ca670b3d8d0b7ba27c948b3445f0593b58ebece92f04'
-# docker.io/library/registry:2 — pomocniczy rejestr, w którym tagi da się przestawiać (webhook, rollback).
+# docker.io/library/registry:2 — helper registry whose tags can be moved (webhook, rollback).
 REGISTRY_IMAGE='docker.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
 
 CANARY=wg-canary
@@ -99,7 +99,7 @@ done
 
 # ── Konfiguracja pochodna ────────────────────────────────────────────────────
 
-# Minimalny odczyt prostych wpisów `klucz = "wartość"` z weglarka.toml (bez pełnego parsera TOML).
+# Minimal reader for simple `key = "value"` entries from weglarka.toml (no full TOML parser).
 toml_get() {
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$CONFIG" | head -n1
 }
@@ -127,9 +127,9 @@ canary_repo=${canary_ref%:*}
 
 wg() { weglarka --config "$CONFIG" "$@"; }
 
-# ── Szkielet kroków ──────────────────────────────────────────────────────────
+# ── Step skeleton ───────────────────────────────────────────────────────────
 
-# Kroki biegną w podpowłoce (die = exit z kroku); stan między krokami przez pliki w $WORK.
+# Steps run in a subshell (die = exit from the step); state between steps goes through files in $WORK.
 put() { printf '%s' "$2" >"$WORK/$1"; }
 get() { cat "$WORK/$1" 2>/dev/null || true; }
 note() { put note "$*"; }
@@ -163,7 +163,7 @@ run_step() {
   done
   : >"$WORK/note"
   start=$(date +%s)
-  # `set -e` nie działa w kontekście `if`/`||`, więc krok biegnie w podpowłoce z własnym `set -e`.
+  # `set -e` does not work in an `if`/`||` context, so the step runs in a subshell with its own `set -e`.
   set +e
   (
     set -e
@@ -186,7 +186,7 @@ run_step() {
   fi
 }
 
-# ── Sprzątanie (też przy przerwaniu) ─────────────────────────────────────────
+# ── Cleanup (also on interrupt) ─────────────────────────────────────────────
 
 cleanup_helpers() {
   local app
@@ -217,7 +217,7 @@ show_field() { # app filtr
   wg --json apps show "$1" | jq -r "$2"
 }
 
-# Czeka (do $2 s), aż polecenie zwróci 0.
+# Waits (up to $2 s) until the command returns 0.
 wait_for() { # opis timeout polecenie...
   local what=$1 timeout=$2 i=0
   shift 2
@@ -229,7 +229,7 @@ wait_for() { # opis timeout polecenie...
   log "$what: ok po ~${i}s"
 }
 
-# Jedno żądanie do kanarka → kod HTTP ("000" przy błędzie transportu); ciało w $WORK/body.
+# One request to the canary → HTTP code ("000" on a transport error); body in $WORK/body.
 canary_request() {
   local rc=0 code url=https://$CANARY_DOMAIN/
   local -a extra=()
@@ -242,18 +242,18 @@ canary_request() {
   printf '%s' "$code"
 }
 
-# Predykaty dla wait_for (wołane pośrednio).
+# Predicates for wait_for (called indirectly).
 # shellcheck disable=SC2329
 digest_changed_from() { [ "$(show_field "$WEBHOOK_APP" '.state.current // empty')" != "$1" ]; }
 # shellcheck disable=SC2329
 router_gone() { ! grep -qF "$CANARY_DOMAIN" "$TRAEFIK_FILE"; }
 
-# whoami drukuje nagłówki żądania; ignoruj wielkość liter i ewentualny CR na końcu linii.
+# whoami prints the request headers; ignore case and a possible trailing CR on the line.
 body_has() { # początek linii
   tr -d '\r' <"$WORK/body" | grep -qiF -- "$1"
 }
 
-# Kanarek odpowiada 200 i widać nagłówek z nginxa/Traefika (X-Forwarded-Host = domena).
+# The canary answers 200 and a header from nginx/Traefik is visible (X-Forwarded-Host = the domain).
 canary_ok() {
   [ "$(canary_request)" = 200 ] && body_has "X-Forwarded-Host: $CANARY_DOMAIN"
 }
@@ -262,7 +262,7 @@ hmac_hex() { # sekret plik → hex. Sekret jest jednorazowy i testowy (argv wido
   openssl dgst -sha256 -mac HMAC -macopt "key:$1" -r "$2" | cut -d' ' -f1
 }
 
-# Payload `registry_package` w formacie, który akceptuje adapter (docs/decisions/0004).
+# `registry_package` payload in the format the adapter accepts (docs/decisions/0004).
 payload_file() { # plik repo:tag action
   local repo=${2%:*} tag=${2##*:} name
   name=${repo#*/}
@@ -271,7 +271,7 @@ payload_file() { # plik repo:tag action
       package_version:{package_url:$url, container_metadata:{tag:{name:$tag}}}}}' >"$1"
 }
 
-# send_webhook <instancja> <sekret> <event> <delivery> <plik-payloadu> → kod HTTP
+# send_webhook <instance> <secret> <event> <delivery> <payload-file> → HTTP code
 send_webhook() {
   local sig
   sig=$(hmac_hex "$2" "$5")
@@ -303,7 +303,7 @@ push_variant() { # repo numer [unhealthy]
 
 REGISTRY_HINT="usługa Podmana nie ufa rejestrowi $REG po http — dodaj do registries.conf użytkownika wpis [[registry]] location=\"$REG\" insecure=true PRZED startem usługi (tak robi CI)"
 
-# Krótka bramka zdrowia, żeby kroki nie czekały domyślnych 30 s.
+# Short health gate so the steps do not wait for the default 30 s.
 write_spec() { # plik obraz
   cat >"$1" <<EOF
 image = "$2"
@@ -394,8 +394,8 @@ step_traffic() {
 step_registry() {
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman run -d --name "$REGISTRY_CONTAINER" -p "127.0.0.1:$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
-  # Wpisu `insecure` NIE dodajemy: pull robi długo żyjąca usługa Podmana, która czyta registries.conf
-  # przy starcie. Warunek (wpis przed startem usługi) zapewnia operator/CI; brak = czytelny FAIL w deployu.
+  # We do NOT add an `insecure` entry: the pull is done by the long-lived Podman service, which reads registries.conf
+  # at startup. The precondition (entry before the service starts) is ensured by the operator/CI; absence = a clear FAIL in the deploy.
   wait_for "rejestr testowy" 60 curl -fsS "http://$REG/v2/" || die "rejestr testowy nie odpowiada na $REG"
   note "lokalny rejestr na $REG"
 }
@@ -426,7 +426,7 @@ step_webhook_protocol() {
   note "202 / 401 / 204 / 204 jak w 0004"
 }
 
-# Webhook, który naprawdę wdraża: apka śledzi tag w lokalnym rejestrze; przestawiamy tag i pukamy.
+# A webhook that really deploys: the app tracks a tag in the local registry; we move the tag and poke it.
 step_webhook_deploy() {
   local secret spec f ref gen0 cur0 cur1 cur2 gen1 code i
   ref=$REG/wg-accept/wh:t
@@ -457,7 +457,7 @@ step_webhook_deploy() {
   [ "$(show_field "$WEBHOOK_APP" .runtime)" = running ] || die "$WEBHOOK_APP nie działa po deployu"
   log "deploy z webhooka: generation $gen0 → $gen1, digest $cur1"
 
-  # 2) ten sam X-GitHub-Delivery przy nowym obrazie → duplikat, bez deployu
+  # 2) the same X-GitHub-Delivery with a new image → duplicate, no deploy
   push_variant wh 3
   code=$(send_webhook "$WEBHOOK_APP" "$secret" registry_package "wg-accept-$$-d1" "$f")
   [ "$code" = 202 ] || die "duplikat: oczekiwano 202 (0004: odpowiedź idzie przed wykryciem duplikatu), jest $code"
@@ -478,8 +478,8 @@ step_webhook_deploy() {
   note "deploy z webhooka, duplikat odrzucony, nowe dostarczenie wdrożone ($cur0 → $cur1 → $cur2)"
 }
 
-# Wymuszony rollback: ten sam tag w lokalnym rejestrze zaczyna wskazywać obraz z healthcheckiem,
-# który zawsze zawodzi; kontener działa, ale bramka zdrowia go odrzuca → wraca poprzedni digest.
+# Forced rollback: the same tag in the local registry starts pointing at an image with a healthcheck
+# that always fails; the container runs, but the health gate rejects it → the previous digest comes back.
 step_rollback() {
   local spec ref good out rc=0 now
   ref=$REG/wg-accept/rb:t
@@ -535,7 +535,7 @@ else
   run_step preflight "doctor --preflight" step_preflight
 fi
 run_step doctor "doctor (przez API demona)" step_doctor
-# Bez działającego demona dalsze kroki nie mają sensu.
+# Without a running daemon the following steps make no sense.
 run_step canary "kanarek: apps add, deploy, bramka zdrowia, digest" step_canary doctor
 if [ -z "$DIRECT" ]; then
   run_step traffic "ruch: https://$CANARY_DOMAIN → 200, cert, nagłówki" step_traffic canary

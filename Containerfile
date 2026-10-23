@@ -1,10 +1,10 @@
-# Obraz Węglarki: statyczne binarki (musl) na `scratch` — bez shella, bez libc, bez CA
-# (demon rozmawia tylko z socketem Podmana; obrazy ściąga Podman). Decyzje: docs/decisions/0006.
+# Węglarka image: static binaries (musl) on `scratch` — no shell, no libc, no CA
+# (the daemon talks only to the Podman socket; Podman pulls the images). Decisions: docs/decisions/0006.
 #
 #   podman build -t weglarka -f Containerfile .
 #
-# Bez `USER`: w rootless Podmanie root kontenera to użytkownik runtime'u z hosta, a tylko on
-# ma dostęp do zamontowanych socketów i katalogu stanu (0005: ścieżki montowane 1:1).
+# No `USER`: in rootless Podman the container's root is the host's runtime user, and only that user
+# has access to the mounted sockets and the state directory (0005: paths mounted 1:1).
 
 ARG RUST_IMAGE=docker.io/library/rust:1.99.1-alpine
 
@@ -13,8 +13,8 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# Obraz bazowy to Alpine (musl), więc build bez --target jest statyczny dla architektury buildu.
-# Cache rejestru i katalogu target przyspiesza kolejne budowy; binarki kopiujemy poza cache.
+# The base image is Alpine (musl), so a build without --target is static for the build architecture.
+# The registry and target caches speed up subsequent builds; the binaries are copied out of the cache.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
