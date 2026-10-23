@@ -16,9 +16,18 @@ name = "weglarka"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "time"] }
+toml.workspace = true
 weglarka-api.workspace = true
 weglarka-core.workspace = true
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["server"] }
+insta.workspace = true

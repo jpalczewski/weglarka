@@ -1,0 +1,12 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: "serde_json::to_string_pretty(&e.envelope()).unwrap()"
+---
+{
+  "error": {
+    "code": "not_found",
+    "message": "no app",
+    "hint": "sprawdź nazwy: `weglarka apps list`",
+    "exit_code": 3
+  }
+}
