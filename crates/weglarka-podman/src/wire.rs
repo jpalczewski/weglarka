@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{Digest, SecretTarget};
 use weglarka_core::podman::{
-    ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, ImageInfo, NetworkInfo,
-    NetworkSpec, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
-    VolumeInfo, VolumeSpec,
+    ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus, IdRange, ImageInfo,
+    NetworkInfo, NetworkSpec, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result,
+    VersionInfo, VolumeInfo, VolumeSpec,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -62,6 +62,12 @@ pub(crate) struct CreateContainer<'a> {
     restart_policy: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     userns: Option<Namespace>,
+    /// Explicit uid/gid maps. Only effective together with `userns: private` — libpod rejects
+    /// `private` without maps and silently ignores maps without `private` (docs/decisions/0009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idmappings: Option<IdMappings>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<NamedVolume<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     netns: Option<Namespace>,
     #[serde(rename = "Networks", skip_serializing_if = "BTreeMap::is_empty")]
@@ -83,6 +89,44 @@ struct BindMountBody<'a> {
     source: &'a str,
     destination: &'a str,
     options: Vec<&'static str>,
+}
+
+/// `specgen.NamedVolume` (no json tags — Go matches names case-insensitively).
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NamedVolume<'a> {
+    name: &'a str,
+    dest: &'a str,
+    options: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct IdMappings {
+    #[serde(rename = "UIDMap")]
+    uid_map: Vec<WireIdRange>,
+    #[serde(rename = "GIDMap")]
+    gid_map: Vec<WireIdRange>,
+    #[serde(rename = "HostUIDMapping")]
+    host_uid_mapping: bool,
+    #[serde(rename = "HostGIDMapping")]
+    host_gid_mapping: bool,
+}
+
+#[derive(Serialize)]
+struct WireIdRange {
+    container_id: u32,
+    host_id: u32,
+    size: u32,
+}
+
+impl From<&IdRange> for WireIdRange {
+    fn from(r: &IdRange) -> Self {
+        Self {
+            container_id: r.container_id,
+            host_id: r.host_id,
+            size: r.size,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -143,7 +187,31 @@ impl<'a> CreateContainer<'a> {
                 RestartPolicy::No => None,
                 RestartPolicy::Always => Some("always"),
             },
-            userns: spec.userns_auto.then_some(Namespace { nsmode: "auto" }),
+            // Explicit maps replace `auto`; they need `private` (see `idmappings`).
+            userns: match (&spec.id_mapping, spec.userns_auto) {
+                (Some(_), _) => Some(Namespace { nsmode: "private" }),
+                (None, true) => Some(Namespace { nsmode: "auto" }),
+                (None, false) => None,
+            },
+            idmappings: spec.id_mapping.as_ref().map(|m| IdMappings {
+                uid_map: m.uid_map.iter().map(Into::into).collect(),
+                gid_map: m.gid_map.iter().map(Into::into).collect(),
+                host_uid_mapping: false,
+                host_gid_mapping: false,
+            }),
+            volumes: spec
+                .volumes
+                .iter()
+                .map(|v| NamedVolume {
+                    name: &v.volume,
+                    dest: &v.target,
+                    options: if v.read_only { vec!["ro"] } else { vec![] },
+                })
+                .collect(),
+            // TODO(session 2, docs/CLAUDE.md map): `spec.resources` -> libpod `resource_limits`
+            // (memory.limit, pids.limit, cpu.quota/period) and `spec.healthcheck` -> `healthconfig`.
+            // Deliberately not serialized yet; limits and the configured healthcheck have no effect
+            // until session 2 maps them.
             // `Networks` works only with bridge mode.
             netns: (!spec.networks.is_empty()).then_some(Namespace { nsmode: "bridge" }),
             networks: spec
@@ -716,6 +784,47 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+        };
+        insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn create_container_volumes_and_explicit_id_mapping() {
+        use weglarka_core::podman::{IdMapping, VolumeAttachment};
+        let range = IdRange {
+            container_id: 0,
+            host_id: 65_537,
+            size: 65_536,
+        };
+        let spec = ContainerSpec {
+            name: "pogoda".into(),
+            image: "i".into(),
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::Always,
+            userns_auto: true,
+            mounts: vec![],
+            volumes: vec![
+                VolumeAttachment {
+                    volume: "pogoda.data".into(),
+                    target: "/data".into(),
+                    read_only: false,
+                },
+                VolumeAttachment {
+                    volume: "pogoda.cfg".into(),
+                    target: "/cfg".into(),
+                    read_only: true,
+                },
+            ],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: Some(IdMapping {
+                uid_map: vec![range],
+                gid_map: vec![range],
+            }),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }

@@ -76,10 +76,6 @@ pub struct VolumeAttachment {
     pub volume: String,
     pub target: String,
     pub read_only: bool,
-    /// Mount option `idmap` (ID-mapped mount; path (b) of docs/decisions/0009).
-    pub idmap: bool,
-    /// Mount option `U`: chown the volume to the container user on start (docs/decisions/0009).
-    pub chown: bool,
 }
 
 /// One line of a uid/gid map: container ids `container_id..+size` ↔ ids `host_id..+size` of the

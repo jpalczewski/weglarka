@@ -324,6 +324,16 @@ async fn scenario(socket: &str, variant: &Variant, user: Option<&str>) {
         );
         return;
     }
+    let _ = s
+        .sh(
+            &c2,
+            "cat /proc/self/uid_map > /data/uidmap2; chmod 644 /data/uidmap2",
+        )
+        .await;
+    eprintln!(
+        "SPIKE {label} [{who}]: c2 uid_map = [{}]",
+        s.host_file(&vol, "uidmap2")
+    );
     // Same uid inside as before?
     let same_uid = s.sh(&c2, "test \"$(id -u)\" = \"$(cat /data/uid)\"").await == 0;
     say(label, who, "c2 sees same uid as c1", same_uid);
@@ -841,5 +851,38 @@ async fn spike_a_archive_and_u() {
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+fn auto_idmappings() -> Value {
+    json!({"AutoUserNs": true, "AutoUserNsOpts": {"Size": 1024}})
+}
+
+/// How to make `auto` engage through the API (the plain `userns: auto` is a no-op rootless) and
+/// whether ownership then survives a recreate (the dummy container takes the freed range).
+#[tokio::test]
+async fn spike_auto_via_api() {
+    let Some(socket) = socket() else { return };
+    let shapes = [
+        (
+            "api-auto-private",
+            Some(json!({"nsmode": "private"})),
+            Some(auto_idmappings()),
+        ),
+        ("api-auto-idmaps-only", None, Some(auto_idmappings())),
+        (
+            "api-auto-auto",
+            Some(json!({"nsmode": "auto"})),
+            Some(auto_idmappings()),
+        ),
+    ];
+    for (label, userns, idmappings) in shapes {
+        let v = Variant {
+            label,
+            userns,
+            idmappings,
+            volume_options: vec![],
+        };
+        scenario(&socket, &v, Some("1000:1000")).await;
     }
 }

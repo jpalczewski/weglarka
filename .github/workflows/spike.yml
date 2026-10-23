@@ -85,7 +85,7 @@ jobs:
           save-if: false
       # Tests run one after another so the SPIKE lines of different scenarios do not interleave.
       - name: Spike
-        run: cargo test -p weglarka-podman --test volumes -- --nocapture --test-threads=1 spike_diag spike_a_archive_and_u spike_a_isolation 2>&1 | tee "$RUNNER_TEMP/spike.log"
+        run: cargo test -p weglarka-podman --test volumes -- --nocapture --test-threads=1 spike_auto_via_api 2>&1 | tee "$RUNNER_TEMP/spike.log"
       - name: Summary
         if: always()
         run: grep -E '^SPIKE|^test ' "$RUNNER_TEMP/spike.log" || true
