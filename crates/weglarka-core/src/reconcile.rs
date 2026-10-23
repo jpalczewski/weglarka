@@ -374,7 +374,6 @@ impl<P: PodmanClient> Reconciler<P> {
 mod tests {
     use super::*;
     use crate::hash::spec_hash;
-    use std::collections::BTreeMap;
 
     fn digest(c: char) -> Digest {
         Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
