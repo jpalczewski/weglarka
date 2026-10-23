@@ -1,4 +1,4 @@
-//! Command definitions. The help text (the `///` docs below) is user-visible and stays in Polish.
+//! Command definitions. The `///` docs below are user-visible `--help` text.
 
 use std::path::PathBuf;
 
@@ -10,19 +10,19 @@ use crate::error::exit;
 #[command(
     name = "weglarka",
     version,
-    about = "Węglarka — deploy-tool dla rootless Podmana (klient admin API demona)",
+    about = "Węglarka — deploy tool for rootless Podman (client of the daemon's admin API)",
     after_long_help = exit::TABLE
 )]
 pub struct Cli {
-    /// Wypisz wynik jako JSON (typy z weglarka-api); błędy jako {"error":{...}}.
+    /// Print the result as JSON (types from weglarka-api); errors as {"error":{...}}.
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Plik konfiguracji hosta.
-    #[arg(long, global = true, env = "WEGLARKA_CONFIG", value_name = "PLIK")]
+    /// Host configuration file.
+    #[arg(long, global = true, env = "WEGLARKA_CONFIG", value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Socket unix admin API (domyślnie `admin.socket` z weglarka.toml).
+    /// Unix socket of the admin API (defaults to `admin.socket` from weglarka.toml).
     #[arg(long, global = true, env = "WEGLARKA_SOCKET", value_name = "SOCKET")]
     pub socket: Option<PathBuf>,
 
@@ -32,61 +32,61 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Zarządzanie apkami (add/remove/list/show).
+    /// Manage apps (add/remove/list/show).
     #[command(subcommand)]
     Apps(AppsCommand),
-    /// Wymuś deploy apki (pull, podmiana kontenera, bramka zdrowia, ewentualny rollback).
+    /// Force an app deploy (pull, container swap, health gate, rollback if needed).
     Deploy(DeployArgs),
-    /// Stan demona i apek.
+    /// Daemon and app status.
     Status,
-    /// Sekrety apek (set/list). Wartości nigdy nie wracają przez API.
+    /// App secrets (set/list). Values are never returned by the API.
     #[command(subcommand)]
     Secrets(SecretsCommand),
-    /// Autodiagnoza; `--preflight` działa lokalnie, bez demona.
+    /// Self-diagnosis; `--preflight` runs locally, without the daemon.
     Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AppsCommand {
-    /// Dodaj instancję apki.
+    /// Add an app instance.
     Add(AddArgs),
-    /// Usuń instancję apki.
+    /// Remove an app instance.
     Remove(RemoveArgs),
-    /// Lista apek.
+    /// List apps.
     List,
-    /// Szczegóły apki: spec, stan, runtime.
+    /// App details: spec, state, runtime.
     Show { name: String },
 }
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Nazwa instancji ([a-z0-9-], 1–63 znaki).
+    /// Instance name ([a-z0-9-], 1–63 characters).
     pub name: String,
-    /// Referencja obrazu, np. ghcr.io/jpalczewski/ntfy.zig:latest.
+    /// Image reference, e.g. ghcr.io/jpalczewski/ntfy.zig:latest.
     #[arg(required_unless_present = "spec")]
     pub image: Option<String>,
-    /// Domena kierowana do apki (można powtarzać).
+    /// Domain routed to the app (repeatable).
     #[arg(long = "domain", conflicts_with = "spec")]
     pub domains: Vec<String>,
-    /// Port HTTP w kontenerze.
+    /// HTTP port in the container.
     #[arg(long, conflicts_with = "spec")]
     pub port: Option<u16>,
-    /// Zmienna środowiskowa KLUCZ=WARTOŚĆ (jawna, nie tajna; można powtarzać).
+    /// Environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
-    /// Sekret jako zmienna środowiskowa: SEKRET=ZMIENNA.
-    #[arg(long = "secret-env", value_name = "SEKRET=ZMIENNA", value_parser = parse_pair, conflicts_with = "spec")]
+    /// Secret as an environment variable: SECRET=VARIABLE.
+    #[arg(long = "secret-env", value_name = "SECRET=VARIABLE", value_parser = parse_pair, conflicts_with = "spec")]
     pub secret_env: Vec<(String, String)>,
-    /// Sekret jako plik w kontenerze: SEKRET=ŚCIEŻKA.
-    #[arg(long = "secret-mount", value_name = "SEKRET=ŚCIEŻKA", value_parser = parse_pair, conflicts_with = "spec")]
+    /// Secret as a file in the container: SECRET=PATH.
+    #[arg(long = "secret-mount", value_name = "SECRET=PATH", value_parser = parse_pair, conflicts_with = "spec")]
     pub secret_mount: Vec<(String, String)>,
-    /// Wyłącz auto-update (webhook nie podmieni obrazu samoczynnie).
+    /// Disable auto-update (the webhook will not swap the image on its own).
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,
-    /// Cały AppSpec z pliku TOML (zamiast powyższych flag); `-` = stdin.
-    #[arg(long, value_name = "PLIK")]
+    /// Whole AppSpec from a TOML file (instead of the flags above); `-` = stdin.
+    #[arg(long, value_name = "FILE")]
     pub spec: Option<PathBuf>,
-    /// Nic nie wysyłaj; pokaż żądanie, które zostałoby wysłane.
+    /// Send nothing; show the request that would be sent.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -94,10 +94,10 @@ pub struct AddArgs {
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
     pub name: String,
-    /// Brak apki nie jest błędem (idempotentne usuwanie).
+    /// A missing app is not an error (idempotent removal).
     #[arg(long)]
     pub ignore_missing: bool,
-    /// Nic nie usuwaj; sprawdź, że apka istnieje, i pokaż żądanie.
+    /// Remove nothing; check that the app exists and show the request.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -105,48 +105,48 @@ pub struct RemoveArgs {
 #[derive(Debug, Args)]
 pub struct DeployArgs {
     pub app: String,
-    /// Jednorazowo nadpisz referencję obrazu (np. przypięty tag sha-…).
+    /// Override the image reference for this deploy only (e.g. a pinned sha-… tag).
     #[arg(long, value_name = "REF")]
     pub image: Option<String>,
-    /// Nic nie wdrażaj; sprawdź, że apka istnieje, i pokaż żądanie.
+    /// Deploy nothing; check that the app exists and show the request.
     #[arg(long)]
     pub dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum SecretsCommand {
-    /// Ustaw (nadpisz) sekret. Wartość ze stdin albo z pliku — nigdy z argumentu.
+    /// Set (overwrite) a secret. Value from stdin or a file — never from an argument.
     Set(SecretSetArgs),
-    /// Lista sekretów apki (nazwa, odcisk, data) — bez wartości.
+    /// List an app's secrets (name, fingerprint, date) — without values.
     List { app: String },
 }
 
 #[derive(Debug, Args)]
 pub struct SecretSetArgs {
     pub app: String,
-    /// Nazwa sekretu ([A-Za-z0-9_-], 1–64 znaki).
+    /// Secret name ([A-Za-z0-9_-], 1–64 characters).
     pub name: String,
-    /// Czytaj wartość z pliku zamiast ze stdin.
-    #[arg(long, value_name = "PLIK")]
+    /// Read the value from a file instead of stdin.
+    #[arg(long, value_name = "FILE")]
     pub from_file: Option<PathBuf>,
-    /// Zachowaj wartość bajt w bajt (domyślnie usuwany jest jeden końcowy znak nowej linii).
+    /// Keep the value byte for byte (by default one trailing newline is stripped).
     #[arg(long)]
     pub raw: bool,
-    /// Nic nie wysyłaj; zwaliduj wejście i pokaż żądanie (wartość jest zasłonięta).
+    /// Send nothing; validate the input and show the request (the value is masked).
     #[arg(long)]
     pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
-    /// Sprawdź host lokalnie, bez demona (user, subuid, cgroups, linger, Podman, ingress…).
+    /// Check the host locally, without the daemon (user, subuid, cgroups, linger, Podman, ingress…).
     #[arg(long)]
     pub preflight: bool,
-    /// Ścieżka secrets.toml do sprawdzenia praw (brak w weglarka.toml;
-    /// domyślnie obok pliku konfiguracji).
+    /// Path of secrets.toml whose permissions to check (not in weglarka.toml;
+    /// defaults to next to the configuration file).
     #[arg(
         long,
-        value_name = "PLIK",
+        value_name = "FILE",
         env = "WEGLARKA_SECRETS_FILE",
         requires = "preflight"
     )]

@@ -24,18 +24,18 @@ pub mod exit {
     pub const CONFIG: i32 = 78;
 
     pub const TABLE: &str = "\
-Kody wyjścia:
-   0  sukces
-   1  doctor: najgorszy wynik = warn
-   2  doctor: najgorszy wynik = fail
-   3  nie znaleziono (apka)
-   4  już istnieje / konflikt
-   5  demon odrzucił żądanie (invalid_request)
-   6  deploy: wycofano do poprzedniej wersji (rolled_back)
-  64  błędne wywołanie lub dane wejściowe
-  69  demon nieosiągalny (socket admin API)
-  70  błąd wewnętrzny (I/O, protokół, błąd demona)
-  78  brak lub błędny weglarka.toml";
+Exit codes:
+   0  success
+   1  doctor: worst result = warn
+   2  doctor: worst result = fail
+   3  not found (app)
+   4  already exists / conflict
+   5  daemon rejected the request (invalid_request)
+   6  deploy: rolled back to the previous version (rolled_back)
+  64  invalid invocation or input
+  69  daemon unreachable (admin API socket)
+  70  internal error (I/O, protocol, daemon error)
+  78  missing or invalid weglarka.toml";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

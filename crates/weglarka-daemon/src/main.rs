@@ -18,9 +18,9 @@ const DEFAULT_IMAGE: &str = "ghcr.io/jpalczewski/weglarka:latest";
 const SERVICE_NAME: &str = "weglarka";
 
 #[derive(Parser)]
-#[command(name = "weglarka-daemon", version, about = "Demon Węglarki")]
+#[command(name = "weglarka-daemon", version, about = "The Węglarka daemon")]
 struct Cli {
-    /// Plik konfiguracji hosta.
+    /// Host configuration file.
     #[arg(
         long,
         global = true,
@@ -34,9 +34,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Uruchamia demona (domyślne).
+    /// Run the daemon (default).
     Run,
-    /// Serwis Węglarki w menedżerze usług (systemd: quadlet usera).
+    /// The Węglarka service in the service manager (systemd: user quadlet).
     Platform {
         #[command(subcommand)]
         action: PlatformAction,
@@ -45,12 +45,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PlatformAction {
-    /// Generuje i instaluje serwis (uruchamiaj jako user runtime'u).
+    /// Generate and install the service (run as the runtime user).
     Install {
-        /// Tylko wypisz pliki, nic nie zapisuj.
+        /// Only print the files, write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Obraz kontenera Węglarki.
+        /// Węglarka container image.
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
@@ -60,9 +60,9 @@ enum PlatformAction {
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
-    /// Usuwa plik serwisu.
+    /// Remove the service file.
     Remove,
-    /// Pokazuje stan serwisu.
+    /// Show the service status.
     Status,
 }
 
