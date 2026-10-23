@@ -215,3 +215,120 @@ fn trusted_proxies_from_config_replace_the_default() {
             .is_err()
     );
 }
+
+/// The publishing validator (docs/install.md) only lets through routers/services named `weglarka`
+/// or `weglarka-*`, `Host()` rules, entryPoints `http`/`https`, a router-level `tls` of `{}` or
+/// `certResolver: letsencrypt`, and no middlewares. The generated file must stay inside that policy.
+#[test]
+fn traefik_output_satisfies_publish_policy() {
+    for resolver in [Some("letsencrypt".to_owned()), None] {
+        let o = TraefikOptions {
+            cert_resolver: resolver,
+            ..Default::default()
+        };
+        for (_, apps) in layouts() {
+            let yml = traefik::generate(&host(), &apps, &o).unwrap();
+            assert!(!yml.contains("middlewares"), "{yml}");
+            let (mut routers, mut http, mut https) = (0, 0, 0);
+            let mut name = String::new();
+            let mut entrypoint = String::new();
+            let mut has_tls = false;
+            let mut check = |name: &str, entrypoint: &str, has_tls: bool| {
+                if name.is_empty() {
+                    return;
+                }
+                assert!(
+                    name == "weglarka" || name.starts_with("weglarka-"),
+                    "{name}"
+                );
+                match entrypoint {
+                    "http" => {
+                        assert!(!has_tls, "{name}: http router must not have tls");
+                        assert!(name.starts_with("weglarka-http-"), "{name}");
+                        http += 1;
+                    }
+                    "https" => {
+                        assert!(has_tls, "{name}: https router needs tls");
+                        https += 1;
+                    }
+                    other => panic!("{name}: entrypoint {other}"),
+                }
+                routers += 1;
+            };
+            let mut in_routers = false;
+            for line in yml.lines() {
+                if line == "  routers:" {
+                    in_routers = true;
+                } else if line == "  services:" {
+                    check(&name, &entrypoint, has_tls);
+                    in_routers = false;
+                } else if in_routers && line.starts_with("    ") && !line.starts_with("     ") {
+                    check(&name, &entrypoint, has_tls);
+                    name = line.trim().trim_end_matches(':').to_owned();
+                    entrypoint.clear();
+                    has_tls = false;
+                } else if in_routers {
+                    let t = line.trim();
+                    if let Some(rule) = t.strip_prefix("rule: ") {
+                        assert!(rule.starts_with("\"Host(`"), "{rule}");
+                        assert!(
+                            !rule.contains("PathPrefix") && !rule.contains("&&"),
+                            "{rule}"
+                        );
+                    } else if let Some(ep) = t.strip_prefix("- ") {
+                        entrypoint = ep.to_owned();
+                    } else if t == "service: weglarka" {
+                    } else if t == "tls: {}" || t == "certResolver: letsencrypt" || t == "tls:" {
+                        has_tls = true;
+                    } else if !matches!(t, "entryPoints:") {
+                        panic!("unexpected router line {t:?}");
+                    }
+                }
+            }
+            assert_eq!(http, https, "every router has an http twin");
+            assert_eq!(routers, http + https);
+        }
+    }
+}
+
+#[test]
+fn nginx_redirects_only_on_explicit_forwarded_http() {
+    let conf = nginx::generate(&host(), &apps(ONE_APP), &opts()).unwrap();
+    // Webhook server + one app; not the default server.
+    assert_eq!(
+        conf.matches("return 301 https://$host$request_uri;")
+            .count(),
+        2
+    );
+    // A trusted peer with no header (the daemon's health probe) must not be redirected.
+    assert!(conf.contains("\"1:http\" 1;") && conf.contains("default 0;"));
+}
+
+#[test]
+fn rejects_bad_http_entrypoint() {
+    let o = TraefikOptions {
+        http_entrypoint: "a b".into(),
+        ..Default::default()
+    };
+    assert!(traefik::generate(&host(), &apps(ONE_APP), &o).is_err());
+}
+
+#[test]
+fn traefik_router_names_never_collide() {
+    let mut a = apps(ONE_APP);
+    let spec = a.values().next().unwrap().clone();
+    for n in ["ntfy-http", "http-ntfy"] {
+        a.insert(n.to_owned().try_into().unwrap(), spec.clone());
+    }
+    let mut a2 = a.clone();
+    for (i, spec) in a2.values_mut().enumerate() {
+        spec.domains = vec![format!("d{i}.example.eu")];
+    }
+    let yml = traefik::generate(&host(), &a2, &TraefikOptions::default()).unwrap();
+    let names: Vec<&str> = yml
+        .lines()
+        .filter(|l| l.starts_with("    weglarka-"))
+        .collect();
+    let unique: std::collections::BTreeSet<_> = names.iter().collect();
+    assert_eq!(names.len(), unique.len(), "{yml}");
+}

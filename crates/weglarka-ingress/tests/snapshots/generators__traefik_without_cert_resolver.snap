@@ -11,12 +11,22 @@ http:
         - https
       service: weglarka
       tls: {}
+    weglarka-http-app-ntfy:
+      rule: "Host(`nz.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
     weglarka-webhooks:
       rule: "Host(`weglarka.example.eu`)"
       entryPoints:
         - https
       service: weglarka
       tls: {}
+    weglarka-http-webhooks:
+      rule: "Host(`weglarka.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
   services:
     weglarka:
       loadBalancer:

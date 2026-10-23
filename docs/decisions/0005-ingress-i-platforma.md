@@ -50,3 +50,17 @@ zawiesza API. `POST …/deploy` próbuje najpierw zwykłego deployu, a przy znan
   (`.github/scripts/smoke-quadlet.sh`) uruchamia obraz dokładnie z nich, z configiem bez `runtime.socket`.
 - Poza zakresem (follow-up): utwardzenie kontenera `weglarka-nginx` tworzonego przez demona (cap drop, limit
   pamięci) — wymaga rozszerzenia `ContainerSpec` i wire'u libpod.
+
+## HTTP → HTTPS (tryb `behind`)
+
+Plik Traefika zawiera dla każdego routera bliźniaka `weglarka-http-*` na entrypoincie `http` (bez `tls`, ten sam
+service); bez niego Traefik odpowiadał 404 na `http://domena/`. Bliźniak ma **prefiks** `weglarka-http-`, nie sufiks
+`-http`: instancja `foo-http` zderzyłaby się z bliźniakiem `foo`. Middleware `redirectScheme` odpada (walidator
+publikacji odrzuca middlewares), więc redirect robi nginx: `return 301 https://$host$request_uri;` w `server` apek
+i webhooków, gdy `$weglarka_redirect_https` (mapa: zaufany peer **i** jawne `X-Forwarded-Proto: http`).
+Nie wystarcza `$weglarka_proto = http`: zaufany peer bez nagłówka (sonda zdrowia demona, `health.http`, docs/decisions/0010)
+dostaje fallback `$scheme` = `http` i nie może dostać 301. Niezaufany peer nigdy nie jest przekierowywany.
+Tryb `edge` użyje tej samej dyrektywy (`ModeProfile::https_redirect`) z kluczem `$scheme` i wyjątkiem dla
+`/.well-known/acme-challenge/`. Nazwa entrypointu: `TraefikOptions::http_entrypoint` (domyślnie `http`).
+Testy: snapshoty, test zgodności z polityką walidatora, `.github/scripts/test-forwarded-headers.sh`, krok
+`http_redirect` w `scripts/acceptance.sh`.

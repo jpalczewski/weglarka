@@ -12,6 +12,11 @@ http:
       service: weglarka
       tls:
         certResolver: letsencrypt
+    weglarka-http-webhooks:
+      rule: "Host(`weglarka.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
   services:
     weglarka:
       loadBalancer:

@@ -119,6 +119,9 @@ impl Backend<'_> {
 trait ModeProfile {
     /// Directives at the `http {}` level: proxy trust, the `$weglarka_proto` variable.
     fn http_prelude(&self, c: &mut Conf);
+    /// Inside a (non-default) `server`: redirect plain-HTTP requests to HTTPS. Must never fire for
+    /// requests whose scheme is unknown (the daemon's health probes carry no forwarded headers).
+    fn https_redirect(&self, c: &mut Conf);
     /// The server's `listen`.
     fn listen(&self, c: &mut Conf, default_server: bool);
 }
@@ -148,6 +151,16 @@ impl ModeProfile for Behind<'_> {
                 c.line("\"1:http\" http;");
             },
         );
+        // Redirect only on an explicit `http` from a trusted peer. A trusted peer that sends no
+        // header (the daemon's health probe) falls back to `$scheme` in `$weglarka_proto` — which is
+        // `http` too — so `$weglarka_proto` alone cannot drive the redirect.
+        c.block(
+            "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_redirect_https",
+            |c| {
+                c.line("default 0;");
+                c.line("\"1:http\" 1;");
+            },
+        );
         // Same rule for the forwarded chain and host: a trusted peer's values are passed on,
         // anyone else gets our own (a client cannot forge `X-Forwarded-*`).
         c.block(
@@ -164,6 +177,13 @@ impl ModeProfile for Behind<'_> {
                 c.line("\"~^1:(?<fhost>.+)$\" $fhost;");
             },
         );
+    }
+
+    fn https_redirect(&self, c: &mut Conf) {
+        // An `edge` profile would key this on `$scheme` instead (and exempt the ACME challenge path).
+        c.block("if ($weglarka_redirect_https)", |c| {
+            c.line("return 301 https://$host$request_uri;");
+        });
     }
 
     fn listen(&self, c: &mut Conf, default_server: bool) {
@@ -272,6 +292,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
         c.block("server", |c| {
             mode.listen(c, false);
             c.line(&format!("server_name {};", plan.webhook.domain));
+            mode.https_redirect(c);
             c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
             c.line(&format!(
                 "client_max_body_size {};",
@@ -295,6 +316,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
             c.block("server", |c| {
                 mode.listen(c, false);
                 c.line(&format!("server_name {};", join_domains(&app.domains)));
+                mode.https_redirect(c);
                 c.line(&format!("set $app \"{}\";", app.instance));
                 c.line(&format!("client_max_body_size {};", o.app_max_body_bytes));
                 Backend::Container {
