@@ -50,8 +50,8 @@ pub struct ImportArgs {
     pub from: Option<PathBuf>,
     /// The tar is a `weglarka volumes export` of THIS app. Restores it byte for byte, ids included.
     /// Do NOT use it for tars from Coolify, docker or tar(1): their uids would silently land on the
-    /// wrong users. Without --own the tar is treated as foreign and its uids are mapped into the
-    /// app's range (a Węglarka export imported that way fails loudly instead).
+    /// wrong users. Without --own the tar is treated as foreign: every extracted file is owned by the app's user
+    /// whatever the tar says (a Węglarka export imported that way loses its owners).
     #[arg(long)]
     pub own: bool,
     /// Send nothing; show the request.

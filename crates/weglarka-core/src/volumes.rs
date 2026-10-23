@@ -434,7 +434,8 @@ impl<P: PodmanClient> Reconciler<P> {
 /// (docs/decisions/0009, findings 8–9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportMode {
-    /// Made elsewhere (Coolify, `docker cp`…): its uids are *container* uids and are mapped into the
+    /// Made elsewhere (Coolify, `docker cp`…): libpod chowns the extracted files to the container's configured user (the image `USER`; root if none),
+    /// whatever the tar says, inside the
     /// instance's range. A Węglarka export imported this way fails loudly (ids outside the range).
     Foreign,
     /// A Węglarka export (`volume_export`) of the same range: it carries *namespace* ids and is

@@ -9,7 +9,7 @@
 //! * default — a **Węglarka export** (namespace ids, same range): `volume_import`, lossless. Mixing
 //!   the modes up is the dangerous error: a foreign tar imported this way lands on wrong uids silently;
 //! * `?foreign=true` — a tar made elsewhere (Coolify, `docker cp`…): extracted through a helper
-//!   container of the instance so its uids are mapped into the instance's range.
+//!   container of the instance; libpod chowns the extracted files to the container's user.
 
 use std::sync::Arc;
 

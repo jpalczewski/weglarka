@@ -117,6 +117,9 @@ Rules for session 1:
   on a created, never started helper container `wg-import.<instance>` of the instance's image with the volume mounted
   (foreign tar, `ImportMode::Foreign`, the default in the CLI), and starts the app again. Węglarka unpacks nothing:
   Podman extracts the archive in its own chroot, so Węglarka's only guard is a byte cap (8 GiB) on the stream.
-  Foreign is the CLI default because the failure of the wrong choice is loud for a Węglarka export imported as
-  foreign (ids outside the range) but silent for a foreign tar imported as own.
+  Foreign is the CLI default because it is the migration case and its wrong-choice failure is the milder one: a
+  Węglarka export imported as foreign only loses its owners (all files go to the app user), while a foreign tar
+  imported as own lands on wrong uids the app cannot use.
+- **Foreign import flattens ownership**: `archive_put` chowns to the container's configured user (finding 9), so a tar
+  with several owners ends up with one. Verified in `engine_ranges_volumes_secrets_import_migration_and_purge`.
 - CI subuid pool is enlarged to ~1 M (the instance range alone is 65 536).

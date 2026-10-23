@@ -218,7 +218,7 @@ maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, be
 Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
 Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`. Opcjonalne `--with-volume` (też w CI; wymaga `tar`) dodaje krok
 wolumenu na instancji `wg-volume`: import obcego tara, dane i zakres UID przeżywają `apps remove` + `apps add`,
-eksport z właścicielem `uid_range.start + 1000`, `--purge-volumes`.
+eksport z właścicielem `uid_range.start`, `--purge-volumes`.
 
 **Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
 zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
@@ -312,8 +312,9 @@ Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów.
 
 ### Import danych z Coolify (np. szklana.pogoda)
 
-Tar z Coolify ma UID-y z obrazu (np. 1000). Importuj go trybem domyślnym (**obcy** tar): UID-y są mapowane przez
-zakres apki, więc pliki należą do właściwego użytkownika w kontenerze.
+Importuj tar z Coolify trybem domyślnym (**obcy** tar): libpod nadaje wypakowanym plikom właściciela z konfiguracji
+kontenera (`USER` obrazu, root gdy brak) — niezależnie od UID-ów w tarze, więc drzewo z wieloma właścicielami zostaje
+spłaszczone do jednego (dla SQLite w jednym użytkowniku to właśnie to, o co chodzi).
 
 ```sh
 # Na hoście Coolify: sam plik z wolumenu, nieskompresowany tar (rozpakuj .tar.gz przez gunzip)
@@ -336,7 +337,7 @@ weglarka volumes import szklana-pogoda data --from backup.tar --own
 ```
 
 Nie myl trybów: obcy tar zaimportowany z `--own` ląduje **po cichu** na złych UID-ach; eksport Węglarki
-zaimportowany bez `--own` kończy się błędem (UID-y spoza zakresu).
+zaimportowany bez `--own` traci właścicieli (wszystko dostaje użytkownika kontenera).
 
 ### Aktualizacja Węglarki do wersji z zakresami UID (jednorazowo)
 

@@ -562,7 +562,7 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
     rec.deploy(&name, true).await.unwrap();
     assert_eq!(sh("grep -q v1 /data/f && echo v2 > /data/f").await, 0);
 
-    // Foreign tar (uid 1000, as made by Coolify) is mapped into the range; the app is restarted.
+    // Foreign tar (uid 1000, as made by Coolify) is chowned to the container user (root for nginx); the app is restarted.
     let foreign = make_tar("imported.txt", "from-coolify\n", "1000");
     rec.import_volume(&name, "data", ImportMode::Foreign, chunked(foreign), WAIT)
         .await
@@ -582,9 +582,9 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
         "imported file content"
     );
     assert_eq!(
-        sh("test \"$(stat -c %u /data/imported.txt)\" = 1000").await,
+        sh("test \"$(stat -c %u /data/imported.txt)\" = 0").await,
         0,
-        "owner is uid 1000"
+        "foreign files are owned by the container user (root), not by the tar's uid 1000"
     );
     assert!(
         client

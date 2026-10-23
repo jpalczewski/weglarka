@@ -537,7 +537,7 @@ step_rollback() {
 
 # Volumes (iteration 2): a foreign tar (uid 1000, as a Coolify backup would have) is imported into a
 # fresh volume, `apps remove` + `apps add` keep the data and the uid range, the export carries the file
-# at namespace uid <range start> + 1000, and `--purge-volumes` leaves nothing behind.
+# at namespace uid <range start> (the image runs as root; foreign files take the container user's owner), and `--purge-volumes` leaves nothing behind.
 add_volume_app() {
   cat >"$WORK/vol-spec.toml" <<EOF
 image = "$IMAGE"
@@ -574,7 +574,7 @@ step_volume() {
   [ "$start2" = "$start" ] || die "zakres UID się zmienił po remove + add ($start → $start2)"
 
   wg volumes export "$VOLUME_APP" data --out "$WORK/vol-out.tar" 2>/dev/null || die "volumes export nie przeszedł"
-  expect=$((start + 1000))
+  expect=$start
   tar -tvf "$WORK/vol-out.tar" --numeric-owner \
     | awk -v want="$expect/$expect" '$2 == want && $NF ~ /(^|\/)f$/ { found = 1 } END { exit !found }' \
     || die "w eksporcie brak pliku f z właścicielem $expect (zakres $start): $(tar -tvf "$WORK/vol-out.tar" --numeric-owner | tr '\n' ';')"
