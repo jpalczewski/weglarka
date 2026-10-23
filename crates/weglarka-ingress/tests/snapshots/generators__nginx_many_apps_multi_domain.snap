@@ -81,10 +81,10 @@ http {
     server {
         listen 8080;
         server_name weglarka.example.eu;
+        set $app "weglarka";
         if ($weglarka_redirect_https) {
             return 301 https://$host$request_uri;
         }
-        set $app "weglarka";
         client_max_body_size 1048576;
         location ^~ /webhook/ {
             limit_except POST {
@@ -101,10 +101,10 @@ http {
     server {
         listen 8080;
         server_name blog.example.eu example.eu www.blog.example.eu;
+        set $app "blog";
         if ($weglarka_redirect_https) {
             return 301 https://$host$request_uri;
         }
-        set $app "blog";
         client_max_body_size 67108864;
         location / {
             set $upstream "http://blog:3000";
@@ -115,10 +115,10 @@ http {
     server {
         listen 8080;
         server_name nz.example.eu;
+        set $app "ntfy";
         if ($weglarka_redirect_https) {
             return 301 https://$host$request_uri;
         }
-        set $app "ntfy";
         client_max_body_size 67108864;
         location / {
             set $upstream "http://ntfy:8085";

@@ -350,6 +350,14 @@ Import zatrzymuje kontener apki, wypakowuje tar (robi to Podman w pomocniczym, n
 samego obrazu — Węglarka niczego nie rozpakowuje) i uruchamia apkę z powrotem. Pliki o tej samej ścieżce są
 nadpisywane, pozostałe zostają; przerwany import zostawia część plików. Limit jednego importu: 8 GiB.
 
+**`--replace` — import do pustego wolumenu.** Bez niej pliki spoza tara zostają w wolumenie. Przy SQLite w trybie
+**WAL** to pułapka: jeśli apka wystartowała przed importem, w wolumenie leżą jej `*.db-wal`/`*.db-shm`, a po starcie
+SQLite odtwarza ten stary WAL na zaimportowaną bazę — dane „znikają”, choć plik `.db` jest poprawny (tak było przy
+kartoteka-develop; weryfikacja z `?immutable=1` tego nie widzi, bo ignoruje WAL). `weglarka volumes import <apka>
+<wolumen> --from kopia.tar --replace` usuwa i zakłada wolumen od nowa (kontener apki jest przy tym odtwarzany).
+Kopię bazy WAL rób przez `.backup` (albo `PRAGMA wal_checkpoint(TRUNCATE)` na kopii), a weryfikuj ją razem z
+plikami `-wal`/`-shm`, nie samym `.db`.
+
 **Własne kopie** (`volumes export`) wracają **tylko** z `--own` i tylko do apki o tym samym zakresie UID:
 
 ```sh

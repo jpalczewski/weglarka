@@ -152,10 +152,11 @@ async fn import_volume<P: PodmanClient + 'static>(
         ImportMode::Own
     };
     d.engine
-        .import_volume(
+        .import_volume_with(
             &name,
             &mount.name,
             mode,
+            flag(query.as_deref(), "replace"),
             capped(body, MAX_IMPORT_BYTES),
             MUTATION_TIMEOUT,
         )
