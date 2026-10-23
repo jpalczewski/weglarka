@@ -70,7 +70,7 @@ WantedBy=default.target
 
 ## Znane ograniczenia (przed wdrożeniem)
 
-- Obraz Węglarki i nginx, release na GHCR — osobna sesja pakowania; `DEFAULT_IMAGE` w `main.rs` to wartość robocza.
+- Obraz i release: `Containerfile`, `.github/workflows/release.yml`, decyzja 0006 (`DEFAULT_IMAGE` = `:latest`, istnieje po pierwszym tagu `v*`).
 - Brak testu e2e na prawdziwym Podmanie (testy demona działają na `FakePodman`); ingress na prawdziwym
   aardvark-dns (nginx w wielu sieciach naraz, kilka `resolver`) wymaga weryfikacji na hoście.
 - Dodanie pierwszej apki z domeną odtwarza kontener nginx (krótka przerwa); sieci `net-<app>` nie są
