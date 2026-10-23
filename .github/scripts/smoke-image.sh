@@ -46,7 +46,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Ścieżki montujemy 1:1 (jak w quadlecie); root kontenera = ten sam użytkownik co na hoście.
-podman run -d --name weglarka-smoke \
+podman run -d --pull=never --name weglarka-smoke \
   -v "$podman_sock:$podman_sock" -v "$dir:$dir" \
   "$image" run --config "$dir/weglarka.toml"
 

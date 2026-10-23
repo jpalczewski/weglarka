@@ -145,7 +145,13 @@ jobs:
         with:
           name: weglarka-image
           path: ${{ runner.temp }}
-      - run: podman load -i "$RUNNER_TEMP/weglarka-image.tar"
+      - name: Załaduj obraz do Podmana
+        run: |
+          set -euo pipefail
+          # Archiwum buildx niesie nazwę `weglarka:ci`; Podman może ją znormalizować (docker.io/library/…).
+          ref=$(podman load -q -i "$RUNNER_TEMP/weglarka-image.tar" | tail -1 | sed 's/^Loaded image[^:]*: //')
+          podman tag "$ref" localhost/weglarka:ci
+          podman images
       - run: cargo build -p weglarka-cli
       - name: Smoke test obrazu
         run: .github/scripts/smoke-image.sh localhost/weglarka:ci target/debug/weglarka "$WEGLARKA_PODMAN_SOCKET"
