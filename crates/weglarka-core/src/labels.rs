@@ -21,3 +21,13 @@ pub fn container_labels(
         (SPEC_HASH.to_owned(), spec_hash.to_string()),
     ])
 }
+
+/// Nazwa kontenera instancji — to ona jest hostem DNS w sieci apki (`proxy_pass` nginxa).
+pub fn container_name(instance: &InstanceName) -> String {
+    instance.to_string()
+}
+
+/// Sieć per apka, do której dołącza kontener instancji (i nginx ingressu).
+pub fn network_name(instance: &InstanceName) -> String {
+    format!("net-{instance}")
+}
