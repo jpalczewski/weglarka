@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -29,6 +29,7 @@ use weglarka_core::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
+use crate::volumes;
 
 const BODY_LIMIT: usize = 1024 * 1024;
 
@@ -67,6 +68,11 @@ impl From<EngineError> for Fail {
     fn from(e: EngineError) -> Self {
         match e {
             EngineError::UnknownInstance(n) => Fail::not_found(format!("unknown app: {n}")),
+            EngineError::Volume(m) => Fail::invalid(m),
+            EngineError::Busy => Fail(
+                ErrorCode::Conflict,
+                "daemon is busy (deploy in progress); retry shortly".into(),
+            ),
             other => Fail::internal(other),
         }
     }
@@ -112,6 +118,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .route(endpoints::DOCTOR.path, get(run_doctor::<P>))
         .fallback(|| async { Fail::not_found("no such endpoint") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
         .with_state(daemon)
 }
 
@@ -252,11 +259,16 @@ async fn add_app<P: PodmanClient + 'static>(
 async fn remove_app<P: PodmanClient + 'static>(
     State(d): Shared<P>,
     Path(raw): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult<StatusCode> {
     let name = parse_name(&raw)?;
     {
         let _g = d.desired_lock.lock().await;
-        mutating(d.engine.remove_app(&name)).await?;
+        mutating(
+            d.engine
+                .remove_app_with_volumes(&name, volumes::flag(query.as_deref(), "purge_volumes")),
+        )
+        .await?;
     }
     d.changed();
     Ok(StatusCode::NO_CONTENT)

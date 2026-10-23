@@ -49,7 +49,9 @@ pub fn uid_range_label(range: crate::uid_range::UidRange) -> String {
     format!("{}+{}", range.start, range.size)
 }
 
-/// Name of the helper container used to import a foreign tar into an instance's volume.
+/// Name of the helper container used to import a foreign tar into an instance's volume. The `.`
+/// cannot occur in an instance name (and container names are instance names), so the helper never
+/// collides with — and force-removing it never touches — another instance's container.
 pub fn import_container_name(instance: &InstanceName) -> String {
-    format!("wg-import-{instance}")
+    format!("wg-import.{instance}")
 }

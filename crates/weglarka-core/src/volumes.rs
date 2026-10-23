@@ -20,6 +20,7 @@
 //! All state changes happen under the engine's `lock` (the sole `state.toml` writer).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use crate::app::{AppSpec, AppsFile, InstanceName};
 use crate::deploy::pinned_ref;
@@ -295,8 +296,12 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         volume: &str,
         tar: TarStream,
+        lock_wait: Duration,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        // Only the wait for the lock is bounded; the upload itself may take as long as it takes.
+        let _g = tokio::time::timeout(lock_wait, self.lock.lock())
+            .await
+            .map_err(|_| EngineError::Busy)?;
         let spec = state::load_apps(&self.paths.apps)?
             .apps
             .remove(instance)
@@ -374,5 +379,316 @@ impl<P: PodmanClient> Reconciler<P> {
         .await;
         let _ = self.podman.container_remove(&name, true).await;
         Ok(result?)
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    use super::*;
+    use crate::app::Digest;
+    use crate::podman::ContainerState;
+    use crate::reconcile::{Action, ActionOutcome, ReconcilerOptions, RecreateReason};
+    use crate::secret_store::SecretStore;
+    use crate::secrets::FileSecretStore;
+    use crate::state::{StatePaths, load_state};
+    use crate::testing::{Call, FakePodman};
+
+    const WAIT: Duration = Duration::from_secs(1);
+    const IMAGE: &str = "ghcr.io/x/szklana:latest";
+    const APP: &str = r#"
+[apps.szklana]
+image = "ghcr.io/x/szklana:latest"
+port = 8080
+health = { attempts = 2, window_secs = 2 }
+volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cache", read_only = true }]
+"#;
+    const PLAIN: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+"#;
+
+    struct Env {
+        _dir: tempfile::TempDir,
+        fake: FakePodman,
+        rec: Reconciler<FakePodman>,
+    }
+
+    fn digest(c: char) -> Digest {
+        Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
+    }
+
+    fn name(s: &str) -> InstanceName {
+        InstanceName::new(s).unwrap()
+    }
+
+    fn env(apps: &str) -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::in_dir(dir.path());
+        std::fs::write(&paths.apps, apps).unwrap();
+        let fake = FakePodman::new();
+        fake.set_pull_digest(IMAGE, digest('a'));
+        let store: Arc<dyn SecretStore> =
+            Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+        let rec = Reconciler::new(fake.clone(), store, paths, ReconcilerOptions::default());
+        Env {
+            _dir: dir,
+            fake,
+            rec,
+        }
+    }
+
+    impl Env {
+        fn set_apps(&self, toml: &str) {
+            std::fs::write(&self.rec.paths().apps, toml).unwrap();
+        }
+        fn state(&self) -> StateFile {
+            load_state(&self.rec.paths().state).unwrap()
+        }
+        fn range(&self, inst: &str) -> Option<UidRange> {
+            self.state().apps.get(&name(inst)).and_then(|s| s.uid_range)
+        }
+        fn mapping(&self, container: &str) -> IdMapping {
+            self.fake
+                .container_spec(container)
+                .unwrap()
+                .id_mapping
+                .expect("container created without an explicit id map")
+        }
+    }
+
+    fn tar() -> TarStream {
+        Box::pin(stream::iter([Ok(Bytes::from_static(b"tar"))]))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_deploy_assigns_a_range_and_creates_labelled_volumes() {
+        let e = env(APP);
+        assert!(e.rec.reconcile().await.unwrap().is_clean());
+
+        let r = e.range("szklana").unwrap();
+        assert_eq!(r, UidRange { start: 1, size: DEFAULT_RANGE_SIZE });
+        assert_eq!(e.mapping("szklana"), id_mapping(r));
+        let spec = e.fake.container_spec("szklana").unwrap();
+        assert!(!spec.userns_auto);
+        assert_eq!(spec.labels[labels::UID_RANGE], "1+65536");
+        assert_eq!(
+            spec.volumes,
+            [
+                VolumeAttachment {
+                    volume: "szklana.data".into(),
+                    target: "/data".into(),
+                    read_only: false
+                },
+                VolumeAttachment {
+                    volume: "szklana.cache".into(),
+                    target: "/cache".into(),
+                    read_only: true
+                },
+            ]
+        );
+        // Created by us (labelled), before the container, not implicitly by the container create.
+        let vols = e.fake.volumes();
+        assert_eq!(vols.len(), 2);
+        assert!(vols.iter().all(|v| v.labels[labels::INSTANCE] == "szklana"));
+        let calls = e.fake.calls();
+        let first_volume = calls.iter().position(|c| matches!(c, Call::VolumeCreate(_)));
+        let create = calls.iter().position(|c| matches!(c, Call::ContainerCreate(_)));
+        assert!(first_volume < create);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn range_is_stable_across_redeploys_and_recreates() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let r = e.range("szklana").unwrap();
+
+        e.rec.deploy(&name("szklana"), true).await.unwrap();
+        e.fake.set_pull_digest(IMAGE, digest('b'));
+        e.rec.deploy(&name("szklana"), false).await.unwrap();
+        e.fake.container_remove("szklana", true).await.unwrap();
+        e.rec.reconcile().await.unwrap(); // recreated from the pinned digest
+
+        assert_eq!(e.range("szklana"), Some(r));
+        assert_eq!(e.mapping("szklana"), id_mapping(r));
+        assert_eq!(e.fake.volumes().len(), 2, "volumes are reused, not duplicated");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn instances_get_disjoint_ranges_and_ingress_does_too() {
+        let e = env(&format!("{APP}\n{}", PLAIN));
+        e.rec.reconcile().await.unwrap();
+        let ingress = e.rec.ensure_ingress_range().await.unwrap();
+        assert_eq!(e.rec.ensure_ingress_range().await.unwrap(), ingress, "stable");
+
+        let (a, b) = (e.range("ntfy").unwrap(), e.range("szklana").unwrap());
+        assert_eq!((a.start, b.start), (1, 65_537));
+        assert_eq!(ingress.size, INFRA_RANGE_SIZE);
+        assert!(!a.overlaps(b) && !a.overlaps(ingress) && !b.overlaps(ingress));
+        assert_eq!(e.state().ingress_uid_range, Some(ingress));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_pool_blocks_only_the_instance_that_does_not_fit() {
+        let e = env(&format!("{APP}\n{PLAIN}"));
+        e.fake.set_subuid_pool(70_000); // room for exactly one full range
+        let report = e.rec.reconcile().await.unwrap();
+
+        assert!(e.range("ntfy").is_some(), "first in alphabetical order wins");
+        assert!(e.range("szklana").is_none());
+        assert!(report.actions.iter().any(|a| a.result.is_err()), "{report:?}");
+        assert!(e.fake.container_spec("szklana").is_none());
+        assert!(e.fake.volumes().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn instance_without_range_is_migrated_with_one_recreate() {
+        let e = env(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        // Rewind to what the MVP produced: no range in state, a container on the default map.
+        let mut legacy = e.fake.container_spec("ntfy").unwrap();
+        legacy.id_mapping = None;
+        legacy.userns_auto = true;
+        legacy.labels.remove(labels::UID_RANGE);
+        e.fake.container_remove("ntfy", true).await.unwrap();
+        e.fake.container_create(&legacy).await.unwrap();
+        e.fake.container_start("ntfy").await.unwrap();
+        let mut st = e.state();
+        st.apps.get_mut(&name("ntfy")).unwrap().uid_range = None;
+        crate::state::save_state(&e.rec.paths().state, &st).unwrap();
+
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(matches!(
+            report.actions[..],
+            [crate::reconcile::ActionReport {
+                action: Action::Recreate { reason: RecreateReason::SpecDrift, .. },
+                result: Ok(ActionOutcome::Recreated(_)),
+            }]
+        ));
+        assert_eq!(e.mapping("ntfy"), id_mapping(e.range("ntfy").unwrap()));
+        assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
+
+        let again = e.rec.reconcile().await.unwrap();
+        assert!(again.actions.is_empty(), "migration happens once: {again:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_deploy_of_an_unmigrated_instance_recreates_instead_of_reporting_unchanged() {
+        let e = env(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        let mut legacy = e.fake.container_spec("ntfy").unwrap();
+        legacy.labels.remove(labels::UID_RANGE);
+        e.fake.container_remove("ntfy", true).await.unwrap();
+        e.fake.container_create(&legacy).await.unwrap();
+        e.fake.container_start("ntfy").await.unwrap();
+
+        let out = e.rec.deploy(&name("ntfy"), false).await.unwrap();
+        assert!(matches!(out, crate::deploy::DeployOutcome::Deployed { .. }), "{out:?}");
+        assert!(e.fake.container_spec("ntfy").unwrap().labels.contains_key(labels::UID_RANGE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plain_remove_keeps_volumes_and_their_range_until_purged() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let r = e.range("szklana").unwrap();
+
+        e.rec.remove_app_with_volumes(&name("szklana"), false).await.unwrap();
+        e.rec.reconcile().await.unwrap();
+        assert!(e.fake.containers().is_empty(), "container pruned");
+        assert_eq!(e.fake.volumes().len(), 2, "volumes survive apps remove");
+        assert_eq!(e.range("szklana"), Some(r), "range stays reserved");
+        let st = e.state();
+        assert_eq!(st.apps[&name("szklana")], AppState { uid_range: Some(r), ..Default::default() });
+
+        // Re-adding the app finds its files owned correctly: same range, same volumes.
+        e.set_apps(APP);
+        e.rec.reconcile().await.unwrap();
+        assert_eq!(e.range("szklana"), Some(r));
+        assert_eq!(e.mapping("szklana"), id_mapping(r));
+
+        e.rec.remove_app_with_volumes(&name("szklana"), true).await.unwrap();
+        assert!(e.fake.containers().is_empty());
+        assert!(e.fake.volumes().is_empty());
+        assert_eq!(e.range("szklana"), None, "purge releases the range");
+        // The freed range is the first one handed out again.
+        e.set_apps(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        assert_eq!(e.range("ntfy"), Some(r));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn orphan_settling_does_not_clobber_ranges_assigned_in_the_same_pass() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        // `szklana` leaves (keeps volumes) while `ntfy` is deployed for the first time in one pass.
+        e.set_apps(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        let st = e.state();
+        assert!(st.apps[&name("ntfy")].uid_range.is_some());
+        assert!(st.apps[&name("szklana")].uid_range.is_some());
+        assert!(!st.apps[&name("ntfy")].uid_range.unwrap().overlaps(st.apps[&name("szklana")].uid_range.unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_an_app_without_volumes_releases_its_range_on_the_next_pass() {
+        let e = env(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        assert!(e.range("ntfy").is_some());
+        e.rec.remove_app_with_volumes(&name("ntfy"), false).await.unwrap();
+        e.rec.reconcile().await.unwrap();
+        assert!(e.state().apps.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn purge_of_unknown_app_is_an_error_and_touches_nothing() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let err = e.rec.remove_app_with_volumes(&name("nope"), true).await.unwrap_err();
+        assert!(matches!(err, EngineError::UnknownInstance(_)));
+        assert_eq!(e.fake.volumes().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreign_import_goes_through_a_unstarted_helper_container_in_the_instance_range() {
+        let e = env(APP);
+        assert!(e.rec.import_foreign(&name("szklana"), "data", tar(), WAIT).await.is_err(), "not deployed");
+        e.rec.reconcile().await.unwrap();
+        let before = e.fake.calls().len();
+
+        e.rec.import_foreign(&name("szklana"), "data", tar(), WAIT).await.unwrap();
+
+        let calls = e.fake.calls()[before..].to_vec();
+        assert!(calls.contains(&Call::ContainerCreate("wg-import.szklana".into())));
+        assert!(calls.contains(&Call::ContainerArchivePut {
+            name: "wg-import.szklana".into(),
+            path: "/data".into()
+        }));
+        assert!(!calls.iter().any(|c| matches!(c, Call::ContainerStart(n) if n == "wg-import.szklana")));
+        assert!(!calls.iter().any(|c| matches!(c, Call::VolumeImport(_))), "not the raw volume import");
+        assert!(e.fake.container_spec("wg-import.szklana").is_none(), "helper is cleaned up");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreign_import_rejects_unknown_volumes() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let err = e.rec.import_foreign(&name("szklana"), "nope", tar(), WAIT).await.unwrap_err();
+        assert!(matches!(err, EngineError::Volume(_)), "{err:?}");
+    }
+
+    #[test]
+    fn id_mapping_is_one_line_per_map() {
+        let m = id_mapping(UidRange { start: 65_537, size: 65_536 });
+        assert_eq!(m.uid_map, m.gid_map);
+        assert_eq!(
+            m.uid_map,
+            [IdRange { container_id: 0, host_id: 65_537, size: 65_536 }]
+        );
     }
 }

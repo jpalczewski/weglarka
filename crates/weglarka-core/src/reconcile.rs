@@ -39,6 +39,9 @@ pub enum EngineError {
         "no free uid range of {size} in the subuid pool of {pool}; enlarge the runtime user's subuid range"
     )]
     UidPoolExhausted { pool: u64, size: u32 },
+    /// The engine lock was not obtained in time (a deploy is in progress).
+    #[error("engine is busy (deploy in progress)")]
+    Busy,
     /// A volume operation the request cannot be served for (unknown volume, app not deployed yet…).
     #[error("{0}")]
     Volume(String),
@@ -285,7 +288,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let _g = self.lock.lock().await;
         let apps = state::load_apps(&self.paths.apps)?;
         let unranged = self.adopt_uid_ranges(&apps).await;
-        let mut st = state::load_state(&self.paths.state)?;
+        let st = state::load_state(&self.paths.state)?;
         let observed: Vec<ContainerInfo> = self
             .podman
             .container_list(&ContainerFilter::default())
@@ -342,6 +345,8 @@ impl<P: PodmanClient> Reconciler<P> {
         }
 
         // We clean up orphan state after their containers are removed.
+        // The actions above saved state.toml themselves; settle on a fresh copy, not on `st`.
+        let mut st = state::load_state(&self.paths.state)?;
         if self.settle_orphan_state(&mut st, &apps).await {
             state::save_state(&self.paths.state, &st)?;
         }
