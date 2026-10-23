@@ -156,7 +156,7 @@ fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
             },
         });
     }
-    Ok(AppSpec {
+    let mut spec = AppSpec {
         image,
         domains: a.domains.clone(),
         port: a.port,
@@ -166,7 +166,9 @@ fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         volumes: vec![],
         resources: Default::default(),
         auto_update: !a.no_auto_update,
-    })
+    };
+    a.spec_flags.apply(&mut spec);
+    Ok(spec)
 }
 
 async fn apps_add(json: bool, o: &Overrides, a: AddArgs) -> Result<i32, CliError> {

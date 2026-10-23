@@ -30,6 +30,8 @@ pub struct Cli {
     pub command: Command,
 }
 
+// CLI arguments are parsed once per process; boxing the big `apps add/update` variants buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Manage apps (add/update/remove/list/show).
@@ -88,6 +90,8 @@ pub struct AddArgs {
     /// Disable auto-update (the webhook will not swap the image on its own).
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,
+    #[command(flatten)]
+    pub spec_flags: crate::spec_flags::SpecFlags,
     /// Whole AppSpec from a TOML file (instead of the flags above); `-` = stdin.
     #[arg(long, value_name = "FILE")]
     pub spec: Option<PathBuf>,

@@ -7,16 +7,16 @@ use futures_util::stream;
 use hyper::Method;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
-    NetworkInfo, NetworkSpec, PodmanClient, PodmanError, PodmanEvent, PullEvent, Result, TarStream,
-    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent,
+    Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
-    InspectImage, InspectNetwork, ListedContainer, PullLine, PullReport, StartExec, Version,
-    WireEvent, WireVolume, decode, health_status,
+    InspectImage, InspectNetwork, ListedContainer, ListedNetwork, NetworkRmReport, PullLine,
+    PullReport, StartExec, Version, WireEvent, WireVolume, decode, health_status,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -262,6 +262,37 @@ impl PodmanClient for LibpodClient {
         let path = format!("/networks/{}/json", path_name(name)?);
         let body = self.transport.call(Method::GET, &path, None).await?;
         Ok(decode::<InspectNetwork>(&body)?.into_domain())
+    }
+
+    async fn network_list(&self) -> Result<Vec<NetworkSummary>> {
+        let body = self
+            .transport
+            .call(Method::GET, "/networks/json", None)
+            .await?;
+        Ok(decode::<Vec<ListedNetwork>>(&body)?
+            .into_iter()
+            .map(ListedNetwork::into_domain)
+            .collect())
+    }
+
+    async fn network_remove(&self, name: &str) -> Result<()> {
+        let path = format!("/networks/{}", path_name(name)?);
+        match self.transport.call(Method::DELETE, &path, None).await {
+            // libpod may report a failure inside a 200 body.
+            Ok(body) => match decode::<Vec<NetworkRmReport>>(&body)
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|r| r.err.filter(|e| !e.is_empty()))
+            {
+                None => Ok(()),
+                Some(message) => Err(PodmanError::Api {
+                    status: 200,
+                    message,
+                }),
+            },
+            Err(PodmanError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn secret_create(&self, name: &str, data: &[u8]) -> Result<()> {

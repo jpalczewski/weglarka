@@ -381,7 +381,44 @@ impl<P: PodmanClient> Reconciler<P> {
         if self.settle_orphan_state(&mut st, &apps).await {
             state::save_state(&self.paths.state, &st)?;
         }
+        self.prune_networks(&apps).await;
         Ok(report)
+    }
+
+    /// Removes per-app networks (`net-<instance>`) whose instance is gone from the desired state.
+    /// Best effort and idempotent: a network still in use (the container is not pruned yet, or the
+    /// ingress nginx has not detached it yet) is left for a later pass. Only networks Węglarka
+    /// created (labelled `weglarka.instance` or `weglarka.managed`) are touched, never
+    /// [`labels::INGRESS_NETWORK`].
+    async fn prune_networks(&self, apps: &AppsFile) {
+        let networks = match self.podman.network_list().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot list networks; skipping network cleanup");
+                return;
+            }
+        };
+        for net in networks {
+            if net.name == labels::INGRESS_NETWORK || !is_weglarka_network(&net.labels) {
+                continue;
+            }
+            let Some(instance) = net
+                .name
+                .strip_prefix("net-")
+                .and_then(|rest| InstanceName::new(rest).ok())
+            else {
+                continue;
+            };
+            if apps.apps.contains_key(&instance) {
+                continue;
+            }
+            match self.podman.network_remove(&net.name).await {
+                Ok(()) => tracing::info!(network = %net.name, "removed network of a removed app"),
+                Err(e) => {
+                    tracing::debug!(network = %net.name, error = %e, "network not removed yet")
+                }
+            }
+        }
     }
 
     async fn execute(&self, apps: &AppsFile, action: Action) -> Result<ActionOutcome, EngineError> {
@@ -425,6 +462,12 @@ impl<P: PodmanClient> Reconciler<P> {
             }
         }
     }
+}
+
+/// Whether a network was created by Węglarka (deploy labels it with the instance, ingress with
+/// `weglarka.managed`).
+fn is_weglarka_network(network_labels: &BTreeMap<String, String>) -> bool {
+    network_labels.contains_key(labels::INSTANCE) || network_labels.contains_key("weglarka.managed")
 }
 
 #[cfg(test)]

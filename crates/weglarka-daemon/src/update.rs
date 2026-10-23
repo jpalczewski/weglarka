@@ -77,7 +77,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
             Ok(r) => r.map_err(internal)?,
             Err(_) => {
                 return Err(Fail(
-                    ErrorCode::Conflict,
+                    ErrorCode::Busy,
                     "daemon is busy (deploy in progress); retry shortly".into(),
                 ));
             }

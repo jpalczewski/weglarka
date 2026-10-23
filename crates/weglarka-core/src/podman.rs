@@ -248,6 +248,13 @@ pub struct EventFilter {
     pub since: Option<i64>,
 }
 
+/// A network as listed by [`PodmanClient::network_list`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSummary {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+}
+
 /// Network data needed by ingress: gateway addresses where the network DNS (aardvark) listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInfo {
@@ -334,6 +341,13 @@ pub trait PodmanClient: Send + Sync {
 
     /// `PodmanError::NotFound` if the network is missing.
     fn network_inspect(&self, name: &str) -> impl Future<Output = Result<NetworkInfo>> + Send;
+
+    /// All networks of the runtime user, with their labels.
+    fn network_list(&self) -> impl Future<Output = Result<Vec<NetworkSummary>>> + Send;
+
+    /// Removes a network. Idempotent: missing → `Ok`. Fails (without force) while containers are
+    /// still attached — callers treat that as "try again later".
+    fn network_remove(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
 
     // Secrets (Podman secrets); `create` overwrites an existing one with that name.
     fn secret_create(&self, name: &str, data: &[u8]) -> impl Future<Output = Result<()>> + Send;

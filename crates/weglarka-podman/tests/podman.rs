@@ -381,3 +381,39 @@ fn serde_json_body(name: &str, id: &str) -> String {
 "healthconfig":{{"Test":["CMD","/pause","-v"],"Interval":30000000000,"Timeout":5000000000,"Retries":1}}}}"#
     )
 }
+
+#[tokio::test]
+async fn network_list_shows_labels_and_remove_is_idempotent() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket);
+    let net = format!("wg-it-net-{}", run_id());
+    client
+        .network_create(&NetworkSpec {
+            name: net.clone(),
+            internal: false,
+            labels: BTreeMap::from([("weglarka.instance".to_owned(), "it".to_owned())]),
+        })
+        .await
+        .unwrap();
+    let listed = client.network_list().await.unwrap();
+    let found = listed
+        .iter()
+        .find(|n| n.name == net)
+        .expect("network listed");
+    assert_eq!(
+        found.labels.get("weglarka.instance").map(String::as_str),
+        Some("it")
+    );
+
+    client.network_remove(&net).await.unwrap();
+    // Missing → Ok (idempotent).
+    client.network_remove(&net).await.unwrap();
+    assert!(
+        !client
+            .network_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|n| n.name == net)
+    );
+}

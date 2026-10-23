@@ -108,6 +108,53 @@ fn api_err(code: ErrorCode, msg: &str) -> String {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn client_retries_busy_until_the_daemon_accepts() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let calls2 = calls.clone();
+    let m = mock(move |_, _| {
+        if calls2.fetch_add(1, Ordering::SeqCst) < 2 {
+            (
+                503,
+                api_err(ErrorCode::Busy, "daemon is busy (deploy in progress)"),
+            )
+        } else {
+            (204, String::new())
+        }
+    })
+    .await;
+    let c = ApiClient::new(&m.socket);
+    c.call_empty(endpoints::APPS_REMOVE, &[("name", "ntfy")])
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(
+        m.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| s.path == "/v1/apps/ntfy")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn client_does_not_retry_other_errors() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let calls2 = calls.clone();
+    let m = mock(move |_, _| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        (409, api_err(ErrorCode::Conflict, "conflict"))
+    })
+    .await;
+    let c = ApiClient::new(&m.socket);
+    let e = c
+        .call_empty(endpoints::APPS_REMOVE, &[("name", "ntfy")])
+        .await
+        .unwrap_err();
+    assert!(!e.is_busy());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn client_sends_contract_path_and_host_and_parses_json() {
     let m = mock(|_, _| {
         (
@@ -144,10 +191,12 @@ async fn api_errors_map_to_exit_codes() {
         (ErrorCode::AlreadyExists, exit::CONFLICT),
         (ErrorCode::Conflict, exit::CONFLICT),
         (ErrorCode::InvalidRequest, exit::INVALID_REQUEST),
+        (ErrorCode::Busy, exit::CONFLICT),
         (ErrorCode::Internal, exit::INTERNAL),
     ] {
         let m = mock(move |_, _| (code.http_status(), api_err(code, "boom"))).await;
         let err = ApiClient::new(&m.socket)
+            .with_busy_wait(std::time::Duration::ZERO)
             .call::<DoctorReport>(endpoints::DOCTOR, &[], None::<&()>)
             .await
             .unwrap_err();

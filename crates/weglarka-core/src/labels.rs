@@ -33,6 +33,10 @@ pub fn container_name(instance: &InstanceName) -> String {
     instance.to_string()
 }
 
+/// Network of Węglarka itself (daemon + ingress nginx). Shaped like an app network, so network
+/// cleanup must never treat it as an orphan.
+pub const INGRESS_NETWORK: &str = "net-weglarka";
+
 /// Per-app network that the instance container (and the ingress nginx) joins.
 pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")

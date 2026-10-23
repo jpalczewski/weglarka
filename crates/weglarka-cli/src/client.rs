@@ -21,9 +21,16 @@ use crate::error::{CliError, Kind};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deploy waits for the image pull and the health gate, so the overall timeout is long.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a request answered with `busy` (another mutation holds the engine, e.g. a deploy behind
+/// the health gate) is retried before the error is returned.
+const BUSY_WAIT: Duration = Duration::from_secs(180);
+/// Pause between retries of a `busy` request (grows up to `BUSY_BACKOFF_MAX`).
+const BUSY_BACKOFF_START: Duration = Duration::from_millis(500);
+const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 pub struct ApiClient {
     socket: PathBuf,
+    busy_wait: Duration,
 }
 
 /// Substitutes `{param}` in an endpoint path. Values must already be validated
@@ -49,7 +56,15 @@ impl ApiClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            busy_wait: BUSY_WAIT,
         }
+    }
+
+    /// How long `busy` answers are retried (default `BUSY_WAIT`; zero = no retry).
+    #[cfg(test)]
+    pub fn with_busy_wait(mut self, wait: Duration) -> Self {
+        self.busy_wait = wait;
+        self
     }
 
     /// Call with a JSON response body.
@@ -82,19 +97,36 @@ impl ApiClient {
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<Vec<u8>, CliError> {
         let payload = match body {
-            Some(b) => serde_json::to_vec(b)
-                .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?,
-            None => Vec::new(),
+            Some(b) => Bytes::from(
+                serde_json::to_vec(b)
+                    .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?,
+            ),
+            None => Bytes::new(),
         };
+        let uri = expand_path(endpoint, params);
+        let json = body.is_some();
+        retry_while_busy(self.busy_wait, || {
+            self.send_once(endpoint.method, &uri, json, payload.clone())
+        })
+        .await
+    }
+
+    async fn send_once(
+        &self,
+        method: Method,
+        uri: &str,
+        json: bool,
+        payload: Bytes,
+    ) -> Result<Vec<u8>, CliError> {
         let mut req = Request::builder()
-            .method(method_str(endpoint.method))
-            .uri(expand_path(endpoint, params))
+            .method(method_str(method))
+            .uri(uri)
             .header(HOST, "weglarka");
-        if body.is_some() {
+        if json {
             req = req.header(CONTENT_TYPE, "application/json");
         }
         let req = req
-            .body(Full::new(Bytes::from(payload)))
+            .body(Full::new(payload))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
 
         let mut sender = self.connect().await?;
@@ -145,27 +177,11 @@ impl ApiClient {
         query: &str,
     ) -> Result<(), CliError> {
         let path = format!("{}?{query}", expand_path(endpoint, params));
-        let req = Request::builder()
-            .method(method_str(endpoint.method))
-            .uri(path)
-            .header(HOST, "weglarka")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let exchange = async {
-            let resp = sender.send_request(req).await?;
-            let status = resp.status();
-            Ok::<_, hyper::Error>((status, resp.into_body().collect().await?.to_bytes()))
-        };
-        let (status, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
-            .await
-            .map_err(|_| CliError::internal("request to daemon timed out"))?
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(error_from_response(status, &bytes))
-        }
+        retry_while_busy(self.busy_wait, || {
+            self.send_once(endpoint.method, &path, false, Bytes::new())
+        })
+        .await
+        .map(drop)
     }
 
     /// Streams `body` as the request body (`application/x-tar`) and expects an empty success
@@ -269,5 +285,31 @@ fn error_from_response(status: StatusCode, body: &[u8]) -> CliError {
             "daemon returned HTTP {status} with an unrecognised body"
         ))
         .with_hint("wersja CLI i demona może się różnić"),
+    }
+}
+
+/// Repeats `attempt` while the daemon answers `busy`, with a growing pause, for at most
+/// `wait`; then returns the last error. Other errors and success return immediately.
+/// Only for requests whose body can be re-sent (not for streamed uploads).
+async fn retry_while_busy<F, Fut>(wait: Duration, mut attempt: F) -> Result<Vec<u8>, CliError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, CliError>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut pause = BUSY_BACKOFF_START;
+    let mut announced = false;
+    loop {
+        match attempt().await {
+            Err(e) if e.is_busy() && tokio::time::Instant::now() + pause < deadline => {
+                if !announced {
+                    eprintln!("daemon is busy (deploy in progress), waiting…");
+                    announced = true;
+                }
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(BUSY_BACKOFF_MAX);
+            }
+            other => return other,
+        }
     }
 }

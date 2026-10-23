@@ -32,7 +32,7 @@ use weglarka_core::volumes;
 use weglarka_ingress::{nginx, traefik};
 
 /// Network joined by both the Węglarka and nginx containers (webhooks: `proxy_pass http://weglarka:<port>`).
-pub const WEBHOOK_NETWORK: &str = "net-weglarka";
+pub const WEBHOOK_NETWORK: &str = labels::INGRESS_NETWORK;
 pub const NGINX_CONTAINER: &str = "weglarka-nginx";
 pub const HASH_LABEL: &str = "weglarka.ingress-hash";
 const NGINX_CONF_FILE: &str = "nginx.conf";

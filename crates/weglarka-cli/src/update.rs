@@ -67,6 +67,8 @@ pub struct UpdateArgs {
     /// Disable auto-update.
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,
+    #[command(flatten)]
+    pub spec_flags: crate::spec_flags::SpecFlags,
     /// Replace the whole spec with an AppSpec TOML file (instead of the flags above); `-` = stdin.
     #[arg(long, value_name = "FILE")]
     pub spec: Option<PathBuf>,
@@ -89,6 +91,7 @@ impl UpdateArgs {
             || !self.unbind_secrets.is_empty()
             || self.auto_update
             || self.no_auto_update
+            || !self.spec_flags.is_empty()
     }
 }
 
@@ -159,6 +162,7 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     if a.no_auto_update {
         spec.auto_update = false;
     }
+    a.spec_flags.apply(&mut spec);
     Ok(spec)
 }
 

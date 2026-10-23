@@ -317,13 +317,19 @@ Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi w�
 ```toml
 # apps.toml / --spec
 volumes = [{ name = "data", target = "/data" }]   # read_only = true dla montowania tylko do odczytu
+resources = { memory = "128m", pids_limit = 256 } # opcjonalnie; domyślnie bez limitów
 ```
+
+To samo flagami `apps add` / `apps update` (bez pliku spec): `--volume data=/data` (`:ro` na końcu = tylko do
+odczytu; ta sama nazwa podmienia wpis), `--memory 128m`, `--pids-limit 256`, `--cpus 0.5`; `none` usuwa limit
+(`--memory none`). Literówka w polu pliku spec (np. `memory` zamiast `resources.memory`) daje błąd z listą pól.
 
 Wolumen `<instancja>.<nazwa>` (np. `szklana-pogoda.data`) powstaje przy deployu z etykietą `weglarka.instance`.
 `weglarka volumes list <apka>` pokazuje deklarowane wolumeny. `apps remove` **nie usuwa danych** (wolumeny i zakres
 UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właścicielem). Usunięcie danych:
 `weglarka apps remove <apka> --purge-volumes` (kasuje kontener i wolumeny, zwalnia zakres UID — bez odwrotu).
-Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów.
+Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów. Sieć apki (`net-<instancja>`) demon usuwa
+sam przy najbliższym przebiegu reconcile po `apps remove` (gdy nic już z niej nie korzysta).
 
 ### Import danych z Coolify (np. szklana.pogoda)
 
@@ -353,6 +359,26 @@ weglarka volumes import szklana-pogoda data --from backup.tar --own
 
 Nie myl trybów: obcy tar zaimportowany z `--own` ląduje **po cichu** na złych UID-ach; eksport Węglarki
 zaimportowany bez `--own` traci właścicieli (wszystko dostaje użytkownika kontenera).
+
+### Migracja apki z SQLite (na przykładzie szklana.pogoda)
+
+Wnioski z migracji szklana.pogoda (2026-10-23, przerwa ≈ 46 s, z czego ~25 s dało się uniknąć):
+
+1. **Próba bez przerwy:** apka w Węglarce **bez domeny**, z wolumenem i `auto_update = false`, jeśli apka migruje
+   schemat przy starcie (rollback obrazu nie cofa schematu). Kopia z działającej apki **tylko przez SQLite**
+   (`sqlite3 -readonly <baza> ".backup /tmp/kopia.db"` albo `VACUUM INTO`) — nigdy surowy plik bazy, do której
+   ktoś właśnie pisze. Import obcym tarem, deploy, porównanie liczności tabel ze starą apką.
+2. **Przełączenie:** zatrzymaj starą apkę w Coolify — przez API to `POST /api/v1/applications/{uuid}/stop`
+   (`GET` daje 405); samo zatrzymanie trwa do ~30 s. Wyłącz w Coolify jej auto-deploy, żeby push na `main` jej
+   nie podniósł. Końcowa kopia `.backup` z **zatrzymanej** bazy → ponowny import → `apps update --domain …`.
+3. **Weryfikacja po przełączeniu, nie w oknie przerwy:** `PRAGMA integrity_check` na bazie w wolumenie i
+   porównanie liczności rób **po** dodaniu domeny (na kopii końcowej możesz je zrobić równolegle, poza
+   oknem). Przy szklanej.pogodzie sprawdzanie w oknie wydłużyło przerwę o ~25 s.
+4. **Za proxy:** apka widzi ruch od nginx Węglarki z podsieci swojej sieci (`net-<instancja>`); jeśli apka sama
+   ufa nagłówkom proxy, podaj jej tę podsieć (szklana.pogoda: `TRUSTED_PROXIES=10.89.5.0/24`, sprawdź
+   `podman network inspect net-<instancja>`). Ustaw publiczny origin, jeśli apka go ma (cookie `Secure`).
+5. **Rollback:** `apps update --remove-domain …` + start starej apki. Dane zapisane po przełączeniu przepadają —
+   przed powrotem przy realnym ruchu zrób `weglarka volumes export`.
 
 ### Aktualizacja Węglarki do wersji z zakresami UID (jednorazowo)
 
@@ -397,6 +423,10 @@ podman logs weglarka-nginx                      # access log JSON z polem app
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
 
 ### `apps update`: co się dzieje po zmianie
+
+Gdy demon jest zajęty innym deployem (bramka zdrowia trwa do kilkudziesięciu sekund), CLI nie zwraca od razu
+błędu „busy”, tylko ponawia żądanie przez maks. 3 min (komunikat „daemon is busy … waiting…” na stderr).
+
 
 `weglarka apps update <app> [flagi]` czyta obecną spec, nakłada flagi i wysyła **całą** spec (pełna podmiana;
 `--spec plik.toml` podmienia ją w całości z pliku). `--dry-run` pokazuje diff i niczego nie wysyła.
