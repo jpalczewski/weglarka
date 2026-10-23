@@ -116,6 +116,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         resources: Default::default(),
         healthcheck: None,
         id_mapping: None,
+        security: Default::default(),
     }
 }
 
@@ -416,4 +417,62 @@ async fn network_list_shows_labels_and_remove_is_idempotent() {
             .iter()
             .any(|n| n.name == net)
     );
+}
+
+#[tokio::test]
+async fn hardened_container_starts_with_read_only_root_dropped_caps_and_no_new_privileges() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-hardened-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let mut s = spec(&name, BTreeMap::new());
+    s.security = weglarka_core::app::Security {
+        read_only: true,
+        tmpfs: vec!["/cache".into()],
+        cap_drop: vec!["ALL".into()],
+        cap_add: vec![],
+        no_new_privileges: true,
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(IMAGE).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+
+    let (ok, body) = raw(&socket, "GET", &format!("/containers/{name}/json"), None);
+    assert!(ok, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let host = &v["HostConfig"];
+    assert_eq!(host["ReadonlyRootfs"], true, "{host}");
+    // Inspect reports either the literal ALL or the expanded list, and the effective set.
+    let effective = v["EffectiveCaps"].as_array().cloned().unwrap_or_default();
+    assert!(effective.is_empty(), "no capabilities left: {effective:?}");
+    assert!(
+        host["SecurityOpt"]
+            .to_string()
+            .contains("no-new-privileges"),
+        "{}",
+        host["SecurityOpt"]
+    );
+    let in_mounts = v["Mounts"]
+        .as_array()
+        .is_some_and(|ms| ms.iter().any(|m| m["Destination"] == "/cache"));
+    let in_tmpfs = host["Tmpfs"].get("/cache").is_some();
+    assert!(
+        in_mounts || in_tmpfs,
+        "tmpfs /cache mounted: Mounts={} Tmpfs={}",
+        v["Mounts"],
+        host["Tmpfs"]
+    );
+    assert_eq!(v["State"]["Status"], "running");
 }

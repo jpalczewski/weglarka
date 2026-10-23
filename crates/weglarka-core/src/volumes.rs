@@ -454,6 +454,7 @@ impl<P: PodmanClient> Reconciler<P> {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: Some(id_mapping(range)),
+            security: Default::default(),
         };
         let result = async {
             self.podman.container_create(&helper).await?;

@@ -126,7 +126,22 @@ pub(crate) struct CreateContainer<'a> {
     /// `Schema2HealthConfig`; omitted keeps the image's own HEALTHCHECK.
     #[serde(skip_serializing_if = "Option::is_none")]
     healthconfig: Option<HealthConfig<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    read_only_filesystem: bool,
+    /// With a read-only root: writable tmpfs on `/tmp`, `/var/tmp` and `/run` (the
+    /// `podman run --read-only` default; the API defaults it to off).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    read_write_tmpfs: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cap_drop: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cap_add: Vec<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    no_new_privileges: bool,
 }
+
+/// Options of a tmpfs mount from `security.tmpfs` (writable, no devices or setuid).
+const TMPFS_OPTIONS: [&str; 3] = ["rw", "nosuid", "nodev"];
 
 #[derive(Serialize)]
 struct ResourceLimits {
@@ -360,7 +375,18 @@ impl<'a> CreateContainer<'a> {
                     destination: &m.target,
                     options: if m.read_only { vec!["ro"] } else { vec![] },
                 })
+                .chain(spec.security.tmpfs.iter().map(|path| BindMountBody {
+                    kind: "tmpfs",
+                    source: "tmpfs",
+                    destination: path,
+                    options: TMPFS_OPTIONS.to_vec(),
+                }))
                 .collect(),
+            read_only_filesystem: spec.security.read_only,
+            read_write_tmpfs: spec.security.read_only,
+            cap_drop: spec.security.cap_drop.iter().map(String::as_str).collect(),
+            cap_add: spec.security.cap_add.iter().map(String::as_str).collect(),
+            no_new_privileges: spec.security.no_new_privileges,
         }
     }
 }
@@ -942,8 +968,56 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn security_maps_to_libpod_fields_and_is_omitted_when_unset() {
+        let mut spec = ContainerSpec {
+            name: "a".into(),
+            image: "i".into(),
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: false,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+            security: Default::default(),
+        };
+        let plain = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        for key in [
+            "read_only_filesystem",
+            "read_write_tmpfs",
+            "cap_drop",
+            "cap_add",
+            "no_new_privileges",
+            "mounts",
+        ] {
+            assert!(plain.get(key).is_none(), "{key} omitted when unset");
+        }
+        spec.security = weglarka_core::app::Security {
+            read_only: true,
+            tmpfs: vec!["/cache".into()],
+            cap_drop: vec!["ALL".into()],
+            cap_add: vec!["NET_BIND_SERVICE".into()],
+            no_new_privileges: true,
+        };
+        let v = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(v["read_only_filesystem"], true);
+        assert_eq!(v["read_write_tmpfs"], true);
+        assert_eq!(v["cap_drop"], serde_json::json!(["ALL"]));
+        assert_eq!(v["cap_add"], serde_json::json!(["NET_BIND_SERVICE"]));
+        assert_eq!(v["no_new_privileges"], true);
+        assert_eq!(v["mounts"][0]["type"], "tmpfs");
+        assert_eq!(v["mounts"][0]["destination"], "/cache");
     }
 
     #[test]
@@ -969,6 +1043,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            security: Default::default(),
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         assert_eq!(body["secrets"][0]["Mode"], 0o444);
@@ -1011,6 +1086,7 @@ mod tests {
                 uid_map: vec![range],
                 gid_map: vec![range],
             }),
+            security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1043,6 +1119,7 @@ mod tests {
                 retries: 3,
             }),
             id_mapping: None,
+            security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1076,6 +1153,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }

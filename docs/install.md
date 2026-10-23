@@ -331,6 +331,28 @@ UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właśc
 Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów. Sieć apki (`net-<instancja>`) demon usuwa
 sam przy najbliższym przebiegu reconcile po `apps remove` (gdy nic już z niej nie korzysta).
 
+### Osłonienie kontenera (`security`)
+
+Domyślnie kontener apki ma tylko izolację UID (osobny zakres per instancja) i ewentualne limity. Dla apek z
+sekretami (klucze API, tokeny) i prywatnymi danymi włącz osłonienie — to samo, co Coolify dawał usługom
+z `read_only` / `cap_drop` / `no-new-privileges`:
+
+```toml
+# apps.toml / --spec
+security = { read_only = true, tmpfs = ["/cache"], cap_drop = ["ALL"], no_new_privileges = true }
+```
+
+Flagami: `--hardened` (= `read_only`, `cap_drop = ["ALL"]`, `no_new_privileges`), do tego `--tmpfs /ścieżka` dla
+zapisywalnych katalogów poza wolumenami i `--cap-add NAZWA`, jeśli apka czegoś potrzebuje (np.
+`NET_BIND_SERVICE` dla portu < 1024 w kontenerze). Pojedynczo: `--read-only true|false`,
+`--no-new-privileges true|false`, `--cap-drop`, `--cap-add`, `--tmpfs` (`none` czyści listę).
+
+- Przy `read_only` Podman montuje zapisywalne tmpfs na `/tmp`, `/var/tmp` i `/run`; wolumeny i sekrety działają
+  jak zwykle. Apka, która pisze gdzie indziej poza wolumenem (cache, pid w katalogu aplikacji), potrzebuje `--tmpfs`.
+- Zmiana `security` odtwarza kontener. Apki bez osłonienia hashują się jak wcześniej (aktualizacja Węglarki nic
+  nie odtwarza).
+- Sprawdź po deployu: `podman inspect <kontener> --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'`.
+
 ### Import danych z Coolify (np. szklana.pogoda)
 
 Importuj tar z Coolify trybem domyślnym (**obcy** tar): libpod nadaje wypakowanym plikom właściciela z konfiguracji
