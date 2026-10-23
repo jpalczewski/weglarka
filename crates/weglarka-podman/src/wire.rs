@@ -793,6 +793,20 @@ mod tests {
     }
 
     #[test]
+    fn subuid_pool_sums_the_subuid_lines_but_not_the_user_itself() {
+        let info: Info = decode(
+            br#"{"host":{"idMappings":{"uidmap":[
+                {"container_id":0,"host_id":1001,"size":1},
+                {"container_id":1,"host_id":1000000,"size":1000000}
+            ],"gidmap":[]},"other":1},"version":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(info.subuid_pool(), 1_000_000);
+        // Rootful or unknown layout: no pool rather than a guess.
+        assert_eq!(decode::<Info>(b"{}").unwrap().subuid_pool(), 0);
+    }
+
+    #[test]
     fn decode_error_is_protocol() {
         let err = decode::<Version>(b"<html>").err().unwrap();
         assert!(matches!(err, PodmanError::Protocol(_)));

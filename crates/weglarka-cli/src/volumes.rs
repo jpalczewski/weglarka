@@ -268,10 +268,10 @@ mod tests {
         (socket, seen)
     }
 
-    fn overrides(socket: &PathBuf) -> Overrides {
+    fn overrides(socket: &std::path::Path) -> Overrides {
         Overrides {
             config: None,
-            socket: Some(socket.clone()),
+            socket: Some(socket.to_owned()),
         }
     }
 
