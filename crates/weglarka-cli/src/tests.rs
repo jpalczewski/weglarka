@@ -316,3 +316,135 @@ fn edge_mode_skips_traefik_check_and_openrc_skips_linger() {
     assert!(!ids.contains(&"ingress.traefik_file"));
     assert!(!ids.contains(&"runtime.linger"));
 }
+
+// ---------- nowe sprawdzenia hosta (devops, niechybnie) ----------
+
+fn status_of(host: &FakeHost, id: &str) -> weglarka_api::CheckStatus {
+    report(host, Some(CONFIG))
+        .checks
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("brak sprawdzenia {id}"))
+        .status
+}
+
+#[test]
+fn subid_thresholds_ok_warn_fail() {
+    use weglarka_api::CheckStatus::*;
+    let with = |n: u64| FakeHost::healthy().file("/etc/subuid", &format!("weglarka:165536:{n}\n"));
+    assert_eq!(status_of(&with(1_000_000), "runtime.subuid"), Ok);
+    assert_eq!(status_of(&with(999_999), "runtime.subuid"), Warn);
+    assert_eq!(status_of(&with(65_536), "runtime.subuid"), Warn);
+    assert_eq!(status_of(&with(65_535), "runtime.subuid"), Fail);
+}
+
+#[test]
+fn apparmor_userns_cases() {
+    use weglarka_api::CheckStatus::*;
+    let id = "runtime.apparmor_userns";
+    assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
+    let mut h = FakeHost::healthy();
+    h.files.remove(&PathBuf::from(
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+    ));
+    assert_eq!(status_of(&h, id), Ok, "brak AppArmor = skip");
+    let h = FakeHost::healthy().file(
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+        "0\n",
+    );
+    assert_eq!(status_of(&h, id), Ok);
+    let h = FakeHost::healthy().file("/sys/kernel/security/apparmor/profiles", "crun (enforce)\n");
+    assert_eq!(status_of(&h, id), Fail);
+    // profile nieczytelne dla nie-roota → warn
+    let mut h = FakeHost::healthy();
+    h.files
+        .remove(&PathBuf::from("/sys/kernel/security/apparmor/profiles"));
+    assert_eq!(status_of(&h, id), Warn);
+}
+
+fn tcp_line(hex_addr: &str, port: u16, uid: u32) -> String {
+    format!(
+        "   0: {hex_addr}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 {uid:5}        0 1 1 0\n"
+    )
+}
+
+#[test]
+fn bind_free_cases() {
+    use crate::preflight::testing::PROC_NET_TCP_HEADER as H;
+    use weglarka_api::CheckStatus::*;
+    let id = "ingress.bind_free";
+    assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
+    // 172.17.0.1 = 0x010011AC w little-endian hex "010011AC"
+    let ours = format!("{H}{}", tcp_line("010011AC", 8080, 1001));
+    assert_eq!(
+        status_of(&FakeHost::healthy().file("/proc/net/tcp", &ours), id),
+        Ok
+    );
+    let traefik = format!("{H}{}", tcp_line("00000000", 8080, 0));
+    assert_eq!(
+        status_of(&FakeHost::healthy().file("/proc/net/tcp", &traefik), id),
+        Fail
+    );
+    let other_port = format!("{H}{}", tcp_line("00000000", 8081, 0));
+    assert_eq!(
+        status_of(&FakeHost::healthy().file("/proc/net/tcp", &other_port), id),
+        Ok
+    );
+    let other_ip = format!("{H}{}", tcp_line("0100007F", 8080, 0));
+    assert_eq!(
+        status_of(&FakeHost::healthy().file("/proc/net/tcp", &other_ip), id),
+        Ok,
+        "inny adres IPv4 nie koliduje"
+    );
+    let mut h = FakeHost::healthy();
+    h.files.remove(&PathBuf::from("/proc/net/tcp"));
+    assert_eq!(status_of(&h, id), Warn);
+}
+
+const POLICY: &str = r#"{"allowed_domains":["nz.example.eu","weglarka.example.eu"]}"#;
+
+fn sync_host(unit_state: &str, apps: Option<&str>) -> FakeHost {
+    let mut h = FakeHost::healthy()
+        .file("/etc/weglarka/traefik-policy.json", POLICY)
+        .cmd("systemctl is-active weglarka-traefik-sync.path", unit_state);
+    if let Some(a) = apps {
+        h = h.file("/etc/weglarka/apps.toml", a);
+    }
+    h
+}
+
+#[test]
+fn traefik_sync_cases() {
+    use weglarka_api::CheckStatus::*;
+    let id = "ingress.traefik_sync";
+    let app = |d: &str| format!("[apps.a]\nimage = \"x\"\ndomains = [\"{d}\"]\n");
+    // brak polityki = sync nieużywany
+    assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
+    assert_eq!(status_of(&sync_host("active\n", None), id), Ok);
+    assert_eq!(
+        status_of(&sync_host("active\n", Some(&app("NZ.example.eu"))), id),
+        Ok
+    );
+    assert_eq!(
+        status_of(&sync_host("active\n", Some(&app("evil.example.eu"))), id),
+        Warn
+    );
+    assert_eq!(status_of(&sync_host("inactive\n", None), id), Fail);
+    // brak systemctl
+    let mut h = sync_host("active\n", None);
+    h.commands.clear();
+    assert_eq!(status_of(&h, id), Warn);
+    // polityka bez allowlisty
+    let h = sync_host("active\n", None).file("/etc/weglarka/traefik-policy.json", "{}");
+    assert_eq!(status_of(&h, id), Warn);
+}
+
+#[test]
+fn traefik_sync_only_for_behind_on_systemd() {
+    let edge = CONFIG.replace("behind", "edge");
+    let r = report(&sync_host("active\n", None), Some(&edge));
+    assert!(r.checks.iter().all(|c| c.id != "ingress.traefik_sync"));
+    let openrc = CONFIG.replace("\n[webhook]", "\n[platform]\nkind = \"openrc\"\n[webhook]");
+    let r = report(&sync_host("active\n", None), Some(&openrc));
+    assert!(r.checks.iter().all(|c| c.id != "ingress.traefik_sync"));
+}

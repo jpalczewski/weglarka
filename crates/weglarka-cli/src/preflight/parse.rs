@@ -134,6 +134,40 @@ pub fn can_write(stat: &FileStat, uid: u32, gids: &[u32]) -> bool {
     }
 }
 
+/// Gniazdo nasłuchujące (TCP LISTEN) z `/proc/net/tcp` lub `/proc/net/tcp6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listener {
+    /// `None` = adres nieokreślony (`0.0.0.0` / `::`); adresy IPv6 inne niż `::` pomijamy.
+    pub addr: Option<std::net::Ipv4Addr>,
+    pub port: u16,
+    pub uid: u32,
+}
+
+/// Wpisy LISTEN z `/proc/net/tcp` (`v6 = false`) albo `/proc/net/tcp6` (`v6 = true`).
+pub fn parse_proc_net_tcp(src: &str, v6: bool) -> Vec<Listener> {
+    src.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 8 || f[3] != "0A" {
+                return None;
+            }
+            let (host, port) = f[1].split_once(':')?;
+            let port = u16::from_str_radix(port, 16).ok()?;
+            let uid = f[7].parse().ok()?;
+            let addr = if v6 {
+                // tylko `::` (dual-stack wildcard); inne adresy v6 nie kolidują z v4
+                host.bytes().all(|b| b == b'0').then_some(None)?
+            } else {
+                // /proc zapisuje adres IPv4 jako little-endian hex
+                let raw = u32::from_str_radix(host, 16).ok()?;
+                (raw != 0).then(|| std::net::Ipv4Addr::from(raw.swap_bytes()))
+            };
+            Some(Listener { addr, port, uid })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +227,19 @@ mod tests {
             })
         );
         assert_eq!(parse_ping_response("garbage"), None);
+    }
+
+    #[test]
+    fn proc_net_tcp_listeners() {
+        let v4 = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0\n   1: 0100007F:0050 0100007F:9999 01 00000000:00000000 00:00000000 00000000  1000        0 2 1 0\n   2: 00000000:2328 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1004        0 3 1 0\n";
+        let l = parse_proc_net_tcp(v4, false);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].addr, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!((l[0].port, l[0].uid), (8080, 0));
+        assert_eq!((l[1].addr, l[1].port, l[1].uid), (None, 9000, 1004));
+        let v6 = "  sl  local_address rem_address st tx rx tr tm retr uid timeout inode\n   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 0:0 0:0 0 0 0 0 1\n   1: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 0:0 0:0 0 0 0 0 1\n";
+        let l = parse_proc_net_tcp(v6, true);
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].addr, l[0].port), (None, 8080));
     }
 }

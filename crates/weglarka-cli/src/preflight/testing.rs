@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use super::host::{CmdOutput, FileKind, FileStat, Host, PingInfo};
 
+pub const PROC_NET_TCP_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
 #[derive(Default)]
 pub struct FakeHost {
     pub files: HashMap<PathBuf, String>,
@@ -65,8 +67,8 @@ impl FakeHost {
     pub fn healthy() -> Self {
         Self::default()
             .file("/etc/passwd", "weglarka:x:1001:1001::/home/weglarka:/usr/sbin/nologin\n")
-            .file("/etc/subuid", "weglarka:165536:65536\n")
-            .file("/etc/subgid", "weglarka:165536:65536\n")
+            .file("/etc/subuid", "weglarka:165536:2000000\n")
+            .file("/etc/subgid", "weglarka:165536:2000000\n")
             .file(
                 "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers",
                 "cpu memory pids\n",
@@ -86,6 +88,12 @@ impl FakeHost {
             .cmd(
                 "ip -j addr show",
                 r#"[{"ifname":"docker0","addr_info":[{"local":"172.17.0.1"}]}]"#,
+            )
+            .file("/proc/net/tcp", PROC_NET_TCP_HEADER)
+            .file("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1\n")
+            .file(
+                "/sys/kernel/security/apparmor/profiles",
+                "podman (enforce)\ncrun (enforce)\n",
             )
             .stat("/etc/weglarka/secrets.toml", FileKind::File, 0o600, 0, 0)
     }

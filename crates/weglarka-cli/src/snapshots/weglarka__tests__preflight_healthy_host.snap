@@ -2,19 +2,22 @@
 source: crates/weglarka-cli/src/tests.rs
 expression: render(&r)
 ---
-[ OK ] config.file             /etc/weglarka/weglarka.toml parses
-[ OK ] runtime.user            user weglarka exists (uid 1001)
-[ OK ] runtime.subuid          65536 ids for weglarka in /etc/subuid
-[ OK ] runtime.subgid          65536 ids for weglarka in /etc/subgid
-[ OK ] runtime.cgroups         cgroups v2
-[ OK ] runtime.linger          linger enabled for weglarka
-[ OK ] runtime.socket          podman socket /run/user/1001/podman/podman.sock responds
-[ OK ] runtime.podman_version  libpod API 6.1
-[ OK ] runtime.podman_source   podman installed from alvistack
-[ OK ] runtime.netavark        netavark 2.0.1, firewall driver nftables (NETAVARK_FW)
-[ OK ] runtime.pasta           pasta available (pasta: pasta 2025_01_21)
-[ OK ] ingress.traefik_file    /data/traefik/weglarka.yml exists and is writable by weglarka
-[ OK ] ingress.bind            172.17.0.1 is assigned to a host interface
-[ OK ] state.secrets_file      /etc/weglarka/secrets.toml has mode 0600
+[ OK ] config.file              /etc/weglarka/weglarka.toml parses
+[ OK ] runtime.user             user weglarka exists (uid 1001)
+[ OK ] runtime.subuid           2000000 ids for weglarka in /etc/subuid
+[ OK ] runtime.subgid           2000000 ids for weglarka in /etc/subgid
+[ OK ] runtime.cgroups          cgroups v2
+[ OK ] runtime.linger           linger enabled for weglarka
+[ OK ] runtime.socket           podman socket /run/user/1001/podman/podman.sock responds
+[ OK ] runtime.podman_version   libpod API 6.1
+[ OK ] runtime.podman_source    podman installed from alvistack
+[ OK ] runtime.netavark         netavark 2.0.1, firewall driver nftables (NETAVARK_FW)
+[ OK ] runtime.pasta            pasta available (pasta: pasta 2025_01_21)
+[ OK ] runtime.apparmor_userns  apparmor_restrict_unprivileged_userns=1 and profile podman is loaded
+[ OK ] ingress.traefik_file     /data/traefik/weglarka.yml exists and is writable by weglarka
+[ OK ] ingress.bind             172.17.0.1 is assigned to a host interface
+[ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
+[ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
+[ OK ] state.secrets_file       /etc/weglarka/secrets.toml has mode 0600
 
-14 ok, 0 warn, 0 fail
+17 ok, 0 warn, 0 fail
