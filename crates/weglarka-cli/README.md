@@ -17,6 +17,10 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 - Errors go to stderr; with `--json`: `{"error":{"code","message","hint","exit_code"}}`.
 - `--dry-run` (`apps add/remove`, `deploy`, `secrets set`): nothing is sent that would change state;
   `remove`/`deploy` only check that the app exists (GET). The secret value is masked.
+- `apps update <name>`: read-modify-write of the whole spec (`GET`, apply flags, `PUT`); `--dry-run` shows the
+  diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
+  Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
+  runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
 - Secret: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
   is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes).

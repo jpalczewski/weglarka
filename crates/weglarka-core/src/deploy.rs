@@ -364,6 +364,7 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
         let mut st: StateFile = state::load_state(&self.paths.state)?;
+        self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
 
         let digest = match self.resolve_digest(&spec.image).await {

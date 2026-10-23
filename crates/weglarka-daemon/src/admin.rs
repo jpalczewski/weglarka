@@ -29,6 +29,7 @@ use weglarka_core::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
+use crate::update;
 
 const BODY_LIMIT: usize = 1024 * 1024;
 
@@ -67,6 +68,12 @@ impl From<EngineError> for Fail {
     fn from(e: EngineError) -> Self {
         match e {
             EngineError::UnknownInstance(n) => Fail::not_found(format!("unknown app: {n}")),
+            e @ EngineError::MissingSecrets(_) => Fail(
+                ErrorCode::Conflict,
+                format!(
+                    "{e}; set them with `weglarka secrets set` and the deploy starts by itself"
+                ),
+            ),
             other => Fail::internal(other),
         }
     }
@@ -104,7 +111,9 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         )
         .route(
             endpoints::APPS_SHOW.path,
-            get(show_app::<P>).delete(remove_app::<P>),
+            get(show_app::<P>)
+                .put(update::update_app::<P>)
+                .delete(remove_app::<P>),
         )
         .route(endpoints::APPS_DEPLOY.path, post(deploy_app::<P>))
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
@@ -155,10 +164,13 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
             image: spec.image.clone(),
             domains: spec.domains.clone(),
             // Podman unavailable → unknown; `Missing` + a log warning (details: doctor).
-            runtime: runtime_state(
-                containers
-                    .as_ref()
-                    .and_then(|m| m.get(&weglarka_core::labels::container_name(name))),
+            runtime: update::with_waiting(
+                runtime_state(
+                    containers
+                        .as_ref()
+                        .and_then(|m| m.get(&weglarka_core::labels::container_name(name))),
+                ),
+                st.apps.get(name),
             ),
             digest: st.apps.get(name).and_then(|s| s.current.clone()),
         })
@@ -202,7 +214,7 @@ async fn show_app<P: PodmanClient + 'static>(
         .ok();
     Ok(json(ShowAppResponse {
         state: st.apps.get(&name).cloned().unwrap_or_default(),
-        runtime: runtime_state(container.as_ref()),
+        runtime: update::with_waiting(runtime_state(container.as_ref()), st.apps.get(&name)),
         name,
         spec,
     }))

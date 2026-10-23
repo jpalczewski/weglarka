@@ -36,6 +36,11 @@ pub enum Event {
     },
     /// Container removed because the instance is not in `apps.toml`.
     Pruned { container: String },
+    /// The spec binds secrets that are not set: no deploy is attempted until they are (not a failure).
+    WaitingForSecret {
+        instance: InstanceName,
+        missing: Vec<String>,
+    },
     /// Webhook rejected as a duplicate (`delivery_id` already seen).
     WebhookDuplicate { delivery_id: String },
 }
