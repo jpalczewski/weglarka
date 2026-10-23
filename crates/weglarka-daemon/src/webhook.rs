@@ -106,9 +106,8 @@ async fn github<P: PodmanClient + 'static>(
 
     tracing::info!(instance = %instance, delivery = ?delivery, image = %event.image_ref, "webhook accepted");
     let daemon = d.clone();
-    let instance = instance.clone();
     d.spawn_tracked(async move {
-        match daemon.engine.handle_webhook_for(&event, Some(&instance)).await {
+        match daemon.engine.handle_webhook(&event).await {
             Ok(outcome) => {
                 for (inst, result) in &outcome.results {
                     match result {

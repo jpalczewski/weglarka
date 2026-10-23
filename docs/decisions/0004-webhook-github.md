@@ -23,7 +23,12 @@ tolerancyjny (`#[serde(default)]`), ale nazwy pól (`registry_package.package_ve
 `package_url`) pochodzą z dokumentacji, nie z obserwacji. CI ntfy.zig pcha dwa tagi (`latest` i `sha-…`), więc
 oczekujemy dwóch dostaw na push; `sha-…` nie pasuje do apki śledzącej `:latest` i kończy się 204.
 
-**Zakres deployu.** Webhook deployuje wyłącznie apkę, której sekretem zweryfikowano podpis
-(`Reconciler::handle_webhook_for`, addytywne w rdzeniu) — nie ma fan-outu po obrazie na cudze instancje.
-Identyfikator dostawy trafia do logów i zbioru dedup tylko, gdy ma ≤ 64 znaków `[A-Za-z0-9-]`; niezaufane
-wartości w logach są formatowane przez `Debug`.
+**Fan-out (świadoma decyzja, Kajet „Model apek i stan”).** Webhook obrazu X aktualizuje *wszystkie* instancje
+śledzące X z `auto_update = true` (`Reconciler::handle_webhook`). Trade-off: podpis jednej instancji może
+wyzwolić deploy innych instancji tego samego obrazu. Ryzyko jest ograniczone: zdarzenie przechodzi tylko, gdy
+`image_ref` z payloadu pasuje do obrazu/tagu **uwierzytelnionej** instancji (inaczej 204, nic się nie dzieje),
+więc podpis instancji A nie uruchomi niczego poza tym, co A sama śledzi; inne instancje i tak śledzą ten sam
+`image_ref`, a bramka zdrowia i rollback działają per instancja.
+
+**Higiena logów i dedupu.** Identyfikator dostawy trafia do logów i zbioru dedup tylko, gdy ma ≤ 64 znaków
+`[A-Za-z0-9-]`; niezaufane wartości w logach są formatowane przez `Debug`.

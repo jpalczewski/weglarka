@@ -75,7 +75,7 @@ WantedBy=default.target
   aardvark-dns (nginx w wielu sieciach naraz, kilka `resolver`) wymaga weryfikacji na hoście.
 - Dodanie pierwszej apki z domeną odtwarza kontener nginx (krótka przerwa); sieci `net-<app>` nie są
   usuwane po `apps remove` (brak `network_remove` w kliencie).
-- Zdarzenie webhooka GitHub niepotwierdzone na prawdziwym pushu (0004).
+- Zdarzenie webhooka GitHub niepotwierdzone na prawdziwym pushu (0004). Fan-out po obrazie jest zamierzony (0004).
 - Brak limitu współbieżności/rate-limitu na listenerze webhooków (przed nim stoi nginx z limitem ciała).
 - `deploy` z `image_ref` → 400; `Failed` bez rollbacku → 500.
 - Zmiana `[ingress]`/`[webhook]` w `weglarka.toml` wymaga restartu demona (config czytany raz).
