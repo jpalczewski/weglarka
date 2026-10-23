@@ -137,10 +137,10 @@ pub enum PlatformKind {
 pub struct PlatformConfig {
     #[serde(default = "PlatformConfig::default_kind")]
     pub kind: PlatformKind,
-    /// Limit pamięci kontenera Węglarki (`podman run --memory`), np. `"128M"`; zawiera też swap.
+    /// Memory limit of the Węglarka container (`podman run --memory`), e.g. `"128M"`; also applies to swap.
     #[serde(default = "PlatformConfig::default_memory")]
     pub memory: String,
-    /// Limit liczby procesów/wątków kontenera Węglarki (`--pids-limit`).
+    /// Process/thread limit of the Węglarka container (`--pids-limit`).
     #[serde(default = "PlatformConfig::default_pids_limit")]
     pub pids_limit: u32,
 }

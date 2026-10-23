@@ -54,9 +54,9 @@ enum PlatformAction {
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
-    /// Wypisuje argumenty `podman run` (jeden w linii) odpowiadające quadletowi — dla testów CI.
+    /// Prints the `podman run` arguments equivalent to the quadlet (one per line) — for CI tests.
     RunArgs {
-        /// Obraz kontenera Węglarki.
+        /// Węglarka container image.
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
@@ -82,7 +82,7 @@ fn systemd(settings: &Settings) -> Result<SystemdPlatform> {
 
 /// Wszystkie ścieżki montujemy pod tą samą nazwą co na hoście, żeby `weglarka.toml` był
 /// poprawny po obu stronach (CLI na hoście czyta ten sam plik).
-/// Zmienna z ustaloną na hoście ścieżką socketu Podmana: kontener (`scratch`) nie ma `/etc/passwd`.
+/// Env var carrying the Podman socket path resolved on the host: the (`scratch`) container has no `/etc/passwd`.
 const SOCKET_ENV: &str = "WEGLARKA_PODMAN_SOCKET";
 
 fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> ServiceSpec {
@@ -167,8 +167,8 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
     Ok(())
 }
 
-/// Demon (zwykle w kontenerze `scratch`) nie zgaduje socketu z `/etc/passwd`: bierze go z
-/// `[runtime] socket` albo ze zmiennej ustawianej przez quadlet (`platform install` liczy go na hoście).
+/// The daemon (usually in a `scratch` container) never guesses the socket from `/etc/passwd`: it takes it from
+/// `[runtime] socket` or from the variable set by the quadlet (`platform install` resolves it on the host).
 async fn run_daemon(settings: Settings) -> Result<()> {
     let socket = match (&settings.host.runtime.socket, std::env::var_os(SOCKET_ENV)) {
         (Some(s), _) => s.clone(),

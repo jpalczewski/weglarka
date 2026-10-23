@@ -35,15 +35,15 @@ pub struct ServiceSpec {
     pub hardening: Hardening,
 }
 
-/// Utwardzenie kontenera Węglarki; Platform tłumaczy to na opcje quadletu / `podman run`.
+/// Hardening of the Węglarka container; Platform translates it into quadlet / `podman run` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hardening {
-    /// System plików roota tylko do odczytu (zapisy tylko w montowaniach i `tmpfs`).
+    /// Read-only root filesystem (writes only to mounts and `tmpfs`).
     pub read_only: bool,
     pub drop_all_capabilities: bool,
     pub no_new_privileges: bool,
     pub tmpfs: Vec<String>,
-    /// Limit pamięci (np. `128M`), obejmuje swap.
+    /// Memory limit (e.g. `128M`), also applies to swap.
     pub memory: Option<String>,
     pub pids_limit: Option<u32>,
 }

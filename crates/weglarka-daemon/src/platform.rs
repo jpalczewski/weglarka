@@ -96,7 +96,7 @@ fn check_value(what: &str, v: &str) -> Result<()> {
     Ok(())
 }
 
-/// `128M`, `1g`, `65536` — format `--memory` Podmana (liczba + opcjonalnie b/k/m/g).
+/// `128M`, `1g`, `65536` — Podman's `--memory` format (number + optional b/k/m/g).
 fn check_memory(v: &str) -> Result<()> {
     let digits = v.trim_end_matches(['b', 'B', 'k', 'K', 'm', 'M', 'g', 'G']);
     if digits.is_empty()
@@ -120,8 +120,8 @@ fn check_hardening(spec: &ServiceSpec) -> Result<()> {
     Ok(())
 }
 
-/// Argumenty `podman run` (bez `run`/`-d`/`--pull`) równoważne quadletowi z [`render`], z obrazem i
-/// poleceniem na końcu. Smoke test w CI uruchamia kontener dokładnie z nich.
+/// `podman run` arguments (without `run`/`-d`/`--pull`) equivalent to the quadlet from [`render`], with the image
+/// and command at the end. The CI smoke test starts the container from exactly these.
 pub fn run_args(spec: &ServiceSpec) -> Result<Vec<String>> {
     check_value("service name", &spec.name)?;
     check_value("image", &spec.image)?;
@@ -208,7 +208,7 @@ pub fn render(spec: &ServiceSpec) -> Result<Vec<UnitFile>> {
         c.push_str("NoNewPrivileges=true\n");
     }
     if let Some(m) = &h.memory {
-        // Quadlet nie ma klucza na limit pamięci we wszystkich wersjach; swap = limit, bo host swapuje.
+        // Not every quadlet version has a memory-limit key; swap = limit, because the host swaps heavily.
         let _ = writeln!(c, "PodmanArgs=--memory={m} --memory-swap={m}");
     }
     if let Some(p) = h.pids_limit {
