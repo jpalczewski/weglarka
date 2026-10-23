@@ -2,11 +2,14 @@
 //!
 //! Contract already in place: [`crate::app::VolumeMount`] (spec), [`crate::labels::volume_name`],
 //! [`crate::podman::PodmanClient`] `volume_*`, [`crate::podman::VolumeAttachment`] (container mount),
-//! [`crate::state::AppState::uid_range`] and [`crate::uid_range::allocate`] (ownership strategy:
-//! docs/decisions/0009-volume-ownership.md).
+//! [`crate::state::AppState::uid_range`], [`crate::uid_range::allocate`] and
+//! [`crate::podman::IdMapping`] (ownership: docs/decisions/0009-volume-ownership.md — a fixed uid range
+//! per instance, explicit maps; plain `userns: auto` is a no-op rootless).
 //!
 //! To do (session 1): before `container_create` in `deploy.rs` call [`ensure_volumes`], map
-//! `spec.volumes` to `ContainerSpec::volumes`, apply the ownership strategy from the ADR, and purge
+//! `spec.volumes` to `ContainerSpec::volumes`, allocate/persist the instance's range on its first deploy
+//! (pool size from `/etc/subuid`, `DEFAULT_MAP_RESERVED` reserved) and set `ContainerSpec::id_mapping`,
+//! import foreign tars with `PodmanClient::container_archive_put` (not `volume_import`), and purge
 //! volumes on `apps remove --purge-volumes`. `deploy.rs` gets a single call site — keep the logic here.
 
 use crate::app::{AppSpec, InstanceName};
