@@ -178,20 +178,9 @@ impl PodmanClient for LibpodClient {
             "/secrets/create?name={}&driver=file&replace=true",
             encode_component(name)
         );
-        let body = || Some(("application/octet-stream", data.to_vec().into()));
-        match self.transport.call(Method::POST, &path, body()).await {
-            Ok(_) => Ok(()),
-            // Podman bez obsługi `replace`: usuń i utwórz od nowa.
-            Err(PodmanError::Api { status: 409, .. }) => {
-                self.secret_remove(name).await?;
-                self.transport
-                    .call(Method::POST, &path, body())
-                    .await
-                    .map_err(name_conflict)?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        let body = Some(("application/octet-stream", data.to_vec().into()));
+        self.transport.call(Method::POST, &path, body).await?;
+        Ok(())
     }
 
     async fn secret_remove(&self, name: &str) -> Result<()> {

@@ -161,13 +161,20 @@ pub(crate) fn error_from_status(status: u16, body: &[u8]) -> PodmanError {
     }
 }
 
-/// Dla operacji tworzących: 409 oznacza zajętą nazwę.
+/// Dla operacji tworzących: zajęta nazwa. Dokumentacja obiecuje 409, ale libpod zwraca 409 tylko
+/// dla sieci; kontener z zajętą nazwą dostaje 500 z komunikatem "… is already in use" (zmierzone
+/// na Podmanie 6.1.3 w CI), więc rozpoznajemy też ten komunikat.
 pub(crate) fn name_conflict(error: PodmanError) -> PodmanError {
     match error {
-        PodmanError::Api {
-            status: 409,
-            message,
-        } => PodmanError::Conflict(message),
+        PodmanError::Api { status, message }
+            if status == 409
+                || (status == 500
+                    && ["already in use", "already exists"]
+                        .iter()
+                        .any(|needle| message.contains(needle))) =>
+        {
+            PodmanError::Conflict(message)
+        }
         other => other,
     }
 }
@@ -288,6 +295,15 @@ mod tests {
         let api409 = || error_from_status(409, br#"{"message":"name in use"}"#);
         assert!(matches!(api409(), PodmanError::Api { status: 409, .. }));
         assert!(matches!(name_conflict(api409()), PodmanError::Conflict(m) if m == "name in use"));
+        let api500 = error_from_status(
+            500,
+            br#"{"message":"creating container storage: the container name \"x\" is already in use by abc"}"#,
+        );
+        assert!(matches!(name_conflict(api500), PodmanError::Conflict(_)));
+        assert!(matches!(
+            name_conflict(error_from_status(500, br#"{"message":"boom"}"#)),
+            PodmanError::Api { status: 500, .. }
+        ));
         assert!(matches!(
             name_conflict(PodmanError::NotFound("x".into())),
             PodmanError::NotFound(_)
