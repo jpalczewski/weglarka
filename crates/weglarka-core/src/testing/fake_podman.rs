@@ -77,6 +77,8 @@ struct State {
     exec_exit_codes: BTreeMap<String, i32>,
     health_scripts: BTreeMap<String, VecDeque<HealthStatus>>,
     events: Vec<PodmanEvent>,
+    /// Networks whose next `network_disconnect` fails once with this error (race injection).
+    disconnect_failures: BTreeMap<String, PodmanError>,
     calls: Vec<Call>,
     next_id: u64,
     /// Subuid pool reported by `subuid_pool` (`None` = [`DEFAULT_SUBUID_POOL`]).
@@ -130,6 +132,14 @@ impl FakePodman {
         self.lock()
             .health_scripts
             .insert(container.to_owned(), results.into_iter().collect());
+    }
+
+    /// The next `network_disconnect` from this network fails once with `error`
+    /// (e.g. libpod's "no container with ID …" while another container is being removed).
+    pub fn fail_next_disconnect(&self, network: &str, error: PodmanError) {
+        self.lock()
+            .disconnect_failures
+            .insert(network.to_owned(), error);
     }
 
     /// Adds an event to be replayed by `events()`.
@@ -514,6 +524,9 @@ impl PodmanClient for FakePodman {
             network: network.into(),
             container: container.into(),
         });
+        if let Some(e) = s.disconnect_failures.remove(network) {
+            return Err(e);
+        }
         if !s.containers.contains_key(container) {
             return Err(PodmanError::NotFound(container.to_owned()));
         }

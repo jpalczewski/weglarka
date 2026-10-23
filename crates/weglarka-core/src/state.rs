@@ -204,6 +204,10 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if spec.port.is_none() {
             return Err(format!("{name}: health.http requires port"));
         }
+        // The probe goes through nginx, which routes by `Host` (docs/decisions/0010).
+        if spec.domains.is_empty() {
+            return Err(format!("{name}: health.http requires at least one domain"));
+        }
         if !http.path.starts_with('/') {
             return Err(format!("{name}: health.http.path must start with '/'"));
         }
@@ -382,7 +386,9 @@ mod tests {
         let check = |extra: &str| {
             fs::write(
                 &p,
-                format!("[apps.a]\nimage = \"x:1\"\nport = 80\n{extra}\n"),
+                format!(
+                    "[apps.a]\nimage = \"x:1\"\nport = 80\ndomains = [\"a.example.com\"]\n{extra}\n"
+                ),
             )
             .unwrap();
             load_apps(&p).is_ok()
@@ -408,9 +414,18 @@ mod tests {
         ] {
             assert!(!check(bad), "{bad}");
         }
-        // The HTTP probe needs a port to go through the ingress.
-        fs::write(&p, "[apps.a]\nimage = \"x:1\"\nhealth = { http = {} }\n").unwrap();
-        assert!(matches!(load_apps(&p), Err(StateError::Invalid { .. })));
+        // The HTTP probe needs a port and a domain to go through the ingress.
+        for no_route in [
+            "image = \"x:1\"\ndomains = [\"a.example.com\"]",
+            "image = \"x:1\"\nport = 80",
+        ] {
+            fs::write(
+                &p,
+                format!("[apps.a]\n{no_route}\nhealth = {{ http = {{}} }}\n"),
+            )
+            .unwrap();
+            assert!(matches!(load_apps(&p), Err(StateError::Invalid { .. })));
+        }
     }
 
     #[test]

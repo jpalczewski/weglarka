@@ -233,8 +233,10 @@ nadpisywana przy kolejnym uruchomieniu).
 
 ## 6. Pierwsza apka: ntfy.zig
 
-Kolejność ma znaczenie: `secrets set` wymaga istniejącej apki, a pierwszy deploy potrzebuje sekretu `config`
-(brak sekretu = deploy zablokowany, ponowienie po jego ustawieniu).
+Kolejność ma znaczenie: `secrets set` wymaga istniejącej apki, a pierwszy deploy potrzebuje sekretu `config`.
+Dopóki sekretu nie ma, apka jest w stanie **„czeka na sekret”** (`weglarka status` → `waiting-for-secret`,
+`apps show` wypisuje brakujące nazwy, `doctor` ostrzega) — to nie błąd i demon nie próbuje deployu. Po
+`secrets set` stan znika, a deploy rusza sam; osobne `weglarka deploy` nie jest potrzebne.
 
 ```sh
 weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:latest \
@@ -242,10 +244,21 @@ weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:latest \
   --env CONFIG_FILE=/config.json \
   --secret-mount config=/config.json
 
-weglarka secrets set ntfy config --from-file ./config.json      # plik trafia pod /config.json
-weglarka deploy ntfy                                            # pull, podmiana, bramka zdrowia
-weglarka apps show ntfy
+weglarka secrets set ntfy config < ./config.json                # plik trafia pod /config.json
+weglarka apps show ntfy                                         # deploy rusza sam: pull, bramka zdrowia
 ```
+
+### Wartość sekretu: `< plik`, nie `/dev/stdin`
+
+Przekaż wartość **przekierowaniem** (`secrets set <app> <nazwa> < plik`) albo potokiem
+(`pbpaste | weglarka secrets set …`) — CLI czyta wtedy standardowe wejście. Nie używaj
+`--from-file /dev/stdin` przez `sudo -u`/`ssh` na innego użytkownika: `/dev/stdin` to dowiązanie do
+`/proc/self/fd/0`, które CLI otwiera *od nowa*, już jako użytkownik runtime'u — a ten nie ma prawa do pliku
+ani potoku, który należy do wywołującego, więc kończy się to `Permission denied`. Przekierowanie `<` otwiera
+plik powłoka wywołującego (jego uprawnieniami) i przekazuje gotowy deskryptor, więc działa także w
+`sudo -u weglarka weglarka secrets set ntfy config < config.json`. `--from-file ścieżka` jest w porządku
+tylko dla pliku czytelnego dla użytkownika, który uruchamia CLI. Sekret nie trafia do argumentów (`ps`,
+historia powłoki).
 
 **Przełączenie z Coolify z minimalną przerwą** (domena nie może mieć jednocześnie dwóch routerów z tym samym
 `Host()` — Coolify i Węglarki):
@@ -254,9 +267,9 @@ weglarka apps show ntfy
    obsługuje Coolify.
 2. Upewnij się, że domena jest na allowliście walidatora (`weglarka_allowed_domains` w Ansible).
 3. Zatrzymaj stary kontener w Coolify (na niechybnie: `coolify-relay`) — znika jego router.
-4. CLI nie ma `apps update`, a `apps add` na istniejącą nazwę zwraca 409 (kod 4): `weglarka apps remove ntfy`,
-   potem `apps add` jak wyżej z `--domain`, i `weglarka deploy ntfy` (obraz już jest lokalnie; sekrety zostają
-   w `secrets.toml` — sprawdź `weglarka secrets list ntfy`).
+4. Dodaj domenę: `weglarka apps update ntfy --domain nz.descriptortable.eu` (sprawdź najpierw z `--dry-run`).
+   To zmienia tylko ingress (przeładowanie nginx) — kontener nie jest odtwarzany, więc bez przerwy i bez
+   ponownego deployu. (`apps add` na istniejącą nazwę zwraca 409; `remove` + `add` nie jest już potrzebne.)
 5. Rollback: `weglarka apps remove ntfy` i ponowny start starego kontenera w Coolify (nie usuwaj go od razu).
 
 Dane ntfy.zig: brak, więc `recreate` jest bezpieczne.
@@ -371,13 +384,29 @@ podman logs weglarka-nginx                      # access log JSON z polem app
 - **Automatyczny rollback:** deploy, który nie przejdzie bramki zdrowia, wraca do poprzedniego digestu
   (retencja 1); wynik w `weglarka deploy` (kod wyjścia 6 = `rolled_back`).
 - **Ręczny rollback do wskazanej wersji:** `deploy --image` jest w MVP odrzucane przez demona (400, 0005), więc
-  przypnij tag `sha-…` zastępując apkę (sekrety zostają w `secrets.toml`; sprawdź `weglarka secrets list ntfy`):
+  przypnij tag `sha-…` przez `apps update` (sekrety, wolumeny i reszta spec zostają):
 
   ```sh
-  weglarka apps remove ntfy
-  weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:sha-<poprzedni> \
-    --domain nz.descriptortable.eu --port 8085 --env CONFIG_FILE=/config.json \
-    --secret-mount config=/config.json --no-auto-update
+  weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:sha-<poprzedni> --no-auto-update
   ```
 
-  Wróć na `:latest` tym samym sposobem (bez `--no-auto-update`).
+  Zmiana obrazu przez `update` deployuje od razu (pull, bramka zdrowia; nieudana bramka = automatyczny rollback
+  do poprzedniego digestu, kod wyjścia 6). Wróć na `:latest` tak samo, z `--auto-update`:
+  `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
+
+### `apps update`: co się dzieje po zmianie
+
+`weglarka apps update <app> [flagi]` czyta obecną spec, nakłada flagi i wysyła **całą** spec (pełna podmiana;
+`--spec plik.toml` podmienia ją w całości z pliku). `--dry-run` pokazuje diff i niczego nie wysyła.
+
+| Zmiana | Skutek |
+|---|---|
+| `--domain` / `--remove-domain` | tylko ingress (nginx reload, plik Traefika); kontener bez zmian |
+| `--env`/`--unset-env`, `--port`/`--unset-port`, `--secret-env`/`--secret-mount`/`--unbind-secret`, wolumeny, limity, `health.command` | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu) |
+| obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
+| `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
+
+Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką i które
+mają `auto_update`. Przypięcie tagu `sha-…` lub `--no-auto-update` to więc ręczny „pin” — webhook jej nie ruszy,
+dopóki nie wrócisz na `:latest`. Rollback (retencja 1) działa jak przy każdym deployu: wraca do poprzedniego
+digestu, a nieudany digest jest zapamiętany (ponowny deploy go pominie, dopóki nie wymusisz `deploy`).

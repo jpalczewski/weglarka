@@ -41,6 +41,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     podman(d, &mut checks).await;
     desired_state(d, &mut checks).await;
     secrets(d, &mut checks);
+    crate::update::doctor_check(d, &mut checks);
     ingress(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }

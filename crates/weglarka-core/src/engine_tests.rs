@@ -12,8 +12,8 @@ use crate::events::{Event, VecSink};
 use crate::labels;
 use crate::podman::{ContainerState, HealthStatus, PodmanClient};
 use crate::reconcile::{
-    Action, ActionOutcome, ReconcileReport, Reconciler, ReconcilerOptions, RecreateReason,
-    SecretChangePolicy, Trigger,
+    Action, ActionOutcome, EngineError, ReconcileReport, Reconciler, ReconcilerOptions,
+    RecreateReason, SecretChangePolicy, Trigger,
 };
 use crate::secret_store::{SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
@@ -407,9 +407,9 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
     let h = Harness::new(WITH_SECRET);
     h.fake.set_pull_digest(IMAGE, digest('a'));
 
-    // No secrets: the instance is blocked with a clear reason, nothing is created.
+    // No secrets: the instance waits, nothing is attempted or created.
     let report = h.rec.reconcile().await.unwrap();
-    assert!(report.actions.iter().all(|a| a.result.is_err()));
+    assert!(report.actions.is_empty(), "{report:?}");
     assert!(h.fake.containers().is_empty());
 
     h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
@@ -429,6 +429,91 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
         }
     );
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_secrets_mean_waiting_not_failure_and_setting_them_deploys() {
+    let h = Harness::new(WITH_SECRET);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "waiting is not a problem: {report:?}");
+    assert!(report.actions.is_empty() && h.fake.containers().is_empty());
+    assert_eq!(
+        report.waiting,
+        vec![(name("ntfy"), vec!["config".to_owned(), "token".to_owned()])]
+    );
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["config", "token"]);
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::ImagePull(_)))
+    );
+
+    // Logged once on entering the state, not on every pass; never as a failure.
+    h.rec.reconcile().await.unwrap();
+    let events = h.sink.events();
+    let waits = events
+        .iter()
+        .filter(|e| matches!(e, Event::WaitingForSecret { .. }))
+        .count();
+    assert_eq!(waits, 1, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::DeployFailed { .. }))
+    );
+
+    // A manual deploy does not try either; it reports what is missing.
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::MissingSecrets(m) if m.len() == 2),
+        "{err:?}"
+    );
+
+    // One of two set: still waiting, for the other one.
+    h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["token"]);
+    assert!(h.fake.containers().is_empty());
+
+    // The last one: the wait clears and the deploy starts by itself.
+    h.store.set("ntfy.token", SecretValue::new("t")).unwrap();
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean() && report.waiting.is_empty(), "{report:?}");
+    assert!(matches!(
+        single(&report),
+        ActionOutcome::Deployed(DeployOutcome::Deployed { .. })
+    ));
+    let st = h.state("ntfy");
+    assert!(st.waiting_for_secrets.is_empty() && st.failed.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_secret_binding_on_a_running_app_keeps_the_old_container() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let before = h.container_digest_ref("ntfy");
+
+    h.set_apps(WITH_SECRET);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty() && report.is_clean(), "{report:?}");
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["config", "token"]);
+    assert_eq!(h.container_digest_ref("ntfy"), before);
+
+    h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
+    h.store.set("ntfy.token", SecretValue::new("t")).unwrap();
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.actions[0].action,
+        Action::Recreate {
+            instance: name("ntfy"),
+            reason: RecreateReason::SpecDrift
+        }
+    );
+    assert!(h.state("ntfy").waiting_for_secrets.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -591,4 +676,132 @@ async fn run_loop_reconciles_on_start_on_trigger_and_periodically() {
     drop(tx);
     task.await.unwrap();
     let _ = &h.dir;
+}
+
+// ── Iteration 2: limits, health.command, health.http ────────────────────────────
+
+use crate::app::HttpProbe;
+use crate::limits::{HttpProber, ProbeFuture};
+use std::sync::Mutex;
+
+/// Prober that answers from a script (last result repeats) and records the hosts it was asked for.
+struct ScriptedProber {
+    script: Mutex<std::collections::VecDeque<Result<(), String>>>,
+    hosts: Mutex<Vec<String>>,
+}
+
+impl ScriptedProber {
+    fn new(results: impl IntoIterator<Item = Result<(), String>>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(results.into_iter().collect()),
+            hosts: Mutex::default(),
+        })
+    }
+}
+
+impl HttpProber for ScriptedProber {
+    fn probe<'a>(&'a self, host: &'a str, _probe: &'a HttpProbe) -> ProbeFuture<'a> {
+        self.hosts.lock().unwrap().push(host.to_owned());
+        let mut script = self.script.lock().unwrap();
+        let r = if script.len() > 1 {
+            script.pop_front().unwrap()
+        } else {
+            script.front().cloned().unwrap_or(Ok(()))
+        };
+        Box::pin(async move { r })
+    }
+}
+
+const WHOAMI: &str = r#"
+[apps.who]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 80
+domains = ["who.example.com", "alias.example.com"]
+resources = { memory = "256m", pids_limit = 100, cpus = 0.5 }
+health = { attempts = 3, window_secs = 6, command = ["/app", "-health"], http = { path = "/up" } }
+"#;
+
+fn with_prober(h: &mut Harness, prober: Arc<ScriptedProber>) {
+    let rec = Arc::get_mut(&mut h.rec).expect("sole owner");
+    rec.http_prober = Some(prober);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spec_limits_and_healthcheck_reach_the_container_and_both_probes_must_pass() {
+    let mut h = Harness::new(WHOAMI);
+    let prober = ScriptedProber::new([Err("status 503".into()), Ok(())]);
+    with_prober(&mut h, prober.clone());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+    // Attempt 1: command healthy but http 503 → retry; attempt 2: both pass.
+    assert_eq!(*prober.hosts.lock().unwrap(), ["who.example.com"; 2]);
+
+    let spec = h.fake.container_spec("who").unwrap();
+    assert_eq!(spec.resources.pids_limit, Some(100));
+    assert_eq!(spec.resources.memory.unwrap().bytes(), 256 << 20);
+    assert_eq!(spec.resources.cpus.unwrap().millis(), 500);
+    assert_eq!(spec.healthcheck.unwrap().command, ["/app", "-health"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_http_probe_fails_the_gate_even_when_the_command_is_healthy() {
+    let mut h = Harness::new(WHOAMI);
+    with_prober(&mut h, ScriptedProber::new([Err("status 502".into())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("status 502")),
+        "{out:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_command_fails_the_gate_even_when_http_passes() {
+    let mut h = Harness::new(WHOAMI);
+    with_prober(&mut h, ScriptedProber::new([Ok(())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Unhealthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("Unhealthy")),
+        "{out:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_only_gate_does_not_pass_on_merely_running() {
+    let apps = r#"
+[apps.who]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 80
+domains = ["who.example.com"]
+health = { attempts = 2, window_secs = 4, http = {} }
+"#;
+    let mut h = Harness::new(apps);
+    with_prober(&mut h, ScriptedProber::new([Err("timeout".into())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Failed { .. }), "{out:?}");
+    // No healthcheck exists, so the engine must not have called `healthcheck run` at all.
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::HealthcheckRun(_)))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_probe_without_a_prober_fails_closed() {
+    let h = Harness::new(WHOAMI);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("prober")),
+        "{out:?}"
+    );
 }

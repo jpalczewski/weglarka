@@ -735,6 +735,29 @@ health = { attempts = 2, window_secs = 2 }
     }
 
     #[tokio::test(start_paused = true)]
+    async fn spec_update_adding_a_volume_recreates_and_creates_it_removing_one_keeps_the_data() {
+        let e = env(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        let r = e.range("ntfy").unwrap();
+
+        // `apps update`: ntfy gains a volume → spec-hash changes → recreate, volume created and labelled.
+        e.set_apps(&format!(
+            "{PLAIN}volumes = [{{ name = \"data\", target = \"/data\" }}]\n"
+        ));
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(e.fake.volumes().len(), 1);
+        assert_eq!(e.fake.container_spec("ntfy").unwrap().volumes.len(), 1);
+        assert_eq!(e.range("ntfy"), Some(r), "range unchanged by the update");
+
+        // Dropping the volume from the spec unmounts it but never deletes data.
+        e.set_apps(PLAIN);
+        e.rec.reconcile().await.unwrap();
+        assert!(e.fake.container_spec("ntfy").unwrap().volumes.is_empty());
+        assert_eq!(e.fake.volumes().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn orphan_settling_does_not_clobber_ranges_assigned_in_the_same_pass() {
         let e = env(APP);
         e.rec.reconcile().await.unwrap();

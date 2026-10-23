@@ -21,6 +21,7 @@ use crate::labels;
 use crate::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient, PodmanError};
 use crate::secret_store::{SecretError, SecretStore};
 use crate::state::{self, StateError, StatePaths};
+use crate::waiting::{apply_waiting, missing_secrets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -45,6 +46,9 @@ pub enum EngineError {
     /// A volume operation the request cannot be served for (unknown volume, app not deployed yet…).
     #[error("{0}")]
     Volume(String),
+    /// The spec binds secrets that are not set (not a failure: the instance waits for them).
+    #[error("waiting for secrets: {}", .0.join(", "))]
+    MissingSecrets(Vec<String>),
 }
 
 /// What to do on a secret value change (decision: a daemon config option).
@@ -207,6 +211,8 @@ pub struct ReconcileReport {
     pub actions: Vec<ActionReport>,
     /// Instances skipped in this pass, with the reason (e.g. missing secret).
     pub blocked: Vec<(InstanceName, String)>,
+    /// Instances left alone because the spec binds secrets that are not set (not a problem).
+    pub waiting: Vec<(InstanceName, Vec<String>)>,
 }
 
 impl ReconcileReport {
@@ -230,6 +236,7 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) paths: StatePaths,
     pub(crate) options: ReconcilerOptions,
     pub(crate) events: Arc<dyn EventSink>,
+    pub(crate) http_prober: Option<Arc<dyn crate::limits::HttpProber>>,
     pub(crate) lock: tokio::sync::Mutex<()>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
 }
@@ -247,6 +254,7 @@ impl<P: PodmanClient> Reconciler<P> {
             paths,
             options,
             events: Arc::new(TracingSink),
+            http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             dedup: std::sync::Mutex::new(DeliveryDedup::new(256)),
         }
@@ -254,6 +262,12 @@ impl<P: PodmanClient> Reconciler<P> {
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Prober for `health.http` gates; without one, an app that configures it fails the gate.
+    pub fn with_http_prober(mut self, prober: Arc<dyn crate::limits::HttpProber>) -> Self {
+        self.http_prober = Some(prober);
         self
     }
 
@@ -288,7 +302,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let _g = self.lock.lock().await;
         let apps = state::load_apps(&self.paths.apps)?;
         let unranged = self.adopt_uid_ranges(&apps).await;
-        let st = state::load_state(&self.paths.state)?;
+        let mut st = state::load_state(&self.paths.state)?;
         let observed: Vec<ContainerInfo> = self
             .podman
             .container_list(&ContainerFilter::default())
@@ -299,12 +313,26 @@ impl<P: PodmanClient> Reconciler<P> {
 
         let mut report = ReconcileReport::default();
         let mut targets = Vec::with_capacity(apps.apps.len());
+        let mut waiting_changed = false;
         for (name, spec) in &apps.apps {
+            let missing = missing_secrets(&self.secrets, name, spec).await?;
+            if apply_waiting(&mut st, name, &missing) {
+                waiting_changed = true;
+                if !missing.is_empty() {
+                    self.events.emit(Event::WaitingForSecret {
+                        instance: name.clone(),
+                        missing: missing.clone(),
+                    });
+                }
+            }
             let app_state = st.apps.get(name);
             let pinned = app_state.and_then(|s| s.current.clone());
             let mut blocked = false;
             let mut expected_hash = None;
-            if let Some(why) = unranged.get(name) {
+            if !missing.is_empty() {
+                blocked = true;
+                report.waiting.push((name.clone(), missing));
+            } else if let Some(why) = unranged.get(name) {
                 blocked = true;
                 report.blocked.push((name.clone(), why.clone()));
             } else if let Some(d) = &pinned {
@@ -336,6 +364,9 @@ impl<P: PodmanClient> Reconciler<P> {
             });
         }
 
+        if waiting_changed {
+            state::save_state(&self.paths.state, &st)?;
+        }
         for action in plan(&targets, &observed) {
             let result = self.execute(&apps, action.clone()).await;
             if let Err(e) = &result {

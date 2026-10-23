@@ -21,6 +21,7 @@ pub mod limits;
 pub mod reconcile;
 pub mod secrets;
 pub mod volumes;
+pub mod waiting;
 
 #[cfg(feature = "testing")]
 pub mod testing;
