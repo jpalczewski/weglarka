@@ -34,6 +34,10 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 - Przed commitem: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 - Sekrety nigdy w logach, `Debug` ani TOML-u apek (są tylko referencjami po nazwie).
 - Git: commituj tylko pliki swojego crate'a (patrz niżej); nie ruszaj cudzych.
+- **Język: README i komentarze w kodzie po angielsku** (decyzja Jacka, 2026-10-23) — dotyczy wszystkich `README.md`
+  (root i crate'ów), komentarzy `//`, doc-commentów `///`/`//!` oraz komentarzy w skryptach i workflowach.
+  Nowy i zmieniany kod piszesz od razu po angielsku; istniejące polskie komentarze w plikach, których nie dotykasz,
+  tłumaczy osobne zadanie (nie mieszaj tłumaczeń z niezwiązanymi zmianami w PR).
 
 ## Mapa crate'ów i własność plików
 
