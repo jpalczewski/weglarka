@@ -1,14 +1,14 @@
-//! Model apki: `AppSpec` (stan pożądany instancji) i typy pomocnicze.
-//! Format zapisu: sekcje `[apps.<instancja>]` w `apps.toml` (jedyny pisarz: demon).
+//! App model: `AppSpec` (an instance's desired state) and helper types.
+//! On-disk format: `[apps.<instance>]` sections in `apps.toml` (sole writer: the daemon).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Nazwa instancji (klucz w `apps.toml`). Instancja ≠ obraz: jeden obraz może mieć wiele instancji.
-/// Dozwolone `[a-z0-9-]`, 1–63 znaki, bez myślnika na brzegach (bezpieczne jako nazwa kontenera,
-/// sieci i hosta DNS oraz jako element nazwy sekretu).
+/// Instance name (key in `apps.toml`). Instance ≠ image: one image can have many instances.
+/// Allowed `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen (safe as a container, network and
+/// DNS host name, and as a component of a secret name).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct InstanceName(String);
@@ -57,7 +57,7 @@ impl fmt::Display for InstanceName {
     }
 }
 
-/// Digest obrazu w postaci `sha256:<64 hex>`.
+/// Image digest in the form `sha256:<64 hex>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Digest(String);
@@ -101,13 +101,13 @@ impl fmt::Display for Digest {
     }
 }
 
-/// Jak sekret trafia do kontenera (Podman secrets typu `env` albo `mount`).
+/// How a secret reaches the container (Podman secrets of type `env` or `mount`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretTarget {
-    /// Zmienna środowiskowa o podanej nazwie.
+    /// Environment variable with the given name.
     Env { var: String },
-    /// Plik w kontenerze (np. `config.json`).
+    /// File in the container (e.g. `config.json`).
     Mount {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,9 +115,9 @@ pub enum SecretTarget {
     },
 }
 
-/// Powiązanie sekretu (nazwa w `SecretStore`, zakres: instancja) z kontenerem.
-/// Brak `deny_unknown_fields` na tym poziomie (serde nie łączy tego z `flatten`); literówki
-/// wyłapuje `deny_unknown_fields` na [`SecretTarget`], do którego spływają pozostałe pola.
+/// Binding of a secret (name in `SecretStore`, scope: instance) to a container.
+/// No `deny_unknown_fields` at this level (serde does not combine it with `flatten`); typos are
+/// caught by `deny_unknown_fields` on [`SecretTarget`], which receives the remaining fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretBinding {
     pub secret: String,
@@ -125,8 +125,8 @@ pub struct SecretBinding {
     pub target: SecretTarget,
 }
 
-/// Bramka zdrowia po deployu: nowy kontener musi być running (i healthy, jeśli obraz ma
-/// healthcheck) — do `attempts` prób `healthcheck run` w oknie `window_secs`; inaczej rollback.
+/// Post-deploy health gate: the new container must be running (and healthy, if the image has a
+/// healthcheck) — up to `attempts` tries of `healthcheck run` within `window_secs`; otherwise rollback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthGate {
@@ -154,27 +154,27 @@ impl Default for HealthGate {
     }
 }
 
-/// Stan pożądany jednej instancji.
+/// Desired state of a single instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSpec {
-    /// Referencja obrazu (ruchomy tag, np. `ghcr.io/jpalczewski/ntfy.zig:latest`).
-    /// Stan przypina rozwiązany digest; patrz [`crate::state::AppState`].
+    /// Image reference (floating tag, e.g. `ghcr.io/jpalczewski/ntfy.zig:latest`).
+    /// State pins the resolved digest; see [`crate::state::AppState`].
     pub image: String,
-    /// Domeny kierowane do apki (generatory ingressu).
+    /// Domains routed to the app (ingress generators).
     #[serde(default)]
     pub domains: Vec<String>,
-    /// Port HTTP w kontenerze, na który proxuje ingress.
+    /// HTTP port in the container that ingress proxies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    /// Jawne zmienne środowiskowe (bez wartości tajnych).
+    /// Plain environment variables (no secret values).
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secrets: Vec<SecretBinding>,
     #[serde(default)]
     pub health: HealthGate,
-    /// `false` — webhook/reconcile nie podmienia obrazu samoczynnie.
+    /// `false` — webhook/reconcile does not swap the image on its own.
     #[serde(default = "default_true")]
     pub auto_update: bool,
 }
@@ -183,7 +183,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Zawartość `apps.toml`.
+/// Contents of `apps.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppsFile {

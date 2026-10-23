@@ -1,10 +1,10 @@
-//! Pętla reconcile: stan pożądany (`apps.toml` + `state.toml`) vs faktyczne kontenery.
+//! Reconcile loop: desired state (`apps.toml` + `state.toml`) vs actual containers.
 //!
-//! Dwa kroki: **plan** — czysta funkcja [`plan`] (łatwo testowalna, bez I/O) — oraz **wykonawca**
-//! [`Reconciler`], który zbiera obserwacje z Podmana, woła `plan` i realizuje akcje.
-//! Reconcile *nie* ściąga nowych wersji: zbiega do przypiętego digestu. Nową wersję wprowadza
-//! dopiero deploy (webhook / ręcznie) — patrz [`crate::deploy`]. Wyjątek: instancja bez
-//! przypiętego digestu (świeża) dostaje pierwszy deploy z pullem.
+//! Two steps: the **plan** — the pure function [`plan`] (easy to test, no I/O) — and the **executor**
+//! [`Reconciler`], which gathers observations from Podman, calls `plan` and carries out the actions.
+//! Reconcile does *not* pull new versions: it converges to the pinned digest. A new version is
+//! introduced only by deploy (webhook / manual) — see [`crate::deploy`]. Exception: an instance
+//! without a pinned digest (fresh) gets its first deploy with a pull.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -36,20 +36,20 @@ pub enum EngineError {
     NoDigest(String),
 }
 
-/// Co robić ze zmianą wartości sekretu (decyzja: opcja konfiguracyjna demona).
+/// What to do on a secret value change (decision: a daemon config option).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecretChangePolicy {
-    /// Odciski sekretów wchodzą do `spec-hash` → najbliższy reconcile odtwarza kontener.
+    /// Secret fingerprints go into `spec-hash` → the next reconcile recreates the container.
     #[default]
     Immediate,
-    /// Odciski nie wchodzą do hasha → nowy sekret zadziała przy następnym deployu/odtworzeniu.
+    /// Fingerprints stay out of the hash → the new secret takes effect on the next deploy/recreate.
     NextDeploy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
-    /// Czas na łagodne zatrzymanie starego kontenera.
+    /// Time allowed for gracefully stopping the old container.
     pub stop_timeout_secs: u32,
 }
 
@@ -62,18 +62,18 @@ impl Default for ReconcilerOptions {
     }
 }
 
-// ── Plan (czysta funkcja) ────────────────────────────────────────────────────
+// ── Plan (pure function) ────────────────────────────────────────────────────
 
-/// Wejście planu dla jednej instancji z `apps.toml`.
+/// Plan input for a single instance from `apps.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub instance: InstanceName,
-    /// Przypięty digest (`None` — instancja jeszcze nie wdrożona).
+    /// Pinned digest (`None` — the instance is not deployed yet).
     pub pinned: Option<Digest>,
-    /// Oczekiwany `spec-hash` kontenera (`Some` iff `pinned`).
+    /// Expected container `spec-hash` (`Some` iff `pinned`).
     pub expected_hash: Option<SpecHash>,
-    /// Nie ruszaj tej instancji w tym przebiegu (np. brak sekretu, nieudany pierwszy deploy
-    /// czekający na ręczną interwencję). Jej kontenery nie są sierotami.
+    /// Leave this instance alone in this pass (e.g. missing secret, failed first deploy
+    /// awaiting manual intervention). Its containers are not orphans.
     pub blocked: bool,
 }
 
@@ -85,21 +85,21 @@ pub enum RecreateReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Pierwszy deploy: pull → kontener → bramka zdrowia.
+    /// First deploy: pull → container → health gate.
     Deploy { instance: InstanceName },
-    /// Odtworzenie kontenera z przypiętego digestu.
+    /// Recreate the container from the pinned digest.
     Recreate {
         instance: InstanceName,
         reason: RecreateReason,
     },
-    /// Kontener istnieje, ale nie działa (np. po restarcie hosta bez linger).
+    /// The container exists but is not running (e.g. after a host restart without linger).
     Start { instance: InstanceName },
-    /// Sierota lub duplikat z etykietą `weglarka.instance`.
+    /// Orphan or duplicate carrying the `weglarka.instance` label.
     Remove { container: String },
 }
 
-/// Porównuje stan pożądany z obserwowanymi kontenerami. Kolejność: najpierw sprzątanie, potem
-/// instancje alfabetycznie. Nie robi I/O.
+/// Compares desired state with observed containers. Order: cleanup first, then
+/// instances alphabetically. Does no I/O.
 pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
     let mut by_instance: BTreeMap<&str, Vec<&ContainerInfo>> = BTreeMap::new();
     for c in observed {
@@ -124,7 +124,7 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
         let own = by_instance.get(t.instance.as_str());
         let main_name = labels::container_name(&t.instance);
         let main = own.and_then(|cs| cs.iter().find(|c| c.name == main_name));
-        // Duplikaty z naszą etykietą, ale inną nazwą, usuwamy niezależnie od `blocked`.
+        // Duplicates with our label but a different name are removed regardless of `blocked`.
         for c in own.into_iter().flatten().filter(|c| c.name != main_name) {
             actions.push(Action::Remove {
                 container: c.name.clone(),
@@ -169,7 +169,7 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
     actions
 }
 
-// ── Wykonawca ────────────────────────────────────────────────────────────────
+// ── Executor ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -188,7 +188,7 @@ pub struct ActionReport {
 #[derive(Debug, Default)]
 pub struct ReconcileReport {
     pub actions: Vec<ActionReport>,
-    /// Instancje pominięte w tym przebiegu wraz z powodem (np. brak sekretu).
+    /// Instances skipped in this pass, with the reason (e.g. missing secret).
     pub blocked: Vec<(InstanceName, String)>,
 }
 
@@ -198,15 +198,15 @@ impl ReconcileReport {
     }
 }
 
-/// Powód do przebudzenia pętli [`Reconciler::run`].
+/// Reason to wake the [`Reconciler::run`] loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
-    /// Zmienił się stan pożądany (`apps.toml`, sekret) — zrób reconcile teraz.
+    /// Desired state changed (`apps.toml`, secret) — reconcile now.
     Changed,
 }
 
-/// Silnik: reconcile + deploy. Jedna instancja na proces demona; wszystkie operacje mutujące
-/// są serializowane przez `lock` (jedyny pisarz stanu).
+/// Engine: reconcile + deploy. One per daemon process; all mutating operations
+/// are serialized by `lock` (the sole state writer).
 pub struct Reconciler<P: PodmanClient> {
     pub(crate) podman: P,
     pub(crate) secrets: Arc<dyn SecretStore>,
@@ -248,7 +248,7 @@ impl<P: PodmanClient> Reconciler<P> {
         &self.podman
     }
 
-    // Zmiany stanu pożądanego (API → demon). Po nich wyślij [`Trigger::Changed`].
+    // Desired-state changes (API → daemon). Send [`Trigger::Changed`] after them.
 
     pub async fn upsert_app(&self, name: InstanceName, spec: AppSpec) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
@@ -266,7 +266,7 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
-    /// Jeden przebieg reconcile.
+    /// A single reconcile pass.
     pub async fn reconcile(&self) -> Result<ReconcileReport, EngineError> {
         let _g = self.lock.lock().await;
         let apps = state::load_apps(&self.paths.apps)?;
@@ -295,7 +295,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     }
                 }
             } else if app_state.is_some_and(|s| s.failed.is_some()) {
-                // Pierwszy deploy się nie udał: nie ponawiamy w pętli, czeka na `deploy`.
+                // First deploy failed: we do not retry in the loop, it waits for `deploy`.
                 blocked = true;
                 report.blocked.push((
                     name.clone(),
@@ -318,7 +318,7 @@ impl<P: PodmanClient> Reconciler<P> {
             report.actions.push(ActionReport { action, result });
         }
 
-        // Stan sierot sprzątamy po usunięciu ich kontenerów.
+        // We clean up orphan state after their containers are removed.
         let before = st.apps.len();
         st.apps.retain(|k, _| apps.apps.contains_key(k));
         if st.apps.len() != before {
@@ -351,8 +351,8 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    /// Pętla demona: reconcile na starcie, potem co `period` i po każdym [`Trigger`].
-    /// Kończy się, gdy nadawca triggerów zostanie zamknięty.
+    /// Daemon loop: reconcile at startup, then every `period` and after each [`Trigger`].
+    /// Ends when the trigger sender is closed.
     pub async fn run(&self, mut triggers: mpsc::Receiver<Trigger>, period: Duration) {
         let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -476,7 +476,7 @@ mod tests {
             ]
         );
         t.blocked = true;
-        // Zablokowana instancja bez kontenera: nic nie planujemy, a jej kontener nie jest sierotą.
+        // Blocked instance without a container: we plan nothing, and its container is not an orphan.
         assert!(plan(&[t], &[main]).is_empty());
     }
 

@@ -1,4 +1,4 @@
-//! `spec_hash` — odcisk specyfikacji decydujący o odtworzeniu kontenera.
+//! `spec_hash` — spec fingerprint that decides whether the container is recreated.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::app::{AppSpec, Digest, SecretBinding};
 
-/// Wersja formatu wejścia hasha; podbić przy zmianie pól (wymusi recreate wszystkich instancji).
+/// Version of the hash input format; bump when fields change (forces recreate of all instances).
 const HASH_FORMAT: &str = "weglarka.spec-hash/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,8 +27,9 @@ impl fmt::Display for SpecHash {
     }
 }
 
-/// Tylko pola wpływające na kontener. `domains` i `health` celowo pominięte — zmiana routingu
-/// lub bramki nie wymaga odtwarzania kontenera. Kolejność pól struktury jest częścią formatu.
+/// Only fields that affect the container. `domains` and `health` are deliberately omitted — changing
+/// routing or the gate does not require recreating the container. The struct's field order is part
+/// of the format.
 #[derive(Serialize)]
 struct HashInput<'a> {
     format: &'static str,
@@ -38,7 +39,7 @@ struct HashInput<'a> {
     secrets: Vec<&'a SecretBinding>,
 }
 
-/// Deterministyczny hash specyfikacji + przypiętego digestu obrazu (hex SHA-256).
+/// Deterministic hash of the spec + the pinned image digest (hex SHA-256).
 pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
     let mut secrets: Vec<&SecretBinding> = spec.secrets.iter().collect();
     secrets.sort_by(|a, b| {
@@ -62,10 +63,10 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
     SpecHash(hex::encode(Sha256::digest(json)))
 }
 
-/// Jak [`spec_hash`], ale dołącza odciski wartości sekretów (`nazwa wiązania → fingerprint`),
-/// więc zmiana sekretu zmienia hash i wymusza odtworzenie kontenera. Przy pustej mapie wynik jest
-/// identyczny z [`spec_hash`] (format v1 pozostaje stabilny, gdy odtwarzanie przy zmianie sekretu
-/// jest wyłączone).
+/// Like [`spec_hash`], but also mixes in secret value fingerprints (`binding name → fingerprint`),
+/// so a secret change changes the hash and forces a container recreate. With an empty map the
+/// result is identical to [`spec_hash`] (format v1 stays stable when recreate-on-secret-change is
+/// disabled).
 pub fn spec_hash_with_secrets(
     spec: &AppSpec,
     image_digest: &Digest,
@@ -103,7 +104,7 @@ env = { B = "2", A = "1" }
 
     #[test]
     fn golden_value_is_stable() {
-        // Zmiana tego hasha = zmiana formatu = recreate wszystkich kontenerów. Świadomie.
+        // Changing this hash = changing the format = recreate of all containers. Deliberate.
         insta::assert_snapshot!(spec_hash(&spec(), &digest('a')));
     }
 

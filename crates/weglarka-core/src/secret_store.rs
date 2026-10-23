@@ -1,5 +1,5 @@
-//! Trait `SecretStore` — magazyn sekretów. MVP: `secrets.toml` (0600); później `age`.
-//! Synchroniczny (lokalne I/O małych plików; wywołujący używa `spawn_blocking`) i dyn-compatible.
+//! `SecretStore` trait — secret storage. MVP: `secrets.toml` (0600); `age` later.
+//! Synchronous (local I/O on small files; callers use `spawn_blocking`) and dyn-compatible.
 
 use std::fmt;
 
@@ -23,7 +23,7 @@ pub enum SecretError {
     Permissions { path: String, reason: String },
 }
 
-/// Wartość sekretu; `Debug` nie ujawnia zawartości.
+/// Secret value; `Debug` does not reveal the contents.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretValue(Vec<u8>);
 
@@ -42,13 +42,13 @@ impl fmt::Debug for SecretValue {
     }
 }
 
-/// Metadane do `secrets list` — nigdy wartość.
+/// Metadata for `secrets list` — never the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMeta {
     pub name: String,
     /// RFC 3339.
     pub updated_at: String,
-    /// Skrót wartości (pierwsze 8 hex SHA-256) — do wykrywania zmian.
+    /// Value fingerprint (first 8 hex of SHA-256) — for change detection.
     pub fingerprint: String,
 }
 
@@ -56,14 +56,14 @@ pub fn fingerprint(value: &SecretValue) -> String {
     hex::encode(&Sha256::digest(value.expose())[..4])
 }
 
-/// Nazwa sekretu w Podmanie i w magazynie: `<instancja>.<nazwa>` (kropka jest niedozwolona
-/// w nazwie instancji, więc złożenie jest jednoznaczne).
+/// Secret name in Podman and in the store: `<instance>.<name>` (a dot is not allowed in an
+/// instance name, so the composition is unambiguous).
 pub fn scoped_name(instance: &InstanceName, name: &str) -> String {
     format!("{instance}.{name}")
 }
 
-/// Część `<nazwa>` w `<instancja>.<nazwa>`: `[A-Za-z0-9_-]`, 1–64 znaki (bez kropki — złożenie
-/// z nazwą instancji jest jednoznaczne).
+/// The `<name>` part of `<instance>.<name>`: `[A-Za-z0-9_-]`, 1–64 chars (no dot — composition
+/// with the instance name is unambiguous).
 pub fn valid_secret_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
@@ -71,7 +71,7 @@ pub fn valid_secret_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Rozbija `<instancja>.<nazwa>` i waliduje obie części.
+/// Splits `<instance>.<name>` and validates both parts.
 pub fn split_scoped(scoped: &str) -> Result<(InstanceName, &str), SecretError> {
     let bad = || SecretError::InvalidName(scoped.to_owned());
     let (inst, name) = scoped.split_once('.').ok_or_else(bad)?;
@@ -84,7 +84,7 @@ pub fn split_scoped(scoped: &str) -> Result<(InstanceName, &str), SecretError> {
 
 pub trait SecretStore: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<SecretValue>, SecretError>;
-    /// Tworzy lub nadpisuje. Brak odczytu wartości przez CLI — to API tylko dla demona.
+    /// Creates or overwrites. Values are not readable via the CLI — this API is for the daemon only.
     fn set(&self, name: &str, value: SecretValue) -> Result<(), SecretError>;
     fn remove(&self, name: &str) -> Result<(), SecretError>;
     fn list(&self) -> Result<Vec<SecretMeta>, SecretError>;

@@ -1,8 +1,8 @@
-//! Kontrakt admin API Węglarki: typy request/response, lista endpointów i wersja.
-//! Współdzielony przez demona (serwer) i CLI (klient). Bez serwera i klienta HTTP.
+//! Węglarka admin API contract: request/response types, endpoint list and version.
+//! Shared by the daemon (server) and the CLI (client). No HTTP server or client included.
 //!
-//! Admin API słucha wyłącznie na sockecie unix (`admin.socket`); ciała to JSON.
-//! Błędy: [`ApiError`] z odpowiednim kodem HTTP (patrz [`ErrorCode::http_status`]).
+//! The admin API listens only on a unix socket (`admin.socket`); bodies are JSON.
+//! Errors: [`ApiError`] with the matching HTTP status (see [`ErrorCode::http_status`]).
 
 pub mod doctor;
 pub mod endpoints;
@@ -12,5 +12,5 @@ pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
 pub use endpoints::{ENDPOINTS, Endpoint, Method};
 pub use types::*;
 
-/// Wersja kontraktu; prefiks ścieżek (`/v1/...`). Zmiana łamiąca = nowy prefiks.
+/// Contract version; path prefix (`/v1/...`). A breaking change means a new prefix.
 pub const API_VERSION: &str = "v1";

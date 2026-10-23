@@ -1,5 +1,5 @@
-//! HTTP/1.1 po unix sockecie: jedno połączenie na wywołanie, odpowiedzi w całości (`call`)
-//! albo jako strumień linii JSON (`Lines`).
+//! HTTP/1.1 over a unix socket: one connection per call, responses read whole (`call`)
+//! or as a stream of JSON lines (`Lines`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,14 +14,14 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 use weglarka_core::podman::{PodmanError, Result};
 
-/// Wersja API w ścieżce — wymusza semantykę v6 niezależnie od domyślnej wersji serwera.
+/// API version in the path — forces v6 semantics regardless of the server's default version.
 pub(crate) const API_PREFIX: &str = "/v6.0.0/libpod";
 
-/// Limit odpowiedzi czytanych w całości (inspect, list) — obrona przed wyciekiem RAM.
+/// Limit for responses read whole (inspect, list) — a defense against RAM blowup.
 const MAX_BODY: usize = 16 << 20;
-/// Limit jednej linii strumienia (pull, events).
+/// Limit for a single stream line (pull, events).
 const MAX_LINE: usize = 1 << 20;
-/// Ile z ciała błędu czytamy.
+/// How much of the error body we read.
 const MAX_ERROR_BODY: usize = 64 << 10;
 
 #[derive(Debug, Clone)]
@@ -78,7 +78,7 @@ impl Transport {
         Ok((response.status(), response.into_body()))
     }
 
-    /// Wywołanie z odpowiedzią czytaną w całości. 2xx i 304 (już wystartowany/zatrzymany) to sukces.
+    /// Call with a response read whole. 2xx and 304 (already started/stopped) count as success.
     pub(crate) async fn call(
         &self,
         method: Method,
@@ -105,7 +105,7 @@ impl Transport {
             .await
     }
 
-    /// Wywołanie ze strumieniową odpowiedzią (linie JSON).
+    /// Call with a streamed response (JSON lines).
     pub(crate) async fn lines(&self, method: Method, path: &str) -> Result<Lines> {
         let (status, incoming) = self.open(method, path, None).await?;
         if is_success(status) {
@@ -129,13 +129,13 @@ async fn read_limited(body: Incoming, limit: usize) -> Result<Bytes> {
 }
 
 async fn error_from_response(status: StatusCode, body: Incoming) -> PodmanError {
-    // Błąd przy czytaniu ciała błędu nie ma znaczenia — status i tak mówi, co się stało.
+    // An error while reading the error body does not matter — the status says what happened anyway.
     let bytes = read_limited(body, MAX_ERROR_BODY).await.unwrap_or_default();
     error_from_status(status.as_u16(), &bytes)
 }
 
-/// Mapuje odpowiedź błędu libpod (`{"cause","message","response"}`) na [`PodmanError`].
-/// 409 zostaje `Api`; wywołania tworzące zamieniają je na `Conflict` przez [`name_conflict`].
+/// Maps a libpod error response (`{"cause","message","response"}`) to [`PodmanError`].
+/// 409 stays `Api`; create calls turn it into `Conflict` via [`name_conflict`].
 pub(crate) fn error_from_status(status: u16, body: &[u8]) -> PodmanError {
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -161,9 +161,9 @@ pub(crate) fn error_from_status(status: u16, body: &[u8]) -> PodmanError {
     }
 }
 
-/// Dla operacji tworzących: zajęta nazwa. Dokumentacja obiecuje 409, ale libpod zwraca 409 tylko
-/// dla sieci; kontener z zajętą nazwą dostaje 500 z komunikatem "… is already in use" (zmierzone
-/// na Podmanie 6.1.3 w CI), więc rozpoznajemy też ten komunikat.
+/// For create operations: name already taken. The docs promise 409, but libpod returns 409 only
+/// for networks; a container with a taken name gets 500 with the message "… is already in use"
+/// (measured on Podman 6.1.3 in CI), so we recognize that message too.
 pub(crate) fn name_conflict(error: PodmanError) -> PodmanError {
     match error {
         PodmanError::Api { status, message }
@@ -179,7 +179,7 @@ pub(crate) fn name_conflict(error: PodmanError) -> PodmanError {
     }
 }
 
-/// Czytnik strumienia linii JSON (`\n`-rozdzielane obiekty: pull, events).
+/// Reader of a JSON-lines stream (`\n`-separated objects: pull, events).
 pub(crate) struct Lines {
     body: Incoming,
     buf: Vec<u8>,
@@ -195,7 +195,7 @@ impl Lines {
         }
     }
 
-    /// Następna niepusta linia; `None` po końcu strumienia.
+    /// Next non-empty line; `None` at the end of the stream.
     pub(crate) async fn next_line(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
             if let Some(line) = take_line(&mut self.buf) {
@@ -226,7 +226,7 @@ impl Lines {
     }
 }
 
-/// Wycina z bufora pierwszą kompletną linię (bez `\n`/`\r\n`).
+/// Cuts the first complete line out of the buffer (without `\n`/`\r\n`).
 pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     let end = buf.iter().position(|&b| b == b'\n')?;
     let mut line: Vec<u8> = buf.drain(..=end).collect();
@@ -237,12 +237,12 @@ pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(line)
 }
 
-/// Percent-encoding składnika zapytania (RFC 3986 unreserved zostają).
+/// Percent-encoding of a query component (RFC 3986 unreserved characters are kept).
 pub(crate) fn encode_component(input: &str) -> String {
     encode(input, |b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
 }
 
-/// Segment(y) ścieżki: jak składnik, ale `/`, `:` i `@` (referencje obrazów) zostają.
+/// Path segment(s): like a component, but `/`, `:` and `@` (image references) are kept.
 pub(crate) fn encode_path(input: &str) -> String {
     encode(input, |b| {
         b.is_ascii_alphanumeric() || b"-._~/:@".contains(&b)
@@ -262,7 +262,7 @@ fn encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
     out
 }
 
-/// Nazwa/referencja wstawiana do ścieżki: niepusta, bez segmentów `.` i `..`.
+/// Name/reference inserted into the path: non-empty, without `.` and `..` segments.
 pub(crate) fn path_name(name: &str) -> Result<String> {
     if name.is_empty() || name.split('/').any(|s| s == "." || s == "..") {
         return Err(PodmanError::Api {

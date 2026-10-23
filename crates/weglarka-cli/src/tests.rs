@@ -1,4 +1,4 @@
-//! Testy: klient na mocku serwera (socket unix), preflight na fałszywym hoście, kody wyjścia.
+//! Tests: the client against a mock server (unix socket), preflight on a fake host, exit codes.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use crate::preflight::host::{CmdOutput, FileKind};
 use crate::preflight::testing::FakeHost;
 use crate::preflight::{Context, all_checks, render, run_checks};
 
-// ---------- mock serwera na sockecie unix ----------
+// ---------- mock server on a unix socket ----------
 
 #[derive(Debug, Clone)]
 struct Seen {
@@ -47,7 +47,7 @@ static N: AtomicU32 = AtomicU32::new(0);
 
 /// `reply(method, path) -> (status, body)`.
 async fn mock(reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> Mock {
-    // Krótka ścieżka: limit sun_path (~104 B na macOS).
+    // Short path: the sun_path limit (~104 B on macOS).
     let socket = std::env::temp_dir().join(format!(
         "wgl-{}-{}.sock",
         std::process::id(),
@@ -202,7 +202,7 @@ fn expand_path_substitutes() {
     );
 }
 
-// ---------- sekrety ----------
+// ---------- secrets ----------
 
 #[test]
 fn secret_value_rules() {
@@ -317,7 +317,7 @@ fn edge_mode_skips_traefik_check_and_openrc_skips_linger() {
     assert!(!ids.contains(&"runtime.linger"));
 }
 
-// ---------- nowe sprawdzenia hosta (devops, niechybnie) ----------
+// ---------- new host checks (devops, niechybnie) ----------
 
 fn status_of(host: &FakeHost, id: &str) -> weglarka_api::CheckStatus {
     report(host, Some(CONFIG))
@@ -355,7 +355,7 @@ fn apparmor_userns_cases() {
     assert_eq!(status_of(&h, id), Ok);
     let h = FakeHost::healthy().file("/sys/kernel/security/apparmor/profiles", "crun (enforce)\n");
     assert_eq!(status_of(&h, id), Fail);
-    // profile nieczytelne dla nie-roota → warn
+    // profiles unreadable for non-root → warn
     let mut h = FakeHost::healthy();
     h.files
         .remove(&PathBuf::from("/sys/kernel/security/apparmor/profiles"));
@@ -374,7 +374,7 @@ fn bind_free_cases() {
     use weglarka_api::CheckStatus::*;
     let id = "ingress.bind_free";
     assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
-    // 172.17.0.1 = 0x010011AC w little-endian hex "010011AC"
+    // 172.17.0.1 = 0x010011AC in little-endian hex "010011AC"
     let ours = format!("{H}{}", tcp_line("010011AC", 8080, 1001));
     assert_eq!(
         status_of(&FakeHost::healthy().file("/proc/net/tcp", &ours), id),
@@ -418,7 +418,7 @@ fn traefik_sync_cases() {
     use weglarka_api::CheckStatus::*;
     let id = "ingress.traefik_sync";
     let app = |d: &str| format!("[apps.a]\nimage = \"x\"\ndomains = [\"{d}\"]\n");
-    // brak polityki = sync nieużywany
+    // no policy = sync not used
     assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
     assert_eq!(status_of(&sync_host("active\n", None), id), Ok);
     assert_eq!(
@@ -430,11 +430,11 @@ fn traefik_sync_cases() {
         Warn
     );
     assert_eq!(status_of(&sync_host("inactive\n", None), id), Fail);
-    // brak systemctl
+    // no systemctl
     let mut h = sync_host("active\n", None);
     h.commands.clear();
     assert_eq!(status_of(&h, id), Warn);
-    // polityka bez allowlisty
+    // policy without an allowlist
     let h = sync_host("active\n", None).file("/etc/weglarka/traefik-policy.json", "{}");
     assert_eq!(status_of(&h, id), Warn);
 }

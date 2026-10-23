@@ -1,26 +1,26 @@
-//! Błędy CLI i ich mapowanie na stabilne kody wyjścia.
+//! CLI errors and their mapping to stable exit codes.
 //!
-//! Tabela kodów jest częścią interfejsu dla agentów — zmiany tylko addytywne.
+//! The code table is part of the interface for agents — changes are additive only.
 
 use serde::Serialize;
 use weglarka_api::ErrorCode;
 
-/// Kody wyjścia procesu (`weglarka --help` zawiera tę samą tabelę).
+/// Process exit codes (`weglarka --help` contains the same table).
 pub mod exit {
     pub const OK: i32 = 0;
-    // 1 i 2 zarezerwowane dla `doctor` (`DoctorReport::exit_code`: warn / fail).
+    // 1 and 2 are reserved for `doctor` (`DoctorReport::exit_code`: warn / fail).
     pub const NOT_FOUND: i32 = 3;
     pub const CONFLICT: i32 = 4;
     pub const INVALID_REQUEST: i32 = 5;
-    /// `deploy`: nowa wersja nie przeszła bramki zdrowia, wrócono do poprzedniej.
+    /// `deploy`: the new version failed the health gate, rolled back to the previous one.
     pub const ROLLED_BACK: i32 = 6;
-    /// Błędne wywołanie lub dane wejściowe odrzucone lokalnie.
+    /// Invalid invocation, or input rejected locally.
     pub const USAGE: i32 = 64;
-    /// Brak połączenia z demonem (socket nie istnieje / brak uprawnień / demon nie działa).
+    /// No connection to the daemon (socket missing / no permission / daemon not running).
     pub const UNREACHABLE: i32 = 69;
-    /// Błąd wewnętrzny: I/O, protokół, błąd demona (5xx).
+    /// Internal error: I/O, protocol, daemon error (5xx).
     pub const INTERNAL: i32 = 70;
-    /// Brak lub błędny `weglarka.toml`.
+    /// Missing or invalid `weglarka.toml`.
     pub const CONFIG: i32 = 78;
 
     pub const TABLE: &str = "\
@@ -62,7 +62,7 @@ impl Kind {
         }
     }
 
-    /// Stabilny identyfikator w `--json` (`error.code`).
+    /// Stable identifier in `--json` (`error.code`).
     pub fn code(self) -> &'static str {
         match self {
             Self::Usage => "usage",
@@ -110,7 +110,7 @@ impl CliError {
         self.kind.exit_code()
     }
 
-    /// Błąd odpowiedzi demona (`ApiError`) z podpowiedzią zależną od kodu.
+    /// Daemon response error (`ApiError`) with a code-dependent hint.
     pub fn from_api(code: ErrorCode, message: String) -> Self {
         let (kind, hint) = match code {
             ErrorCode::NotFound => (Kind::NotFound, Some("sprawdź nazwy: `weglarka apps list`")),
@@ -136,7 +136,7 @@ impl CliError {
     }
 }
 
-/// Postać błędu w `--json` (`{"error": {...}}`).
+/// Shape of the error in `--json` (`{"error": {...}}`).
 #[derive(Debug, Serialize)]
 pub struct ErrorEnvelope<'a> {
     pub error: ErrorBody<'a>,

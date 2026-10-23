@@ -1,5 +1,5 @@
-//! Testy integracyjne z prawdziwym Podmanem 6 (job CI `integration-podman`).
-//! Wymagają `WEGLARKA_PODMAN_SOCKET`; bez niej każdy test się pomija
+//! Integration tests against a real Podman 6 (CI job `integration-podman`).
+//! They require `WEGLARKA_PODMAN_SOCKET`; without it every test is skipped
 //! (docs/decisions/0002-podman-in-ci.md).
 
 use std::collections::BTreeMap;
@@ -16,7 +16,7 @@ use weglarka_core::podman::{
 };
 use weglarka_podman::LibpodClient;
 
-/// Mały obraz, który działa w nieskończoność (bez shella, ~300 KB) i ma `/pause -v` do healthchecka.
+/// A small image that runs forever (no shell, ~300 KB) and has `/pause -v` for the healthcheck.
 const IMAGE: &str = "registry.k8s.io/pause:3.9";
 const STEP: Duration = Duration::from_secs(60);
 
@@ -30,7 +30,7 @@ fn socket() -> Option<String> {
     socket
 }
 
-/// Unikalny sufiks na przebieg, żeby równoległe/ponowione przebiegi się nie zderzały.
+/// Unique per-run suffix so that parallel/repeated runs do not collide.
 fn run_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -39,8 +39,8 @@ fn run_id() -> String {
     format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
 }
 
-/// Wywołanie surowego API przez `curl` — dla rzeczy poza kontraktem klienta (sprzątanie sieci,
-/// kontener z healthcheckiem, którego `ContainerSpec` nie opisuje).
+/// Raw API call via `curl` — for things outside the client contract (network cleanup,
+/// a container with a healthcheck that `ContainerSpec` cannot describe).
 fn raw(socket: &str, method: &str, path: &str, body: Option<&str>) -> (bool, String) {
     let mut cmd = Command::new("curl");
     cmd.args([
@@ -64,7 +64,7 @@ fn raw(socket: &str, method: &str, path: &str, body: Option<&str>) -> (bool, Str
     )
 }
 
-/// Sprząta po teście nawet przy panice (`Drop`).
+/// Cleans up after the test even on panic (`Drop`).
 struct Cleanup {
     socket: String,
     containers: Vec<String>,
@@ -175,7 +175,7 @@ async fn full_lifecycle() {
         ("weglarka.spec-hash".to_owned(), "deadbeef".to_owned()),
     ]);
 
-    // Obraz: pull jako strumień kończący się Complete z digestem; inspect zgadza się z pullem.
+    // Image: pull as a stream ending in Complete with a digest; inspect agrees with the pull.
     let events: Vec<_> = timeout(STEP, client.image_pull(IMAGE).collect::<Vec<_>>())
         .await
         .unwrap();
@@ -190,7 +190,7 @@ async fn full_lifecycle() {
             || image_id.starts_with(&image.id)
     );
 
-    // Tag (ręczny rollback) i usunięcie samego tagu.
+    // Tag (manual rollback) and removal of the tag alone.
     client.image_tag(&image.id, tag_repo, &tag).await.unwrap();
     let tagged = client
         .image_inspect(&format!("{tag_repo}:{tag}"))
@@ -211,7 +211,7 @@ async fn full_lifecycle() {
         Err(PodmanError::NotFound(_))
     ));
 
-    // Sieci: idempotentne create; sekrety: create nadpisuje.
+    // Networks: idempotent create; secrets: create overwrites.
     let net = |name: &str| NetworkSpec {
         name: name.into(),
         internal: false,
@@ -227,7 +227,7 @@ async fn full_lifecycle() {
         .await
         .unwrap();
 
-    // Zdarzenia: strumień otwarty „od teraz” (since), czytany po akcjach.
+    // Events: stream opened "from now" (since), read after the actions.
     let since = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -242,7 +242,7 @@ async fn full_lifecycle() {
     };
     let mut events = Box::pin(client.events(&event_filter));
 
-    // Kontener z etykietami weglarka.*, siecią, sekretem env i mount, userns=auto.
+    // Container with weglarka.* labels, a network, an env secret and a mount, userns=auto.
     let mut app_spec = spec(&app, labels.clone());
     app_spec.networks = vec![net_a.clone()];
     app_spec.secrets = vec![
@@ -278,7 +278,7 @@ async fn full_lifecycle() {
     assert_eq!(info.image, IMAGE);
 
     client.container_start(&app).await.unwrap();
-    client.container_start(&app).await.unwrap(); // już działa: idempotentne (304)
+    client.container_start(&app).await.unwrap(); // already running: idempotent (304)
     client.network_connect(&net_b, &app).await.unwrap();
     let info = client.container_inspect(&app).await.unwrap();
     assert_eq!(info.state, ContainerState::Running);
@@ -288,7 +288,7 @@ async fn full_lifecycle() {
         Err(PodmanError::Api { status: 409, .. })
     ));
 
-    // List z filtrem po etykietach widzi dokładnie nasz kontener.
+    // List filtered by labels sees exactly our container.
     let listed = client
         .container_list(&ContainerFilter {
             labels: BTreeMap::from([("weglarka.instance".into(), format!("it-{id}"))]),
@@ -307,7 +307,7 @@ async fn full_lifecycle() {
         .unwrap();
     assert!(none.is_empty());
 
-    // Healthcheck run: kontener z healthchecka spoza kontraktu `ContainerSpec` (utworzony surowo).
+    // Healthcheck run: a container with a healthcheck outside the `ContainerSpec` contract (created raw).
     let body = serde_json_body(&hc_app, &id);
     let (ok, out) = raw(&socket, "POST", "/containers/create", Some(&body));
     assert!(ok, "raw create: {out}");
@@ -327,7 +327,7 @@ async fn full_lifecycle() {
     client.container_stop(&hc_app, 1).await.unwrap();
     client.container_remove(&hc_app, false).await.unwrap();
 
-    // Stop (idempotentny) i usunięcie.
+    // Stop (idempotent) and removal.
     client.container_stop(&app, 1).await.unwrap();
     client.container_stop(&app, 1).await.unwrap();
     let info = client.container_inspect(&app).await.unwrap();
@@ -352,7 +352,7 @@ async fn full_lifecycle() {
         Err(PodmanError::NotFound(_))
     ));
 
-    // Zdarzenia: strumień (otwarty z `since`) odtwarza start i zatrzymanie naszego kontenera.
+    // Events: the stream (opened with `since`) replays the start and stop of our container.
     let (mut started, mut stopped) = (false, false);
     while !(started && stopped) {
         let event = timeout(STEP, events.next())

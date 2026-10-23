@@ -1,5 +1,5 @@
-//! Klient admin API: HTTP/1.1 po sockecie unix (hyper, jedno połączenie na żądanie).
-//! Ścieżki i metody pochodzą z `weglarka_api::endpoints`, więc nie rozjadą się z kontraktem.
+//! Admin API client: HTTP/1.1 over a unix socket (hyper, one connection per request).
+//! Paths and methods come from `weglarka_api::endpoints`, so they can't drift from the contract.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,15 +17,15 @@ use weglarka_api::{ApiError, Endpoint, Method};
 use crate::error::{CliError, Kind};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Deploy czeka na pull obrazu i bramkę zdrowia, więc ogólny limit jest długi.
+/// Deploy waits for the image pull and the health gate, so the overall timeout is long.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub struct ApiClient {
     socket: PathBuf,
 }
 
-/// Podstawia `{param}` w ścieżce endpointu. Wartości muszą być już zwalidowane
-/// (`InstanceName`, nazwa sekretu) — tu nie ma kodowania procentowego.
+/// Substitutes `{param}` in an endpoint path. Values must already be validated
+/// (`InstanceName`, secret name) — there is no percent-encoding here.
 pub fn expand_path(endpoint: Endpoint, params: &[(&str, &str)]) -> String {
     let mut path = endpoint.path.to_owned();
     for (key, value) in params {
@@ -50,7 +50,7 @@ impl ApiClient {
         }
     }
 
-    /// Wywołanie z ciałem JSON odpowiedzi.
+    /// Call with a JSON response body.
     pub async fn call<Res: DeserializeOwned>(
         &self,
         endpoint: Endpoint,
@@ -64,7 +64,7 @@ impl ApiClient {
         })
     }
 
-    /// Wywołanie bez ciała odpowiedzi (204).
+    /// Call without a response body (204).
     pub async fn call_empty(
         &self,
         endpoint: Endpoint,

@@ -1,4 +1,4 @@
-//! Etykiety kontenerów — kontrakt reconcile (`Zasady architektury`, QlBT25G).
+//! Container labels — the reconcile contract (`Zasady architektury`, QlBT25G).
 
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ pub const INSTANCE: &str = "weglarka.instance";
 pub const GENERATION: &str = "weglarka.generation";
 pub const SPEC_HASH: &str = "weglarka.spec-hash";
 
-/// Zestaw etykiet, który reconcile nakłada na kontener instancji.
+/// Set of labels that reconcile applies to an instance's container.
 pub fn container_labels(
     instance: &InstanceName,
     generation: u64,
@@ -22,12 +22,12 @@ pub fn container_labels(
     ])
 }
 
-/// Nazwa kontenera instancji — to ona jest hostem DNS w sieci apki (`proxy_pass` nginxa).
+/// Instance container name — it is the DNS host in the app's network (nginx `proxy_pass`).
 pub fn container_name(instance: &InstanceName) -> String {
     instance.to_string()
 }
 
-/// Sieć per apka, do której dołącza kontener instancji (i nginx ingressu).
+/// Per-app network that the instance container (and the ingress nginx) joins.
 pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")
 }

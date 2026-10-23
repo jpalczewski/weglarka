@@ -1,4 +1,4 @@
-//! Lista endpointów. Ścieżki zawierają parametry `{name}` / `{secret}`.
+//! Endpoint list. Paths contain `{name}` / `{secret}` parameters.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -44,13 +44,13 @@ pub const APPS_DEPLOY: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/deploy",
 };
-/// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (bez wartości)
+/// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}/secrets",
 };
 /// `PUT` [`SetSecretRequest`](crate::SetSecretRequest) → [`SecretInfo`](crate::SecretInfo).
-/// Tylko nadpisywanie; brak endpointu odczytu wartości.
+/// Overwrite only; there is no endpoint for reading the value back.
 pub const SECRETS_SET: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/secrets/{secret}",

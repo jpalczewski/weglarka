@@ -1,11 +1,11 @@
-//! Czyste parsery i oceny (bez I/O) — łatwe do testowania.
+//! Pure parsers and assessments (no I/O) — easy to test.
 
 use std::path::Path;
 
 use super::RuntimeUser;
 use super::host::{FileStat, Host, PingInfo};
 
-/// `getent passwd <name>`, a gdy go nie ma — `/etc/passwd`.
+/// `getent passwd <name>`, and when it's unavailable — `/etc/passwd`.
 pub fn lookup_user(host: &dyn Host, name: &str) -> Option<RuntimeUser> {
     if let Ok(out) = host.run("getent", &["passwd", name])
         && out.success
@@ -32,7 +32,7 @@ pub fn parse_passwd_line(line: &str, name: &str) -> Option<RuntimeUser> {
     })
 }
 
-/// GID-y użytkownika: grupa główna + członkostwo z `/etc/group`.
+/// User's GIDs: primary group + membership from `/etc/group`.
 pub fn gids_of(host: &dyn Host, user: &RuntimeUser) -> Vec<u32> {
     let mut gids = vec![user.gid];
     if let Ok(src) = host.read_to_string(Path::new("/etc/group")) {
@@ -49,7 +49,7 @@ pub fn gids_of(host: &dyn Host, user: &RuntimeUser) -> Vec<u32> {
     gids
 }
 
-/// Suma rozmiarów zakresów z `/etc/subuid`|`/etc/subgid` dla usera (po nazwie lub uid).
+/// Sum of range sizes from `/etc/subuid`|`/etc/subgid` for the user (by name or uid).
 pub fn subid_total(src: &str, user: &RuntimeUser) -> u64 {
     let uid = user.uid.to_string();
     src.lines()
@@ -81,7 +81,7 @@ pub fn parse_ping_response(raw: &str) -> Option<PingInfo> {
     })
 }
 
-/// Pierwszy ciąg `X.Y[.Z]` w tekście → `(major, minor)`.
+/// First `X.Y[.Z]` token in the text → `(major, minor)`.
 pub fn parse_major_minor(text: &str) -> Option<(u32, u32)> {
     text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
         .find_map(|tok| {
@@ -92,8 +92,8 @@ pub fn parse_major_minor(text: &str) -> Option<(u32, u32)> {
         })
 }
 
-/// Czy w wyjściu `apt-cache policy <pkg>` zainstalowana wersja pochodzi ze źródła zawierającego
-/// `needle`. `None` — nie da się ustalić (brak wersji zainstalowanej).
+/// Whether, in the `apt-cache policy <pkg>` output, the installed version comes from a source
+/// containing `needle`. `None` — can't be determined (no installed version).
 pub fn apt_installed_from(policy: &str, needle: &str) -> Option<bool> {
     let installed = policy
         .lines()
@@ -102,7 +102,7 @@ pub fn apt_installed_from(policy: &str, needle: &str) -> Option<bool> {
     if installed == "(none)" {
         return None;
     }
-    // Wiersze wersji mają wcięcie ≤ 5 (zainstalowana: ` *** …`), wiersze źródeł ≥ 6.
+    // Version lines are indented ≤ 5 (installed: ` *** …`), source lines ≥ 6.
     let mut in_installed = false;
     let mut found = false;
     for line in policy
@@ -120,7 +120,7 @@ pub fn apt_installed_from(policy: &str, needle: &str) -> Option<bool> {
     Some(found)
 }
 
-/// Czy proces z `uid`/`gids` mógłby zapisać plik (klasyczne bity; ACL-e pomijane).
+/// Whether a process with `uid`/`gids` could write the file (classic mode bits; ACLs ignored).
 pub fn can_write(stat: &FileStat, uid: u32, gids: &[u32]) -> bool {
     if uid == 0 {
         return true;
@@ -134,16 +134,16 @@ pub fn can_write(stat: &FileStat, uid: u32, gids: &[u32]) -> bool {
     }
 }
 
-/// Gniazdo nasłuchujące (TCP LISTEN) z `/proc/net/tcp` lub `/proc/net/tcp6`.
+/// A listening socket (TCP LISTEN) from `/proc/net/tcp` or `/proc/net/tcp6`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listener {
-    /// `None` = adres nieokreślony (`0.0.0.0` / `::`); adresy IPv6 inne niż `::` pomijamy.
+    /// `None` = unspecified address (`0.0.0.0` / `::`); IPv6 addresses other than `::` are skipped.
     pub addr: Option<std::net::Ipv4Addr>,
     pub port: u16,
     pub uid: u32,
 }
 
-/// Wpisy LISTEN z `/proc/net/tcp` (`v6 = false`) albo `/proc/net/tcp6` (`v6 = true`).
+/// LISTEN entries from `/proc/net/tcp` (`v6 = false`) or `/proc/net/tcp6` (`v6 = true`).
 pub fn parse_proc_net_tcp(src: &str, v6: bool) -> Vec<Listener> {
     src.lines()
         .skip(1)
@@ -156,10 +156,10 @@ pub fn parse_proc_net_tcp(src: &str, v6: bool) -> Vec<Listener> {
             let port = u16::from_str_radix(port, 16).ok()?;
             let uid = f[7].parse().ok()?;
             let addr = if v6 {
-                // tylko `::` (dual-stack wildcard); inne adresy v6 nie kolidują z v4
+                // only `::` (dual-stack wildcard); other v6 addresses don't collide with v4
                 host.bytes().all(|b| b == b'0').then_some(None)?
             } else {
-                // /proc zapisuje adres IPv4 jako little-endian hex
+                // /proc stores an IPv4 address as little-endian hex
                 let raw = u32::from_str_radix(host, 16).ok()?;
                 (raw != 0).then(|| std::net::Ipv4Addr::from(raw.swap_bytes()))
             };

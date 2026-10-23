@@ -1,9 +1,9 @@
-//! Czyste generatory configu ingressu (bez I/O, snapshot testy `insta`). **Własność: sesja c.**
+//! Pure ingress config generators (no I/O, `insta` snapshot tests). **Owner: session c.**
 //!
-//! Wejście: [`HostConfig`](weglarka_core::config::HostConfig) + apki (`InstanceName → AppSpec`).
-//! Oba generatory budują najpierw wspólny, zwalidowany [`Plan`]; dopiero z niego powstaje tekst.
-//! Wartości z danych apki trafiają do configu wyłącznie jako typy o ograniczonym alfabecie
-//! ([`Domain`], `InstanceName`, `u16`), więc nie da się wstrzyknąć dyrektyw nginx ani YAML-a.
+//! Input: [`HostConfig`](weglarka_core::config::HostConfig) + apps (`InstanceName → AppSpec`).
+//! Both generators first build a shared, validated [`Plan`]; only then is any text produced.
+//! Values from app data reach the config only as types with a restricted alphabet
+//! ([`Domain`], `InstanceName`, `u16`), so nginx directives or YAML cannot be injected.
 
 pub mod nginx;
 mod plan;

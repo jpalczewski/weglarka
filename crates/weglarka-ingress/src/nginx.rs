@@ -1,8 +1,9 @@
-//! Config nginx: server per apka, `proxy_pass` po nazwie w sieci apki, JSON access log z `app`; **Własność: sesja c.**
+//! nginx config: one server per app, `proxy_pass` by name on the app network, JSON access log with `app`;
+//! **Owner: session c.**
 //!
-//! Punkty rozszerzeń: [`ModeProfile`] (to, co różni tryby `behind`/`edge`: nagłówki zaufania,
-//! `listen`, TLS/ACME) oraz [`Backend`] (dziś tylko proxy do kontenera; strony statyczne to
-//! kolejny wariant). Tryb `edge` zwraca na razie [`IngressError::UnsupportedMode`].
+//! Extension points: [`ModeProfile`] (what differs between the `behind`/`edge` modes: trust headers,
+//! `listen`, TLS/ACME) and [`Backend`] (today only a proxy to a container; static sites would be
+//! another variant). The `edge` mode currently returns [`IngressError::UnsupportedMode`].
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -13,20 +14,20 @@ use weglarka_core::config::{HostConfig, IngressMode};
 use crate::plan::{Cidr, Domain, IngressError, Plan, WEBHOOK_UPSTREAM_HOST};
 use std::collections::BTreeMap;
 
-/// Ustawienia generatora, które nie należą do `HostConfig`/`AppSpec`.
+/// Generator settings that belong to neither `HostConfig` nor `AppSpec`.
 #[derive(Debug, Clone)]
 pub struct NginxOptions {
-    /// Adresy resolverów (aardvark-dns sieci Podmana); wymagany co najmniej jeden.
+    /// Resolver addresses (aardvark-dns of the Podman network); at least one is required.
     pub resolvers: Vec<IpAddr>,
-    /// Port, na którym nginx słucha *wewnątrz* kontenera (publikowany na `ingress.bind`).
+    /// Port nginx listens on *inside* the container (published on `ingress.bind`).
     pub listen_port: u16,
-    /// Sieci, którym ufamy co do `X-Forwarded-*` (tryb `behind`: sieć Dockera z Traefikiem).
+    /// Networks we trust for `X-Forwarded-*` (`behind` mode: the Docker network with Traefik).
     pub trusted_proxies: Vec<Cidr>,
-    /// Prefiksy ścieżek webhooków (zaczynają się i kończą `/`); reszta domeny → 404.
+    /// Webhook path prefixes (start and end with `/`); the rest of the domain → 404.
     pub webhook_paths: Vec<String>,
-    /// Limit ciała żądania webhooka.
+    /// Webhook request body limit.
     pub webhook_max_body_bytes: u32,
-    /// Limit ciała żądania do apek.
+    /// App request body limit.
     pub app_max_body_bytes: u64,
 }
 
@@ -75,7 +76,7 @@ impl NginxOptions {
     }
 }
 
-/// Dokąd nginx przekazuje ruch. Dziś tylko kontener; strony statyczne dojdą jako kolejny wariant.
+/// Where nginx forwards traffic. Today only a container; static sites will come as another variant.
 enum Backend<'a> {
     Container { host: &'a str, port: u16 },
 }
@@ -84,8 +85,8 @@ impl Backend<'_> {
     fn write_location(&self, c: &mut Conf) {
         match self {
             Backend::Container { host, port } => {
-                // Zmienna w `proxy_pass` wymusza resolve w runtime (przez `resolver`): brak
-                // kontenera daje 502, a nie błąd startu; nowe IP po recreate łapiemy po TTL.
+                // A variable in `proxy_pass` forces runtime resolution (via `resolver`): a missing
+                // container yields 502 instead of a startup error; a new IP after recreate is picked up after the TTL.
                 c.block("location /", |c| {
                     c.line(&format!("set $upstream \"http://{host}:{port}\";"));
                     c.line("proxy_pass $upstream;");
@@ -95,12 +96,12 @@ impl Backend<'_> {
     }
 }
 
-/// To, czym różnią się tryby ingressu. `behind` jest zaimplementowany; `edge` (TLS, ACME
-/// `/.well-known/acme-challenge/`, `listen 80/443`) dojdzie jako druga implementacja.
+/// What differs between ingress modes. `behind` is implemented; `edge` (TLS, ACME
+/// `/.well-known/acme-challenge/`, `listen 80/443`) will come as a second implementation.
 trait ModeProfile {
-    /// Dyrektywy na poziomie `http {}`: zaufanie do proxy, zmienna `$weglarka_proto`.
+    /// Directives at the `http {}` level: proxy trust, the `$weglarka_proto` variable.
     fn http_prelude(&self, c: &mut Conf);
-    /// `listen` serwera.
+    /// The server's `listen`.
     fn listen(&self, c: &mut Conf, default_server: bool);
 }
 
@@ -114,7 +115,7 @@ impl ModeProfile for Behind<'_> {
         c.line("real_ip_header X-Forwarded-For;");
         c.line("real_ip_recursive on;");
         c.blank();
-        // `X-Forwarded-Proto` honorujemy tylko od zaufanego peera (Traefik terminuje TLS).
+        // We honor `X-Forwarded-Proto` only from a trusted peer (Traefik terminates TLS).
         c.block("geo $realip_remote_addr $weglarka_trusted", |c| {
             c.line("default 0;");
             for net in &self.0.trusted_proxies {
@@ -141,7 +142,7 @@ impl ModeProfile for Behind<'_> {
     }
 }
 
-/// Generuje pełny `nginx.conf` dla kontenera nginx Węglarki.
+/// Generates the full `nginx.conf` for Węglarka's nginx container.
 pub fn generate(
     host: &HostConfig,
     apps: &BTreeMap<InstanceName, AppSpec>,
@@ -155,8 +156,8 @@ pub fn generate(
     }
 }
 
-/// Format JSON access logu. `path` to `$uri` (bez query stringu — tokeny w URL-ach nie
-/// trafiają do logów); `upstream_response_time` jako string (`-` lub lista przy retry).
+/// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
+/// end up in logs); `upstream_response_time` is a string (`-` or a list on retry).
 const LOG_FORMAT: &str = concat!(
     "{\"time\":\"$time_iso8601\",\"app\":\"$app\",\"host\":\"$host\",",
     "\"remote_addr\":\"$remote_addr\",\"method\":\"$request_method\",\"path\":\"$uri\",",
@@ -224,7 +225,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
         c.line("add_header X-Request-Id $request_id always;");
         c.blank();
 
-        // Domyślny server: obcy Host nie dostaje niczego.
+        // Default server: a foreign Host gets nothing.
         c.block("server", |c| {
             mode.listen(c, true);
             c.line("server_name _;");
@@ -232,7 +233,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
             c.line("return 444;");
         });
 
-        // Webhooki: tylko wskazane prefiksy, POST, mały limit ciała.
+        // Webhooks: only the listed prefixes, POST, small body limit.
         c.blank();
         c.block("server", |c| {
             mode.listen(c, false);
@@ -284,7 +285,7 @@ fn join_domains(domains: &[Domain]) -> String {
     s
 }
 
-/// Mały builder z wcięciami (4 spacje).
+/// Small builder with indentation (4 spaces).
 #[derive(Default)]
 struct Conf {
     buf: String,

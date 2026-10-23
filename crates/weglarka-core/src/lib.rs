@@ -1,7 +1,7 @@
-//! Rdzeń Węglarki: typy domenowe, traity adapterów i (w modułach sesji b) logika reconcile.
+//! Węglarka core: domain types, adapter traits and (in session b's modules) the reconcile logic.
 //!
-//! Własność plików — patrz `CLAUDE.md`. Typy i traity w tym crate to **kontrakt** dla pozostałych
-//! crate'ów; zmiany w nim muszą być addytywne, a łamiące uzgadnia się przez właściciela (sesja b).
+//! File ownership — see `CLAUDE.md`. Types and traits in this crate are a **contract** for the other
+//! crates; changes to it must be additive, and breaking ones are agreed via the owner (session b).
 
 pub mod app;
 pub mod config;
@@ -14,7 +14,7 @@ pub mod secret_store;
 pub mod state;
 pub mod webhook;
 
-// Logika — własność sesji b (zalążki).
+// Logic — owned by session b (stubs).
 pub mod deploy;
 pub mod reconcile;
 pub mod secrets;

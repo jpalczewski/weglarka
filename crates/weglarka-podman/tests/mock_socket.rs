@@ -1,5 +1,5 @@
-//! Pełny klient na atrapie serwera po unix sockecie (bez Podmana): ścieżki żądań, mapowanie
-//! błędów, strumień pulla z błędem w środku, brak socketu.
+//! Full client against a mock unix-socket server (no Podman): request paths, error
+//! mapping, a pull stream with an error mid-way, a missing socket.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,7 +20,7 @@ macro_rules! fixture {
     };
 }
 
-/// Trasa: (prefiks "METHOD /ścieżka", status, ciało). Pierwsze pasujące wygrywa.
+/// Route: (prefix "METHOD /path", status, body). The first match wins.
 type Route = (&'static str, u16, &'static str);
 
 struct Mock {

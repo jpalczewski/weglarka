@@ -1,4 +1,4 @@
-//! `LibpodClient` — implementacja `PodmanClient` na libpod API v6.
+//! `LibpodClient` — `PodmanClient` implementation on the libpod API v6.
 
 use std::path::PathBuf;
 
@@ -18,9 +18,9 @@ use crate::wire::{
     WireEvent, decode, health_status,
 };
 
-/// Klient libpod po unix sockecie. Tani w klonowaniu (współdzieli tylko ścieżkę socketu);
-/// nie łączy się przy tworzeniu — brak socketu wychodzi jako `PodmanError::Unreachable`
-/// przy pierwszym wywołaniu (np. [`PodmanClient::version`]).
+/// libpod client over a unix socket. Cheap to clone (shares only the socket path);
+/// it does not connect on creation — a missing socket surfaces as `PodmanError::Unreachable`
+/// on the first call (e.g. [`PodmanClient::version`]).
 #[derive(Debug, Clone)]
 pub struct LibpodClient {
     transport: Transport,
@@ -112,12 +112,12 @@ impl PodmanClient for LibpodClient {
         }
         let body = self.transport.call(Method::GET, &path, None).await?;
         let listed: Vec<ListedContainer> = decode(&body)?;
-        // Lista nie niesie stanu zdrowia ani kodu wyjścia w stabilnej postaci — dociągamy inspectem.
+        // The list carries neither health state nor exit code in a stable form — we fetch them via inspect.
         let mut containers = Vec::with_capacity(listed.len());
         for entry in listed {
             match self.inspect_container(&entry.id).await {
                 Ok(info) => containers.push(info),
-                // Usunięty między listą a inspectem.
+                // Removed between the list and the inspect.
                 Err(PodmanError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -169,7 +169,7 @@ impl PodmanClient for LibpodClient {
             .await
             .map_err(name_conflict)
         {
-            // Idempotentne — kontrakt traitu.
+            // Idempotent — the trait contract.
             Ok(_) | Err(PodmanError::Conflict(_)) => Ok(()),
             Err(e) => Err(e),
         }
@@ -190,7 +190,7 @@ impl PodmanClient for LibpodClient {
     }
 
     async fn secret_create(&self, name: &str, data: &[u8]) -> Result<()> {
-        // Dane sekretu idą wyłącznie w ciele żądania i nigdy do logów/błędów.
+        // Secret data goes only into the request body and never into logs/errors.
         let path = format!(
             "/secrets/create?name={}&driver=file&replace=true",
             encode_component(name)
@@ -246,7 +246,7 @@ struct PullState {
 }
 
 impl PullState {
-    /// Następny element strumienia; `None` kończy strumień. Każdy błąd jest ostatnim elementem.
+    /// Next stream item; `None` ends the stream. Every error is the last item.
     async fn step(&mut self) -> Option<Result<PullEvent>> {
         if self.finished {
             return None;
@@ -269,12 +269,12 @@ impl PullState {
         let lines = self.lines.as_mut().expect("opened above");
         loop {
             let Some(line) = lines.next_line().await? else {
-                // Koniec strumienia: bez ID obrazu pull się nie udał (a nie zgłosił błędu).
+                // End of stream: without an image ID the pull failed (rather than reporting an error).
                 let image_id = self.image_id.take().ok_or_else(|| {
                     PodmanError::Protocol("pull stream ended without an image id".into())
                 })?;
-                // Digest preferowany dla repozytorium z `reference`; obraz mógł dostać inną nazwę
-                // (np. pull po digeście), wtedy pytamy po ID.
+                // Prefer the digest for the repository from `reference`; the image may have got another name
+                // (e.g. a pull by digest), in which case we query by ID.
                 let digest = match self.client.image_inspect(&self.reference).await {
                     Ok(image) => image.digest,
                     Err(PodmanError::NotFound(_)) => {
@@ -319,7 +319,7 @@ impl EventsState {
         let lines = self.lines.as_mut().expect("opened above");
         match lines.next_line().await? {
             Some(line) => Ok(Some(decode::<WireEvent>(&line)?.into_domain())),
-            // Strumień zdarzeń nie powinien się kończyć — dla wywołującego to utrata połączenia.
+            // The event stream should never end — for the caller that means a lost connection.
             None => Err(PodmanError::Unreachable("event stream closed".into())),
         }
     }

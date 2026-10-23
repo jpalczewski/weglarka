@@ -1,5 +1,5 @@
-//! `cargo run -p weglarka-ingress --example dump -- nginx|traefik` — wypisuje przykładowy config
-//! (używane w CI do `nginx -t`).
+//! `cargo run -p weglarka-ingress --example dump -- nginx|traefik` — prints a sample config
+//! (used in CI for `nginx -t`).
 
 use std::collections::BTreeMap;
 

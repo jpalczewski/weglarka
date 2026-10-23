@@ -1,5 +1,5 @@
-//! `FakePodman` — `PodmanClient` w pamięci. Deterministyczny, bez I/O i czasu.
-//! Skryptowanie: digesty pulla, błędy pulla, kolejka wyników healthchecka, zdarzenia.
+//! `FakePodman` — in-memory `PodmanClient`. Deterministic, no I/O or time.
+//! Scripting: pull digests, pull errors, healthcheck result queue, events.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,7 +15,7 @@ use crate::podman::{
     VersionInfo,
 };
 
-/// Zapis wywołania — do asercji kolejności operacji w testach reconcile/deploy.
+/// Record of a call — for asserting operation order in reconcile/deploy tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     ContainerCreate(String),
@@ -46,7 +46,7 @@ pub enum Call {
 #[derive(Default)]
 struct State {
     containers: BTreeMap<String, ContainerInfo>,
-    /// referencja → obraz
+    /// reference → image
     images: BTreeMap<String, ImageInfo>,
     pull_digests: BTreeMap<String, Digest>,
     pull_failures: BTreeMap<String, String>,
@@ -58,7 +58,7 @@ struct State {
     next_id: u64,
 }
 
-/// Klonowanie daje uchwyt na ten sam stan (`Arc`).
+/// Cloning yields a handle to the same state (`Arc`).
 #[derive(Clone, Default)]
 pub struct FakePodman {
     state: Arc<Mutex<State>>,
@@ -73,14 +73,14 @@ impl FakePodman {
         self.state.lock().expect("fake podman mutex poisoned")
     }
 
-    /// Digest zwracany przez kolejne pulle danej referencji (domyślnie: hash referencji).
+    /// Digest returned by subsequent pulls of a reference (default: hash of the reference).
     pub fn set_pull_digest(&self, reference: &str, digest: Digest) {
         self.lock()
             .pull_digests
             .insert(reference.to_owned(), digest);
     }
 
-    /// Pull tej referencji zakończy się błędem w środku strumienia.
+    /// Pulling this reference ends with an error mid-stream.
     pub fn fail_pull(&self, reference: &str, message: &str) {
         self.lock()
             .pull_failures
@@ -91,19 +91,19 @@ impl FakePodman {
         self.lock().pull_failures.remove(reference);
     }
 
-    /// Kolejne `healthcheck_run`/odczyty zdrowia kontenera; ostatni element powtarza się w nieskończoność.
+    /// Successive `healthcheck_run`s / container health reads; the last element repeats forever.
     pub fn script_health(&self, container: &str, results: impl IntoIterator<Item = HealthStatus>) {
         self.lock()
             .health_scripts
             .insert(container.to_owned(), results.into_iter().collect());
     }
 
-    /// Dodaje zdarzenie do odtworzenia przez `events()`.
+    /// Adds an event to be replayed by `events()`.
     pub fn push_event(&self, event: PodmanEvent) {
         self.lock().events.push(event);
     }
 
-    /// Symuluje zakończenie kontenera (crash).
+    /// Simulates the container exiting (crash).
     pub fn crash_container(&self, name: &str, exit_code: i32) {
         if let Some(c) = self.lock().containers.get_mut(name) {
             c.state = ContainerState::Exited;
@@ -172,7 +172,7 @@ impl PodmanClient for FakePodman {
         if s.containers.contains_key(&spec.name) {
             return Err(PodmanError::Conflict(spec.name.clone()));
         }
-        // Prawdziwy Podman nie tworzy kontenera z nieznanego obrazu.
+        // Real Podman does not create a container from an unknown image.
         let image = s
             .images
             .iter()
@@ -303,7 +303,7 @@ impl PodmanClient for FakePodman {
                 .cloned()
                 .unwrap_or_else(|| Self::default_digest(reference));
             let id = digest.as_str().trim_start_matches("sha256:").to_owned();
-            // Ten sam obraz dostępny pod referencją i pod `repo@digest`.
+            // The same image is available under the reference and under `repo@digest`.
             let repo = reference
                 .rsplit_once(':')
                 .map_or(reference, |(r, _)| r)
@@ -392,7 +392,7 @@ impl PodmanClient for FakePodman {
             .keys()
             .position(|n| n == name)
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))?;
-        // Deterministyczna „bramka” z numeru sieci (jak 10.89.N.1 w netavark).
+        // Deterministic "gateway" derived from the network number (like 10.89.N.1 in netavark).
         let octet = u8::try_from(index % 250).unwrap_or(0);
         Ok(NetworkInfo {
             name: name.to_owned(),
@@ -434,7 +434,7 @@ impl PodmanClient for FakePodman {
 
     fn events(&self, filter: &EventFilter) -> impl Stream<Item = Result<PodmanEvent>> + Send {
         let s = self.lock();
-        // Filtr etykiet dopasowuje atrybuty zdarzenia (jak `attributes` w prawdziwym API).
+        // The label filter matches the event's attributes (like `attributes` in the real API).
         let items: Vec<_> = s
             .events
             .iter()

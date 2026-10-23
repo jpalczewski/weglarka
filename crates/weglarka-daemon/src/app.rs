@@ -1,4 +1,4 @@
-//! Wspólny stan demona współdzielony przez admin API, listener webhooków i doctora.
+//! Daemon state shared by the admin API, the webhook listener and doctor.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,10 +15,10 @@ use weglarka_core::webhook::WebhookSource;
 use crate::ingress::IngressManager;
 use crate::settings::Paths;
 
-/// Nazwa sekretu apki z kluczem HMAC webhooka (w magazynie jako `<instancja>.webhook-hmac`).
+/// Name of the app secret holding the webhook HMAC key (stored as `<instance>.webhook-hmac`).
 pub const WEBHOOK_SECRET: &str = "webhook-hmac";
 
-/// Jak długo operacja mutująca czeka na muteks silnika (deploy trzyma go przez bramkę zdrowia).
+/// How long a mutating operation waits for the engine mutex (a deploy holds it through the health gate).
 pub const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Daemon<P: PodmanClient> {
@@ -28,7 +28,7 @@ pub struct Daemon<P: PodmanClient> {
     pub secrets: Arc<FileSecretStore>,
     pub ingress: Arc<IngressManager<P>>,
     pub github: Box<dyn WebhookSource>,
-    /// Serializuje „sprawdź i zapisz” w `apps add` (silnik blokuje dopiero sam zapis).
+    /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
     pub desired_lock: tokio::sync::Mutex<()>,
     pub(crate) triggers: mpsc::Sender<Trigger>,
     pub(crate) webhook_addr: OnceLock<SocketAddr>,
@@ -36,14 +36,14 @@ pub struct Daemon<P: PodmanClient> {
 }
 
 impl<P: PodmanClient + 'static> Daemon<P> {
-    /// Stan pożądany się zmienił: reconcile i ingress ruszają od razu (zlane z innymi żądaniami).
+    /// Desired state changed: reconcile and ingress kick in immediately (coalesced with other requests).
     pub fn changed(&self) {
-        // Pełny kanał = reconcile i tak jest już zaplanowany.
+        // A full channel means a reconcile is already scheduled.
         let _ = self.triggers.try_send(Trigger::Changed);
         self.ingress.request_apply();
     }
 
-    /// Uruchamia zadanie w tle śledzone na czas graceful shutdownu.
+    /// Spawns a background task tracked for the duration of graceful shutdown.
     pub fn spawn_tracked(&self, fut: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}

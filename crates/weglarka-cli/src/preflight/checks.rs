@@ -1,4 +1,4 @@
-//! Konkretne sprawdzenia preflight. Każde to osobny typ za [`Check`].
+//! Concrete preflight checks. Each is a separate type behind [`Check`].
 
 use std::io::ErrorKind;
 use std::net::IpAddr;
@@ -14,27 +14,29 @@ use super::parse::{
 };
 use super::{Check, Context, RuntimeUser, fail, ok, warn};
 
-/// Minimalny łączny rozmiar zakresów subuid/subgid usera dla `userns=auto`.
-/// 65536 to standardowy zakres rootless Podmana (obrazy z uid > 0 mieszczą się w nim);
-/// poniżej tego `userns=auto` i zwykłe obrazy zaczną zawodzić.
+/// Minimum total size of the user's subuid/subgid ranges for `userns=auto`.
+/// 65536 is the standard rootless Podman range (images with uid > 0 fit in it);
+/// below that, `userns=auto` and ordinary images start failing.
 pub const MIN_SUBID_COUNT: u64 = 65_536;
 
-/// Zalecany rozmiar zakresu: `userns=auto` przydziela każdemu kontenerowi osobny blok
-/// (domyślnie 1024 id, obrazy z dużymi uid potrzebują więcej), więc 65536 starcza na jedną-dwie
-/// apki. Rola Ansible `weglarka_host` daje 2 000 000; poniżej 1 000 000 ostrzegamy.
+/// Recommended range size: `userns=auto` gives each container a separate block
+/// (1024 ids by default, images with large uids need more), so 65536 is enough for one or two
+/// apps. The Ansible role `weglarka_host` provides 2,000,000; we warn below 1,000,000.
 pub const RECOMMENDED_SUBID_COUNT: u64 = 1_000_000;
 
-// Poniższe nazwy/ścieżki to konwencja roli Ansible `weglarka_host` (repo niechybnie),
-// nie część konfiguracji Węglarki — zmiana tam wymaga zmiany tutaj.
-/// Polityka walidatora synchronizacji pliku Traefika (JSON, root-owa).
+// The names/paths below are a convention of the Ansible role `weglarka_host` (niechybnie repo),
+// not part of Węglarka's configuration — a change there requires a change here.
+/// Sync validator policy for Traefik's file (JSON, root-owned).
 pub const TRAEFIK_POLICY_PATH: &str = "/etc/weglarka/traefik-policy.json";
-/// Unit systemd, który po zmianie pliku Węglarki waliduje go polityką i kopiuje do Traefika.
+/// systemd unit that, after Węglarka's file changes, validates it against the policy and copies
+/// it to Traefik.
 pub const TRAEFIK_SYNC_UNIT: &str = "weglarka-traefik-sync.path";
 
-/// Źródło, z którego ma pochodzić Podman (repo OBS `home:alvistack`, decyzja z notatki MVP).
+/// The source Podman is expected to come from (OBS repo `home:alvistack`, decision from the MVP
+/// note).
 pub const PINNED_PODMAN_SOURCE: &str = "alvistack";
 
-/// Minimalna wersja Podmana/libpod API.
+/// Minimum Podman / libpod API version.
 pub const MIN_PODMAN_MAJOR: u32 = 6;
 
 fn runtime_user<'a>(cx: &'a Context<'_>, id: &str) -> Result<&'a RuntimeUser, DoctorCheck> {
@@ -47,7 +49,7 @@ fn runtime_user<'a>(cx: &'a Context<'_>, id: &str) -> Result<&'a RuntimeUser, Do
     })
 }
 
-/// Pierwszy działający program z listy kandydatów (`NotFound` → następny).
+/// First working program from the candidate list (`NotFound` → next).
 fn run_first(host: &dyn Host, candidates: &[&str], args: &[&str]) -> Option<(String, CmdOutput)> {
     candidates.iter().find_map(|c| match host.run(c, args) {
         Ok(out) => Some(((*c).to_owned(), out)),
@@ -97,7 +99,7 @@ impl Check for RuntimeUserExists {
     }
 }
 
-/// `/etc/subuid` albo `/etc/subgid`.
+/// `/etc/subuid` or `/etc/subgid`.
 pub struct SubIds {
     id: &'static str,
     file: &'static str,
@@ -386,7 +388,8 @@ impl Check for Netavark {
                 "potrzebny netavark ≥ 2",
             );
         }
-        // Sterownik firewalla: env `NETAVARK_FW` (w środowisku lub containers.conf) wygrywa z autodetekcją.
+        // Firewall driver: env `NETAVARK_FW` (in the environment or containers.conf) wins over
+        // autodetection.
         let mut configured = cx.host.env("NETAVARK_FW");
         if configured.is_none() {
             let mut files = vec!["/etc/containers/containers.conf".to_owned()];
@@ -478,8 +481,8 @@ impl Check for Pasta {
     }
 }
 
-/// Ubuntu 24.04: przy `kernel.apparmor_restrict_unprivileged_userns=1` rootless Podman
-/// działa tylko z załadowanym profilem `podman` (attach do binarki, z `userns,`).
+/// Ubuntu 24.04: with `kernel.apparmor_restrict_unprivileged_userns=1` rootless Podman
+/// only works with the `podman` profile loaded (attached to the binary, with `userns,`).
 pub struct AppArmorUserns;
 impl AppArmorUserns {
     const SYSCTL: &'static str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
@@ -523,7 +526,7 @@ impl Check for AppArmorUserns {
                     )
                 }
             }
-            // Lista profili jest czytelna tylko dla roota — nie zgadujemy.
+            // The profile list is readable only by root — we don't guess.
             Err(e) => {
                 let file = cx.host.stat(Path::new(Self::PROFILE_FILE)).is_ok();
                 warn(
@@ -659,8 +662,9 @@ impl Check for BindAddress {
     }
 }
 
-/// Port z `ingress.bind` nie może być zajęty przez cudzy proces. Właściciela gniazda czytamy
-/// z `/proc/net/tcp*` (kolumna uid): gniazdo usera runtime'u to nginx Węglarki (pasta/rootlessport).
+/// The port from `ingress.bind` must not be held by someone else's process. We read the socket
+/// owner from `/proc/net/tcp*` (uid column): the runtime user's socket is Węglarka's nginx
+/// (pasta/rootlessport).
 pub struct BindFree;
 impl Check for BindFree {
     fn id(&self) -> &'static str {
@@ -720,8 +724,8 @@ impl Check for BindFree {
     }
 }
 
-/// Tryb `behind` na systemd: root-owy `weglarka-traefik-sync.path` waliduje plik Węglarki
-/// polityką i kopiuje go do Traefika; domeny apek muszą być na allowliście polityki.
+/// `behind` mode on systemd: the root-owned `weglarka-traefik-sync.path` validates Węglarka's file
+/// against the policy and copies it to Traefik; app domains must be on the policy's allowlist.
 pub struct TraefikSync;
 impl Check for TraefikSync {
     fn id(&self) -> &'static str {

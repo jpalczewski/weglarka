@@ -1,5 +1,5 @@
-//! Testy silnika (reconcile + deploy + sekrety) na `FakePodman`. Czas wirtualny (`start_paused`),
-//! więc bramka zdrowia nie czeka naprawdę.
+//! Engine tests (reconcile + deploy + secrets) on `FakePodman`. Virtual time (`start_paused`),
+//! so the health gate does not really wait.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,7 +138,7 @@ async fn fresh_deploy_then_converged() {
         Event::DeployOk { generation: 1, .. }
     ));
 
-    // Drugi przebieg: nic do roboty.
+    // Second pass: nothing to do.
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
 }
 
@@ -175,7 +175,7 @@ async fn deploy_without_changes_is_unchanged_and_new_digest_moves_pointers() {
             .ends_with(digest('b').as_str())
     );
 
-    // Kolejność: pull → stop starego → remove → create → start → (bramka bez healthchecka).
+    // Order: pull → stop old → remove → create → start → (gate without a healthcheck).
     let calls = h.fake.calls()[before..].to_vec();
     let pos = |c: &Call| calls.iter().position(|x| x == c).unwrap();
     assert!(pos(&Call::ImagePull(IMAGE.into())) < pos(&Call::ContainerStop("ntfy".into())));
@@ -191,7 +191,7 @@ async fn failed_health_gate_rolls_back_and_marks_state() {
     h.fake.script_health("ntfy", [HealthStatus::Healthy]);
     h.rec.reconcile().await.unwrap();
 
-    // Nowa wersja: 3 próby unhealthy, potem (dla kontenera po rollbacku) healthy.
+    // New version: 3 unhealthy attempts, then (for the container after rollback) healthy.
     h.fake.set_pull_digest(IMAGE, digest('b'));
     h.fake.script_health(
         "ntfy",
@@ -232,7 +232,7 @@ async fn failed_health_gate_rolls_back_and_marks_state() {
             .any(|e| matches!(e, Event::RolledBack { .. }))
     );
 
-    // Znany zły digest: webhook go nie ponawia, force tak.
+    // Known-bad digest: the webhook does not retry it, force does.
     assert_eq!(
         h.rec.deploy(&ntfy, false).await.unwrap(),
         DeployOutcome::KnownBad {
@@ -258,7 +258,7 @@ async fn failed_first_deploy_removes_container_and_waits_for_manual_deploy() {
     assert_eq!(st.current, None);
     assert_eq!(st.failed.unwrap().digest, digest('a'));
 
-    // Kolejny reconcile nie próbuje w kółko.
+    // The next reconcile does not retry endlessly.
     let again = h.rec.reconcile().await.unwrap();
     assert!(again.actions.is_empty());
     assert_eq!(again.blocked.len(), 1);
@@ -266,7 +266,7 @@ async fn failed_first_deploy_removes_container_and_waits_for_manual_deploy() {
 
 #[tokio::test(start_paused = true)]
 async fn crash_inside_gate_window_fails_running_only_gate() {
-    // Bez healthchecka: kontener, który padł, nie przechodzi bramki.
+    // Without a healthcheck: a container that died does not pass the gate.
     let h = Harness::new(NTFY);
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.rec.reconcile().await.unwrap();
@@ -274,7 +274,7 @@ async fn crash_inside_gate_window_fails_running_only_gate() {
     let rec = h.rec.clone();
     let fake = h.fake.clone();
     let task = tokio::spawn(async move { rec.deploy(&name("ntfy"), false).await });
-    tokio::time::sleep(Duration::from_secs(3)).await; // w środku okna bramki (6 s)
+    tokio::time::sleep(Duration::from_secs(3)).await; // in the middle of the gate window (6 s)
     fake.crash_container("ntfy", 1);
     let out = task.await.unwrap().unwrap();
     assert!(matches!(out, DeployOutcome::RolledBack { .. }), "{out:?}");
@@ -304,7 +304,7 @@ async fn spec_drift_missing_container_and_stopped_container() {
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.rec.reconcile().await.unwrap();
 
-    // Drift: zmiana env w apks.toml → odtworzenie bez pulla.
+    // Drift: env change in apps.toml → recreate without a pull.
     h.set_apps(&format!("{NTFY}env = {{ A = \"1\" }}\n"));
     let pulls = |h: &Harness| {
         h.fake
@@ -326,7 +326,7 @@ async fn spec_drift_missing_container_and_stopped_container() {
     assert_eq!(h.state("ntfy").generation, 2);
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
 
-    // Kontener zniknął.
+    // The container disappeared.
     h.fake.container_remove("ntfy", true).await.unwrap();
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(
@@ -337,7 +337,7 @@ async fn spec_drift_missing_container_and_stopped_container() {
         }
     );
 
-    // Kontener padł → zwykły start.
+    // The container died → plain start.
     h.fake.crash_container("ntfy", 137);
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(single(&report), &ActionOutcome::Started);
@@ -375,7 +375,7 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
     let h = Harness::new(WITH_SECRET);
     h.fake.set_pull_digest(IMAGE, digest('a'));
 
-    // Brak sekretów: instancja zablokowana z czytelnym powodem, nic nie powstaje.
+    // No secrets: the instance is blocked with a clear reason, nothing is created.
     let report = h.rec.reconcile().await.unwrap();
     assert!(report.actions.iter().all(|a| a.result.is_err()));
     assert!(h.fake.containers().is_empty());
@@ -386,7 +386,7 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
     assert!(report.is_clean(), "{report:?}");
     assert!(h.fake.has_secret("ntfy.config") && h.fake.has_secret("ntfy.token"));
 
-    // Zmiana wartości → drift hasha → recreate.
+    // Value change → hash drift → recreate.
     h.store.set("ntfy.token", SecretValue::new("t2")).unwrap();
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(
@@ -409,7 +409,7 @@ async fn secret_change_waits_for_next_deploy_when_configured() {
 
     h.store.set("ntfy.token", SecretValue::new("t2")).unwrap();
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
-    // Następny deploy (tu wymuszony) odtwarza kontener z nowym sekretem.
+    // The next deploy (forced here) recreates the container with the new secret.
     let creates = |h: &Harness| {
         h.fake
             .calls()
@@ -476,7 +476,7 @@ health = { attempts = 1, window_secs = 1 }
     assert_eq!(h.state("ntfy-v2").current, Some(digest('c')));
     assert_eq!(h.state("pinned").current, Some(digest('a')));
 
-    // Ta sama dostawa → duplikat, żadnych wywołań.
+    // Same delivery → duplicate, no calls.
     let calls = h.fake.calls().len();
     let dup = h.rec.handle_webhook(&ev).await.unwrap();
     assert!(dup.duplicate && dup.results.is_empty());
@@ -488,7 +488,7 @@ health = { attempts = 1, window_secs = 1 }
             .any(|e| matches!(e, Event::WebhookDuplicate { .. }))
     );
 
-    // Bez delivery_id nie dedupujemy (ale deploy jest idempotentny: Unchanged).
+    // Without a delivery_id we do not dedupe (but deploy is idempotent: Unchanged).
     let anon = WebhookEvent {
         delivery_id: None,
         image_ref: IMAGE.into(),
@@ -543,15 +543,15 @@ async fn run_loop_reconciles_on_start_on_trigger_and_periodically() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(h.fake.containers().len(), 1, "start reconcile");
 
-    // Po zmianie stanu: trigger, bez czekania na okres.
+    // After a state change: trigger, without waiting for the period.
     h.set_apps(&format!(
         "{NTFY}\n[apps.second]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n"
     ));
     tx.send(Trigger::Changed).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(40)).await; // domyślna bramka: 30 s
+    tokio::time::sleep(Duration::from_secs(40)).await; // default gate: 30 s
     assert_eq!(h.fake.containers().len(), 2);
 
-    // Okresowo: usunięty kontener wraca po upływie okresu.
+    // Periodically: a removed container comes back after the period elapses.
     h.fake.container_remove("second", true).await.unwrap();
     tokio::time::sleep(Duration::from_secs(150)).await;
     assert_eq!(h.fake.containers().len(), 2);

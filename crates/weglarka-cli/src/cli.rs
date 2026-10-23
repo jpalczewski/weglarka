@@ -1,4 +1,4 @@
-//! Definicja komend. Język opisów: polski (spójnie z README).
+//! Command definitions. The help text (the `///` docs below) is user-visible and stays in Polish.
 
 use std::path::PathBuf;
 

@@ -1,6 +1,6 @@
-//! Deploy `recreate`: pull → stop starego → nowy kontener → bramka zdrowia → przesunięcie
-//! digestów albo rollback do poprzedniego digestu (retencja 1). Do tego fan-out webhooka
-//! (obraz → wszystkie instancje śledzące ten obraz/tag) z deduplikacją po `delivery_id`.
+//! `recreate` deploy: pull → stop old → new container → health gate → digest shift
+//! or rollback to the previous digest (retention 1). Plus webhook fan-out
+//! (image → all instances tracking that image/tag) with dedup by `delivery_id`.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -22,25 +22,26 @@ use crate::webhook::WebhookEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployOutcome {
-    /// Nowy kontener przeszedł bramkę; digesty przesunięte.
+    /// New container passed the gate; digests shifted.
     Deployed { digest: Digest, generation: u64 },
-    /// Ten sam digest i kontener zgodny ze specyfikacją — nic do roboty.
+    /// Same digest and the container matches the spec — nothing to do.
     Unchanged { digest: Digest },
-    /// Ten digest już raz nie przeszedł bramki; wymaga `force`.
+    /// This digest already failed the gate once; requires `force`.
     KnownBad { digest: Digest },
-    /// Nowa wersja odrzucona, przywrócono poprzednią.
+    /// New version rejected, previous one restored.
     RolledBack {
         failed: Digest,
         restored: Digest,
         reason: String,
     },
-    /// Wdrożenie się nie udało i nie było do czego wrócić (lub rollback też zawiódł).
+    /// Deploy failed and there was nothing to return to (or the rollback failed too).
     Failed { digest: Digest, reason: String },
 }
 
-// ── Pomocnicze (czyste) ──────────────────────────────────────────────────────
+// ── Helpers (pure) ──────────────────────────────────────────────────────
 
-/// Repozytorium z referencji obrazu: bez tagu i digestu (`host:5000/a/b:1@sha256:…` → `host:5000/a/b`).
+/// Repository from an image reference: without tag and digest (`host:5000/a/b:1@sha256:…` →
+/// `host:5000/a/b`).
 pub fn image_repo(image: &str) -> &str {
     let image = image.split('@').next().unwrap_or(image);
     let name_start = image.rfind('/').map_or(0, |i| i + 1);
@@ -50,12 +51,12 @@ pub fn image_repo(image: &str) -> &str {
     }
 }
 
-/// Referencja przypinająca digest: `repo@sha256:…`.
+/// Reference pinning a digest: `repo@sha256:…`.
 pub fn pinned_ref(image: &str, digest: &Digest) -> String {
     format!("{}@{digest}", image_repo(image))
 }
 
-/// `(repo, tag)` do porównywania obrazów z webhooka z `apps.toml`; brak tagu = `latest`.
+/// `(repo, tag)` for comparing webhook images with `apps.toml`; no tag = `latest`.
 fn normalize_image(image: &str) -> (String, String) {
     let no_digest = image.split('@').next().unwrap_or(image);
     let repo = image_repo(no_digest).to_ascii_lowercase();
@@ -67,7 +68,7 @@ fn normalize_image(image: &str) -> (String, String) {
     (repo, tag)
 }
 
-/// Instancje z `auto_update`, które śledzą dany obraz/tag (fan-out).
+/// Instances with `auto_update` that track the given image/tag (fan-out).
 pub fn instances_tracking(apps: &AppsFile, image_ref: &str) -> Vec<InstanceName> {
     let wanted = normalize_image(image_ref);
     apps.apps
@@ -77,7 +78,7 @@ pub fn instances_tracking(apps: &AppsFile, image_ref: &str) -> Vec<InstanceName>
         .collect()
 }
 
-/// Ograniczona pamięć ostatnio widzianych `delivery_id`.
+/// Bounded memory of recently seen `delivery_id`s.
 pub struct DeliveryDedup {
     cap: usize,
     order: VecDeque<String>,
@@ -93,7 +94,7 @@ impl DeliveryDedup {
         }
     }
 
-    /// `true`, jeśli identyfikator był już widziany; w przeciwnym razie zapamiętuje go.
+    /// `true` if the identifier was already seen; otherwise remembers it.
     pub fn check_and_insert(&mut self, id: &str) -> bool {
         if self.seen.contains(id) {
             return true;
@@ -116,14 +117,14 @@ pub struct WebhookOutcome {
     pub results: Vec<(InstanceName, Result<DeployOutcome, EngineError>)>,
 }
 
-/// Wynik startu kontenera: hash, z którym go uruchomiono, i werdykt bramki.
+/// Result of starting a container: the hash it was started with, and the gate verdict.
 struct Launched {
     hash: SpecHash,
     health: Result<(), String>,
 }
 
 impl<P: PodmanClient> Reconciler<P> {
-    /// Ręczny/webhookowy deploy jednej instancji. `force` pomija `Unchanged` i `KnownBad`.
+    /// Manual/webhook deploy of a single instance. `force` skips `Unchanged` and `KnownBad`.
     pub async fn deploy(
         &self,
         instance: &InstanceName,
@@ -133,7 +134,7 @@ impl<P: PodmanClient> Reconciler<P> {
         self.deploy_locked(instance, force).await
     }
 
-    /// Webhook „nowy obraz”: dedup po `delivery_id`, fan-out do instancji z `auto_update`.
+    /// "New image" webhook: dedup by `delivery_id`, fan-out to instances with `auto_update`.
     pub async fn handle_webhook(
         &self,
         event: &WebhookEvent,
@@ -168,7 +169,7 @@ impl<P: PodmanClient> Reconciler<P> {
         })
     }
 
-    // ── Wnętrze (wołane pod `lock`) ──────────────────────────────────────────
+    // ── Internals (called under `lock`) ──────────────────────────────────────────
 
     fn load_spec(&self, instance: &InstanceName) -> Result<AppSpec, EngineError> {
         state::load_apps(&self.paths.apps)?
@@ -177,7 +178,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))
     }
 
-    /// Oczekiwany `spec-hash` zgodnie z polityką zmiany sekretów.
+    /// Expected `spec-hash` according to the secret-change policy.
     pub(crate) async fn desired_hash(
         &self,
         instance: &InstanceName,
@@ -225,9 +226,9 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    /// Przygotowanie (obraz, sieć, sekrety) → usunięcie starego → create+start → bramka.
-    /// `Err` oznacza porażkę *przed* ruszeniem starego kontenera; późniejsze błędy lądują
-    /// w `Launched::health`.
+    /// Prepare (image, network, secrets) → remove the old one → create+start → gate.
+    /// `Err` means failure *before* touching the old container; later errors end up
+    /// in `Launched::health`.
     async fn launch(
         &self,
         instance: &InstanceName,
@@ -285,9 +286,9 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(Launched { hash, health })
     }
 
-    /// Bramka zdrowia: `attempts` prób w oknie `window_secs`. Kontener musi cały czas działać;
-    /// jeśli obraz ma healthcheck, pierwszy `Healthy` kończy bramkę sukcesem, a brak `Healthy`
-    /// po wszystkich próbach to porażka. Bez healthchecka sukces = running przez całe okno.
+    /// Health gate: `attempts` tries within `window_secs`. The container must keep running throughout;
+    /// if the image has a healthcheck, the first `Healthy` ends the gate in success, and no `Healthy`
+    /// after all attempts is a failure. Without a healthcheck, success = running for the whole window.
     async fn health_gate(&self, name: &str, gate: &HealthGate) -> Result<(), String> {
         let attempts = gate.attempts.max(1);
         let step = Duration::from_millis(gate.window_secs.max(1) * 1000 / u64::from(attempts));
@@ -396,7 +397,7 @@ impl<P: PodmanClient> Reconciler<P> {
             reason: reason.clone(),
         });
         let name = labels::container_name(instance);
-        // Nie ma do czego wrócić, gdy nic nie jest przypięte albo to ten sam digest (np. zmiana env).
+        // Nothing to return to when nothing is pinned or it is the same digest (e.g. an env change).
         let rollback_to = cur.current.clone().filter(|c| *c != digest);
         let Some(prev) = rollback_to else {
             if cur.current.is_none() {
@@ -470,8 +471,8 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    /// Odtworzenie kontenera z przypiętego digestu (brak kontenera / drift). Bez rollbacku:
-    /// digest jest już uznany za dobry, a stary kontener nie istnieje albo ma zły spec.
+    /// Recreate the container from the pinned digest (container missing / drift). No rollback:
+    /// the digest is already considered good, and the old container does not exist or has a bad spec.
     pub(crate) async fn recreate_locked(
         &self,
         instance: &InstanceName,
@@ -547,7 +548,7 @@ mod tests {
         assert!(!d.check_and_insert("a"));
         assert!(d.check_and_insert("a"));
         assert!(!d.check_and_insert("b"));
-        assert!(!d.check_and_insert("c")); // wypycha "a"
+        assert!(!d.check_and_insert("c")); // evicts "a"
         assert!(!d.check_and_insert("a"));
     }
 }

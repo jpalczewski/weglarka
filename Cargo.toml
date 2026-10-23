@@ -17,13 +17,13 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-# wewnętrzne
+# internal
 weglarka-api = { path = "crates/weglarka-api" }
 weglarka-core = { path = "crates/weglarka-core" }
 weglarka-podman = { path = "crates/weglarka-podman" }
 weglarka-ingress = { path = "crates/weglarka-ingress" }
 
-# zewnętrzne
+# external
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 clap = { version = "4", features = ["derive"] }

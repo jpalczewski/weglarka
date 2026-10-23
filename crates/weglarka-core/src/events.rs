@@ -1,5 +1,5 @@
-//! Zdarzenia domenowe silnika (deploy ok/fail/rollback…) — typy pod przyszły dziennik zdarzeń.
-//! W MVP bez trwałego logu: domyślny odbiornik tylko loguje przez `tracing`.
+//! Engine domain events (deploy ok/fail/rollback…) — types for a future event journal.
+//! No durable log in the MVP: the default sink only logs via `tracing`.
 
 use std::sync::Mutex;
 
@@ -17,35 +17,35 @@ pub enum Event {
         digest: Option<Digest>,
         reason: String,
     },
-    /// Nowa wersja odrzucona przez bramkę zdrowia, przywrócono poprzedni digest.
+    /// New version rejected by the health gate, previous digest restored.
     RolledBack {
         instance: InstanceName,
         failed: Digest,
         restored: Digest,
         reason: String,
     },
-    /// Rollback też się nie powiódł — instancja wymaga interwencji.
+    /// Rollback failed too — the instance needs intervention.
     RollbackFailed {
         instance: InstanceName,
         reason: String,
     },
-    /// Kontener odtworzony z przypiętego digestu (brak kontenera lub drift `spec-hash`).
+    /// Container recreated from the pinned digest (container missing or `spec-hash` drift).
     Recreated {
         instance: InstanceName,
         reason: String,
     },
-    /// Kontener usunięty, bo instancji nie ma w `apps.toml`.
+    /// Container removed because the instance is not in `apps.toml`.
     Pruned { container: String },
-    /// Webhook odrzucony jako duplikat (`delivery_id` już widziany).
+    /// Webhook rejected as a duplicate (`delivery_id` already seen).
     WebhookDuplicate { delivery_id: String },
 }
 
-/// Odbiornik zdarzeń; synchroniczny i dyn-compatible (przyszły dziennik dopisuje do pliku).
+/// Event sink; synchronous and dyn-compatible (a future journal appends to a file).
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: Event);
 }
 
-/// Domyślny odbiornik: `tracing` (poziom info, błędy jako warn).
+/// Default sink: `tracing` (info level, errors as warn).
 pub struct TracingSink;
 
 impl EventSink for TracingSink {
@@ -59,7 +59,7 @@ impl EventSink for TracingSink {
     }
 }
 
-/// Zbiera zdarzenia w pamięci (testy).
+/// Collects events in memory (tests).
 #[derive(Default)]
 pub struct VecSink(Mutex<Vec<Event>>);
 

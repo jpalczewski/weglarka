@@ -1,7 +1,7 @@
 name: Release
 
-# main → ghcr.io/jpalczewski/weglarka:main + :sha-<7>; tag v* → :<wersja> + :latest oraz assety GitHub Release.
-# Decyzje: docs/decisions/0006-pakowanie-obrazy-i-release.md
+# main → ghcr.io/jpalczewski/weglarka:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
+# Decisions: docs/decisions/0006-pakowanie-obrazy-i-release.md
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write # cosign keyless (OIDC GitHub)
+      id-token: write # cosign keyless (GitHub OIDC)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Tag zgodny z wersją workspace

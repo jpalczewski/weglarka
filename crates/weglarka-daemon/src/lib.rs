@@ -1,8 +1,8 @@
-//! Demon Węglarki — składanie całości: admin API (unix socket), listener webhooków (TCP),
-//! pętla reconcile z `weglarka-core`, ingress (nginx + Traefik) i `Platform` systemd.
+//! The Węglarka daemon — wires everything together: admin API (unix socket), webhook listener (TCP),
+//! the `weglarka-core` reconcile loop, ingress (nginx + Traefik) and the systemd `Platform`.
 //!
-//! Demon jest generyczny po `PodmanClient` (trait nie jest dyn-compatible), więc testy
-//! uruchamiają go na `FakePodman`, a binarka na `LibpodClient`.
+//! The daemon is generic over `PodmanClient` (the trait is not dyn-compatible), so tests
+//! run it on `FakePodman` and the binary on `LibpodClient`.
 
 pub mod admin;
 pub mod app;
@@ -54,7 +54,7 @@ fn io(what: impl Into<String>) -> impl FnOnce(std::io::Error) -> StartError {
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Działający demon; `stop` kończy go łagodnie.
+/// A running daemon; `stop` shuts it down gracefully.
 pub struct Running<P: PodmanClient + 'static> {
     pub daemon: Arc<Daemon<P>>,
     pub admin_socket: PathBuf,
@@ -77,7 +77,7 @@ fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
         .map_err(io(format!("create {}", dir.display())))
 }
 
-/// Binduje socket admin API: usuwa tylko stary *socket*, prawa 0600 od razu po bindzie.
+/// Binds the admin API socket: removes only a stale *socket*, sets mode 0600 right after the bind.
 fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent, 0o700)?;
@@ -111,11 +111,11 @@ pub async fn start<P: PodmanClient + 'static>(
     let Settings { host, paths, .. } = settings;
     ensure_dir(&paths.state_dir, 0o755)?;
 
-    // Sekrety: pusty plik 0600, jeśli go nie ma; luźne prawa = odmowa startu.
+    // Secrets: an empty 0600 file if missing; loose permissions = refuse to start.
     let secrets = Arc::new(FileSecretStore::new(&paths.secrets));
     secrets.init()?;
     secrets.check_permissions()?;
-    // Uszkodzone TOML-e wychodzą od razu, a nie dopiero w pierwszym reconcile.
+    // Corrupt TOMLs surface immediately rather than at the first reconcile.
     state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
 
@@ -211,8 +211,8 @@ pub async fn start<P: PodmanClient + 'static>(
 }
 
 impl<P: PodmanClient + 'static> Running<P> {
-    /// Łagodne zatrzymanie: serwery przestają przyjmować żądania, trwające deploye z webhooków
-    /// kończą się (do limitu), pętla reconcile wychodzi po zamknięciu kanału triggerów.
+    /// Graceful stop: servers stop accepting requests, in-flight webhook deploys finish (up to a
+    /// limit), and the reconcile loop exits once the trigger channel closes.
     pub async fn stop(self) {
         let Running {
             daemon,
@@ -245,7 +245,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             tasks.abort_all();
         }
 
-        // Ostatnia referencja do `Daemon` niesie nadawcę triggerów — jej zwolnienie kończy pętlę.
+        // The last reference to `Daemon` holds the trigger sender — dropping it ends the loop.
         drop(daemon);
         let abort = reconcile.abort_handle();
         if tokio::time::timeout(TASK_DRAIN_TIMEOUT, reconcile)

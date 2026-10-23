@@ -1,4 +1,4 @@
-//! `IngressManager::apply`: kiedy nginx jest tworzony, odtwarzany, przeładowywany (HUP).
+//! `IngressManager::apply`: when nginx is created, recreated, reloaded (HUP).
 
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ async fn nginx_lifecycle() {
         ApplyReport::Unchanged => None,
     };
 
-    // Pusty zbiór apek: nginx i tak powstaje (webhooki).
+    // Empty app set: nginx is created anyway (webhooks).
     assert_eq!(
         nginx_action(manager.apply().await),
         Some(NginxAction::Created)
@@ -69,7 +69,7 @@ async fn nginx_lifecycle() {
     );
     assert_eq!(nginx_action(manager.apply().await), None);
 
-    // Nowa apka z domeną = nowa sieć = odtworzenie kontenera (brak `network_disconnect`).
+    // A new app with a domain = a new network = container recreation (no `network_disconnect`).
     set_apps(&[("blog", "blog.example.eu")]);
     assert_eq!(
         nginx_action(manager.apply().await),
@@ -78,7 +78,7 @@ async fn nginx_lifecycle() {
     assert_eq!(kills(&fake), 0);
     assert_eq!(nginx_action(manager.apply().await), None);
 
-    // Sama zmiana domeny: ten sam zbiór sieci → przeładowanie sygnałem HUP.
+    // Domain change only: same set of networks → reload via HUP.
     set_apps(&[("blog", "new.example.eu")]);
     assert_eq!(
         nginx_action(manager.apply().await),
@@ -93,7 +93,7 @@ async fn nginx_lifecycle() {
             .contains("new.example.eu")
     );
 
-    // Kontener padł → start (bez ruszania configu).
+    // Container died → start (without touching the config).
     fake.crash_container("weglarka-nginx", 1);
     assert_eq!(
         nginx_action(manager.apply().await),
