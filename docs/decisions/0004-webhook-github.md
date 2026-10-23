@@ -23,6 +23,7 @@ tolerancyjny (`#[serde(default)]`), ale nazwy pól (`registry_package.package_ve
 `package_url`) pochodzą z dokumentacji, nie z obserwacji. CI ntfy.zig pcha dwa tagi (`latest` i `sha-…`), więc
 oczekujemy dwóch dostaw na push; `sha-…` nie pasuje do apki śledzącej `:latest` i kończy się 204.
 
-**Znane ograniczenie.** Fan-out rdzenia deployuje *wszystkie* instancje śledzące dany obraz, choć podpis
-zweryfikowano sekretem jednej. Dopóki każda apka ma osobny sekret, a jeden obraz = jedna apka, jest to
-bez znaczenia; przy wielu instancjach jednego obrazu trzeba zawęzić fan-out w rdzeniu.
+**Zakres deployu.** Webhook deployuje wyłącznie apkę, której sekretem zweryfikowano podpis
+(`Reconciler::handle_webhook_for`, addytywne w rdzeniu) — nie ma fan-outu po obrazie na cudze instancje.
+Identyfikator dostawy trafia do logów i zbioru dedup tylko, gdy ma ≤ 64 znaków `[A-Za-z0-9-]`; niezaufane
+wartości w logach są formatowane przez `Debug`.

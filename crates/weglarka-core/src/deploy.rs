@@ -138,6 +138,16 @@ impl<P: PodmanClient> Reconciler<P> {
         &self,
         event: &WebhookEvent,
     ) -> Result<WebhookOutcome, EngineError> {
+        self.handle_webhook_for(event, None).await
+    }
+
+    /// Jak [`Self::handle_webhook`], ale z `only` deployuje wyłącznie tę instancję (np. tę, której
+    /// sekretem zweryfikowano podpis), o ile śledzi obraz z zdarzenia.
+    pub async fn handle_webhook_for(
+        &self,
+        event: &WebhookEvent,
+        only: Option<&InstanceName>,
+    ) -> Result<WebhookOutcome, EngineError> {
         let apps = state::load_apps(&self.paths.apps)?;
         if let Some(id) = &event.delivery_id {
             let dup = self
@@ -156,7 +166,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
             }
         }
-        let matched = instances_tracking(&apps, &event.image_ref);
+        let mut matched = instances_tracking(&apps, &event.image_ref);
+        if let Some(only) = only {
+            matched.retain(|i| i == only);
+        }
         let mut results = Vec::with_capacity(matched.len());
         for inst in &matched {
             results.push((inst.clone(), self.deploy(inst, false).await));

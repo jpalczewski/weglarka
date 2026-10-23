@@ -54,10 +54,15 @@ async fn github<P: PodmanClient + 'static>(
     body: Bytes,
 ) -> StatusCode {
     let req = request_from(&headers, &body);
-    let delivery = req.header(DELIVERY_HEADER).unwrap_or("-").to_owned();
+    // Identyfikator dostawy jest niezaufany do chwili podpisu; do logów tylko krótki, bezpieczny.
+    let delivery = req
+        .header(DELIVERY_HEADER)
+        .filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        .unwrap_or("-")
+        .to_owned();
     let reject = |reason: &str, status: StatusCode| {
         // Bez treści sekretów i ciała — tylko powód i identyfikatory.
-        tracing::warn!(instance = %raw, delivery = %delivery, reason, "webhook rejected");
+        tracing::warn!(instance = ?raw, delivery = ?delivery, reason, "webhook rejected");
         status
     };
 
@@ -99,10 +104,11 @@ async fn github<P: PodmanClient + 'static>(
         }
     }
 
-    tracing::info!(instance = %instance, delivery = %delivery, image = %event.image_ref, "webhook accepted");
+    tracing::info!(instance = %instance, delivery = ?delivery, image = %event.image_ref, "webhook accepted");
     let daemon = d.clone();
+    let instance = instance.clone();
     d.spawn_tracked(async move {
-        match daemon.engine.handle_webhook(&event).await {
+        match daemon.engine.handle_webhook_for(&event, Some(&instance)).await {
             Ok(outcome) => {
                 for (inst, result) in &outcome.results {
                     match result {

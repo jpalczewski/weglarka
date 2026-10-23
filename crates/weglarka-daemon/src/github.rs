@@ -121,7 +121,15 @@ impl WebhookSource for GitHub {
             return Err(WebhookError::BadPayload("missing package object".into()));
         };
         Ok(package.image_ref()?.map(|image_ref| WebhookEvent {
-            delivery_id: request.header(DELIVERY_HEADER).map(str::to_owned),
+            // Do zbioru dedup trafia tylko krótki identyfikator z bezpiecznego alfabetu.
+            delivery_id: request
+                .header(DELIVERY_HEADER)
+                .filter(|v| {
+                    !v.is_empty()
+                        && v.len() <= 64
+                        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+                .map(str::to_owned),
             image_ref,
         }))
     }
