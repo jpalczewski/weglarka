@@ -87,5 +87,5 @@ if [ -n "$acceptance" ]; then
   PATH="$(cd "$(dirname "$cli")" && pwd):$PATH" "$acceptance" --config "$dir/weglarka.toml" \
     --canary-domain wg-canary.example.test \
     --direct http://127.0.0.1:18080 --webhook-base http://127.0.0.1:19180 \
-    --skip-preflight
+    --skip-preflight --with-local-registry
 fi

@@ -26,6 +26,7 @@ IMAGE=$DEFAULT_CANARY_IMAGE
 WEBHOOK_BASE=
 DIRECT=
 KEEP=0
+LOCAL_REGISTRY=0
 SKIP_ROLLBACK=0
 SKIP_PREFLIGHT=0
 STRICT=0
@@ -46,6 +47,10 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
   --direct URL           zamiast https://<domena>/ pytaj nginx Węglarki bezpośrednio (Host: <domena>),
                          bez Traefika i TLS — do testów lokalnych/CI, np. http://127.0.0.1:8088
   --keep                 nie usuwaj kanarka na końcu (instancje pomocnicze i tak znikają)
+  --with-local-registry  dodatkowo: webhook z realnym deployem + duplikat dostarczenia i wymuszony rollback.
+                         Stawia tymczasowy rejestr na 127.0.0.1:<port>; usługa Podmana użytkownika musi
+                         mieć wpis `insecure` dla tego adresu w registries.conf (robi to CI; na produkcji
+                         nie zalecane). Bez flagi te kroki są pomijane (SKIP).
   --skip-rollback        pomiń test wymuszonego rollbacku
   --skip-preflight       pomiń `doctor --preflight` (np. gdy host to nie docelowy układ)
   --strict               ostrzeżenia `doctor` traktuj jak błąd
@@ -71,6 +76,7 @@ while [ $# -gt 0 ]; do
     --webhook-base) WEBHOOK_BASE=${2:?--webhook-base wymaga wartości}; shift 2 ;;
     --direct) DIRECT=${2:?--direct wymaga wartości}; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --with-local-registry) LOCAL_REGISTRY=1; shift ;;
     --skip-rollback) SKIP_ROLLBACK=1; shift ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
     --strict) STRICT=1; shift ;;
@@ -110,9 +116,6 @@ TRAEFIK_FILE=$(toml_get traefik_dynamic_file)
 REG=127.0.0.1:$REGISTRY_PORT
 WORK=$(mktemp -d)
 : >"$WORK/results.tsv"
-REGISTRIES_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/containers"
-REGISTRIES_DROPIN="$REGISTRIES_DIR/registries.conf.d/zz-weglarka-acceptance.conf"
-REGISTRIES_CONF="$REGISTRIES_DIR/registries.conf"
 
 # Repo i tag kanarka (do payloadu webhooka): `repo:tag[@digest]` → `repo:tag`.
 canary_ref=${IMAGE%%@*}
@@ -139,6 +142,11 @@ die() {
 # Opis przebiegu: stdout, a z --json stderr (stdout zostaje na raport).
 human() {
   if [ "$JSON" = 1 ]; then printf '%s\n' "$*" >&2; else printf '%s\n' "$*"; fi
+}
+
+skip_step() { # opis powód
+  printf '%s\tSKIP\t0\t%s\n' "$1" "$2" >>"$WORK/results.tsv"
+  human "SKIP  $1 ($2)"
 }
 
 # run_step <klucz> <opis> <funkcja> [wymagane-klucze...]
@@ -187,9 +195,6 @@ cleanup_helpers() {
   done
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman rmi -f "$REG/wg-accept/wh:t" "$REG/wg-accept/rb:t" >/dev/null 2>&1 || true
-  rm -f "$REGISTRIES_DROPIN"
-  # Plik zakładamy tylko wtedy, gdy go nie było (patrz step_registry); wtedy znamy jego treść.
-  if [ -f "$WORK/registries_conf_created" ]; then rm -f "$REGISTRIES_CONF"; fi
 }
 
 on_exit() {
@@ -243,9 +248,14 @@ digest_changed_from() { [ "$(show_field "$WEBHOOK_APP" '.state.current // empty'
 # shellcheck disable=SC2329
 router_gone() { ! grep -qF "$CANARY_DOMAIN" "$TRAEFIK_FILE"; }
 
+# whoami drukuje nagłówki żądania; ignoruj wielkość liter i ewentualny CR na końcu linii.
+body_has() { # początek linii
+  tr -d '\r' <"$WORK/body" | grep -qiF -- "$1"
+}
+
 # Kanarek odpowiada 200 i widać nagłówek z nginxa/Traefika (X-Forwarded-Host = domena).
 canary_ok() {
-  [ "$(canary_request)" = 200 ] && grep -qi "^X-Forwarded-Host: $CANARY_DOMAIN\$" "$WORK/body" 2>/dev/null
+  [ "$(canary_request)" = 200 ] && body_has "X-Forwarded-Host: $CANARY_DOMAIN"
 }
 
 hmac_hex() { # sekret plik → hex. Sekret jest jednorazowy i testowy (argv widoczny lokalnie przez chwilę).
@@ -290,6 +300,8 @@ push_variant() { # repo numer [unhealthy]
   podman build -q --pull=never --format docker -t "$ref" "$ctx" >/dev/null
   podman push -q --tls-verify=false "$ref" >/dev/null
 }
+
+REGISTRY_HINT="usługa Podmana nie ufa rejestrowi $REG po http — dodaj do registries.conf użytkownika wpis [[registry]] location=\"$REG\" insecure=true PRZED startem usługi (tak robi CI)"
 
 # Krótka bramka zdrowia, żeby kroki nie czekały domyślnych 30 s.
 write_spec() { # plik obraz
@@ -368,11 +380,11 @@ step_traffic() {
     sleep 5
   done
   log "200 po ~${i}s"
-  grep -qi "^X-Forwarded-Host: $CANARY_DOMAIN\$" "$WORK/body" \
+  body_has "X-Forwarded-Host: $CANARY_DOMAIN" \
     || { sed 's/^/  | /' "$WORK/body"; die "brak X-Forwarded-Host: $CANARY_DOMAIN w odpowiedzi whoami (nginx/Traefik nie przekazały nagłówka)"; }
-  grep -qi '^X-Forwarded-For:' "$WORK/body" || die "brak X-Forwarded-For w odpowiedzi whoami"
+  body_has 'X-Forwarded-For:' || die "brak X-Forwarded-For w odpowiedzi whoami"
   if [ -z "$DIRECT" ]; then
-    grep -qi '^X-Forwarded-Proto: https' "$WORK/body" || die "brak X-Forwarded-Proto: https (nginx nie ufa Traefikowi?)"
+    body_has 'X-Forwarded-Proto: https' || die "brak X-Forwarded-Proto: https (nginx nie ufa Traefikowi?)"
     note "https://$CANARY_DOMAIN/ → 200, cert ważny, nagłówki forwardowane"
   else
     note "$DIRECT (Host: $CANARY_DOMAIN) → 200, nagłówki forwardowane; TLS nie sprawdzany"
@@ -382,18 +394,8 @@ step_traffic() {
 step_registry() {
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman run -d --name "$REGISTRY_CONTAINER" -p "127.0.0.1:$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
-  # Demon ciągnie obrazy przez usługę Podmana tego usera — rejestr po http musi być jawnie „insecure”.
-  # containers/image czyta `registries.conf.d` użytkownika tylko wtedy, gdy istnieje jego `registries.conf`.
-  mkdir -p "$(dirname "$REGISTRIES_DROPIN")"
-  if [ ! -e "$REGISTRIES_CONF" ]; then
-    : >"$REGISTRIES_CONF"
-    : >"$WORK/registries_conf_created"
-  fi
-  cat >"$REGISTRIES_DROPIN" <<EOF
-[[registry]]
-location = "$REG"
-insecure = true
-EOF
+  # Wpisu `insecure` NIE dodajemy: pull robi długo żyjąca usługa Podmana, która czyta registries.conf
+  # przy starcie. Warunek (wpis przed startem usługi) zapewnia operator/CI; brak = czytelny FAIL w deployu.
   wait_for "rejestr testowy" 60 curl -fsS "http://$REG/v2/" || die "rejestr testowy nie odpowiada na $REG"
   note "lokalny rejestr na $REG"
 }
@@ -435,7 +437,7 @@ step_webhook_deploy() {
   wg apps remove --ignore-missing "$WEBHOOK_APP" >/dev/null
   wg apps add "$WEBHOOK_APP" --spec "$spec" >/dev/null
   set_secret "$WEBHOOK_APP" webhook-hmac "$secret"
-  wg --json deploy "$WEBHOOK_APP" >/dev/null || die "pierwszy deploy $WEBHOOK_APP nie przeszedł"
+  wg --json deploy "$WEBHOOK_APP" >/dev/null || die "pierwszy deploy $WEBHOOK_APP nie przeszedł; $REGISTRY_HINT"
   gen0=$(show_field "$WEBHOOK_APP" .state.generation)
   cur0=$(show_field "$WEBHOOK_APP" '.state.current // empty')
   [ -n "$cur0" ] || die "brak digestu po pierwszym deployu"
@@ -486,7 +488,7 @@ step_rollback() {
   write_spec "$spec" "$ref"
   wg apps remove --ignore-missing "$ROLLBACK_APP" >/dev/null
   wg apps add "$ROLLBACK_APP" --spec "$spec" >/dev/null
-  wg --json deploy "$ROLLBACK_APP" >/dev/null || die "deploy dobrej wersji nie przeszedł"
+  wg --json deploy "$ROLLBACK_APP" >/dev/null || die "deploy dobrej wersji nie przeszedł; $REGISTRY_HINT"
   good=$(show_field "$ROLLBACK_APP" '.state.current // empty')
   [ -n "$good" ] || die "brak digestu dobrej wersji"
   log "dobra wersja: $good"
@@ -510,8 +512,6 @@ step_cleanup() {
     wg apps remove --ignore-missing "$app" >/dev/null
   done
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
-  rm -f "$REGISTRIES_DROPIN"
-  if [ -f "$WORK/registries_conf_created" ]; then rm -f "$REGISTRIES_CONF"; fi
   wg apps remove "$CANARY" >/dev/null || die "apps remove $CANARY nie powiodło się"
   wg --json apps list | jq -e --arg n "$CANARY" '[.apps[].name] | index($n) | not' >/dev/null \
     || die "kanarek nadal na liście apek"
@@ -542,12 +542,17 @@ if [ -z "$DIRECT" ]; then
 else
   run_step traffic "ruch: nginx bezpośrednio → 200, nagłówki" step_traffic canary
 fi
-run_step registry "lokalny rejestr testowy" step_registry doctor
 run_step webhook_protocol "webhook: 202 / 401 / 204" step_webhook_protocol canary
-run_step webhook_deploy "webhook: deploy, duplikat dostarczenia" step_webhook_deploy registry
+if [ "$LOCAL_REGISTRY" = 1 ]; then
+  run_step registry "lokalny rejestr testowy" step_registry doctor
+  run_step webhook_deploy "webhook: deploy, duplikat dostarczenia" step_webhook_deploy registry
+else
+  skip_step "webhook: deploy, duplikat dostarczenia" "wymaga --with-local-registry"
+fi
 if [ "$SKIP_ROLLBACK" = 1 ]; then
-  printf '%s\tSKIP\t0\t%s\n' "rollback wymuszony" "--skip-rollback" >>"$WORK/results.tsv"
-  human "SKIP  rollback wymuszony (--skip-rollback)"
+  skip_step "rollback wymuszony (kod 6)" "--skip-rollback"
+elif [ "$LOCAL_REGISTRY" != 1 ]; then
+  skip_step "rollback wymuszony (kod 6)" "wymaga --with-local-registry (pełny test rollbacku jest w CI)"
 else
   run_step rollback "rollback wymuszony (kod 6)" step_rollback registry canary
 fi

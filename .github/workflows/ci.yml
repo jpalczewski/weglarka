@@ -130,6 +130,13 @@ jobs:
           runroot = "$XDG_RUNTIME_DIR/containers"
           STORAGE
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
+          # Lokalny rejestr skryptu odbioru (scripts/acceptance.sh --with-local-registry) działa po http;
+          # usługa Podmana czyta registries.conf przy starcie, więc wpis musi być przed jej startem.
+          cat > "$HOME/.config/containers/registries.conf" <<'REG'
+          [[registry]]
+          location = "127.0.0.1:15099"
+          insecure = true
+          REG
           podman info 2>&1 | head -40
       - name: Start rootless podman service
         run: |

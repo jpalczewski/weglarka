@@ -162,10 +162,9 @@ weglarka doctor            # autodiagnoza przez API (--json dla maszyn)
 
 ## Odbiór na hoście (`scripts/acceptance.sh`)
 
-Test całego łańcucha na prawdziwym hoście: preflight i `doctor`, kanarek `traefik/whoami` na domenie testowej
-(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204, deploy z webhooka, duplikat dostarczenia),
-wymuszony rollback (kod 6) i sprzątanie. Uruchamiaj **po instalacji** i **po każdej aktualizacji Węglarki**
-(zanim ruszysz prawdziwą apkę), jako użytkownik runtime'u:
+Test łańcucha na prawdziwym hoście: preflight i `doctor`, kanarek `traefik/whoami` na domenie testowej
+(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204) i sprzątanie. Uruchamiaj **po instalacji**
+i **po każdej aktualizacji Węglarki** (zanim ruszysz prawdziwą apkę), jako użytkownik runtime'u:
 
 ```sh
 sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
@@ -174,19 +173,23 @@ sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
 
 Wymaganie: domena kanarka jest w DNS (wskazuje na host) **i na allowliście walidatora**
 (`weglarka_allowed_domains`) — bez tego Traefik nie dostanie routera i krok „ruch” skończy się timeoutem.
-Skrypt dotyka tylko instancji `wg-canary`, `wg-webhook`, `wg-rollback` i kontenera `wg-accept-registry`
-(nigdy `ntfy`). Opcje: `--canary-image`, `--webhook-base`, `--keep` (kanarek zostaje), `--skip-rollback`,
-`--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`, `--json` (raport maszynowy na stdout),
-`--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa tego CI). Kod wyjścia ≠ 0 przy
-jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków. Wymaga `weglarka`, `curl`,
-`openssl`, `jq`, `podman`.
+Skrypt dotyka tylko instancji `wg-canary` (domyślnie) oraz `wg-webhook`/`wg-rollback` i kontenera
+`wg-accept-registry` z `--with-local-registry` — nigdy `ntfy`. Opcje: `--canary-image`, `--webhook-base`, `--keep`
+(kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`, `--json` (raport
+maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa tego CI).
+Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
+Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`.
 
-Jak wymuszany jest zmienny stan: webhook i rollback używają tagów w tymczasowym rejestrze
-`127.0.0.1:15099` (kontener `wg-accept-registry`, jawny wpis `insecure` w
-`~/.config/containers/registries.conf.d/zz-weglarka-acceptance.conf`, usuwany na końcu). Rollback: tag zaczyna
-wskazywać obraz z zawsze nieudanym healthcheckiem → bramka zdrowia odrzuca → wraca poprzedni digest. Uwaga:
-`secrets.toml` zachowuje sekrety `webhook-hmac` instancji testowych po ich usunięciu (nadpisywane przy kolejnym
-uruchomieniu; to jednorazowe wartości testowe).
+**Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
+zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
+oraz webhook z realnym deployem i duplikatem dostarczenia biegną w CI (`integration-podman`); na hoście są
+opcjonalne (`--with-local-registry`) — wymagają tymczasowego rejestru na `127.0.0.1:15099` i wpisu
+`[[registry]] location = "127.0.0.1:15099" insecure = true` w `registries.conf` użytkownika **przed startem**
+usługi Podmana (czyta go przy starcie). Skrypt sam niczego nie konfiguruje; bez wpisu deploy kończy się FAIL
+z podpowiedzią. Na produkcji nie zalecane.
+
+Uwaga: `secrets.toml` zachowuje sekret `webhook-hmac` kanarka po jego usunięciu (jednorazowa wartość testowa,
+nadpisywana przy kolejnym uruchomieniu).
 
 ## 6. Pierwsza apka: ntfy.zig
 
