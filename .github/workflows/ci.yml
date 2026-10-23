@@ -63,8 +63,14 @@ jobs:
           Pin: origin download.opensuse.org
           Pin-Priority: 1001
           PIN
-          sudo apt-get update
-          sudo apt-get install -y podman netavark passt uidmap
+          # OBS przekierowuje na mirrory, które bywają w trakcie synchronizacji
+          # ("File has unexpected size") — ponawiamy z odświeżeniem list.
+          for attempt in 1 2 3 4; do
+            sudo apt-get update
+            sudo apt-get install -y -o Acquire::Retries=3 podman netavark passt uidmap && break
+            [ "$attempt" = 4 ] && exit 1
+            sleep 15
+          done
           podman --version
       - name: Start rootless podman service
         run: |
