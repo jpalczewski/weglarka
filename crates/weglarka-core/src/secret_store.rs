@@ -15,6 +15,10 @@ pub enum SecretError {
     Io(String),
     #[error("secret store is corrupt: {0}")]
     Corrupt(String),
+    #[error("invalid secret name {0:?}: expected <instance>.<name>")]
+    InvalidName(String),
+    #[error("secret value for {0} is not valid UTF-8")]
+    NotUtf8(String),
     #[error("insecure permissions on {path}: {reason}")]
     Permissions { path: String, reason: String },
 }
@@ -56,6 +60,26 @@ pub fn fingerprint(value: &SecretValue) -> String {
 /// w nazwie instancji, więc złożenie jest jednoznaczne).
 pub fn scoped_name(instance: &InstanceName, name: &str) -> String {
     format!("{instance}.{name}")
+}
+
+/// Część `<nazwa>` w `<instancja>.<nazwa>`: `[A-Za-z0-9_-]`, 1–64 znaki (bez kropki — złożenie
+/// z nazwą instancji jest jednoznaczne).
+pub fn valid_secret_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Rozbija `<instancja>.<nazwa>` i waliduje obie części.
+pub fn split_scoped(scoped: &str) -> Result<(InstanceName, &str), SecretError> {
+    let bad = || SecretError::InvalidName(scoped.to_owned());
+    let (inst, name) = scoped.split_once('.').ok_or_else(bad)?;
+    let inst = InstanceName::new(inst).map_err(|_| bad())?;
+    if !valid_secret_name(name) {
+        return Err(bad());
+    }
+    Ok((inst, name))
 }
 
 pub trait SecretStore: Send + Sync {

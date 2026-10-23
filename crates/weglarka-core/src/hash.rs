@@ -62,6 +62,24 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
     SpecHash(hex::encode(Sha256::digest(json)))
 }
 
+/// Jak [`spec_hash`], ale dołącza odciski wartości sekretów (`nazwa wiązania → fingerprint`),
+/// więc zmiana sekretu zmienia hash i wymusza odtworzenie kontenera. Przy pustej mapie wynik jest
+/// identyczny z [`spec_hash`] (format v1 pozostaje stabilny, gdy odtwarzanie przy zmianie sekretu
+/// jest wyłączone).
+pub fn spec_hash_with_secrets(
+    spec: &AppSpec,
+    image_digest: &Digest,
+    fingerprints: &BTreeMap<String, String>,
+) -> SpecHash {
+    let base = spec_hash(spec, image_digest);
+    if fingerprints.is_empty() {
+        return base;
+    }
+    let json = serde_json::to_vec(&(base.as_str(), "secrets", fingerprints))
+        .expect("hash input is always serializable");
+    SpecHash(hex::encode(Sha256::digest(json)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +140,17 @@ env = { B = "2", A = "1" }
         s.health.attempts = 9;
         s.auto_update = false;
         assert_eq!(base, spec_hash(&s, &digest('a')));
+    }
+
+    #[test]
+    fn secret_fingerprints_change_hash_only_when_present() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let none = BTreeMap::new();
+        assert_eq!(base, spec_hash_with_secrets(&spec(), &digest('a'), &none));
+        let one = BTreeMap::from([("k".to_owned(), "aaaa".to_owned())]);
+        let two = BTreeMap::from([("k".to_owned(), "bbbb".to_owned())]);
+        let h1 = spec_hash_with_secrets(&spec(), &digest('a'), &one);
+        assert_ne!(base, h1);
+        assert_ne!(h1, spec_hash_with_secrets(&spec(), &digest('a'), &two));
     }
 }

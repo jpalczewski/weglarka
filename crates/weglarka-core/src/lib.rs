@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod config;
+pub mod events;
 pub mod hash;
 pub mod labels;
 pub mod platform;
@@ -20,3 +21,6 @@ pub mod secrets;
 
 #[cfg(feature = "testing")]
 pub mod testing;
+
+#[cfg(all(test, feature = "testing"))]
+mod engine_tests;
