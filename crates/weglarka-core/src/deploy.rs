@@ -216,13 +216,40 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    async fn ensure_image(&self, spec: &AppSpec, digest: &Digest) -> Result<(), EngineError> {
+    /// Returns the image reference to create the container from. Order: the pinned `repo@digest`
+    /// if present locally, then `local_id` (the image of the previous container, kept locally so
+    /// that a rollback does not depend on the registry), and only then a pull.
+    async fn ensure_image(
+        &self,
+        spec: &AppSpec,
+        digest: &Digest,
+        local_id: Option<&str>,
+    ) -> Result<String, EngineError> {
         let reference = pinned_ref(&spec.image, digest);
         match self.podman.image_inspect(&reference).await {
-            Ok(_) => Ok(()),
-            Err(PodmanError::NotFound(_)) => self.pull(&reference).await.map(|_| ()),
+            Ok(_) => Ok(reference),
+            Err(PodmanError::NotFound(_)) => {
+                if let Some(id) = local_id
+                    && self.podman.image_inspect(id).await.is_ok()
+                {
+                    return Ok(id.to_owned());
+                }
+                self.pull(&reference).await?;
+                Ok(reference)
+            }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// ID of the image the app's container currently runs (retention 1: the rollback target).
+    async fn running_image_id(&self, instance: &InstanceName) -> Option<String> {
+        let name = labels::container_name(instance);
+        self.podman
+            .container_inspect(&name)
+            .await
+            .ok()
+            .map(|c| c.image_id)
+            .filter(|id| !id.is_empty())
     }
 
     /// Przygotowanie (obraz, sieć, sekrety) → usunięcie starego → create+start → bramka.
@@ -234,8 +261,9 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
         digest: &Digest,
         generation: u64,
+        local_id: Option<&str>,
     ) -> Result<Launched, EngineError> {
-        self.ensure_image(spec, digest).await?;
+        let image = self.ensure_image(spec, digest, local_id).await?;
         let network = labels::network_name(instance);
         self.podman
             .network_create(&NetworkSpec {
@@ -263,7 +291,7 @@ impl<P: PodmanClient> Reconciler<P> {
 
         let container = ContainerSpec {
             name: name.clone(),
-            image: pinned_ref(&spec.image, digest),
+            image,
             labels: labels::container_labels(instance, generation, &hash),
             env: spec.env.clone(),
             networks: vec![network],
@@ -357,7 +385,10 @@ impl<P: PodmanClient> Reconciler<P> {
         }
 
         let generation = cur.generation + 1;
-        let launched = self.launch(instance, &spec, &digest, generation).await;
+        let prev_image_id = self.running_image_id(instance).await;
+        let launched = self
+            .launch(instance, &spec, &digest, generation, None)
+            .await;
         let launched = match launched {
             Ok(l) => l,
             Err(e) => {
@@ -411,7 +442,15 @@ impl<P: PodmanClient> Reconciler<P> {
             return Ok(DeployOutcome::Failed { digest, reason });
         };
 
-        let restore = self.launch(instance, &spec, &prev, generation + 1).await;
+        let restore = self
+            .launch(
+                instance,
+                &spec,
+                &prev,
+                generation + 1,
+                prev_image_id.as_deref(),
+            )
+            .await;
         let entry = st.apps.entry(instance.clone()).or_default();
         match restore {
             Ok(Launched {
@@ -485,7 +524,9 @@ impl<P: PodmanClient> Reconciler<P> {
             .clone()
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         let generation = cur.generation + 1;
-        let launched = self.launch(instance, &spec, &digest, generation).await?;
+        let launched = self
+            .launch(instance, &spec, &digest, generation, None)
+            .await?;
 
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.generation = generation;

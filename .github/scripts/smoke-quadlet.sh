@@ -9,7 +9,8 @@ set -euo pipefail
 image=$1
 cli=$2
 daemon=$3
-podman_sock=$4
+podman_sock=$4 # kept for the CI call signature; the socket is resolved by the daemon on the host
+: "$podman_sock"
 
 dir=$(mktemp -d -p "${RUNNER_TEMP:-$HOME}") # not under /tmp: the container has a tmpfs there
 chmod 755 "$dir"

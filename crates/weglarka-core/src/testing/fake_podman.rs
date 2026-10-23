@@ -178,6 +178,7 @@ impl PodmanClient for FakePodman {
             .iter()
             .find(|(reference, img)| {
                 **reference == spec.image
+                    || img.id == spec.image
                     || img
                         .digest
                         .as_ref()
@@ -314,7 +315,9 @@ impl PodmanClient for FakePodman {
                 repo_tags: vec![reference.to_owned()],
             };
             s.images.insert(reference.to_owned(), image.clone());
-            s.images.insert(format!("{repo}@{digest}"), image);
+            s.images.insert(format!("{repo}@{digest}"), image.clone());
+            // Image stays addressable by ID even after its names are gone (as in Podman).
+            s.images.insert(id.clone(), image);
             items.push(Ok(PullEvent::Complete {
                 image_id: id,
                 digest: Some(digest),
@@ -324,9 +327,11 @@ impl PodmanClient for FakePodman {
     }
 
     async fn image_inspect(&self, reference: &str) -> Result<ImageInfo> {
-        self.lock()
-            .images
+        let s = self.lock();
+        // Like Podman, an image is also addressable by its ID.
+        s.images
             .get(reference)
+            .or_else(|| s.images.values().find(|i| i.id == reference))
             .cloned()
             .ok_or_else(|| PodmanError::NotFound(reference.to_owned()))
     }
