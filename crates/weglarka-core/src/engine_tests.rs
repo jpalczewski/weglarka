@@ -592,3 +592,131 @@ async fn run_loop_reconciles_on_start_on_trigger_and_periodically() {
     task.await.unwrap();
     let _ = &h.dir;
 }
+
+// ── Iteration 2: limits, health.command, health.http ────────────────────────────
+
+use crate::app::HttpProbe;
+use crate::limits::{HttpProber, ProbeFuture};
+use std::sync::Mutex;
+
+/// Prober that answers from a script (last result repeats) and records the hosts it was asked for.
+struct ScriptedProber {
+    script: Mutex<std::collections::VecDeque<Result<(), String>>>,
+    hosts: Mutex<Vec<String>>,
+}
+
+impl ScriptedProber {
+    fn new(results: impl IntoIterator<Item = Result<(), String>>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(results.into_iter().collect()),
+            hosts: Mutex::default(),
+        })
+    }
+}
+
+impl HttpProber for ScriptedProber {
+    fn probe<'a>(&'a self, host: &'a str, _probe: &'a HttpProbe) -> ProbeFuture<'a> {
+        self.hosts.lock().unwrap().push(host.to_owned());
+        let mut script = self.script.lock().unwrap();
+        let r = if script.len() > 1 {
+            script.pop_front().unwrap()
+        } else {
+            script.front().cloned().unwrap_or(Ok(()))
+        };
+        Box::pin(async move { r })
+    }
+}
+
+const WHOAMI: &str = r#"
+[apps.who]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 80
+domains = ["who.example.com", "alias.example.com"]
+resources = { memory = "256m", pids_limit = 100, cpus = 0.5 }
+health = { attempts = 3, window_secs = 6, command = ["/app", "-health"], http = { path = "/up" } }
+"#;
+
+fn with_prober(h: &mut Harness, prober: Arc<ScriptedProber>) {
+    let rec = Arc::get_mut(&mut h.rec).expect("sole owner");
+    rec.http_prober = Some(prober);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spec_limits_and_healthcheck_reach_the_container_and_both_probes_must_pass() {
+    let mut h = Harness::new(WHOAMI);
+    let prober = ScriptedProber::new([Err("status 503".into()), Ok(())]);
+    with_prober(&mut h, prober.clone());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+    // Attempt 1: command healthy but http 503 → retry; attempt 2: both pass.
+    assert_eq!(*prober.hosts.lock().unwrap(), ["who.example.com"; 2]);
+
+    let spec = h.fake.container_spec("who").unwrap();
+    assert_eq!(spec.resources.pids_limit, Some(100));
+    assert_eq!(spec.resources.memory.unwrap().bytes(), 256 << 20);
+    assert_eq!(spec.resources.cpus.unwrap().millis(), 500);
+    assert_eq!(spec.healthcheck.unwrap().command, ["/app", "-health"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_http_probe_fails_the_gate_even_when_the_command_is_healthy() {
+    let mut h = Harness::new(WHOAMI);
+    with_prober(&mut h, ScriptedProber::new([Err("status 502".into())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("status 502")),
+        "{out:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_command_fails_the_gate_even_when_http_passes() {
+    let mut h = Harness::new(WHOAMI);
+    with_prober(&mut h, ScriptedProber::new([Ok(())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Unhealthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("Unhealthy")),
+        "{out:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_only_gate_does_not_pass_on_merely_running() {
+    let apps = r#"
+[apps.who]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 80
+domains = ["who.example.com"]
+health = { attempts = 2, window_secs = 4, http = {} }
+"#;
+    let mut h = Harness::new(apps);
+    with_prober(&mut h, ScriptedProber::new([Err("timeout".into())]));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Failed { .. }), "{out:?}");
+    // No healthcheck exists, so the engine must not have called `healthcheck run` at all.
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::HealthcheckRun(_)))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_probe_without_a_prober_fails_closed() {
+    let h = Harness::new(WHOAMI);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(
+        matches!(&out, DeployOutcome::Failed { reason, .. } if reason.contains("prober")),
+        "{out:?}"
+    );
+}

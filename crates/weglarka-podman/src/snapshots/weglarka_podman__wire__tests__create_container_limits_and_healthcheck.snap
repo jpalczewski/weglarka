@@ -1,0 +1,30 @@
+---
+source: crates/weglarka-podman/src/wire.rs
+expression: "CreateContainer::new(&spec)"
+---
+{
+  "name": "a",
+  "image": "i",
+  "resource_limits": {
+    "memory": {
+      "limit": 268435456
+    },
+    "pids": {
+      "limit": 200
+    },
+    "cpu": {
+      "quota": 150000,
+      "period": 100000
+    }
+  },
+  "healthconfig": {
+    "Test": [
+      "CMD",
+      "/app",
+      "-health"
+    ],
+    "Interval": 30000000000,
+    "Timeout": 5000000000,
+    "Retries": 3
+  }
+}

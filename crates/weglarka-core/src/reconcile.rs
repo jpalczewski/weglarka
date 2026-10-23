@@ -213,6 +213,7 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) paths: StatePaths,
     pub(crate) options: ReconcilerOptions,
     pub(crate) events: Arc<dyn EventSink>,
+    pub(crate) http_prober: Option<Arc<dyn crate::limits::HttpProber>>,
     pub(crate) lock: tokio::sync::Mutex<()>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
 }
@@ -230,6 +231,7 @@ impl<P: PodmanClient> Reconciler<P> {
             paths,
             options,
             events: Arc::new(TracingSink),
+            http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             dedup: std::sync::Mutex::new(DeliveryDedup::new(256)),
         }
@@ -237,6 +239,12 @@ impl<P: PodmanClient> Reconciler<P> {
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Prober for `health.http` gates; without one, an app that configures it fails the gate.
+    pub fn with_http_prober(mut self, prober: Arc<dyn crate::limits::HttpProber>) -> Self {
+        self.http_prober = Some(prober);
         self
     }
 
