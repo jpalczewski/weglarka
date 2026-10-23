@@ -265,10 +265,11 @@ async fn full_lifecycle() {
         container_port: 8080,
     }];
     let created = client.container_create(&app_spec).await.unwrap();
-    assert!(matches!(
-        client.container_create(&app_spec).await,
-        Err(PodmanError::Conflict(_))
-    ));
+    let duplicate = client.container_create(&app_spec).await;
+    assert!(
+        matches!(duplicate, Err(PodmanError::Conflict(_))),
+        "duplikat nazwy: {duplicate:?}"
+    );
     let info = client.container_inspect(&app).await.unwrap();
     assert_eq!(info.id, created);
     assert_eq!(info.state, ContainerState::Created);

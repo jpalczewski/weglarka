@@ -136,8 +136,8 @@ async fn not_found_and_name_conflict() {
         ),
         (
             "POST /v6.0.0/libpod/containers/create",
-            409,
-            r#"{"message":"the container name \"x\" is already in use"}"#,
+            500,
+            fixture!("error_create_name_in_use.json"),
         ),
         ("POST /v6.0.0/libpod/containers/x/healthcheck", 409, "{}"),
     ]);
