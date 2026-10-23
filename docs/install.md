@@ -17,8 +17,23 @@ Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie i
   Socket admina leży w trwałym katalogu, bo `/run/user/<uid>` znika po restarcie, a Podman nie startuje
   kontenera, jeśli zamontowany katalog nie istnieje;
 - `/etc/weglarka/weglarka.toml` czytelny dla `weglarka` (sekcja 2);
-- (tryb `behind`) plik dynamiczny Traefika `weglarka.yml` założony z góry i należący do `weglarka`, a sam
-  użytkownik ma ACL `x` na katalogu `dynamic/` (jest `drwx------` innego uid) — Węglarka nadpisuje ten jeden plik w miejscu;
+- (tryb `behind`) plik Traefika **po stronie Węglarki**: `/var/lib/weglarka/traefik/weglarka.yml` założony z góry
+  (właściciel `weglarka`, 0644, treść może być komentarzem — quadlet montuje ten pojedynczy plik, więc musi istnieć
+  przed startem). Węglarka nadpisuje go w miejscu. **Nie dostaje dostępu do katalogu Traefika** (`/data` i
+  `/data/coolify` mają 0700, ACL na `/data` odsłoniłby inne usługi) — publikację robi root, patrz niżej;
+- (tryb `behind`) **publikacja do Traefika przez root-owy path-unit z walidatorem**: `weglarka-traefik-sync.path`
+  (obserwuje `/var/lib/weglarka/traefik`) → `weglarka-traefik-sync.service` → `/usr/local/sbin/weglarka-traefik-sync`.
+  Walidator (polityka w `/etc/weglarka/traefik-policy.json`) przepuszcza tylko `http.routers`/`http.services`
+  o nazwie `weglarka` lub `weglarka-*`, reguły `Host()` (opcjonalnie `&& PathPrefix()`) dla domen z allowlisty,
+  jedyny backend `http://host.docker.internal:<port z bind>`, `tls.certResolver: letsencrypt`; bez middlewares,
+  tcp/udp. Zwalidowany YAML jest kopiowany atomowo do `/data/coolify/proxy/dynamic/weglarka.yml`; przy błędzie
+  zostaje poprzednia wersja, powód w `journalctl -t weglarka-traefik-sync`. Nowa domena apki = najpierw dopisanie
+  jej do allowlisty w Ansible (`weglarka_allowed_domains`);
+- (tryb `behind`) port nginx Węglarki na adresie `docker0` **inny niż 8080** (8080 na `0.0.0.0` trzyma docker-proxy
+  Traefika z Coolify) — na niechybnie `172.17.0.1:8088`, a UFW wpuszcza na niego tylko sieć `coolify`
+  (`172.18.0.0/16`);
+- AppArmor (Ubuntu 24.04, `apparmor_restrict_unprivileged_userns=1`): systemowy profil `podman` z pakietu wystarcza,
+  rootless działa bez zmian sysctl;
 - DNS: rekord domeny webhooków (`[webhook] domain`) i domen apek wskazuje na host (Traefik terminuje TLS).
 
 Sprawdzenie (jako użytkownik runtime'u, po zapisaniu `weglarka.toml`):
@@ -42,8 +57,8 @@ user = "weglarka"
 
 [ingress]
 mode = "behind"
-bind = "172.17.0.1:8080"                                   # docker0 — tu Traefik widzi nginx Węglarki
-traefik_dynamic_file = "/data/coolify/proxy/dynamic/weglarka.yml"
+bind = "172.17.0.1:8088"                                   # docker0; 8080 zajmuje Traefik z Coolify
+traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # root-owy path-unit waliduje i publikuje do dynamic/
 # nginx przypięty po digeście (0006); podbijaj świadomie — zmiana odtwarza kontener nginx:
 nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421428ce13bd1eaa412404953859cf7a5b6512c25e67a60"
 
@@ -61,7 +76,22 @@ dir = "/var/lib/weglarka"                                  # apps.toml, state.to
 ## 3. Binarki na hoście (`platform install`)
 
 `platform install` używa `systemctl --user` i `/etc/passwd`, więc **nie działa w kontenerze** — potrzebny jest
-`weglarka-daemon` z tarballa release'u (CLI i demon, `x86_64-unknown-linux-musl`):
+`weglarka-daemon` na hoście (CLI i demon, `x86_64-unknown-linux-musl`).
+
+**Przed pierwszym tagiem `v*`** release'u nie ma — wyciągnij binarki z podpisanego obrazu `:main`
+(najpierw `cosign verify` jak w sekcji 4, „Weryfikacja”):
+
+```sh
+IMG=ghcr.io/jpalczewski/weglarka:main
+podman pull "$IMG"
+podman create --name wg-extract "$IMG"
+podman cp wg-extract:/usr/local/bin/weglarka-daemon .
+podman cp wg-extract:/usr/local/bin/weglarka .
+podman rm wg-extract
+sudo install -m 0755 weglarka weglarka-daemon /usr/local/bin/
+```
+
+**Od pierwszego tagu** — z tarballa release'u:
 
 ```sh
 VER=0.1.0
@@ -75,8 +105,7 @@ sudo install -m 0755 weglarka-$VER-x86_64-unknown-linux-musl/{weglarka,weglarka-
 
 ## 4. Quadlet i start
 
-Obraz `ghcr.io/jpalczewski/weglarka` jest po pierwszym wypchnięciu **prywatny** — ustaw pakiet jako publiczny
-(GitHub → Packages → Package settings) albo wykonaj `podman login ghcr.io` jako `weglarka`.
+Obraz `ghcr.io/jpalczewski/weglarka` jest publiczny (pobieranie bez `podman login`).
 Tag `:latest` powstaje dopiero z pierwszego tagu `v*`; wcześniej użyj `--image ghcr.io/jpalczewski/weglarka:main`.
 
 ```sh
@@ -141,8 +170,19 @@ weglarka deploy ntfy                                            # pull, podmiana
 weglarka apps show ntfy
 ```
 
-Przed przełączeniem istniejącej instalacji z Coolify zatrzymaj `coolify-relay` i usuń jego router z Traefika,
-żeby domena nie miała dwóch routerów (dane ntfy.zig: brak, więc `recreate` jest bezpieczne).
+**Przełączenie z Coolify z minimalną przerwą** (domena nie może mieć jednocześnie dwóch routerów z tym samym
+`Host()` — Coolify i Węglarki):
+
+1. Dodaj apkę **bez `--domain`**, ustaw sekret, `deploy` — kontener przechodzi bramkę zdrowia, ruch nadal
+   obsługuje Coolify.
+2. Upewnij się, że domena jest na allowliście walidatora (`weglarka_allowed_domains` w Ansible).
+3. Zatrzymaj stary kontener w Coolify (na niechybnie: `coolify-relay`) — znika jego router.
+4. CLI nie ma `apps update`, a `apps add` na istniejącą nazwę zwraca 409 (kod 4): `weglarka apps remove ntfy`,
+   potem `apps add` jak wyżej z `--domain`, i `weglarka deploy ntfy` (obraz już jest lokalnie; sekrety zostają
+   w `secrets.toml` — sprawdź `weglarka secrets list ntfy`).
+5. Rollback: `weglarka apps remove ntfy` i ponowny start starego kontenera w Coolify (nie usuwaj go od razu).
+
+Dane ntfy.zig: brak, więc `recreate` jest bezpieczne.
 
 ### Webhook GitHub (auto-update)
 
