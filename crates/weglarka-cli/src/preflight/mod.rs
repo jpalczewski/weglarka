@@ -1,9 +1,9 @@
-//! `weglarka doctor --preflight` — sprawdzenia hosta bez demona.
+//! `weglarka doctor --preflight` — host checks without the daemon.
 //!
-//! Każde sprawdzenie to osobny typ za traitem [`Check`] (dyn-compatible, synchroniczny);
-//! dostęp do hosta (pliki, komendy, socket Podmana, env) idzie wyłącznie przez [`Host`],
-//! więc testy podstawiają [`testing::FakeHost`]. Nowy init (OpenRC) = nowe checki +
-//! gałąź w [`all_checks`].
+//! Each check is a separate type behind the [`Check`] trait (dyn-compatible, synchronous);
+//! host access (files, commands, the Podman socket, env) goes exclusively through [`Host`],
+//! so tests substitute [`testing::FakeHost`]. A new init system (OpenRC) = new checks +
+//! a branch in [`all_checks`].
 
 mod checks;
 pub(crate) mod host;
@@ -20,7 +20,7 @@ pub use host::{Host, RealHost};
 
 use crate::settings::{Overrides, load_config};
 
-/// Wynik ustalenia, kim jest user runtime'u.
+/// Result of determining who the runtime user is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeUser {
     pub name: String,
@@ -29,7 +29,7 @@ pub struct RuntimeUser {
     pub home: PathBuf,
 }
 
-/// Wspólny kontekst sprawdzeń.
+/// Shared context for the checks.
 pub struct Context<'a> {
     pub host: &'a dyn Host,
     pub config_path: PathBuf,
@@ -82,7 +82,8 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Socket libpod: `runtime.socket` albo domyślny dla systemd (`/run/user/<uid>/podman/podman.sock`).
+    /// libpod socket: `runtime.socket` or the systemd default
+    /// (`/run/user/<uid>/podman/podman.sock`).
     pub fn podman_socket(&self) -> Option<PathBuf> {
         if let Some(s) = &self.runtime.socket {
             return Some(s.clone());
@@ -93,11 +94,11 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Jedno sprawdzenie. Dodanie nowego = nowy typ + wpis w [`all_checks`].
+/// A single check. Adding a new one = a new type + an entry in [`all_checks`].
 pub trait Check {
-    /// Stabilny identyfikator (`runtime.subuid`) — trafia do `DoctorCheck::id`.
+    /// Stable identifier (`runtime.subuid`) — goes into `DoctorCheck::id`.
     fn id(&self) -> &'static str;
-    /// Czy sprawdzenie ma sens w tej konfiguracji (np. linger tylko dla systemd).
+    /// Whether the check makes sense in this configuration (e.g. linger only for systemd).
     fn applies(&self, _cx: &Context<'_>) -> bool {
         true
     }
@@ -137,7 +138,7 @@ pub fn run_checks(cx: &Context<'_>, checks: &[Box<dyn Check>]) -> DoctorReport {
     }
 }
 
-/// Punkt wejścia `doctor --preflight` na prawdziwym hoście.
+/// Entry point of `doctor --preflight` on the real host.
 pub fn run_local(overrides: &Overrides, secrets_file: Option<PathBuf>) -> DoctorReport {
     let path = overrides.config_path();
     let config = load_config(&path).map_err(|e| e.message);
@@ -146,7 +147,7 @@ pub fn run_local(overrides: &Overrides, secrets_file: Option<PathBuf>) -> Doctor
     run_checks(&cx, &all_checks())
 }
 
-// ---- budowanie wyników ----
+// ---- building results ----
 
 pub fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
     check(id, CheckStatus::Ok, message, None)
@@ -174,7 +175,7 @@ fn check(
     }
 }
 
-/// Render tekstowy raportu (wspólny dla `doctor` i `doctor --preflight`).
+/// Text rendering of the report (shared by `doctor` and `doctor --preflight`).
 pub fn render(report: &DoctorReport) -> String {
     let width = report.checks.iter().map(|c| c.id.len()).max().unwrap_or(0);
     let mut out = String::new();

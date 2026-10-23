@@ -1,8 +1,9 @@
-//! Dynamiczny plik Traefika (router per apka → `host.docker.internal:<port>`, router webhooków → ten sam service). **Własność: sesja c.**
+//! Traefik dynamic file (one router per app → `host.docker.internal:<port>`, webhook router → the same
+//! service). **Owner: session c.**
 //!
-//! Jedna usługa (nginx Węglarki), wiele routerów; to nginx rozdziela ruch po `Host`. Router jest
-//! jeden na apkę (wiele `Host(...)` w regule), nie na domenę — nazwa routera z domeny
-//! mogłaby kolidować (`a.b-c` vs `a-b.c`), a nazwa instancji jest unikalna z konstrukcji.
+//! One service (Węglarka's nginx), many routers; nginx then splits traffic by `Host`. There is one
+//! router per app (several `Host(...)` in the rule), not per domain — a router name derived from a
+//! domain could collide (`a.b-c` vs `a-b.c`), while the instance name is unique by construction.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -15,9 +16,9 @@ use crate::plan::{Domain, IngressError, Plan};
 #[derive(Debug, Clone)]
 pub struct TraefikOptions {
     pub entrypoint: String,
-    /// `None` — router bez `tls.certResolver` (np. certy wystawia ktoś inny).
+    /// `None` — router without `tls.certResolver` (e.g. certificates issued by someone else).
     pub cert_resolver: Option<String>,
-    /// Host nginx widziany z kontenera Traefika.
+    /// The nginx host as seen from the Traefik container.
     pub upstream_host: String,
 }
 
@@ -55,12 +56,12 @@ impl TraefikOptions {
         if let Some(r) = &self.cert_resolver {
             check_ident("cert_resolver", r, b"")?;
         }
-        // Host DNS: litery, cyfry, `-`, `.`; nie może wyglądać na nic poza nazwą hosta.
+        // DNS host: letters, digits, `-`, `.`; must not look like anything other than a hostname.
         check_ident("upstream_host", &self.upstream_host, b".")
     }
 }
 
-/// Generuje YAML pliku dynamicznego. Kolejność: routery apek (wg nazwy instancji), potem webhooki.
+/// Generates the dynamic-file YAML. Order: app routers (by instance name), then webhooks.
 pub fn generate(
     host: &HostConfig,
     apps: &BTreeMap<InstanceName, AppSpec>,

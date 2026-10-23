@@ -1,9 +1,9 @@
-//! Stan na dysku: `apps.toml` (stan pożądany) i `state.toml` (stan runtime'owy).
+//! On-disk state: `apps.toml` (desired state) and `state.toml` (runtime state).
 //!
-//! Oba pliki pisze wyłącznie demon, zawsze atomowo (tmp w tym samym katalogu + `fsync` + `rename`
-//! + `fsync` katalogu). Odczyt waliduje zawartość (`deny_unknown_fields` + niezmienniki).
+//! Both files are written only by the daemon, always atomically (tmp in the same directory + `fsync`
+//! + `rename` + directory `fsync`). Reading validates the contents (`deny_unknown_fields` + invariants).
 //!
-//! Decyzja o podziale na dwa pliki: `docs/decisions/0003-state-toml.md`.
+//! Decision on the two-file split: `docs/decisions/0003-state-toml.md`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -26,7 +26,7 @@ pub enum StateError {
     Invalid { path: PathBuf, reason: String },
 }
 
-/// Ostatni nieudany deploy — oznaczenie, żeby webhook/reconcile nie próbowały w kółko tego samego.
+/// Last failed deploy — a marker so webhook/reconcile do not retry the same thing endlessly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailedDeploy {
@@ -34,23 +34,23 @@ pub struct FailedDeploy {
     pub reason: String,
 }
 
-/// Stan jednej instancji. `previous` to retencja 1 do rollbacku.
+/// State of a single instance. `previous` is retention 1, for rollback.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppState {
-    /// Numer generacji kontenera (rośnie przy każdym odtworzeniu).
+    /// Container generation number (increments on every recreate).
     #[serde(default)]
     pub generation: u64,
-    /// Aktualnie przypięty digest.
+    /// Currently pinned digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<Digest>,
-    /// Poprzedni (znany dobry) digest.
+    /// Previous (known-good) digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Digest>,
-    /// Hash specyfikacji, z którym uruchomiono `current`.
+    /// Spec hash that `current` was started with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<SpecHash>,
-    /// Ostatni nieudany deploy (czyszczony po udanym).
+    /// Last failed deploy (cleared after a successful one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<FailedDeploy>,
 }
@@ -62,7 +62,7 @@ pub struct StateFile {
     pub apps: BTreeMap<InstanceName, AppState>,
 }
 
-/// Lokalizacja plików stanu (jeden katalog danych demona).
+/// Location of the state files (the daemon's single data directory).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatePaths {
     pub apps: PathBuf,
@@ -86,7 +86,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StateError + '_ {
     }
 }
 
-/// Atomowy zapis: tmp w tym samym katalogu (tworzony z `mode`) → `fsync` → `rename` → `fsync` katalogu.
+/// Atomic write: tmp in the same directory (created with `mode`) → `fsync` → `rename` → directory `fsync`.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), io::Error> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
@@ -95,7 +95,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), io::Erro
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
     let tmp = dir.join(format!(".{}.tmp", file_name.to_string_lossy()));
     let result = (|| {
-        // `create_new` + zawsze świeży plik: tmp nigdy nie dziedziczy cudzych praw/zawartości.
+        // `create_new` + always a fresh file: tmp never inherits foreign permissions/contents.
         let _ = fs::remove_file(&tmp);
         let mut f = OpenOptions::new()
             .write(true)
@@ -128,7 +128,7 @@ fn invalid(path: &Path, reason: impl Into<String>) -> StateError {
     }
 }
 
-/// Niezmienniki `apps.toml`, których nie wyraża serde.
+/// `apps.toml` invariants that serde cannot express.
 pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if spec.image.is_empty() || spec.image.chars().any(char::is_whitespace) {
         return Err(format!("{name}: image must be a non-empty reference"));

@@ -1,4 +1,4 @@
-//! Admin API (axum) na sockecie unix. Ścieżki i metody z `weglarka_api::endpoints`.
+//! Admin API (axum) on a unix socket. Paths and methods come from `weglarka_api::endpoints`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ const BODY_LIMIT: usize = 1024 * 1024;
 type Shared<P> = State<Arc<Daemon<P>>>;
 type ApiResult<T> = Result<T, Fail>;
 
-/// Błąd API: kod domenowy + komunikat; status HTTP wynika z `ErrorCode::http_status`.
+/// API error: domain code + message; the HTTP status derives from `ErrorCode::http_status`.
 #[derive(Debug)]
 pub struct Fail(pub ErrorCode, pub String);
 
@@ -84,7 +84,7 @@ fn parse_name(raw: &str) -> ApiResult<InstanceName> {
     InstanceName::new(raw).map_err(|e| Fail::invalid(e.to_string()))
 }
 
-/// Mutacje czekają na muteks silnika co najwyżej `MUTATION_TIMEOUT`; potem 409 zamiast zawieszenia.
+/// Mutations wait for the engine mutex at most `MUTATION_TIMEOUT`; then 409 instead of hanging.
 async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>>) -> ApiResult<T> {
     match tokio::time::timeout(MUTATION_TIMEOUT, fut).await {
         Ok(r) => Ok(r?),
@@ -115,7 +115,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .with_state(daemon)
 }
 
-// ── Odczyty (bez muteksu silnika) ────────────────────────────────────────────
+// ── Reads (no engine mutex) ──────────────────────────────────────────────────
 
 pub(crate) fn runtime_state(c: Option<&ContainerInfo>) -> RuntimeState {
     match c {
@@ -154,7 +154,7 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
             name: name.clone(),
             image: spec.image.clone(),
             domains: spec.domains.clone(),
-            // Podman niedostępny → nie wiemy; `Missing` + ostrzeżenie w logu (szczegóły: doctor).
+            // Podman unavailable → unknown; `Missing` + a log warning (details: doctor).
             runtime: runtime_state(
                 containers
                     .as_ref()
@@ -216,7 +216,7 @@ fn load_spec<P: PodmanClient>(d: &Daemon<P>, name: &InstanceName) -> ApiResult<A
         .ok_or_else(|| Fail::not_found(format!("unknown app: {name}")))
 }
 
-// ── Mutacje ──────────────────────────────────────────────────────────────────
+// ── Mutations ────────────────────────────────────────────────────────────────
 
 async fn add_app<P: PodmanClient + 'static>(
     State(d): Shared<P>,
@@ -236,7 +236,7 @@ async fn add_app<P: PodmanClient + 'static>(
             ));
         }
         apps.insert(req.name.clone(), req.spec.clone());
-        // Domeny/porty muszą dać się wyrenderować — inaczej ingress by się nie zbudował.
+        // Domains/ports must be renderable — otherwise ingress would fail to build.
         weglarka_ingress::Plan::build(&d.host, &apps).map_err(|e| Fail::invalid(e.to_string()))?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;
     }
@@ -279,10 +279,10 @@ async fn deploy_app<P: PodmanClient + 'static>(
         ));
     }
     load_spec(&d, &name)?;
-    // Deploy trzyma muteks silnika przez pull i bramkę zdrowia — celowo bez limitu czasu.
+    // A deploy holds the engine mutex through pull and health gate — deliberately without a timeout.
     let mut outcome = d.engine.deploy(&name, false).await?;
     if matches!(outcome, CoreOutcome::KnownBad { .. }) {
-        // Ręczny deploy to jawna wola operatora: ponów znany zły digest.
+        // A manual deploy is the operator's explicit will: retry a known-bad digest.
         outcome = d.engine.deploy(&name, true).await?;
     }
     d.changed();
@@ -315,7 +315,7 @@ async fn deploy_app<P: PodmanClient + 'static>(
     Ok(json(resp))
 }
 
-// ── Sekrety ──────────────────────────────────────────────────────────────────
+// ── Secrets ──────────────────────────────────────────────────────────────────
 
 fn secret_infos<P: PodmanClient>(
     d: &Daemon<P>,

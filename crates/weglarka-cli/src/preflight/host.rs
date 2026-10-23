@@ -1,4 +1,4 @@
-//! Granica z hostem: jedyne miejsce w preflight, które dotyka systemu.
+//! Host boundary: the only place in preflight that touches the system.
 
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -18,7 +18,7 @@ pub enum FileKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStat {
     pub kind: FileKind,
-    /// Bity uprawnień (`0o600`), bez typu pliku.
+    /// Permission bits (`0o600`), without the file type.
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -31,21 +31,21 @@ pub struct CmdOutput {
     pub stderr: String,
 }
 
-/// Odpowiedź `HEAD /libpod/_ping`.
+/// Response to `HEAD /libpod/_ping`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PingInfo {
     pub status: u16,
-    /// Nagłówek `Libpod-API-Version`.
+    /// The `Libpod-API-Version` header.
     pub libpod_api_version: Option<String>,
 }
 
 pub trait Host {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     fn stat(&self, path: &Path) -> io::Result<FileStat>;
-    /// Uruchamia program (bez powłoki). `ErrorKind::NotFound`, gdy programu nie ma.
+    /// Runs a program (no shell). `ErrorKind::NotFound` when the program doesn't exist.
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput>;
     fn env(&self, key: &str) -> Option<String>;
-    /// `HEAD /libpod/_ping` po sockecie unix Podmana.
+    /// `HEAD /libpod/_ping` over Podman's unix socket.
     fn podman_ping(&self, socket: &Path) -> io::Result<PingInfo>;
 }
 
@@ -96,7 +96,7 @@ impl Host for RealHost {
         stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
         stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
         stream.write_all(b"HEAD /libpod/_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n")?;
-        // HEAD → odpowiedź bez ciała; czytamy do końca nagłówków (lub zamknięcia).
+        // HEAD → response without a body; read to the end of the headers (or until close).
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {

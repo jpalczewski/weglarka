@@ -1,4 +1,4 @@
-//! CLI `weglarka`. Cienki klient admin API; `doctor --preflight` działa lokalnie, bez demona.
+//! The `weglarka` CLI. A thin admin API client; `doctor --preflight` runs locally, no daemon needed.
 
 mod cli;
 mod client;
@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         }
     };
     let json = cli.json;
-    // Jeden wątek: CLI nie potrzebuje puli (RAM).
+    // Single thread: the CLI doesn't need a pool (RAM).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

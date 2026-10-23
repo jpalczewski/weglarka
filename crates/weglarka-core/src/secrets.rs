@@ -1,5 +1,5 @@
-//! `secrets.toml` (0600) jako implementacja [`SecretStore`] + dostarczanie sekretów do kontenerów
-//! przez Podman secrets (typy `env` i `mount`). Wartości nigdy nie trafiają do logów ani `Debug`.
+//! `secrets.toml` (0600) as a [`SecretStore`] implementation + delivering secrets to containers
+//! via Podman secrets (types `env` and `mount`). Values never reach logs or `Debug`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -33,12 +33,12 @@ struct Entry {
     updated_at: String,
 }
 
-/// Magazyn w pliku TOML z prawami 0600. Wartości muszą być UTF-8 (klucze API, JSON-y konfiguracyjne).
-/// Plik z luźniejszymi prawami jest odrzucany przy każdym odczycie ([`SecretError::Permissions`]).
+/// Store in a TOML file with 0600 permissions. Values must be UTF-8 (API keys, JSON configs).
+/// A file with looser permissions is rejected on every read ([`SecretError::Permissions`]).
 pub struct FileSecretStore {
     path: PathBuf,
     clock: Box<dyn Fn() -> SystemTime + Send + Sync>,
-    /// Serializuje cykl read-modify-write w obrębie procesu (jedyny pisarz: demon).
+    /// Serializes the read-modify-write cycle within the process (sole writer: the daemon).
     write_lock: Mutex<()>,
 }
 
@@ -62,7 +62,7 @@ impl FileSecretStore {
         }
     }
 
-    /// Tworzy pusty plik z prawami 0600, jeśli go nie ma; istniejącego nie rusza.
+    /// Creates an empty file with 0600 permissions if missing; leaves an existing one alone.
     pub fn init(&self) -> Result<(), SecretError> {
         if self.path.exists() {
             return Ok(());
@@ -70,12 +70,12 @@ impl FileSecretStore {
         write_atomic(&self.path, b"", 0o600).map_err(io_err)
     }
 
-    /// Ustawia prawa 0600 na istniejącym pliku (naprawa po `doctor`).
+    /// Sets 0600 permissions on an existing file (repair after `doctor`).
     pub fn restrict_permissions(&self) -> Result<(), SecretError> {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).map_err(io_err)
     }
 
-    /// Sprawdza prawa pliku (brak pliku = OK, powstanie z 0600).
+    /// Checks the file's permissions (missing file = OK, it will be created with 0600).
     pub fn check_permissions(&self) -> Result<(), SecretError> {
         match fs::metadata(&self.path) {
             Ok(m) if m.permissions().mode() & 0o077 != 0 => Err(SecretError::Permissions {
@@ -99,7 +99,7 @@ impl FileSecretStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SecretsFile::default()),
             Err(e) => return Err(io_err(e)),
         };
-        // Tylko `message()`: pełny `Display` błędu TOML cytuje fragment źródła, czyli wartości.
+        // Only `message()`: the full `Display` of a TOML error quotes a source fragment, i.e. values.
         let file: SecretsFile =
             toml::from_str(&src).map_err(|e| SecretError::Corrupt(e.message().to_owned()))?;
         for name in file.secrets.keys() {
@@ -164,7 +164,7 @@ impl SecretStore for FileSecretStore {
     }
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` bez zależności od `chrono` (algorytm civil-from-days Howarda Hinnanta).
+/// `YYYY-MM-DDTHH:MM:SSZ` without depending on `chrono` (Howard Hinnant's civil-from-days algorithm).
 pub fn rfc3339_utc(t: SystemTime) -> String {
     let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
@@ -185,7 +185,7 @@ pub fn rfc3339_utc(t: SystemTime) -> String {
     )
 }
 
-/// Woła synchroniczny `SecretStore` poza wątkiem asynchronicznym (ADR 0001).
+/// Calls the synchronous `SecretStore` off the async thread (ADR 0001).
 pub(crate) async fn blocking<T: Send + 'static>(
     store: &Arc<dyn SecretStore>,
     f: impl FnOnce(&dyn SecretStore) -> Result<T, SecretError> + Send + 'static,
@@ -197,8 +197,8 @@ pub(crate) async fn blocking<T: Send + 'static>(
         .map_err(EngineError::from)
 }
 
-/// Odciski sekretów instancji w postaci `nazwa wiązania → fingerprint` (do `spec_hash`).
-/// Brakujący sekret = [`SecretError::NotFound`].
+/// Instance secret fingerprints as `binding name → fingerprint` (for `spec_hash`).
+/// A missing secret = [`SecretError::NotFound`].
 pub(crate) async fn binding_fingerprints(
     store: &Arc<dyn SecretStore>,
     instance: &InstanceName,
@@ -220,8 +220,8 @@ pub(crate) async fn binding_fingerprints(
     Ok(out)
 }
 
-/// Zapisuje sekrety instancji jako sekrety Podmana (`create` nadpisuje) i zwraca załączniki
-/// do `ContainerSpec`.
+/// Writes the instance's secrets as Podman secrets (`create` overwrites) and returns the attachments
+/// for `ContainerSpec`.
 pub(crate) async fn materialize<P: PodmanClient>(
     podman: &P,
     store: &Arc<dyn SecretStore>,

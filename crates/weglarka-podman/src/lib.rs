@@ -1,10 +1,10 @@
-//! Klient libpod v6 po unix sockecie (hyper + hyper-util, tokio).
-//! Implementuje `weglarka_core::podman::PodmanClient`.
+//! libpod v6 client over a unix socket (hyper + hyper-util, tokio).
+//! Implements `weglarka_core::podman::PodmanClient`.
 //!
-//! Modele wire (`wire`) to serde z `#[serde(default)]`, tylko używane pola, nieznane pola
-//! ignorowane; do domeny (`weglarka_core::podman`) konwertuje je ten crate. Każde wywołanie
-//! otwiera własne połączenie z socketem (lokalny socket — tanie, bez puli i stanu współdzielonego).
-//! Testy integracyjne z prawdziwym Podmanem: `tests/` (wymagają `WEGLARKA_PODMAN_SOCKET`).
+//! The wire models (`wire`) are serde with `#[serde(default)]`, only the used fields, unknown fields
+//! ignored; this crate converts them to the domain (`weglarka_core::podman`). Each call
+//! opens its own socket connection (a local socket is cheap; no pool, no shared state).
+//! Integration tests against a real Podman: `tests/` (require `WEGLARKA_PODMAN_SOCKET`).
 
 mod client;
 mod transport;

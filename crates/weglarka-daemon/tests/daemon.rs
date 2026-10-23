@@ -1,4 +1,4 @@
-//! Testy demona na `FakePodman`: admin API przez prawdziwy socket unix, webhooki przez TCP.
+//! Daemon tests on `FakePodman`: admin API over a real unix socket, webhooks over TCP.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -27,7 +27,7 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    // Krótka ścieżka: `sun_path` ma ~104 znaki.
+    // Short path: `sun_path` is limited to ~104 characters.
     let dir = tempfile::Builder::new()
         .prefix("wg")
         .tempdir_in("/tmp")
@@ -207,7 +207,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(v["code"], "already_exists");
 
-    // Domena zajęta przez inną apkę nie przejdzie walidacji ingressu.
+    // A domain taken by another app fails ingress validation.
     let (s, v) = admin(
         &h,
         "POST",
@@ -225,7 +225,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // `add` budzi reconcile, który robi pierwszy deploy.
+    // `add` wakes the reconcile, which performs the first deploy.
     eventually("first deploy", || async {
         current_digest(&h, "ntfy").await.is_some()
     })
@@ -264,7 +264,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
     assert_eq!(v["api_version"], "v1");
     assert_eq!(v["apps"].as_array().unwrap().len(), 1);
 
-    // Sekrety: walidacja nazw i wartości, brak wartości w odpowiedziach.
+    // Secrets: name and value validation, no values in responses.
     let (s, v) = admin(
         &h,
         "PUT",
@@ -312,7 +312,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
         0o600
     );
 
-    // Ingress: nginx.conf, plik Traefika i kontener nginx powstają po zmianie zbioru apek.
+    // Ingress: nginx.conf, the Traefik file and the nginx container appear after the app set changes.
     eventually("ingress applied", || async {
         read(&h.root.join("state/nginx/nginx.conf")).contains("nz.example.eu")
             && read(&h.root.join("traefik.yml")).contains("nz.example.eu")
@@ -396,7 +396,7 @@ async fn webhook_flow() {
     let body = published("latest");
     let good = Some(sign(SECRET.as_bytes(), &body));
 
-    // Zły podpis, brak podpisu, zły sekret, nieznana apka, apka bez sekretu → 401.
+    // Bad signature, no signature, wrong secret, unknown app, app without a secret → 401.
     let bad = Some(sign(b"wrong", &body));
     assert_eq!(
         hook(addr, "ntfy", "registry_package", "d0", &body, bad).await,
@@ -411,7 +411,7 @@ async fn webhook_flow() {
         StatusCode::UNAUTHORIZED
     );
 
-    // Nieistotne zdarzenia (poprawnie podpisane) → 204.
+    // Irrelevant events (correctly signed) → 204.
     let ping = b"{}".to_vec();
     let ping_sig = Some(sign(SECRET.as_bytes(), &ping));
     assert_eq!(
@@ -436,7 +436,7 @@ async fn webhook_flow() {
         StatusCode::NO_CONTENT
     );
 
-    // Dobry podpis → 202 od razu; deploy leci w osobnym tasku.
+    // Good signature → 202 right away; the deploy runs in a separate task.
     let before = pulls(&h.fake);
     assert_eq!(
         hook(addr, "ntfy", "registry_package", "d4", &body, good.clone()).await,
@@ -448,7 +448,7 @@ async fn webhook_flow() {
     .await;
     let after_first = pulls(&h.fake);
 
-    // Duplikat dostawy: 202, ale bez ponownego deployu (dedup po X-GitHub-Delivery).
+    // Duplicate delivery: 202, but no redeploy (dedup by X-GitHub-Delivery).
     assert_eq!(
         hook(addr, "ntfy", "registry_package", "d4", &body, good.clone()).await,
         StatusCode::ACCEPTED
@@ -456,7 +456,7 @@ async fn webhook_flow() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(pulls(&h.fake), after_first);
 
-    // Ciało ponad limit → 413.
+    // Body over the limit → 413.
     let huge = vec![b'x'; 1024 * 1024 + 1];
     assert_eq!(
         hook(

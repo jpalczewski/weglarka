@@ -1,5 +1,5 @@
-//! Modele wire libpod v6: tylko używane pola, `#[serde(default)]`, nieznane pola ignorowane.
-//! Konwersje do typów domenowych `weglarka_core::podman`.
+//! libpod v6 wire models: only the used fields, `#[serde(default)]`, unknown fields ignored.
+//! Conversions to the `weglarka_core::podman` domain types.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +32,7 @@ struct Component {
 }
 
 impl Version {
-    /// `ApiVersion` na wierzchu to wersja compat ("1.41"); wersja libpod jest w komponencie Podman Engine.
+    /// The top-level `ApiVersion` is the compat version ("1.41"); the libpod version is in the Podman Engine component.
     pub(crate) fn into_domain(self) -> VersionInfo {
         let api_version = self
             .components
@@ -47,7 +47,7 @@ impl Version {
     }
 }
 
-// ---- kontenery ----
+// ---- containers ----
 
 #[derive(Serialize)]
 pub(crate) struct CreateContainer<'a> {
@@ -101,7 +101,7 @@ struct PortMapping<'a> {
     protocol: &'static str,
 }
 
-/// `specgen.Secret` nie ma tagów json — Go dopasowuje nazwy bez względu na wielkość liter.
+/// `specgen.Secret` has no json tags — Go matches names case-insensitively.
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct MountSecret<'a> {
@@ -111,7 +111,7 @@ struct MountSecret<'a> {
     uid: u32,
     #[serde(rename = "GID")]
     gid: u32,
-    /// 0 = domyślne 0444 po stronie Podmana.
+    /// 0 = Podman's default 0444.
     mode: u32,
 }
 
@@ -143,7 +143,7 @@ impl<'a> CreateContainer<'a> {
                 RestartPolicy::Always => Some("always"),
             },
             userns: spec.userns_auto.then_some(Namespace { nsmode: "auto" }),
-            // `Networks` działa tylko z trybem bridge.
+            // `Networks` works only with bridge mode.
             netns: (!spec.networks.is_empty()).then_some(Namespace { nsmode: "bridge" }),
             networks: spec
                 .networks
@@ -195,10 +195,10 @@ pub(crate) struct InspectContainer {
     id: String,
     #[serde(rename = "Name")]
     name: String,
-    /// ID obrazu.
+    /// Image ID.
     #[serde(rename = "Image")]
     image_id: String,
-    /// Referencja użyta przy tworzeniu.
+    /// Reference used at creation.
     #[serde(rename = "ImageName")]
     image_name: String,
     #[serde(rename = "Config")]
@@ -271,7 +271,7 @@ pub(crate) struct HealthReport {
     pub(crate) status: String,
 }
 
-// ---- obrazy ----
+// ---- images ----
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -282,13 +282,13 @@ pub(crate) struct InspectImage {
     repo_tags: Option<Vec<String>>,
     #[serde(rename = "RepoDigests")]
     repo_digests: Option<Vec<String>>,
-    /// Digest manifestu (gdy brak `RepoDigests`, np. obraz zbudowany lokalnie).
+    /// Manifest digest (when `RepoDigests` is absent, e.g. a locally built image).
     #[serde(rename = "Digest")]
     digest: String,
 }
 
 impl InspectImage {
-    /// Preferuje digest repozytorium z `reference`, potem dowolny `RepoDigests`, potem `Digest`.
+    /// Prefers the digest of the repository from `reference`, then any `RepoDigests`, then `Digest`.
     pub(crate) fn into_domain(self, reference: &str) -> ImageInfo {
         let repo = reference_repo(reference);
         let repo_digests = self.repo_digests.unwrap_or_default();
@@ -316,7 +316,7 @@ fn reference_repo(reference: &str) -> &str {
     }
 }
 
-/// Jedna linia strumienia `images/pull`.
+/// One line of the `images/pull` stream.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct PullReport {
@@ -327,7 +327,7 @@ pub(crate) struct PullReport {
 
 pub(crate) enum PullLine {
     Progress(PullEvent),
-    /// Raport z ID obrazu (zwykle ostatnia linia).
+    /// Report with the image ID (usually the last line).
     Image(String),
     Nothing,
 }
@@ -351,14 +351,14 @@ impl PullReport {
     }
 }
 
-// ---- sieci ----
+// ---- networks ----
 
 #[derive(Serialize)]
 pub(crate) struct CreateNetwork<'a> {
     name: &'a str,
     driver: &'static str,
     internal: bool,
-    /// Rozwiązywanie nazw kontenerów w sieci (nginx → `proxy_pass` po nazwie).
+    /// Container name resolution on the network (nginx → `proxy_pass` by name).
     dns_enabled: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     labels: &'a BTreeMap<String, String>,
@@ -407,7 +407,7 @@ pub(crate) struct ConnectNetwork<'a> {
     pub(crate) container: &'a str,
 }
 
-// ---- zdarzenia ----
+// ---- events ----
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -418,7 +418,7 @@ pub(crate) struct WireEvent {
     action: String,
     #[serde(rename = "Actor")]
     actor: Actor,
-    /// Pola starszego formatu docker (`status`/`id`) — zapasowe.
+    /// Fields of the older docker format (`status`/`id`) — fallback.
     status: String,
     id: String,
 }
@@ -522,7 +522,7 @@ mod tests {
             format!("sha256:{}", "2".repeat(64))
         );
         assert_eq!(ours.repo_tags, ["ghcr.io/jpalczewski/ntfy.zig:latest"]);
-        // nieznane repo → pierwszy z RepoDigests
+        // unknown repo → the first of RepoDigests
         let other = decode::<InspectImage>(json).unwrap().into_domain("x/y:1");
         assert_eq!(
             other.digest.unwrap().as_str(),

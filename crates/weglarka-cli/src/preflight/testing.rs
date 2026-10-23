@@ -1,4 +1,4 @@
-//! Fałszywy host do testów sprawdzeń (bez dotykania prawdziwego systemu).
+//! Fake host for testing the checks (without touching the real system).
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
@@ -12,7 +12,7 @@ pub const PROC_NET_TCP_HEADER: &str = "  sl  local_address rem_address   st tx_q
 pub struct FakeHost {
     pub files: HashMap<PathBuf, String>,
     pub stats: HashMap<PathBuf, FileStat>,
-    /// Klucz: `program arg1 arg2`. Brak wpisu = program nie istnieje.
+    /// Key: `program arg1 arg2`. No entry = the program doesn't exist.
     pub commands: HashMap<String, CmdOutput>,
     pub env: HashMap<String, String>,
     pub ping: Option<PingInfo>,
@@ -63,7 +63,7 @@ impl FakeHost {
         self
     }
 
-    /// Host, na którym wszystko jest w porządku (konfiguracja z przykładu MVP, user uid 1001).
+    /// A host where everything is fine (config from the MVP example, user uid 1001).
     pub fn healthy() -> Self {
         Self::default()
             .file("/etc/passwd", "weglarka:x:1001:1001::/home/weglarka:/usr/sbin/nologin\n")

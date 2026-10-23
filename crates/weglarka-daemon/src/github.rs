@@ -1,6 +1,6 @@
-//! Adapter GitHub za traitem `WebhookSource`: HMAC-SHA256 (`X-Hub-Signature-256`, czas stały)
-//! i normalizacja zdarzeń `registry_package`/`package` do `{image_ref}`.
-//! Wybór zdarzenia potwierdzimy na prawdziwym pushu (docs/decisions/0004).
+//! GitHub adapter behind the `WebhookSource` trait: HMAC-SHA256 (`X-Hub-Signature-256`, constant time)
+//! and normalization of `registry_package`/`package` events to `{image_ref}`.
+//! The choice of event will be confirmed on a real push (docs/decisions/0004).
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
@@ -53,7 +53,7 @@ struct Tag {
     name: String,
 }
 
-/// Referencja musi być jednym „słowem” z bezpiecznego alfabetu — trafia do logów i porównań.
+/// A reference must be a single "word" from a safe alphabet — it ends up in logs and comparisons.
 fn valid_ref(r: &str) -> bool {
     r.len() <= 255
         && r.bytes()
@@ -65,7 +65,7 @@ impl Package {
         if !self.package_type.is_empty() && !self.package_type.eq_ignore_ascii_case("container") {
             return Ok(None);
         }
-        // Wersja bez tagu (sam manifest) — nie da się jej śledzić po tagu.
+        // A version without a tag (bare manifest) — it cannot be tracked by tag.
         let tag = self.package_version.container_metadata.tag.name.trim();
         if tag.is_empty() {
             return Ok(None);
@@ -102,7 +102,7 @@ impl WebhookSource for GitHub {
         let sig = hex::decode(hex_sig).map_err(|_| WebhookError::BadSignature)?;
         let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| WebhookError::BadSignature)?;
         mac.update(&request.body);
-        // `verify_slice` porównuje w czasie stałym.
+        // `verify_slice` compares in constant time.
         mac.verify_slice(&sig)
             .map_err(|_| WebhookError::BadSignature)
     }
@@ -121,7 +121,7 @@ impl WebhookSource for GitHub {
             return Err(WebhookError::BadPayload("missing package object".into()));
         };
         Ok(package.image_ref()?.map(|image_ref| WebhookEvent {
-            // Do zbioru dedup trafia tylko krótki identyfikator z bezpiecznego alfabetu.
+            // Only a short identifier from a safe alphabet goes into the dedup set.
             delivery_id: request
                 .header(DELIVERY_HEADER)
                 .filter(|v| {
@@ -135,7 +135,7 @@ impl WebhookSource for GitHub {
     }
 }
 
-/// Podpis w formacie GitHuba — do testów (i przyszłych narzędzi).
+/// Signature in GitHub's format — for tests (and future tooling).
 pub fn sign(secret: &[u8], body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
     mac.update(body);

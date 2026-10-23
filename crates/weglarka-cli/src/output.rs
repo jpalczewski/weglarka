@@ -1,5 +1,5 @@
-//! Wypisywanie wyników: `--json` = jeden dokument JSON na stdout; tekst dla ludzi poza tym.
-//! Błędy zawsze na stderr (w trybie `--json` jako `{"error":{...}}`).
+//! Result output: `--json` = a single JSON document on stdout; human-readable text otherwise.
+//! Errors always go to stderr (in `--json` mode as `{"error":{...}}`).
 
 use serde::Serialize;
 
@@ -34,7 +34,7 @@ pub fn emit_error(json: bool, err: &CliError) {
     }
 }
 
-/// Prosta tabela z wyrównanymi kolumnami (ostatnia kolumna bez dopełnienia).
+/// Simple table with aligned columns (the last column is not padded).
 pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in rows {

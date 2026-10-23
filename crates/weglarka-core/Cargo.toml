@@ -12,7 +12,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Fake `PodmanClient` w pamięci — dla testów sesji b i demona.
+# In-memory fake `PodmanClient` — for session b and daemon tests.
 testing = []
 
 [dependencies]

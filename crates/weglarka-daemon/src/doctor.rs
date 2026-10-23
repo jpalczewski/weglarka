@@ -1,5 +1,5 @@
-//! `doctor` po stronie demona: to, co ma sens sprawdzać z wnętrza działającego procesu.
-//! Sprawdzenia hosta (subuid, linger, cgroups…) robi `weglarka doctor --preflight`.
+//! Daemon-side `doctor`: what makes sense to check from inside the running process.
+//! Host checks (subuid, linger, cgroups…) are done by `weglarka doctor --preflight`.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
@@ -112,7 +112,7 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         .await
     {
         Ok(c) => c,
-        Err(_) => return, // brak Podmana już zgłoszony wyżej
+        Err(_) => return, // missing Podman already reported above
     };
     let mut problems = Vec::new();
     for name in apps.apps.keys() {
@@ -242,7 +242,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some("powstaje przy pierwszym przeliczeniu ingressu"),
         ));
     }
-    // Socket admin: prawa 0600.
+    // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {
         let mode = m.permissions().mode() & 0o777;
         out.push(if mode & 0o077 == 0 {

@@ -1,9 +1,10 @@
-//! Zarządzanie ingressem: generacja `nginx.conf` i pliku Traefika, kontener nginx, sieci.
+//! Ingress management: generating `nginx.conf` and the Traefik file, the nginx container, networks.
 //!
-//! `apply` jest idempotentne: bez zmian w configu i kontenerze nie robi nic (w szczególności nie
-//! dotyka pliku Traefika, który ma ~2 s throttle przeładowań). Kontener nginx ma etykietę
-//! `weglarka.ingress-hash` (obraz + sieci + publikacja); zmiana zbioru sieci apek = odtworzenie
-//! kontenera (nie ma `network_disconnect`), zmiana samego configu = `SIGHUP`.
+//! `apply` is idempotent: with no change to the config or the container it does nothing (notably it
+//! does not touch the Traefik file, which has a ~2 s reload throttle). The nginx container carries
+//! a `weglarka.ingress-hash` label (image + networks + publishing); a change in the set of app
+//! networks means recreating the container (there is no `network_disconnect`), a config-only
+//! change means `SIGHUP`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -27,7 +28,7 @@ use weglarka_core::reconcile::Reconciler;
 use weglarka_core::state::{self, write_atomic};
 use weglarka_ingress::{nginx, traefik};
 
-/// Sieć, do której dołącza kontener Węglarki i nginx (webhooki: `proxy_pass http://weglarka:<port>`).
+/// Network joined by both the Węglarka and nginx containers (webhooks: `proxy_pass http://weglarka:<port>`).
 pub const WEBHOOK_NETWORK: &str = "net-weglarka";
 pub const NGINX_CONTAINER: &str = "weglarka-nginx";
 pub const HASH_LABEL: &str = "weglarka.ingress-hash";
@@ -61,7 +62,7 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> IngressApplyError + '_ 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyReport {
-    /// Niczego nie trzeba było zmieniać.
+    /// Nothing needed changing.
     Unchanged,
     Changed {
         conf_written: bool,
@@ -103,12 +104,12 @@ impl<P: PodmanClient> IngressManager<P> {
         }
     }
 
-    /// Zbiór apek/domen się zmienił — przelicz ingress (scala wiele wywołań w jedno).
+    /// The set of apps/domains changed — recompute ingress (coalesces many calls into one).
     pub fn request_apply(&self) {
         self.notify.notify_one();
     }
 
-    /// Błąd ostatniego `apply` (dla `doctor`); `None` — ostatni przebieg się udał.
+    /// Error from the last `apply` (for `doctor`); `None` means the last run succeeded.
     pub fn last_error(&self) -> Option<String> {
         self.last_error
             .lock()
@@ -120,7 +121,7 @@ impl<P: PodmanClient> IngressManager<P> {
         self.conf_dir.join(NGINX_CONF_FILE)
     }
 
-    /// Pętla: apply na starcie, po `request_apply` i co `period` (samonaprawa kontenera nginx).
+    /// Loop: apply at startup, after `request_apply` and every `period` (self-heals the nginx container).
     pub async fn run(&self, period: Duration, mut shutdown: watch::Receiver<bool>) {
         loop {
             match self.apply().await {
@@ -152,7 +153,7 @@ impl<P: PodmanClient> IngressManager<P> {
             .map(|(n, _)| n)
             .collect();
 
-        // Sieci: nasza (webhooki) i po jednej na apkę z domeną (idempotentne, niezależne od deployu).
+        // Networks: ours (webhooks) plus one per app with a domain (idempotent, independent of deploys).
         let podman = self.engine.podman();
         let mut networks = vec![WEBHOOK_NETWORK.to_owned()];
         networks.extend(routed.iter().map(|n| labels::network_name(n)));
@@ -208,14 +209,14 @@ impl<P: PodmanClient> IngressManager<P> {
         }
     }
 
-    /// `nginx.conf` atomowo (katalog jest montowany, więc `rename` jest widoczny w kontenerze).
+    /// `nginx.conf` atomically (the directory is mounted, so the `rename` is visible in the container).
     fn write_conf(&self, conf: &str) -> Result<bool, IngressApplyError> {
         let path = self.conf_path();
         if fs::read(&path).is_ok_and(|old| old == conf.as_bytes()) {
             return Ok(false);
         }
         fs::create_dir_all(&self.conf_dir).map_err(io_err(&self.conf_dir))?;
-        // Kontener nginx działa pod innym uid (userns=auto) — katalog i plik muszą być czytelne.
+        // The nginx container runs under a different uid (userns=auto) — the directory and file must be readable.
         fs::set_permissions(&self.conf_dir, fs::Permissions::from_mode(0o755))
             .map_err(io_err(&self.conf_dir))?;
         write_atomic(&path, conf.as_bytes(), 0o644).map_err(io_err(&path))?;
@@ -271,7 +272,7 @@ impl<P: PodmanClient> IngressManager<P> {
                     .container_create(&ContainerSpec {
                         name: NGINX_CONTAINER.to_owned(),
                         image: image.clone(),
-                        // Bez `weglarka.instance` — reconcile traktowałby kontener jak sierotę.
+                        // No `weglarka.instance` — reconcile would treat the container as an orphan.
                         labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
                         env: BTreeMap::new(),
                         networks: networks.to_vec(),
@@ -328,8 +329,9 @@ fn ingress_hash(image: &str, networks: &[String], bind: &str, listen_port: u16) 
     hex::encode(&h.finalize()[..8])
 }
 
-/// Nadpisanie pliku w miejscu (truncate + write + fsync), bez `rename`: ACL na katalogu Traefika
-/// daje tylko przejście, a plik zakłada się z góry. Zwraca `false`, gdy treść już jest aktualna.
+/// Overwrites a file in place (truncate + write + fsync), without `rename`: the ACL on the Traefik
+/// directory grants traversal only, and the file is created up front. Returns `false` if the
+/// content is already up to date.
 pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyError> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -345,7 +347,7 @@ pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyErr
         return Ok(false);
     }
     file.set_len(0).map_err(io_err(path))?;
-    // Po `read_to_end` pozycja jest na końcu — po `set_len(0)` trzeba wrócić na początek.
+    // After `read_to_end` the position is at the end — after `set_len(0)` we must seek back to the start.
     std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(io_err(path))?;
     file.write_all(bytes).map_err(io_err(path))?;
     file.sync_all().map_err(io_err(path))?;

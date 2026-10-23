@@ -1,6 +1,6 @@
-//! Trait `WebhookSource` — adapter źródła zdarzeń o nowym obrazie (MVP: GitHub; później Forgejo).
-//! Celowo synchroniczny i dyn-compatible: operuje na już wczytanym żądaniu, więc daemon może
-//! trzymać `Vec<Box<dyn WebhookSource>>` bez kosztów async-trait.
+//! `WebhookSource` trait — adapter for new-image event sources (MVP: GitHub; Forgejo later).
+//! Deliberately synchronous and dyn-compatible: it operates on an already-read request, so the
+//! daemon can hold a `Vec<Box<dyn WebhookSource>>` without async-trait overhead.
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
@@ -10,7 +10,7 @@ pub enum WebhookError {
     BadPayload(String),
 }
 
-/// Surowe żądanie po stronie HTTP (nagłówki + ciało), niezależne od frameworka.
+/// Raw HTTP-side request (headers + body), framework-independent.
 #[derive(Debug, Clone, Default)]
 pub struct WebhookRequest {
     pub headers: Vec<(String, String)>,
@@ -18,7 +18,7 @@ pub struct WebhookRequest {
 }
 
 impl WebhookRequest {
-    /// Nagłówek bez rozróżniania wielkości liter.
+    /// Header lookup, case-insensitive.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -27,10 +27,10 @@ impl WebhookRequest {
     }
 }
 
-/// Znormalizowane zdarzenie: pojawił się nowy obraz.
+/// Normalized event: a new image appeared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookEvent {
-    /// Identyfikator dostawy do deduplikacji (np. `X-GitHub-Delivery`).
+    /// Delivery identifier for deduplication (e.g. `X-GitHub-Delivery`).
     pub delivery_id: Option<String>,
     pub image_ref: String,
 }
@@ -38,9 +38,9 @@ pub struct WebhookEvent {
 pub trait WebhookSource: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Weryfikuje podpis (HMAC) sekretem apki; czas stały.
+    /// Verifies the signature (HMAC) with the app's secret; constant time.
     fn verify(&self, request: &WebhookRequest, secret: &[u8]) -> Result<(), WebhookError>;
 
-    /// `Ok(None)` — poprawne, ale nieistotne zdarzenie (np. ping, inny typ).
+    /// `Ok(None)` — a valid but irrelevant event (e.g. ping, other type).
     fn normalize(&self, request: &WebhookRequest) -> Result<Option<WebhookEvent>, WebhookError>;
 }

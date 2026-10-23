@@ -1,4 +1,4 @@
-//! Fake'i do testów (feature `testing`).
+//! Test fakes (feature `testing`).
 
 mod fake_podman;
 

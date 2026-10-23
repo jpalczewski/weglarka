@@ -1,4 +1,4 @@
-//! Wspólny, zwalidowany model tras — jedyne miejsce, gdzie dane apek stają się „bezpieczne”.
+//! Shared, validated route model — the only place where app data becomes "safe".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -8,8 +8,8 @@ use std::str::FromStr;
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::{HostConfig, IngressMode};
 
-/// Nazwa DNS kontenera Węglarki w sieci `net-weglarka` (cel `proxy_pass` dla webhooków).
-/// Nazwa instancji apki nie może się z nią zrównać (przesłoniłaby upstream webhooków).
+/// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
+/// An app instance name must not equal it (it would shadow the webhook upstream).
 pub const WEBHOOK_UPSTREAM_HOST: &str = "weglarka";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -30,8 +30,8 @@ pub enum IngressError {
     InvalidOption { name: &'static str, reason: String },
 }
 
-/// Nazwa domenowa po ścisłej walidacji: małe litery ASCII, cyfry i `-`, ≥2 etykiet,
-/// brak kropki końcowej, wildcardów i znaków specjalnych.
+/// Domain name after strict validation: lowercase ASCII, digits and `-`, ≥2 labels,
+/// no trailing dot, wildcards or special characters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Domain(String);
 
@@ -86,7 +86,7 @@ impl fmt::Display for Domain {
     }
 }
 
-/// Sieć IP w notacji CIDR (np. zaufane sieci Dockera dla `set_real_ip_from`).
+/// IP network in CIDR notation (e.g. trusted Docker networks for `set_real_ip_from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
     addr: IpAddr,
@@ -128,23 +128,23 @@ impl fmt::Display for Cidr {
     }
 }
 
-/// Trasa jednej apki: wszystkie jej domeny → `instance:port` w sieci apki.
+/// Route of a single app: all its domains → `instance:port` on the app network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRoute<'a> {
     pub instance: &'a InstanceName,
     pub port: u16,
-    /// Posortowane, bez duplikatów.
+    /// Sorted, without duplicates.
     pub domains: Vec<Domain>,
 }
 
-/// Trasa webhooków: domena publiczna → kontener Węglarki.
+/// Webhook route: public domain → Węglarka's container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookRoute {
     pub domain: Domain,
     pub upstream_port: u16,
 }
 
-/// Zwalidowane wejście generatorów. Kolejność apek = kolejność `BTreeMap` (deterministyczna).
+/// Validated generator input. App order = `BTreeMap` order (deterministic).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan<'a> {
     pub mode: IngressMode,
@@ -154,8 +154,8 @@ pub struct Plan<'a> {
 }
 
 impl<'a> Plan<'a> {
-    /// Apki bez domen są pomijane (nie mają co routować). Domena nie może się powtórzyć
-    /// ani w obrębie apki, ani między apkami, ani z domeną webhooków.
+    /// Apps without domains are skipped (nothing to route). A domain must not repeat
+    /// within an app, between apps, or with the webhook domain.
     pub fn build(
         host: &HostConfig,
         apps: &'a BTreeMap<InstanceName, AppSpec>,

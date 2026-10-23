@@ -1,4 +1,4 @@
-//! Raport `weglarka doctor`. Wspólny dla `doctor` (przez API) i `doctor --preflight` (lokalnie).
+//! The `weglarka doctor` report. Shared by `doctor` (via the API) and `doctor --preflight` (local).
 
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +12,11 @@ pub enum CheckStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorCheck {
-    /// Stabilny identyfikator, np. `runtime.subuid`.
+    /// Stable identifier, e.g. `runtime.subuid`.
     pub id: String,
     pub status: CheckStatus,
     pub message: String,
-    /// Podpowiedź naprawy (dla `warn`/`fail`).
+    /// Remediation hint (for `warn`/`fail`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -27,7 +27,7 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    /// Najgorszy status z raportu (`Ok` dla pustego).
+    /// Worst status in the report (`Ok` for an empty one).
     pub fn worst(&self) -> CheckStatus {
         self.checks
             .iter()
@@ -36,7 +36,7 @@ impl DoctorReport {
             .unwrap_or(CheckStatus::Ok)
     }
 
-    /// Kod wyjścia CLI: 0 = ok, 1 = warn, 2 = fail.
+    /// CLI exit code: 0 = ok, 1 = warn, 2 = fail.
     pub fn exit_code(&self) -> i32 {
         match self.worst() {
             CheckStatus::Ok => 0,

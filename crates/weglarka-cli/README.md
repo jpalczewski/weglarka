@@ -1,57 +1,57 @@
 # weglarka-cli
 
-Binarka `weglarka` — cienki klient admin API demona (HTTP/JSON po sockecie unix) oraz lokalny
-`doctor --preflight`. Opisy komend po polsku (spójnie z README repo).
+The `weglarka` binary — a thin client for the daemon's admin API (HTTP/JSON over a unix socket)
+plus a local `doctor --preflight`. Command descriptions (`--help`) are in Polish.
 
-## Konfiguracja
+## Configuration
 
-Socket: `--socket` / `WEGLARKA_SOCKET`, w przeciwnym razie `admin.socket` z `weglarka.toml`
-(`--config` / `WEGLARKA_CONFIG`, domyślnie `/etc/weglarka/weglarka.toml`).
+Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.toml`
+(`--config` / `WEGLARKA_CONFIG`, default `/etc/weglarka/weglarka.toml`).
 
-## Konwencje dla agentów
+## Conventions for agents
 
-- `--json`: na stdout dokładnie jeden dokument — typ z `weglarka-api` (`ListAppsResponse`,
+- `--json`: exactly one document on stdout — a type from `weglarka-api` (`ListAppsResponse`,
   `ShowAppResponse`, `DeployResponse`, `StatusResponse`, `ListSecretsResponse`, `SecretInfo`,
-  `DoctorReport`). Wyjątki CLI: `apps remove` → `{"removed","existed"}`, `--dry-run` →
+  `DoctorReport`). CLI exceptions: `apps remove` → `{"removed","existed"}`, `--dry-run` →
   `{"dry_run":true,"method","path","body"}`.
-- Błędy na stderr; z `--json`: `{"error":{"code","message","hint","exit_code"}}`.
-- `--dry-run` (`apps add/remove`, `deploy`, `secrets set`): nic nie jest wysyłane do zmiany stanu;
-  `remove`/`deploy` tylko sprawdzają istnienie apki (GET). Wartość sekretu jest zasłonięta.
-- Idempotencja: `apps remove --ignore-missing`. `apps add --spec plik.toml` przyjmuje cały `AppSpec`.
-- Sekret: `secrets set <app> <nazwa>` czyta stdin albo `--from-file`; wartość z argumentu jest
-  niemożliwa. Domyślnie ucinany jest jeden końcowy `\n` (`--raw` zachowuje bajty).
+- Errors go to stderr; with `--json`: `{"error":{"code","message","hint","exit_code"}}`.
+- `--dry-run` (`apps add/remove`, `deploy`, `secrets set`): nothing is sent that would change state;
+  `remove`/`deploy` only check that the app exists (GET). The secret value is masked.
+- Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
+- Secret: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
+  is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes).
 
-## Kody wyjścia
+## Exit codes
 
-| kod | znaczenie |
+| code | meaning |
 |---|---|
-| 0 | sukces |
-| 1 / 2 | `doctor`: najgorszy wynik `warn` / `fail` |
-| 3 | nie znaleziono |
-| 4 | już istnieje / konflikt |
-| 5 | demon odrzucił żądanie (`invalid_request`) |
+| 0 | success |
+| 1 / 2 | `doctor`: worst result is `warn` / `fail` |
+| 3 | not found |
+| 4 | already exists / conflict |
+| 5 | the daemon rejected the request (`invalid_request`) |
 | 6 | `deploy`: `rolled_back` |
-| 64 | błędne wywołanie / dane wejściowe |
-| 69 | demon nieosiągalny |
-| 70 | błąd wewnętrzny (I/O, protokół, 5xx) |
-| 78 | brak / błędny `weglarka.toml` |
+| 64 | invalid invocation / input data |
+| 69 | daemon unreachable |
+| 70 | internal error (I/O, protocol, 5xx) |
+| 78 | missing / invalid `weglarka.toml` |
 
 ## `doctor --preflight`
 
-Sprawdzenia (`id`): `config.file`, `runtime.user`, `runtime.subuid`/`subgid` (fail < 65 536,
-warn < 1 000 000 — zapas pod `userns=auto`), `runtime.cgroups`, `runtime.linger` (tylko systemd),
+Checks (`id`): `config.file`, `runtime.user`, `runtime.subuid`/`subgid` (fail < 65,536,
+warn < 1,000,000 — headroom for `userns=auto`), `runtime.cgroups`, `runtime.linger` (systemd only),
 `runtime.socket`, `runtime.podman_version` (libpod ≥ 6.0), `runtime.podman_source` (alvistack),
-`runtime.netavark` (≥ 2, nftables), `runtime.pasta`, `runtime.apparmor_userns` (przy
-`kernel.apparmor_restrict_unprivileged_userns=1` musi być załadowany profil `podman`; lista profili
-jest czytelna tylko dla roota — jako zwykły user wynik to `warn`; brak AppArmor = ok),
-`ingress.traefik_file` (tylko `behind`), `ingress.bind`, `ingress.bind_free` (port z `bind` nie jest
-zajęty przez gniazdo innego uid niż user runtime'u; z `/proc/net/tcp*`), `ingress.traefik_sync`
-(tylko `behind` + systemd: jeśli jest `/etc/weglarka/traefik-policy.json`, to unit
-`weglarka-traefik-sync.path` jest `active`, a domeny z `apps.toml` — jeśli dostępny lokalnie —
-są na allowliście polityki, klucz `allowed_domains`; ścieżki i nazwa unitu to stałe z konwencji roli
-Ansible `weglarka_host`), `state.secrets_file` (0600).
-Reguły firewalla (UFW) nie są sprawdzane — wymagają roota.
-Nowe sprawdzenie = typ implementujący `Check` w `src/preflight/checks.rs` + wpis w `all_checks()`.
-Dostęp do hosta wyłącznie przez trait `Host` (testy: `FakeHost`).
-`secrets.toml` nie ma ścieżki w `weglarka.toml` — domyślnie obok pliku konfiguracji,
-nadpisanie: `--secrets-file` / `WEGLARKA_SECRETS_FILE`.
+`runtime.netavark` (≥ 2, nftables), `runtime.pasta`, `runtime.apparmor_userns` (with
+`kernel.apparmor_restrict_unprivileged_userns=1` the `podman` profile must be loaded; the profile
+list is readable only by root — as a regular user the result is `warn`; no AppArmor = ok),
+`ingress.traefik_file` (`behind` only), `ingress.bind`, `ingress.bind_free` (the port from `bind` is
+not held by a socket of a uid other than the runtime user; read from `/proc/net/tcp*`),
+`ingress.traefik_sync` (`behind` + systemd only: if `/etc/weglarka/traefik-policy.json` exists, the
+unit `weglarka-traefik-sync.path` is `active`, and the domains from `apps.toml` — if available
+locally — are on the policy allowlist, key `allowed_domains`; the paths and the unit name are
+constants from the convention of the Ansible role `weglarka_host`), `state.secrets_file` (0600).
+Firewall rules (UFW) are not checked — they require root.
+A new check = a type implementing `Check` in `src/preflight/checks.rs` + an entry in `all_checks()`.
+Host access goes exclusively through the `Host` trait (tests: `FakeHost`).
+`secrets.toml` has no path in `weglarka.toml` — by default it sits next to the config file,
+override: `--secrets-file` / `WEGLARKA_SECRETS_FILE`.

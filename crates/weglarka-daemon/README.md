@@ -1,21 +1,21 @@
 # weglarka-daemon
 
-Demon Węglarki: admin API (unix socket, 0600), listener webhooków GitHub (TCP), pętla reconcile,
-ingress (nginx + Traefik) i instalator serwisu systemd. Decyzje: `docs/decisions/0004`, `0005`.
+The Węglarka daemon: admin API (unix socket, 0600), GitHub webhook listener (TCP), reconcile loop,
+ingress (nginx + Traefik) and the systemd service installer. Decisions: `docs/decisions/0004`, `0005`.
 
-## Uruchomienie lokalne
+## Running locally
 
 ```toml
-# weglarka.toml (przykład; ścieżki dostosuj)
+# weglarka.toml (example; adjust the paths)
 [runtime]
 user = "weglarka"
-# socket = "/run/user/1001/podman/podman.sock"   # domyślnie z Platform (uid z /etc/passwd)
+# socket = "/run/user/1001/podman/podman.sock"   # defaults from Platform (uid from /etc/passwd)
 # reconcile_interval_secs = 60
 
 [ingress]
 mode = "behind"
 bind = "172.17.0.1:8080"
-traefik_dynamic_file = "/data/coolify/proxy/dynamic/weglarka.yml"   # plik musi istnieć
+traefik_dynamic_file = "/data/coolify/proxy/dynamic/weglarka.yml"   # the file must exist
 # nginx_image = "docker.io/library/nginx:1-alpine"
 
 [admin]
@@ -33,15 +33,15 @@ dir = "/var/lib/weglarka"        # apps.toml, state.toml, secrets.toml, nginx/
 RUST_LOG=info cargo run -p weglarka-daemon -- --config ./weglarka.toml run
 ```
 
-Potem `weglarka --config ./weglarka.toml status`; apka: `weglarka apps add …`, sekret HMAC webhooka:
-`weglarka secrets set <app> webhook-hmac`, webhook GitHub → `https://<domain>/webhook/github/<app>`
-(typ zdarzenia: *Packages*).
+Then `weglarka --config ./weglarka.toml status`; app: `weglarka apps add …`, webhook HMAC secret:
+`weglarka secrets set <app> webhook-hmac`, GitHub webhook → `https://<domain>/webhook/github/<app>`
+(event type: *Packages*).
 
-## Serwis systemd (quadlet)
+## systemd service (quadlet)
 
-`weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run` wypisuje pliki;
-bez `--dry-run` zapisuje je w `~/.config/containers/systemd/` usera runtime'u i robi `daemon-reload`.
-Przykład (`weglarka.container`):
+`weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run` prints the files;
+without `--dry-run` it writes them to the runtime user's `~/.config/containers/systemd/` and runs
+`daemon-reload`. Example (`weglarka.container`):
 
 ```ini
 [Unit]
@@ -68,14 +68,14 @@ TimeoutStopSec=70
 WantedBy=default.target
 ```
 
-## Znane ograniczenia (przed wdrożeniem)
+## Known limitations (before deployment)
 
-- Obraz i release: `Containerfile`, `.github/workflows/release.yml`, decyzja 0006 (`DEFAULT_IMAGE` = `:latest`, istnieje po pierwszym tagu `v*`).
-- Brak testu e2e na prawdziwym Podmanie (testy demona działają na `FakePodman`); ingress na prawdziwym
-  aardvark-dns (nginx w wielu sieciach naraz, kilka `resolver`) wymaga weryfikacji na hoście.
-- Dodanie pierwszej apki z domeną odtwarza kontener nginx (krótka przerwa); sieci `net-<app>` nie są
-  usuwane po `apps remove` (brak `network_remove` w kliencie).
-- Zdarzenie webhooka GitHub niepotwierdzone na prawdziwym pushu (0004). Fan-out po obrazie jest zamierzony (0004).
-- Brak limitu współbieżności/rate-limitu na listenerze webhooków (przed nim stoi nginx z limitem ciała).
-- `deploy` z `image_ref` → 400; `Failed` bez rollbacku → 500.
-- Zmiana `[ingress]`/`[webhook]` w `weglarka.toml` wymaga restartu demona (config czytany raz).
+- Image and release: `Containerfile`, `.github/workflows/release.yml`, decision 0006 (`DEFAULT_IMAGE` = `:latest`, exists after the first `v*` tag).
+- No e2e test against a real Podman (daemon tests run on `FakePodman`); ingress on a real
+  aardvark-dns (nginx on several networks at once, multiple `resolver`s) needs verification on the host.
+- Adding the first app with a domain recreates the nginx container (brief downtime); `net-<app>` networks
+  are not removed after `apps remove` (no `network_remove` in the client).
+- The GitHub webhook event is unconfirmed on a real push (0004). Fan-out by image is intentional (0004).
+- No concurrency limit/rate limit on the webhook listener (nginx with a body-size limit sits in front of it).
+- `deploy` with `image_ref` → 400; `Failed` without rollback → 500.
+- Changing `[ingress]`/`[webhook]` in `weglarka.toml` requires a daemon restart (config is read once).

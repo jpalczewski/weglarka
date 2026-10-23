@@ -1,5 +1,5 @@
-//! Wykonanie komend. Każda zwraca kod wyjścia (0 lub specjalny, np. `doctor`/rollback);
-//! błędy idą jako [`CliError`].
+//! Command execution. Each returns an exit code (0 or a special one, e.g. `doctor`/rollback);
+//! errors are returned as [`CliError`].
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -55,7 +55,7 @@ fn instance(name: &str) -> Result<InstanceName, CliError> {
     })
 }
 
-/// Nazwa sekretu trafia do ścieżki URL, więc zawężamy alfabet (bez kodowania procentowego).
+/// The secret name ends up in a URL path, so we restrict the alphabet (no percent-encoding).
 fn secret_name(name: &str) -> Result<&str, CliError> {
     let ok = (1..=64).contains(&name.len())
         && name
@@ -69,7 +69,7 @@ fn secret_name(name: &str) -> Result<&str, CliError> {
     }
 }
 
-/// Wynik `--dry-run`: żądanie, które zostałoby wysłane (wartości sekretów zasłonięte).
+/// Result of `--dry-run`: the request that would be sent (secret values masked).
 #[derive(Debug, Serialize)]
 struct DryRun {
     dry_run: bool,
@@ -293,7 +293,7 @@ async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {
 
 // ---------- secrets ----------
 
-/// Czyta wartość sekretu. Argument wiersza poleceń jest świadomie niemożliwy (ps, historia powłoki).
+/// Reads the secret value. A command-line argument is deliberately impossible (ps, shell history).
 pub fn read_secret_value(
     from_file: Option<&Path>,
     stdin: &mut dyn Read,

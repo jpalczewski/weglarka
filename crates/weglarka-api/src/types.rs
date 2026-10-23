@@ -1,4 +1,4 @@
-//! Typy request/response admin API.
+//! Admin API request/response types.
 
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{AppSpec, Digest, InstanceName};
@@ -25,7 +25,7 @@ impl ErrorCode {
     }
 }
 
-/// Ciało odpowiedzi błędu.
+/// Error response body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiError {
     pub code: ErrorCode,
@@ -41,7 +41,7 @@ pub enum RuntimeState {
     Unhealthy,
 }
 
-/// Skrót apki na liście.
+/// App summary in a list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSummary {
     pub name: InstanceName,
@@ -73,7 +73,7 @@ pub struct ShowAppResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployRequest {
-    /// Domyślnie `spec.image`; podana referencja nadpisuje ją tylko na ten deploy.
+    /// Defaults to `spec.image`; a given reference overrides it for this deploy only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
 }
@@ -82,9 +82,9 @@ pub struct DeployRequest {
 #[serde(rename_all = "snake_case")]
 pub enum DeployOutcome {
     Deployed,
-    /// Digest i spec bez zmian — nic do zrobienia.
+    /// Digest and spec unchanged — nothing to do.
     Unchanged,
-    /// Nowa wersja nie przeszła bramki zdrowia; wrócono do poprzedniego digestu.
+    /// The new version failed the health gate; rolled back to the previous digest.
     RolledBack,
 }
 
@@ -104,7 +104,7 @@ pub struct StatusResponse {
     pub apps: Vec<AppSummary>,
 }
 
-/// Wartość sekretu; `Debug` jej nie ujawnia.
+/// Secret value; `Debug` does not reveal it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetSecretRequest {
     pub value: String,
@@ -116,7 +116,7 @@ impl std::fmt::Debug for SetSecretRequest {
     }
 }
 
-/// Metadane sekretu — nigdy wartość.
+/// Secret metadata — never the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretInfo {
     pub name: String,

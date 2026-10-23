@@ -1,4 +1,4 @@
-//! Ustalanie ścieżek: `weglarka.toml` i socketu admin API (flaga > env > plik konfiguracji).
+//! Path resolution: `weglarka.toml` and the admin API socket (flag > env > config file).
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ pub struct Overrides {
     pub socket: Option<PathBuf>,
 }
 
-/// Wczytuje i parsuje `weglarka.toml`.
+/// Loads and parses `weglarka.toml`.
 pub fn load_config(path: &Path) -> Result<HostConfig, CliError> {
     let src = std::fs::read_to_string(path).map_err(|e| {
         CliError::new(
@@ -41,7 +41,7 @@ impl Overrides {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
     }
 
-    /// Socket admin API: `--socket` > `admin.socket` z konfiguracji.
+    /// Admin API socket: `--socket` > `admin.socket` from the config.
     pub fn admin_socket(&self) -> Result<PathBuf, CliError> {
         if let Some(s) = &self.socket {
             return Ok(s.clone());

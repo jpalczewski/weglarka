@@ -1,7 +1,7 @@
-//! Listener webhooków (TCP, osobny router): `POST /webhook/github/{instance}`.
+//! Webhook listener (TCP, separate router): `POST /webhook/github/{instance}`.
 //!
-//! Sekret HMAC jest per apka (`<instancja>.webhook-hmac`), więc instancja siedzi w ścieżce.
-//! Kolejność: sekret → podpis (401) → normalizacja (204/400) → 202 i `handle_webhook` w tle.
+//! The HMAC secret is per app (`<instance>.webhook-hmac`), hence the instance is in the path.
+//! Order: secret → signature (401) → normalization (204/400) → 202 and `handle_webhook` in the background.
 
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use weglarka_core::webhook::{WebhookError, WebhookRequest};
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER};
 
-/// Zgodny z `webhook_max_body_bytes` nginxa (1 MiB).
+/// Matches nginx's `webhook_max_body_bytes` (1 MiB).
 pub const BODY_LIMIT: usize = 1024 * 1024;
 
 pub const GITHUB_PATH: &str = "/webhook/github/{instance}";
@@ -54,19 +54,19 @@ async fn github<P: PodmanClient + 'static>(
     body: Bytes,
 ) -> StatusCode {
     let req = request_from(&headers, &body);
-    // Identyfikator dostawy jest niezaufany do chwili podpisu; do logów tylko krótki, bezpieczny.
+    // The delivery id is untrusted until the signature is verified; only a short, safe one goes to logs.
     let delivery = req
         .header(DELIVERY_HEADER)
         .filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
         .unwrap_or("-")
         .to_owned();
     let reject = |reason: &str, status: StatusCode| {
-        // Bez treści sekretów i ciała — tylko powód i identyfikatory.
+        // No secret contents or body — only the reason and identifiers.
         tracing::warn!(instance = ?raw, delivery = ?delivery, reason, "webhook rejected");
         status
     };
 
-    // Nieznana apka i brak sekretu są nieodróżnialne od złego podpisu (401).
+    // An unknown app and a missing secret are indistinguishable from a bad signature (401).
     let Ok(instance) = InstanceName::new(raw.clone()) else {
         return reject("invalid instance name", StatusCode::UNAUTHORIZED);
     };
@@ -94,7 +94,7 @@ async fn github<P: PodmanClient + 'static>(
         }
     };
 
-    // Podpis dotyczy tej apki — zdarzenie musi ją dotyczyć (obraz śledzony przez nią).
+    // The signature belongs to this app — the event must concern it (an image it tracks).
     match state::load_apps(&d.paths.state.apps) {
         Ok(apps) if instances_tracking(&apps, &event.image_ref).contains(&instance) => {}
         Ok(_) => return StatusCode::NO_CONTENT,

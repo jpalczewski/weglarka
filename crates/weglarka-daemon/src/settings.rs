@@ -1,4 +1,4 @@
-//! Wczytanie `weglarka.toml` i wyznaczenie ścieżek (stan, sekrety, katalog nginxa).
+//! Loading `weglarka.toml` and deriving paths (state, secrets, nginx directory).
 
 use std::path::{Path, PathBuf};
 
@@ -16,13 +16,13 @@ pub enum SettingsError {
     Parse { path: PathBuf, message: String },
 }
 
-/// Ścieżki plików, które demon czyta i pisze.
+/// Paths of the files the daemon reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub state_dir: PathBuf,
     pub state: StatePaths,
     pub secrets: PathBuf,
-    /// Katalog hosta z `nginx.conf` (montowany do kontenera nginx).
+    /// Host directory with `nginx.conf` (mounted into the nginx container).
     pub nginx_conf_dir: PathBuf,
 }
 

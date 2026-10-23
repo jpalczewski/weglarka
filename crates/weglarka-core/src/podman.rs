@@ -1,10 +1,10 @@
-//! Kontrakt klienta Podmana (libpod v6). Implementuje go `weglarka-podman` (sesja a),
-//! a `testing::FakePodman` w pamięci (sesja b, demon). Modele są *naszymi* typami domenowymi —
-//! modele wire (serde z `#[serde(default)]`, tylko używane pola) żyją w `weglarka-podman`.
+//! Podman client contract (libpod v6). Implemented by `weglarka-podman` (session a) and by the
+//! in-memory `testing::FakePodman` (session b, daemon). The models are *our* domain types —
+//! wire models (serde with `#[serde(default)]`, only used fields) live in `weglarka-podman`.
 //!
-//! Async: natywne `async fn` w traitach + generyki (patrz `docs/decisions/0001-async-traits.md`).
-//! Metody są zapisane jako `-> impl Future + Send`, żeby implementacje mogły używać `async fn`,
-//! a wywołujący mogli `tokio::spawn`.
+//! Async: native `async fn` in traits + generics (see `docs/decisions/0001-async-traits.md`).
+//! Methods are written as `-> impl Future + Send` so implementations can use `async fn`
+//! and callers can `tokio::spawn`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -23,7 +23,7 @@ pub enum PodmanError {
     Conflict(String),
     #[error("podman API error {status}: {message}")]
     Api { status: u16, message: String },
-    /// Błąd zgłoszony w środku strumienia pulla (HTTP 200, błąd w ciele).
+    /// Error reported mid-way through the pull stream (HTTP 200, error in the body).
     #[error("image pull failed: {0}")]
     Pull(String),
     #[error("unexpected podman response: {0}")]
@@ -41,7 +41,7 @@ pub struct VersionInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     No,
-    /// `--restart=always` — restart robi conmon, także gdy Węglarka leży.
+    /// `--restart=always` — conmon does the restart, even when Węglarka is down.
     Always,
 }
 
@@ -54,12 +54,12 @@ pub struct PortMapping {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretAttachment {
-    /// Nazwa sekretu w Podmanie.
+    /// Secret name in Podman.
     pub secret: String,
     pub target: SecretTarget,
 }
 
-/// Bind mount katalogu/pliku z hosta (np. `nginx.conf` ingressu).
+/// Bind mount of a host directory/file (e.g. the ingress `nginx.conf`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindMount {
     pub source: String,
@@ -70,18 +70,18 @@ pub struct BindMount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub name: String,
-    /// Referencja obrazu lub digest (`repo@sha256:…`) — reconcile przypina digest.
+    /// Image reference or digest (`repo@sha256:…`) — reconcile pins the digest.
     pub image: String,
     pub labels: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
-    /// Sieci, do których kontener dołącza przy tworzeniu (pierwsza = główna).
+    /// Networks the container joins on creation (first = primary).
     pub networks: Vec<String>,
     pub secrets: Vec<SecretAttachment>,
     pub publish: Vec<PortMapping>,
     pub restart: RestartPolicy,
-    /// `--userns=auto` (decyzja: od początku).
+    /// `--userns=auto` (decision: from the start).
     pub userns_auto: bool,
-    /// Bind mounty z hosta (pusta lista dla zwykłych apek).
+    /// Host bind mounts (empty list for ordinary apps).
     pub mounts: Vec<BindMount>,
 }
 
@@ -106,20 +106,20 @@ pub enum HealthStatus {
 pub struct ContainerInfo {
     pub id: String,
     pub name: String,
-    /// Referencja obrazu użyta przy tworzeniu.
+    /// Image reference used at creation.
     pub image: String,
     pub image_id: String,
     pub labels: BTreeMap<String, String>,
     pub state: ContainerState,
     pub exit_code: Option<i32>,
-    /// `None` — obraz nie ma healthchecka.
+    /// `None` — the image has no healthcheck.
     pub health: Option<HealthStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
     pub id: String,
-    /// Digest repozytoryjny (z manifestu), jeśli znany.
+    /// Repository digest (from the manifest), if known.
     pub digest: Option<Digest>,
     pub repo_tags: Vec<String>,
 }
@@ -129,7 +129,7 @@ pub enum PullEvent {
     Progress {
         message: String,
     },
-    /// Koniec pulla; `digest` to digest, który zostanie przypięty w stanie.
+    /// End of the pull; `digest` is the digest that will be pinned in state.
     Complete {
         image_id: String,
         digest: Option<Digest>,
@@ -163,13 +163,13 @@ pub struct PodmanEvent {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventFilter {
-    /// Zdarzenia tylko od obiektów z tymi etykietami (`k=v`).
+    /// Only events from objects with these labels (`k=v`).
     pub labels: BTreeMap<String, String>,
-    /// Unix timestamp — odtwórz zdarzenia od tej chwili.
+    /// Unix timestamp — replay events from this moment.
     pub since: Option<i64>,
 }
 
-/// Dane sieci potrzebne ingressowi: adresy bramek, pod którymi nasłuchuje DNS sieci (aardvark).
+/// Network data needed by ingress: gateway addresses where the network DNS (aardvark) listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInfo {
     pub name: String,
@@ -181,11 +181,11 @@ pub struct ContainerFilter {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Klient libpod. `Send + Sync`, tanio klonowany przez `Arc` po stronie wywołującego.
+/// libpod client. `Send + Sync`, cheaply cloned via `Arc` on the caller's side.
 pub trait PodmanClient: Send + Sync {
     fn version(&self) -> impl Future<Output = Result<VersionInfo>> + Send;
 
-    // Kontenery
+    // Containers
     fn container_create(&self, spec: &ContainerSpec)
     -> impl Future<Output = Result<String>> + Send;
     fn container_start(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
@@ -195,26 +195,26 @@ pub trait PodmanClient: Send + Sync {
         timeout_secs: u32,
     ) -> impl Future<Output = Result<()>> + Send;
     fn container_remove(&self, name: &str, force: bool) -> impl Future<Output = Result<()>> + Send;
-    /// Wysyła sygnał (nazwa bez `SIG`, np. `HUP`) do działającego kontenera — przeładowanie nginxa.
+    /// Sends a signal (name without `SIG`, e.g. `HUP`) to a running container — reloads nginx.
     fn container_kill(&self, name: &str, signal: &str) -> impl Future<Output = Result<()>> + Send;
-    /// `PodmanError::NotFound`, gdy brak.
+    /// `PodmanError::NotFound` if missing.
     fn container_inspect(&self, name: &str) -> impl Future<Output = Result<ContainerInfo>> + Send;
     fn container_list(
         &self,
         filter: &ContainerFilter,
     ) -> impl Future<Output = Result<Vec<ContainerInfo>>> + Send;
 
-    // Obrazy
-    /// Pull jako strumień; błąd w środku pulla pojawia się jako `Err` w strumieniu.
+    // Images
+    /// Pull as a stream; an error mid-pull appears as an `Err` in the stream.
     fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send;
     fn image_inspect(&self, reference: &str) -> impl Future<Output = Result<ImageInfo>> + Send;
-    /// Nadaje obrazowi `id` dodatkowy tag (ręczny rollback).
+    /// Gives image `id` an additional tag (manual rollback).
     fn image_tag(&self, id: &str, repo: &str, tag: &str)
     -> impl Future<Output = Result<()>> + Send;
     fn image_remove(&self, reference: &str) -> impl Future<Output = Result<()>> + Send;
 
-    // Sieci
-    /// Idempotentne: istniejąca sieć o tej nazwie → `Ok`.
+    // Networks
+    /// Idempotent: an existing network with that name → `Ok`.
     fn network_create(&self, spec: &NetworkSpec) -> impl Future<Output = Result<()>> + Send;
     fn network_connect(
         &self,
@@ -222,18 +222,18 @@ pub trait PodmanClient: Send + Sync {
         container: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// `PodmanError::NotFound`, gdy brak sieci.
+    /// `PodmanError::NotFound` if the network is missing.
     fn network_inspect(&self, name: &str) -> impl Future<Output = Result<NetworkInfo>> + Send;
 
-    // Sekrety (Podman secrets); `create` nadpisuje istniejący o tej nazwie.
+    // Secrets (Podman secrets); `create` overwrites an existing one with that name.
     fn secret_create(&self, name: &str, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
     fn secret_remove(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
 
-    /// Jednorazowe wywołanie healthchecka (bramka deployu woła je sama — bez timerów systemd).
+    /// One-shot healthcheck invocation (the deploy gate calls it itself — no systemd timers).
     fn healthcheck_run(&self, container: &str)
     -> impl Future<Output = Result<HealthStatus>> + Send;
 
-    /// Strumień zdarzeń (nigdy się nie kończy w normalnej pracy).
+    /// Event stream (never ends in normal operation).
     fn events(&self, filter: &EventFilter) -> impl Stream<Item = Result<PodmanEvent>> + Send;
 }
 
