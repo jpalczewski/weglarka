@@ -151,14 +151,18 @@ impl ModeProfile for Behind<'_> {
                 c.line("\"1:http\" http;");
             },
         );
-        // Redirect only on an explicit `http` from a trusted peer. A trusted peer that sends no
+        // Redirect only on an explicit non-secure scheme from a trusted peer. A trusted peer that sends no
         // header (the daemon's health probe) falls back to `$scheme` in `$weglarka_proto` — which is
         // `http` too — so `$weglarka_proto` alone cannot drive the redirect.
         c.block(
             "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_redirect_https",
             |c| {
                 c.line("default 0;");
-                c.line("\"1:http\" 1;");
+                // Fail closed: any value a trusted proxy reports other than a secure scheme (`http`,
+                // `ws`, garbage) redirects. Exact entries win over the regex.
+                c.line("\"~^1:.+\" 1;");
+                c.line("\"1:https\" 0;");
+                c.line("\"1:wss\" 0;");
             },
         );
         // Same rule for the forwarded chain and host: a trusted peer's values are passed on,

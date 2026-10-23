@@ -57,7 +57,7 @@ Plik Traefika zawiera dla każdego routera bliźniaka `weglarka-http-*` na entry
 service); bez niego Traefik odpowiadał 404 na `http://domena/`. Bliźniak ma **prefiks** `weglarka-http-`, nie sufiks
 `-http`: instancja `foo-http` zderzyłaby się z bliźniakiem `foo`. Middleware `redirectScheme` odpada (walidator
 publikacji odrzuca middlewares), więc redirect robi nginx: `return 301 https://$host$request_uri;` w `server` apek
-i webhooków, gdy `$weglarka_redirect_https` (mapa: zaufany peer **i** jawne `X-Forwarded-Proto: http`).
+i webhooków, gdy `$weglarka_redirect_https` (mapa: zaufany peer **i** niepusty `X-Forwarded-Proto` inny niż `https`/`wss` — fail closed, np. `ws` z Traefika dla WebSocketu po HTTP).
 Nie wystarcza `$weglarka_proto = http`: zaufany peer bez nagłówka (sonda zdrowia demona, `health.http`, docs/decisions/0010)
 dostaje fallback `$scheme` = `http` i nie może dostać 301. Niezaufany peer nigdy nie jest przekierowywany.
 Tryb `edge` użyje tej samej dyrektywy (`ModeProfile::https_redirect`) z kluczem `$scheme` i wyjątkiem dla

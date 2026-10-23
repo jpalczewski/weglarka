@@ -69,6 +69,8 @@ expect trusted "$body" 'X-Real-Ip: 203.0.113.9'
 # HTTP → HTTPS: only an explicit `http` from a trusted peer redirects; HTTPS and "no header" (the daemon's
 # health probe: trusted peer, no forwarded headers) do not. The trusted conf is still running from request().
 expect_status 'trusted + http' "$(status_of -H 'X-Forwarded-Proto: http')" '301 https://blog.example.eu/p/a?x=1&y=2'
+expect_status 'trusted + ws (plain-HTTP websocket)' "$(status_of -H 'X-Forwarded-Proto: ws')" '301 https://blog.example.eu/p/a?x=1&y=2'
+expect_status 'trusted + wss' "$(status_of -H 'X-Forwarded-Proto: wss')" '200 '
 expect_status 'trusted + https' "$(status_of -H 'X-Forwarded-Proto: https')" '200 '
 expect_status 'trusted, no header (health probe)' "$(status_of)" '200 '
 

@@ -301,7 +301,8 @@ fn nginx_redirects_only_on_explicit_forwarded_http() {
         2
     );
     // A trusted peer with no header (the daemon's health probe) must not be redirected.
-    assert!(conf.contains("\"1:http\" 1;") && conf.contains("default 0;"));
+    assert!(conf.contains("\"~^1:.+\" 1;") && conf.contains("\"1:https\" 0;"));
+    assert!(conf.contains("\"1:wss\" 0;") && conf.contains("default 0;"));
 }
 
 #[test]

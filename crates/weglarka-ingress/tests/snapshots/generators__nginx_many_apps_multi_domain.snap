@@ -37,7 +37,9 @@ http {
     }
     map "$weglarka_trusted:$http_x_forwarded_proto" $weglarka_redirect_https {
         default 0;
-        "1:http" 1;
+        "~^1:.+" 1;
+        "1:https" 0;
+        "1:wss" 0;
     }
     map "$weglarka_trusted:$http_x_forwarded_for" $weglarka_xff {
         default $remote_addr;
