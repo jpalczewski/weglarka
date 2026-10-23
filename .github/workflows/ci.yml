@@ -53,18 +53,18 @@ jobs:
       - name: Install Podman 6 from OBS home:alvistack
         run: |
           set -euo pipefail
-          base="https://download.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
+          base="https://downloadcontent.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
           curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
           echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
             | sudo tee /etc/apt/sources.list.d/alvistack.list
           # Pinning: stos Podmana tylko z alvistack (jak na hoście `niechybnie`).
           sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
           Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
-          Pin: origin download.opensuse.org
+          Pin: origin downloadcontent.opensuse.org
           Pin-Priority: 1001
           PIN
-          # OBS przekierowuje na mirrory, które bywają w trakcie synchronizacji
-          # ("File has unexpected size") — ponawiamy z odświeżeniem list.
+          # download.opensuse.org przekierowuje na mirrory ze starymi plikami ("unexpected size");
+          # downloadcontent.opensuse.org jest bez mirrorów. Ponowienia na wszelki wypadek.
           for attempt in 1 2 3 4; do
             sudo apt-get update
             sudo apt-get install -y -o Acquire::Retries=3 podman netavark passt uidmap && break
