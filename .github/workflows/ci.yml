@@ -177,6 +177,10 @@ jobs:
           # (docs/decisions/0009). Production has 2 000 000; mirror that order of magnitude here.
           sudo usermod --add-subuids 1000000-1999999 --add-subgids 1000000-1999999 "$USER"
           grep "^$USER:" /etc/subuid /etc/subgid
+          # `podman info` in the previous step created the rootless user namespace (pause process) with the
+          # old pool; migrate restarts it so the new subuids are mapped.
+          podman system migrate
+          podman info --format '{{json .Host.IDMappings.UIDMap}}'
       - name: Start rootless podman service
         run: |
           set -euo pipefail
