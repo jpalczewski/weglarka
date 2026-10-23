@@ -76,11 +76,22 @@ jobs:
             sleep 15
           done
           podman --version
-      - name: Diagnose podman config
+      - name: Configure rootless containers
         run: |
-          id; echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} HOME=$HOME"
-          grep -vE '^\s*(#|$)' /etc/containers/containers.conf /etc/containers/storage.conf || true
-          podman info 2>&1 | head -30 || true
+          set -euo pipefail
+          # Pakiet alvistack nie dostarcza /etc/containers/*.conf (zmierzone w CI: brak plików,
+          # Podman schodzi na domyślny rootful graphroot). Konfiguracja użytkownika jest jawna.
+          dpkg -l | grep -E 'podman|containers-common|crun|netavark|passt' || true
+          ls -la /etc/containers /usr/share/containers 2>&1 || true
+          mkdir -p "$HOME/.config/containers"
+          cat > "$HOME/.config/containers/storage.conf" <<STORAGE
+          [storage]
+          driver = "overlay"
+          graphroot = "$HOME/.local/share/containers/storage"
+          runroot = "$XDG_RUNTIME_DIR/containers"
+          STORAGE
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
+          podman info 2>&1 | head -40
       - name: Start rootless podman service
         run: |
           set -euo pipefail
