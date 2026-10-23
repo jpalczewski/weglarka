@@ -11,6 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ pub const HASH_LABEL: &str = "weglarka.ingress-hash";
 const NGINX_CONF_FILE: &str = "nginx.conf";
 const NGINX_CONF_MOUNT: &str = "/etc/nginx";
 const NGINX_STOP_TIMEOUT: u32 = 10;
+/// Delay before re-running `apply` after a best-effort network operation failed.
+const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressApplyError {
@@ -95,6 +98,8 @@ pub struct IngressManager<P: PodmanClient> {
     apply_lock: tokio::sync::Mutex<()>,
     notify: Notify,
     last_error: Mutex<Option<String>>,
+    /// Set when a best-effort step (detaching a stale network) failed: `run` retries soon.
+    retry_soon: AtomicBool,
 }
 
 impl<P: PodmanClient> IngressManager<P> {
@@ -108,6 +113,7 @@ impl<P: PodmanClient> IngressManager<P> {
             apply_lock: tokio::sync::Mutex::new(()),
             notify: Notify::new(),
             last_error: Mutex::new(None),
+            retry_soon: AtomicBool::new(false),
         }
     }
 
@@ -138,7 +144,7 @@ impl<P: PodmanClient> IngressManager<P> {
             }
             tokio::select! {
                 _ = self.notify.notified() => {}
-                _ = tokio::time::sleep(period) => {}
+                _ = tokio::time::sleep(if self.retry_soon.load(Ordering::Relaxed) { period.min(RETRY_DELAY) } else { period }) => {}
                 _ = shutdown.changed() => return,
             }
         }
@@ -146,6 +152,7 @@ impl<P: PodmanClient> IngressManager<P> {
 
     pub async fn apply(&self) -> Result<ApplyReport, IngressApplyError> {
         let _g = self.apply_lock.lock().await;
+        self.retry_soon.store(false, Ordering::Relaxed);
         let result = self.apply_locked().await;
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
             result.as_ref().err().map(ToString::to_string);
@@ -313,10 +320,20 @@ impl<P: PodmanClient> IngressManager<P> {
         } else if !missing.is_empty() {
             action = NginxAction::NetworksSynced;
         }
+        // Detaching a stale network is best effort: a container removed concurrently (`apps remove`)
+        // can make libpod fail the call. That must not block the new config and the Traefik file
+        // (the removed app's router would stay) — log it and retry shortly (`retry_soon`).
         for net in &stale {
-            podman.network_disconnect(net, NGINX_CONTAINER).await?;
-            if action == NginxAction::None {
-                action = NginxAction::NetworksSynced;
+            match podman.network_disconnect(net, NGINX_CONTAINER).await {
+                Ok(()) | Err(PodmanError::NotFound(_)) => {
+                    if action == NginxAction::None {
+                        action = NginxAction::NetworksSynced;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(network = %net, error = %e, "cannot detach stale network from nginx, will retry");
+                    self.retry_soon.store(true, Ordering::Relaxed);
+                }
             }
         }
         Ok(action)
