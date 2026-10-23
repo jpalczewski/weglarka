@@ -8,7 +8,7 @@
 //!
 //! To do (session 1): before `container_create` in `deploy.rs` call [`ensure_volumes`], map
 //! `spec.volumes` to `ContainerSpec::volumes`, allocate/persist the instance's range on its first deploy
-//! (pool size from `/etc/subuid`, `DEFAULT_MAP_RESERVED` reserved) and set `ContainerSpec::id_mapping`,
+//! (pool size from `/etc/subuid`; the ingress nginx gets `StateFile::ingress_uid_range` the same way) and set `ContainerSpec::id_mapping`,
 //! import foreign tars with `PodmanClient::container_archive_put` (not `volume_import`), and purge
 //! volumes on `apps remove --purge-volumes`. `deploy.rs` gets a single call site — keep the logic here.
 

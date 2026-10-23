@@ -141,9 +141,9 @@ impl Env {
         }
     }
 
-    /// A fresh instance range from the pure allocator (no reserved prefix: the CI pool is 65 536).
+    /// A fresh instance range from the pure allocator (the CI pool is 65 536).
     fn range(&mut self) -> UidRange {
-        let r = allocate(&self.used, self.pool, RANGE, 0).expect("subuid pool exhausted");
+        let r = allocate(&self.used, self.pool, RANGE).expect("subuid pool exhausted");
         self.used.push(r);
         r
     }

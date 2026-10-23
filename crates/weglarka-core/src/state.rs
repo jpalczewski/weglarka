@@ -71,6 +71,10 @@ pub struct AppState {
 pub struct StateFile {
     #[serde(default)]
     pub apps: BTreeMap<InstanceName, AppState>,
+    /// Fixed uid/gid range of the ingress nginx container (iteration 2, docs/decisions/0009): like
+    /// instances, it must not stay on libpod's default map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_uid_range: Option<UidRange>,
 }
 
 /// Location of the state files (the daemon's single data directory).
@@ -244,10 +248,12 @@ fn validate_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
             return Err(invalid(path, format!("{name}: previous equals current")));
         }
     }
+    let ingress = "ingress".to_owned();
     let ranges: Vec<_> = state
         .apps
         .iter()
-        .filter_map(|(n, s)| s.uid_range.map(|r| (n, r)))
+        .filter_map(|(n, s)| s.uid_range.map(|r| (n.to_string(), r)))
+        .chain(state.ingress_uid_range.map(|r| (ingress, r)))
         .collect();
     for (i, (a, ra)) in ranges.iter().enumerate() {
         if ra.start == 0 || ra.size == 0 {

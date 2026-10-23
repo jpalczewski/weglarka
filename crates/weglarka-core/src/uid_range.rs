@@ -2,20 +2,20 @@
 //!
 //! Offsets are in the namespace the rootless Podman user runs in: 0 is the user itself and
 //! `1..=pool_size` are its subuids in order, so the same code serves a CI runner (65536 subuids) and
-//! the production host (2000000). The first [`DEFAULT_MAP_RESERVED`] offsets are kept free: containers
-//! that are not instances (the ingress nginx) keep libpod's default map, which covers exactly
-//! `1..=65536`, and must not share uids with an instance. The allocator is pure; reading the pool size
-//! from `/etc/subuid` and persisting the result in `state.toml` (`AppState::uid_range`) belong to
-//! session 1.
+//! the production host (2000000). Every container Węglarka creates gets an explicit range — instances
+//! and the ingress nginx alike (`AppState::uid_range`, `StateFile::ingress_uid_range`). Nothing may stay
+//! on libpod's default map: it spans the *whole* subuid pool (`1..=<pool size>`), so it would overlap
+//! every allocated range. The allocator is pure; reading the pool size from `/etc/subuid` and persisting
+//! the results in `state.toml` belong to session 1.
 
 use serde::{Deserialize, Serialize};
-
-/// Offsets `1..=65536` belong to libpod's default map (see the module docs).
-pub const DEFAULT_MAP_RESERVED: u32 = 65_536;
 
 /// Default size of an instance's range: a full 16-bit uid space, so images using any uid up to 65535
 /// work.
 pub const DEFAULT_RANGE_SIZE: u32 = 65_536;
+
+/// Size of the ingress nginx's range (the official image uses uid 101).
+pub const INFRA_RANGE_SIZE: u32 = 4_096;
 
 /// Range of `size` subuid offsets starting at `start` (>= 1). Used for both uid and gid maps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,16 +35,15 @@ impl UidRange {
     }
 }
 
-/// First-fit allocation of `size` offsets out of `reserved + 1 ..= pool_size`, avoiding `used`.
-/// `None` if the pool is exhausted (or `size` is 0). Deterministic: the lowest free gap wins, so freed
-/// ranges are reused. Production passes [`DEFAULT_MAP_RESERVED`] as `reserved`.
-pub fn allocate(used: &[UidRange], pool_size: u64, size: u32, reserved: u32) -> Option<UidRange> {
+/// First-fit allocation of `size` offsets out of `1..=pool_size`, avoiding `used`. `None` if the pool
+/// is exhausted (or `size` is 0). Deterministic: the lowest free gap wins, so freed ranges are reused.
+pub fn allocate(used: &[UidRange], pool_size: u64, size: u32) -> Option<UidRange> {
     if size == 0 {
         return None;
     }
     let mut sorted: Vec<UidRange> = used.to_vec();
     sorted.sort_by_key(|r| r.start);
-    let mut candidate: u64 = u64::from(reserved) + 1;
+    let mut candidate: u64 = 1;
     for r in sorted {
         if candidate + u64::from(size) <= u64::from(r.start) {
             break;
@@ -72,14 +71,14 @@ mod tests {
 
     #[test]
     fn first_instance_starts_at_one() {
-        assert_eq!(allocate(&[], 65_536, 1000, 0), Some(r(1, 1000)));
+        assert_eq!(allocate(&[], 65_536, 1000), Some(r(1, 1000)));
     }
 
     #[test]
     fn ranges_never_overlap() {
         let mut used = Vec::new();
         for _ in 0..4 {
-            let next = allocate(&used, 4_000, 1000, 0).unwrap();
+            let next = allocate(&used, 4_000, 1000).unwrap();
             assert!(used.iter().all(|u: &UidRange| !u.overlaps(next)));
             used.push(next);
         }
@@ -87,44 +86,41 @@ mod tests {
             used,
             [r(1, 1000), r(1001, 1000), r(2001, 1000), r(3001, 1000)]
         );
-        assert_eq!(allocate(&used, 4_000, 1000, 0), None, "pool exhausted");
+        assert_eq!(allocate(&used, 4_000, 1000), None, "pool exhausted");
     }
 
     #[test]
     fn freed_gap_is_reused_first_fit() {
         let used = [r(1, 1000), r(2001, 1000)];
-        assert_eq!(allocate(&used, 10_000, 1000, 0), Some(r(1001, 1000)));
+        assert_eq!(allocate(&used, 10_000, 1000), Some(r(1001, 1000)));
         // Does not fit into the gap → goes after the last range.
-        assert_eq!(allocate(&used, 10_000, 1500, 0), Some(r(3001, 1500)));
+        assert_eq!(allocate(&used, 10_000, 1500), Some(r(3001, 1500)));
     }
 
     #[test]
     fn order_of_used_is_irrelevant() {
         assert_eq!(
-            allocate(&[r(1001, 1000), r(1, 1000)], 10_000, 10, 0),
+            allocate(&[r(1001, 1000), r(1, 1000)], 10_000, 10),
             Some(r(2001, 10))
         );
     }
 
     #[test]
-    fn reserved_prefix_is_skipped() {
-        // Production host: 2 000 000 subuids, the first 65 536 stay with libpod's default map.
-        let first = allocate(&[], 2_000_000, DEFAULT_RANGE_SIZE, DEFAULT_MAP_RESERVED).unwrap();
-        assert_eq!(first, r(65_537, 65_536));
-        // (2 000 000 - 65 536) / 65 536 = 29 instances fit.
-        let mut used = Vec::new();
-        while let Some(next) = allocate(&used, 2_000_000, DEFAULT_RANGE_SIZE, DEFAULT_MAP_RESERVED)
-        {
+    fn production_pool_capacity() {
+        // 2 000 000 subuids: the ingress range plus 29 full instance ranges fit.
+        let ingress = allocate(&[], 2_000_000, INFRA_RANGE_SIZE).unwrap();
+        let mut used = vec![ingress];
+        while let Some(next) = allocate(&used, 2_000_000, DEFAULT_RANGE_SIZE) {
             used.push(next);
         }
-        assert_eq!(used.len(), 29);
+        assert_eq!(used.len(), 1 + 30);
     }
 
     #[test]
     fn edges() {
-        assert_eq!(allocate(&[], 100, 100, 0), Some(r(1, 100)));
-        assert_eq!(allocate(&[], 99, 100, 0), None);
-        assert_eq!(allocate(&[], 100, 0, 0), None);
-        assert_eq!(allocate(&[], 0, 1, 0), None);
+        assert_eq!(allocate(&[], 100, 100), Some(r(1, 100)));
+        assert_eq!(allocate(&[], 99, 100), None);
+        assert_eq!(allocate(&[], 100, 0), None);
+        assert_eq!(allocate(&[], 0, 1), None);
     }
 }

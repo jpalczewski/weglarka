@@ -58,15 +58,16 @@ Use **(a)**. Rationale, in the project's priority order:
 Rules for session 1:
 
 - **Range size** `DEFAULT_RANGE_SIZE = 65536` (images use uids up to 65534/65532). The production pool
-  (2 000 000) holds 29 instances after the reserved prefix; the pool is read from `/etc/subuid`.
-- **Reserved prefix.** Offsets `1..=65536` stay with libpod's default map, which non-instance containers
-  (the ingress nginx) keep using; `allocate(.., reserved = DEFAULT_MAP_RESERVED)` skips them.
+  (2 000 000, read from `/etc/subuid`) holds 30 instances next to the ingress range.
+- **Nothing stays on the default map.** It spans the whole pool (`1..=<subuid count>`), so any container
+  left on it would overlap every allocated range. The ingress nginx gets its own bounded range
+  (`INFRA_RANGE_SIZE = 4096`, `StateFile::ingress_uid_range`) allocated by the same function.
 - **Every instance gets a range at its first deploy**, with or without volumes (uniform rule; fixes the
-  isolation gap). Existing instances (ntfy.zig) adopt it on the next recreate — the range must then
+  isolation gap), and the daemon refuses to start containers on the default map. Existing instances (ntfy.zig) adopt it on the next recreate — the range must then
   enter the container-identity check, but not `spec_hash` (it is state, not spec).
 - Never mix real `auto` containers with explicit ranges on the same host.
-- `ContainerSpec::userns_auto` stays only for non-instance containers and is documented as a no-op
-  rootless; do not "fix" it to real `auto`.
+- `ContainerSpec::userns_auto` is documented as a no-op rootless; once every container has an explicit
+  range it can be removed in a cleanup. Do not "fix" it to real `auto`.
 
 ### Import and export
 
@@ -83,8 +84,8 @@ Rules for session 1:
 
 - Behaviour change for running apps: the next recreate moves them from the shared default map to their
   own range. Anything depending on container root == the `weglarka` host user (bind mounts of files
-  owned by it) must be world-readable or re-owned; the ingress nginx conf mount is unaffected because
-  nginx keeps the default map.
+  owned by it) must be world-readable or re-owned — this includes the ingress nginx conf mount (0644
+  files in a 0755 directory work; session 1 verifies it in the smoke test).
 - The CI pool is 65 536 subuids, so the integration tests use 4096-uid ranges; production uses 65536.
 - `idmap` and real `auto` stay documented dead ends; the `plain_userns_auto_is_a_noop_rootless` test
   fails loudly if Podman changes the behaviour.
@@ -92,7 +93,7 @@ Rules for session 1:
 ## Open questions (Jacek)
 
 1. Confirm (a) over (c). (c) is a one-day-simpler fallback if the allocator feels like too much state.
-2. Is a 29-instance ceiling on the production host acceptable, or should the range size be per-instance
+2. Is a 30-instance ceiling on the production host acceptable, or should the range size be per-instance
    configurable (a smaller range is enough for images that stay below uid ~1000)?
 3. Finding 1 means every app and the ingress nginx on `niechybnie` currently runs container root as
    the `weglarka` user. Confirm with `podman exec ntfy cat /proc/self/uid_map` (expect `0 <uid> 1`).
