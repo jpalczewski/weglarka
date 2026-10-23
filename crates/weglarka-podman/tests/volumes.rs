@@ -83,7 +83,7 @@ impl Drop for Cleanup {
             let _ = raw(
                 &self.socket,
                 "DELETE",
-                &format!("/containers/{c}?force=true&v=true"),
+                &format!("/containers/{c}?force=true&v=true&timeout=0"),
                 None,
                 &[],
             );
@@ -209,7 +209,7 @@ impl Spike {
         let _ = raw(
             &self.socket,
             "DELETE",
-            &format!("/containers/{name}?force=true&v=true"),
+            &format!("/containers/{name}?force=true&v=true&timeout=0"),
             None,
             &[],
         );
@@ -602,8 +602,12 @@ async fn spike_diag_userns_modes() {
     let mut s = Spike::new(socket.clone());
     s.pull();
     let id = run_id();
-    let modes: [(&str, Option<Value>); 3] = [
+    let modes: [(&str, Option<Value>); 4] = [
         ("auto", Some(json!({"nsmode": "auto"}))),
+        (
+            "auto-size",
+            Some(json!({"nsmode": "auto", "value": "size=1024"})),
+        ),
         ("private", Some(json!({"nsmode": "private"}))),
         ("unset", None),
     ];
@@ -683,5 +687,159 @@ async fn spike_diag_userns_modes() {
             .await;
             eprintln!("SPIKE diag idmap: mountinfo=[{}]", s.host_file(&vol, "mi"));
         }
+    }
+}
+
+/// Import/export fixes for path (a): (1) `PUT/GET /containers/{name}/archive` (podman cp — maps ids
+/// through the container's user namespace), (2) volume import followed by a container restart with
+/// the `U` volume option.
+#[tokio::test]
+async fn spike_a_archive_and_u() {
+    let Some(socket) = socket() else { return };
+    for user in USERS {
+        let who = user.unwrap_or("root");
+        let tar_uid = user.map_or("0", |u| u.split(':').next().unwrap());
+        let id = run_id();
+        let mut s = Spike::new(socket.clone());
+        s.pull();
+        let dir = std::env::temp_dir().join(format!("weglarka-spike-ar-{id}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("imported.txt"), "from-tar\n").unwrap();
+        let tar = dir.join("in.tar");
+        assert!(
+            Command::new("tar")
+                .args(["-cf", tar.to_str().unwrap(), "-C", dir.to_str().unwrap()])
+                .args([
+                    "--owner",
+                    tar_uid,
+                    "--group",
+                    tar_uid,
+                    "--numeric-owner",
+                    "imported.txt"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (label, opts) in [("a-archive", vec![]), ("a-U-restart", vec!["U"])] {
+            let v = Variant {
+                label: "a-private",
+                userns: Some(json!({"nsmode": "private"})),
+                idmappings: Some(explicit_maps(1, 4096)),
+                volume_options: opts,
+            };
+            let vol = format!("weglarka-spike-{label}-{id}");
+            s.cleanup.volumes.push(vol.clone());
+            raw(
+                &socket,
+                "POST",
+                "/volumes/create",
+                Some(&json!({"Name": vol})),
+                &[],
+            )
+            .unwrap();
+            let c = format!("spike-{label}-{id}");
+            if let Err(e) = s.start(&v.body(&c, user, &vol)) {
+                eprintln!("SPIKE {label} [{who}]: start -> FAIL ({})", one_line(&e));
+                continue;
+            }
+            if label == "a-archive" {
+                let put = raw(
+                    &socket,
+                    "PUT",
+                    &format!("/containers/{c}/archive?path=/data"),
+                    None,
+                    &[
+                        "-H",
+                        "content-type: application/x-tar",
+                        "--data-binary",
+                        &format!("@{}", tar.display()),
+                    ],
+                );
+                eprintln!(
+                    "SPIKE {label} [{who}]: archive PUT = {:?}",
+                    put.as_ref().map(|_| "ok").map_err(|e| one_line(e))
+                );
+                let o = s
+                    .sh(
+                        &c,
+                        "test \"$(stat -c %u /data/imported.txt)\" = \"$(id -u)\"",
+                    )
+                    .await
+                    == 0;
+                say(label, who, "archive-put file owned by container uid", o);
+                eprintln!(
+                    "SPIKE {label} [{who}]: host owner = {}",
+                    s.host_owner(&vol, "imported.txt")
+                );
+                let out = dir.join("get.tar");
+                let get = raw(
+                    &socket,
+                    "GET",
+                    &format!("/containers/{c}/archive?path=/data/imported.txt"),
+                    None,
+                    &["-o", out.to_str().unwrap()],
+                );
+                if get.is_ok() {
+                    let l = Command::new("tar")
+                        .args(["-tvf", out.to_str().unwrap(), "--numeric-owner"])
+                        .output()
+                        .unwrap();
+                    for line in String::from_utf8_lossy(&l.stdout).lines() {
+                        eprintln!("SPIKE {label} [{who}]: archive GET entry: {line}");
+                    }
+                } else {
+                    eprintln!("SPIKE {label} [{who}]: archive GET -> FAIL");
+                }
+            } else {
+                // volume import while the container is stopped, then start → `U` should chown.
+                raw(
+                    &socket,
+                    "POST",
+                    &format!("/containers/{c}/stop?timeout=0"),
+                    None,
+                    &[],
+                )
+                .unwrap();
+                let imp = raw(
+                    &socket,
+                    "POST",
+                    &format!("/volumes/{vol}/import"),
+                    None,
+                    &[
+                        "-H",
+                        "content-type: application/x-tar",
+                        "--data-binary",
+                        &format!("@{}", tar.display()),
+                    ],
+                );
+                say(label, who, "volume import while stopped", imp.is_ok());
+                eprintln!(
+                    "SPIKE {label} [{who}]: host owner before restart = {}",
+                    s.host_owner(&vol, "imported.txt")
+                );
+                raw(
+                    &socket,
+                    "POST",
+                    &format!("/containers/{c}/start"),
+                    None,
+                    &[],
+                )
+                .unwrap();
+                let o = s
+                    .sh(
+                        &c,
+                        "test \"$(stat -c %u /data/imported.txt)\" = \"$(id -u)\"",
+                    )
+                    .await
+                    == 0;
+                say(label, who, "after restart: file owned by container uid", o);
+                eprintln!(
+                    "SPIKE {label} [{who}]: host owner after restart = {}",
+                    s.host_owner(&vol, "imported.txt")
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

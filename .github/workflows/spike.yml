@@ -67,6 +67,17 @@ jobs:
           for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
           echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
           podman version
+      - name: Does rootless --userns=auto engage? (CLI)
+        run: |
+          set +e
+          echo "SPIKE cli: rootless=$(podman info --format '{{.Host.Security.Rootless}}')"
+          echo "SPIKE cli: plain uid_map: $(podman run --rm docker.io/library/alpine:3.20 cat /proc/self/uid_map | tr -s ' \n' ' ')"
+          echo "SPIKE cli: auto uid_map: $(podman run --rm --userns=auto docker.io/library/alpine:3.20 cat /proc/self/uid_map 2>&1 | tr -s ' \n' ' ')"
+          echo "SPIKE cli: auto size=1024 uid_map: $(podman run --rm --userns=auto:size=1024 docker.io/library/alpine:3.20 cat /proc/self/uid_map 2>&1 | tr -s ' \n' ' ')"
+          podman run -d --name spike-cli-auto --userns=auto docker.io/library/alpine:3.20 sleep 60 >/dev/null 2>&1
+          echo "SPIKE cli: inspect: $(podman inspect spike-cli-auto --format '{{.HostConfig.UsernsMode}} {{json .HostConfig.IDMappings}}' 2>&1)"
+          podman rm -f -t 0 spike-cli-auto >/dev/null 2>&1
+          echo "SPIKE cli: containers.conf userns: $(podman info --format '{{.Host.IDMappings}}' 2>&1 | tr -s ' \n' ' ')"
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
@@ -74,7 +85,7 @@ jobs:
           save-if: false
       # Tests run one after another so the SPIKE lines of different scenarios do not interleave.
       - name: Spike
-        run: cargo test -p weglarka-podman --test volumes -- --nocapture --test-threads=1 spike_diag spike_a_fixed_range_chown_u spike_a_fixed_range 2>&1 | tee "$RUNNER_TEMP/spike.log"
+        run: cargo test -p weglarka-podman --test volumes -- --nocapture --test-threads=1 spike_diag spike_a_archive_and_u spike_a_isolation 2>&1 | tee "$RUNNER_TEMP/spike.log"
       - name: Summary
         if: always()
         run: grep -E '^SPIKE|^test ' "$RUNNER_TEMP/spike.log" || true
