@@ -138,6 +138,7 @@ impl<P: PodmanClient> Reconciler<P> {
         &self,
         event: &WebhookEvent,
     ) -> Result<WebhookOutcome, EngineError> {
+        let apps = state::load_apps(&self.paths.apps)?;
         if let Some(id) = &event.delivery_id {
             let dup = self
                 .dedup
@@ -155,7 +156,6 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
             }
         }
-        let apps = state::load_apps(&self.paths.apps)?;
         let matched = instances_tracking(&apps, &event.image_ref);
         let mut results = Vec::with_capacity(matched.len());
         for inst in &matched {
