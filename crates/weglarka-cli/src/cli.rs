@@ -32,7 +32,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Manage apps (add/remove/list/show).
+    /// Manage apps (add/update/remove/list/show).
     #[command(subcommand)]
     Apps(AppsCommand),
     /// Force an app deploy (pull, container swap, health gate, rollback if needed).
@@ -50,6 +50,8 @@ pub enum Command {
 pub enum AppsCommand {
     /// Add an app instance.
     Add(AddArgs),
+    /// Change an app's spec (read-modify-write; domains, env, secrets, image…).
+    Update(crate::update::UpdateArgs),
     /// Remove an app instance.
     Remove(RemoveArgs),
     /// List apps.
@@ -153,7 +155,7 @@ pub struct DoctorArgs {
     pub secrets_file: Option<PathBuf>,
 }
 
-fn parse_pair(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_pair(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
         _ => Err(format!("expected KEY=VALUE, got {s:?}")),

@@ -12,8 +12,8 @@ use crate::events::{Event, VecSink};
 use crate::labels;
 use crate::podman::{ContainerState, HealthStatus, PodmanClient};
 use crate::reconcile::{
-    Action, ActionOutcome, ReconcileReport, Reconciler, ReconcilerOptions, RecreateReason,
-    SecretChangePolicy, Trigger,
+    Action, ActionOutcome, EngineError, ReconcileReport, Reconciler, ReconcilerOptions,
+    RecreateReason, SecretChangePolicy, Trigger,
 };
 use crate::secret_store::{SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
@@ -407,9 +407,9 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
     let h = Harness::new(WITH_SECRET);
     h.fake.set_pull_digest(IMAGE, digest('a'));
 
-    // No secrets: the instance is blocked with a clear reason, nothing is created.
+    // No secrets: the instance waits, nothing is attempted or created.
     let report = h.rec.reconcile().await.unwrap();
-    assert!(report.actions.iter().all(|a| a.result.is_err()));
+    assert!(report.actions.is_empty(), "{report:?}");
     assert!(h.fake.containers().is_empty());
 
     h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
@@ -429,6 +429,91 @@ async fn secrets_are_materialized_and_change_recreates_immediately() {
         }
     );
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_secrets_mean_waiting_not_failure_and_setting_them_deploys() {
+    let h = Harness::new(WITH_SECRET);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "waiting is not a problem: {report:?}");
+    assert!(report.actions.is_empty() && h.fake.containers().is_empty());
+    assert_eq!(
+        report.waiting,
+        vec![(name("ntfy"), vec!["config".to_owned(), "token".to_owned()])]
+    );
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["config", "token"]);
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::ImagePull(_)))
+    );
+
+    // Logged once on entering the state, not on every pass; never as a failure.
+    h.rec.reconcile().await.unwrap();
+    let events = h.sink.events();
+    let waits = events
+        .iter()
+        .filter(|e| matches!(e, Event::WaitingForSecret { .. }))
+        .count();
+    assert_eq!(waits, 1, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::DeployFailed { .. }))
+    );
+
+    // A manual deploy does not try either; it reports what is missing.
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::MissingSecrets(m) if m.len() == 2),
+        "{err:?}"
+    );
+
+    // One of two set: still waiting, for the other one.
+    h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["token"]);
+    assert!(h.fake.containers().is_empty());
+
+    // The last one: the wait clears and the deploy starts by itself.
+    h.store.set("ntfy.token", SecretValue::new("t")).unwrap();
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean() && report.waiting.is_empty(), "{report:?}");
+    assert!(matches!(
+        single(&report),
+        ActionOutcome::Deployed(DeployOutcome::Deployed { .. })
+    ));
+    let st = h.state("ntfy");
+    assert!(st.waiting_for_secrets.is_empty() && st.failed.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_secret_binding_on_a_running_app_keeps_the_old_container() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let before = h.container_digest_ref("ntfy");
+
+    h.set_apps(WITH_SECRET);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty() && report.is_clean(), "{report:?}");
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["config", "token"]);
+    assert_eq!(h.container_digest_ref("ntfy"), before);
+
+    h.store.set("ntfy.config", SecretValue::new("{}")).unwrap();
+    h.store.set("ntfy.token", SecretValue::new("t")).unwrap();
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.actions[0].action,
+        Action::Recreate {
+            instance: name("ntfy"),
+            reason: RecreateReason::SpecDrift
+        }
+    );
+    assert!(h.state("ntfy").waiting_for_secrets.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

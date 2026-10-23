@@ -31,6 +31,9 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
     };
     match cli.command {
         Command::Apps(AppsCommand::Add(a)) => apps_add(json, &overrides, a).await,
+        Command::Apps(AppsCommand::Update(a)) => {
+            crate::update::apps_update(json, &overrides, a).await
+        }
         Command::Apps(AppsCommand::Remove(a)) => apps_remove(json, &overrides, a).await,
         Command::Apps(AppsCommand::List) => apps_list(json, &overrides).await,
         Command::Apps(AppsCommand::Show { name }) => apps_show(json, &overrides, &name).await,
@@ -44,11 +47,11 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
     }
 }
 
-fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
+pub(crate) fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
     Ok(ApiClient::new(overrides.admin_socket()?))
 }
 
-fn instance(name: &str) -> Result<InstanceName, CliError> {
+pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {
     InstanceName::new(name).map_err(|e| {
         CliError::usage(e.to_string())
             .with_hint("nazwy instancji: małe litery, cyfry i myślniki, np. `ntfy-zig`")
@@ -412,7 +415,7 @@ fn render_apps(apps: &[AppSummary]) -> String {
         .map(|a| {
             vec![
                 a.name.to_string(),
-                format!("{:?}", a.runtime).to_lowercase(),
+                crate::update::runtime_label(a.runtime),
                 a.image.clone(),
                 a.domains.join(","),
             ]
@@ -421,12 +424,13 @@ fn render_apps(apps: &[AppSummary]) -> String {
     table(&["NAME", "RUNTIME", "IMAGE", "DOMAINS"], &rows)
 }
 
-fn render_show(r: &ShowAppResponse) -> String {
+pub(crate) fn render_show(r: &ShowAppResponse) -> String {
     let spec = toml::to_string(&r.spec).unwrap_or_default();
+    let waiting = crate::update::render_waiting(r.name.as_str(), &r.state);
     format!(
-        "name:       {}\nruntime:    {}\ngeneration: {}\ndigest:     {}\nprevious:   {}\n\n[spec]\n{spec}",
+        "name:       {}\nruntime:    {}\ngeneration: {}\ndigest:     {}\nprevious:   {}\n{waiting}\n[spec]\n{spec}",
         r.name,
-        format!("{:?}", r.runtime).to_lowercase(),
+        crate::update::runtime_label(r.runtime),
         r.state.generation,
         r.state.current.as_ref().map_or("-", |d| d.as_str()),
         r.state.previous.as_ref().map_or("-", |d| d.as_str()),

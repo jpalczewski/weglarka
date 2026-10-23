@@ -21,6 +21,7 @@ use crate::labels;
 use crate::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient, PodmanError};
 use crate::secret_store::{SecretError, SecretStore};
 use crate::state::{self, StateError, StatePaths};
+use crate::waiting::{apply_waiting, missing_secrets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -34,6 +35,9 @@ pub enum EngineError {
     UnknownInstance(InstanceName),
     #[error("cannot resolve image digest for {0}")]
     NoDigest(String),
+    /// The spec binds secrets that are not set (not a failure: the instance waits for them).
+    #[error("waiting for secrets: {}", .0.join(", "))]
+    MissingSecrets(Vec<String>),
 }
 
 /// What to do on a secret value change (decision: a daemon config option).
@@ -190,6 +194,8 @@ pub struct ReconcileReport {
     pub actions: Vec<ActionReport>,
     /// Instances skipped in this pass, with the reason (e.g. missing secret).
     pub blocked: Vec<(InstanceName, String)>,
+    /// Instances left alone because the spec binds secrets that are not set (not a problem).
+    pub waiting: Vec<(InstanceName, Vec<String>)>,
 }
 
 impl ReconcileReport {
@@ -289,12 +295,26 @@ impl<P: PodmanClient> Reconciler<P> {
 
         let mut report = ReconcileReport::default();
         let mut targets = Vec::with_capacity(apps.apps.len());
+        let mut waiting_changed = false;
         for (name, spec) in &apps.apps {
+            let missing = missing_secrets(&self.secrets, name, spec).await?;
+            if apply_waiting(&mut st, name, &missing) {
+                waiting_changed = true;
+                if !missing.is_empty() {
+                    self.events.emit(Event::WaitingForSecret {
+                        instance: name.clone(),
+                        missing: missing.clone(),
+                    });
+                }
+            }
             let app_state = st.apps.get(name);
             let pinned = app_state.and_then(|s| s.current.clone());
             let mut blocked = false;
             let mut expected_hash = None;
-            if let Some(d) = &pinned {
+            if !missing.is_empty() {
+                blocked = true;
+                report.waiting.push((name.clone(), missing));
+            } else if let Some(d) = &pinned {
                 match self.desired_hash(name, spec, d).await {
                     Ok(h) => expected_hash = Some(h),
                     Err(e) => {
@@ -318,6 +338,9 @@ impl<P: PodmanClient> Reconciler<P> {
             });
         }
 
+        if waiting_changed {
+            state::save_state(&self.paths.state, &st)?;
+        }
         for action in plan(&targets, &observed) {
             let result = self.execute(&apps, action.clone()).await;
             if let Err(e) = &result {

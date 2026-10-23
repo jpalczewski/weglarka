@@ -25,16 +25,16 @@ use crate::preflight::{Context, all_checks, render, run_checks};
 // ---------- mock server on a unix socket ----------
 
 #[derive(Debug, Clone)]
-struct Seen {
-    method: String,
-    path: String,
+pub(crate) struct Seen {
+    pub(crate) method: String,
+    pub(crate) path: String,
     host: Option<String>,
-    body: String,
+    pub(crate) body: String,
 }
 
-struct Mock {
-    socket: PathBuf,
-    seen: Arc<Mutex<Vec<Seen>>>,
+pub(crate) struct Mock {
+    pub(crate) socket: PathBuf,
+    pub(crate) seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl Drop for Mock {
@@ -46,7 +46,9 @@ impl Drop for Mock {
 static N: AtomicU32 = AtomicU32::new(0);
 
 /// `reply(method, path) -> (status, body)`.
-async fn mock(reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> Mock {
+pub(crate) async fn mock(
+    reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+) -> Mock {
     // Short path: the sun_path limit (~104 B on macOS).
     let socket = std::env::temp_dir().join(format!(
         "wgl-{}-{}.sock",
