@@ -35,6 +35,12 @@ http {
         "1:https" https;
         "1:http" http;
     }
+    map "$weglarka_trusted:$http_x_forwarded_proto" $weglarka_redirect_https {
+        default 0;
+        "~^1:.+" 1;
+        "1:https" 0;
+        "1:wss" 0;
+    }
     map "$weglarka_trusted:$http_x_forwarded_for" $weglarka_xff {
         default $remote_addr;
         "~^1:(?<chain>.+)$" $chain;
@@ -75,6 +81,9 @@ http {
     server {
         listen 8080;
         server_name weglarka.example.eu;
+        if ($weglarka_redirect_https) {
+            return 301 https://$host$request_uri;
+        }
         set $app "weglarka";
         client_max_body_size 1048576;
         location ^~ /webhook/ {
@@ -92,6 +101,9 @@ http {
     server {
         listen 8080;
         server_name nz.example.eu;
+        if ($weglarka_redirect_https) {
+            return 301 https://$host$request_uri;
+        }
         set $app "ntfy";
         client_max_body_size 67108864;
         location / {

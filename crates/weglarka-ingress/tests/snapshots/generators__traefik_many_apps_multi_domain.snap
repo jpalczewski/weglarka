@@ -12,6 +12,11 @@ http:
       service: weglarka
       tls:
         certResolver: letsencrypt
+    weglarka-http-app-blog:
+      rule: "Host(`blog.example.eu`) || Host(`example.eu`) || Host(`www.blog.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
     weglarka-app-ntfy:
       rule: "Host(`nz.example.eu`)"
       entryPoints:
@@ -19,6 +24,11 @@ http:
       service: weglarka
       tls:
         certResolver: letsencrypt
+    weglarka-http-app-ntfy:
+      rule: "Host(`nz.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
     weglarka-webhooks:
       rule: "Host(`weglarka.example.eu`)"
       entryPoints:
@@ -26,6 +36,11 @@ http:
       service: weglarka
       tls:
         certResolver: letsencrypt
+    weglarka-http-webhooks:
+      rule: "Host(`weglarka.example.eu`)"
+      entryPoints:
+        - http
+      service: weglarka
   services:
     weglarka:
       loadBalancer:

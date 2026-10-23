@@ -420,6 +420,24 @@ step_traffic() {
   fi
 }
 
+# Plain HTTP on the canary domain redirects to HTTPS (no -L). Through Traefik this proves the `http`
+# router exists; with --direct we impersonate Traefik's http entrypoint (X-Forwarded-Proto: http).
+step_http_redirect() {
+  local url=http://$CANARY_DOMAIN/ code loc
+  local -a extra=()
+  if [ -n "$DIRECT" ]; then
+    url=$DIRECT/
+    extra=(-H "Host: $CANARY_DOMAIN" -H 'X-Forwarded-Proto: http')
+  fi
+  code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code} %{redirect_url}' ${extra[@]+"${extra[@]}"} "$url" 2>"$WORK/curl_err") \
+    || die "curl $url: $(tr '\n' ' ' <"$WORK/curl_err")"
+  loc=${code#* }
+  code=${code%% *}
+  [ "$code" = 301 ] || die "http://$CANARY_DOMAIN/ → $code zamiast 301 (brak routera na entrypoincie http? 404 z Traefika = stary plik/obraz, docs/decisions/0005)"
+  [ "$loc" = "https://$CANARY_DOMAIN/" ] || die "redirect na '$loc' zamiast https://$CANARY_DOMAIN/"
+  note "http://$CANARY_DOMAIN/ → 301 https://$CANARY_DOMAIN/"
+}
+
 step_registry() {
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman run -d --name "$REGISTRY_CONTAINER" -p "127.0.0.1:$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
@@ -620,6 +638,7 @@ if [ -z "$DIRECT" ]; then
 else
   run_step traffic "ruch: nginx bezpośrednio → 200, nagłówki" step_traffic canary
 fi
+run_step http_redirect "http → 301 na https (bez -L)" step_http_redirect canary traffic
 run_step webhook_protocol "webhook: 202 / 401 / 204" step_webhook_protocol canary
 if [ "$LOCAL_REGISTRY" = 1 ]; then
   run_step registry "lokalny rejestr testowy" step_registry doctor

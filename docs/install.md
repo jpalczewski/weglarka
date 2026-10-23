@@ -25,8 +25,10 @@ Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie i
   (obserwuje `/var/lib/weglarka/traefik`) → `weglarka-traefik-sync.service` → `/usr/local/sbin/weglarka-traefik-sync`.
   Walidator (polityka w `/etc/weglarka/traefik-policy.json`) przepuszcza tylko `http.routers`/`http.services`
   o nazwie `weglarka` lub `weglarka-*`, reguły `Host()` (opcjonalnie `&& PathPrefix()`) dla domen z allowlisty,
-  jedyny backend `http://host.docker.internal:<port z bind>`, `tls.certResolver: letsencrypt`; bez middlewares,
-  tcp/udp. Zwalidowany YAML jest kopiowany atomowo do `/data/coolify/proxy/dynamic/weglarka.yml`; przy błędzie
+  jedyny backend `http://host.docker.internal:<port z bind>`, `tls.certResolver: letsencrypt` (routery na
+  entrypoincie `http` bez `tls`); bez middlewares, tcp/udp. Węglarka generuje dla każdej domeny drugi router
+  `weglarka-http-*` na entrypoincie `http` — redirect 301 na HTTPS robi nginx Węglarki (nie Traefik), więc polityka
+  walidatora musi dopuszczać entrypoint `http` bez `tls`. Zwalidowany YAML jest kopiowany atomowo do `/data/coolify/proxy/dynamic/weglarka.yml`; przy błędzie
   zostaje poprzednia wersja, powód w `journalctl -t weglarka-traefik-sync`. Nowa domena apki = najpierw dopisanie
   jej do allowlisty w Ansible (`weglarka_allowed_domains`);
 - (tryb `behind`) port nginx Węglarki na adresie `docker0` **inny niż 8080** (8080 na `0.0.0.0` trzyma docker-proxy

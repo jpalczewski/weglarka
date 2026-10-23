@@ -15,7 +15,11 @@ use crate::plan::{Domain, IngressError, Plan};
 
 #[derive(Debug, Clone)]
 pub struct TraefikOptions {
+    /// TLS entrypoint (routers with `tls`).
     pub entrypoint: String,
+    /// Plain-HTTP entrypoint: a twin router without `tls` per router, so nginx can answer
+    /// with the redirect to HTTPS (without it Traefik would answer 404).
+    pub http_entrypoint: String,
     /// `None` — router without `tls.certResolver` (e.g. certificates issued by someone else).
     pub cert_resolver: Option<String>,
     /// The nginx host as seen from the Traefik container.
@@ -26,6 +30,7 @@ impl Default for TraefikOptions {
     fn default() -> Self {
         Self {
             entrypoint: "https".to_owned(),
+            http_entrypoint: "http".to_owned(),
             cert_resolver: Some("letsencrypt".to_owned()),
             upstream_host: "host.docker.internal".to_owned(),
         }
@@ -53,6 +58,7 @@ fn check_ident(name: &'static str, value: &str, extra: &[u8]) -> Result<(), Ingr
 impl TraefikOptions {
     fn validate(&self) -> Result<(), IngressError> {
         check_ident("entrypoint", &self.entrypoint, b"")?;
+        check_ident("http_entrypoint", &self.http_entrypoint, b"")?;
         if let Some(r) = &self.cert_resolver {
             check_ident("cert_resolver", r, b"")?;
         }
@@ -61,7 +67,10 @@ impl TraefikOptions {
     }
 }
 
-/// Generates the dynamic-file YAML. Order: app routers (by instance name), then webhooks.
+/// Generates the dynamic-file YAML. Order: app routers (by instance name), then webhooks; every
+/// router is followed by its `weglarka-http-*` twin (plain HTTP, no `tls`, same service). The twin carries no
+/// middleware on purpose (the publishing validator rejects them): the redirect is done by nginx,
+/// which sees `X-Forwarded-Proto: http` from Traefik.
 pub fn generate(
     host: &HostConfig,
     apps: &BTreeMap<InstanceName, AppSpec>,
@@ -99,6 +108,21 @@ pub fn generate(
 }
 
 fn router(y: &mut String, name: &str, domains: &[Domain], o: &TraefikOptions) {
+    router_on(y, name, domains, &o.entrypoint, Some(o));
+    // A prefix, not a `-http` suffix: instance `foo-http` would otherwise collide with the twin of `foo`.
+    // TLS routers are `weglarka-app-*` / `weglarka-webhooks`, so `weglarka-http-*` never overlaps.
+    let twin = name.replacen("weglarka-", "weglarka-http-", 1);
+    router_on(y, &twin, domains, &o.http_entrypoint, None);
+}
+
+/// One router; `tls` is `Some(options)` for the TLS entrypoint, `None` for plain HTTP.
+fn router_on(
+    y: &mut String,
+    name: &str,
+    domains: &[Domain],
+    entrypoint: &str,
+    tls: Option<&TraefikOptions>,
+) {
     let rule = domains
         .iter()
         .map(|d| format!("Host(`{d}`)"))
@@ -107,8 +131,9 @@ fn router(y: &mut String, name: &str, domains: &[Domain], o: &TraefikOptions) {
     let _ = write!(
         y,
         "    {name}:\n      rule: \"{rule}\"\n      entryPoints:\n        - {}\n      service: {SERVICE}\n",
-        o.entrypoint
+        entrypoint
     );
+    let Some(o) = tls else { return };
     if let Some(resolver) = &o.cert_resolver {
         let _ = write!(y, "      tls:\n        certResolver: {resolver}\n");
     } else {
