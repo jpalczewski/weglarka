@@ -11,9 +11,10 @@ cli=$2
 daemon=$3
 podman_sock=$4
 
-dir=$(mktemp -d)
+dir=$(mktemp -d -p "${RUNNER_TEMP:-$HOME}") # nie pod /tmp: kontener ma tam tmpfs
 chmod 755 "$dir"
 admin_sock="$dir/run/admin.sock"
+mkdir -p "$dir/run" # katalog admin socketu zakłada operator (docs/install.md)
 touch "$dir/traefik.yml"
 
 cat > "$dir/weglarka.toml" <<TOML
