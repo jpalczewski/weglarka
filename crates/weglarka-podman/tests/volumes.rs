@@ -312,10 +312,16 @@ async fn scenario(socket: &str, variant: &Variant, user: Option<&str>) {
     // 2. recreate: remove c1, let a dummy `auto` container take the freed range, create c2.
     s.remove(&c1);
     let dummy = format!("spike-dummy-{label}-{id}");
-    let _ = s.start(&json!({
+    // The dummy uses the same user-namespace shape, so with real `auto` it takes c1's range.
+    let mut dummy_body = json!({
         "name": dummy, "image": ALPINE, "command": ["sleep", "3600"],
-        "userns": {"nsmode": "auto"},
-    }));
+        "userns": variant.userns.clone().unwrap_or(json!({"nsmode": "auto"})),
+    });
+    if label.starts_with("api-auto") {
+        dummy_body["idmappings"] = auto_idmappings();
+    }
+    let dummy_started = s.start(&dummy_body);
+    eprintln!("SPIKE {label} [{who}]: dummy occupying the range started = {dummy_started:?}");
     let c2 = format!("spike-{label}-2-{id}");
     if let Err(e) = s.start(&variant.body(&c2, user, &vol)) {
         eprintln!(
@@ -858,31 +864,24 @@ fn auto_idmappings() -> Value {
     json!({"AutoUserNs": true, "AutoUserNsOpts": {"Size": 1024}})
 }
 
-/// How to make `auto` engage through the API (the plain `userns: auto` is a no-op rootless) and
-/// whether ownership then survives a recreate (the dummy container takes the freed range).
+/// `auto` through the API = `userns: auto` + `idmappings: {AutoUserNs}`. Ownership across a recreate
+/// where a dummy container takes the freed range, with and without the `idmap` / `U` volume options.
 #[tokio::test]
 async fn spike_auto_via_api() {
     let Some(socket) = socket() else { return };
-    let shapes = [
-        (
-            "api-auto-private",
-            Some(json!({"nsmode": "private"})),
-            Some(auto_idmappings()),
-        ),
-        ("api-auto-idmaps-only", None, Some(auto_idmappings())),
-        (
-            "api-auto-auto",
-            Some(json!({"nsmode": "auto"})),
-            Some(auto_idmappings()),
-        ),
-    ];
-    for (label, userns, idmappings) in shapes {
+    for (label, opts) in [
+        ("api-auto", vec![]),
+        ("api-auto-idmap", vec!["idmap"]),
+        ("api-auto-U", vec!["U"]),
+    ] {
         let v = Variant {
             label,
-            userns,
-            idmappings,
-            volume_options: vec![],
+            userns: Some(json!({"nsmode": "auto"})),
+            idmappings: Some(auto_idmappings()),
+            volume_options: opts,
         };
-        scenario(&socket, &v, Some("1000:1000")).await;
+        for u in USERS {
+            scenario(&socket, &v, u).await;
+        }
     }
 }
