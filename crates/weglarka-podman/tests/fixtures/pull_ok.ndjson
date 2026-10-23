@@ -1,0 +1,4 @@
+{"status":"pulling","stream":"Trying to pull ghcr.io/jpalczewski/ntfy.zig:latest...\n"}
+{"status":"pulling","stream":"Getting image source signatures\n"}
+{"status":"pulling","stream":"\n"}
+{"status":"success","images":["9b8a7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b"],"id":"9b8a7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b"}

@@ -1,0 +1,44 @@
+---
+source: crates/weglarka-podman/src/wire.rs
+expression: "CreateContainer::new(&spec)"
+---
+{
+  "name": "ntfy-1",
+  "image": "ghcr.io/jpalczewski/ntfy.zig@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "labels": {
+    "weglarka.instance": "ntfy"
+  },
+  "env": {
+    "CONFIG_FILE": "/config.json"
+  },
+  "restart_policy": "always",
+  "userns": {
+    "nsmode": "auto"
+  },
+  "netns": {
+    "nsmode": "bridge"
+  },
+  "Networks": {
+    "net-ntfy": {}
+  },
+  "portmappings": [
+    {
+      "host_ip": "172.17.0.1",
+      "host_port": 8085,
+      "container_port": 8085,
+      "protocol": "tcp"
+    }
+  ],
+  "secrets": [
+    {
+      "Source": "ntfy-config",
+      "Target": "/config.json",
+      "UID": 0,
+      "GID": 0,
+      "Mode": 288
+    }
+  ],
+  "secret_env": {
+    "TOKEN": "ntfy-token"
+  }
+}

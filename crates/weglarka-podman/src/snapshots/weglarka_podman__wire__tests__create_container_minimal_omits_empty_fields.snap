@@ -1,0 +1,8 @@
+---
+source: crates/weglarka-podman/src/wire.rs
+expression: "CreateContainer::new(&spec)"
+---
+{
+  "name": "a",
+  "image": "i"
+}

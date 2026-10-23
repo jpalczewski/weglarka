@@ -81,9 +81,16 @@ jobs:
           set -euo pipefail
           sock="$XDG_RUNTIME_DIR/podman/podman.sock"
           mkdir -p "$(dirname "$sock")"
-          podman system service --time 0 "unix://$sock" &
+          podman system service --time 0 "unix://$sock" 2>"$RUNNER_TEMP/podman-service.log" &
           for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
           echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
+          podman version
+          grep "^$USER:" /etc/subuid /etc/subgid
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p weglarka-podman
+      # Bez WEGLARKA_PODMAN_SOCKET testy same się pomijają — tu zmienna jest ustawiona,
+      # więc `--nocapture` pokazuje, że nic się nie pominęło.
+      - run: cargo test -p weglarka-podman -- --nocapture
+      - name: Podman service log
+        if: failure()
+        run: cat "$RUNNER_TEMP/podman-service.log" || true
