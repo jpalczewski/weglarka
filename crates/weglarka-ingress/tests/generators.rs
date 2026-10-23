@@ -177,7 +177,8 @@ fn rejects_bad_options() {
         assert!(traefik::generate(&h, &a, &o).is_err(), "host {bad:?}");
     }
     assert!("1.2.3.4/33".parse::<Cidr>().is_err());
-    assert!("1.2.3.4".parse::<Cidr>().is_err());
+    assert!("1.2.3.4".parse::<Cidr>().is_ok(), "a bare address is a /32");
+    assert!("1.2.3.4/x".parse::<Cidr>().is_err());
     assert!("1.2.3.4/8; deny".parse::<Cidr>().is_err());
 }
 
@@ -193,4 +194,31 @@ fn edge_mode_is_not_supported_yet() {
         traefik::generate(&h, &BTreeMap::new(), &TraefikOptions::default()),
         Err(IngressError::UnsupportedMode(_))
     ));
+}
+
+#[test]
+fn trusted_proxies_from_config_replace_the_default() {
+    let o = opts()
+        .with_trusted_proxies(&["192.0.2.0/24".into(), "198.51.100.7".into()])
+        .unwrap();
+    let conf = nginx::generate(&host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("set_real_ip_from 192.0.2.0/24;"));
+    assert!(conf.contains("set_real_ip_from 198.51.100.7/32;"));
+    assert!(
+        !conf.contains("10.88.0.0/15"),
+        "default is replaced, not extended"
+    );
+    // Empty list keeps the default, which covers rootlessport's 10.89.x.x source.
+    let conf = nginx::generate(
+        &host(),
+        &apps(ONE_APP),
+        &opts().with_trusted_proxies(&[]).unwrap(),
+    )
+    .unwrap();
+    assert!(conf.contains("set_real_ip_from 10.88.0.0/15;"));
+    assert!(
+        opts()
+            .with_trusted_proxies(&["10.0.0.0/8; deny".into()])
+            .is_err()
+    );
 }

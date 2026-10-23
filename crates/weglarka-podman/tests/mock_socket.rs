@@ -319,3 +319,36 @@ async fn events_stream_yields_domain_events_and_reports_close() {
         "koniec strumienia = utrata połączenia"
     );
 }
+
+#[tokio::test]
+async fn exec_runs_detached_and_returns_exit_code_and_disconnect_is_idempotent() {
+    let mock = serve(vec![
+        (
+            "POST /v6.0.0/libpod/containers/c/exec",
+            201,
+            r#"{"Id":"abc123"}"#,
+        ),
+        ("POST /v6.0.0/libpod/exec/abc123/start", 200, ""),
+        (
+            "GET /v6.0.0/libpod/exec/abc123/json",
+            200,
+            r#"{"Running":false,"ExitCode":1}"#,
+        ),
+        (
+            "POST /v6.0.0/libpod/networks/net/disconnect",
+            500,
+            r#"{"message":"container c is not connected to network net"}"#,
+        ),
+    ]);
+    let client = LibpodClient::new(&mock.socket);
+    let cmd = ["nginx".to_owned(), "-t".to_owned()];
+    assert_eq!(client.container_exec("c", &cmd).await.unwrap(), 1);
+    client.network_disconnect("net", "c").await.unwrap();
+    let requests = mock.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.contains(r#"{"Cmd":["nginx","-t"]}"#))
+    );
+    assert!(requests.iter().any(|r| r.contains(r#"{"Detach":true}"#)));
+}

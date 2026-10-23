@@ -13,14 +13,18 @@ use weglarka_core::podman::{
 
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
-    ConnectNetwork, CreateContainer, CreateNetwork, CreatedContainer, HealthReport,
-    InspectContainer, InspectImage, InspectNetwork, ListedContainer, PullLine, PullReport, Version,
-    WireEvent, decode, health_status,
+    ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreatedContainer, CreatedExec,
+    DisconnectNetwork, HealthReport, InspectContainer, InspectExec, InspectImage, InspectNetwork,
+    ListedContainer, PullLine, PullReport, StartExec, Version, WireEvent, decode, health_status,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
 /// it does not connect on creation — a missing socket surfaces as `PodmanError::Unreachable`
 /// on the first call (e.g. [`PodmanClient::version`]).
+/// Exec polling: up to `EXEC_POLLS * EXEC_POLL_INTERVAL` (30 s).
+const EXEC_POLLS: u32 = 600;
+const EXEC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[derive(Debug, Clone)]
 pub struct LibpodClient {
     transport: Transport,
@@ -98,6 +102,38 @@ impl PodmanClient for LibpodClient {
         );
         self.transport.call(Method::POST, &path, None).await?;
         Ok(())
+    }
+
+    async fn container_exec(&self, name: &str, cmd: &[String]) -> Result<i32> {
+        let path = format!("/containers/{}/exec", path_name(name)?);
+        let body = self
+            .transport
+            .call_json(Method::POST, &path, &CreateExec { cmd })
+            .await?;
+        let id = decode::<CreatedExec>(&body)?.id;
+        let id = path_name(&id)?;
+        // Detached start + polling: avoids parsing the hijacked multiplexed stream; output is not needed.
+        self.transport
+            .call_json(
+                Method::POST,
+                &format!("/exec/{id}/start"),
+                &StartExec { detach: true },
+            )
+            .await?;
+        for _ in 0..EXEC_POLLS {
+            let body = self
+                .transport
+                .call(Method::GET, &format!("/exec/{id}/json"), None)
+                .await?;
+            let exec = decode::<InspectExec>(&body)?;
+            if !exec.running {
+                return Ok(exec.exit_code);
+            }
+            tokio::time::sleep(EXEC_POLL_INTERVAL).await;
+        }
+        Err(PodmanError::Protocol(format!(
+            "exec in {name} did not finish in time"
+        )))
     }
 
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
@@ -181,6 +217,27 @@ impl PodmanClient for LibpodClient {
             .call_json(Method::POST, &path, &ConnectNetwork { container })
             .await?;
         Ok(())
+    }
+
+    async fn network_disconnect(&self, network: &str, container: &str) -> Result<()> {
+        let path = format!("/networks/{}/disconnect", path_name(network)?);
+        let result = self
+            .transport
+            .call_json(
+                Method::POST,
+                &path,
+                &DisconnectNetwork {
+                    container,
+                    force: false,
+                },
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            // Not attached (libpod answers 500 "is not connected to network") — idempotent.
+            Err(PodmanError::Api { message, .. }) if message.contains("not connected") => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn network_inspect(&self, name: &str) -> Result<NetworkInfo> {

@@ -394,6 +394,7 @@ mod tests {
             state,
             exit_code: None,
             health: None,
+            networks: vec![],
         }
     }
     fn target(inst: &str, pinned: Option<char>) -> (Target, SpecHash) {

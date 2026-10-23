@@ -80,6 +80,8 @@ cat "$dir/doctor.json"
 [ "$rc" -le 2 ] || { echo "doctor failed to run (exit $rc)"; exit 1; }
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dir/doctor.json"
 
+nginx_id=$(podman inspect -f '{{.Id}}' weglarka-nginx)
+
 if [ -n "$acceptance" ]; then
   echo "--- skrypt odbioru (acceptance.sh) na demonie ze smoke testu"
   # Bez Traefika i TLS: ruch bezpośrednio do nginx (Host: domena), webhooki prosto na listener demona;
@@ -89,3 +91,9 @@ if [ -n "$acceptance" ]; then
     --direct http://127.0.0.1:18080 --webhook-base http://127.0.0.1:19180 \
     --skip-preflight --with-local-registry
 fi
+
+# Adding and removing apps (the acceptance canary) only connects/disconnects networks and reloads:
+# the nginx container must be the same one (docs/decisions/0007).
+[ "$(podman inspect -f '{{.Id}}' weglarka-nginx)" = "$nginx_id" ] \
+  || { echo "weglarka-nginx was recreated by an ingress change"; exit 1; }
+echo "weglarka-nginx survived app add/remove without recreation"

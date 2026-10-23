@@ -38,6 +38,14 @@ pub enum Call {
         network: String,
         container: String,
     },
+    NetworkDisconnect {
+        network: String,
+        container: String,
+    },
+    ContainerExec {
+        name: String,
+        cmd: Vec<String>,
+    },
     SecretCreate(String),
     SecretRemove(String),
     HealthcheckRun(String),
@@ -52,6 +60,8 @@ struct State {
     pull_failures: BTreeMap<String, String>,
     networks: BTreeMap<String, (NetworkSpec, Vec<String>)>,
     secrets: BTreeMap<String, Vec<u8>>,
+    /// Exit code returned by `container_exec` (default 0).
+    exec_exit_codes: BTreeMap<String, i32>,
     health_scripts: BTreeMap<String, VecDeque<HealthStatus>>,
     events: Vec<PodmanEvent>,
     calls: Vec<Call>,
@@ -111,12 +121,20 @@ impl FakePodman {
         }
     }
 
+    /// Exit code returned by subsequent `container_exec`s in this container.
+    pub fn set_exec_exit_code(&self, container: &str, code: i32) {
+        self.lock()
+            .exec_exit_codes
+            .insert(container.to_owned(), code);
+    }
+
     pub fn calls(&self) -> Vec<Call> {
         self.lock().calls.clone()
     }
 
     pub fn containers(&self) -> Vec<ContainerInfo> {
-        self.lock().containers.values().cloned().collect()
+        let s = self.lock();
+        s.containers.values().map(|c| s.with_networks(c)).collect()
     }
 
     pub fn has_secret(&self, name: &str) -> bool {
@@ -146,6 +164,18 @@ impl State {
         self.containers
             .get_mut(name)
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))
+    }
+
+    /// Container snapshot with `networks` filled in from network membership.
+    fn with_networks(&self, c: &ContainerInfo) -> ContainerInfo {
+        let mut info = c.clone();
+        info.networks = self
+            .networks
+            .iter()
+            .filter(|(_, (_, members))| members.contains(&c.name))
+            .map(|(n, _)| n.clone())
+            .collect();
+        info
     }
 
     fn next_health(&mut self, name: &str) -> Option<HealthStatus> {
@@ -217,6 +247,7 @@ impl PodmanClient for FakePodman {
                 state: ContainerState::Created,
                 exit_code: None,
                 health,
+                networks: Vec::new(),
             },
         );
         Ok(id)
@@ -267,17 +298,30 @@ impl PodmanClient for FakePodman {
     }
 
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
-        self.lock()
-            .containers
+        let s = self.lock();
+        s.containers
             .get(name)
-            .cloned()
+            .map(|c| s.with_networks(c))
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))
     }
 
+    async fn container_exec(&self, name: &str, cmd: &[String]) -> Result<i32> {
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerExec {
+            name: name.to_owned(),
+            cmd: cmd.to_vec(),
+        });
+        if s.container_mut(name)?.state != ContainerState::Running {
+            return Err(PodmanError::Conflict(format!(
+                "container {name} is not running"
+            )));
+        }
+        Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
+    }
+
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
-        Ok(self
-            .lock()
-            .containers
+        let s = self.lock();
+        Ok(s.containers
             .values()
             .filter(|c| {
                 filter
@@ -285,7 +329,7 @@ impl PodmanClient for FakePodman {
                     .iter()
                     .all(|(k, v)| c.labels.get(k) == Some(v))
             })
-            .cloned()
+            .map(|c| s.with_networks(c))
             .collect())
     }
 
@@ -387,6 +431,23 @@ impl PodmanClient for FakePodman {
         if !members.iter().any(|m| m == container) {
             members.push(container.to_owned());
         }
+        Ok(())
+    }
+
+    async fn network_disconnect(&self, network: &str, container: &str) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::NetworkDisconnect {
+            network: network.into(),
+            container: container.into(),
+        });
+        if !s.containers.contains_key(container) {
+            return Err(PodmanError::NotFound(container.to_owned()));
+        }
+        let (_, members) = s
+            .networks
+            .get_mut(network)
+            .ok_or_else(|| PodmanError::NotFound(network.to_owned()))?;
+        members.retain(|m| m != container);
         Ok(())
     }
 

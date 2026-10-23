@@ -114,6 +114,8 @@ pub struct ContainerInfo {
     pub exit_code: Option<i32>,
     /// `None` — the image has no healthcheck.
     pub health: Option<HealthStatus>,
+    /// Names of the networks the container is currently attached to (sorted).
+    pub networks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +200,13 @@ pub trait PodmanClient: Send + Sync {
     /// Sends a signal (name without `SIG`, e.g. `HUP`) to a running container — reloads nginx.
     fn container_kill(&self, name: &str, signal: &str) -> impl Future<Output = Result<()>> + Send;
     /// `PodmanError::NotFound` if missing.
+    /// Runs `cmd` in a running container, waits for it to finish and returns the exit code.
+    /// Output is not captured (used for `nginx -t`).
+    fn container_exec(
+        &self,
+        name: &str,
+        cmd: &[String],
+    ) -> impl Future<Output = Result<i32>> + Send;
     fn container_inspect(&self, name: &str) -> impl Future<Output = Result<ContainerInfo>> + Send;
     fn container_list(
         &self,
@@ -217,6 +226,13 @@ pub trait PodmanClient: Send + Sync {
     /// Idempotent: an existing network with that name → `Ok`.
     fn network_create(&self, spec: &NetworkSpec) -> impl Future<Output = Result<()>> + Send;
     fn network_connect(
+        &self,
+        network: &str,
+        container: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Detaches a running container from a network. Idempotent: not attached → `Ok`.
+    fn network_disconnect(
         &self,
         network: &str,
         container: &str,

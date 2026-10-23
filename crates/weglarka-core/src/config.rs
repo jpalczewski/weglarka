@@ -100,6 +100,10 @@ pub struct IngressConfig {
     /// Katalog hosta z `nginx.conf` (montowany do kontenera nginx); domyślnie `<state dir>/nginx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nginx_conf_dir: Option<PathBuf>,
+    /// Peers (IPs/CIDRs) whose `X-Forwarded-*` nginx trusts. Empty = the generator's default
+    /// (rootless Podman's port-forwarder networks, see `docs/decisions/0007`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl IngressConfig {
@@ -196,6 +200,20 @@ kind = "systemd"
     #[test]
     fn parses_sample_from_mvp_note() {
         insta::assert_json_snapshot!(HostConfig::from_toml_str(SAMPLE).unwrap());
+    }
+
+    #[test]
+    fn trusted_proxies_are_optional_and_listed() {
+        let cfg = SAMPLE.replace("[admin]", "trusted_proxies = [\"10.89.0.0/16\"]\n\n[admin]");
+        let parsed = HostConfig::from_toml_str(&cfg).unwrap();
+        assert_eq!(parsed.ingress.trusted_proxies, ["10.89.0.0/16"]);
+        assert!(
+            HostConfig::from_toml_str(SAMPLE)
+                .unwrap()
+                .ingress
+                .trusted_proxies
+                .is_empty()
+        );
     }
 
     #[test]

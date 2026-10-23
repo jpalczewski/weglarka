@@ -282,6 +282,10 @@ async fn full_lifecycle() {
     client.network_connect(&net_b, &app).await.unwrap();
     let info = client.container_inspect(&app).await.unwrap();
     assert_eq!(info.state, ContainerState::Running);
+    assert!(
+        info.networks.contains(&net_b),
+        "connected network is reported"
+    );
     assert_eq!(info.health, None, "obraz bez healthchecka");
     assert!(matches!(
         client.healthcheck_run(&app).await,

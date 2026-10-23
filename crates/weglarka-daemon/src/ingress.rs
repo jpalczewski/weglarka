@@ -2,9 +2,9 @@
 //!
 //! `apply` is idempotent: with no change to the config or the container it does nothing (notably it
 //! does not touch the Traefik file, which has a ~2 s reload throttle). The nginx container carries
-//! a `weglarka.ingress-hash` label (image + networks + publishing); a change in the set of app
-//! networks means recreating the container (there is no `network_disconnect`), a config-only
-//! change means `SIGHUP`.
+//! a `weglarka.ingress-hash` label (image + publishing — what cannot change on a live container).
+//! App networks are *not* part of it: they are connected/disconnected on the running container, and
+//! a config change is validated with `nginx -t` (rolled back on failure) and applied with `SIGHUP`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -51,6 +51,11 @@ pub enum IngressApplyError {
     },
     #[error("network {0} has no gateway address (no DNS resolver for nginx)")]
     NoResolver(String),
+    #[error(
+        "nginx rejected the new config (nginx -t exit {0}); previous config restored — \
+         inspect with `podman exec weglarka-nginx nginx -t`"
+    )]
+    ConfigRejected(i32),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> IngressApplyError + '_ {
@@ -78,6 +83,8 @@ pub enum NginxAction {
     Recreated,
     Started,
     Reloaded,
+    /// Only the set of attached networks changed (no config change).
+    NetworksSynced,
 }
 
 pub struct IngressManager<P: PodmanClient> {
@@ -175,7 +182,8 @@ impl<P: PodmanClient> IngressManager<P> {
             resolvers.extend(info.gateways);
         }
 
-        let options = nginx::NginxOptions::new(resolvers);
+        let options = nginx::NginxOptions::new(resolvers)
+            .with_trusted_proxies(&self.host.ingress.trusted_proxies)?;
         let conf = nginx::generate(&self.host, &apps, &options)?;
         let traefik_yaml = match (
             &self.host.ingress.traefik_dynamic_file,
@@ -189,14 +197,29 @@ impl<P: PodmanClient> IngressManager<P> {
             _ => None,
         };
 
+        let previous = fs::read(self.conf_path()).ok();
         let conf_written = self.write_conf(&conf)?;
+        // Traefik is updated only once nginx accepted the config (no route to a server that is not there).
+        let nginx = match self
+            .ensure_nginx(&networks, options.listen_port, conf_written)
+            .await
+        {
+            Ok(action) => action,
+            Err(e) => {
+                // Roll back so the next `apply` sees the difference again and retries.
+                if let (true, Some(old)) = (conf_written, &previous) {
+                    let path = self.conf_path();
+                    if let Err(re) = write_atomic(&path, old, 0o644) {
+                        tracing::error!(error = %re, "cannot restore previous nginx.conf");
+                    }
+                }
+                return Err(e);
+            }
+        };
         let traefik_written = match (&self.host.ingress.traefik_dynamic_file, &traefik_yaml) {
             (Some(path), Some(yaml)) => write_in_place(path, yaml.as_bytes())?,
             _ => false,
         };
-        let nginx = self
-            .ensure_nginx(&networks, options.listen_port, conf_written)
-            .await?;
 
         if !conf_written && !traefik_written && nginx == NginxAction::None {
             Ok(ApplyReport::Unchanged)
@@ -232,7 +255,7 @@ impl<P: PodmanClient> IngressManager<P> {
         let podman = self.engine.podman();
         let image = &self.host.ingress.nginx_image;
         let bind = self.host.ingress.bind;
-        let hash = ingress_hash(image, networks, &bind.to_string(), listen_port);
+        let hash = ingress_hash(image, &bind.to_string(), listen_port);
 
         let existing = podman
             .container_list(&ContainerFilter::default())
@@ -240,61 +263,102 @@ impl<P: PodmanClient> IngressManager<P> {
             .into_iter()
             .find(|c| c.name == NGINX_CONTAINER);
 
-        let action = match &existing {
-            None => NginxAction::Created,
-            Some(c) if c.labels.get(HASH_LABEL) != Some(&hash) => NginxAction::Recreated,
-            Some(c) if c.state != ContainerState::Running => NginxAction::Started,
-            Some(_) if conf_changed => NginxAction::Reloaded,
-            Some(_) => NginxAction::None,
+        let existed = existing.is_some();
+        let Some(existing) = existing.filter(|c| c.labels.get(HASH_LABEL) == Some(&hash)) else {
+            self.create_nginx(networks, listen_port, hash, existed)
+                .await?;
+            return Ok(if existed {
+                NginxAction::Recreated
+            } else {
+                NginxAction::Created
+            });
         };
 
-        match action {
-            NginxAction::None => {}
-            NginxAction::Reloaded => {
-                podman.container_kill(NGINX_CONTAINER, "HUP").await?;
+        // Networks are attached to the live container; removal waits until the new config is live.
+        let missing: Vec<&String> = networks
+            .iter()
+            .filter(|n| !existing.networks.contains(n))
+            .collect();
+        let stale: Vec<&String> = existing
+            .networks
+            .iter()
+            .filter(|n| !networks.contains(n))
+            .collect();
+        for net in &missing {
+            podman.network_connect(net, NGINX_CONTAINER).await?;
+        }
+
+        let mut action = NginxAction::None;
+        if existing.state != ContainerState::Running {
+            podman.container_start(NGINX_CONTAINER).await?;
+            action = NginxAction::Started;
+        } else if conf_changed {
+            let test = ["nginx", "-t", "-c", "/etc/nginx/nginx.conf"].map(str::to_owned);
+            let code = podman.container_exec(NGINX_CONTAINER, &test).await?;
+            if code != 0 {
+                return Err(IngressApplyError::ConfigRejected(code));
             }
-            NginxAction::Started => {
-                podman.container_start(NGINX_CONTAINER).await?;
-            }
-            NginxAction::Created | NginxAction::Recreated => {
-                self.ensure_image(image).await?;
-                if existing.is_some() {
-                    match podman
-                        .container_stop(NGINX_CONTAINER, NGINX_STOP_TIMEOUT)
-                        .await
-                    {
-                        Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    podman.container_remove(NGINX_CONTAINER, true).await?;
-                }
-                podman
-                    .container_create(&ContainerSpec {
-                        name: NGINX_CONTAINER.to_owned(),
-                        image: image.clone(),
-                        // No `weglarka.instance` — reconcile would treat the container as an orphan.
-                        labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
-                        env: BTreeMap::new(),
-                        networks: networks.to_vec(),
-                        secrets: vec![],
-                        publish: vec![PortMapping {
-                            host_ip: Some(bind.ip().to_string()),
-                            host_port: bind.port(),
-                            container_port: listen_port,
-                        }],
-                        restart: RestartPolicy::Always,
-                        userns_auto: true,
-                        mounts: vec![BindMount {
-                            source: self.conf_dir.display().to_string(),
-                            target: NGINX_CONF_MOUNT.to_owned(),
-                            read_only: true,
-                        }],
-                    })
-                    .await?;
-                podman.container_start(NGINX_CONTAINER).await?;
+            podman.container_kill(NGINX_CONTAINER, "HUP").await?;
+            action = NginxAction::Reloaded;
+        } else if !missing.is_empty() {
+            action = NginxAction::NetworksSynced;
+        }
+        for net in &stale {
+            podman.network_disconnect(net, NGINX_CONTAINER).await?;
+            if action == NginxAction::None {
+                action = NginxAction::NetworksSynced;
             }
         }
         Ok(action)
+    }
+
+    /// (Re)creates the nginx container with the current set of networks.
+    async fn create_nginx(
+        &self,
+        networks: &[String],
+        listen_port: u16,
+        hash: String,
+        replace: bool,
+    ) -> Result<(), IngressApplyError> {
+        let podman = self.engine.podman();
+        let image = &self.host.ingress.nginx_image;
+        let bind = self.host.ingress.bind;
+        self.ensure_image(image).await?;
+        if replace {
+            match podman
+                .container_stop(NGINX_CONTAINER, NGINX_STOP_TIMEOUT)
+                .await
+            {
+                Ok(()) | Err(PodmanError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            podman.container_remove(NGINX_CONTAINER, true).await?;
+        }
+        podman
+            .container_create(&ContainerSpec {
+                name: NGINX_CONTAINER.to_owned(),
+                image: image.clone(),
+                // No `weglarka.instance` — reconcile would treat the container as an orphan.
+                labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
+                env: BTreeMap::new(),
+                networks: networks.to_vec(),
+                secrets: vec![],
+                publish: vec![PortMapping {
+                    host_ip: Some(bind.ip().to_string()),
+                    host_port: bind.port(),
+                    container_port: listen_port,
+                }],
+                restart: RestartPolicy::Always,
+                userns_auto: true,
+                mounts: vec![BindMount {
+                    source: self.conf_dir.display().to_string(),
+                    target: NGINX_CONF_MOUNT.to_owned(),
+                    read_only: true,
+                }],
+            })
+            .await?;
+        podman.container_start(NGINX_CONTAINER).await?;
+        Ok(())
     }
 
     async fn ensure_image(&self, image: &str) -> Result<(), IngressApplyError> {
@@ -313,19 +377,15 @@ impl<P: PodmanClient> IngressManager<P> {
     }
 }
 
-fn ingress_hash(image: &str, networks: &[String], bind: &str, listen_port: u16) -> String {
-    let mut nets: Vec<&String> = networks.iter().collect();
-    nets.sort();
+/// Spec hash of the nginx container: only what cannot change on a live container. The set of app
+/// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
+fn ingress_hash(image: &str, bind: &str, listen_port: u16) -> String {
     let mut h = Sha256::new();
     for part in [image, bind] {
         h.update(part.as_bytes());
         h.update([0]);
     }
     h.update(listen_port.to_be_bytes());
-    for n in nets {
-        h.update([0]);
-        h.update(n.as_bytes());
-    }
     hex::encode(&h.finalize()[..8])
 }
 
@@ -372,11 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn hash_ignores_network_order_but_not_membership() {
-        let a = ingress_hash("i", &["a".into(), "b".into()], "x", 80);
-        let b = ingress_hash("i", &["b".into(), "a".into()], "x", 80);
-        let c = ingress_hash("i", &["a".into()], "x", 80);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+    fn hash_covers_image_bind_and_port() {
+        let a = ingress_hash("i", "x", 80);
+        assert_eq!(a, ingress_hash("i", "x", 80));
+        assert_ne!(a, ingress_hash("j", "x", 80));
+        assert_ne!(a, ingress_hash("i", "y", 80));
+        assert_ne!(a, ingress_hash("i", "x", 81));
     }
 }

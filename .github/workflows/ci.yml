@@ -49,6 +49,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
       - run: docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+      # X-Forwarded-* z zaufanego peera przechodzą, od niezaufanego są nadpisywane (docs/decisions/0007).
+      # Peer żądania na opublikowanym porcie to brama mostu Dockera (172.17.0.1) — raz w trusted, raz nie.
+      - name: Forwarded headers through nginx
+        run: |
+          set -euo pipefail
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/trusted.conf"
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 192.0.2.0/24 > "$RUNNER_TEMP/untrusted.conf"
+          .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf"
 
   # Obraz Węglarki (Containerfile) — artefakt trafia do smoke testu w `integration-podman`.
   image:

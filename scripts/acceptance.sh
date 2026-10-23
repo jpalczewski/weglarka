@@ -235,7 +235,9 @@ canary_request() {
   local -a extra=()
   if [ -n "$DIRECT" ]; then
     url=$DIRECT/
-    extra=(-H "Host: $CANARY_DOMAIN")
+    # Impersonate Traefik: the request reaches nginx through the port forwarder, which is a trusted
+    # peer by default, so the header must arrive at the app (docs/decisions/0007).
+    extra=(-H "Host: $CANARY_DOMAIN" -H 'X-Forwarded-Proto: https')
   fi
   code=$(curl -sS --max-time 10 -o "$WORK/body" -w '%{http_code}' ${extra[@]+"${extra[@]}"} "$url" 2>"$WORK/curl_err") || rc=$?
   put curl_rc "$rc"
@@ -383,11 +385,12 @@ step_traffic() {
   body_has "X-Forwarded-Host: $CANARY_DOMAIN" \
     || { sed 's/^/  | /' "$WORK/body"; die "brak X-Forwarded-Host: $CANARY_DOMAIN w odpowiedzi whoami (nginx/Traefik nie przekazały nagłówka)"; }
   body_has 'X-Forwarded-For:' || die "brak X-Forwarded-For w odpowiedzi whoami"
+  body_has 'X-Forwarded-Proto: https' \
+    || die "brak X-Forwarded-Proto: https (nginx nie ufa peerowi? sprawdź [ingress] trusted_proxies, docs/decisions/0007)"
   if [ -z "$DIRECT" ]; then
-    body_has 'X-Forwarded-Proto: https' || die "brak X-Forwarded-Proto: https (nginx nie ufa Traefikowi?)"
     note "https://$CANARY_DOMAIN/ → 200, cert ważny, nagłówki forwardowane"
   else
-    note "$DIRECT (Host: $CANARY_DOMAIN) → 200, nagłówki forwardowane; TLS nie sprawdzany"
+    note "$DIRECT (Host: $CANARY_DOMAIN) → 200, nagłówki forwardowane (X-Forwarded-Proto od zaufanego peera); TLS nie sprawdzany"
   fi
 }
 

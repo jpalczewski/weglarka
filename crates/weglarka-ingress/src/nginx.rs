@@ -21,7 +21,8 @@ pub struct NginxOptions {
     pub resolvers: Vec<IpAddr>,
     /// Port nginx listens on *inside* the container (published on `ingress.bind`).
     pub listen_port: u16,
-    /// Networks we trust for `X-Forwarded-*` (`behind` mode: the Docker network with Traefik).
+    /// Peers we trust for `X-Forwarded-*` and `real_ip` (`behind` mode: whoever connects to the
+    /// published port — with rootless Podman that is the port forwarder, not Traefik itself).
     pub trusted_proxies: Vec<Cidr>,
     /// Webhook path prefixes (start and end with `/`); the rest of the domain → 404.
     pub webhook_paths: Vec<String>,
@@ -36,11 +37,33 @@ impl NginxOptions {
         Self {
             resolvers,
             listen_port: 8080,
-            trusted_proxies: vec![Cidr::new(IpAddr::from([172, 16, 0, 0]), 12).expect("static")],
+            trusted_proxies: Self::default_trusted_proxies(),
             webhook_paths: vec!["/webhook/".to_owned()],
             webhook_max_body_bytes: 1024 * 1024,
             app_max_body_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    /// Default trusted peers (`docs/decisions/0007`): rootless Podman's networks `10.88.0.0/15`
+    /// (the address rootlessport connects from, seen as `10.89.x.x`) and Docker's `172.16.0.0/12`
+    /// (a forwarder that preserves the source address, e.g. pasta, shows Traefik's own address).
+    pub fn default_trusted_proxies() -> Vec<Cidr> {
+        [([10, 88, 0, 0], 15), ([172, 16, 0, 0], 12)]
+            .into_iter()
+            .map(|(octets, prefix)| Cidr::new(IpAddr::from(octets), prefix).expect("static"))
+            .collect()
+    }
+
+    /// Replaces the trusted peers with `[ingress] trusted_proxies` (empty keeps the default).
+    /// Entries are CIDRs or bare addresses (a single host).
+    pub fn with_trusted_proxies(mut self, entries: &[String]) -> Result<Self, IngressError> {
+        if !entries.is_empty() {
+            self.trusted_proxies = entries
+                .iter()
+                .map(|e| e.parse())
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), IngressError> {
@@ -50,6 +73,9 @@ impl NginxOptions {
         };
         if self.resolvers.is_empty() {
             return Err(bad("resolvers", "at least one resolver required"));
+        }
+        if self.trusted_proxies.is_empty() {
+            return Err(bad("trusted_proxies", "at least one peer required"));
         }
         if self.listen_port == 0 {
             return Err(bad("listen_port", "must not be 0"));
@@ -128,6 +154,22 @@ impl ModeProfile for Behind<'_> {
                 c.line("default $scheme;");
                 c.line("\"1:https\" https;");
                 c.line("\"1:http\" http;");
+            },
+        );
+        // Same rule for the forwarded chain and host: a trusted peer's values are passed on,
+        // anyone else gets our own (a client cannot forge `X-Forwarded-*`).
+        c.block(
+            "map \"$weglarka_trusted:$http_x_forwarded_for\" $weglarka_xff",
+            |c| {
+                c.line("default $remote_addr;");
+                c.line("\"~^1:(?<chain>.+)$\" $chain;");
+            },
+        );
+        c.block(
+            "map \"$weglarka_trusted:$http_x_forwarded_host\" $weglarka_fwd_host",
+            |c| {
+                c.line("default $host;");
+                c.line("\"~^1:(?<fhost>.+)$\" $fhost;");
             },
         );
     }
@@ -216,9 +258,9 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
         c.line("proxy_http_version 1.1;");
         c.line("proxy_set_header Host $host;");
         c.line("proxy_set_header X-Real-IP $remote_addr;");
-        c.line("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
+        c.line("proxy_set_header X-Forwarded-For $weglarka_xff;");
         c.line("proxy_set_header X-Forwarded-Proto $weglarka_proto;");
-        c.line("proxy_set_header X-Forwarded-Host $host;");
+        c.line("proxy_set_header X-Forwarded-Host $weglarka_fwd_host;");
         c.line("proxy_set_header X-Request-Id $request_id;");
         c.line("proxy_set_header Upgrade $http_upgrade;");
         c.line("proxy_set_header Connection $connection_upgrade;");
