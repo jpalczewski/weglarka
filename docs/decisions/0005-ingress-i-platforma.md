@@ -1,6 +1,6 @@
 # 0005 — Ingress w demonie: przeładowanie nginxa, plik Traefika, quadlet
 
-Status: przyjęta (sesja daemon, 2026-10-23).
+Status: przyjęta (sesja daemon, 2026-10-23). **Aktualizacja: reload bez `exec`/odtwarzania nginxa zastąpiony przez 0007** (`nginx -t` + HUP, sieci w locie).
 
 **nginx.**
 - Kontener `weglarka-nginx` zarządza demon (`IngressManager::apply`, idempotentne). Katalog z `nginx.conf`

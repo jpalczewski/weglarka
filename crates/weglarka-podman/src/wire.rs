@@ -205,6 +205,15 @@ pub(crate) struct InspectContainer {
     config: InspectConfig,
     #[serde(rename = "State")]
     state: InspectState,
+    #[serde(rename = "NetworkSettings")]
+    network_settings: InspectNetworkSettings,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct InspectNetworkSettings {
+    /// Only the keys (network names) matter.
+    networks: Option<BTreeMap<String, serde::de::IgnoredAny>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -261,6 +270,12 @@ impl InspectContainer {
                 .then_some(self.state.exit_code),
             state,
             health: self.state.health.and_then(|h| health_status(&h.status)),
+            networks: self
+                .network_settings
+                .networks
+                .unwrap_or_default()
+                .into_keys()
+                .collect(),
         }
     }
 }
@@ -387,6 +402,7 @@ pub(crate) struct InspectNetwork {
 #[serde(default)]
 struct Subnet {
     gateway: String,
+    subnet: String,
 }
 
 impl InspectNetwork {
@@ -398,6 +414,12 @@ impl InspectNetwork {
                 .iter()
                 .filter_map(|s| s.gateway.parse().ok())
                 .collect(),
+            subnets: self
+                .subnets
+                .iter()
+                .filter(|s| !s.subnet.is_empty())
+                .map(|s| s.subnet.clone())
+                .collect(),
         }
     }
 }
@@ -405,6 +427,37 @@ impl InspectNetwork {
 #[derive(Serialize)]
 pub(crate) struct ConnectNetwork<'a> {
     pub(crate) container: &'a str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DisconnectNetwork<'a> {
+    pub(crate) container: &'a str,
+    pub(crate) force: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CreateExec<'a> {
+    pub(crate) cmd: &'a [String],
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub(crate) struct CreatedExec {
+    pub(crate) id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct StartExec {
+    pub(crate) detach: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub(crate) struct InspectExec {
+    pub(crate) running: bool,
+    pub(crate) exit_code: i32,
 }
 
 // ---- events ----

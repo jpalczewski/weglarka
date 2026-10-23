@@ -113,9 +113,11 @@ impl FromStr for Cidr {
             name: "cidr",
             reason: format!("{s:?}: {reason}"),
         };
-        let (addr, prefix) = s
-            .split_once('/')
-            .ok_or_else(|| bad("expected addr/prefix"))?;
+        let Some((addr, prefix)) = s.split_once('/') else {
+            // A bare address is a single host.
+            let addr: IpAddr = s.parse().map_err(|_| bad("expected addr[/prefix]"))?;
+            return Self::new(addr, if addr.is_ipv4() { 32 } else { 128 });
+        };
         let addr: IpAddr = addr.parse().map_err(|_| bad("bad address"))?;
         let prefix: u8 = prefix.parse().map_err(|_| bad("bad prefix"))?;
         Self::new(addr, prefix)

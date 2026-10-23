@@ -67,6 +67,9 @@ bind = "172.17.0.1:8088"                                   # docker0; 8080 zajmu
 traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # root-owy path-unit waliduje i publikuje do dynamic/
 # nginx przypięty po digeście (0006); podbijaj świadomie — zmiana odtwarza kontener nginx:
 nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421428ce13bd1eaa412404953859cf7a5b6512c25e67a60"
+# Opcjonalnie: peery, którym nginx ufa w sprawie X-Forwarded-* (0007). Domyślnie podsieć `net-weglarka`
+# (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE domyślną. Zwykle zostaw nieustawione.
+# trusted_proxies = ["10.89.1.2"]
 
 [admin]
 socket = "/var/lib/weglarka/run/admin.sock"

@@ -1,5 +1,5 @@
-//! `cargo run -p weglarka-ingress --example dump -- nginx|traefik` — prints a sample config
-//! (used in CI for `nginx -t`).
+//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|traefik` — prints a
+//! sample config (used in CI for `nginx -t` and the forwarded-header test).
 
 use std::collections::BTreeMap;
 
@@ -36,11 +36,21 @@ fn main() {
     let host = HostConfig::from_toml_str(HOST).expect("host");
     let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(APPS).expect("apps").apps;
     let out = match std::env::args().nth(1).as_deref() {
-        Some("nginx") => nginx::generate(
-            &host,
-            &apps,
-            &nginx::NginxOptions::new(vec!["10.89.0.1".parse().unwrap()]),
-        ),
+        Some("nginx") => {
+            let resolver = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "10.89.0.1".into());
+            let trusted: Vec<String> = std::env::args()
+                .nth(3)
+                .unwrap_or_else(|| "10.89.0.0/24".into())
+                .split(',')
+                .map(str::to_owned)
+                .collect();
+            let options = nginx::NginxOptions::new(vec![resolver.parse().expect("resolver")])
+                .with_trusted_proxies(&trusted)
+                .expect("trusted proxies");
+            nginx::generate(&host, &apps, &options)
+        }
         Some("traefik") => traefik::generate(&host, &apps, &traefik::TraefikOptions::default()),
         _ => {
             eprintln!("usage: dump nginx|traefik");

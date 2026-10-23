@@ -11,6 +11,8 @@ use weglarka_ingress::{Cidr, IngressError};
 
 fn opts() -> NginxOptions {
     NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+        .with_trusted_proxies(&["10.89.0.0/24".into()])
+        .unwrap()
 }
 
 fn layouts() -> Vec<(&'static str, BTreeMap<InstanceName, AppSpec>)> {
@@ -177,7 +179,8 @@ fn rejects_bad_options() {
         assert!(traefik::generate(&h, &a, &o).is_err(), "host {bad:?}");
     }
     assert!("1.2.3.4/33".parse::<Cidr>().is_err());
-    assert!("1.2.3.4".parse::<Cidr>().is_err());
+    assert!("1.2.3.4".parse::<Cidr>().is_ok(), "a bare address is a /32");
+    assert!("1.2.3.4/x".parse::<Cidr>().is_err());
     assert!("1.2.3.4/8; deny".parse::<Cidr>().is_err());
 }
 
@@ -193,4 +196,22 @@ fn edge_mode_is_not_supported_yet() {
         traefik::generate(&h, &BTreeMap::new(), &TraefikOptions::default()),
         Err(IngressError::UnsupportedMode(_))
     ));
+}
+
+#[test]
+fn trusted_proxies_from_config_replace_the_default() {
+    let o = opts()
+        .with_trusted_proxies(&["192.0.2.0/24".into(), "198.51.100.7".into()])
+        .unwrap();
+    let conf = nginx::generate(&host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("set_real_ip_from 192.0.2.0/24;"));
+    assert!(conf.contains("set_real_ip_from 198.51.100.7/32;"));
+    // No implicit default: an empty list is refused.
+    let empty = opts().with_trusted_proxies(&[]).unwrap();
+    assert!(nginx::generate(&host(), &apps(ONE_APP), &empty).is_err());
+    assert!(
+        opts()
+            .with_trusted_proxies(&["10.0.0.0/8; deny".into()])
+            .is_err()
+    );
 }
