@@ -1,29 +1,29 @@
-# 0002 — Podman 6.1 w testach integracyjnych: instalacja z OBS na runnerze
+# 0002 — Podman 6.1 in integration tests: install from OBS on the runner
 
-Status: przyjęta (fundament, 2026-10-23); do potwierdzenia pierwszym zielonym przebiegiem joba.
+Status: accepted (foundation, 2026-10-23); to be confirmed by the first green run of the job.
 
-**Opcje.** (A) `apt install` z OBS `home:alvistack` na `ubuntu-24.04` z pinningiem apt;
-(B) Podman w kontenerze (`--privileged`, Podman-w-Podmanie / Docker).
+**Options.** (A) `apt install` from OBS `home:alvistack` on `ubuntu-24.04` with apt pinning;
+(B) Podman in a container (`--privileged`, Podman-in-Podman / Docker).
 
-**Decyzja: A.**
-- Runner `ubuntu-24.04` to lustro hosta `niechybnie` (Ubuntu 24.04.4, cgroups v2, systemd 255) —
-  test sprawdza też ten sam kanał dostarczania i pinning, który pójdzie na produkcję.
-- Rootless Podman w kontenerze wymaga trybu uprzywilejowanego i zagnieżdżonych user namespace,
-  co zmienia semantykę `userns=auto`/subuid — czyli właśnie to, co chcemy testować.
-- Koszt: instalacja z zewnętrznego repo (kilkadziesiąt sekund) i zależność od dostępności OBS.
-  Łagodzenie: job `integration-podman` jest osobny; w razie awarii OBS nie blokuje fmt/clippy/test.
+**Decision: A.**
+- The `ubuntu-24.04` runner mirrors the `niechybnie` host (Ubuntu 24.04.4, cgroups v2, systemd 255) —
+  the test also exercises the same delivery channel and pinning that will go to production.
+- Rootless Podman in a container requires privileged mode and nested user namespaces, which changes
+  the semantics of `userns=auto`/subuid — that is exactly what we want to test.
+- Cost: installation from an external repo (tens of seconds) and a dependency on OBS availability.
+  Mitigation: the `integration-podman` job is separate; if OBS fails it does not block fmt/clippy/test.
 
-**Kontrakt z testami (sesja a).** Job uruchamia `podman system service` i eksportuje
-`WEGLARKA_PODMAN_SOCKET`. Testy integracyjne czytają tę zmienną i pomijają się, gdy jej brak
-(lokalnie `cargo test` zostaje szybki i bez Podmana).
+**Contract with the tests (session a).** The job starts `podman system service` and exports
+`WEGLARKA_PODMAN_SOCKET`. Integration tests read this variable and skip when it is absent
+(locally `cargo test` stays fast and without Podman).
 
-**Uwaga operacyjna (zmierzone w CI, 2026-10-23).** `download.opensuse.org` przekierowuje na
-mirrory, które potrafiły serwować pliki `.deb` o innym rozmiarze niż indeks (`File has unexpected
-size`) i `apt install` padał powtarzalnie. Używamy `downloadcontent.opensuse.org` (serwer
-OBS bez mirrorów). **Ta sama uwaga dotyczy zadania Ansible dla hosta `niechybnie`.**
+**Operational note (measured in CI, 2026-10-23).** `download.opensuse.org` redirects to mirrors that
+could serve `.deb` files of a different size than the index (`File has unexpected size`) and
+`apt install` failed repeatably. We use `downloadcontent.opensuse.org` (the OBS server without mirrors).
+**The same note applies to the Ansible task for the `niechybnie` host.**
 
-**Kolizja pakietów (zmierzone w CI).** Ubuntowy `golang-github-containers-common` (zależność
-Podmana 4.9, preinstalowanego na runnerze) nie ma `Replaces` względem `containers-common` z alvistack
-— `dpkg` odmawia nadpisania `/etc/containers/policy.json`. Przed instalacją trzeba odinstalować
-ubuntowy stos (`apt purge podman buildah skopeo crun conmon golang-github-containers-*`).
-Na hoście `niechybnie` Podmana nie ma, więc nie dotyczy — ale zadanie Ansible niech to zapewni.
+**Package conflict (measured in CI).** Ubuntu's `golang-github-containers-common` (a dependency of
+Podman 4.9, preinstalled on the runner) has no `Replaces` against `containers-common` from alvistack
+— `dpkg` refuses to overwrite `/etc/containers/policy.json`. Before installing, the Ubuntu stack must be
+uninstalled (`apt purge podman buildah skopeo crun conmon golang-github-containers-*`).
+On the `niechybnie` host there is no Podman, so this does not apply — but the Ansible task should ensure it.

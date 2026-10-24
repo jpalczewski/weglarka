@@ -52,7 +52,7 @@ provision path.
 
 ## Consequences
 
-- `apps update --spec plik.toml` replaces the whole spec: a file without `start` means `start = true`, so
+- `apps update --spec file.toml` replaces the whole spec: a file without `start` means `start = true`, so
   the app starts. A stopped app needs `start = false` in the file as well.
 - The provision path pins the digest of the tag, but the next `apps start` re-resolves the tag (pull):
   a stopped app does not freeze its image, and the webhook only resumes mattering after the start.

@@ -5,7 +5,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0011).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0012).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -25,10 +25,12 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 - Przed commitem: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 - Sekrety nigdy w logach, `Debug` ani TOML-u apek (są tylko referencjami po nazwie).
 - Git: PR do `main`, merge przez squash po zielonym CI; odwołuj się do issues (`#NN`), nie do prywatnych notatek.
-- **Język: README i komentarze w kodzie po angielsku** (decyzja Jacka, 2026-10-23) — dotyczy wszystkich `README.md`
-  (root i crate'ów), komentarzy `//`, doc-commentów `///`/`//!` oraz komentarzy w skryptach i workflowach.
-  Nowy i zmieniany kod piszesz od razu po angielsku; istniejące polskie komentarze w plikach, których nie dotykasz,
-  tłumaczy osobne zadanie (nie mieszaj tłumaczeń z niezwiązanymi zmianami w PR).
+- **Język: README, komentarze w kodzie i ADR-y po angielsku** (decyzja Jacka, 2026-10-23; ADR-y: 2026-10-24) —
+  dotyczy wszystkich `README.md` (root i crate'ów), komentarzy `//`, doc-commentów `///`/`//!`, komentarzy
+  w skryptach i workflowach oraz `docs/decisions/` (ADR-y i ich indeks). `docs/install.md` zostaje po polsku,
+  a komunikaty runtime/CLI są w trakcie tłumaczenia (issue #32). Nowy i zmieniany kod piszesz od razu po angielsku;
+  istniejące polskie komentarze w plikach, których nie dotykasz, tłumaczy osobne zadanie (nie mieszaj tłumaczeń
+  z niezwiązanymi zmianami w PR).
 
 ## Commity i PR-y (Conventional Commits)
 

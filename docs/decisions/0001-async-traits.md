@@ -1,20 +1,20 @@
-# 0001 — Async w traitach: natywne `async fn` + generyki
+# 0001 — Async in traits: native `async fn` + generics
 
-Status: przyjęta (fundament, 2026-10-23).
+Status: accepted (foundation, 2026-10-23).
 
-**Decyzja.** Traity z I/O (`PodmanClient`, `Platform`) używają natywnych async w traitach,
-zapisanych jako `fn … -> impl Future<Output = …> + Send` (strumienie: `impl Stream + Send`), a kod
-je konsumujący jest generyczny (`struct Reconciler<P: PodmanClient>`). Bez `async-trait`, bez `dyn`.
+**Decision.** Traits with I/O (`PodmanClient`, `Platform`) use native async in traits, written as
+`fn … -> impl Future<Output = …> + Send` (streams: `impl Stream + Send`), and the code consuming them
+is generic (`struct Reconciler<P: PodmanClient>`). No `async-trait`, no `dyn`.
 
-**Dlaczego.** Zero alokacji na wywołanie (priorytet: RAM), brak zależności od makra, `Send` jawnie
-w sygnaturze, więc `tokio::spawn` działa. Jest jedna implementacja produkcyjna per trait w danym
-procesie (wybór platformy/klienta przy starcie), więc dyspozycja statyczna nic nie kosztuje.
-Implementacje mogą pisać zwykłe `async fn` (kompilator sprawdza zgodność z `+ Send`).
+**Why.** Zero allocation per call (priority: RAM), no dependency on a macro, `Send` explicit in the
+signature, so `tokio::spawn` works. There is one production implementation per trait in a given
+process (platform/client choice at startup), so static dispatch costs nothing. Implementations can
+write plain `async fn` (the compiler checks conformance with `+ Send`).
 
-**Wyjątek.** Traity, które muszą być kolekcją heterogeniczną (`WebhookSource`: GitHub, później
-Forgejo) i `SecretStore` są **synchroniczne i dyn-compatible**: operują na już wczytanych danych
-(nagłówki+ciało; mały plik), więc async nie jest potrzebny. `SecretStore` wołany z async przez
+**Exception.** Traits that must be a heterogeneous collection (`WebhookSource`: GitHub, later
+Forgejo) and `SecretStore` are **synchronous and dyn-compatible**: they operate on already-loaded data
+(headers+body; a small file), so async is not needed. `SecretStore` is called from async via
 `spawn_blocking`.
 
-**Konsekwencje.** Nie da się `Box<dyn PodmanClient>`; testy używają `FakePodman` jako parametru
-generycznego. Gdyby kiedyś potrzebny był `dyn`, dokłada się wąski adapter z `async-trait`, bez zmiany traitów.
+**Consequences.** `Box<dyn PodmanClient>` is not possible; tests use `FakePodman` as a generic
+parameter. If `dyn` were ever needed, a narrow `async-trait` adapter is added without changing the traits.
