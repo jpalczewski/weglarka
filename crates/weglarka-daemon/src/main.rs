@@ -10,7 +10,8 @@ use tracing::level_filters::LevelFilter;
 use weglarka_core::config::PlatformKind;
 use weglarka_core::platform::Platform;
 use weglarka_daemon::platform::{
-    SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, render, run_args,
+    SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_SERVICE, WATCHDOG_TIMER,
+    render, run_args,
 };
 use weglarka_daemon::service::{
     DEFAULT_IMAGE, SERVICE_NAME, SOCKET_ENV, host_socket, service_spec,
@@ -46,6 +47,10 @@ enum Command {
     /// Update Węglarka's own image: pull the configured tag, verify the cosign signature, pin the
     /// digest in the service definition and restart (issue #99).
     SelfUpdate(SelfUpdateArgs),
+    /// Watch a switch in flight and fall back to the previous image when the new daemon does not
+    /// answer the admin API within `[self_update] fallback_timeout_secs` (issue #100). Runs from
+    /// `weglarka-watchdog.timer`; a manual run prints what it would do.
+    Supervise,
 }
 
 #[derive(clap::Args)]
@@ -56,7 +61,8 @@ struct SelfUpdateArgs {
     /// Ignore the configured interval (and retry a digest that already failed).
     #[arg(long)]
     force: bool,
-    /// Pin the previous digest again — the manual fallback until the automatic one (#100).
+    /// Pin the previous digest again — the manual lever when the automatic fallback (issue #100)
+    /// could not act.
     #[arg(long)]
     rollback: bool,
     /// Follow this reference instead of `[self_update] image` (a one-shot manual update).
@@ -122,6 +128,9 @@ async fn run_self_update(settings: Settings, options: SelfUpdateArgs) -> Result<
                     image: image.to_owned(),
                     enabled: true,
                     interval_secs: weglarka_core::config::SelfUpdateConfig::DEFAULT_INTERVAL_SECS,
+                    fallback: true,
+                    fallback_timeout_secs:
+                        weglarka_core::self_update::FallbackPolicy::DEFAULT_TIMEOUT_SECS,
                     public_key_file: None,
                 });
             }
@@ -152,6 +161,27 @@ async fn run_self_update(settings: Settings, options: SelfUpdateArgs) -> Result<
     Ok(())
 }
 
+/// `weglarka-daemon supervise` — the host-side watchdog (issue #100). The timer runs it every
+/// minute; `platform install` installs both units.
+async fn run_supervise(settings: Settings) -> Result<()> {
+    let platform = systemd(&settings)?;
+    let socket = host_socket(&settings, &platform).await?;
+    let podman = LibpodClient::new(socket);
+    let report = weglarka_daemon::supervise::run(
+        &podman,
+        &platform,
+        &settings,
+        std::time::SystemTime::now(),
+    )
+    .await?;
+    println!("{report}");
+    if !report.is_success() {
+        // Non-zero so the watchdog unit shows a failure (an exhausted fallback needs the operator).
+        bail!("{report}");
+    }
+    Ok(())
+}
+
 async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> {
     let platform = systemd(&settings)?;
     match action {
@@ -164,7 +194,8 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
         PlatformAction::Install { dry_run, image } => {
             let socket = host_socket(&settings, &platform).await?;
             let spec = service_spec(&settings, socket, image);
-            let units = weglarka_daemon::self_update::units(&settings)?;
+            let mut units = weglarka_daemon::self_update::units(&settings)?;
+            units.extend(weglarka_daemon::self_update::watchdog_units(&settings)?);
             if dry_run {
                 for f in render(&spec)? {
                     println!("# {}\n{}", f.file_name, f.content);
@@ -177,21 +208,30 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
             platform.install_service(&spec).await?;
             platform.install_user_units(&units).await?;
             platform.set_timer(SELF_UPDATE_TIMER, true).await?;
+            platform.set_timer(WATCHDOG_TIMER, true).await?;
             println!(
                 "Installed. Start it with: systemctl --user start {SERVICE_NAME}.service \
-                 (requires `loginctl enable-linger {}`); the self-update timer is enabled and does \
-                 nothing until [self_update] is configured.",
+                 (requires `loginctl enable-linger {}`); the self-update and watchdog timers are \
+                 enabled and do nothing until [self_update] is configured.",
                 settings.host.runtime.user
             );
         }
         PlatformAction::Remove => {
             // Disable before deleting: `systemctl disable` needs the unit files.
             platform.set_timer(SELF_UPDATE_TIMER, false).await?;
+            platform.set_timer(WATCHDOG_TIMER, false).await?;
             platform
-                .remove_user_units(&[SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER])
+                .remove_user_units(&[
+                    SELF_UPDATE_SERVICE,
+                    SELF_UPDATE_TIMER,
+                    WATCHDOG_SERVICE,
+                    WATCHDOG_TIMER,
+                ])
                 .await?;
             platform.remove_service(SERVICE_NAME).await?;
-            println!("Removed the {SERVICE_NAME} service file and the self-update timer.");
+            println!(
+                "Removed the {SERVICE_NAME} service file, the self-update timer and the watchdog."
+            );
         }
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);
@@ -238,5 +278,6 @@ async fn main() -> Result<()> {
         Command::Run => run_daemon(settings).await,
         Command::Platform { action } => run_platform(settings, action).await,
         Command::SelfUpdate(args) => run_self_update(settings, args).await,
+        Command::Supervise => run_supervise(settings).await,
     }
 }

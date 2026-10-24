@@ -1,6 +1,6 @@
 # 0034 — Automatic fallback to the previous daemon image
 
-Status: proposed (2026-10-24, issue #100) · part of #47; extends [0027](0027-self-update.md)
+Status: accepted (2026-10-24, issue #100) · part of #47; extends [0027](0027-self-update.md)
 
 ## Problem
 
@@ -66,11 +66,12 @@ on an unattended host, which is the deployment Węglarka targets.
    `pending = target` and the fallback record, so the next start confirms the restored image.
 6. **Reporting.** The failed digest is recorded in `error`, so the existing `failed_for()` shortcut refuses to re-pin
    it until the tag moves (`--force` stays the deliberate override). The daemon's startup confirmation learns about the
-   fallback from the record and emits `SelfUpdateFellBack` (warning) or `SelfUpdateFallbackExhausted` (critical)
-   through the existing notification pipeline — the watchdog runs on the host without a notifier, and the image it
-   falls back to is normally #100-capable as well. `doctor` reports the switch age, the fallback history and an
-   exhausted budget (a failing check for the CLI exit code), and the watchdog unit's own journal line names what
-   happened.
+   fallback from the record and emits `SelfUpdateFellBack` (warning) through the existing notification pipeline — the
+   watchdog runs on the host without a notifier, and the image it falls back to is normally #100-capable as well.
+   `doctor` reports the switch age, the fallback history and an exhausted budget (a failing check for the CLI exit
+   code); a `GiveUp` also exits non-zero from `weglarka-daemon supervise`, so the watchdog unit shows a failed run in
+   `systemctl --user list-timers` and the journal names the reason. There is deliberately no
+   "fallback exhausted" notification event: when nothing could be restored, no daemon runs to deliver it.
 7. **Invariants.**
    * No registry access on the fallback path.
    * No fallback across a state-schema bump (ADR 0023): the target's `io.weglarka.state-schema` label must still be
@@ -96,8 +97,7 @@ on an unattended host, which is the deployment Węglarka targets.
 * **New API surface**: `GET /v1/health` (additive; `API_VERSION` stays `v1`).
 * **New CLI**: `weglarka-daemon supervise`, with the watchdog unit calling it; `FallBack`/`Healthy` exit 0, a
   `GiveUp` exits non-zero so `systemctl --user list-timers` shows the failure instead of pretending everything is fine.
-* **Notifications**: `SelfUpdateFellBack` (warning) and `SelfUpdateFallbackExhausted` (critical), no click-through
-  link — they name Węglarka itself.
+* **Notifications**: `SelfUpdateFellBack` (warning), no click-through link — it names Węglarka itself.
 * **Tests**: the decision table in `weglarka-core` unit tests; the watchdog on the existing
   `FakePodman`/`FakeRegistry`/`FakePlatform` harness; snapshot tests for the new units; a real unix-socket test for
   `/v1/health` and for the confirmation/event of a fallback. A real systemd trigger cannot run in CI (no user manager

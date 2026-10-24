@@ -116,6 +116,30 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         let age = now.saturating_sub(error.at);
         parts.push(format!("last attempt failed {age}s ago: {}", error.message));
     }
+    // Issue #100: a switch in flight (the watchdog is waiting for the new daemon's health) and the
+    // last automatic fallback.
+    let switch = state.active_switch();
+    if let Some(switch) = &switch {
+        let age = now.saturating_sub(switch.at);
+        parts.push(format!(
+            "supervising the switch to {} for {age}s of {}s",
+            short(&switch.to),
+            config.fallback_timeout_secs
+        ));
+    }
+    if let Some(fallback) = state.last_fallback() {
+        let age = now.saturating_sub(fallback.at);
+        parts.push(format!(
+            "automatic fallback {} → {} {age}s ago",
+            short(&fallback.from),
+            short(&fallback.to)
+        ));
+    }
+    // The watchdog runs once a minute, so being a little past the deadline is normal; only a whole
+    // extra tick means the timer is not running (or the fallback gave up).
+    let switch_overdue = switch.is_some_and(|switch| {
+        now.saturating_sub(switch.at) > config.fallback_timeout_secs.saturating_add(120)
+    });
     let stale_after = config.interval_secs.saturating_mul(3);
     let stale = state
         .checked_at
@@ -123,7 +147,16 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let (status, hint) = if state.error.is_some() {
         (
             CheckStatus::Warn,
-            Some("see the state file and the journal of weglarka-self-update.service"),
+            Some(
+                "see the state file and `journalctl --user -u weglarka-self-update.service -u weglarka-watchdog.service`",
+            ),
+        )
+    } else if switch_overdue {
+        (
+            CheckStatus::Warn,
+            Some(
+                "the switch is past its fallback deadline and was not reverted — is weglarka-watchdog.timer enabled? (re-run `platform install`)",
+            ),
         )
     } else if state.pending.is_some() {
         (

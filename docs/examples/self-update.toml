@@ -1,4 +1,5 @@
-# Self-update (issue #99, docs/decisions/0027): an excerpt of weglarka.toml, not of apps.toml.
+# Self-update (issue #99, docs/decisions/0027) and its automatic fallback (issue #100,
+# docs/decisions/0034): an excerpt of weglarka.toml, not of apps.toml.
 #
 # Węglarka follows its own image tag, verifies the cosign signature with the key embedded in the
 # binary (cosign.pub in the repository root) and, once a new digest passes the check, pins it in the
@@ -7,8 +8,12 @@
 # installed by `platform install` wakes it every 10 minutes and the interval below decides whether it
 # really runs. The daemon inside the container only reports the outcome (`weglarka doctor`).
 #
-# Without a [self_update] section the timer still exists but every run returns immediately.
-# Enabling or changing the image needs no service reinstall; changing the timer itself does.
+# A second user timer, `weglarka-watchdog.timer`, checks every minute whether the switched daemon
+# answered the admin API's `/v1/health`; otherwise, after the deadline below, the previous digest is
+# restored in the unit and the service restarted (`weglarka-daemon supervise`).
+#
+# Without a [self_update] section both timers exist but every run returns immediately.
+# Enabling or changing the image needs no service reinstall; changing the timers themselves does.
 
 [self_update]
 # The tag to follow. Must be a tag, not a digest: the switcher resolves the digest itself and pins it.
@@ -20,6 +25,14 @@ image = "ghcr.io/jpalczewski/weglarka:latest"
 # Minimum time between two checks, seconds (at least 300). Measured from the last completed check,
 # including a refused one, so a broken release is not retried every ten minutes.
 # interval_secs = 3600
+
+# Automatic fallback to the previous image when the switched daemon does not become healthy
+# (issue #100). Off leaves only the manual `self-update --rollback`.
+# fallback = true
+
+# How long the switched daemon gets to answer `/v1/health` after the restart, seconds (30..=3600).
+# The watchdogs checks once a minute, so the effective delay is this deadline plus at most a minute.
+# fallback_timeout_secs = 180
 
 # Public key that overrides the one embedded in the binary — for rotating the signing key.
 # public_key_file = "/etc/weglarka/cosign.pub"

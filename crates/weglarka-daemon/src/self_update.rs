@@ -14,7 +14,9 @@
 //! The daemon confirms the switch on its next start (`crate::start`): it compares `pending` with the
 //! digest of its own container and records `current`/`previous` — the rollback target. If it does not
 //! run the pinned digest, `doctor` and a `SelfUpdatePending` event say so instead of silently
-//! pretending the update happened. Automatic fallback is #100; until then `--rollback` is the lever.
+//! pretending the update happened. The automatic fallback to the previous digest (issue #100,
+//! `docs/decisions/0034`) lives here too: [`watch`] turns the pure `supervise()` decision of
+//! `weglarka-core` into a pinned rollback, and `--rollback` stays the manual lever.
 //!
 //! The whole procedure is a function over three traits (`PodmanClient`, `Registry`, `Platform`), so
 //! the tests drive it end to end without Podman, a registry or systemd.
@@ -29,7 +31,8 @@ use weglarka_core::events::{Event, EventSink};
 use weglarka_core::platform::Platform;
 use weglarka_core::podman::{PodmanClient, PodmanError, PullEvent};
 use weglarka_core::self_update::{
-    self as state, Confirmation, Decision, SelfUpdateState, SelfUpdateStateError, secs,
+    self as state, Confirmation, Decision, FallbackPolicy, SelfUpdateState, SelfUpdateStateError,
+    Supervision, Switch, secs,
 };
 use weglarka_core::state as state_files;
 use weglarka_registry::{
@@ -43,6 +46,40 @@ use crate::settings::Settings;
 
 /// OCI label through which the image declares the state schema it writes (`docs/decisions/0023`).
 pub const SCHEMA_LABEL: &str = "io.weglarka.state-schema";
+
+/// File in the state directory that serializes the host-side runs (switcher and watchdog).
+pub const LOCK_NAME: &str = "self-update.lock";
+
+/// An exclusive lock on the state directory, held for the duration of a host-side run.
+///
+/// The switcher, the watchdog and the daemon all read-modify-write `self-update.toml`; the atomic save
+/// prevents a torn file but not a lost update, so the two host-side commands take this lock and skip
+/// the run when another one holds it (issue #100). The daemon's own write happens once, at startup,
+/// and is not covered — a lost update there costs at most one supervision round.
+pub struct StateLock {
+    _file: std::fs::File,
+}
+
+/// Takes the host-side state lock; `Ok(None)` when another run already holds it.
+pub fn lock_state(state_dir: &Path) -> Result<Option<StateLock>, Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = state_dir.join(LOCK_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|source| Error::Lock {
+            path: path.clone(),
+            source,
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(StateLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(source)) => Err(Error::Lock { path, source }),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -67,6 +104,12 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The host-side state lock could not be taken (another run holds it, or the file is unusable).
+    #[error("cannot lock {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -87,6 +130,8 @@ pub struct Options {
 pub enum Report {
     /// No `[self_update]` section, or `enabled = false`.
     Disabled,
+    /// Another host-side run (the watchdog or a manual command) holds the state lock; nothing happened.
+    Locked,
     /// The interval since the last check has not passed yet.
     NotDue,
     /// The pulled digest is already the running or the pending one.
@@ -130,6 +175,11 @@ where
         return Ok(Report::Disabled);
     }
     config.validate().map_err(Error::Config)?;
+    // The watchdog runs from its own timer; a wake-up that lands in the middle of a switch would see
+    // a half-applied state, so the second runner simply skips this round.
+    let Some(_lock) = lock_state(&settings.paths.state_dir)? else {
+        return Ok(Report::Locked);
+    };
 
     let state_dir = settings.paths.state_dir.clone();
     let mut st = state::load(&state_dir)?;
@@ -197,13 +247,37 @@ where
         state::save(&state_dir, &st)?;
         return Ok(Report::Available { from, to });
     }
-    // 3. Pin the verified digest and restart. `pending` is written first: if the restart
-    //    kills the service, the next start still knows what it should be running.
-    apply(platform, settings, &image, &to, &state_dir, &mut st, now).await?;
+    // 3. Pin the verified digest and restart. The attempt (and `pending`) is written first: if the
+    //    restart kills the service, the next start still knows what it should be running, and the
+    //    watchdog knows the deadline and the fallback target.
+    apply(
+        platform,
+        settings,
+        &image,
+        &to,
+        &state_dir,
+        &mut st,
+        now,
+        Applied::Switch { from: from.clone() },
+    )
+    .await?;
     Ok(Report::Applied { from, to })
 }
 
-/// Pins `to` in the service definition and restarts the service, recording `pending` first.
+/// Why an image is being pinned: an automatic update, which the watchdog then supervises
+/// (issue #100), or a manual rollback, where the operator decided and nothing may revert it
+/// automatically.
+#[derive(Debug, Clone)]
+enum Applied {
+    Switch { from: Option<Digest> },
+    Manual,
+}
+
+/// Pins `to` in the service definition and restarts the service, recording the pending digest first.
+///
+/// `Applied::Switch` also records the switch attempt (`begin_switch`), so the watchdog knows the
+/// fallback target and the deadline it started from; a manual rollback clears any attempt in flight.
+#[allow(clippy::too_many_arguments)]
 async fn apply<Pl: Platform>(
     platform: &Pl,
     settings: &Settings,
@@ -212,12 +286,19 @@ async fn apply<Pl: Platform>(
     state_dir: &Path,
     st: &mut SelfUpdateState,
     now: SystemTime,
+    applied: Applied,
 ) -> Result<(), Error> {
     let socket = host_socket(settings, platform).await?;
     let spec = service_spec(settings, socket, pinned(image, to));
     platform.install_service(&spec).await?;
-    st.pending = Some(to.clone());
-    st.pending_at = Some(secs(now));
+    match applied {
+        Applied::Switch { from } => st.begin_switch(from, to.clone(), now),
+        Applied::Manual => {
+            st.clear_switch();
+            st.pending = Some(to.clone());
+            st.pending_at = Some(secs(now));
+        }
+    }
     st.clear_error();
     st.record_check(now);
     state::save(state_dir, st)?;
@@ -283,7 +364,17 @@ where
     if options.check {
         return Ok(Report::Available { from, to: previous });
     }
-    apply(platform, settings, image, &previous, state_dir, st, now).await?;
+    apply(
+        platform,
+        settings,
+        image,
+        &previous,
+        state_dir,
+        st,
+        now,
+        Applied::Manual,
+    )
+    .await?;
     Ok(Report::RolledBack { from, to: previous })
 }
 
@@ -392,6 +483,20 @@ pub fn units(settings: &Settings) -> Result<Vec<weglarka_core::platform::UnitFil
     )?)
 }
 
+/// The user units of the watchdog (issue #100), rendered for this binary and configuration.
+pub fn watchdog_units(
+    settings: &Settings,
+) -> Result<Vec<weglarka_core::platform::UnitFile>, Error> {
+    let binary = std::env::current_exe().map_err(|source| Error::Read {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    Ok(crate::platform::render_watchdog_units(
+        &binary,
+        &settings.config_path,
+    )?)
+}
+
 /// Confirms at startup which image this daemon really runs and resolves a switch requested by the
 /// host-side switcher: `pending` == running updates `current`/`previous` (the rollback target), a
 /// mismatch is reported instead of pretending the update happened.
@@ -434,6 +539,17 @@ pub async fn confirm_startup<P: PodmanClient>(
                 to: to.clone(),
             });
         }
+        Confirmation::FellBack { from, to } => {
+            tracing::warn!(
+                %from,
+                %to,
+                "the switched image did not become healthy; the watchdog restored the previous one"
+            );
+            events.emit(Event::SelfUpdateFellBack {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
         Confirmation::Pending { expected, actual } => {
             tracing::warn!(
                 %expected,
@@ -470,6 +586,203 @@ async fn own_digest(podman: &impl PodmanClient) -> Option<Digest> {
     })
 }
 
+/// Outcome of one watchdog run (issue #100); the caller logs it and maps it to an exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchReport {
+    /// No `[self_update]` section, `enabled = false`, or `fallback = false`.
+    Disabled,
+    /// Another host-side run (the switcher or a manual command) holds the state lock.
+    Locked,
+    /// No switch in flight: nothing to supervise.
+    Idle,
+    /// The probe answered: the switch is good and the attempt was forgotten.
+    Healthy { to: Digest },
+    /// The deadline has not passed yet.
+    Waiting { remaining: Duration },
+    /// The previous digest was restored in the service definition and the service was restarted.
+    FellBack { from: Digest, to: Digest },
+    /// Nothing could be reverted automatically; the reason is in the state file and the log.
+    GivenUp { reason: String },
+}
+
+impl WatchReport {
+    /// `false` for the outcomes that need the operator's attention: the watchdog unit then shows a
+    /// failed run instead of pretending everything is fine.
+    pub fn is_success(&self) -> bool {
+        !matches!(self, Self::GivenUp { .. })
+    }
+}
+
+impl std::fmt::Display for WatchReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("self-update is not configured (or its fallback is off)"),
+            Self::Locked => f.write_str("another self-update run is active"),
+            Self::Idle => f.write_str("no self-update switch in flight"),
+            Self::Healthy { to } => write!(f, "the switch to {to} is healthy"),
+            Self::Waiting { remaining } => {
+                write!(f, "the switch has {remaining:?} left to become healthy")
+            }
+            Self::FellBack { from, to } => write!(f, "fell back from {from} to {to}"),
+            Self::GivenUp { reason } => write!(f, "gave up: {reason}"),
+        }
+    }
+}
+
+/// One watchdog run (issue #100, `docs/decisions/0034`): `healthy` is the host-side probe of
+/// `GET /v1/health`, and the decision itself is `weglarka_core::self_update::supervise`.
+///
+/// The fallback reuses the manual rollback's guarantees — no registry access, the image must be in the
+/// local store, and the state-schema gate applies — plus `reset_failed`, because the failed image has
+/// normally exhausted the service's start limit by the time the deadline passes.
+pub async fn watch<P, Pl>(
+    podman: &P,
+    platform: &Pl,
+    settings: &Settings,
+    healthy: bool,
+    now: SystemTime,
+) -> Result<WatchReport, Error>
+where
+    P: PodmanClient,
+    Pl: Platform,
+{
+    let Some(config) = settings.host.self_update.as_ref() else {
+        return Ok(WatchReport::Disabled);
+    };
+    if !config.enabled || !config.fallback {
+        return Ok(WatchReport::Disabled);
+    }
+    config.validate().map_err(Error::Config)?;
+    let state_dir = settings.paths.state_dir.clone();
+    let policy = FallbackPolicy {
+        timeout: Duration::from_secs(config.fallback_timeout_secs),
+        max_attempts: FallbackPolicy::DEFAULT_MAX_ATTEMPTS,
+    };
+    let mut st = state::load(&state_dir)?;
+    let Some(switch) = st.active_switch() else {
+        return Ok(WatchReport::Idle);
+    };
+    match state::supervise(&st, healthy, now, &policy) {
+        // An attempt is in flight, so `Idle` cannot happen; treating it as "nothing to do" keeps the
+        // match total without a panic.
+        Supervision::Idle => Ok(WatchReport::Idle),
+        Supervision::Healthy => {
+            st.clear_switch();
+            state::save(&state_dir, &st)?;
+            Ok(WatchReport::Healthy { to: switch.to })
+        }
+        Supervision::Waiting { remaining } => Ok(WatchReport::Waiting { remaining }),
+        Supervision::GiveUp { reason } => {
+            give_up(&state_dir, &mut st, Some(switch.to.clone()), reason, now)
+        }
+        Supervision::FallBack { target } => {
+            fall_back(
+                podman, platform, settings, &state_dir, &mut st, &switch, target, now,
+            )
+            .await
+        }
+    }
+}
+
+/// Records why nothing was reverted — once per distinct reason: the watchdog wakes every minute, and
+/// rewriting the state (and reporting again) every minute would be noise.
+fn give_up(
+    state_dir: &Path,
+    st: &mut SelfUpdateState,
+    digest: Option<Digest>,
+    reason: String,
+    now: SystemTime,
+) -> Result<WatchReport, Error> {
+    if st.error.as_ref().map(|e| e.message.as_str()) != Some(reason.as_str()) {
+        st.record_error(reason.clone(), digest, now);
+        state::save(state_dir, st)?;
+    }
+    Ok(WatchReport::GivenUp { reason })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fall_back<P, Pl>(
+    podman: &P,
+    platform: &Pl,
+    settings: &Settings,
+    state_dir: &Path,
+    st: &mut SelfUpdateState,
+    switch: &Switch,
+    target: Digest,
+    now: SystemTime,
+) -> Result<WatchReport, Error>
+where
+    P: PodmanClient,
+    Pl: Platform,
+{
+    let Some(config) = settings.host.self_update.as_ref() else {
+        return Ok(WatchReport::Disabled);
+    };
+    let image = ImageRef::parse(&config.image).map_err(|e| Error::Config(e.to_string()))?;
+    let target_ref = pinned(&image, &target);
+    // The fallback must work when the registry does not: the target is the image that ran a moment
+    // ago, and retention keeps it (ADR 0020). A missing one would pin a reference the service cannot
+    // start, so report instead of trying.
+    let info = match podman.image_inspect(&target_ref).await {
+        Ok(info) => info,
+        Err(PodmanError::NotFound(_)) => {
+            return give_up(
+                state_dir,
+                st,
+                Some(switch.to.clone()),
+                format!(
+                    "the switch to {} did not become healthy, but the fallback image {target_ref} is \
+                     not in the local store any more; pull it or install it with `weglarka-daemon \
+                     platform install --image {target_ref}`",
+                    switch.to
+                ),
+                now,
+            );
+        }
+        Err(e) => return Err(Error::Podman(e)),
+    };
+    let state_schema = state_schema(settings)?;
+    if let Some(image_schema) = schema_label(&info.labels)
+        && image_schema < state_schema
+    {
+        return give_up(
+            state_dir,
+            st,
+            Some(switch.to.clone()),
+            format!(
+                "the switch to {} did not become healthy, but the fallback image writes state schema \
+                 {image_schema} while the state is at {state_schema}: a fallback across a schema bump \
+                 would lose fields — restore a state backup or install a matching image",
+                switch.to
+            ),
+            now,
+        );
+    }
+    // The failed image has normally exhausted the start limit already; without `reset-failed` the
+    // restart below would be refused ("start request repeated too quickly").
+    platform.reset_failed(SERVICE_NAME).await?;
+    let socket = host_socket(settings, platform).await?;
+    let spec = service_spec(settings, socket, pinned(&image, &target));
+    platform.install_service(&spec).await?;
+    st.record_fallback(switch.to.clone(), target.clone(), now);
+    st.record_error(
+        format!(
+            "the switch to {} did not become healthy within {}s (no answer on GET /v1/health); the \
+             watchdog restored {target}. The failed digest is not retried until the tag moves — \
+             `--force` overrides that",
+            switch.to, config.fallback_timeout_secs
+        ),
+        Some(switch.to.clone()),
+        now,
+    );
+    state::save(state_dir, st)?;
+    platform.restart_service(SERVICE_NAME).await?;
+    Ok(WatchReport::FellBack {
+        from: switch.to.clone(),
+        to: target,
+    })
+}
+
 /// The timer unit name — re-exported so `platform install/remove/status` do not import two modules.
 pub const TIMER: &str = SELF_UPDATE_TIMER;
 
@@ -480,6 +793,7 @@ impl std::fmt::Display for Report {
             Self::Disabled => {
                 f.write_str("self-update is not configured ([self_update] absent or disabled)")
             }
+            Self::Locked => f.write_str("another self-update run is active; skipped"),
             Self::NotDue => f.write_str("not due yet ([self_update] interval_secs not elapsed)"),
             Self::UpToDate { digest } => write!(f, "up to date ({digest})"),
             Self::Available { to, .. } => write!(f, "verified and available: {to}"),
@@ -517,6 +831,7 @@ mod tests {
     struct FakePlatform {
         installed: Mutex<Vec<String>>,
         restarts: Mutex<u32>,
+        resets: Mutex<u32>,
     }
 
     impl FakePlatform {
@@ -525,6 +840,9 @@ mod tests {
         }
         fn restarts(&self) -> u32 {
             *self.restarts.lock().unwrap()
+        }
+        fn resets(&self) -> u32 {
+            *self.resets.lock().unwrap()
         }
     }
 
@@ -556,6 +874,10 @@ mod tests {
         }
         async fn restart_service(&self, _: &str) -> Result<(), PlatformError> {
             *self.restarts.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn reset_failed(&self, _: &str) -> Result<(), PlatformError> {
+            *self.resets.lock().unwrap() += 1;
             Ok(())
         }
         async fn set_timer(&self, _: &str, _: bool) -> Result<(), PlatformError> {
@@ -667,6 +989,18 @@ dir = "{root}/state"
                 &self.platform,
                 &self.settings,
                 options,
+                self.now,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn watch(&self, healthy: bool) -> WatchReport {
+            watch(
+                &self.podman,
+                &self.platform,
+                &self.settings,
+                healthy,
                 self.now,
             )
             .await
@@ -1009,5 +1343,261 @@ dir = "{root}/state"
     #[test]
     fn service_name_is_the_container_name_used_by_the_confirmation() {
         assert_eq!(SERVICE_NAME, "weglarka");
+    }
+
+    /// A switch applied `age` seconds ago and not confirmed healthy yet.
+    fn switch_state(
+        ctx: &Ctx,
+        from: Option<Digest>,
+        to: &Digest,
+        age: Duration,
+    ) -> SelfUpdateState {
+        let mut st = SelfUpdateState {
+            current: from.clone(),
+            ..SelfUpdateState::default()
+        };
+        st.begin_switch(from, to.clone(), ctx.now - age);
+        st
+    }
+
+    #[tokio::test]
+    async fn a_switch_inside_its_deadline_is_left_alone() {
+        let ctx = Ctx::new(true);
+        let st = switch_state(
+            &ctx,
+            Some(digest_of('a')),
+            &digest_of('b'),
+            Duration::from_secs(10),
+        );
+        ctx.save_state(&st);
+
+        assert!(matches!(
+            ctx.watch(false).await,
+            WatchReport::Waiting { .. }
+        ));
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_switch_is_forgotten_without_touching_the_service() {
+        let ctx = Ctx::new(true);
+        let to = digest_of('b');
+        let st = switch_state(&ctx, Some(digest_of('a')), &to, Duration::from_secs(10));
+        ctx.save_state(&st);
+
+        assert_eq!(
+            ctx.watch(true).await,
+            WatchReport::Healthy { to: to.clone() }
+        );
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+        let state = ctx.state();
+        assert!(state.active_switch().is_none());
+        // The daemon still confirms the switch itself; the watchdog only forgets the supervision.
+        assert_eq!(state.pending, Some(to));
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_switch_is_reverted_to_the_digest_it_came_from() {
+        let ctx = Ctx::new(true);
+        let before = digest_of('a');
+        let failed = digest_of('b');
+        // The fallback target is the image that ran a moment ago: it is in the local store and no
+        // registry call is involved.
+        ctx.pull_image(&before).await;
+        let st = switch_state(
+            &ctx,
+            Some(before.clone()),
+            &failed,
+            Duration::from_secs(500),
+        );
+        ctx.save_state(&st);
+
+        assert_eq!(
+            ctx.watch(false).await,
+            WatchReport::FellBack {
+                from: failed.clone(),
+                to: before.clone()
+            }
+        );
+        assert_eq!(
+            ctx.platform.installed_images(),
+            vec![pinned(&ctx.image(), &before)]
+        );
+        assert_eq!(
+            ctx.platform.resets(),
+            1,
+            "a crash-looping unit is reset first"
+        );
+        assert_eq!(ctx.platform.restarts(), 1);
+
+        let state = ctx.state();
+        assert_eq!(
+            state.pending,
+            Some(before.clone()),
+            "the daemon confirms it"
+        );
+        assert_eq!(
+            state.last_fallback(),
+            Some(weglarka_core::self_update::Fallback {
+                from: failed.clone(),
+                to: before.clone(),
+                at: weglarka_core::self_update::secs(ctx.now),
+            })
+        );
+        // The failed digest is recorded, so the next switcher run refuses to re-pin it.
+        assert_eq!(
+            state.error.as_ref().and_then(|e| e.digest.clone()),
+            Some(failed)
+        );
+        assert!(
+            state.active_switch().is_some(),
+            "the attempt keeps its budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_that_does_not_come_up_gives_up_instead_of_looping() {
+        let ctx = Ctx::new(true);
+        let before = digest_of('a');
+        let failed = digest_of('b');
+        let mut st = switch_state(
+            &ctx,
+            Some(before.clone()),
+            &failed,
+            Duration::from_secs(1_000),
+        );
+        // The one automatic fallback already happened; now its own deadline has passed too.
+        st.record_fallback(failed.clone(), before, ctx.now - Duration::from_secs(500));
+        ctx.save_state(&st);
+
+        match ctx.watch(false).await {
+            WatchReport::GivenUp { reason } => assert!(reason.contains("budget"), "{reason}"),
+            other => panic!("expected GiveUp, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+
+        // The reason is recorded once, so the next wake-up does not rewrite the state.
+        let recorded = ctx.state().error;
+        assert!(matches!(
+            ctx.watch(false).await,
+            WatchReport::GivenUp { .. }
+        ));
+        assert_eq!(ctx.state().error, recorded);
+    }
+
+    #[tokio::test]
+    async fn the_first_install_cannot_fall_back() {
+        let ctx = Ctx::new(true);
+        let st = switch_state(&ctx, None, &digest_of('b'), Duration::from_secs(500));
+        ctx.save_state(&st);
+
+        match ctx.watch(false).await {
+            WatchReport::GivenUp { reason } => {
+                assert!(reason.contains("no previous image"), "{reason}");
+            }
+            other => panic!("expected GiveUp, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pruned_fallback_image_is_reported_and_not_pinned() {
+        let ctx = Ctx::new(true);
+        let st = switch_state(
+            &ctx,
+            Some(digest_of('a')),
+            &digest_of('b'),
+            Duration::from_secs(500),
+        );
+        ctx.save_state(&st);
+
+        match ctx.watch(false).await {
+            WatchReport::GivenUp { reason } => {
+                assert!(reason.contains("local store"), "{reason}");
+            }
+            other => panic!("expected GiveUp, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_across_a_state_schema_bump_is_refused() {
+        let ctx = Ctx::new(true);
+        let before = digest_of('a');
+        // The previous image predates the current state schema (ADR 0023): restoring it would lose
+        // fields, so the watchdog reports instead of pinning it.
+        ctx.podman.set_pull_labels(IMAGE, &[(SCHEMA_LABEL, "1")]);
+        ctx.pull_image(&before).await;
+        let st = switch_state(
+            &ctx,
+            Some(before),
+            &digest_of('b'),
+            Duration::from_secs(500),
+        );
+        ctx.save_state(&st);
+
+        match ctx.watch(false).await {
+            WatchReport::GivenUp { reason } => assert!(reason.contains("schema"), "{reason}"),
+            other => panic!("expected GiveUp, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_fallback_can_be_switched_off_and_needs_the_section() {
+        let mut ctx = Ctx::new(true);
+        ctx.settings.host.self_update.as_mut().unwrap().fallback = false;
+        assert_eq!(ctx.watch(false).await, WatchReport::Disabled);
+
+        let ctx = Ctx::new(false);
+        assert_eq!(ctx.watch(false).await, WatchReport::Disabled);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_confirmation_is_reported_and_keeps_the_failed_image_off_the_rollback() {
+        use weglarka_core::events::VecSink;
+
+        let ctx = Ctx::new(true);
+        let restored = digest_of('a');
+        let failed = digest_of('b');
+        ctx.pull_image(&restored).await;
+        ctx.podman.add_foreign_container(SERVICE_NAME, IMAGE);
+        let mut st = SelfUpdateState {
+            current: Some(failed.clone()),
+            ..SelfUpdateState::default()
+        };
+        st.begin_switch(
+            Some(restored.clone()),
+            failed.clone(),
+            ctx.now - Duration::from_secs(500),
+        );
+        st.record_fallback(failed.clone(), restored.clone(), ctx.now);
+        ctx.save_state(&st);
+
+        let sink = VecSink::default();
+        let confirmation = confirm_startup(&ctx.podman, &ctx.settings.paths.state_dir, &sink).await;
+        assert_eq!(
+            confirmation,
+            Some(Confirmation::FellBack {
+                from: failed.clone(),
+                to: restored.clone()
+            })
+        );
+        let state = ctx.state();
+        assert_eq!(state.current, Some(restored));
+        assert_eq!(
+            state.previous, None,
+            "the failed image is not a rollback target"
+        );
+        assert!(
+            sink.events()
+                .into_iter()
+                .any(|e| matches!(e, Event::SelfUpdateFellBack { .. })),
+            "the fallback is reported through the existing notification pipeline"
+        );
     }
 }

@@ -106,6 +106,10 @@ pub enum Confirmation {
     Updated { from: Option<Digest>, to: Digest },
     /// The running digest changed without a pending request (a manual `platform install --image`).
     Adopted { from: Option<Digest>, to: Digest },
+    /// A switch failed and the watchdog restored the previous image, so the daemon now runs `to` —
+    /// the digest that ran before the failed switch, and `from` is the digest that failed
+    /// (issue #100). The failed digest deliberately never becomes the rollback target.
+    FellBack { from: Digest, to: Digest },
     /// A switch was requested but the container runs a different image.
     Pending { expected: Digest, actual: Digest },
     /// Nothing changed.
@@ -272,6 +276,22 @@ impl SelfUpdateState {
     pub fn confirm(&mut self, running: &Digest) -> Confirmation {
         match self.pending.clone() {
             Some(pending) if &pending == running => {
+                // A fallback pins the restored digest as `pending` (issue #100): confirming it must
+                // not make the failed digest the rollback target, so `previous` is cleared rather
+                // than taken from `current`, which still names the image that failed.
+                if self.switch_attempts > 0
+                    && let Some(fallback) = self.last_fallback()
+                    && &fallback.to == running
+                {
+                    self.current = Some(running.clone());
+                    self.previous = None;
+                    self.pending = None;
+                    self.pending_at = None;
+                    return Confirmation::FellBack {
+                        from: fallback.from,
+                        to: running.clone(),
+                    };
+                }
                 let from = self.current.take();
                 self.current = Some(running.clone());
                 self.previous = from.clone();
@@ -828,5 +848,43 @@ mod tests {
             supervise(&state, false, at(1_030), &policy),
             Supervision::FallBack { .. }
         ));
+    }
+
+    #[test]
+    fn a_fallback_confirmation_keeps_the_failed_digest_out_of_previous() {
+        let mut state = SelfUpdateState {
+            current: Some(digest('a')),
+            ..SelfUpdateState::default()
+        };
+        state.begin_switch(Some(digest('a')), digest('b'), at(1_000));
+        state.record_fallback(digest('b'), digest('a'), at(1_200));
+
+        assert_eq!(
+            state.confirm(&digest('a')),
+            Confirmation::FellBack {
+                from: digest('b'),
+                to: digest('a'),
+            }
+        );
+        assert_eq!(state.current, Some(digest('a')));
+        assert_eq!(
+            state.previous, None,
+            "the failed image is not a rollback target"
+        );
+        assert!(state.pending.is_none() && state.pending_at.is_none());
+
+        // The next start of the same image is just "nothing changed".
+        assert_eq!(state.confirm(&digest('a')), Confirmation::Unchanged);
+
+        // A later, ordinary switch starts from the restored image and works as before.
+        state.begin_switch(Some(digest('a')), digest('c'), at(2_000));
+        assert_eq!(
+            state.confirm(&digest('c')),
+            Confirmation::Updated {
+                from: Some(digest('a')),
+                to: digest('c'),
+            }
+        );
+        assert_eq!(state.previous, Some(digest('a')));
     }
 }

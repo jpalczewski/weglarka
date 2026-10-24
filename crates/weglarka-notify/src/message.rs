@@ -63,7 +63,8 @@ fn instance_of(event: &Event) -> Option<&InstanceName> {
         Event::Pruned { .. }
         | Event::WebhookDuplicate { .. }
         | Event::SelfUpdated { .. }
-        | Event::SelfUpdatePending { .. } => None,
+        | Event::SelfUpdatePending { .. }
+        | Event::SelfUpdateFellBack { .. } => None,
     }
 }
 
@@ -213,6 +214,18 @@ pub fn build(event: &Event) -> Message {
                  `weglarka-daemon self-update --rollback` returns to the previous image",
                 short(expected),
                 short(actual)
+            ),
+            tag("warning"),
+        ),
+        // Issue #100: the watchdog reverted an image that never became healthy.
+        Event::SelfUpdateFellBack { from, to } => (
+            "self-update:daemon".to_owned(),
+            "Węglarka fell back to the previous image".to_owned(),
+            format!(
+                "the switch to {} did not answer the admin API in time, so the watchdog restored {}; \
+                 the failed digest is not retried until the tag moves (`--force` overrides that)",
+                short(from),
+                short(to)
             ),
             tag("warning"),
         ),
