@@ -52,6 +52,11 @@ pub fn volume_name(instance: &InstanceName, volume: &str) -> String {
 /// **no** [`INSTANCE`] label, so instance purge / orphan settling / volume filters never touch it.
 pub const SHARED_VOLUME: &str = "weglarka.shared-volume";
 
+/// Label carrying the group of a shared volume (issue #129): the volumes of one group share a uid
+/// range. Set when the volume is created; volumes created before groups only have
+/// [`SHARED_VOLUME`], and their group is that volume's own name.
+pub const SHARED_GROUP: &str = "weglarka.shared-group";
+
 /// Podman volume name of a shared volume. It contains no `.`, while every per-instance volume is
 /// `<instance>.<volume>` (instance and volume names are `[a-z0-9-]`), so the two namespaces cannot
 /// collide.

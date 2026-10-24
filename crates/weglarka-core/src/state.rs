@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -50,10 +50,18 @@ fn host_config_mounts_v2(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v2 → v3: shared volume groups (issue #129, ADR 0029). `[shared_volumes.<name>] group` is optional
+/// and defaults to the volume's own name, so a v2 document needs no data transformation — the marker
+/// records that the file may carry the field. A no-op that must accept a hand-edited file which
+/// already has it.
+fn shared_volume_groups_v3(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
-const SCHEMA_STEPS: &[SchemaStep] = &[host_config_mounts_v2];
+const SCHEMA_STEPS: &[SchemaStep] = &[host_config_mounts_v2, shared_volume_groups_v3];
 
 const _: () = assert!(
     SCHEMA_STEPS.len() as u32 == SCHEMA_VERSION - IMPLICIT_SCHEMA_VERSION,
@@ -348,13 +356,16 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
             return Err(format!("{name}: duplicate volume target {:?}", v.target));
         }
     }
-    if spec.shared_volumes.len() > 1 {
-        return Err(format!(
-            "{name}: at most one shared volume per app (a shared volume is a uid-range boundary; \
-             see docs/decisions/0017-shared-volumes.md)"
-        ));
-    }
+    // Which group each volume belongs to needs the declarations, so "one group per app" is checked
+    // across apps in `shared_volumes::validate`.
+    let mut seen_shared = BTreeSet::new();
     for v in &spec.shared_volumes {
+        if !seen_shared.insert(&v.name) {
+            return Err(format!(
+                "{name}: shared volume {:?} is mounted twice",
+                v.name
+            ));
+        }
         if !valid_mount_target(&v.target) {
             return Err(format!(
                 "{name}: shared volume {:?} target must be an absolute path (no '..', ':' or ',')",

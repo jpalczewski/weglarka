@@ -193,6 +193,24 @@ impl Env {
         volume
     }
 
+    /// Shared volume of a group (ADR 0029): as [`Self::shared_volume`], plus the
+    /// `weglarka.shared-group` label.
+    async fn shared_group_volume(&mut self, name: &SharedVolumeName, group: &str) -> String {
+        let volume = labels::shared_volume_name(name);
+        self.volumes.push(volume.clone());
+        self.client
+            .volume_create(&VolumeSpec {
+                name: volume.clone(),
+                labels: BTreeMap::from([
+                    (labels::SHARED_VOLUME.to_owned(), name.to_string()),
+                    (labels::SHARED_GROUP.to_owned(), group.to_owned()),
+                ]),
+            })
+            .await
+            .unwrap();
+        volume
+    }
+
     /// Pulls an image and checks the stream completed; member images have to keep running by
     /// themselves (`ContainerSpec` has no command), so the test needs its own image.
     async fn pull(&self, image: &str) {
@@ -897,5 +915,72 @@ async fn shared_volume_two_members_one_range_read_write_recreate_and_isolate() {
     assert!(
         !std::path::Path::new(&format!("{mountpoint}/evil")).exists(),
         "nothing appeared on the volume"
+    );
+}
+
+/// Issue #129 (ADR 0029): two volumes of one group are mounted by one container in the group's single
+/// range; files written to either are owned through that range, and a second member that mounts
+/// only one of the volumes sees the same owner.
+#[tokio::test]
+async fn shared_group_two_volumes_one_range_consistent_ownership() {
+    let Some(socket) = socket() else { return };
+    let mut env = Env::new(socket).await;
+    env.pull(NGINX).await;
+    let id = run_id();
+    let range = env.range();
+
+    let data = SharedVolumeName::new(format!("it-gd-{id}")).unwrap();
+    let work = SharedVolumeName::new(format!("it-gw-{id}")).unwrap();
+    let group = format!("it-grp-{id}");
+    let data_volume = env.shared_group_volume(&data, &group).await;
+    let work_volume = env.shared_group_volume(&work, &group).await;
+    let mountpoint = |name: &str| {
+        let name = name.to_owned();
+        let client = &env.client;
+        async move {
+            client
+                .volume_inspect(&name)
+                .await
+                .unwrap()
+                .mountpoint
+                .expect("volume mountpoint")
+        }
+    };
+    let (data_mp, work_mp) = (
+        mountpoint(&data_volume).await,
+        mountpoint(&work_volume).await,
+    );
+
+    let api = format!("wgit-grp-api-{id}");
+    let mut spec = member_spec(&api, &data_volume, range);
+    spec.volumes.push(VolumeAttachment {
+        volume: work_volume.clone(),
+        target: "/workspaces".to_owned(),
+        read_only: false,
+    });
+    env.spawn(&spec).await;
+    assert_eq!(
+        env.sh(&api, "echo a > /data/f && echo b > /workspaces/f")
+            .await,
+        0,
+        "one container writes into both volumes of the group"
+    );
+    assert_eq!(
+        host_uid(&format!("{data_mp}/f")),
+        host_uid(&format!("{work_mp}/f")),
+        "both volumes are owned through the group's single range"
+    );
+
+    // A second member mounting only one of the volumes, same range: it reads the other's file.
+    let mcp = format!("wgit-grp-mcp-{id}");
+    env.spawn(&member_spec(&mcp, &data_volume, range)).await;
+    assert_eq!(
+        env.sh(
+            &mcp,
+            r#"test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q a /data/f"#
+        )
+        .await,
+        0,
+        "the second member reads the file with the same owner"
     );
 }

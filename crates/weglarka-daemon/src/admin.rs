@@ -111,6 +111,7 @@ impl From<EngineError> for Fail {
             e @ (EngineError::SharedVolumeInUse { .. }
             | EngineError::SharedVolumeHasData { .. }
             | EngineError::SharedVolumeBusy { .. }
+            | EngineError::SharedGroupChange { .. }
             | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
             // Config mounts (issue #118): a spec/source problem is the request's fault (400).
             EngineError::Configs(message) => Fail::invalid(message),

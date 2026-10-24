@@ -28,7 +28,8 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
 - Spec flags without `--spec`: `--volume NAME=/PATH[:ro]` (repeatable) adds a private named volume;
   `--shared-volume NAME=/PATH[:ro]` (repeatable) mounts a volume shared with other apps (issue #33).
-  A shared volume must be declared first (`weglarka volumes add NAME`), at most one per app; a mount
+  A shared volume must be declared first (`weglarka volumes add NAME`); an app may mount several,
+  but only of one group (`volumes add NAME --group G`, issue #129); a mount
   of the same name is replaced; `--shared-volume` conflicts with `--spec` like `--volume`. Omitting
   the flags keeps the volumes already in the spec (read-modify-write).
 - Spec flags without `--spec`: `--host-port [IP:]HOST:CONTAINER` (repeatable) publishes a container port
@@ -74,10 +75,12 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 ## Volumes
 
 - `volumes list [app]` — with an app: the app's volumes (private and shared) with a `SHARED`
-  column; without an app: the shared volumes declared in `apps.toml` — `NAME`, `PODMAN NAME`,
-  `MEMBERS`, `RANGE` (`<start>+<size>`, `-` before the first deploy), `EXISTS`.
-- `volumes add <name>` — declare a shared volume (`PUT /v1/volumes/{name}`, idempotent, 204). The
-  name is validated locally before anything is sent; `--dry-run` prints the request.
+  column; without an app: the shared volumes declared in `apps.toml` — `NAME`, `GROUP`,
+  `PODMAN NAME`, `MEMBERS`, `RANGE` (`<start>+<size>`, `-` before the first deploy), `EXISTS`.
+- `volumes add <name> [--group G]` — declare a shared volume (`PUT /v1/volumes/{name}`, idempotent,
+  204). Volumes of one group share a uid range, so one app can mount several of them; the default
+  group is the volume itself. The group is fixed while the volume exists (409 otherwise). Names are
+  validated locally before anything is sent; `--dry-run` prints the request including `?group=`.
 - `volumes remove <name> [--purge]` — remove a declaration (`DELETE /v1/volumes/{name}`; with
   `--purge` the query is `?purge=true` and the Podman volume is deleted with its data). Refused with
   409 while an app still mounts it; without `--purge` also while the volume holds data.
@@ -85,7 +88,7 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 - `volumes export <app> <volume>` / `volumes import <app> <volume>` — stream a tar to/from a file or
   stdin/stdout; a shared volume is resolved through a member app (the import helper runs in the
   group's uid range). An import into a shared volume is refused while another member runs.
-- Shared volumes (`docs/decisions/0017-shared-volumes.md`) own one uid range: `wg-shared-<name>`,
+- Shared volume groups (`docs/decisions/0017-shared-volumes.md`, `0029-shared-volume-groups.md`) own one uid range: `wg-shared-<name>`,
   created on the first member's deploy. `apps add/update --shared-volume NAME=/PATH[:ro]` mounts
   one; `apps remove` keeps the data, while `apps remove --purge-volumes` on a member is refused
   (409) while other members exist.

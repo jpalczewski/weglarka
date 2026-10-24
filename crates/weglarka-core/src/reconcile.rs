@@ -106,6 +106,17 @@ pub enum EngineError {
         volume: crate::app::SharedVolumeName,
         members: String,
     },
+    /// A shared volume cannot move to another group while it exists: its files belong to the old
+    /// group's uid range (docs/decisions/0029).
+    #[error(
+        "shared volume {volume} belongs to group {from}, not {to}: its data is owned by that group's \
+         uid range; remove it with --purge and declare it again, or import the data into a new volume"
+    )]
+    SharedGroupChange {
+        volume: crate::app::SharedVolumeName,
+        from: crate::app::SharedVolumeName,
+        to: crate::app::SharedVolumeName,
+    },
     /// Unknown shared volume declaration.
     #[error("unknown shared volume: {0}")]
     UnknownSharedVolume(crate::app::SharedVolumeName),
@@ -642,7 +653,7 @@ impl<P: PodmanClient> Reconciler<P> {
             }
             let uid_range = pinned
                 .as_ref()
-                .and_then(|_| crate::volumes::effective_range_label(&st, name, spec));
+                .and_then(|_| crate::volumes::effective_range_label(&apps, &st, name, spec));
             targets.push(Target {
                 instance: name.clone(),
                 pinned,

@@ -68,7 +68,8 @@ pub struct SpecFlags {
     #[arg(long = "volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_volume, conflicts_with = "spec")]
     pub volumes: Vec<VolumeMount>,
     /// Shared volume mount: NAME=/PATH[:ro] (repeatable; replaces a mount of that name). The
-    /// volume must be declared first (`weglarka volumes add NAME`); v1 allows at most one per app.
+    /// volume must be declared first (`weglarka volumes add NAME`); an app may mount several, but only
+    /// of one group (`volumes add NAME --group G`).
     #[arg(long = "shared-volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_shared_volume, conflicts_with = "spec")]
     pub shared_volumes: Vec<SharedVolumeRef>,
     /// Read-only host config mount from `config_root` (ADR 0028): SOURCE:TARGET, with `source`

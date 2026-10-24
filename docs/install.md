@@ -451,6 +451,31 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]  
 ```
 
 Gotowy plik (deklaracja + dwie apki): [`docs/examples/sqlite-shared-volume.toml`](examples/sqlite-shared-volume.toml).
+
+Dwa wolumeny, jedna grupa (np. baza SQLite w `/data` i drzewa robocze gita w `/workspaces`, montowane przez te same
+procesy):
+
+```toml
+[shared_volumes.kajet-data]
+group = "kajet"            # opcjonalne; domyślnie grupą jest sam wolumen
+
+[shared_volumes.kajet-workspaces]
+group = "kajet"
+
+[apps.kajet-api]
+image = "ghcr.io/.../kajet-api:latest"
+shared_volumes = [
+  { name = "kajet-data", target = "/data" },
+  { name = "kajet-workspaces", target = "/workspaces" },
+]
+```
+
+Z CLI: `weglarka volumes add kajet-data --group kajet`. **Grupa wolumenu jest stała, dopóki wolumen istnieje** — jego
+pliki należą do zakresu grupy, więc `volumes add` z inną grupą (albo ręczna zmiana `group` w `apps.toml`) kończy się
+`409` / odmową deployu, a `doctor` ostrzega o rozjeździe. Żeby przenieść wolumen do innej grupy: `volumes export`,
+`volumes remove --purge`, `volumes add --group …`, `volumes import`. Zakres grupy jest zwalniany dopiero wtedy, gdy
+znika **ostatni** wolumen grupy (i ostatni jej członek) — purge jednego wolumenu nie uwalnia zakresu, w którym leżą
+dane pozostałych.
 Sekcję `[shared_volumes]` dopisuje `weglarka volumes add <nazwa>`; `apps.toml` jest plikiem demona, więc nie edytuj
 go równolegle z działającym CLI.
 
@@ -463,9 +488,12 @@ go równolegle z działającym CLI.
 - Deklaracja chroni przed literówką: `shared_volumes` z nazwą, której nie ma w `[shared_volumes]`, odrzuca
   walidacja (HTTP 400, podpowiedź `weglarka volumes add <nazwa>`), a `apps.toml` z takim wpisem nie wczyta się przy
   starcie demona.
-- **Maks. jeden wolumen współdzielony na apkę** (v1): jeden wolumen = jedna granica zakresu UID. Wolumeny prywatne
-  (`volumes`) można łączyć ze współdzielonym — powstają w zakresie grupy, więc pozostali członkowie mogą je czytać
-  (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
+- **Kilka wolumenów na apkę tylko z jednej grupy** (issue #129, [0029](decisions/0029-shared-volume-groups.md)): zakres
+  UID należy do **grupy** wolumenów, nie do pojedynczego wolumenu. Bez pola `group` grupą wolumenu jest on sam
+  (zachowanie sprzed grup), więc istniejące pliki nic nie tracą. Apka może zamontować dowolnie wiele wolumenów
+  **jednej** grupy; wolumeny z różnych grup w jednej apce odrzuca walidacja (HTTP 400, „belong to different groups”).
+  Wolumeny prywatne (`volumes`) można łączyć ze współdzielonym — powstają w zakresie grupy, więc pozostali członkowie
+  mogą je czytać (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
 - `start = false` członka provisionuje zakres i wolumen **bez kontenera** ([6b](#6b-zatrzymywanie-apek-start--false)),
   więc dane można zaimportować przed pierwszym startem.
 - **Zmiana zakresu UID przy danych jest odrzucana także bez kontenera:** dołączenie apki z prywatnymi wolumenami do
@@ -474,7 +502,9 @@ go równolegle z działającym CLI.
   (`effective_uid_range`). Provisioning i deploy mają wspólny prolog, więc ręczna edycja `apps.toml` przy
   zatrzymanym demonie też nie przejdzie. Zmiana zakresu jest bezpieczna dopiero po usunięciu danych
   (`apps remove --purge-volumes` albo ręcznie skasowane wolumeny).
-- **`doctor`:** `state.shared_volumes` raportuje dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
+- **`doctor`:** `state.shared_volumes` raportuje członkostwo w grupach (wolumeny i członkowie każdej grupy
+  z więcej niż jednym wolumenem), wolumen istniejący w innej grupie, niż deklaruje `apps.toml`,
+  dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
   --purge`), zadeklarowany a jeszcze nieutworzony wolumen, rozjazd etykiety `weglarka.uid-range` i przypomnienie,
   że wszystkie obrazy grupy muszą działać jako ten sam `USER` — porównania użytkowników `doctor` nie robi za Ciebie.
 - **Sprzątanie:** `apps remove` (bez `--purge-volumes`) **nie usuwa danych** — wolumen i zakres zostają, a ponowne
@@ -488,8 +518,9 @@ Deklaracja i sprzątanie z CLI (przez API, jak `apps`):
 
 ```sh
 weglarka volumes add kajet-data                 # deklaracja w apps.toml (idempotentna; PUT /v1/volumes/<nazwa>)
+weglarka volumes add kajet-data --group kajet   # ...w grupie, która dzieli jeden zakres UID (PUT ...?group=kajet)
 weglarka volumes list                           # bez apki: wszystkie wolumeny współdzielone
-                                                # (NAME, PODMAN NAME, MEMBERS, RANGE, EXISTS)
+                                                # (NAME, GROUP, PODMAN NAME, MEMBERS, RANGE, EXISTS)
 weglarka volumes remove kajet-data              # 409, gdy wolumen montuje jakakolwiek apka; bez danych usuwa
                                                 # deklarację (bez --purge nie rusza wolumenu z danymi)
 weglarka volumes remove kajet-data --purge      # usuwa wolumen grupy (dane!) i wpis w state.toml; 409, dopóki
@@ -1361,16 +1392,19 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
 [0023](decisions/0023-state-schema-version.md)). Zasady:
 
 - **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
-  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 2**
-  (configi z hosta, issue #118, [0026](decisions/0028-config-root-mounts.md)): plik v1 wczytuje się
-  bez zmian, a pierwszy zwykły zapis dopisuje `schema_version = 2`.
+  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 3**
+  (v2: configi z hosta, issue #118, [0028](decisions/0028-config-root-mounts.md); v3: grupy wolumenów
+  współdzielonych, issue #129): plik v1 wczytuje się bez zmian, a pierwszy zwykły zapis dopisuje
+  `schema_version = 3`.
 - Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
   `apps.toml`/`state.toml`); taka wersja uruchamia migrację przy odczycie, a pierwszy zwykły zapis
-  dopisuje nowy numer.
+  dopisuje nowy numer. **Wersja 3** (issue #129, [0029](decisions/0029-shared-volume-groups.md)) dodaje opcjonalne
+  `group` w `[shared_volumes.<nazwa>]`: od aktualizacji do niej oba pliki dostają `schema_version = 3` przy pierwszym
+  zapisie, także gdy nie używasz grup, a rollback do wcześniejszego wydania wymaga kopii plików sprzed aktualizacji.
 - **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
 
   ```text
-  /var/lib/weglarka/state.toml: schema version 2 is newer than this daemon supports (1); written by
+  /var/lib/weglarka/state.toml: schema version 4 is newer than this daemon supports (3); written by
   a newer Węglarka — roll forward to that version, or restore apps.toml and state.toml from before
   the upgrade
   ```

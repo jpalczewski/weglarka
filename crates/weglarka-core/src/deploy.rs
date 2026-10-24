@@ -348,6 +348,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
         // old container. The range was assigned by the caller, so `state.toml` already has it.
         let new_label = crate::volumes::effective_range_label(
+            &state::load_apps(&self.paths.apps)?,
             &state::load_state(&self.paths.state)?,
             instance,
             spec,
