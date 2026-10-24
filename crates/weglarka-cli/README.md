@@ -31,7 +31,13 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   A shared volume must be declared first (`weglarka volumes add NAME`); an app may mount several,
   but only of one group (`volumes add NAME --group G`, issue #129); a mount
   of the same name is replaced; `--shared-volume` conflicts with `--spec` like `--volume`. Omitting
-  the flags keeps the volumes already in the spec (read-modify-write).
+  the flags keeps the volumes already in the spec (read-modify-write). `apps update --remove-volume NAME`
+  and `--remove-shared-volume NAME` (both repeatable, both conflict with `--spec`) detach a private or a
+  shared volume instead (issue #54); an unknown name is a usage error (exit 64) and nothing is sent.
+  Neither flag deletes data: a private volume (and its files) stays in Podman until
+  `apps remove --purge-volumes`, and detaching the last member of a shared volume keeps both the
+  `[shared_volumes.<name>]` declaration and `wg-shared-<name>` + its uid range. `--dry-run` shows the
+  removed lines in the spec diff.
 - Spec flags without `--spec`: `--host-port [IP:]HOST:CONTAINER` (repeatable) publishes a container port
   directly on the host (issue #34): omitting `IP` binds loopback (`127.0.0.1`), `--host-port 0.0.0.0:2222:22`
   exposes it, `none` clears the list. TCP only, and the port bypasses the ingress (no TLS, no routing, no
