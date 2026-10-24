@@ -26,5 +26,10 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
     "memory": "128M",
     "pids_limit": 256
   },
-  "state": {}
+  "state": {},
+  "monitor": {
+    "crash_loop_restarts": 3,
+    "crash_loop_window_secs": 600,
+    "unhealthy_observations": 2
+  }
 }

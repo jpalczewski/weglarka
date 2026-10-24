@@ -322,6 +322,7 @@ mod tests {
             state: ContainerState::Running,
             exit_code: None,
             health: None,
+            restarts: 0,
             networks: Vec::new(),
         }
     }

@@ -56,7 +56,10 @@ fn instance_of(event: &Event) -> Option<&InstanceName> {
         | Event::RollbackFailed { instance, .. }
         | Event::Recreated { instance, .. }
         | Event::WaitingForSecret { instance, .. }
-        | Event::WaitingForDependency { instance, .. } => Some(instance),
+        | Event::WaitingForDependency { instance, .. }
+        | Event::CrashLooping { instance, .. }
+        | Event::Unhealthy { instance }
+        | Event::Recovered { instance } => Some(instance),
         Event::Pruned { .. } | Event::WebhookDuplicate { .. } => None,
     }
 }
@@ -170,6 +173,24 @@ pub fn build(event: &Event) -> Message {
             format!("duplicate webhook {delivery_id}"),
             "already handled (deduplicated by delivery id)".to_owned(),
             tag("recycle"),
+        ),
+        Event::CrashLooping { instance, restarts } => (
+            format!("crash:{instance}"),
+            format!("crash loop: {instance}"),
+            format!("{restarts} restarts; check the logs with `weglarka apps show {instance}`"),
+            tag("rotating_light"),
+        ),
+        Event::Unhealthy { instance } => (
+            format!("unhealthy:{instance}"),
+            format!("unhealthy: {instance}"),
+            "the container healthcheck is failing".to_owned(),
+            tag("warning"),
+        ),
+        Event::Recovered { instance } => (
+            format!("recovered:{instance}"),
+            format!("running again: {instance}"),
+            "no new restarts and the healthcheck passes".to_owned(),
+            tag("white_check_mark"),
         ),
     };
     Message {
@@ -322,6 +343,25 @@ image = "ghcr.io/x/worker:1"
                     delivery_id: "abc-123".into(),
                 },
                 Severity::Debug,
+            ),
+            (
+                Event::CrashLooping {
+                    instance: instance(),
+                    restarts: 4,
+                },
+                Severity::Critical,
+            ),
+            (
+                Event::Unhealthy {
+                    instance: instance(),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::Recovered {
+                    instance: instance(),
+                },
+                Severity::Info,
             ),
         ]
     }

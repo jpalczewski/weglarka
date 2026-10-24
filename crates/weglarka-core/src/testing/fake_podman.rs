@@ -162,6 +162,21 @@ impl FakePodman {
         }
     }
 
+    /// libpod's `RestartCount` seen by `container_inspect`/`container_list` (crash-loop detection).
+    pub fn set_restarts(&self, name: &str, restarts: u32) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.restarts = restarts;
+        }
+    }
+
+    /// Health status seen by `container_inspect`/`container_list`; `None` = the image has no healthcheck
+    /// (unlike `script_health`, which feeds the deploy health gate).
+    pub fn set_health(&self, name: &str, health: Option<HealthStatus>) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.health = health;
+        }
+    }
+
     /// Exit code returned by subsequent `container_exec`s in this container.
     pub fn set_exec_exit_code(&self, container: &str, code: i32) {
         self.lock()
@@ -362,6 +377,7 @@ impl PodmanClient for FakePodman {
                 state: ContainerState::Created,
                 exit_code: None,
                 health,
+                restarts: 0,
                 networks: Vec::new(),
             },
         );

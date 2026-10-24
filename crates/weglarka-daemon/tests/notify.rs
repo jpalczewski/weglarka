@@ -161,6 +161,10 @@ domain = "hooks.example.eu"
 [state]
 dir = "{root}/state"
 
+[runtime]
+# The crash-loop test waits for a periodic pass; one second keeps it short.
+reconcile_interval_secs = 1
+
 {notify}"#,
         root = root.display(),
     ))
@@ -359,5 +363,59 @@ async fn a_failed_delivery_stays_in_the_outbox() {
     assert!(
         !src.contains("Authorization"),
         "no token in the outbox: {src}"
+    );
+}
+
+/// Crash-loop detection (issue #112) rides the same pipeline: libpod's restart counter is observed by the
+/// reconcile pass, becomes an engine event and reaches ntfy.
+#[tokio::test]
+async fn a_crash_loop_reaches_ntfy() {
+    let ntfy = Ntfy::start().await;
+    let h = harness(Some(&ntfy)).await;
+
+    let (status, body) = admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(app_body("demo", "demo.example.eu")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    eventually("the deploy notification", || async {
+        ntfy.published()
+            .iter()
+            .any(|p| p["title"] == json!("deployed demo"))
+    })
+    .await;
+
+    // Below the default threshold (3 new restarts): no alert, the periodic pass must have seen it.
+    h.fake.set_restarts("demo", 2);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !ntfy
+            .published()
+            .iter()
+            .any(|p| p["title"] == json!("crash loop: demo")),
+        "two restarts are below the threshold"
+    );
+
+    h.fake.set_restarts("demo", 3);
+    eventually("the crash-loop notification", || async {
+        ntfy.published()
+            .iter()
+            .any(|p| p["title"] == json!("crash loop: demo"))
+    })
+    .await;
+
+    let published = ntfy.published();
+    let crash: Vec<&Value> = published
+        .iter()
+        .filter(|p| p["title"] == json!("crash loop: demo"))
+        .collect();
+    assert_eq!(crash.len(), 1, "{published:?}");
+    assert_eq!(crash[0]["priority"], json!(5));
+    assert_eq!(
+        crash[0]["message"],
+        json!("3 restarts; check the logs with `weglarka apps show demo`")
     );
 }

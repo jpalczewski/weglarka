@@ -425,6 +425,10 @@ pub(crate) struct InspectContainer {
     config: InspectConfig,
     #[serde(rename = "State")]
     state: InspectState,
+    /// libpod's restart counter, bumped by conmon when the restart policy restarts the container.
+    /// Crash-loop detection (`core::crash`) reads it — a missing field would silently read `0`.
+    #[serde(rename = "RestartCount")]
+    restart_count: u32,
     #[serde(rename = "NetworkSettings")]
     network_settings: InspectNetworkSettings,
 }
@@ -490,6 +494,7 @@ impl InspectContainer {
                 .then_some(self.state.exit_code),
             state,
             health: self.state.health.and_then(|h| health_status(&h.status)),
+            restarts: self.restart_count,
             networks: self
                 .network_settings
                 .networks
@@ -869,6 +874,10 @@ mod tests {
         assert_eq!(info.exit_code, None);
         assert_eq!(info.health, Some(HealthStatus::Healthy));
         assert_eq!(info.labels["weglarka.generation"], "3");
+        assert_eq!(
+            info.restarts, 3,
+            "libpod `RestartCount` maps to `ContainerInfo::restarts`"
+        );
     }
 
     #[test]
