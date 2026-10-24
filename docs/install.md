@@ -10,7 +10,9 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [5. CLI z laptopa](#5-cli-z-laptopa-macos-przez-tunel-ssh) · [Odbiór](#odbiór-na-hoście-scriptsacceptancesh) ·
 [6. Pierwsza apka](#6-pierwsza-apka-ntfyzig) ·
 [6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2) ·
-[6b. `start = false`](#6b-zatrzymywanie-apek-start--false) · [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
+[6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
+[6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
+[7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek (kopiuj-wklej): [`docs/examples/`](examples/).
 
@@ -45,6 +47,11 @@ Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie i
   (`172.18.0.0/16`);
 - AppArmor (Ubuntu 24.04, `apparmor_restrict_unprivileged_userns=1`): systemowy profil `podman` z pakietu wystarcza,
   rootless działa bez zmian sysctl;
+- **porty publikowane na hoście** (`host_ports`, [6c](#6c-porty-publikowane-na-hoście-host_ports)): ruch do nich
+  przekazuje forwarder portów rootless Podmana, więc na hoście nie trzeba nic instalować, ale **UFW musi je
+  wpuszczać** — reguły dodaje rola `weglarka_host` w Ansible, Węglarka firewalla nie zmienia. Porty < 1024
+  wymagają `net.ipv4.ip_unprivileged_port_start=0` na hoście **i** `[runtime] allow_privileged_host_ports = true`
+  w `weglarka.toml`; bez sysctla sam start kontenera się nie powiedzie;
 - DNS: rekord domeny webhooków (`[webhook] domain`) i domen apek wskazuje na host (Traefik terminuje TLS).
 
 Sprawdzenie (jako użytkownik runtime'u, po zapisaniu `weglarka.toml`):
@@ -61,7 +68,9 @@ Wybrane sprawdzenia hosta:
 profil `podman` załadowany, gdy `apparmor_restrict_unprivileged_userns=1`; pełny wynik tylko jako root),
 `ingress.bind_free` (port `bind` nie zajęty przez cudzy proces, np. Traefika), `ingress.traefik_sync`
 (tryb `behind`: aktywny `weglarka-traefik-sync.path`, gdy istnieje `/etc/weglarka/traefik-policy.json`;
-domeny z `apps.toml` na allowliście polityki, klucz `allowed_domains`). Reguły firewalla nie są sprawdzane. Kody wyjścia: 0 ok, 1 warn, 2 fail.
+domeny z `apps.toml` na allowliście polityki, klucz `allowed_domains`), `apps.host_ports_free` (porty z
+`apps.toml` nie zajęte przez cudzy proces — `/proc/net/tcp*`, jak `ingress.bind_free` — oraz porty < 1024 bez
+`allow_privileged_host_ports`). Reguły firewalla (także dla `host_ports`) nie są sprawdzane. Kody wyjścia: 0 ok, 1 warn, 2 fail.
 
 ## 2. Konfiguracja hosta
 
@@ -71,6 +80,9 @@ więc ten sam plik działa dla demona i dla CLI na hoście):
 ```toml
 [runtime]
 user = "weglarka"
+# Porty publikowane na hoście < 1024 (`host_ports`, sekcja 6c): host musi mieć
+# net.ipv4.ip_unprivileged_port_start=0. Domyślnie false — takie porty są odrzucane w walidacji.
+# allow_privileged_host_ports = true
 
 [ingress]
 mode = "behind"
@@ -495,6 +507,70 @@ weglarka apps update stara-apka --start      # to samo co `apps start`
   nie zna tego wariantu i gdy w chwili `weglarka doctor` trwa deploy/recreate, nie sparsuje odpowiedzi — aktualizuj
   CLI razem z demonem (nowe CLI czyta starszy demon bez zmian).
 
+## 6c. Porty publikowane na hoście (`host_ports`)
+
+Niektóre usługi muszą być widoczne na **stałym porcie TCP hosta**, obok swojej strony HTTPS w ingressie. Typowy
+przypadek: serwer gita, którego SSH musi zostać pod znanym numerem (np. `2222` → port `22` w kontenerze), bo ten
+numer siedzi w `git remote` i w przekierowaniu portów na routerze — a UI dalej idzie przez ingress po domenie.
+Decyzja i odrzucone alternatywy: [0013](decisions/0013-host-ports.md).
+
+```toml
+# apps.toml / --spec: git.example.com po HTTPS przez ingress + SSH na porcie hosta
+image = "ghcr.io/example/git-server:latest"
+domains = ["git.example.com"]
+port = 3000
+# 127.0.0.1:2222 → 22 w kontenerze (bez `ip` = tylko loopback):
+host_ports = [{ host = 2222, container = 22 }]
+# publicznie, dopiero po regule UFW:
+# host_ports = [{ host = 2222, container = 22, ip = "0.0.0.0" }]
+```
+
+Zastosowanie: `weglarka apps add git --spec git.toml` (albo `apps update git --spec git.toml`); gotowy plik:
+[`docs/examples/host-ports.toml`](examples/host-ports.toml). To samo flagami `apps add` / `apps update`:
+`--host-port 2222:22` (bez IP = loopback), `--host-port 0.0.0.0:2222:22`, `--host-port none` czyści listę.
+Flaga, jak `--volume`, wyklucza się z `--spec`; reszta specu (obraz, domeny, limity) zostaje na dotychczasowych
+flagach albo w pliku.
+
+- `host` to port na hoście, `container` to port w kontenerze, `ip` — opcjonalny adres nasłuchu. **Bez `ip` port
+  słucha tylko na `127.0.0.1`**: z hosta, przez tunel SSH albo lokalne proxy. Wystawienie na świat wymaga jawnego
+  `ip = "0.0.0.0"` (albo `::`, albo adresu konkretnego interfejsu) — celowo, żeby nowe pole nie odsłaniało
+  usługi przez przypadek.
+- Tylko **TCP**. Nie ma UDP, TLS ani PROXY protocolu: to zwykłe mapowanie portu w Podmanie
+  (`ContainerSpec.publish`), a nie proxy.
+- **Ingress jest całkowicie pomijany:** żadnego routera nginx/Traefik, certyfikatu, logu dostępu ani routingu po
+  domenie. Jedyne «drzwi» to firewall hosta — regułę UFW dodaje rola `weglarka_host` w Ansible, **Węglarka
+  firewalla nie zmienia** (działa rootless). Port bez reguły jest nieosiągalny z zewnątrz, choć działa lokalnie:
+  nie zakładaj, że «skoro `curl` z hosta działa, to działa też z internetu».
+- `host_ports` **wchodzi do `spec-hash`**: zmiana `host`, `container` albo wystawionego adresu odtwarza kontener
+  (krótka przerwa; bramka zdrowia i rollback jak przy każdym recreate). Pusta/nieustawiona lista haszuje się jak
+  dotąd — aktualizacja Węglarki niczego nie odtwarza. Zapisanie `ip = "127.0.0.1"` zamiast pominięcia `ip` to ten
+  sam hash (kolejność wpisów też nie ma znaczenia) — jawny loopback nie odtwarza kontenera.
+- `apps update --spec` podmienia **całą** spec, więc plik bez `host_ports` po cichu usuwa wpisy — jak każde inne
+  pole.
+- Apka z `start = false` ([6b](#6b-zatrzymywanie-apek-start--false)) nie publikuje nic (nie ma kontenera, więc nikt
+  nie słucha), ale wpisy zostają w specu i w walidacji konfliktów — zarezerwowane jak domeny.
+- **Walidacja:** `host` i `container` ≠ 0, `ip` musi być literałem IP, żadnych dwóch wpisów tej samej apki na tym
+  samym gnieździe; między apkami i względem `[ingress] bind` też nie może być kolizji (adres `0.0.0.0`/`::`
+  koliduje z każdym innym adresem na tym porcie). Demon odrzuca taki spec przy `apps add`/`apps update` (HTTP 400,
+  `invalid_request`), a `apps.toml` z kolizją nie wczyta się przy starcie — komunikat wskazuje apkę i port.
+- **Porty < 1024** (np. samo `22`): rootless Podman zwiąże je tylko wtedy, gdy host ma ustawione
+  `net.ipv4.ip_unprivileged_port_start=0`, a Węglarka dodatkowo wymaga
+  `[runtime] allow_privileged_host_ports = true` ([2](#2-konfiguracja-hosta), domyślnie `false`). Bez tego spec
+  jest odrzucany od razu, zamiast wywalać się przy starcie kontenera.
+- Sprawdzenie przed dodaniem: `weglarka doctor --preflight` — `apps.host_ports_free` czyta lokalny `apps.toml`,
+  waliduje deklarację (kolizje, porty < 1024 bez opt-inu) i pokazuje porty zajęte przez cudzy proces. Po
+  deployu: `podman port <instancja>` albo `ss -lnt | grep 2222`.
+
+**Uwaga bezpieczeństwa:** publikowany port omija cały ingress — nie ma tam TLS, logu dostępu, routingu po domenie
+ani żadnej warstwy Węglarki. Autoryzację (klucze SSH, tokeny aplikacji) robi sama usługa, a dostęp ogranicza tylko
+firewall hosta. Wystawiaj wyłącznie to, co naprawdę musi być publiczne, i zaczynaj od loopbacku, dopóki nie masz
+reguły UFW.
+
+Uwaga przy rollbacku: `host_ports` to nowe pole w `apps.toml`, a `[runtime] allow_privileged_host_ports` — w
+`weglarka.toml`; oba pliki mają `deny_unknown_fields`, więc **starszy demon** ich nie odczyta. Wracając do
+poprzedniej wersji Węglarki usuń wpisy `host_ports` z apek i tę flagę z configu — inaczej demon odmówi startu z
+błędem parsowania.
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -515,6 +591,10 @@ podman logs weglarka-nginx                      # access log JSON z polem app
   Zmiana obrazu przez `update` deployuje od razu (pull, bramka zdrowia; nieudana bramka = automatyczny rollback
   do poprzedniego digestu, kod wyjścia 6). Wróć na `:latest` tak samo, z `--auto-update`:
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
+- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, więc starszy demon nie odczyta
+  `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
+  ([6b](#6b-zatrzymywanie-apek-start--false)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
 
 ### `apps update`: co się dzieje po zmianie
 
@@ -533,6 +613,7 @@ diff i niczego nie wysyła.
 | obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
+| `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
 
 Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką, które
 mają `auto_update` i nie są zatrzymane (`start = false` — patrz 6b). Przypięcie tagu `sha-…` lub `--no-auto-update`

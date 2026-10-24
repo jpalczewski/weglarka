@@ -124,6 +124,7 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(BindAddress),
         Box::new(BindFree),
         Box::new(TraefikSync),
+        Box::new(HostPortsFree),
         Box::new(SecretsFile),
     ]
 }

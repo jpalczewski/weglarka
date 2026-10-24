@@ -848,6 +848,137 @@ fn allowed_domains(policy_json: &str) -> Option<Vec<String>> {
     })
 }
 
+/// Ports published directly on the host (`host_ports`, issue #34). Two layers: the declaration must
+/// pass [`weglarka_core::host_ports::validate`] (privileged ports, two apps on one socket, the
+/// ingress bind) and the port must not be held by someone else's process. Like `ingress.bind_free`,
+/// the socket owner comes from `/proc/net/tcp*`: sockets of the runtime user belong to Węglarka
+/// (rootlessport forwarding an already running app), so they are not a collision.
+pub struct HostPortsFree;
+impl Check for HostPortsFree {
+    fn id(&self) -> &'static str {
+        "apps.host_ports_free"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.config.is_some()
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        let id = self.id();
+        let host = cx.config.as_ref().expect("applies");
+        let apps = match cx.host.read_to_string(&cx.apps_path) {
+            Ok(src) => match toml::from_str::<AppsFile>(&src) {
+                Ok(apps) => apps,
+                Err(e) => {
+                    return fail(
+                        id,
+                        format!("cannot parse {}: {e}", cx.apps_path.display()),
+                        "fix apps.toml; host ports cannot be checked until it parses",
+                    );
+                }
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return ok(
+                    id,
+                    format!(
+                        "{} does not exist — no host ports published",
+                        cx.apps_path.display()
+                    ),
+                );
+            }
+            Err(e) => {
+                return warn(
+                    id,
+                    format!("cannot read {}: {e}", cx.apps_path.display()),
+                    "run preflight as the runtime user or make apps.toml readable",
+                );
+            }
+        };
+        if let Err(e) = apps
+            .apps
+            .iter()
+            .try_for_each(|(name, spec)| weglarka_core::state::validate_app(name, spec))
+        {
+            return fail(id, e, "fix apps.toml; the daemon rejects the whole file");
+        }
+        if let Err(e) = weglarka_core::host_ports::validate(host, &apps) {
+            return fail(
+                id,
+                e.to_string(),
+                "fix the app host_ports: no two apps may share a host socket, the [ingress] bind is \
+                 reserved, and ports below 1024 need [runtime] allow_privileged_host_ports = true",
+            );
+        }
+        let entries: Vec<_> = apps
+            .apps
+            .iter()
+            .flat_map(|(name, spec)| spec.host_ports.iter().map(move |p| (name.as_str(), p)))
+            .collect();
+        if entries.is_empty() {
+            return ok(
+                id,
+                format!("{} publishes no app host ports", cx.apps_path.display()),
+            );
+        }
+        let mut listeners = match cx.host.read_to_string(Path::new("/proc/net/tcp")) {
+            Ok(src) => parse_proc_net_tcp(&src, false),
+            Err(e) => {
+                return warn(
+                    id,
+                    format!("cannot read /proc/net/tcp: {e}"),
+                    "cannot check whether the declared host ports are free",
+                );
+            }
+        };
+        if let Ok(src) = cx.host.read_to_string(Path::new("/proc/net/tcp6")) {
+            listeners.extend(parse_proc_net_tcp(&src, true));
+        }
+        let ours = cx.user.as_ref().map(|u| u.uid);
+        let mut free = Vec::new();
+        let mut ipv6 = Vec::new();
+        for (app, entry) in entries {
+            let ip = entry
+                .bind_ip()
+                .parse::<IpAddr>()
+                .expect("host_ports::validate checked the bind address");
+            let IpAddr::V4(ip) = ip else {
+                // `parse_proc_net_tcp` models IPv4 addresses and the dual-stack wildcard only.
+                ipv6.push(format!("{app}:{}", entry.host));
+                continue;
+            };
+            let foreign = listeners.iter().find(|l| {
+                l.port == entry.host
+                    && (l.addr.is_none() || l.addr == Some(ip))
+                    && Some(l.uid) != ours
+            });
+            if let Some(listener) = foreign {
+                return fail(
+                    id,
+                    format!(
+                        "{app}: host port {} on {ip} is already in use by uid {}",
+                        entry.host, listener.uid
+                    ),
+                    format!(
+                        "choose another --host-port or free {} (check `ss -ltnp`)",
+                        entry.host
+                    ),
+                );
+            }
+            free.push(format!("{app} {} on {ip}", entry.host));
+        }
+        let mut message = if free.is_empty() {
+            String::new()
+        } else {
+            format!("host ports are free: {}", free.join(", "))
+        };
+        if !ipv6.is_empty() {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str(&format!("IPv6 binds not checked: {}", ipv6.join(", ")));
+        }
+        ok(id, message)
+    }
+}
+
 pub struct SecretsFile;
 impl Check for SecretsFile {
     fn id(&self) -> &'static str {

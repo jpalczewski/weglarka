@@ -63,14 +63,15 @@ pub async fn update_app<P: PodmanClient + 'static>(
 
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
-        let mut apps = state::load_apps(&d.paths.state.apps)
-            .map_err(internal)?
-            .apps;
+        let mut apps = state::load_apps(&d.paths.state.apps).map_err(internal)?;
         let old = apps
+            .apps
             .insert(name.clone(), req.spec.clone())
             .ok_or_else(|| Fail(ErrorCode::NotFound, format!("unknown app: {name}")))?;
-        // Domains/ports must be renderable (and not taken by another app), as in `add`.
-        weglarka_ingress::Plan::build(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
+        // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
+        // by another app), as in `add`. Both see the candidate app set.
+        weglarka_core::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
+        weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;
         match tokio::time::timeout(
             MUTATION_TIMEOUT,
             d.engine.upsert_app(name.clone(), req.spec.clone()),

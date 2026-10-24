@@ -54,6 +54,12 @@ pub struct RuntimeConfig {
     /// Reconcile loop period (seconds); reconcile is additionally triggered by desired-state changes.
     #[serde(default = "RuntimeConfig::default_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
+    /// Allow apps to publish host ports below 1024 (`host_ports`). Rootless Podman can only bind
+    /// them on a host with `net.ipv4.ip_unprivileged_port_start=0`; unset/false rejects such ports
+    /// in validation instead of failing at container start
+    /// (`docs/decisions/0013-host-ports.md`).
+    #[serde(default)]
+    pub allow_privileged_host_ports: bool,
 }
 
 impl RuntimeConfig {
@@ -72,6 +78,7 @@ impl Default for RuntimeConfig {
             user: Self::default_user(),
             socket: None,
             reconcile_interval_secs: Self::default_reconcile_interval_secs(),
+            allow_privileged_host_ports: false,
         }
     }
 }
@@ -213,6 +220,26 @@ kind = "systemd"
                 .ingress
                 .trusted_proxies
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn privileged_host_ports_are_opt_in() {
+        assert!(
+            !HostConfig::from_toml_str(SAMPLE)
+                .unwrap()
+                .runtime
+                .allow_privileged_host_ports
+        );
+        let allowed = SAMPLE.replace(
+            "[ingress]",
+            "allow_privileged_host_ports = true\n\n[ingress]",
+        );
+        assert!(
+            HostConfig::from_toml_str(&allowed)
+                .unwrap()
+                .runtime
+                .allow_privileged_host_ports
         );
     }
 

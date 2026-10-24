@@ -225,6 +225,33 @@ pub fn valid_volume_name(name: &str) -> bool {
     InstanceName::new(name).is_ok()
 }
 
+/// A container port published directly on the host, next to the ingress (issue #34). Such ports
+/// bypass nginx/Traefik completely: no TLS, no routing by domain, no access log — the host firewall
+/// is the only gate, so the default bind address is loopback
+/// ([`HostPort::DEFAULT_IP`], `docs/decisions/0013-host-ports.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPort {
+    /// Port on the host (rootless Podman cannot bind below 1024 without a host sysctl).
+    pub host: u16,
+    /// Container port the host port is forwarded to.
+    pub container: u16,
+    /// Host address to bind; omitted means loopback. Public exposure has to be explicit,
+    /// e.g. `ip = "0.0.0.0"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+}
+
+impl HostPort {
+    /// Address bound when the spec names none: loopback, so publishing is opt-in.
+    pub const DEFAULT_IP: &'static str = "127.0.0.1";
+
+    /// Effective bind address: the spec's `ip`, or loopback when unset.
+    pub fn bind_ip(&self) -> &str {
+        self.ip.as_deref().unwrap_or(Self::DEFAULT_IP)
+    }
+}
+
 /// Memory limit in bytes. TOML accepts an integer (bytes) or a string with a binary suffix
 /// (`"256m"`, `"1g"`); serialized in the largest exact unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +429,9 @@ pub struct AppSpec {
     /// Named volumes (iteration 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeMount>,
+    /// Ports published directly on the host (issue #34); the ingress keeps routing `domains`/`port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports: Vec<HostPort>,
     /// Resource limits (iteration 2); all unlimited by default.
     #[serde(default, skip_serializing_if = "Resources::is_unlimited")]
     pub resources: Resources,
@@ -467,12 +497,43 @@ health = { command = ["/app", "-health"], http = { path = "/healthz" } }
     #[test]
     fn old_specs_stay_unlimited_and_serialize_without_new_fields() {
         let spec: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
-        assert!(spec.resources.is_unlimited() && spec.volumes.is_empty());
+        assert!(
+            spec.resources.is_unlimited() && spec.volumes.is_empty() && spec.host_ports.is_empty()
+        );
         let text = toml::to_string(&spec).unwrap();
         assert!(
-            !text.contains("volumes") && !text.contains("resources") && !text.contains("command"),
+            !text.contains("volumes")
+                && !text.contains("resources")
+                && !text.contains("command")
+                && !text.contains("host_ports"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn host_ports_roundtrip_and_default_to_loopback() {
+        let toml_src = r#"
+[apps.git]
+image = "ghcr.io/x/forgejo:latest"
+host_ports = [
+    { host = 2222, container = 22 },
+    { host = 2223, container = 22, ip = "0.0.0.0" },
+]
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        insta::assert_json_snapshot!(parsed);
+        let spec = &parsed.apps[&InstanceName::new("git").unwrap()];
+        assert_eq!(spec.host_ports[0].bind_ip(), HostPort::DEFAULT_IP);
+        assert_eq!(spec.host_ports[1].bind_ip(), "0.0.0.0");
+        // An omitted `ip` (loopback) stays omitted on the way out; explicit values round-trip.
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(!text.contains(HostPort::DEFAULT_IP), "{text}");
+        let again: AppsFile = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, again);
+        // Per-entry fields are strict (`deny_unknown_fields`).
+        let bad =
+            "[apps.a]\nimage = \"i\"\nhost_ports = [{ host = 1, container = 2, bogus = 3 }]\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
     }
 
     #[test]

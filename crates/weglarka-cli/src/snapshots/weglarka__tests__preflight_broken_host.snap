@@ -25,7 +25,8 @@ expression: render(&r)
                                 hint: the address must belong to a host interface (for Traefik from Coolify: the docker0 gateway, e.g. 172.17.0.1)
 [ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
 [ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
+[ OK ] apps.host_ports_free     /etc/weglarka/apps.toml does not exist — no host ports published
 [FAIL] state.secrets_file       /etc/weglarka/secrets.toml has mode 0644 (expected 0600)
                                 hint: `chmod 0600 /etc/weglarka/secrets.toml`
 
-9 ok, 0 info, 1 warn, 7 fail
+10 ok, 0 info, 1 warn, 7 fail

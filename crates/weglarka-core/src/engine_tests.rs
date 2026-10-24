@@ -11,7 +11,7 @@ use crate::app::{Digest, InstanceName};
 use crate::deploy::DeployOutcome;
 use crate::events::{Event, VecSink};
 use crate::labels;
-use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient};
+use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping};
 use crate::reconcile::{
     Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
     ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
@@ -536,6 +536,51 @@ async fn spec_drift_missing_container_and_stopped_container() {
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(single(&report), &ActionOutcome::Started);
     assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// `host_ports` reach libpod through `ContainerSpec.publish` (loopback unless the spec names an
+/// address) and a change recreates the container — they are part of the spec hash (ADR 0013).
+#[tokio::test(start_paused = true)]
+async fn host_ports_are_published_and_a_change_recreates() {
+    const WITH_PORTS: &str = r#"
+[apps.git]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+domains = ["git.example.eu"]
+host_ports = [{ host = 2222, container = 22 }]
+"#;
+    let h = Harness::new(WITH_PORTS);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let publish = |h: &Harness| {
+        h.fake
+            .container_spec("git")
+            .expect("the container exists")
+            .publish
+    };
+    assert_eq!(
+        publish(&h),
+        vec![PortMapping {
+            host_ip: Some("127.0.0.1".into()),
+            host_port: 2222,
+            container_port: 22,
+        }]
+    );
+
+    // Exposing the port publicly is a different container.
+    h.set_apps(&WITH_PORTS.replace(
+        "host_ports = [{ host = 2222, container = 22 }]",
+        "host_ports = [{ host = 2222, container = 22, ip = \"0.0.0.0\" }]",
+    ));
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.actions[0].action,
+        Action::Recreate {
+            instance: name("git"),
+            reason: RecreateReason::SpecDrift
+        }
+    );
+    assert_eq!(publish(&h)[0].host_ip.as_deref(), Some("0.0.0.0"));
 }
 
 #[tokio::test(start_paused = true)]

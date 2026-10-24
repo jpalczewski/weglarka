@@ -1,7 +1,7 @@
 # Implementation decisions (ADR)
 
 Each decision describes the problem, the choice, the consequences and the rejected alternatives. New entries are
-numbered consecutively (after `0012` comes `0013`); the skeleton is [`0000-template.md`](0000-template.md).
+numbered consecutively (after `0013` comes `0014`); the skeleton is [`0000-template.md`](0000-template.md).
 
 | # | Topic |
 |---|---|
@@ -17,3 +17,4 @@ numbered consecutively (after `0012` comes `0013`); the skeleton is [`0000-templ
 | [0010](0010-health-http-probe.md) | `health.http`: probe through nginx, resource limits, `health.command` |
 | [0011](0011-start-false-provisioning.md) | `start = false`: provision without starting (issue #29) |
 | [0012](0012-doctor-in-flight.md) | `doctor` and an operation in progress: `info` status instead of false drift |
+| [0013](0013-host-ports.md) | `host_ports`: app container ports published directly on the host (issue #34) |
