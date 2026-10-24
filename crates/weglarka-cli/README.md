@@ -23,6 +23,12 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
   Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
   runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
+- Spec flags without `--spec`: `--host-port [IP:]HOST:CONTAINER` (repeatable) publishes a container port
+  directly on the host (issue #34): omitting `IP` binds loopback (`127.0.0.1`), `--host-port 0.0.0.0:2222:22`
+  exposes it, `none` clears the list. TCP only, and the port bypasses the ingress (no TLS, no routing, no
+  access log) — the host firewall has to allow it. The mapping is part of `spec_hash`, so a change recreates the
+  container; host ports < 1024 need `[runtime] allow_privileged_host_ports = true`. Conflicts with `--spec`,
+  like `--volume` and the limit flags.
 - Lifecycle: `start` is a spec field (default `true`), not a one-shot flag. `apps add --no-start` provisions
   only — the image digest is pinned, the network, uid range and volumes are created, **no container**;
   `apps start` / `apps stop` flip the flag with the same read-modify-write as `apps update`
@@ -64,7 +70,10 @@ not held by a socket of a uid other than the runtime user; read from `/proc/net/
 `ingress.traefik_sync` (`behind` + systemd only: if `/etc/weglarka/traefik-policy.json` exists, the
 unit `weglarka-traefik-sync.path` is `active`, and the domains from `apps.toml` — if available
 locally — are on the policy allowlist, key `allowed_domains`; the paths and the unit name are
-constants from the convention of the Ansible role `weglarka_host`), `state.secrets_file` (0600).
+constants from the convention of the Ansible role `weglarka_host`), `apps.host_ports_free` (ports published via
+`host_ports` — read from `apps.toml` if available locally — are not held by a socket of another uid, same
+`/proc/net/tcp*` technique as `ingress.bind_free`, and no port < 1024 without
+`[runtime] allow_privileged_host_ports`), `state.secrets_file` (0600).
 Firewall rules (UFW) are not checked — they require root.
 A new check = a type implementing `Check` in `src/preflight/checks.rs` + an entry in `all_checks()`.
 Host access goes exclusively through the `Host` trait (tests: `FakeHost`).

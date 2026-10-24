@@ -266,18 +266,20 @@ async fn add_app<P: PodmanClient + 'static>(
     state::validate_app(&req.name, &req.spec).map_err(Fail::invalid)?;
     {
         let _g = d.desired_lock.lock().await;
-        let mut apps = state::load_apps(&d.paths.state.apps)
-            .map_err(Fail::internal)?
-            .apps;
-        if apps.contains_key(&req.name) {
+        let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
+        if apps.apps.contains_key(&req.name) {
             return Err(Fail(
                 ErrorCode::AlreadyExists,
                 format!("app {} already exists", req.name),
             ));
         }
-        apps.insert(req.name.clone(), req.spec.clone());
-        // Domains/ports must be renderable — otherwise ingress would fail to build.
-        weglarka_ingress::Plan::build(&d.host, &apps).map_err(|e| Fail::invalid(e.to_string()))?;
+        apps.apps.insert(req.name.clone(), req.spec.clone());
+        // Host-wide `host_ports` rules first (privileged ports, another app on the same socket, the
+        // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
+        weglarka_core::host_ports::validate(&d.host, &apps)
+            .map_err(|e| Fail::invalid(e.to_string()))?;
+        weglarka_ingress::Plan::build(&d.host, &apps.apps)
+            .map_err(|e| Fail::invalid(e.to_string()))?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;
     }
     // `start = false`: provision synchronously (pin the digest, create the network, uid range and

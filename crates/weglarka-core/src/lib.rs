@@ -7,6 +7,7 @@ pub mod app;
 pub mod config;
 pub mod events;
 pub mod hash;
+pub mod host_ports;
 pub mod labels;
 pub mod platform;
 pub mod podman;

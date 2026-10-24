@@ -42,6 +42,9 @@ pub enum StartError {
     State(#[from] state::StateError),
     #[error(transparent)]
     Secret(#[from] weglarka_core::secret_store::SecretError),
+    /// `host_ports` that cannot work on this host (privileged ports, conflicts, the ingress bind).
+    #[error(transparent)]
+    HostPorts(#[from] weglarka_core::host_ports::HostPortError),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -119,8 +122,11 @@ pub async fn start<P: PodmanClient + 'static>(
     secrets.init()?;
     secrets.check_permissions()?;
     // Corrupt TOMLs surface immediately rather than at the first reconcile.
-    state::load_apps(&paths.state.apps)?;
+    let apps = state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
+    // Host-wide `host_ports` rules (privileged ports, two apps on one socket, the ingress bind)
+    // stop the daemon instead of failing at container start (`docs/decisions/0013-host-ports.md`).
+    weglarka_core::host_ports::validate(&host, &apps)?;
 
     let engine = Arc::new(
         Reconciler::new(

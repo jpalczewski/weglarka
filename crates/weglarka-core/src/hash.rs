@@ -51,6 +51,20 @@ struct HashInput<'a> {
     /// Appended after iteration 2 the same way: skipped while the app sets no hardening.
     #[serde(skip_serializing_if = "Security::is_default")]
     security: &'a Security,
+    /// Ports published on the host are container settings, so a change recreates the container.
+    /// Normalized to the effective bind address and sorted (their order in the spec is not
+    /// meaningful), and skipped while empty so existing instances keep their hash.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    host_ports: Vec<HashHostPort<'a>>,
+}
+
+/// One `host_ports` entry as it enters the hash: the effective address (loopback when the spec names
+/// none) instead of `Option`, so `ip = "127.0.0.1"` and an omitted `ip` hash the same.
+#[derive(Serialize)]
+struct HashHostPort<'a> {
+    ip: &'a str,
+    host: u16,
+    container: u16,
 }
 
 /// Deterministic hash of the spec + the pinned image digest (hex SHA-256).
@@ -68,6 +82,16 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
     });
     let mut volumes: Vec<&VolumeMount> = spec.volumes.iter().collect();
     volumes.sort_by(|a, b| (&a.name, &a.target).cmp(&(&b.name, &b.target)));
+    let mut host_ports: Vec<HashHostPort> = spec
+        .host_ports
+        .iter()
+        .map(|p| HashHostPort {
+            ip: p.bind_ip(),
+            host: p.host,
+            container: p.container,
+        })
+        .collect();
+    host_ports.sort_by(|a, b| (a.ip, a.host, a.container).cmp(&(b.ip, b.host, b.container)));
     let input = HashInput {
         format: HASH_FORMAT,
         image_digest,
@@ -78,6 +102,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         resources: &spec.resources,
         health_command: spec.health.command.as_ref(),
         security: &spec.security,
+        host_ports,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -242,6 +267,53 @@ env = { B = "2", A = "1" }
         s.health.attempts = 9;
         s.auto_update = false;
         assert_eq!(base, spec_hash(&s, &digest('a')));
+    }
+
+    #[test]
+    fn host_ports_are_container_settings() {
+        use crate::app::HostPort;
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        let port = |host: u16, container: u16, ip: Option<&str>| HostPort {
+            host,
+            container,
+            ip: ip.map(ToOwned::to_owned),
+        };
+        assert_eq!(base, hash(&|_| {}), "no host ports hashes as before");
+        assert_ne!(base, hash(&|s| s.host_ports.push(port(2222, 22, None))));
+        assert_ne!(
+            hash(&|s| s.host_ports.push(port(2222, 22, None))),
+            hash(&|s| s.host_ports.push(port(2222, 23, None))),
+            "the container port is part of the mapping"
+        );
+        assert_ne!(
+            hash(&|s| s.host_ports.push(port(2222, 22, None))),
+            hash(&|s| s.host_ports.push(port(2223, 22, None)))
+        );
+        // The omitted address means loopback, so spelling it out must not recreate the container.
+        assert_eq!(
+            hash(&|s| s.host_ports.push(port(2222, 22, None))),
+            hash(&|s| s.host_ports.push(port(2222, 22, Some("127.0.0.1"))))
+        );
+        assert_ne!(
+            hash(&|s| s.host_ports.push(port(2222, 22, None))),
+            hash(&|s| s.host_ports.push(port(2222, 22, Some("0.0.0.0")))),
+            "exposing the port is a different container"
+        );
+        // Order in the spec is not meaningful.
+        let a = hash(&|s| {
+            s.host_ports.push(port(2222, 22, None));
+            s.host_ports.push(port(2223, 22, Some("10.0.0.5")));
+        });
+        let b = hash(&|s| {
+            s.host_ports.push(port(2223, 22, Some("10.0.0.5")));
+            s.host_ports.push(port(2222, 22, None));
+        });
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -1,0 +1,30 @@
+---
+source: crates/weglarka-core/src/app.rs
+expression: parsed
+---
+{
+  "apps": {
+    "git": {
+      "image": "ghcr.io/x/forgejo:latest",
+      "domains": [],
+      "env": {},
+      "secrets": [],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30
+      },
+      "host_ports": [
+        {
+          "host": 2222,
+          "container": 22
+        },
+        {
+          "host": 2223,
+          "container": 22,
+          "ip": "0.0.0.0"
+        }
+      ],
+      "auto_update": true
+    }
+  }
+}

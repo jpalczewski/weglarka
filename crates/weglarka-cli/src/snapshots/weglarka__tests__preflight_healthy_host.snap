@@ -18,6 +18,7 @@ expression: render(&r)
 [ OK ] ingress.bind             172.17.0.1 is assigned to a host interface
 [ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
 [ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
+[ OK ] apps.host_ports_free     /etc/weglarka/apps.toml does not exist — no host ports published
 [ OK ] state.secrets_file       /etc/weglarka/secrets.toml has mode 0600
 
-17 ok, 0 info, 0 warn, 0 fail
+18 ok, 0 info, 0 warn, 0 fail

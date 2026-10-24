@@ -1,0 +1,14 @@
+# Publish a container port directly on the host next to the HTTPS route through the ingress (issue #34):
+# the SSH of a git server stays on a fixed host port. Add it with
+#   weglarka apps add git --spec docs/examples/host-ports.toml
+# host_ports is TCP only and bypasses the ingress completely (no TLS, no domain routing, no access log),
+# so the host firewall has to open the port. Without `ip` the port is bound to loopback (127.0.0.1) only.
+image = "ghcr.io/example/git-server:latest"
+domains = ["git.example.com"]
+port = 3000
+host_ports = [{ host = 2222, container = 22 }]
+
+# Public instead of loopback — `ip` is the host address the port is bound to:
+# host_ports = [{ host = 2222, container = 22, ip = "0.0.0.0" }]
+# Host ports below 1024 additionally need `[runtime] allow_privileged_host_ports = true` in weglarka.toml
+# and `net.ipv4.ip_unprivileged_port_start=0` on the host.

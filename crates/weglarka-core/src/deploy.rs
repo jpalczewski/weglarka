@@ -12,8 +12,8 @@ use crate::events::Event;
 use crate::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use crate::labels;
 use crate::podman::{
-    ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError, PullEvent,
-    RestartPolicy,
+    ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
+    PortMapping, PullEvent, RestartPolicy,
 };
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
 use crate::secrets::{binding_fingerprints, materialize};
@@ -303,7 +303,16 @@ impl<P: PodmanClient> Reconciler<P> {
             env: spec.env.clone(),
             networks: vec![network],
             secrets,
-            publish: vec![],
+            publish: spec
+                .host_ports
+                .iter()
+                .map(|p| PortMapping {
+                    // Validated earlier; the loopback default keeps publishing opt-in.
+                    host_ip: Some(p.bind_ip().to_owned()),
+                    host_port: p.host,
+                    container_port: p.container,
+                })
+                .collect(),
             restart: RestartPolicy::Always,
             userns_auto: true,
             mounts: vec![],

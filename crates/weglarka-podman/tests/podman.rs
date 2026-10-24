@@ -39,6 +39,34 @@ fn run_id() -> String {
     format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
 }
 
+/// A loopback host port that was free a moment ago: bind `127.0.0.1:0`, read the assigned port and
+/// release it again. Only this test publishes ports in the CI job, so the tiny TOCTOU race is
+/// acceptable — losing it fails the container start loudly instead of passing silently.
+fn free_host_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback port");
+    listener.local_addr().expect("local addr").port()
+}
+
+/// `(host ip, host port)` pairs under one container-port key of `HostConfig.PortBindings` or
+/// `NetworkSettings.Ports` (both use the same libpod inspect shape); empty when unset/null.
+fn port_bindings(ports: &serde_json::Value, container_port: &str) -> Vec<(String, String)> {
+    ports
+        .get(container_port)
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["HostIp"].as_str().unwrap_or_default().to_owned(),
+                        entry["HostPort"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Raw API call via `curl` — for things outside the client contract (network cleanup,
 /// a container with a healthcheck that `ContainerSpec` cannot describe).
 fn raw(socket: &str, method: &str, path: &str, body: Option<&str>) -> (bool, String) {
@@ -265,9 +293,11 @@ async fn full_lifecycle() {
             },
         },
     ];
+    // A fixed loopback port, so the mapping can be checked against an exact expected value.
+    let host_port = free_host_port();
     app_spec.publish = vec![PortMapping {
         host_ip: Some("127.0.0.1".into()),
-        host_port: 0,
+        host_port,
         container_port: 8080,
     }];
     let created = client.container_create(&app_spec).await.unwrap();
@@ -290,6 +320,25 @@ async fn full_lifecycle() {
     assert!(
         info.networks.contains(&net_b),
         "connected network is reported"
+    );
+    // The published mapping took effect, not just got accepted at create: inspect reports the
+    // requested loopback binding and the actual host-port assignment for the container port.
+    // This image (pause) does not listen on 8080, so there is deliberately no TCP connect check.
+    let (ok, body) = raw(&socket, "GET", &format!("/containers/{app}/json"), None);
+    assert!(ok, "raw inspect: {body}");
+    let inspected: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected_binding = vec![("127.0.0.1".to_owned(), host_port.to_string())];
+    assert_eq!(
+        port_bindings(&inspected["HostConfig"]["PortBindings"], "8080/tcp"),
+        expected_binding,
+        "HostConfig.PortBindings must publish 127.0.0.1:{host_port} -> 8080/tcp: {}",
+        inspected["HostConfig"],
+    );
+    assert_eq!(
+        port_bindings(&inspected["NetworkSettings"]["Ports"], "8080/tcp"),
+        expected_binding,
+        "NetworkSettings.Ports must report the applied mapping: {}",
+        inspected["NetworkSettings"],
     );
     assert_eq!(info.health, None, "obraz bez healthchecka");
     assert!(matches!(

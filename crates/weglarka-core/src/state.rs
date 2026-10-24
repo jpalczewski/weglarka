@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppSpec, AppsFile, Digest, InstanceName, valid_volume_name};
+use crate::app::{AppSpec, AppsFile, Digest, HostPort, InstanceName, valid_volume_name};
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
 
@@ -248,6 +248,37 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if http.timeout_secs == 0 {
             return Err(format!("{name}: health.http.timeout_secs must be > 0"));
         }
+    }
+    validate_host_ports(name, &spec.host_ports)?;
+    Ok(())
+}
+
+/// Rules an app can break on its own for ports published directly on the host. The host-dependent
+/// ones (privileged ports, conflicts between apps, the ingress bind) are in
+/// [`crate::host_ports::validate`], which needs `weglarka.toml`.
+fn validate_host_ports(name: &InstanceName, ports: &[HostPort]) -> Result<(), String> {
+    let mut seen: Vec<(u16, std::net::IpAddr)> = Vec::new();
+    for entry in ports {
+        if entry.host == 0 || entry.container == 0 {
+            return Err(format!(
+                "{name}: host_ports need non-zero host and container ports"
+            ));
+        }
+        let bind = entry.bind_ip().parse::<std::net::IpAddr>().map_err(|_| {
+            format!(
+                "{name}: host_ports bind address {:?} is not an IP literal",
+                entry.bind_ip()
+            )
+        })?;
+        if seen.iter().any(|(port, other)| {
+            *port == entry.host && crate::host_ports::bind_overlaps(bind, *other)
+        }) {
+            return Err(format!(
+                "{name}: host port {} is published twice on the same address",
+                entry.host
+            ));
+        }
+        seen.push((entry.host, bind));
     }
     Ok(())
 }
@@ -492,6 +523,36 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(load_apps(&p), Err(StateError::Invalid { .. })));
+        }
+    }
+
+    #[test]
+    fn host_ports_are_validated_per_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("apps.toml");
+        let check = |extra: &str| {
+            fs::write(&p, format!("[apps.a]\nimage = \"x:1\"\n{extra}\n")).unwrap();
+            load_apps(&p).is_ok()
+        };
+        assert!(check("host_ports = [{ host = 2222, container = 22 }]"));
+        assert!(check(
+            "host_ports = [{ host = 2222, container = 22, ip = \"0.0.0.0\" }]"
+        ));
+        // The same host port on two different, specific addresses is two distinct sockets.
+        assert!(check(
+            "host_ports = [\
+             { host = 2222, container = 22, ip = \"10.0.0.5\" }, \
+             { host = 2222, container = 23, ip = \"10.0.0.6\" }]"
+        ));
+        for bad in [
+            "host_ports = [{ host = 0, container = 22 }]",
+            "host_ports = [{ host = 2222, container = 0 }]",
+            "host_ports = [{ host = 2222, container = 22, ip = \"nope\" }]",
+            "host_ports = [{ host = 2222, container = 22 }, { host = 2222, container = 22 }]",
+            "host_ports = [{ host = 2222, container = 22 }, \
+             { host = 2222, container = 23, ip = \"0.0.0.0\" }]",
+        ] {
+            assert!(!check(bad), "{bad}");
         }
     }
 

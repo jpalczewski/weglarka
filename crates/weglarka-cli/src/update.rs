@@ -518,6 +518,25 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn host_port_flag_appends_and_none_clears() {
+        let s = apply_flags(spec(), &args(&["--host-port", "2222:22"])).unwrap();
+        assert_eq!(s.host_ports.len(), 1);
+        assert_eq!(
+            (s.host_ports[0].host, s.host_ports[0].container),
+            (2222, 22)
+        );
+        let s = apply_flags(s, &args(&["--host-port", "none"])).unwrap();
+        assert!(s.host_ports.is_empty());
+        // Same rules as the other spec flags: incompatible with --spec.
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        assert!(W::try_parse_from(["w", "ntfy", "--host-port", "2222:22", "--spec", "f"]).is_err());
+    }
+
+    #[test]
     fn removing_something_absent_is_a_usage_error() {
         for flags in [
             ["--remove-domain", "nope.example.eu"],

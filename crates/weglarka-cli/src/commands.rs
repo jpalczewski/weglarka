@@ -170,6 +170,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         secrets,
         health: HealthGate::default(),
         volumes: vec![],
+        host_ports: Vec::new(),
         resources: Default::default(),
         security: Default::default(),
         auto_update: !a.no_auto_update,

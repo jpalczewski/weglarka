@@ -5,7 +5,8 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
 {
   "runtime": {
     "user": "weglarka",
-    "reconcile_interval_secs": 60
+    "reconcile_interval_secs": 60,
+    "allow_privileged_host_ports": false
   },
   "ingress": {
     "mode": "behind",

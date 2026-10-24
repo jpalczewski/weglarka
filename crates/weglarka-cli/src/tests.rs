@@ -474,6 +474,84 @@ fn bind_free_cases() {
     assert_eq!(status_of(&h, id), Warn);
 }
 
+/// A healthy host with `apps.toml` at the state path derived from [`CONFIG`].
+fn host_ports_host(apps: &str) -> FakeHost {
+    FakeHost::healthy().file("/etc/weglarka/apps.toml", apps)
+}
+
+#[test]
+fn host_ports_free_cases() {
+    use crate::preflight::testing::PROC_NET_TCP_HEADER as H;
+    use weglarka_api::CheckStatus::*;
+    let id = "apps.host_ports_free";
+    // No apps.toml: nothing to publish, nothing to check.
+    assert_eq!(status_of(&FakeHost::healthy(), id), Ok);
+    // apps.toml without host_ports.
+    assert_eq!(
+        status_of(&host_ports_host("[apps.a]\nimage = \"i\"\n"), id),
+        Ok
+    );
+    let git = "[apps.git]\nimage = \"i\"\nhost_ports = [{ host = 2222, container = 22 }]\n";
+    assert_eq!(status_of(&host_ports_host(git), id), Ok, "free port");
+    // The runtime user's own socket (rootlessport of a running app) is not a collision.
+    let ours = format!("{H}{}", tcp_line("0100007F", 2222, 1001));
+    assert_eq!(
+        status_of(&host_ports_host(git).file("/proc/net/tcp", &ours), id),
+        Ok
+    );
+    // Someone else holds the wildcard address.
+    let wildcard = format!("{H}{}", tcp_line("00000000", 2222, 0));
+    assert_eq!(
+        status_of(&host_ports_host(git).file("/proc/net/tcp", &wildcard), id),
+        Fail
+    );
+    // ... or the loopback address itself.
+    let loopback = format!("{H}{}", tcp_line("0100007F", 2222, 4242));
+    assert_eq!(
+        status_of(&host_ports_host(git).file("/proc/net/tcp", &loopback), id),
+        Fail
+    );
+    // A different specific address is a different socket.
+    let other_ip = format!("{H}{}", tcp_line("010011AC", 2222, 0));
+    assert_eq!(
+        status_of(&host_ports_host(git).file("/proc/net/tcp", &other_ip), id),
+        Ok
+    );
+    // Privileged port without the explicit host opt-in.
+    let ssh = "[apps.git]\nimage = \"i\"\nhost_ports = [{ host = 22, container = 22 }]\n";
+    assert_eq!(status_of(&host_ports_host(ssh), id), Fail);
+    let allowed = CONFIG.replace(
+        "user = \"weglarka\"",
+        "user = \"weglarka\"\nallow_privileged_host_ports = true",
+    );
+    let r = report(&host_ports_host(ssh), Some(&allowed));
+    assert_eq!(
+        r.checks
+            .iter()
+            .find(|c| c.id == id)
+            .expect("check present")
+            .status,
+        Ok
+    );
+    // Two apps publishing the same host socket.
+    let conflict = "[apps.a]\nimage = \"i\"\nhost_ports = [{ host = 2222, container = 22 }]\n\
+                    [apps.b]\nimage = \"j\"\nhost_ports = [{ host = 2222, container = 22 }]\n";
+    assert_eq!(status_of(&host_ports_host(conflict), id), Fail);
+    // An IPv6 bind cannot be matched against /proc/net/tcp; it is reported as skipped, not failed.
+    let v6 =
+        "[apps.git]\nimage = \"i\"\nhost_ports = [{ host = 2222, container = 22, ip = \"::1\" }]\n";
+    let r = report(&host_ports_host(v6), Some(CONFIG));
+    let check = r.checks.iter().find(|c| c.id == id).expect("check present");
+    assert_eq!(check.status, Ok);
+    assert!(check.message.contains("IPv6"), "{}", check.message);
+    // Unparseable apps.toml.
+    assert_eq!(status_of(&host_ports_host("[apps.a]\nimage = "), id), Fail);
+    // /proc/net/tcp unavailable.
+    let mut h = host_ports_host(git);
+    h.files.remove(&PathBuf::from("/proc/net/tcp"));
+    assert_eq!(status_of(&h, id), Warn);
+}
+
 const POLICY: &str = r#"{"allowed_domains":["nz.example.eu","weglarka.example.eu"]}"#;
 
 fn sync_host(unit_state: &str, apps: Option<&str>) -> FakeHost {
@@ -610,6 +688,47 @@ fn add_no_start_builds_a_provision_only_spec() {
     assert!(running.start);
     let body = serde_json::to_value(running).unwrap();
     assert!(body.get("start").is_none(), "{body}");
+}
+
+#[test]
+fn add_accepts_host_ports() {
+    let spec = build_spec(&add_args(&[
+        "--host-port",
+        "2222:22",
+        "--host-port",
+        "0.0.0.0:8088:80",
+    ]))
+    .unwrap();
+    let ports: Vec<_> = spec
+        .host_ports
+        .iter()
+        .map(|p| (p.host, p.container, p.bind_ip().to_owned()))
+        .collect();
+    assert_eq!(
+        ports,
+        [
+            (2222, 22, "127.0.0.1".to_owned()),
+            (8088, 80, "0.0.0.0".to_owned())
+        ]
+    );
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(
+        Add::try_parse_from([
+            "add",
+            "ntfy",
+            "img",
+            "--host-port",
+            "2222:22",
+            "--spec",
+            "f"
+        ])
+        .is_err()
+    );
 }
 
 #[test]

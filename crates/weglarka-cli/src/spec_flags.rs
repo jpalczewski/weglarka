@@ -1,8 +1,11 @@
-//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes and hardening.
-//! Before these existed, they could only be set through `--spec <file.toml>`.
+//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes, hardening and
+//! ports published directly on the host. Before these existed, they could only be set through
+//! `--spec <file.toml>`.
 
 use clap::Args;
-use weglarka_core::app::{AppSpec, CpuLimit, MemoryLimit, VolumeMount, valid_volume_name};
+use weglarka_core::app::{
+    AppSpec, CpuLimit, HostPort, MemoryLimit, VolumeMount, valid_volume_name,
+};
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
 #[derive(Debug, Clone, PartialEq)]
@@ -11,7 +14,15 @@ pub enum Limit<T> {
     Unset,
 }
 
-/// Limits and volumes; flattened into `AddArgs` and `UpdateArgs`.
+/// Value of [`SpecFlags::host_ports`]: a port entry, or `none` to clear the list (the same
+/// convention as the limits and the list flags).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostPortFlag {
+    Set(HostPort),
+    Clear,
+}
+
+/// Limits, volumes, hardening and host ports; flattened into `AddArgs` and `UpdateArgs`.
 #[derive(Debug, Default, Args)]
 pub struct SpecFlags {
     /// Memory limit, e.g. 128m or 1g (`none` removes it). Default: no limit.
@@ -42,6 +53,10 @@ pub struct SpecFlags {
     /// Capability to add back after --cap-drop (repeatable; `none` clears the list).
     #[arg(long, value_name = "CAP|none", conflicts_with = "spec")]
     pub cap_add: Vec<String>,
+    /// Publish a container port directly on the host: `[IP:]HOST:CONTAINER` (repeatable; the bind
+    /// address defaults to 127.0.0.1, `none` clears the list).
+    #[arg(long = "host-port", value_name = "IP:HOST:CONTAINER", value_parser = parse_host_port, conflicts_with = "spec")]
+    pub host_ports: Vec<HostPortFlag>,
     /// no-new-privileges (setuid and file capabilities cannot raise privileges).
     #[arg(long, value_name = "true|false", conflicts_with = "spec")]
     pub no_new_privileges: Option<bool>,
@@ -58,6 +73,7 @@ impl SpecFlags {
             && self.tmpfs.is_empty()
             && self.cap_drop.is_empty()
             && self.cap_add.is_empty()
+            && self.host_ports.is_empty()
             && self.no_new_privileges.is_none()
     }
 
@@ -88,6 +104,7 @@ impl SpecFlags {
         extend_list(&mut sec.tmpfs, &self.tmpfs);
         extend_list(&mut sec.cap_drop, &upper(&self.cap_drop));
         extend_list(&mut sec.cap_add, &upper(&self.cap_add));
+        apply_host_ports(&mut spec.host_ports, &self.host_ports);
     }
 }
 
@@ -113,6 +130,27 @@ fn upper(caps: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// `none` clears the list; entries are appended once each. "Once" means the same effective socket
+/// (`bind_ip()` resolves the loopback default), so `2222:22` does not duplicate an explicit
+/// `127.0.0.1:2222:22`.
+fn apply_host_ports(spec: &mut Vec<HostPort>, flags: &[HostPortFlag]) {
+    for flag in flags {
+        match flag {
+            HostPortFlag::Clear => spec.clear(),
+            HostPortFlag::Set(port) => {
+                let duplicate = spec.iter().any(|p| {
+                    p.host == port.host
+                        && p.container == port.container
+                        && p.bind_ip() == port.bind_ip()
+                });
+                if !duplicate {
+                    spec.push(port.clone());
+                }
+            }
+        }
+    }
 }
 
 fn apply<T: Clone>(slot: &mut Option<T>, flag: &Option<Limit<T>>) {
@@ -176,6 +214,53 @@ fn parse_volume(s: &str) -> Result<VolumeMount, String> {
     })
 }
 
+/// `[IP:]HOST:CONTAINER`, or `none` to clear the list. The host part is parsed from the right, so
+/// unbracketed IPv6 literals also work; the spec stores a bare IP (no brackets).
+fn parse_host_port(s: &str) -> Result<HostPortFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(HostPortFlag::Clear);
+    }
+    let syntax = || format!("invalid host port {s:?}: expected [IP:]HOST:CONTAINER");
+    let (rest, container) = s.rsplit_once(':').ok_or_else(syntax)?;
+    let container = port_number(container, s)?;
+    let (ip, host) = match rest.rsplit_once(':') {
+        Some((ip, host)) => (Some(ip), host),
+        None => (None, rest),
+    };
+    let host = port_number(host, s)?;
+    let ip = match ip {
+        None => None,
+        Some(raw) => {
+            let bare = raw
+                .strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+                .unwrap_or(raw);
+            let parsed: std::net::IpAddr = bare
+                .parse()
+                .map_err(|_| format!("invalid host port {s:?}: {raw:?} is not an IP literal"))?;
+            Some(parsed.to_string())
+        }
+    };
+    Ok(HostPortFlag::Set(HostPort {
+        host,
+        container,
+        ip,
+    }))
+}
+
+/// A non-zero TCP port from the flag value.
+fn port_number(raw: &str, s: &str) -> Result<u16, String> {
+    match raw.parse::<u16>() {
+        Ok(0) => Err(format!(
+            "invalid host port {s:?}: host and container ports must be non-zero"
+        )),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!(
+            "invalid host port {s:?}: {raw:?} is not a port number"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +286,64 @@ mod tests {
         assert!(parse_volume("Data=/data").is_err());
         assert!(parse_volume("data=relative").is_err());
         assert!(parse_volume("/data").is_err());
+    }
+
+    #[test]
+    fn parses_host_ports() {
+        let set = |s: &str| match parse_host_port(s).unwrap() {
+            HostPortFlag::Set(p) => p,
+            HostPortFlag::Clear => panic!("{s}: expected an entry"),
+        };
+        let p = set("2222:22");
+        assert_eq!((p.host, p.container, p.ip.as_deref()), (2222, 22, None));
+        let p = set("0.0.0.0:2222:22");
+        assert_eq!(p.ip.as_deref(), Some("0.0.0.0"));
+        let p = set("[::1]:2222:22");
+        assert_eq!(p.ip.as_deref(), Some("::1"));
+        let p = set("::1:2222:22");
+        assert_eq!(p.ip.as_deref(), Some("::1"));
+        assert_eq!(parse_host_port("none").unwrap(), HostPortFlag::Clear);
+        assert_eq!(parse_host_port("NONE").unwrap(), HostPortFlag::Clear);
+        // zero ports, garbage and a bogus address are rejected
+        assert!(parse_host_port("2222:0").is_err());
+        assert!(parse_host_port("0:22").is_err());
+        assert!(parse_host_port("garbage").is_err());
+        assert!(parse_host_port("2222:http").is_err());
+        assert!(parse_host_port("1:2:3:4").is_err());
+        assert!(parse_host_port("99999:22").is_err());
+    }
+
+    #[test]
+    fn apply_appends_dedupes_and_clears_host_ports() {
+        let mut spec: AppSpec =
+            toml::from_str("image = \"i\"\nhost_ports = [{ host = 2222, container = 22 }]\n")
+                .unwrap();
+        SpecFlags {
+            host_ports: vec![
+                parse_host_port("127.0.0.1:2222:22").unwrap(),
+                parse_host_port("2223:22").unwrap(),
+            ],
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert_eq!(
+            spec.host_ports.len(),
+            2,
+            "the explicit loopback entry duplicates the default one"
+        );
+        assert_eq!(spec.host_ports[1].host, 2223);
+        let only_host_port = SpecFlags {
+            host_ports: vec![parse_host_port("2223:22").unwrap()],
+            ..SpecFlags::default()
+        };
+        assert!(!only_host_port.is_empty());
+
+        SpecFlags {
+            host_ports: vec![parse_host_port("none").unwrap()],
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert!(spec.host_ports.is_empty());
     }
 
     #[test]
