@@ -57,6 +57,18 @@ pub enum Event {
     },
     /// Webhook rejected as a duplicate (`delivery_id` already seen).
     WebhookDuplicate { delivery_id: String },
+    /// The container keeps restarting: libpod's restart counter grew by `restarts` inside the monitor
+    /// window (`[monitor] crash_loop_restarts`, `docs/decisions/0022-crash-loop-detection.md`).
+    CrashLooping {
+        instance: InstanceName,
+        restarts: u32,
+    },
+    /// The container healthcheck has been failing for several consecutive observations
+    /// (`[monitor] unhealthy_observations`).
+    Unhealthy { instance: InstanceName },
+    /// A crashing or unhealthy instance is running normally again: no new restarts for a full window, or
+    /// the healthcheck passes again.
+    Recovered { instance: InstanceName },
 }
 
 /// How serious an event is. Notification channels route on it (`min_severity`) and the daemon uses it
@@ -96,15 +108,18 @@ impl Event {
     /// Severity used for notification routing and for the `tracing` level.
     pub fn severity(&self) -> Severity {
         match self {
-            Self::RollbackFailed { .. } => Severity::Critical,
-            Self::DeployFailed { .. } | Self::RolledBack { .. } => Severity::Warning,
+            Self::RollbackFailed { .. } | Self::CrashLooping { .. } => Severity::Critical,
+            Self::DeployFailed { .. } | Self::RolledBack { .. } | Self::Unhealthy { .. } => {
+                Severity::Warning
+            }
             Self::Pruned { .. }
             | Self::WaitingForDependency { .. }
             | Self::WebhookDuplicate { .. } => Severity::Debug,
             Self::DeployOk { .. }
             | Self::Provisioned { .. }
             | Self::Recreated { .. }
-            | Self::WaitingForSecret { .. } => Severity::Info,
+            | Self::WaitingForSecret { .. }
+            | Self::Recovered { .. } => Severity::Info,
         }
     }
 }
@@ -229,6 +244,25 @@ mod tests {
                     delivery_id: "d".into(),
                 },
                 Severity::Debug,
+            ),
+            (
+                Event::CrashLooping {
+                    instance: name("a"),
+                    restarts: 4,
+                },
+                Severity::Critical,
+            ),
+            (
+                Event::Unhealthy {
+                    instance: name("a"),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::Recovered {
+                    instance: name("a"),
+                },
+                Severity::Info,
             ),
         ];
         for (event, expected) in cases {

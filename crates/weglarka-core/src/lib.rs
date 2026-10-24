@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod config;
+pub mod crash;
 pub mod events;
 pub mod hash;
 pub mod host_ports;

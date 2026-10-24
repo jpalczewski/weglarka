@@ -122,5 +122,38 @@ expression: rendered
     "tags": [
       "recycle"
     ]
+  },
+  {
+    "severity": "critical",
+    "key": "crash:ntfy",
+    "title": "crash loop: ntfy",
+    "body": "4 restarts; check the logs with `weglarka apps show ntfy`",
+    "priority": 5,
+    "tags": [
+      "rotating_light"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "warning",
+    "key": "unhealthy:ntfy",
+    "title": "unhealthy: ntfy",
+    "body": "the container healthcheck is failing",
+    "priority": 4,
+    "tags": [
+      "warning"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "info",
+    "key": "recovered:ntfy",
+    "title": "running again: ntfy",
+    "body": "no new restarts and the healthcheck passes",
+    "priority": 3,
+    "tags": [
+      "white_check_mark"
+    ],
+    "click": "https://nz.example.com"
   }
 ]

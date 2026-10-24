@@ -18,7 +18,11 @@ use weglarka_podman::LibpodClient;
 
 /// A small image that runs forever (no shell, ~300 KB) and has `/pause -v` for the healthcheck.
 const IMAGE: &str = "registry.k8s.io/pause:3.9";
+/// Has a shell, so the test can make a container exit immediately (crash-loop detection).
+const BUSYBOX: &str = "docker.io/library/busybox:latest";
 const STEP: Duration = Duration::from_secs(60);
+/// A crashed container is restarted quickly (the first restart has a short backoff).
+const RESTART_DEADLINE: Duration = Duration::from_secs(30);
 
 fn socket() -> Option<String> {
     let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
@@ -591,4 +595,48 @@ async fn command_reaches_libpod_as_arguments_to_the_image_entrypoint() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(state["ExitCode"], 0, "{state}");
+}
+
+/// libpod reports `RestartCount` in `GET /containers/{name}/json`; `weglarka-core`'s crash-loop detector
+/// reads exactly that field. A fixture cannot prove the field name — a missing field silently reads 0 —
+/// so this test makes a real container crash and waits for the counter to move.
+#[tokio::test]
+async fn restart_count_is_reported_and_grows_after_a_crash() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-restarts-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.image = BUSYBOX.into();
+    // Exits immediately, so conmon restarts it (`restart = always`).
+    s.command = vec!["sh".into(), "-c".into(), "exit 1".into()];
+    s.restart = RestartPolicy::Always;
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+    let deadline = tokio::time::Instant::now() + RESTART_DEADLINE;
+    let info = loop {
+        let info = client.container_inspect(&name).await.unwrap();
+        if info.restarts >= 1 {
+            break info;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "libpod never reported a restart: {info:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(info.restarts >= 1, "{info:?}");
 }

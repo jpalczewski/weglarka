@@ -18,6 +18,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6f. Komenda i argumenty](#6f-komenda-i-argumenty-kontenera-command) ·
 [6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
 [6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
+[6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -925,8 +926,9 @@ Węglarkę samą (apka `ntfy`), więc powiadomienia muszą przetrwać deploy ntf
 
 Co przychodzi: `deploy ok`, `deploy failed`, `rolled back`, `ROLLBACK FAILED` (krytyczne),
 `provisioned`, `recreated`, `waiting for secrets` (info) oraz — gdy podniesiesz `min_severity` do `debug` —
-`sprzątanie kontenera`, `oczekiwanie na zależności` i `duplikat webhooka`. Wykrywanie zapętlających się
-kontenerów to osobne zadanie (#112), a fallback mailowy — #113.
+`sprzątanie kontenera`, `oczekiwanie na zależności` i `duplikat webhooka`. Pętle restartów i failing
+healthchecki opisuje [6i](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) i
+[0022](decisions/0022-crash-loop-detection.md); fallback mailowy to #113.
 
 **1. Temat i token w ntfy.** Utwórz temat (np. `weglarka`) i — jeśli serwer nie jest publiczny — token dostępu
 w panelu ntfy. Token trzymaj w pliku 0600 obok konfiguracji; **nie wpisuj go do `weglarka.toml`**:
@@ -978,6 +980,46 @@ Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, 
 **5. Rollback.** `weglarka.toml` ma `deny_unknown_fields`, więc **starszy demon nie wystartuje** z sekcją
 `[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
 nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
+
+## 6i. Wykrywanie awarii apek (crash loop, unhealthy)
+
+Apka, która w kółko pada, nie jest dziś widoczna: każdy kontener chodzi z `restart = always`, więc Podman
+podnosi go, zanim następne przejście reconcile zauważy cokolwiek złego — a bramka zdrowia sprawdza healthcheck
+tylko przy deployu. Pętla reconcile wykrywa teraz dwie rzeczy i wysyła je jako **zdarzenia silnika**: przy
+skonfigurowanych powiadomieniach trafiają do ntfy (patrz [6h](#6h-powiadomienia-ntfy)), a bez nich zostają
+w logu demona. Decyzja i odrzucone alternatywy: [0022](decisions/0022-crash-loop-detection.md). Wycinek
+konfiguracji: [`docs/examples/monitor.toml`](examples/monitor.toml).
+
+**Co powstaje:**
+
+- `crash loop: <apka>` (krytyczne) — liczba **nowych** restartów w oknie osiągnęła próg. Licznik to
+  `RestartCount` z libpoda; odtworzenie kontenera (deploy, recreate, rollback) zaczyna liczyć od zera,
+  więc nowa wersja nie dziedziczy alarmu po starej.
+- `unhealthy: <apka>` (ostrzeżenie) — healthcheck kontenera nie przechodzi od `unhealthy_observations`
+  kolejnych obserwacji. Kontener bez healthchecku nigdy nie jest tak zgłaszany.
+- `running again: <apka>` (info) — apka wróciła do zdrowia: całe okno bez nowego restartu albo healthcheck
+  znów przechodzi. Jedno zdarzenie na powrót, nie na każdą obserwację.
+
+**Konfiguracja** (sekcja opcjonalna; domyślne wartości działają bez niej):
+
+```toml
+[monitor]
+crash_loop_restarts = 3        # ile nowych restartów w oknie = pętla; 0 wyłącza detekcję
+crash_loop_window_secs = 600   # okno licznika i okres ciszy, po którym uznajemy powrót do zdrowia
+unhealthy_observations = 2     # ile kolejnych obserwacji z failing healthcheck = unhealthy; 0 wyłącza
+```
+
+- **Bez dodatkowego obciążenia:** detekcja korzysta z listy kontenerów, którą reconcile i tak pobiera
+  (`container_list` robi inspect każdego kontenera), i nie zapisuje nic na dysk. Wszystko dzieje się w pamięci
+  i pod mutexem silnika, więc obserwacja nie nakłada się na deploy.
+- **Restart demona:** stan obserwacji jest pamięciowy. Pierwsza obserwacja po starcie tylko ustala punkt
+  odniesienia, więc trwająca pętla zaalarmuje po kolejnych `crash_loop_restarts` restartach — nie od razu.
+- **Appki `start = false`, czekające na sekrety i przed pierwszym deployem:** nie mają kontenera, więc nie
+  generują zdarzeń. Kontenery spoza `apps.toml` (w trakcie sprzątania) też są pomijane.
+- **Powtórzenia:** detektor wysyła jedno zdarzenie na pętlę, a nie na każdy restart; okna dedup powiadomień
+  (sekcja 6h) nadal zbiorą ewentualne podsumowanie, gdy apka migocze między awarią a powrotem.
+- **Rollback:** `[monitor]` to nowa sekcja w `weglarka.toml`, więc starszy demon jej nie odczyta — przed
+  downgradem usuń ją razem z `[notify]` (patrz [7](#7-weryfikacja-i-rollback)).
 
 ## 7. Weryfikacja i rollback
 

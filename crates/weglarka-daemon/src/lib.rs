@@ -157,7 +157,10 @@ pub async fn start<P: PodmanClient + 'static>(
         paths.state.clone(),
         ReconcilerOptions::default(),
     )
-    .with_http_prober(Arc::new(health_probe::NginxProber::default_target()));
+    .with_http_prober(Arc::new(health_probe::NginxProber::default_target()))
+    // Crash-loop / unhealthy thresholds (`[monitor]`): the reconcile pass observes them and emits
+    // events, so the notifications above deliver them and the log gets them even without a channel.
+    .with_monitor(weglarka_core::crash::Policy::from_config(&host.monitor));
     if let Some(notifier) = &notifier {
         // The engine emits into the durable pipeline instead of only into the log.
         reconciler = reconciler.with_events(notifier.sink());

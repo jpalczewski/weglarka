@@ -1,6 +1,6 @@
 # 0021 — Notifications: engine events → severity → dedup → durable outbox → ntfy
 
-Status: accepted (2026-10-24, issue #38). Crash-loop detection: issue #112. Mail fallback: issue #113.
+Status: accepted (2026-10-24, issue #38). Crash-loop detection: ADR 0022 (issue #112). Mail fallback: issue #113.
 
 ## Problem
 
@@ -120,8 +120,8 @@ name in the outbox; `Severity` ordering is `debug < info < warning < critical`.
   runs the whole daemon on `FakePodman` against a mock ntfy: status/test endpoints, one publish per
   deploy, an undeliverable deploy kept in the outbox with `last_error`. The CLI tests cover the two
   commands and the status rendering.
-- Follow-ups: crash-loop/unhealthy detection from libpod `RestartCount` (#112) and the SMTP mail
-  fallback (#113).
+- Follow-ups: the SMTP mail fallback (#113). Crash-loop/unhealthy detection shipped separately
+  (`docs/decisions/0022-crash-loop-detection.md`) and emits through the same event sink.
 
 ## Rejected alternatives
 

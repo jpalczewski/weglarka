@@ -22,6 +22,9 @@ pub struct HostConfig {
     /// Notifications; absent = off (the events only reach the daemon log).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<NotifyConfig>,
+    /// Failure detection (crash loops, failing healthchecks); defaults apply when absent.
+    #[serde(default)]
+    pub monitor: MonitorConfig,
 }
 
 impl HostConfig {
@@ -195,6 +198,49 @@ pub struct NtfyConfig {
     pub min_severity: Severity,
 }
 
+/// `[monitor]`: which runtime observations become engine events (crash loops, failing healthchecks).
+///
+/// Detection is independent of notification delivery: with no `[notify]` channel the events still reach
+/// the daemon log, so these thresholds are host policy, not channel policy. `0` disables a detector.
+/// See `docs/decisions/0022-crash-loop-detection.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorConfig {
+    /// New container restarts inside the window that make it a crash loop.
+    #[serde(default = "MonitorConfig::default_crash_loop_restarts")]
+    pub crash_loop_restarts: u32,
+    /// Window for the restart counter (seconds); also the quiet period that counts as recovery.
+    #[serde(default = "MonitorConfig::default_crash_loop_window_secs")]
+    pub crash_loop_window_secs: u64,
+    /// Consecutive observations with a failing healthcheck before the app is reported unhealthy.
+    #[serde(default = "MonitorConfig::default_unhealthy_observations")]
+    pub unhealthy_observations: u32,
+}
+
+impl MonitorConfig {
+    fn default_crash_loop_restarts() -> u32 {
+        3
+    }
+
+    fn default_crash_loop_window_secs() -> u64 {
+        600
+    }
+
+    fn default_unhealthy_observations() -> u32 {
+        2
+    }
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            crash_loop_restarts: Self::default_crash_loop_restarts(),
+            crash_loop_window_secs: Self::default_crash_loop_window_secs(),
+            unhealthy_observations: Self::default_unhealthy_observations(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
@@ -366,5 +412,40 @@ kind = "systemd"
         );
         let bad = format!("{src}\nbogus = true\n");
         assert!(HostConfig::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn monitor_defaults_apply_when_the_section_is_absent() {
+        let monitor = HostConfig::from_toml_str(SAMPLE).unwrap().monitor;
+        assert_eq!(monitor.crash_loop_restarts, 3);
+        assert_eq!(monitor.crash_loop_window_secs, 600);
+        assert_eq!(monitor.unhealthy_observations, 2);
+        assert_eq!(monitor, MonitorConfig::default());
+    }
+
+    #[test]
+    fn monitor_section_parses_and_rejects_unknown_fields() {
+        let src = format!(
+            "{SAMPLE}\n[monitor]\ncrash_loop_restarts = 5\n\
+             crash_loop_window_secs = 120\nunhealthy_observations = 0\n"
+        );
+        let monitor = HostConfig::from_toml_str(&src).unwrap().monitor;
+        assert_eq!(monitor.crash_loop_restarts, 5);
+        assert_eq!(monitor.crash_loop_window_secs, 120);
+        assert_eq!(monitor.unhealthy_observations, 0, "0 disables the check");
+        let bad = format!("{src}\nbogus = true\n");
+        assert!(HostConfig::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn the_monitor_example_parses() {
+        // `docs/examples/monitor.toml` is a `weglarka.toml` excerpt: keep it valid.
+        let example = include_str!("../../../docs/examples/monitor.toml");
+        let monitor = HostConfig::from_toml_str(&format!("{SAMPLE}\n{example}"))
+            .unwrap()
+            .monitor;
+        assert_eq!(monitor.crash_loop_restarts, 3);
+        assert_eq!(monitor.crash_loop_window_secs, 600);
+        assert_eq!(monitor.unhealthy_observations, 2);
     }
 }

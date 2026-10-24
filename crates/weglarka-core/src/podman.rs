@@ -196,6 +196,9 @@ pub struct ContainerInfo {
     pub exit_code: Option<i32>,
     /// `None` — the image has no healthcheck.
     pub health: Option<HealthStatus>,
+    /// How many times Podman restarted the container (libpod `RestartCount`); `0` until the first restart.
+    /// Crash-loop detection compares it across reconcile passes (`crate::crash`).
+    pub restarts: u32,
     /// Names of the networks the container is currently attached to (sorted).
     pub networks: Vec<String>,
 }
