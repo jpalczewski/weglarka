@@ -28,3 +28,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0019](0019-container-command.md) | Per-app container command: arguments to the image entrypoint (issue #79) |
 | [0020](0020-image-retention.md) | Image retention: keep the current and previous image, prune the rest (issue #40) |
 | [0021](0021-notifications.md) | Notifications: engine events → severity → dedup → durable outbox → ntfy |
+| [0022](0022-config-root-mounts.md) | Host config mounts (`config_root`) and app reload |
