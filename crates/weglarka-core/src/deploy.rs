@@ -528,8 +528,14 @@ impl<P: PodmanClient> Reconciler<P> {
         let (Some(prober), Some(host)) = (&self.http_prober, spec.domains.first()) else {
             return Err("http probe needs an HTTP prober and a domain".into());
         };
+        // The probe goes through nginx, which routes by `Host` and path prefix (ADR 0031): without the
+        // app's prefix a shared domain would answer from another instance (or the catch-all).
+        let mut probe = probe.clone();
+        if let Some(prefix) = spec.paths.first().filter(|p| p.as_str() != "/") {
+            probe.path = format!("{prefix}{}", probe.path);
+        }
         prober
-            .probe(host, probe)
+            .probe(host, &probe)
             .await
             .map_err(|e| format!("http probe: {e}"))
     }

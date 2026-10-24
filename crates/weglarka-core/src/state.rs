@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -66,6 +66,14 @@ fn shared_networks_v4(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v4 → v5: path-prefix routing (issue #130, ADR 0031). `AppSpec::paths` and
+/// `AppIngress::strip_prefix` are optional and default to empty/false, so a v4 document needs no data
+/// transformation — the marker records that the file may carry them. A no-op that must accept a
+/// hand-edited file which already has them.
+fn path_prefix_routing_v5(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -73,6 +81,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     host_config_mounts_v2,
     shared_volume_groups_v3,
     shared_networks_v4,
+    path_prefix_routing_v5,
 ];
 
 const _: () = assert!(
@@ -275,7 +284,7 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         }
     }
     validate_depends_on(name, spec)?;
-    validate_ingress(name, &spec.ingress)?;
+    validate_ingress(name, spec)?;
     validate_iteration2(name, spec)
 }
 
@@ -295,23 +304,38 @@ fn validate_depends_on(name: &InstanceName, spec: &AppSpec) -> Result<(), String
 }
 
 /// Ingress options are rendered into `nginx.conf` verbatim, so they are checked here rather than in the
-/// generator. A timeout without `streaming` would be a silent no-op, hence an error.
-fn validate_ingress(name: &InstanceName, ingress: &crate::app::AppIngress) -> Result<(), String> {
+/// generator. A timeout without `streaming` and a `strip_prefix` without a real prefix would be silent
+/// no-ops, hence errors. Cross-app overlap of `paths` is the ingress plan's job (needs all apps).
+fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     use crate::app::AppIngress;
+    let ingress = &spec.ingress;
     if !ingress.streaming {
-        return if ingress.is_default() {
-            Ok(())
-        } else {
-            Err(format!(
+        if ingress.stream_timeout_secs != AppIngress::DEFAULT_STREAM_TIMEOUT_SECS {
+            return Err(format!(
                 "{name}: ingress.stream_timeout_secs requires ingress.streaming = true"
-            ))
-        };
-    }
-    if !(1..=AppIngress::MAX_STREAM_TIMEOUT_SECS).contains(&ingress.stream_timeout_secs) {
+            ));
+        }
+    } else if !(1..=AppIngress::MAX_STREAM_TIMEOUT_SECS).contains(&ingress.stream_timeout_secs) {
         return Err(format!(
             "{name}: ingress.stream_timeout_secs must be 1..={} (default {})",
             AppIngress::MAX_STREAM_TIMEOUT_SECS,
             AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+        ));
+    }
+    if !spec.paths.is_empty() && spec.domains.is_empty() {
+        return Err(format!("{name}: paths requires at least one domain"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &spec.paths {
+        crate::app::check_path_prefix(path)
+            .map_err(|reason| format!("{name}: invalid path {path:?}: {reason}"))?;
+        if !seen.insert(path) {
+            return Err(format!("{name}: duplicate path {path:?}"));
+        }
+    }
+    if ingress.strip_prefix && spec.paths.iter().all(|p| p == "/") {
+        return Err(format!(
+            "{name}: ingress.strip_prefix requires a path other than \"/\""
         ));
     }
     Ok(())
@@ -705,6 +729,7 @@ mod tests {
             check(AppIngress {
                 streaming: true,
                 stream_timeout_secs: 1,
+                strip_prefix: false,
             })
             .is_ok()
         );
@@ -712,6 +737,7 @@ mod tests {
             check(AppIngress {
                 streaming: true,
                 stream_timeout_secs: AppIngress::MAX_STREAM_TIMEOUT_SECS,
+                strip_prefix: false,
             })
             .is_ok()
         );
@@ -719,6 +745,7 @@ mod tests {
             let err = check(AppIngress {
                 streaming: true,
                 stream_timeout_secs: bad,
+                strip_prefix: false,
             })
             .unwrap_err();
             assert!(err.contains("stream_timeout_secs"), "{bad}: {err}");
@@ -727,9 +754,48 @@ mod tests {
         let err = check(AppIngress {
             streaming: false,
             stream_timeout_secs: 600,
+            strip_prefix: false,
         })
         .unwrap_err();
         assert!(err.contains("requires ingress.streaming = true"), "{err}");
+    }
+
+    #[test]
+    fn paths_and_strip_prefix_are_validated() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap()
+        };
+        let ok = |extra: &str| validate_app(&name("a"), &spec(extra));
+        assert!(ok("").is_ok());
+        assert!(ok("paths = [\"/\"]").is_ok());
+        assert!(ok("paths = [\"/api\", \"/.well-known\", \"/a/b-c_d.e\"]").is_ok());
+        assert!(ok("paths = [\"/api\"]\ningress = { strip_prefix = true }").is_ok());
+        for bad in [
+            "api", "/api/", "//a", "/a//b", "/a/../b", "/a/./b", "/a b", "/a%2f", "/ä", "",
+        ] {
+            let err = ok(&format!("paths = [{bad:?}]")).unwrap_err();
+            assert!(err.contains("invalid path"), "{bad}: {err}");
+        }
+        let err = ok("paths = [\"/a\", \"/a\"]").unwrap_err();
+        assert!(err.contains("duplicate path"), "{err}");
+        // `paths` without a domain would silently route nothing.
+        let no_domain: AppSpec = toml::from_str("image = \"i\"\npaths = [\"/a\"]").unwrap();
+        assert!(
+            validate_app(&name("a"), &no_domain)
+                .unwrap_err()
+                .contains("requires at least one domain")
+        );
+        // A strip with nothing to strip is a silent no-op.
+        for extra in [
+            "ingress = { strip_prefix = true }",
+            "paths = [\"/\"]\ningress = { strip_prefix = true }",
+        ] {
+            let err = ok(extra).unwrap_err();
+            assert!(err.contains("strip_prefix requires a path"), "{err}");
+        }
     }
 
     #[test]
