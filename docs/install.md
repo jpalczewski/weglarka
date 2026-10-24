@@ -12,6 +12,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2) ·
 [6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
 [6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
+[6d. Zależności między apkami](#6d-zależności-między-apkami-depends_on) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -592,6 +593,59 @@ Uwaga przy rollbacku: `host_ports` to nowe pole w `apps.toml`, a `[runtime] allo
 poprzedniej wersji Węglarki usuń wpisy `host_ports` z apek i tę flagę z configu — inaczej demon odmówi startu z
 błędem parsowania.
 
+## 6d. Zależności między apkami (`depends_on`)
+
+Część apek potrzebuje, żeby inna apka już działała — usługa i jej baza, worker i kolejka. Bez deklaracji obie
+startują w tym samym przebiegu reconcile, więc zależna apka może trafić na bramkę zdrowia, zanim zależność ma
+kontener: deploy „raz działa, raz się cofa”. Decyzja i odrzucone alternatywy: [0015](decisions/0016-depends-on.md).
+
+```toml
+# apps.toml / --spec: `api` startuje dopiero, gdy `db` działa (i jest zdrowa, jeśli ma healthcheck)
+depends_on = ["db"]
+# kilka zależności naraz, kolejność na liście nie ma znaczenia:
+# depends_on = ["db", "redis"]
+```
+
+Zastosowanie: `weglarka apps add api --depends-on db` (albo `apps update api --depends-on db`); `db` musi już być
+w `apps.toml`. Gotowy plik: [`docs/examples/depends-on.toml`](examples/depends-on.toml) — fragment `apps.toml`
+z dwiema apkami (nie `--spec`: plik specu opisuje jedną apkę). Flagi: `--depends-on` jest powtarzalna,
+`--depends-on none` czyści listę, a `apps update api --remove-depends-on db` usuwa jedną pozycję (błąd użycia, gdy
+jej nie ma); jak `--host-port`, wykluczają się z `--spec`.
+
+- `depends_on` to **tylko kolejność startu i bramka zdrowia**, nie sieć: każda apka ma własną sieć `net-<instancja>`
+  (0009), więc `api` nie rozwiąże nazwy `db` i nie połączy się z nią. Wspólna sieć / wspólny Postgres to pozostała,
+  niezaimplementowana część #35.
+- Kolejność obowiązuje tam, gdzie Węglarka **startuje** kontener: reconcile po starcie demona, pierwszy deploy,
+  `apps start`, deploy z CLI i z webhooka oraz recreate, gdy kontenera nie ma. Nie dotyczy podmiany działającego
+  kontenera przy zmianie spec-hash (apka już działa) ani provisioningu (`start = false` — nie ma kontenera).
+- **Bramka:** kontener zależności musi **działać**, a jeśli zależność ma healthcheck (`health.command` albo
+  `HEALTHCHECK` z obrazu), musi być **zdrowa**; `health.http` jest sprawdzane przez ingress, jak w bramce deployu
+  (0010). Samo istnienie kontenera nie wystarcza.
+- **Czekanie jest ograniczone:** gdy kontener zależności istnieje, ale nie jest jeszcze gotowy (np. właśnie trwa
+  jego deploy), Węglarka czeka do 10 s, odpytując co 1 s. Potem — a także gdy czekanie nie ma sensu (brak
+  kontenera, `start = false`) — admin API zwraca **409 Conflict** z listą niespełnionych zależności i powodów, a
+  reconcile zgłasza „waiting for dependencies” i ponawia w następnym przebiegu, **bez oznaczania apki jako
+  błędnej** (bez rollbacku i bez błędu w stanie).
+- **Walidacja:** nieznana nazwa, odwołanie do samej siebie, duplikat i cykl są odrzucane przy zapisie specu
+  (`apps add`/`apps update` → HTTP 400 `invalid_request`) i przy wczytywaniu `apps.toml` na starcie demona (demon
+  odmawia startu, komunikat wskazuje apki). Dlatego `apps add api --depends-on db` wymaga, żeby `db` już było
+  w `apps.toml`.
+- **Usuwanie:** `apps remove db`, gdy inna apka ma `depends_on = ["db"]`, kończy się 409 Conflict z listą zależnych
+  apek — nic nie jest usuwane, także z `--purge-volumes`. Najpierw usuń zależne apki albo ich wpisy `depends_on`.
+- Zależność z `start = false` ([6b](#6b-zatrzymywanie-apek-start--false)) nie ma kontenera, więc zależna apka nie
+  wystartuje: reconcile zgłasza oczekiwanie, a `doctor` ostrzega. Wystarczy `weglarka apps start db`.
+- `depends_on` **nie wchodzi do `spec-hash`**: zmiana, przełożenie czy wyczyszczenie listy nie odtwarza kontenera,
+  a `state.toml` się nie zmienia.
+- `apps update --spec` podmienia **całą** spec, więc plik bez `depends_on` po cichu usuwa listę — jak każde inne
+  pole.
+- Sprawdzenie: `weglarka doctor` — nowy check `state.dependencies`: Warn, gdy zależność działającej apki nie
+  istnieje, stoi albo jest niezdrowa, lub gdy zależność ma `start = false`; Info, gdy apka nie jest jeszcze wdrożona
+  i czeka na zależności; Ok inaczej.
+
+Uwaga przy rollbacku: `depends_on` to nowe pole w `apps.toml`, a ten plik ma `deny_unknown_fields`, więc **starszy
+demon** go nie odczyta. Wracając do poprzedniej wersji Węglarki usuń wpisy `depends_on`
+(`weglarka apps update <apka> --remove-depends-on <zależność>`) — inaczej demon odmówi startu z błędem parsowania.
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -615,7 +669,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
 - **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, więc starszy demon nie odczyta
   `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
-  ([6b](#6b-zatrzymywanie-apek-start--false)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on))
+  oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
 
 ### `apps update`: co się dzieje po zmianie
@@ -636,6 +691,7 @@ diff i niczego nie wysyła.
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
+| `--depends-on` / `--remove-depends-on` (`depends_on` w `--spec`) | tylko zapis: kolejność startu; `spec-hash` bez zmian, kontener nie jest odtwarzany |
 
 Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką, które
 mają `auto_update` i nie są zatrzymane (`start = false` — patrz 6b). Przypięcie tagu `sha-…` lub `--no-auto-update`
