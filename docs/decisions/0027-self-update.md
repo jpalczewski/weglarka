@@ -1,6 +1,6 @@
 # 0027 — Self-update: a host-side switcher, a pinned cosign key and a schema gate
 
-Status: accepted (2026-10-24, issue #99) · part of #47; automatic fallback is #100.
+Status: accepted (2026-10-24, issue #99) · part of #47; automatic fallback: [0034](0034-automatic-fallback.md).
 
 ## Problem
 
@@ -16,8 +16,8 @@ every release. The daemon cannot do it from inside its container:
   local tag, not through the service definition, and would leave the quadlet describing something else.
 
 Pulling and running a new image is remote code execution on the host, so it needs a verifiable trust anchor: a
-signature, not just TLS to the registry. A failed update must also be recoverable by hand — #100 (automatic
-fallback) is deliberately later.
+signature, not just TLS to the registry. A failed update must also be recoverable: this ADR gives the operator
+`--rollback`, and [0034](0034-automatic-fallback.md) automates the recovery.
 
 ## Decision
 
@@ -60,7 +60,9 @@ The daemon confirms the outcome on its next start: it reads the digest of its ow
 * `pending != running` → `SelfUpdatePending` (warning) and `doctor` keeps showing the pending digest with its age —
   a failed switch is reported, never silently assumed.
 
-`weglarka-daemon self-update --rollback` pins `previous` again and restarts — the manual fallback until #100. It
+`weglarka-daemon self-update --rollback` pins `previous` again and restarts — the manual lever, and the shape the
+automatic fallback of [0034](0034-automatic-fallback.md) reuses with the digest recorded when the switch was applied
+instead of `previous`. It
 does not re-fetch or re-verify the signature: returning to the image that was running a moment ago is not an
 untrusted operation, and a rollback must work when the registry does not.
 
@@ -82,7 +84,7 @@ immediately).
   older nor a newer daemon may be stopped by it. The strict, schema-versioned files stay `state.toml`/`apps.toml`.
 * The container never gets write access to the quadlet directory; the switch is always a host operation.
 * `[self_update]` is a new section of `weglarka.toml`, which uses `deny_unknown_fields`: an older daemon refuses to
-  start with it. Documented in [install.md](../install.md) (6i and 7).
+  start with it. Documented in [install.md](../install.md) (6k and 7).
 
 ## Consequences
 
@@ -102,9 +104,9 @@ immediately).
 * Tests: payload/key/verification vectors and an HTTP server per case in `weglarka-registry`; the whole switcher
   (no-op, applied, refused, schema downgrade, `--check`, `--rollback`, not-due) on fakes in
   `weglarka-daemon`; the startup confirmation and both `doctor` checks through the real admin socket.
-* **Not covered:** automatic fallback when the new daemon does not become healthy (#100 — its home is the same
-  timer: wait for health, then `--rollback`); keyless Sigstore verification in the daemon; private registries
-  (pulls are anonymous); a webhook-triggered check (the timer covers "or tag").
+* **Not covered:** keyless Sigstore verification in the daemon; private registries (pulls are anonymous); a
+  webhook-triggered check (the timer covers "or tag"). The recovery when the new image starts but never becomes
+  healthy is [0034](0034-automatic-fallback.md).
 
 ## Rejected alternatives
 
