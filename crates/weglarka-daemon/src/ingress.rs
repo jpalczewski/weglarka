@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +32,7 @@ use weglarka_core::reconcile::Reconciler;
 use weglarka_core::state::{self, write_atomic};
 use weglarka_core::uid_range::UidRange;
 use weglarka_core::volumes;
-use weglarka_ingress::{nginx, traefik};
+use weglarka_ingress::{Domain, nginx, traefik};
 
 /// Network joined by both the Węglarka and nginx containers (webhooks: `proxy_pass http://weglarka:<port>`).
 pub const WEBHOOK_NETWORK: &str = labels::INGRESS_NETWORK;
@@ -41,6 +41,11 @@ pub const HASH_LABEL: &str = "weglarka.ingress-hash";
 const NGINX_CONF_FILE: &str = "nginx.conf";
 const NGINX_CONF_MOUNT: &str = "/etc/nginx";
 const NGINX_STOP_TIMEOUT: u32 = 10;
+/// `<nginx_conf_dir>` subdirectories (issue #95): TLS material and the ACME HTTP-01 webroot. Both sit
+/// inside the directory mounted at `/etc/nginx`, so `edge` needs no extra mount and no hash entry
+/// for mounts: the nginx container already sees them.
+const TLS_SUBDIR: &str = "tls";
+const ACME_SUBDIR: &str = "acme";
 /// Delay before re-running `apply` after a best-effort network operation failed.
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
@@ -212,20 +217,37 @@ impl<P: PodmanClient> IngressManager<P> {
             _ => None,
         };
 
+        // `edge` (issue #95): certificates come from the state dir on every pass, so a renewal is
+        // picked up (the fingerprint makes the config differ) and a missing one simply leaves the
+        // domain without a TLS server. `behind` has no TLS material of its own (Traefik owns it).
+        let (certificates, tls_fingerprint) = if self.host.ingress.mode == IngressMode::Edge {
+            self.ensure_tls_material()?
+        } else {
+            (Vec::new(), None)
+        };
+
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
+        // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
+        let behind = self.host.ingress.mode == IngressMode::Behind;
         let pinned = !self.host.ingress.trusted_proxies.is_empty();
         let render = Render {
             apps: &apps,
             resolvers: &resolvers,
             forwarder_subnets: &forwarder_subnets,
             networks: &networks,
+            certificates: &certificates,
+            tls_fingerprint: tls_fingerprint.as_deref(),
         };
-        let mut own_addresses = self.nginx_addresses().await?;
+        let mut own_addresses = if behind {
+            self.nginx_addresses().await?
+        } else {
+            Vec::new()
+        };
         let (mut conf_written, mut nginx) = self.apply_nginx(&render, &own_addresses).await?;
         // The addresses the config trusts were read before nginx was (re)created or joined a new network, so
         // they may be stale (or the bootstrap fallback): never leave that config in place. Re-read and, if
         // they moved, regenerate and reload within this pass. If the re-read fails, retry shortly.
-        if !pinned {
+        if behind && !pinned {
             let current = self.nginx_addresses().await.inspect_err(|_| {
                 self.retry_soon.store(true, Ordering::Relaxed);
             })?;
@@ -263,19 +285,29 @@ impl<P: PodmanClient> IngressManager<P> {
         r: &Render<'_>,
         own_addresses: &[IpAddr],
     ) -> Result<(bool, NginxAction), IngressApplyError> {
-        let trusted = if self.host.ingress.trusted_proxies.is_empty() {
-            default_trusted(own_addresses, r.forwarder_subnets)
+        let mut options = nginx::NginxOptions::new(r.resolvers.to_vec());
+        if self.host.ingress.mode == IngressMode::Behind {
+            let trusted = if self.host.ingress.trusted_proxies.is_empty() {
+                default_trusted(own_addresses, r.forwarder_subnets)
+            } else {
+                self.host.ingress.trusted_proxies.clone()
+            };
+            options = options.with_trusted_proxies(&trusted)?;
         } else {
-            self.host.ingress.trusted_proxies.clone()
-        };
-        let options =
-            nginx::NginxOptions::new(r.resolvers.to_vec()).with_trusted_proxies(&trusted)?;
+            options.certificates = r.certificates.to_vec();
+            options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
+        }
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
         let previous = fs::read(self.conf_path()).ok();
         let conf_written = self.write_conf(&conf)?;
         match self
-            .ensure_nginx(r.networks, options.listen_port, conf_written)
+            .ensure_nginx(
+                r.networks,
+                options.listen_port,
+                options.https_listen_port,
+                conf_written,
+            )
             .await
         {
             Ok(action) => Ok((conf_written, action)),
@@ -314,29 +346,121 @@ impl<P: PodmanClient> IngressManager<P> {
             return Ok(false);
         }
         fs::create_dir_all(&self.conf_dir).map_err(io_err(&self.conf_dir))?;
-        // The nginx container runs under a different uid (userns=auto) — the directory and file must be readable.
+        // The nginx container runs in its own uid namespace: the directory and `nginx.conf` must be
+        // readable by the container's worker uid (the ACME webroot files are served by it).
         fs::set_permissions(&self.conf_dir, fs::Permissions::from_mode(0o755))
             .map_err(io_err(&self.conf_dir))?;
         write_atomic(&path, conf.as_bytes(), 0o644).map_err(io_err(&path))?;
         Ok(true)
     }
 
+    /// `edge` TLS material from the state dir (issue #95): creates the ACME webroot (`0755`, the worker
+    /// serves the tokens) and the TLS directory (`0700`, only the master — running as the daemon's user
+    /// under the ingress uid map — needs it), then returns the domains with a `<domain>.crt` +
+    /// `<domain>.key` pair and a fingerprint of the material.
+    ///
+    /// The fingerprint is rendered into `nginx.conf`, so renewing a certificate changes the config and
+    /// rides the normal `nginx -t` + SIGHUP path; it is metadata only (name, size, mtime), the daemon
+    /// never reads the private keys. Anything that is not a regular `<domain>.crt` file, or has no
+    /// matching key, is ignored: the domain simply keeps its redirect and has no TLS server.
+    fn ensure_tls_material(&self) -> Result<(Vec<Domain>, Option<String>), IngressApplyError> {
+        let acme = self.conf_dir.join(ACME_SUBDIR);
+        let tls = self.conf_dir.join(TLS_SUBDIR);
+        fs::create_dir_all(&acme).map_err(io_err(&acme))?;
+        fs::set_permissions(&acme, fs::Permissions::from_mode(0o755)).map_err(io_err(&acme))?;
+        if !tls.is_dir() {
+            fs::create_dir_all(&tls).map_err(io_err(&tls))?;
+            fs::set_permissions(&tls, fs::Permissions::from_mode(0o700)).map_err(io_err(&tls))?;
+        }
+
+        let mut candidates: Vec<Domain> = Vec::new();
+        let entries = match fs::read_dir(&tls) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((candidates, Some(empty_fingerprint())));
+            }
+            Err(e) => return Err(io_err(&tls)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_err(&tls))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".crt") else {
+                continue;
+            };
+            match Domain::new(stem) {
+                Ok(domain) => candidates.push(domain),
+                Err(_) => {
+                    tracing::warn!(file = %name, "ignoring a TLS file whose name is not a domain")
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        let mut material = Vec::new();
+        let mut certificates = Vec::new();
+        for domain in candidates {
+            let cert = tls.join(format!("{domain}.crt"));
+            let key = tls.join(format!("{domain}.key"));
+            let (Ok(cert_meta), Ok(key_meta)) =
+                (fs::symlink_metadata(&cert), fs::symlink_metadata(&key))
+            else {
+                tracing::debug!(%domain, "no certificate pair in the TLS directory");
+                continue;
+            };
+            if !cert_meta.is_file() || !key_meta.is_file() {
+                tracing::warn!(%domain, "certificate or key is not a regular file, ignoring");
+                continue;
+            }
+            material.push(format!(
+                "{domain}:{}:{}:{}:{}",
+                cert_meta.len(),
+                mtime_nanos(&cert_meta),
+                key_meta.len(),
+                mtime_nanos(&key_meta)
+            ));
+            certificates.push(domain);
+        }
+        let fingerprint = if material.is_empty() {
+            empty_fingerprint()
+        } else {
+            let digest = Sha256::digest(material.join("\n").as_bytes());
+            hex::encode(&digest[..4])
+        };
+        Ok((certificates, Some(fingerprint)))
+    }
+
+    /// `edge`: the TLS material directory (`<nginx_conf_dir>/tls`).
+    pub fn tls_dir(&self) -> PathBuf {
+        self.conf_dir.join(TLS_SUBDIR)
+    }
+
+    /// `edge`: the ACME HTTP-01 webroot (`<nginx_conf_dir>/acme`).
+    pub fn acme_dir(&self) -> PathBuf {
+        self.conf_dir.join(ACME_SUBDIR)
+    }
+
     async fn ensure_nginx(
         &self,
         networks: &[String],
         listen_port: u16,
+        https_listen_port: u16,
         conf_changed: bool,
     ) -> Result<NginxAction, IngressApplyError> {
         let podman = self.engine.podman();
         let image = &self.host.ingress.nginx_image;
         let bind = self.host.ingress.bind;
+        let https_bind = self.host.ingress.https_bind;
         // The range is part of the container's identity: nginx created before ranges existed is
         // recreated once, now on its own map instead of libpod's shared default (docs/decisions/0009).
         let range = self.engine.ensure_ingress_range().await?;
         let hash = ingress_hash(
             image,
-            &bind.to_string(),
+            bind,
+            https_bind,
             listen_port,
+            https_listen_port,
             range,
             &nginx_security(),
         );
@@ -349,8 +473,15 @@ impl<P: PodmanClient> IngressManager<P> {
 
         let existed = existing.is_some();
         let Some(existing) = existing.filter(|c| c.labels.get(HASH_LABEL) == Some(&hash)) else {
-            self.create_nginx(networks, listen_port, hash, range, existed)
-                .await?;
+            self.create_nginx(
+                networks,
+                listen_port,
+                https_listen_port,
+                hash,
+                range,
+                existed,
+            )
+            .await?;
             return Ok(if existed {
                 NginxAction::Recreated
             } else {
@@ -411,6 +542,7 @@ impl<P: PodmanClient> IngressManager<P> {
         &self,
         networks: &[String],
         listen_port: u16,
+        https_listen_port: u16,
         hash: String,
         range: UidRange,
         replace: bool,
@@ -418,6 +550,20 @@ impl<P: PodmanClient> IngressManager<P> {
         let podman = self.engine.podman();
         let image = &self.host.ingress.nginx_image;
         let bind = self.host.ingress.bind;
+        // nginx listens on unprivileged ports inside the container; only the *host* side is 80/443 in
+        // `edge`, so the hardened profile needs no `NET_BIND_SERVICE` (ADR 0014).
+        let mut publish = vec![PortMapping {
+            host_ip: Some(bind.ip().to_string()),
+            host_port: bind.port(),
+            container_port: listen_port,
+        }];
+        if let Some(https) = self.host.ingress.https_bind {
+            publish.push(PortMapping {
+                host_ip: Some(https.ip().to_string()),
+                host_port: https.port(),
+                container_port: https_listen_port,
+            });
+        }
         self.ensure_image(image).await?;
         if replace {
             match podman
@@ -441,11 +587,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 networks: networks.to_vec(),
                 network_aliases: Default::default(),
                 secrets: vec![],
-                publish: vec![PortMapping {
-                    host_ip: Some(bind.ip().to_string()),
-                    host_port: bind.port(),
-                    container_port: listen_port,
-                }],
+                publish,
                 restart: RestartPolicy::Always,
                 userns_auto: false,
                 mounts: vec![BindMount {
@@ -456,7 +598,9 @@ impl<P: PodmanClient> IngressManager<P> {
                 volumes: vec![],
                 resources: Default::default(),
                 healthcheck: None,
-                id_mapping: Some(volumes::id_mapping(range)),
+                // `edge`/`behind`: container uid 0 is the daemon's host user, so the TLS master reads
+                // the 0600 keys; the worker stays in the reserved ingress range (docs/decisions/0035).
+                id_mapping: Some(volumes::ingress_id_mapping(range)),
                 security: nginx_security(),
             })
             .await?;
@@ -481,7 +625,8 @@ impl<P: PodmanClient> IngressManager<P> {
 }
 
 /// Version of the ingress hash input; bump when its shape changes (recreates every nginx container).
-const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v2";
+/// v3 (issue #95): the mode and the second publish are part of the identity.
+const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v3";
 
 /// Hardened profile of the nginx container — ours to choose, unlike an app's `security`, so it is always
 /// on (docs/decisions/0014): read-only root with libpod's writable `/tmp`, `/var/tmp` and `/run` tmpfs
@@ -502,6 +647,12 @@ struct Render<'a> {
     resolvers: &'a [IpAddr],
     forwarder_subnets: &'a [String],
     networks: &'a [String],
+    /// `edge`: domains with a certificate pair in [`TLS_SUBDIR`]; empty in `behind`.
+    certificates: &'a [Domain],
+    /// `edge`: fingerprint of the TLS material. It is rendered into `nginx.conf`, so a renewed
+    /// certificate re-renders the config and goes through the usual `nginx -t` + SIGHUP path
+    /// (never a recreate). `None` in `behind`.
+    tls_fingerprint: Option<&'a str>,
 }
 
 /// Peers whose `X-Forwarded-*` nginx trusts by default (docs/decisions/0032): nginx's **own**
@@ -536,18 +687,23 @@ fn nginx_security() -> Security {
 /// Spec hash of the nginx container: only what cannot change on a live container. The set of app
 /// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
 /// Hardening is in: changing the profile must recreate the container, not leave an old, writable one.
+#[allow(clippy::too_many_arguments)]
 fn ingress_hash(
     image: &str,
-    bind: &str,
+    bind: SocketAddr,
+    https_bind: Option<SocketAddr>,
     listen_port: u16,
+    https_listen_port: u16,
     range: UidRange,
     security: &Security,
 ) -> String {
     let input = IngressHashInput {
         format: INGRESS_HASH_FORMAT,
         image,
-        bind,
+        bind: bind.to_string(),
+        https_bind: https_bind.map(|b| b.to_string()),
         listen_port,
+        https_listen_port,
         range_start: range.start,
         range_size: range.size,
         security,
@@ -561,11 +717,27 @@ fn ingress_hash(
 struct IngressHashInput<'a> {
     format: &'static str,
     image: &'a str,
-    bind: &'a str,
+    bind: String,
+    https_bind: Option<String>,
     listen_port: u16,
+    https_listen_port: u16,
     range_start: u32,
     range_size: u32,
     security: &'a Security,
+}
+
+/// The fingerprint of an empty TLS directory. It still renders into the config (so switching to
+/// `edge` re-renders) and a later first certificate changes it.
+fn empty_fingerprint() -> String {
+    hex::encode(&Sha256::digest(b"no tls material")[..4])
+}
+
+/// Seconds/nanoseconds of a file's mtime; `0` when the platform does not report it.
+fn mtime_nanos(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
 }
 
 /// Overwrites a file in place (truncate + write + fsync), without `rename`: the ACL on the Traefik
@@ -643,17 +815,31 @@ mod tests {
             size: 4096,
         };
         let sec = nginx_security();
-        let a = ingress_hash("i", "x", 80, r, &sec);
-        assert_eq!(a, ingress_hash("i", "x", 80, r, &sec));
-        assert_ne!(a, ingress_hash("j", "x", 80, r, &sec));
-        assert_ne!(a, ingress_hash("i", "y", 80, r, &sec));
-        assert_ne!(a, ingress_hash("i", "x", 81, r, &sec));
+        let bind = "127.0.0.1:18080".parse().unwrap();
+        let a = ingress_hash("i", bind, None, 8080, 8443, r, &sec);
+        assert_eq!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
+        assert_ne!(a, ingress_hash("j", bind, None, 8080, 8443, r, &sec));
         assert_ne!(
             a,
             ingress_hash(
                 "i",
-                "x",
-                80,
+                "127.0.0.1:18081".parse().unwrap(),
+                None,
+                8080,
+                8443,
+                r,
+                &sec
+            )
+        );
+        assert_ne!(a, ingress_hash("i", bind, None, 8081, 8443, r, &sec));
+        assert_ne!(
+            a,
+            ingress_hash(
+                "i",
+                bind,
+                None,
+                8080,
+                8443,
                 UidRange {
                     start: 4097,
                     size: 4096
@@ -663,6 +849,35 @@ mod tests {
         );
     }
 
+    /// `edge` (issue #95): the second publish is part of the container's identity, so changing
+    /// `https_bind` must recreate it instead of leaving the old port mapping in place.
+    #[test]
+    fn hash_covers_the_edge_tls_publish() {
+        let r = UidRange {
+            start: 1,
+            size: 4096,
+        };
+        let sec = nginx_security();
+        let bind = "0.0.0.0:80".parse().unwrap();
+        let https = "0.0.0.0:443".parse().unwrap();
+        let a = ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec);
+        assert_eq!(a, ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec));
+        assert_ne!(
+            a,
+            ingress_hash(
+                "i",
+                bind,
+                Some("0.0.0.0:444".parse().unwrap()),
+                8080,
+                8443,
+                r,
+                &sec
+            )
+        );
+        assert_ne!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
+        assert_ne!(a, ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec));
+    }
+
     /// Upgrading from a build without hardening must recreate nginx: the profile is in the hash.
     #[test]
     fn hash_covers_hardening() {
@@ -670,18 +885,19 @@ mod tests {
             start: 1,
             size: 4096,
         };
+        let bind = "127.0.0.1:18080".parse().unwrap();
         let hardened = nginx_security();
         let unhardened = Security::default();
         assert_ne!(
-            ingress_hash("i", "x", 80, r, &hardened),
-            ingress_hash("i", "x", 80, r, &unhardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &unhardened),
             "a profile change must not leave the old container in place"
         );
         let mut no_nnp = hardened.clone();
         no_nnp.no_new_privileges = false;
         assert_ne!(
-            ingress_hash("i", "x", 80, r, &hardened),
-            ingress_hash("i", "x", 80, r, &no_nnp)
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp)
         );
     }
 }

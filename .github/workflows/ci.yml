@@ -112,6 +112,22 @@ jobs:
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
           docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+      # Edge mode (issue #95): nginx owns the public web ports and terminates TLS. The same image must accept
+      # the generated config with the TLS material mounted where the daemon puts it (<nginx_conf_dir>/tls),
+      # and the containers below exercise redirects, the ACME webroot, TLS and the fail-closed paths.
+      - name: nginx -t and edge ingress
+        run: |
+          set -euo pipefail
+          domain=blog.example.eu
+          mkdir -p "$RUNNER_TEMP/edge-certs"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
+            -keyout "$RUNNER_TEMP/edge-certs/$domain.key" -out "$RUNNER_TEMP/edge-certs/$domain.crt" \
+            -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain"
+          chmod 600 "$RUNNER_TEMP/edge-certs/$domain.key"
+          cargo run -q -p weglarka-ingress --example dump -- nginx-edge "$domain" > "$RUNNER_TEMP/edge.conf"
+          docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" docker.io/library/nginx:1-alpine \
+            sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge.conf"
+          .github/scripts/test-edge.sh "$RUNNER_TEMP/edge.conf" "$RUNNER_TEMP/edge-certs"
       # X-Forwarded-* from a trusted peer pass through, from an untrusted one they are overwritten (docs/decisions/0007).
       # The request peer on the published port is the Docker bridge gateway (172.17.0.1) — once trusted, once not.
       - name: Forwarded headers through nginx
@@ -312,6 +328,10 @@ jobs:
         run: .github/scripts/smoke-image.sh localhost/weglarka:ci bin/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
       - name: Image smoke test from the quadlet arguments (no runtime.socket, hardened)
         run: .github/scripts/smoke-quadlet.sh localhost/weglarka:ci bin/weglarka bin/weglarka-daemon "$WEGLARKA_PODMAN_SOCKET"
+      # Edge mode (issue #95): the same image with `[ingress] mode = "edge"` — both web ports published,
+      # TLS + ACME through nginx, no Traefik file, and a certificate change reloads nginx without a recreate.
+      - name: Image smoke test in edge mode (TLS, no Traefik)
+        run: .github/scripts/smoke-image.sh localhost/weglarka:ci bin/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh edge
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true

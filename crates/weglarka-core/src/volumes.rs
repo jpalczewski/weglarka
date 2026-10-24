@@ -54,6 +54,34 @@ pub fn id_mapping(range: UidRange) -> IdMapping {
     }
 }
 
+/// Map of the ingress nginx container (`docs/decisions/0035`, amending 0009): container uid 0 is the
+/// **daemon's host user**, the rest of the ingress range belongs to the container as usual.
+///
+/// The TLS private keys live in `<nginx_conf_dir>/tls` as `0600` files owned by the daemon's user, and
+/// nginx's master — the process that reads `ssl_certificate_key` at start and at every reload — runs
+/// as container uid 0. Mapping that one uid to the host user keeps the keys out of world-readable
+/// files; the worker (uid 101 in the image) still maps into the reserved ingress range, so it cannot
+/// read them. This is deliberately *not* the pool-spanning default map: only uid 0 is shared with the
+/// user, and the ingress range stays disjoint from every app range.
+pub fn ingress_id_mapping(range: UidRange) -> IdMapping {
+    let mut uid_map = vec![IdRange {
+        container_id: 0,
+        host_id: 0,
+        size: 1,
+    }];
+    if range.size > 1 {
+        uid_map.push(IdRange {
+            container_id: 1,
+            host_id: range.start,
+            size: range.size - 1,
+        });
+    }
+    IdMapping {
+        uid_map: uid_map.clone(),
+        gid_map: uid_map,
+    }
+}
+
 /// The uid/gid range a container of `instance` runs in: the range of its shared volumes' group when
 /// the spec mounts any (all members share it, docs/decisions/0017 and 0029), otherwise the
 /// instance's own range. `st.shared_volumes` is keyed by group name.
@@ -1539,6 +1567,44 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
                 container_id: 0,
                 host_id: 65_537,
                 size: 65_536
+            }]
+        );
+    }
+
+    #[test]
+    fn ingress_mapping_keeps_the_master_on_the_host_user() {
+        let range = UidRange {
+            start: 1,
+            size: 4096,
+        };
+        let m = ingress_id_mapping(range);
+        assert_eq!(m.uid_map, m.gid_map);
+        // Container uid 0 = the daemon's host user (offset 0 in the rootless namespace), so the nginx
+        // master can read the 0600 TLS keys; the worker (uid 101) still lands in the ingress range.
+        assert_eq!(
+            m.uid_map,
+            [
+                IdRange {
+                    container_id: 0,
+                    host_id: 0,
+                    size: 1
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: 1,
+                    size: 4095
+                },
+            ]
+        );
+        // The worker's host id is inside the ingress range, never 0.
+        assert_eq!(m.uid_map[1].host_id + 100, 101);
+        // A degenerate range still yields a valid one-line map.
+        assert_eq!(
+            ingress_id_mapping(UidRange { start: 1, size: 1 }).uid_map,
+            [IdRange {
+                container_id: 0,
+                host_id: 0,
+                size: 1
             }]
         );
     }

@@ -313,6 +313,43 @@ listen = "0.0.0.0:9180"
 domain = "weglarka.example.eu"
 "#;
 
+/// `edge` host (issue #95): two publishes, no Traefik. High ports keep it independent of the
+/// privileged-port opt-in; the TLS directory lives under the state dir's `nginx/`.
+const EDGE_CONFIG: &str = r#"
+[runtime]
+user = "weglarka"
+[ingress]
+mode = "edge"
+bind = "0.0.0.0:18080"
+https_bind = "0.0.0.0:18443"
+[admin]
+socket = "/run/user/1001/weglarka/admin.sock"
+[webhook]
+listen = "0.0.0.0:9180"
+domain = "weglarka.example.eu"
+"#;
+
+/// A healthy edge host: the webhook domain's certificate is in place and the firewall/sysctl facts
+/// are fine.
+fn edge_host() -> FakeHost {
+    FakeHost::healthy()
+        .stat(
+            "/etc/weglarka/nginx/tls/weglarka.example.eu.crt",
+            FileKind::File,
+            0o600,
+            1001,
+            1001,
+        )
+        .stat(
+            "/etc/weglarka/nginx/tls/weglarka.example.eu.key",
+            FileKind::File,
+            0o600,
+            1001,
+            1001,
+        )
+        .file("/proc/sys/net/ipv4/ip_unprivileged_port_start", "1024\n")
+}
+
 fn report(host: &FakeHost, config: Option<&str>) -> DoctorReport {
     let cfg = config
         .map(|c| HostConfig::from_toml_str(c).map_err(|e| e.to_string()))
@@ -326,6 +363,59 @@ fn preflight_healthy_host() {
     let r = report(&FakeHost::healthy(), Some(CONFIG));
     insta::assert_snapshot!(render(&r));
     assert_eq!(r.exit_code(), 0);
+}
+
+#[test]
+fn preflight_edge_host() {
+    let r = report(&edge_host(), Some(EDGE_CONFIG));
+    insta::assert_snapshot!(render(&r));
+    assert_eq!(r.exit_code(), 0);
+    let ids: Vec<_> = r.checks.iter().map(|c| c.id.as_str()).collect();
+    assert!(ids.contains(&"ingress.tls"), "{ids:?}");
+    assert!(!ids.contains(&"ingress.traefik_file"), "{ids:?}");
+    assert!(
+        !ids.contains(&"ingress.privileged_ports"),
+        "high ports need no sysctl: {ids:?}"
+    );
+}
+
+#[test]
+fn preflight_edge_reports_missing_certificates_as_a_warning() {
+    let r = report(&FakeHost::healthy(), Some(EDGE_CONFIG));
+    let tls = r
+        .checks
+        .iter()
+        .find(|c| c.id == "ingress.tls")
+        .expect("ingress.tls");
+    assert_eq!(tls.status, weglarka_api::CheckStatus::Warn, "{tls:?}");
+    assert!(
+        tls.message.contains("weglarka.example.eu"),
+        "names the missing domain: {}",
+        tls.message
+    );
+    assert!(tls.hint.is_some(), "a warning carries a fix");
+}
+
+#[test]
+fn preflight_edge_requires_the_sysctl_for_privileged_ports() {
+    let cfg = EDGE_CONFIG
+        .replace(
+            "user = \"weglarka\"",
+            "user = \"weglarka\"\nallow_privileged_host_ports = true",
+        )
+        .replace("0.0.0.0:18080", "0.0.0.0:80")
+        .replace("0.0.0.0:18443", "0.0.0.0:443");
+    let status = |sysctl: &str| {
+        let host = edge_host().file("/proc/sys/net/ipv4/ip_unprivileged_port_start", sysctl);
+        report(&host, Some(&cfg))
+            .checks
+            .into_iter()
+            .find(|c| c.id == "ingress.privileged_ports")
+            .unwrap_or_else(|| panic!("brak ingress.privileged_ports dla {sysctl:?}"))
+            .status
+    };
+    assert_eq!(status("1024\n"), weglarka_api::CheckStatus::Fail);
+    assert_eq!(status("0\n"), weglarka_api::CheckStatus::Ok);
 }
 
 #[test]
@@ -419,13 +509,12 @@ fn render_reports_info_checks_without_alarming() {
 
 #[test]
 fn edge_mode_skips_traefik_check_and_openrc_skips_linger() {
-    let cfg = CONFIG
-        .replace("behind", "edge")
-        .replace("\n[webhook]", "\n[platform]\nkind = \"openrc\"\n[webhook]");
-    let r = report(&FakeHost::healthy(), Some(&cfg));
+    let cfg = EDGE_CONFIG.replace("\n[webhook]", "\n[platform]\nkind = \"openrc\"\n[webhook]");
+    let r = report(&edge_host(), Some(&cfg));
     let ids: Vec<_> = r.checks.iter().map(|c| c.id.as_str()).collect();
-    assert!(!ids.contains(&"ingress.traefik_file"));
-    assert!(!ids.contains(&"runtime.linger"));
+    assert!(!ids.contains(&"ingress.traefik_file"), "{ids:?}");
+    assert!(!ids.contains(&"runtime.linger"), "{ids:?}");
+    assert!(ids.contains(&"ingress.tls"), "{ids:?}");
 }
 
 // ---------- new host checks (devops, niechybnie) ----------

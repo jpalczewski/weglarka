@@ -88,6 +88,15 @@ Rules for session 1:
   owned by it) must be world-readable or re-owned — this includes the ingress nginx conf mount (0644
   files in a 0755 directory work; session 1 verifies it in the smoke test).
 - The CI pool is 65 536 subuids, so the integration tests use 4096-uid ranges; production uses 65536.
+
+## Update (issue #95, ADR 0035)
+
+The ingress container no longer maps container uid 0 into its own range: [0035](0035-edge-mode.md) uses a
+two-line map (`volumes::ingress_id_mapping`) — container uid 0 → the rootless namespace's uid 0 (the runtime
+user), container uid 1.. → the reserved ingress range. That lets the nginx master read the daemon's `0600` TLS
+keys while the worker (uid 101) stays inside the ingress range and cannot. It is deliberately not the
+pool-spanning default map: only uid 0 is shared with the user, and the ingress range stays disjoint from every
+app range. `integration-podman` measures it (`weglarka-podman/tests/ingress_identity.rs`).
 - `idmap` and real `auto` stay documented dead ends; the `plain_userns_auto_is_a_noop_rootless` test
   fails loudly if Podman changes the behaviour.
 

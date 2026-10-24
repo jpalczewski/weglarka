@@ -15,10 +15,11 @@ expression: render(&r)
 [ OK ] runtime.pasta            pasta available (pasta: pasta 2025_01_21)
 [ OK ] runtime.apparmor_userns  apparmor_restrict_unprivileged_userns=1 and profile podman is loaded
 [ OK ] ingress.traefik_file     /data/traefik/weglarka.yml exists and is writable by weglarka
+[ OK ] ingress.config           [ingress] mode is consistent (Behind, publishes 172.17.0.1:8080)
 [ OK ] ingress.bind             172.17.0.1 is assigned to a host interface
 [ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
 [ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
 [ OK ] apps.host_ports_free     /etc/weglarka/apps.toml does not exist — no host ports published
 [ OK ] state.secrets_file       /etc/weglarka/secrets.toml has mode 0600
 
-18 ok, 0 info, 0 warn, 0 fail
+19 ok, 0 info, 0 warn, 0 fail

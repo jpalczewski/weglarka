@@ -737,3 +737,134 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
     };
     assert!(err.to_string().contains("apps.toml"), "{err}");
 }
+
+/// Same as [`admin`] but for a raw [`Running`] (tests that do not build the whole [`Harness`]).
+async fn admin_running(
+    running: &Running<FakePodman>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let stream = UnixStream::connect(&running.admin_socket).await.unwrap();
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "weglarka")
+        .body(Full::new(Bytes::from(
+            body.map(|b| b.to_string()).unwrap_or_default(),
+        )))
+        .unwrap();
+    let (status, bytes) = send(stream, req).await;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, value)
+}
+
+/// An `edge` daemon (issue #95): two public ports, no Traefik, certificates under `<state>/nginx/tls`.
+fn edge_settings(root: &Path) -> Settings {
+    let host = HostConfig::from_toml_str(&format!(
+        r#"
+[ingress]
+mode = "edge"
+bind = "127.0.0.1:18080"
+https_bind = "127.0.0.1:18443"
+
+[admin]
+socket = "{root}/run/admin.sock"
+
+[webhook]
+listen = "127.0.0.1:0"
+domain = "hooks.example.eu"
+
+[state]
+dir = "{root}/state"
+"#,
+        root = root.display()
+    ))
+    .unwrap();
+    Settings::from_host(host, root.join("weglarka.toml"))
+}
+
+#[tokio::test]
+async fn refuses_an_edge_config_without_https_bind() {
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\n[admin]\nsocket=\"{r}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n[state]\ndir=\"{r}/state\"\n",
+        r = root.display()
+    ))
+    .unwrap();
+    let err = match start(
+        Settings::from_host(host, root.join("weglarka.toml")),
+        FakePodman::new(),
+    )
+    .await
+    {
+        Ok(_) => panic!("edge without https_bind must refuse to start"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("requires https_bind"), "{err}");
+}
+
+#[tokio::test]
+async fn edge_ingress_owns_two_ports_and_doctor_reports_tls() {
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().to_owned();
+    let fake = FakePodman::new();
+    let running = start(edge_settings(&root), fake.clone()).await.unwrap();
+
+    eventually("edge ingress applied", || async {
+        fake.containers().iter().any(|c| c.name == "weglarka-nginx")
+    })
+    .await;
+
+    let spec = fake.container_spec("weglarka-nginx").unwrap();
+    let publishes: Vec<(u16, u16)> = spec
+        .publish
+        .iter()
+        .map(|p| (p.host_port, p.container_port))
+        .collect();
+    assert_eq!(publishes, [(18080, 8080), (18443, 8443)]);
+    // Traefik has no part in edge: no file is written even though the state dir exists.
+    assert!(!root.join("traefik.yml").exists());
+    let nginx_dir = root.join("state/nginx");
+    let conf = read(&nginx_dir.join("nginx.conf"));
+    assert!(conf.contains("listen 8443 ssl default_server;"), "{conf}");
+    assert!(conf.contains("ssl_reject_handshake on;"), "{conf}");
+
+    let (status, v) = admin_running(&running, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"ingress.tls"), "{ids:?}");
+    assert!(!ids.contains(&"ingress.traefik_file"), "{ids:?}");
+    let tls = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "ingress.tls")
+        .unwrap();
+    assert_eq!(tls["status"], "warn", "{tls}");
+    assert!(
+        tls["message"]
+            .as_str()
+            .unwrap()
+            .contains("hooks.example.eu"),
+        "{tls}"
+    );
+    running.stop().await;
+}

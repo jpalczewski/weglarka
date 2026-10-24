@@ -5,6 +5,12 @@
 # weglarka, curl, openssl, jq, podman (+ tar for --with-volume). Touches only the instances `wg-canary`,
 # `wg-webhook`, `wg-rollback`, `wg-volume`, `wg-nostart` and the `wg-accept-registry` container (local test registry) — never any other apps.
 #
+# In `[ingress] mode = "edge"` (issue #95) nginx owns the public ports and terminates TLS: the script
+# bootstraps a certificate for the canary domain into `<nginx_conf_dir>/tls`, waits until nginx has reloaded
+# (the domain's `ssl_certificate` is in nginx.conf), then drives traffic over `https://<domain>:<https port>`
+# (`curl --resolve`, `-k`) and checks the ACME HTTP-01 webroot. Mode and ports come from `weglarka.toml`
+# (`[ingress] mode`, `bind`, `https_bind`, `nginx_conf_dir`), so the same script runs on a host and in CI.
+#
 #   scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
 #
 # Exit codes: 0 all PASS, 1 at least one FAIL, 64 invalid invocation / missing dependency.
@@ -27,6 +33,15 @@ CANARY_DOMAIN=
 IMAGE=$DEFAULT_CANARY_IMAGE
 WEBHOOK_BASE=
 DIRECT=
+EDGE=0
+EDGE_FORCE=0
+EDGE_HTTP_HOST=
+EDGE_HTTP_PORT=
+EDGE_HTTPS_HOST=
+EDGE_HTTPS_PORT=
+NGINX_CONF_DIR=
+EDGE_TLS_DIR=
+EDGE_ACME_DIR=
 KEEP=0
 LOCAL_REGISTRY=0
 WITH_VOLUME=0
@@ -50,6 +65,11 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
   --webhook-base URL     baza URL webhooków (domyślnie https://<webhook.domain> z configu)
   --direct URL           zamiast https://<domena>/ pytaj nginx Węglarki bezpośrednio (Host: <domena>),
                          bez Traefika i TLS — do testów lokalnych/CI, np. http://127.0.0.1:8088
+                         (tylko tryb behind; w trybie edge jest odrzucane)
+  --edge                 wymuś tryb edge, gdy [ingress] mode nie jest widoczne w configu (normalnie tryb
+                         wykrywany jest z configu). W trybie edge adresy publikacji biorą się z
+                         [ingress] bind (HTTP) i https_bind (TLS), certyfikat kanarka ląduje w
+                         <nginx_conf_dir>/tls, a ruch idzie po https z `curl --resolve ... -k`.
   --keep                 nie usuwaj kanarka na końcu (instancje pomocnicze i tak znikają)
   --with-local-registry  dodatkowo: webhook z realnym deployem + duplikat dostarczenia i wymuszony rollback.
                          Stawia tymczasowy rejestr na 127.0.0.1:<port>; usługa Podmana użytkownika musi
@@ -86,6 +106,7 @@ while [ $# -gt 0 ]; do
     --canary-image) IMAGE=${2:?--canary-image wymaga wartości}; shift 2 ;;
     --webhook-base) WEBHOOK_BASE=${2:?--webhook-base wymaga wartości}; shift 2 ;;
     --direct) DIRECT=${2:?--direct wymaga wartości}; shift 2 ;;
+    --edge) EDGE_FORCE=1; shift ;;
     --keep) KEEP=1; shift ;;
     --with-local-registry) LOCAL_REGISTRY=1; shift ;;
     --with-volume) WITH_VOLUME=1; shift ;;
@@ -118,6 +139,24 @@ toml_get() {
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$CONFIG" | head -n1
 }
 
+# Splits a publish address from the config (`<ip>:<port>`, `[v6]:<port>`) into $BIND_HOST/$BIND_PORT.
+# A wildcard address (0.0.0.0, ::) is reached through loopback: that is where the script connects from.
+split_bind() { # wartość etykieta
+  local value=$1 label=$2
+  case $value in
+    \[*\]:*) BIND_HOST=${value%:*}; BIND_HOST=${BIND_HOST#[}; BIND_HOST=${BIND_HOST%]} ;;
+    *:*) BIND_HOST=${value%:*}; BIND_PORT=${value##*:} ;;
+    *) die_usage "$label: oczekuję <ip>:<port>, mam '$value'" ;;
+  esac
+  case $BIND_HOST in
+    0.0.0.0 | :: | '[::]' | localhost) BIND_HOST=127.0.0.1 ;;
+    '') die_usage "$label: brak adresu w '$value'" ;;
+  esac
+  case $BIND_PORT in
+    '' | *[!0-9]*) die_usage "$label: brak portu w '$value'" ;;
+  esac
+}
+
 if [ -z "$WEBHOOK_BASE" ]; then
   webhook_domain=$(toml_get domain)
   [ -n "$webhook_domain" ] || die_usage "brak [webhook] domain w $CONFIG — podaj --webhook-base"
@@ -126,6 +165,41 @@ fi
 WEBHOOK_BASE=${WEBHOOK_BASE%/}
 DIRECT=${DIRECT%/}
 TRAEFIK_FILE=$(toml_get traefik_dynamic_file)
+
+# ── Tryb ingressu (behind / edge) ────────────────────────────────────────────
+
+# Detection comes from the config (`[ingress] mode`); `--edge` only forces it (e.g. a stripped config).
+case $(toml_get mode) in
+  edge) EDGE=1 ;;
+  behind | '') ;;
+  *) die_usage "nieznany [ingress] mode w $CONFIG: $(toml_get mode)" ;;
+esac
+[ "$EDGE_FORCE" = 0 ] || EDGE=1
+if [ "$EDGE" = 1 ]; then
+  [ -z "$DIRECT" ] || die_usage "--direct nie ma zastosowania w trybie edge: ruch idzie po https na [ingress] https_bind"
+  split_bind "$(toml_get bind)" "[ingress] bind"
+  EDGE_HTTP_HOST=$BIND_HOST
+  EDGE_HTTP_PORT=$BIND_PORT
+  https_bind=$(toml_get https_bind)
+  [ -n "$https_bind" ] || die_usage "tryb edge wymaga [ingress] https_bind = \"<ip>:<port>\" w $CONFIG"
+  split_bind "$https_bind" "[ingress] https_bind"
+  EDGE_HTTPS_HOST=$BIND_HOST
+  EDGE_HTTPS_PORT=$BIND_PORT
+  # <nginx_conf_dir> is the host directory the daemon mounts at /etc/nginx: `[ingress] nginx_conf_dir` or
+  # `<state dir>/nginx`; the state dir is `[state] dir` or the directory of weglarka.toml.
+  NGINX_CONF_DIR=$(toml_get nginx_conf_dir)
+  if [ -z "$NGINX_CONF_DIR" ]; then
+    state_dir=$(toml_get dir)
+    if [ -z "$state_dir" ]; then
+      state_dir=$(cd -- "$(dirname -- "$CONFIG")" && pwd)
+    elif [ "${state_dir#/}" = "$state_dir" ]; then
+      state_dir=$(cd -- "$(dirname -- "$CONFIG")" && pwd)/$state_dir
+    fi
+    NGINX_CONF_DIR=$state_dir/nginx
+  fi
+  EDGE_TLS_DIR=$NGINX_CONF_DIR/tls
+  EDGE_ACME_DIR=$NGINX_CONF_DIR/acme
+fi
 
 REG=127.0.0.1:$REGISTRY_PORT
 WORK=$(mktemp -d)
@@ -213,12 +287,25 @@ cleanup_helpers() {
   podman rmi -f "$REG/wg-accept/wh:t" "$REG/wg-accept/rb:t" >/dev/null 2>&1 || true
 }
 
+# Edge mode only: the canary's certificate and the ACME token are test artifacts of this run.
+# A certificate that was already in <nginx_conf_dir>/tls (a real one) is left alone.
+remove_edge_canary_artifacts() {
+  [ "$EDGE" = 1 ] || return 0
+  if [ "$(get created_cert)" = 1 ]; then
+    rm -f "$EDGE_TLS_DIR/$CANARY_DOMAIN.crt" "$EDGE_TLS_DIR/$CANARY_DOMAIN.key" 2>/dev/null || true
+  fi
+  acme_token=$(get acme_token)
+  [ -z "$acme_token" ] || rm -f "$EDGE_ACME_DIR/$acme_token" 2>/dev/null || true
+  return 0
+}
+
 on_exit() {
   local rc=$?
   trap - EXIT INT TERM
   cleanup_helpers
   if [ "$KEEP" != 1 ]; then
     wg apps remove --ignore-missing "$CANARY" >/dev/null 2>&1 || true
+    remove_edge_canary_artifacts
   fi
   rm -rf "$WORK"
   exit "$rc"
@@ -246,10 +333,16 @@ wait_for() { # opis timeout polecenie...
 }
 
 # One request to the canary → HTTP code ("000" on a transport error); body in $WORK/body.
+# Extra curl arguments (e.g. forged headers) come from the caller.
 canary_request() {
   local rc=0 code url=https://$CANARY_DOMAIN/
-  local -a extra=()
-  if [ -n "$DIRECT" ]; then
+  local -a extra=("$@")
+  if [ "$EDGE" = 1 ]; then
+    # nginx terminates TLS here: the certificate is the one bootstrapped for the canary (self-signed in
+    # tests), so `-k`; `--resolve` points the domain at the published https port (DNS is not needed).
+    url=https://$CANARY_DOMAIN:$EDGE_HTTPS_PORT/
+    extra+=(--resolve "$CANARY_DOMAIN:$EDGE_HTTPS_PORT:$EDGE_HTTPS_HOST" -k)
+  elif [ -n "$DIRECT" ]; then
     url=$DIRECT/
     # Impersonate Traefik: the request reaches nginx through the port forwarder, which dials from one of
     # nginx's own addresses — trusted by default — so the header must arrive at the app (docs/decisions/0032).
@@ -258,6 +351,12 @@ canary_request() {
   code=$(curl -sS --max-time 10 -o "$WORK/body" -w '%{http_code}' ${extra[@]+"${extra[@]}"} "$url" 2>"$WORK/curl_err") || rc=$?
   put curl_rc "$rc"
   printf '%s' "$code"
+}
+
+# A whole header line from whoami: `X-Forwarded-Proto: http` is a prefix of `...: https`, so a substring
+# check would report a forged value that nginx actually overwrote.
+body_has_line() { # pełna linia
+  tr -d '\r' <"$WORK/body" | grep -qixF -- "$1"
 }
 
 # Predicates for wait_for (called indirectly).
@@ -274,6 +373,30 @@ body_has() { # początek linii
 # The canary answers 200 and a header from nginx/Traefik is visible (X-Forwarded-Host = the domain).
 canary_ok() {
   [ "$(canary_request)" = 200 ] && body_has "X-Forwarded-Host: $CANARY_DOMAIN"
+}
+
+# Edge mode: a self-signed certificate for the canary domain under <nginx_conf_dir>/tls. nginx renders a
+# TLS server only for a routed domain that has a cert pair, and a changed certificate set reloads nginx
+# (nginx -t + SIGHUP) instead of recreating its container (issue #95).
+edge_make_cert() { # domena
+  # The daemon creates <nginx_conf_dir>/{tls,acme} on its first apply (`tls/` is 0700): only the files are
+  # ours, the directory modes stay as the daemon made them.
+  mkdir -p "$EDGE_TLS_DIR"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
+    -keyout "$EDGE_TLS_DIR/$1.key" -out "$EDGE_TLS_DIR/$1.crt" -subj "/CN=$1" \
+    -addext "subjectAltName=DNS:$1" >/dev/null 2>&1
+  chmod 600 "$EDGE_TLS_DIR/$1.key"
+  chmod 644 "$EDGE_TLS_DIR/$1.crt"
+  put created_cert 1
+}
+
+edge_ensure_cert() { # domena
+  if [ -s "$EDGE_TLS_DIR/$1.crt" ] && [ -s "$EDGE_TLS_DIR/$1.key" ]; then
+    log "certyfikat dla $1 już jest w $EDGE_TLS_DIR"
+  else
+    edge_make_cert "$1"
+    log "zapisano testowy certyfikat dla $1 w $EDGE_TLS_DIR"
+  fi
 }
 
 hmac_hex() { # sekret plik → hex. Sekret jest jednorazowy i testowy (argv widoczny lokalnie przez chwilę).
@@ -363,6 +486,11 @@ step_doctor() {
 
 step_canary() {
   local out outcome digest runtime rc=0
+  if [ "$EDGE" = 1 ]; then
+    # The certificate must exist before the app is added: the ingress apply only renders a TLS server for
+    # a routed domain that already has a cert pair (fail closed otherwise).
+    edge_ensure_cert "$CANARY_DOMAIN"
+  fi
   wg apps remove --ignore-missing "$CANARY" >/dev/null
   if [ -n "$HEALTH_WINDOW" ]; then
     # Same spec as the flags below, plus a shortened health gate (the default window is 30 s).
@@ -391,13 +519,22 @@ EOF
   [ "$runtime" = running ] || die "kanarek nie działa (runtime=$runtime)"
   case $digest in sha256:*) ;; *) die "brak digestu w apps show" ;; esac
   log "outcome=$outcome runtime=$runtime digest=$digest"
-  if [ -n "$TRAEFIK_FILE" ] && [ -r "$TRAEFIK_FILE" ]; then
+  if [ "$EDGE" = 1 ]; then
+    # The daemon rerenders nginx.conf and reloads it (nginx -t + SIGHUP, no container recreate) on an
+    # ingress change; a TLS server for the canary domain proves both the certificate rescan and the reload.
+    wait_for "serwer TLS w nginx.conf" 30 \
+      podman exec weglarka-nginx grep -qF "tls/$CANARY_DOMAIN.crt" /etc/nginx/nginx.conf \
+      || die "brak 'ssl_certificate .../tls/$CANARY_DOMAIN.crt' w nginx.conf po 30s — certyfikat nie trafił do $EDGE_TLS_DIR albo reload nginx się nie wykonał"
+    note "$outcome, $digest, serwer TLS w nginx.conf"
+  elif [ -n "$TRAEFIK_FILE" ] && [ -r "$TRAEFIK_FILE" ]; then
     wait_for "router w pliku Traefika" 30 grep -qF "$CANARY_DOMAIN" "$TRAEFIK_FILE" \
       || die "domena kanarka nie pojawiła się w $TRAEFIK_FILE"
+    note "$outcome, $digest"
   else
     log "plik Traefika niedostępny — pomijam sprawdzenie routera"
+    note "$outcome, $digest"
   fi
-  note "$outcome, $digest"
+  return 0
 }
 
 step_traffic() {
@@ -407,6 +544,9 @@ step_traffic() {
     [ "$code" != 200 ] || break
     i=$((i + 5))
     if [ "$i" -gt "$CERT_TIMEOUT" ]; then
+      if [ "$EDGE" = 1 ]; then
+        die "brak 200 po ${CERT_TIMEOUT}s (ostatni: https=$code, curl=$(get curl_rc): $(tr '\n' ' ' <"$WORK/curl_err")) — certyfikat w $EDGE_TLS_DIR, reload nginx, [ingress] https_bind?"
+      fi
       die "brak 200 po ${CERT_TIMEOUT}s (ostatni: http=$code, curl=$(get curl_rc): $(tr '\n' ' ' <"$WORK/curl_err")) — DNS, allowlista walidatora, certyfikat Traefika (curl 60 = cert jeszcze niewystawiony)?"
     fi
     sleep 5
@@ -417,7 +557,23 @@ step_traffic() {
   body_has 'X-Forwarded-For:' || die "brak X-Forwarded-For w odpowiedzi whoami"
   body_has 'X-Forwarded-Proto: https' \
     || die "brak X-Forwarded-Proto: https (nginx nie ufa peerowi? porównaj \`remote_addr\` z logu nginx z własnymi adresami kontenera i sprawdź [ingress] trusted_proxies, docs/decisions/0032)"
-  if [ -z "$DIRECT" ]; then
+  if [ "$EDGE" = 1 ]; then
+    # Edge mode terminates TLS, so nginx rebuilds the forwarded headers from the connection ($scheme,
+    # $remote_addr, $host) and must not trust what the client sent: a forged chain has to be overwritten,
+    # and `X-Forwarded-Proto: http` must not trigger the HTTP→HTTPS redirect on the TLS listener.
+    code=$(canary_request -H 'X-Forwarded-Proto: http' -H 'X-Forwarded-For: 203.0.113.9' \
+      -H 'X-Forwarded-Host: forged.example')
+    [ "$code" = 200 ] || die "żądanie https z podszytymi X-Forwarded-* → $code zamiast 200 (przekierowanie po X-Forwarded-Proto: http?)"
+    body_has_line 'X-Forwarded-Proto: https' \
+      || die "przy podszytym X-Forwarded-Proto: http apka nie widzi 'X-Forwarded-Proto: https' (nginx ma je nadpisać ze \$scheme)"
+    if body_has_line 'X-Forwarded-Host: forged.example'; then
+      die "podszyty X-Forwarded-Host (forged.example) dotarł do apki — w trybie edge nginx ma go nadpisać"
+    fi
+    if body_has_line 'X-Forwarded-For: 203.0.113.9'; then
+      die "podszyty X-Forwarded-For (203.0.113.9) dotarł do apki — w trybie edge nginx ma go nadpisać"
+    fi
+    note "https://$CANARY_DOMAIN:$EDGE_HTTPS_PORT/ → 200, cert (testowy), X-Forwarded-* przebudowane z połączenia"
+  elif [ -z "$DIRECT" ]; then
     note "https://$CANARY_DOMAIN/ → 200, cert ważny, nagłówki forwardowane"
   else
     note "$DIRECT (Host: $CANARY_DOMAIN) → 200, nagłówki forwardowane (X-Forwarded-Proto od zaufanego peera); TLS nie sprawdzany"
@@ -458,10 +614,15 @@ step_streaming() {
 
 # Plain HTTP on the canary domain redirects to HTTPS (no -L). Through Traefik this proves the `http`
 # router exists; with --direct we impersonate Traefik's http entrypoint (X-Forwarded-Proto: http).
+# In edge mode nginx itself owns the HTTP publish, so the request carries no forwarded headers at all:
+# the redirect must come from the connection, not from anything the client claims.
 step_http_redirect() {
   local url=http://$CANARY_DOMAIN/ code loc
   local -a extra=()
-  if [ -n "$DIRECT" ]; then
+  if [ "$EDGE" = 1 ]; then
+    url=http://$EDGE_HTTP_HOST:$EDGE_HTTP_PORT/
+    extra=(-H "Host: $CANARY_DOMAIN")
+  elif [ -n "$DIRECT" ]; then
     url=$DIRECT/
     extra=(-H "Host: $CANARY_DOMAIN" -H 'X-Forwarded-Proto: http')
   fi
@@ -469,9 +630,42 @@ step_http_redirect() {
     || die "curl $url: $(tr '\n' ' ' <"$WORK/curl_err")"
   loc=${code#* }
   code=${code%% *}
-  [ "$code" = 301 ] || die "http://$CANARY_DOMAIN/ → $code zamiast 301 (brak routera na entrypoincie http? 404 z Traefika = stary plik/obraz, docs/decisions/0005)"
+  if [ "$code" != 301 ]; then
+    if [ "$EDGE" = 1 ]; then
+      die "http://$EDGE_HTTP_HOST:$EDGE_HTTP_PORT/ (Host: $CANARY_DOMAIN) → $code zamiast 301 (poza prefiksem ACME każda routowana domena na porcie HTTP przekierowuje na https)"
+    fi
+    die "http://$CANARY_DOMAIN/ → $code zamiast 301 (brak routera na entrypoincie http? 404 z Traefika = stary plik/obraz, docs/decisions/0005)"
+  fi
   [ "$loc" = "https://$CANARY_DOMAIN/" ] || die "redirect na '$loc' zamiast https://$CANARY_DOMAIN/"
-  note "http://$CANARY_DOMAIN/ → 301 https://$CANARY_DOMAIN/"
+  if [ "$EDGE" = 1 ]; then
+    note "http://$EDGE_HTTP_HOST:$EDGE_HTTP_PORT/ (Host: $CANARY_DOMAIN) → 301 https://$CANARY_DOMAIN/"
+  else
+    note "http://$CANARY_DOMAIN/ → 301 https://$CANARY_DOMAIN/"
+  fi
+}
+
+# ACME HTTP-01 (issue #95): a token in `<nginx_conf_dir>/acme/<token>` is served over the plain-HTTP publish
+# at /.well-known/acme-challenge/<token> — the one path that must answer instead of redirecting, or the
+# certificate flow cannot complete. Edge mode only (behind mode has no ACME webroot).
+step_acme() {
+  local token body code loc
+  token=wg-accept-$$-acme
+  body=wg-accept-acme-body-$$
+  mkdir -p "$EDGE_ACME_DIR"
+  printf '%s' "$body" >"$EDGE_ACME_DIR/$token"
+  chmod 644 "$EDGE_ACME_DIR/$token"
+  put acme_token "$token"
+  code=$(curl -sS --max-time 10 -o "$WORK/acme.body" -w '%{http_code} %{redirect_url}' \
+    -H "Host: $CANARY_DOMAIN" 2>"$WORK/curl_err" \
+    "http://$EDGE_HTTP_HOST:$EDGE_HTTP_PORT/.well-known/acme-challenge/$token") \
+    || die "curl http://$EDGE_HTTP_HOST:$EDGE_HTTP_PORT/.well-known/acme-challenge/$token nie powiódł się: $(tr '\n' ' ' <"$WORK/curl_err")"
+  loc=${code#* }
+  code=${code%% *}
+  [ "$code" = 200 ] || die "ACME HTTP-01 → $code zamiast 200 (redirect na '$loc'? prefiks ACME nie może być przekierowany)"
+  [ -z "$loc" ] || die "ACME HTTP-01 → redirect na '$loc'; prefiks ACME nie może być przekierowany"
+  [ "$(cat "$WORK/acme.body")" = "$body" ] \
+    || die "ACME HTTP-01 zwróciło '$(cat "$WORK/acme.body")' zamiast '$body' — webroot $EDGE_ACME_DIR nie jest podpięty?"
+  note "ACME HTTP-01: token z <nginx_conf_dir>/acme → 200 bez redirectu"
 }
 
 step_registry() {
@@ -729,7 +923,14 @@ step_cleanup() {
   printf '%s' "$out" | jq -e --arg n "$CANARY" \
     '[.checks[] | select(.id == "state.orphan_secrets" and (((.message // "") + " " + (.hint // "")) | contains($n)))] | length == 0' >/dev/null \
     || die "doctor nadal zgłasza osierocone sekrety kanarka ($CANARY) po --purge-secrets"
-  if [ -n "$TRAEFIK_FILE" ] && [ -r "$TRAEFIK_FILE" ]; then
+  if [ "$EDGE" = 1 ]; then
+    # The canary's TLS server disappears with the app; then the test artifacts (certificate, ACME token) go.
+    wait_for "zniknięcie serwera TLS" 30 \
+      bash -c "! podman exec weglarka-nginx cat /etc/nginx/nginx.conf | grep -qF 'tls/$CANARY_DOMAIN.crt'" \
+      || die "domena kanarka nadal ma serwer TLS w nginx.conf"
+    remove_edge_canary_artifacts
+    note "kanarek usunięty z sekretami (bez osieroconych wpisów), serwer TLS zniknął, certyfikat i token ACME usunięte"
+  elif [ -n "$TRAEFIK_FILE" ] && [ -r "$TRAEFIK_FILE" ]; then
     wait_for "zniknięcie routera" 30 router_gone || die "domena kanarka nadal w $TRAEFIK_FILE"
     note "kanarek usunięty z sekretami (bez osieroconych wpisów), router zniknął z pliku Traefika"
   else
@@ -751,13 +952,19 @@ fi
 run_step doctor "doctor (przez API demona)" step_doctor
 # Without a running daemon the following steps make no sense.
 run_step canary "kanarek: apps add, deploy, bramka zdrowia, digest" step_canary doctor
-if [ -z "$DIRECT" ]; then
+if [ "$EDGE" = 1 ]; then
+  run_step traffic "ruch: https://$CANARY_DOMAIN:$EDGE_HTTPS_PORT → 200, TLS, nagłówki" step_traffic canary
+elif [ -z "$DIRECT" ]; then
   run_step traffic "ruch: https://$CANARY_DOMAIN → 200, cert, nagłówki" step_traffic canary
 else
   run_step traffic "ruch: nginx bezpośrednio → 200, nagłówki" step_traffic canary
 fi
 run_step streaming "ingress: streaming = reload nginx bez odtworzenia kontenera" step_streaming canary traffic
 run_step http_redirect "http → 301 na https (bez -L)" step_http_redirect canary traffic
+# The ACME webroot exists only in edge mode, so behind keeps its step list unchanged.
+if [ "$EDGE" = 1 ]; then
+  run_step acme "ACME HTTP-01: token z webroota → 200 bez redirectu" step_acme canary
+fi
 run_step webhook_protocol "webhook: 202 / 401 / 204" step_webhook_protocol canary
 run_step secrets "sekrety: set → list → remove → list" step_secrets webhook_protocol
 if [ "$LOCAL_REGISTRY" = 1 ]; then
