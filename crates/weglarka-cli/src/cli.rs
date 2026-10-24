@@ -116,6 +116,13 @@ pub struct AddArgs {
     /// Domain routed to the app (repeatable).
     #[arg(long = "domain", conflicts_with = "spec")]
     pub domains: Vec<String>,
+    /// Path prefix of the domains served by this app, e.g. `/api` (repeatable; default `/`). Several
+    /// instances may share a domain when their prefixes are disjoint.
+    #[arg(long = "path", value_name = "PREFIX", conflicts_with = "spec")]
+    pub paths: Vec<String>,
+    /// Strip the `--path` prefix before proxying (`/api/x` reaches the app as `/x`).
+    #[arg(long, conflicts_with = "spec")]
+    pub strip_prefix: bool,
     /// HTTP port in the container.
     #[arg(long, conflicts_with = "spec")]
     pub port: Option<u16>,

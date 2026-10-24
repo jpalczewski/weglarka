@@ -1,6 +1,6 @@
 # 0031 — Path-prefix routing (several instances behind one domain)
 
-Status: proposed (2026-10-24, issue #130)
+Status: accepted (2026-10-24, issue #130)
 
 ## Problem
 
@@ -21,7 +21,7 @@ reverse proxy inside the stack. It is a routing rule, so the ingress should expr
 - **Overlap.** Two instances may share a domain only when their prefixes are disjoint: an identical prefix
   (including a second `/`) and a nested prefix (`/api` vs `/api/v2`) are rejected with
   `IngressError::PathConflict`. `/` coexists with every other prefix — it is the catch-all by design. A
-  domain without `paths` on both apps is still the old `409`. The webhook domain stays exclusive.
+  domain without `paths` on both apps is still refused with the old "domain already used" error (`400`, like every ingress validation failure). The webhook domain stays exclusive.
 - **Rendering.** Domains with an identical route set (same instances and paths) share one `server`, so an
   app whose domains are not shared renders byte-for-byte as before. Traefik is unchanged: one router per
   app with `Host(...)`; only nginx knows paths. `streaming` is per instance, hence per path.
@@ -36,10 +36,11 @@ reverse proxy inside the stack. It is a routing rule, so the ingress should expr
 
 ## Consequences
 
+`doctor` adds the `ingress.routes` check; the list API is unchanged (`apps show` carries `paths`).
 `apps.toml` with `paths`/`strip_prefix` is refused by an older daemon (`deny_unknown_fields`, schema gate):
 before a downgrade remove both fields or restore the pre-upgrade files (`docs/install.md`). New CLI flags
 `--path` and `--strip-prefix`; the API app view gains `paths`. Tests: plan validation, nginx/Traefik
-snapshots, hash stability, probe path, daemon 409 and reload-without-recreate.
+snapshots, hash stability, probe path, daemon refusal and reload-without-recreate.
 
 ## Rejected alternatives
 
