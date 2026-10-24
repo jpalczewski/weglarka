@@ -29,3 +29,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0020](0020-image-retention.md) | Image retention: keep the current and previous image, prune the rest (issue #40) |
 | [0021](0021-notifications.md) | Notifications: engine events → severity → dedup → durable outbox → ntfy |
 | [0022](0022-crash-loop-detection.md) | Crash-loop and unhealthy detection |
+| [0023](0023-state-schema-version.md) | State schema version and a startup compatibility check (issue #98) |

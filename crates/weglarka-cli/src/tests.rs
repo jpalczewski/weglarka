@@ -350,6 +350,33 @@ fn preflight_broken_host() {
 }
 
 #[test]
+fn preflight_reports_a_newer_apps_schema_instead_of_an_unknown_field() {
+    // The host-port check reads apps.toml itself; a file written by a newer Węglarka must be
+    // reported as a schema mismatch, not as a typo (ADR 0023).
+    let h = FakeHost::healthy().file(
+        "/etc/weglarka/apps.toml",
+        "schema_version = 2\n[apps.a]\nimage = \"x:1\"\nfuture_field = 1\n",
+    );
+    let r = report(&h, Some(CONFIG));
+    let check = r
+        .checks
+        .iter()
+        .find(|c| c.id == "apps.host_ports_free")
+        .expect("the host-port check applies with a config");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(
+        check.message.contains("schema version 2"),
+        "{}",
+        check.message
+    );
+    assert!(
+        check.hint.as_deref().unwrap_or_default().contains("newer"),
+        "{:?}",
+        check.hint
+    );
+}
+
+#[test]
 fn preflight_without_config_or_user_degrades_gracefully() {
     let h = FakeHost::default();
     let r = report(&h, None);

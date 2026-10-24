@@ -1042,16 +1042,47 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   Zmiana obrazu przez `update` deployuje od razu (pull, bramka zdrowia; nieudana bramka = automatyczny rollback
   do poprzedniego digestu, kod wyjścia 6). Wróć na `:latest` tak samo, z `--auto-update`:
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
-- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, więc starszy demon nie odczyta
-  `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
+- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, a `apps.toml` i
+  `state.toml` mogą nieść `schema_version` — demon, który zastanie plik nowszy niż rozumie, odmawia
+  startu z czytelnym komunikatem ([wersja schematu plików
+  stanu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Przed downgradem do wersji, która
+  dane pole dopiero wprowadziła, usuń je ręcznie: z apek `start = false`
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on)),
   wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
   ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
   ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
-  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
-  ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
+  ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy)).
+  Inaczej daemon nie wystartuje z błędem parsowania.
+
+### Wersja schematu plików stanu (rollback między wersjami)
+
+`apps.toml` i `state.toml` mogą nieść pole `schema_version` (decyzja:
+[0023](decisions/0023-state-schema-version.md)). Zasady:
+
+- **Plik bez `schema_version` to wersja 1** — dzisiejszy kształt. Demon celowo **nie** dopisuje
+  `schema_version = 1`, więc pliki pozostają bez zmian, a rollback do Węglarki sprzed wersjonowania
+  nadal działa.
+- Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
+  `apps.toml`/`state.toml`); przy pierwszym starcie taka wersja uruchamia migrację i zapisuje nowy
+  numer.
+- **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
+
+  ```text
+  /var/lib/weglarka/state.toml: schema version 2 is newer than this daemon supports (1); written by
+  a newer Węglarka — roll forward to that version, or restore apps.toml and state.toml from before
+  the upgrade
+  ```
+
+  To nie jest błąd pliku, tylko sygnał, że obraz Węglarki jest starszy niż stan. Wyjścia: wróć na
+  nowszy obraz (roll forward) albo przywróć `apps.toml` i `state.toml` z kopii sprzed aktualizacji.
+  `weglarka doctor --preflight` czyta `apps.toml` sam i pokazuje ten sam komunikat jeszcze przed
+  restartem demona.
+- **Przed każdą aktualizacją Węglarki** zrób kopię katalogu stanu (albo przynajmniej `apps.toml`,
+  `state.toml` i `secrets.toml`). Ta kopia jest jedyną drogą powrotu przez granicę wersji schematu:
+  nowszy demon migruje pliki, a starszy ich potem nie odczyta.
+- Po przywróceniu starszej kopii `state.toml` reconcile uzupełni zakresy UID z etykiet kontenerów, ale
+  apki bez przypiętego `current` mogą zostać wdrożone od nowa (pull + bramka zdrowia).
 
 ### `apps update`: co się dzieje po zmianie
 

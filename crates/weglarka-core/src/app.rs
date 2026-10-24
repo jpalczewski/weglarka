@@ -620,6 +620,12 @@ fn is_true(value: &bool) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppsFile {
+    /// On-disk schema version (issue #98, `docs/decisions/0023-state-schema-version.md`). `None` is
+    /// the implicit v1 — the shape written before versioning, still the current one, so v1 files
+    /// stay byte-for-byte unchanged. Written only once the schema moves past v1; serialized first
+    /// because TOML wants values before tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// Volumes shared between instances (issue #33, `docs/decisions/0017-shared-volumes.md`),
     /// declared once here and mounted by apps through [`AppSpec::shared_volumes`]. Serialized
     /// before `apps` so the TOML file keeps its top-level tables first.

@@ -56,8 +56,10 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 2. `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 3. Snapshoty: `INSTA_UPDATE=always cargo test`, przejrzyj diff `.snap` i commituj `.snap` (`.snap.new` jest ignorowany).
 4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
-   w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Opisz też kompatybilność wstecz
-   (`deny_unknown_fields` a rollback) w PR i w `docs/install.md`.
+   w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Nowe pole `apps.toml`/`state.toml`
+   (także `AppState`) → podbij `state::SCHEMA_VERSION` i dopisz krok w `SCHEMA_STEPS` (kompilacja tego pilnuje,
+   ADR 0023); kompatybilność wstecz (`deny_unknown_fields` a rollback) opisz w PR i w `docs/install.md`
+   — dla plików stanu to [wersja schematu](docs/install.md#wersja-schematu-plików-stanu-rollback-między-wersjami).
 5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md).
    Tabelę indeksu generuje `scripts/adr.sh index` — nie edytuj jej ręcznie. Numer ADR to zasób wspólny
    dla równoległych gałęzi: zarezerwuj go wcześnie (push + draft PR ze stubem ADR-a) i scalaj szybko;
@@ -114,7 +116,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 
 | Obszar | Pliki |
 |---|---|
-| model i walidacja apki | `core/src/app.rs`, `core/src/state.rs` (`AppSpec`, `AppsFile`, `validate_app`) |
+| model i walidacja apki | `core/src/app.rs`, `core/src/state.rs` (`AppSpec`, `AppsFile`, `validate_app`, `SCHEMA_VERSION` + bramka schematu) |
 | pętla reconcile | `core/src/reconcile.rs` — czyste `plan()` (`Target`/`Action`) + `execute()` (jedyny pisarz stanu) |
 | deploy | `core/src/deploy.rs` — `deploy_locked`: pull → stop → create+start → bramka → rollback; `provision_locked` |
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
@@ -133,8 +135,12 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 
 - **Nowe pola `AppSpec` / `ContainerSpec` są opcjonalne i nie zmieniają `spec_hash`, gdy nie są ustawione**
   (`skip_serializing_if` w `HashInput`) — inaczej aktualizacja Węglarki odtworzy wszystkie działające apki.
-- **TOML-e mają `deny_unknown_fields`:** nowe pole w `state.toml`/`apps.toml` łamie rollback do starszego demona —
-  opisz to w PR i w notatce do wdrożenia.
+- **Wersjonowanie schematu stanu (ADR 0023):** `apps.toml`/`state.toml` mogą nieść `schema_version`; plik bez
+  znacznika to v1 (dzisiejszy kształt — demon celowo go nie dopisuje, żeby nie łamać najbliższego rollbacku),
+  a każde nowe pole wymaga podbicia `state::SCHEMA_VERSION` i wpisu w `SCHEMA_STEPS` (pilnuje tego const-assert).
+  Starszy demon odmawia startu z czytelnym komunikatem zamiast błędu parsowania; rollback przez granicę wersji
+  schematu wymaga kopii plików sprzed aktualizacji. `secrets.toml` nie jest (jeszcze) wersjonowany, a `[notify]`
+  w `weglarka.toml` nadal trzeba usunąć ręcznie przed downgradem.
 - **Rollback przywraca digest, nie spec:** nieudany deploy wznawia poprzedni obraz *z nowym spec-em*, więc zmiana
   specu, która psuje start (`command`, `env`, mount), obleje deploy **i** rollback — apka leży do czasu poprawki
   specu. Nie opisuj nowego pola `AppSpec` jako „rollback-safe” (przykład: `command`, ADR 0019).

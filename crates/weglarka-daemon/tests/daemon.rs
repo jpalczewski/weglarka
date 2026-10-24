@@ -26,14 +26,8 @@ struct Harness {
     running: Running<FakePodman>,
 }
 
-async fn harness() -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
+/// The host configuration every test uses, pointed at `root` (a short path for the unix socket).
+fn settings(root: &Path) -> Settings {
     let host = HostConfig::from_toml_str(&format!(
         r#"
 [ingress]
@@ -54,9 +48,19 @@ dir = "{root}/state"
         root = root.display()
     ))
     .unwrap();
+    Settings::from_host(host, root.join("weglarka.toml"))
+}
+
+async fn harness() -> Harness {
+    // Short path: `sun_path` is limited to ~104 characters.
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().to_owned();
+    std::fs::write(root.join("traefik.yml"), "").unwrap();
     let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
+    let running = start(settings(&root), fake.clone()).await.unwrap();
     Harness {
         _dir: dir,
         root,
@@ -614,4 +618,40 @@ async fn refuses_loose_secrets_permissions() {
     )
     .await;
     assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn refuses_a_state_schema_from_a_newer_daemon() {
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(root.join("traefik.yml"), "").unwrap();
+
+    // `state.toml` written by a newer schema stops the daemon before it binds anything.
+    std::fs::write(root.join("state/state.toml"), "schema_version = 2\n").unwrap();
+    let err = match start(settings(root), FakePodman::new()).await {
+        Ok(_) => panic!("a newer state schema must refuse to start"),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("state.toml") && message.contains("schema version 2"),
+        "{message}"
+    );
+
+    // The same for `apps.toml`, with a valid `state.toml` next to it.
+    std::fs::write(root.join("state/state.toml"), "").unwrap();
+    std::fs::write(
+        root.join("state/apps.toml"),
+        "schema_version = 2\n[apps.a]\nimage = \"x:1\"\n",
+    )
+    .unwrap();
+    let err = match start(settings(root), FakePodman::new()).await {
+        Ok(_) => panic!("a newer apps schema must refuse to start"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("apps.toml"), "{err}");
 }

@@ -36,6 +36,17 @@ fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
     check(id, CheckStatus::Ok, message, None)
 }
 
+/// A state file written by a newer Węglarka needs a different remedy than a malformed one
+/// (issue #98): do not tell the operator to delete it.
+fn state_hint(error: &state::StateError, malformed: &'static str) -> &'static str {
+    match error {
+        state::StateError::SchemaTooNew { .. } => {
+            "written by a newer Węglarka: roll forward, or restore this file from before the upgrade"
+        }
+        _ => malformed,
+    }
+}
+
 pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(ok(
@@ -108,7 +119,7 @@ async fn desired_state<P: PodmanClient>(
             "state.apps_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("fix or remove apps.toml"),
+            Some(state_hint(e, "fix or remove apps.toml")),
         ),
     });
     out.push(match &st {
@@ -117,7 +128,10 @@ async fn desired_state<P: PodmanClient>(
             "state.state_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("removing state.toml is safe (instances get a fresh deploy)"),
+            Some(state_hint(
+                e,
+                "removing state.toml is safe (instances get a fresh deploy)",
+            )),
         ),
     });
     let (Ok(apps), Ok(st)) = (apps, st) else {

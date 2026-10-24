@@ -3,6 +3,9 @@
 //! Both files are written only by the daemon, always atomically (tmp in the same directory + `fsync`
 //! + `rename` + directory `fsync`). Reading validates the contents (`deny_unknown_fields` + invariants).
 //!
+//! Both carry an optional `schema_version`: a file written by a newer Węglarka is refused with a
+//! clear message instead of an unknown-field parse error (`docs/decisions/0023-state-schema-version.md`).
+//!
 //! Decision on the two-file split: `docs/decisions/0003-state-toml.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +14,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
@@ -20,6 +24,34 @@ use crate::app::{
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
 
+/// On-disk schema version of `apps.toml` and `state.toml` (issue #98,
+/// `docs/decisions/0023-state-schema-version.md`).
+///
+/// Bump it whenever a field of either file is added, renamed or changes meaning, and add the
+/// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
+/// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
+/// misreading it as a pile of unknown fields.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Version of a file written before versioning. It stays v1 on purpose: stamping
+/// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
+/// the very rollback the marker exists to make predictable. The marker is written from the first
+/// real schema bump on, i.e. once `SCHEMA_VERSION > IMPLICIT_SCHEMA_VERSION`.
+const IMPLICIT_SCHEMA_VERSION: u32 = 1;
+
+/// One schema migration: rewrites a parsed document in place, returning a reason on failure.
+type SchemaStep = fn(&mut toml::Table) -> Result<(), String>;
+
+/// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
+/// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
+/// a newer schema without the marker).
+const SCHEMA_STEPS: &[SchemaStep] = &[];
+
+const _: () = assert!(
+    SCHEMA_STEPS.len() as u32 == SCHEMA_VERSION - IMPLICIT_SCHEMA_VERSION,
+    "one migration step per schema version above IMPLICIT_SCHEMA_VERSION"
+);
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("i/o error on {path}: {source}")]
@@ -28,6 +60,18 @@ pub enum StateError {
     Parse { path: PathBuf, message: String },
     #[error("invalid {path}: {reason}")]
     Invalid { path: PathBuf, reason: String },
+    /// The file was written by a newer Węglarka. Refusing is the point: silently misreading it as
+    /// unknown fields would hide why a rollback cannot start (issue #98).
+    #[error(
+        "{path}: schema version {found} is newer than this daemon supports ({supported}); written by \
+         a newer Węglarka — roll forward to that version, or restore apps.toml and state.toml from \
+         before the upgrade"
+    )]
+    SchemaTooNew {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 /// Last failed deploy — a marker so webhook/reconcile do not retry the same thing endlessly.
@@ -72,6 +116,10 @@ pub struct AppState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateFile {
+    /// On-disk schema version (issue #98); `None` is the implicit v1 — see
+    /// [`crate::state::SCHEMA_VERSION`] and `crates/weglarka-core/src/app.rs` (`AppsFile`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     #[serde(default)]
     pub apps: BTreeMap<InstanceName, AppState>,
     /// Fixed uid/gid range of the ingress nginx container (iteration 2, docs/decisions/0009): like
@@ -357,20 +405,101 @@ fn validate_host_ports(name: &InstanceName, ports: &[HostPort]) -> Result<(), St
     Ok(())
 }
 
-pub fn load_apps(path: &Path) -> Result<AppsFile, StateError> {
-    let Some(src) = read_optional(path)? else {
-        return Ok(AppsFile::default());
-    };
-    let apps: AppsFile = toml::from_str(&src).map_err(|e| StateError::Parse {
+/// The schema version declared by the file; no marker means the implicit v1.
+fn declared_schema_version(path: &Path, src: &str) -> Result<u32, StateError> {
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(default)]
+        schema_version: Option<toml::Value>,
+    }
+    // Deliberately tolerant (`deny_unknown_fields` off): the rest of the document is not this
+    // struct's business, and a newer schema must fail on its version, not on its fields.
+    let header: Header = toml::from_str(src).map_err(|e| StateError::Parse {
         path: path.to_owned(),
         message: e.to_string(),
     })?;
+    match header.schema_version {
+        None => Ok(IMPLICIT_SCHEMA_VERSION),
+        // Any positive integer is a version; an absurdly large one saturates, so it is reported as
+        // "newer than supported" rather than as a malformed field.
+        Some(toml::Value::Integer(v)) if v >= i64::from(IMPLICIT_SCHEMA_VERSION) => {
+            Ok(u32::try_from(v).unwrap_or(u32::MAX))
+        }
+        Some(toml::Value::Integer(_)) => {
+            Err(invalid(path, "schema_version must be an integer >= 1"))
+        }
+        Some(_) => Err(invalid(path, "schema_version must be an integer")),
+    }
+}
+
+/// Runs the migration steps that bring a file written by `from` up to [`SCHEMA_VERSION`] and stamps
+/// the version, so the next save writes the marker. Steps transform the parsed table (they may add,
+/// rename or fill nested fields); the result is deserialized directly, so a parse error here has no
+/// line numbers — acceptable for a file that is migrated once.
+fn migrate<T: DeserializeOwned>(path: &Path, src: &str, from: u32) -> Result<T, StateError> {
+    let mut table: toml::Table = toml::from_str(src).map_err(|e| StateError::Parse {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })?;
+    // In bounds: `declared_schema_version` guarantees `IMPLICIT <= from < SCHEMA_VERSION`, and the
+    // assertion next to `SCHEMA_STEPS` ties the slice length to the version difference.
+    for step in &SCHEMA_STEPS[(from - IMPLICIT_SCHEMA_VERSION) as usize..] {
+        step(&mut table).map_err(|reason| invalid(path, format!("schema migration: {reason}")))?;
+    }
+    table.insert(
+        "schema_version".to_owned(),
+        toml::Value::Integer(SCHEMA_VERSION.into()),
+    );
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| StateError::Parse {
+            path: path.to_owned(),
+            message: e.to_string(),
+        })
+}
+
+/// The shared reader: version gate first (a newer file gets a clear message, never a confusing
+/// `deny_unknown_fields` error), then migration, then the strict parse of the current schema.
+fn load_versioned<T: DeserializeOwned + Default>(path: &Path, src: &str) -> Result<T, StateError> {
+    // An empty file means "nothing declared yet", like a missing one.
+    if src.trim().is_empty() {
+        return Ok(T::default());
+    }
+    let found = declared_schema_version(path, src)?;
+    if found > SCHEMA_VERSION {
+        return Err(StateError::SchemaTooNew {
+            path: path.to_owned(),
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if found < SCHEMA_VERSION {
+        return migrate(path, src, found);
+    }
+    toml::from_str(src).map_err(|e| StateError::Parse {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })
+}
+
+/// Parses `apps.toml` content: the schema gate plus the invariants of [`load_apps`], without I/O —
+/// `weglarka doctor --preflight` reads the file itself and must report a too-new schema instead of
+/// an unknown field.
+pub fn parse_apps(path: &Path, src: &str) -> Result<AppsFile, StateError> {
+    let apps: AppsFile = load_versioned(path, src)?;
     for (name, spec) in &apps.apps {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
     crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
     crate::shared_volumes::validate(&apps).map_err(|r| invalid(path, r))?;
     Ok(apps)
+}
+
+pub fn load_apps(path: &Path) -> Result<AppsFile, StateError> {
+    let Some(src) = read_optional(path)? else {
+        return Ok(AppsFile::default());
+    };
+    parse_apps(path, &src)
 }
 
 pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
@@ -419,16 +548,18 @@ fn validate_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Parses `state.toml` content: the schema gate plus [`validate_state`], without I/O.
+pub fn parse_state(path: &Path, src: &str) -> Result<StateFile, StateError> {
+    let state: StateFile = load_versioned(path, src)?;
+    validate_state(path, &state)?;
+    Ok(state)
+}
+
 pub fn load_state(path: &Path) -> Result<StateFile, StateError> {
     let Some(src) = read_optional(path)? else {
         return Ok(StateFile::default());
     };
-    let state: StateFile = toml::from_str(&src).map_err(|e| StateError::Parse {
-        path: path.to_owned(),
-        message: e.to_string(),
-    })?;
-    validate_state(path, &state)?;
-    Ok(state)
+    parse_state(path, &src)
 }
 
 pub fn save_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
@@ -791,5 +922,135 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let apps = load_apps(&p).unwrap();
         save_apps(&p, &apps).unwrap();
         assert_eq!(load_apps(&p).unwrap(), apps);
+    }
+
+    #[test]
+    fn files_without_a_version_are_v1_and_stay_unmarked() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(&apps_path, "[apps.a]\nimage = \"x:1\"\n").unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, None);
+        save_apps(&apps_path, &apps).unwrap();
+        // v1 files keep their exact shape: stamping a marker would break a downgrade to a daemon
+        // that predates versioning (ADR 0023).
+        assert!(
+            !fs::read_to_string(&apps_path)
+                .unwrap()
+                .contains("schema_version")
+        );
+
+        let state_path = dir.path().join("state.toml");
+        fs::write(&state_path, "[apps.a]\ngeneration = 3\n").unwrap();
+        let st = load_state(&state_path).unwrap();
+        assert_eq!(st.schema_version, None);
+        save_state(&state_path, &st).unwrap();
+        assert!(
+            !fs::read_to_string(&state_path)
+                .unwrap()
+                .contains("schema_version")
+        );
+    }
+
+    #[test]
+    fn an_explicit_current_version_is_accepted_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        fs::write(
+            &p,
+            format!("schema_version = {SCHEMA_VERSION}\n[apps.a]\ngeneration = 1\n"),
+        )
+        .unwrap();
+        let st = load_state(&p).unwrap();
+        assert_eq!(st.schema_version, Some(SCHEMA_VERSION));
+        save_state(&p, &st).unwrap();
+        // A marker that is already there is preserved, not silently dropped on the next write.
+        assert!(
+            fs::read_to_string(&p)
+                .unwrap()
+                .starts_with(&format!("schema_version = {SCHEMA_VERSION}"))
+        );
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_the_payload_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        // Under `deny_unknown_fields` the `bogus` field would win; the version must be reported
+        // first — that is the whole point of issue #98.
+        fs::write(
+            &apps_path,
+            "schema_version = 2\n[apps.a]\nimage = \"x:1\"\nbogus = 1\n",
+        )
+        .unwrap();
+        let err = load_apps(&apps_path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::SchemaTooNew {
+                    found: 2,
+                    supported: SCHEMA_VERSION,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("apps.toml") && message.contains("schema version 2"),
+            "{message}"
+        );
+
+        let state_path = dir.path().join("state.toml");
+        fs::write(&state_path, "schema_version = 7\n").unwrap();
+        assert!(matches!(
+            load_state(&state_path),
+            Err(StateError::SchemaTooNew { found: 7, .. })
+        ));
+
+        // A value beyond `u32` is still "newer", not a malformed field.
+        fs::write(&state_path, "schema_version = 4294967296\n").unwrap();
+        assert!(matches!(
+            load_state(&state_path),
+            Err(StateError::SchemaTooNew {
+                found: u32::MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_versions_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        for bad in [
+            "schema_version = 0",
+            "schema_version = -1",
+            "schema_version = \"1\"",
+            "schema_version = 1.5",
+        ] {
+            fs::write(&p, format!("{bad}\n")).unwrap();
+            let err = load_state(&p).unwrap_err();
+            assert!(matches!(err, StateError::Invalid { .. }), "{bad}: {err}");
+            assert!(err.to_string().contains("schema_version"), "{bad}: {err}");
+        }
+        // An empty (or comment-only) file is "nothing yet", not a parse error.
+        fs::write(&p, "").unwrap();
+        assert_eq!(load_state(&p).unwrap(), StateFile::default());
+        fs::write(&p, "# nothing yet\n").unwrap();
+        assert_eq!(load_state(&p).unwrap(), StateFile::default());
+    }
+
+    #[test]
+    fn migrating_stamps_the_schema_version() {
+        // There is no step yet (`SCHEMA_VERSION == IMPLICIT_SCHEMA_VERSION`), so exercise the
+        // machinery directly: the first bump adds a step to `SCHEMA_STEPS` and this test keeps
+        // proving that the migrated document carries the current version.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let st: StateFile =
+            migrate(&path, "[apps.a]\ngeneration = 2\n", IMPLICIT_SCHEMA_VERSION).unwrap();
+        assert_eq!(st.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(st.apps[&name("a")].generation, 2);
     }
 }
