@@ -24,6 +24,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6l. Configi z hosta](#6l-configi-z-hosta-config_root-i-apps-reload) ·
 [6m. Wspólna sieć między apkami](#6m-wspólna-sieć-między-apkami-shared_networks) ·
 [6n. Ścieżki na jednej domenie](#6n-ścieżki-na-jednej-domenie-paths) ·
+[6o. Limit rozmiaru żądania](#6o-limit-rozmiaru-żądania-ingressmax_body_size) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -1448,6 +1449,49 @@ przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `paths` i `ingres
 przywróć pliki **z kopii sprzed aktualizacji**,
 [wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
 
+## 6o. Limit rozmiaru żądania (`ingress.max_body_size`)
+
+Domyślnie nginx przyjmuje ciało żądania do **64 MiB** (`client_max_body_size`) i odpowiada `413` na większe. To dobry
+domyślny limit dla zwykłej apki, ale uniemożliwia serwer git (push to setki MB) i rejestr kontenerów (jedna warstwa
+obrazu to jedno żądanie na kilka GB). Pole `ingress.max_body_size` zmienia limit **jednej apki**. Decyzja i odrzucone
+alternatywy: [0033](decisions/0033-ingress-max-body-size.md).
+
+```toml
+# apps.toml
+[apps.git.ingress]
+streaming = true        # zalecane razem z limitem, patrz niżej
+max_body_size = "4g"
+```
+
+Przez CLI: `weglarka apps add git --max-body-size 4g ...`, `weglarka apps update git --max-body-size 4g` oraz
+`--unset-max-body-size` (powrót do 64 MiB). Gotowy plik: [`docs/examples/max-body-size.toml`](examples/max-body-size.toml)
+(Forgejo: HTTP przez ingress + SSH na `host_ports` 2222:22).
+
+- **Składnia** jak `resources.memory`: liczba bajtów albo `<n>[k|m|g]` (wielokrotności binarne, bez rozróżniania
+  wielkości liter). **`0` oznacza brak limitu** (inaczej niż przy pamięci, gdzie `0` jest błędem). Błędna wartość
+  (`"1.5g"`, `"1t"`, przepełnienie) odrzuca `apps.toml`/`--spec` przy wczytaniu.
+- **Gdzie trafia:** `client_max_body_size` w `location` tej apki, nie w `server` — apki dzielące domenę pod różnymi
+  `paths` ([6n](#6n-ścieżki-na-jednej-domenie-paths)) mają osobne limity. Apka bez pola dostaje `nginx.conf` taki
+  jak dotąd (64 MiB w `server`).
+- **Ustawiony limit wyłącza też `proxy_request_buffering`** w locations apki. Kontener ingressu ma root tylko do
+  odczytu i niewielki tmpfs w `/tmp`, więc domyślne buforowanie ciała (nginx zapisuje je do
+  `/tmp/client_body` zanim zadzwoni do apki) oznaczałoby zapis wielu GB do RAM-u albo błąd `500`. Dotyczy to też
+  limitów poniżej 64 MiB. Buforowanie *odpowiedzi* i timeouty zostają bez zmian, dopóki nie ustawisz `streaming`.
+- **Timeouty:** `client_body_timeout`, `proxy_send_timeout` i `proxy_read_timeout` liczą **bezczynność** między
+  kolejnymi odczytami/zapisami, nie czas całego żądania, więc równomierny upload trwający minuty ich nie ucina
+  (test w CI: 96 MiB w ~76 s przechodzi mimo domyślnych 60 s). Ryzykiem jest odpowiedź *po* ostatnim bajcie —
+  rejestr weryfikuje digest warstwy i może milczeć dłużej niż 60 s — dlatego razem z limitem ustaw
+  `streaming = true` (timeouty 180 s, [6e](#6e-streaming-sse-long-polling)) i w razie potrzeby podnieś
+  `stream_timeout_secs`.
+- **Tylko ingress:** zmiana renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP — kontener nie jest
+  odtwarzany, `spec-hash` się nie zmienia. `--no-streaming` zeruje streaming, ale zostawia limit.
+- **Traefik (`behind`) się nie zmienia** — w wygenerowanym pliku nie ma limitu rozmiaru, jedyny limit na ścieżce to ten z nginxa.
+
+**Rollback:** to zmiana schematu plików stanu (wersja 6) — `apps.toml` i `state.toml` dostają `schema_version = 6`
+przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `ingress.max_body_size` z apek
+(`weglarka apps update <apka> --unset-max-body-size`) albo przywróć pliki **z kopii sprzed aktualizacji**
+([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -1483,7 +1527,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
   weglarka-self-update.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
   ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
-  ([6n](#6n-ścieżki-na-jednej-domenie-paths)). Inaczej daemon nie wystartuje z błędem parsowania.
+  ([6n](#6n-ścieżki-na-jednej-domenie-paths)) oraz `ingress.max_body_size`
+  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)). Inaczej daemon nie wystartuje z błędem parsowania.
 
 ### Wersja schematu plików stanu (rollback między wersjami)
 

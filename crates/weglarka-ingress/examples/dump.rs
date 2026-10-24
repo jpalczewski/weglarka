@@ -3,6 +3,8 @@
 //!
 //! `sse` is the only app with `ingress.streaming = true` (issue #64); `blog` deliberately keeps the
 //! buffered defaults, so `.github/scripts/test-streaming.sh` can use it as the negative control.
+//! `upload` (streamed, 256 MiB) and `capped` (not streamed, 8 MiB) carry `ingress.max_body_size`
+//! (ADR 0033) for `.github/scripts/test-body-size.sh`; `blog` is again the default-limit control.
 
 use std::collections::BTreeMap;
 
@@ -41,6 +43,23 @@ port = 3000
 
 [apps.sse.ingress]
 streaming = true
+
+[apps.upload]
+image = "ghcr.io/x/upload:latest"
+domains = ["upload.example.eu"]
+port = 3000
+
+[apps.upload.ingress]
+streaming = true
+max_body_size = "256m"
+
+[apps.capped]
+image = "ghcr.io/x/capped:latest"
+domains = ["capped.example.eu"]
+port = 3000
+
+[apps.capped.ingress]
+max_body_size = "8m"
 "#;
 
 fn main() {

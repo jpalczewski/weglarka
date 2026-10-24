@@ -3,7 +3,9 @@
 //!
 //! Per-app ingress options ([`AppIngress`], issue #64) are rendered inside that app's `location` only:
 //! `streaming = true` turns response/request buffering off and raises both proxy timeouts, so other
-//! apps keep the nginx defaults.
+//! apps keep the nginx defaults. `max_body_size` (ADR 0033) overrides the server-level
+//! `client_max_body_size` in that app's locations and, since a large body must not be spooled to the
+//! ingress container's tmpfs, also turns request buffering off there.
 //!
 //! Extension points: [`ModeProfile`] (what differs between the `behind`/`edge` modes: trust headers,
 //! `listen`, TLS/ACME) and [`Backend`] (today only a proxy to a container; static sites would be
@@ -157,6 +159,17 @@ impl Backend<'_> {
                         c.line(&format!("rewrite {regex} {replacement} break;"));
                     }
                     c.line("proxy_pass $upstream;");
+                    // Per-app body limit (ADR 0033). It is a *location* directive so that apps
+                    // sharing a `server` (path routing) keep their own limits, and the server-level
+                    // default stays for everyone else. nginx would otherwise buffer the body in
+                    // `client_body_temp_path` — on the read-only root's small tmpfs, i.e. in RAM —
+                    // before the upstream sees the first byte; `streaming` below already says this.
+                    if let Some(limit) = ingress.max_body_size {
+                        c.line(&format!("client_max_body_size {};", limit.bytes()));
+                        if !ingress.streaming {
+                            c.line("proxy_request_buffering off;");
+                        }
+                    }
                     // Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the
                     // right default everywhere else. Both timeouts change together — nginx would
                     // otherwise cut an idle stream at its 60 s default. The `Connection`/`Upgrade`

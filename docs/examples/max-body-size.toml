@@ -1,0 +1,30 @@
+# Accept huge request bodies: a git server whose pushes reach hundreds of MB and a container registry
+# whose single layer upload is several GB (ADR 0033). Add it with
+#   weglarka apps add git --spec docs/examples/max-body-size.toml
+# or, for an app that already exists:
+#   weglarka apps update git --max-body-size 4g
+# and back to the default 64 MiB with
+#   weglarka apps update git --unset-max-body-size
+# This is an ingress-only setting: it re-renders nginx.conf and reloads nginx, never recreates or
+# redeploys the container.
+image = "codeberg.org/forgejo/forgejo:latest"
+domains = ["git.example.com"]
+port = 3000
+
+# SSH for `git clone git@...` is a plain TCP port, not an HTTP route (docs/install.md 6c).
+host_ports = [{ host = 2222, container = 22 }]
+
+[ingress]
+# `<n>[k|m|g]` or a byte count; "0" removes the limit. Rendered as `client_max_body_size` in this
+# app's `location` only; the other apps keep 64 MiB.
+max_body_size = "4g"
+
+# Setting a limit also turns `proxy_request_buffering off` on, so a layer is streamed to the app as it
+# arrives instead of being spooled to the ingress container's small tmpfs (RAM).
+#
+# Recommended pairing for a registry: `streaming = true` as well. It raises the proxy timeouts from nginx's
+# 60 s to `stream_timeout_secs` (default 180), which covers the wait for the app's answer after the last
+# byte of a large blob (digest verification, moving the file into place). The upload itself is never cut by
+# a timeout while data keeps flowing - those are idle timeouts.
+streaming = true
+# stream_timeout_secs = 180

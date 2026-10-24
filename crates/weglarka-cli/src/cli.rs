@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use weglarka_core::app::BodySizeLimit;
 
 use crate::error::exit;
 
@@ -131,6 +132,10 @@ pub struct AddArgs {
     /// itself is set through `--spec` (`stream_timeout_secs`, default 180 s).
     #[arg(long, conflicts_with = "spec")]
     pub streaming: bool,
+    /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
+    /// Also streams the request to the app instead of buffering it. Ingress-only.
+    #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse, conflicts_with = "spec")]
+    pub max_body_size: Option<BodySizeLimit>,
     /// Environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,

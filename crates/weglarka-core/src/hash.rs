@@ -378,12 +378,13 @@ env = { B = "2", A = "1" }
             streaming: true,
             stream_timeout_secs: 600,
             strip_prefix: true,
+            max_body_size: Some(crate::app::BodySizeLimit::UNLIMITED),
         };
         s.paths = vec!["/api".into()];
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options and paths (issues #64, #130) only re-render nginx"
+            "ingress options and paths (issues #64, #130, ADR 0033) only re-render nginx"
         );
     }
 
