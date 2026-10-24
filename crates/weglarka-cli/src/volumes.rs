@@ -13,7 +13,7 @@ use hyper::body::Bytes;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use weglarka_api::{ListSharedVolumesResponse, ListVolumesResponse, endpoints};
-use weglarka_core::app::{InstanceName, SharedVolumeName};
+use weglarka_core::app::{InstanceName, SharedVolumeName, valid_volume_name};
 
 use crate::commands::{DryRun, client, instance};
 use crate::error::{CliError, Kind, exit};
@@ -208,6 +208,19 @@ fn shared_volume_name(name: &str) -> Result<SharedVolumeName, CliError> {
     })
 }
 
+/// A volume name is also a URL path segment here, so it must be validated before anything is sent
+/// or any file is created.
+fn volume(name: &str) -> Result<&str, CliError> {
+    if valid_volume_name(name) {
+        Ok(name)
+    } else {
+        Err(CliError::usage(format!(
+            "invalid volume name {name:?}: [a-z0-9-], 1–63 characters"
+        ))
+        .with_hint("volume names: lowercase letters, digits and hyphens, e.g. `data`"))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct Declared {
     declared: String,
@@ -305,7 +318,8 @@ fn shared_volume_error(e: CliError, purge: bool) -> CliError {
 
 async fn export(o: &Overrides, a: ExportArgs) -> Result<i32, CliError> {
     let app = instance(&a.app)?;
-    let params = [("name", app.as_str()), ("volume", a.volume.as_str())];
+    let volume = volume(&a.volume)?;
+    let params = [("name", app.as_str()), ("volume", volume)];
     let client = client(o)?;
     let io = |what: &str, e: std::io::Error| CliError::internal(format!("{what}: {e}"));
     let written = match &a.out {
@@ -352,7 +366,8 @@ struct Imported {
 
 async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliError> {
     let app = instance(&a.app)?;
-    let params = [("name", app.as_str()), ("volume", a.volume.as_str())];
+    let volume = volume(&a.volume)?;
+    let params = [("name", app.as_str()), ("volume", volume)];
     let (mut query, mode) = if a.own {
         (String::new(), "own")
     } else {
@@ -813,6 +828,57 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.exit_code(), exit::USAGE);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "invalid names never reach the daemon"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_volume_names_are_usage_errors_and_send_nothing() {
+        let (socket, seen) = mock("bvol", 200, b"TAR-BYTES").await;
+        let o = overrides(&socket);
+        let out = scratch("bvol.tar");
+        let _ = std::fs::remove_file(&out);
+        for bad in ["../x", "data?replace=true", "Data"] {
+            let err = export(
+                &o,
+                ExportArgs {
+                    app: "szklana".into(),
+                    volume: bad.into(),
+                    out: Some(out.clone()),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.exit_code(), exit::USAGE, "{bad}: {}", err.message);
+            assert!(
+                err.message.contains("invalid volume name"),
+                "{bad}: {}",
+                err.message
+            );
+            assert!(err.hint.is_some(), "{bad}: the refusal carries a hint");
+
+            let err = import(
+                true,
+                &o,
+                ImportArgs {
+                    app: "szklana".into(),
+                    volume: bad.into(),
+                    from: None,
+                    own: false,
+                    replace: false,
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.exit_code(), exit::USAGE, "{bad}: {}", err.message);
+        }
+        assert!(
+            !out.exists(),
+            "no file is created for an invalid volume name"
+        );
         assert!(
             seen.lock().unwrap().is_empty(),
             "invalid names never reach the daemon"
