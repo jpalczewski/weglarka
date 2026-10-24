@@ -89,9 +89,9 @@ Rules for session 1:
   files in a 0755 directory work; session 1 verifies it in the smoke test).
 - The CI pool is 65 536 subuids, so the integration tests use 4096-uid ranges; production uses 65536.
 
-## Update (issue #95, ADR 0035)
+## Update (issue #95, ADR 0036)
 
-The ingress container no longer maps container uid 0 into its own range: [0035](0035-edge-mode.md) uses a
+The ingress container no longer maps container uid 0 into its own range: [0036](0036-edge-mode.md) uses a
 two-line map (`volumes::ingress_id_mapping`) — container uid 0 → the rootless namespace's uid 0 (the runtime
 user), container uid 1.. → the reserved ingress range. That lets the nginx master read the daemon's `0600` TLS
 keys while the worker (uid 101) stays inside the ingress range and cannot. It is deliberately not the

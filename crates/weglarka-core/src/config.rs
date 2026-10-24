@@ -131,7 +131,7 @@ pub enum IngressMode {
     /// Węglarka's nginx terminates TLS itself and publishes the two public web ports: `bind` (plain
     /// HTTP, redirects to HTTPS except ACME) and `https_bind` (TLS). Certificates come from
     /// `<nginx_conf_dir>/tls`, ACME HTTP-01 tokens from `<nginx_conf_dir>/acme`
-    /// (`docs/decisions/0035`).
+    /// (`docs/decisions/0036`).
     Edge,
     /// nginx na wysokim porcie za Traefikiem z Coolify.
     Behind,

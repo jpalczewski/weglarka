@@ -127,7 +127,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`/`supervise()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher + akcja fallbacku), `daemon/src/supervise.rs` (host-side watchdog: sonda `GET /v1/health`, blokada stanu), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timery, `install_user_units`, `restart_service`, `reset_failed`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027, ADR 0034) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
-| ingress | `ingress/src/plan.rs` (`Plan::build` waliduje, w tym rozłączność `paths` na wspólnej domenie; `route_table()` dla `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs`; prefiksy ścieżek: ADR 0031, `paths`/`ingress.strip_prefix` w `core/src/app.rs`, składnia `check_path_prefix`, `docs/install.md` 6n; tryb `edge` (dwa puby, TLS, webroot ACME, mapa uid ingressu): ADR 0035, `docs/install.md` 6p |
+| ingress | `ingress/src/plan.rs` (`Plan::build` waliduje, w tym rozłączność `paths` na wspólnej domenie; `route_table()` dla `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs`; prefiksy ścieżek: ADR 0031, `paths`/`ingress.strip_prefix` w `core/src/app.rs`, składnia `check_path_prefix`, `docs/install.md` 6n; tryb `edge` (dwa puby, TLS, webroot ACME, mapa uid ingressu): ADR 0036, `docs/install.md` 6p |
 | powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
 | wykrywanie awarii | `core/src/crash.rs` (polityka `Policy` + maszyna stanu `Watcher`), wywołanie w `core/src/reconcile.rs` (`Reconciler::with_monitor`, raz na przejście), sekcja `[monitor]`: `core/src/config.rs`, zdarzenia: `core/src/events.rs`, testy: `core/src/engine_tests.rs` (ADR 0022) |
 | CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |
@@ -180,7 +180,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
   ustala baseline), pod mutexem silnika, a granicą baseline'u jest etykieta `weglarka.generation`. Progi w
   `[monitor]` (nowa sekcja → kolejny caveat downgrade'u), zdarzenia idą tym samym `EventSink`-iem co deploye.
-- **Tryb `edge` (ADR 0035, #95):** nginx Węglarki terminuje TLS i publikuje dwa porty — `bind` (HTTP: tylko
+- **Tryb `edge` (ADR 0036, #95):** nginx Węglarki terminuje TLS i publikuje dwa porty — `bind` (HTTP: tylko
   301 na HTTPS + `/.well-known/acme-challenge/`) i `https_bind`; w kontenerze nadal 8080/8443, więc profil
   hardeningu (0014) i `health_probe` się nie zmieniają. Certyfikaty: `<nginx_conf_dir>/tls/<domena>.crt|key`
   (0600/0700), webroot ACME `<nginx_conf_dir>/acme` (0644/0755); serwer TLS powstaje **tylko** dla domeny z

@@ -1,4 +1,4 @@
-# 0035 — Edge mode: nginx owns 80/443 (TLS, ACME webroot, certificate reload)
+# 0036 — Edge mode: nginx owns 80/443 (TLS, ACME webroot, certificate reload)
 
 Status: accepted (2026-10-24, issue #95). The nginx half was measured locally and in the `check` job (Docker);
 the uid-map half has no local rootless Podman 6, so it was measured by `integration-podman`

@@ -54,7 +54,7 @@ pub fn id_mapping(range: UidRange) -> IdMapping {
     }
 }
 
-/// Map of the ingress nginx container (`docs/decisions/0035`, amending 0009): container uid 0 is the
+/// Map of the ingress nginx container (`docs/decisions/0036`, amending 0009): container uid 0 is the
 /// **daemon's host user**, the rest of the ingress range belongs to the container as usual.
 ///
 /// The TLS private keys live in `<nginx_conf_dir>/tls` as `0600` files owned by the daemon's user, and

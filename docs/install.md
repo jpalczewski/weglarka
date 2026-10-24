@@ -125,7 +125,7 @@ nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421
 # kontenera nginx we wszystkich jego sieciach (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE
 # domyślną i jest statyczna (adresy kontenera mogą się zmienić). Zwykle zostaw nieustawione.
 # trusted_proxies = ["10.89.1.2"]
-# Tryb `edge` (issue #95, 0035): nginx sam terminuje TLS i publikuje DWA porty — `bind` (HTTP: tylko
+# Tryb `edge` (issue #95, 0036): nginx sam terminuje TLS i publikuje DWA porty — `bind` (HTTP: tylko
 # przekierowanie na HTTPS i ACME) oraz `https_bind` (TLS). `traefik_dynamic_file` i `trusted_proxies` są
 # wtedy odrzucane przez walidację, a certyfikaty kładziesz w <state>/nginx/tls (6p).
 # mode = "edge"
@@ -1558,7 +1558,7 @@ przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `ingress.max_body
 
 W trybie `edge` Węglarka nie stoi już za Traefikiem: jej nginx **sam terminuje TLS** i publikuje na hoście dwa
 porty — `bind` (HTTP) i `https_bind` (TLS); w kontenerze nadal nasłuchuje na 8080/8443. Decyzja i odrzucone
-alternatywy: [0035](decisions/0035-edge-mode.md). Tryb `behind` niczego się nie zmienia.
+alternatywy: [0036](decisions/0036-edge-mode.md). Tryb `behind` niczego się nie zmienia.
 
 ```toml
 [ingress]
@@ -1588,7 +1588,7 @@ https_bind = "0.0.0.0:443"   # TLS: jeden serwer na domenę, certyfikat z <state
 
 `<nginx_conf_dir>` to `[ingress] nginx_conf_dir` albo `<state dir>/nginx`. Webroot ACME przyjmuje tylko
 `GET`/`HEAD`; token jest **publiczny**, więc `0644` to nie wyciek — klucze prywatne nigdy nie trafiają do
-webroota. Prywatny klucz jest czytany przez master nginx, który od 0035 działa jako użytkownik runtime'u
+webroota. Prywatny klucz jest czytany przez master nginx, który od 0036 działa jako użytkownik runtime'u
 (dwuipisowa mapa uid kontenera ingressu); dlatego pliki mogą zostać `0600` i **nie** są czytelne dla
 użytkowników hosta.
 
@@ -1624,7 +1624,7 @@ curl -k --resolve nz.example.eu:443:127.0.0.1 https://nz.example.eu/   # -k tylk
   w `edge` jest błędem walidacji.
 - **Kontener ingressu:** profil osłonienia (0014) się nie zmienia (te same trzy capability, read-only root);
   zmienia się mapa uid — root kontenera to użytkownik runtime'u, worker zostaje w zakresie ingressu
-  ([0035](decisions/0035-edge-mode.md), [0009](decisions/0009-volume-ownership.md)). Konsekwencja: **do
+  ([0036](decisions/0036-edge-mode.md), [0009](decisions/0009-volume-ownership.md)). Konsekwencja: **do
   kontenera nginx nie wolno montować niczego poza `<nginx_conf_dir>`** (żadnego katalogu stanu, `config_root`
   ani pliku Traefika).
 - Własny `ingress.nginx_image` musi mieć nginx ≥ 1.25.1 (`http2 on`, `ssl_reject_handshake`); oficjalny
@@ -1633,10 +1633,10 @@ curl -k --resolve nz.example.eu:443:127.0.0.1 https://nz.example.eu/   # -k tylk
   (patrz [Odbiór](#odbiór-na-hoście-scriptsacceptancesh)). Po instalacji: `weglarka doctor` (check
   `ingress.apply`, `ingress.tls`, `ingress.nginx`).
 
-**Rollback:** przełączenie na `behind` to powrót do konfiguracji sprzed 0035: ustaw `mode = "behind"`, usuń
+**Rollback:** przełączenie na `behind` to powrót do konfiguracji sprzed 0036: ustaw `mode = "behind"`, usuń
 `https_bind`, przywróć `traefik_dynamic_file`, zrestartuj demona. Jednorazowo odtworzy się kontener nginx
 (inny `weglarka.ingress-hash`). `apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu), a
-pliki w `tls/`/`acme/` możesz zostawić — `behind` ich nie czyta. Przed downgradem do wydania sprzed 0035
+pliki w `tls/`/`acme/` możesz zostawić — `behind` ich nie czyta. Przed downgradem do wydania sprzed 0036
 usuń `https_bind` z `weglarka.toml` (starszy demon nie zna tego klucza).
 
 ## 7. Weryfikacja i rollback

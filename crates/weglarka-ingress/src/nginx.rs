@@ -7,7 +7,7 @@
 //! `client_max_body_size` in that app's locations and, since a large body must not be spooled to the
 //! ingress container's tmpfs, also turns request buffering off there.
 //!
-//! Two ingress modes (`docs/decisions/0005`, `docs/decisions/0035`):
+//! Two ingress modes (`docs/decisions/0005`, `docs/decisions/0036`):
 //!
 //! * `behind` (ADR 0005/0007) — one published port; Traefik terminates TLS and forwards
 //!   `X-Forwarded-*` from a trusted peer. The generated config trusts exactly `[ingress]
@@ -609,7 +609,7 @@ fn behind_prelude(c: &mut Conf, o: &NginxOptions) {
     );
 }
 
-/// `edge` (issue #95, docs/decisions/0035): nginx terminates TLS. The plain-HTTP listener only
+/// `edge` (issue #95, docs/decisions/0036): nginx terminates TLS. The plain-HTTP listener only
 /// redirects (ACME token requests excepted); the TLS listener has one `server` per domain, because
 /// nginx picks the server — and therefore the certificate — by SNI.
 fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {

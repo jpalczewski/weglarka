@@ -17,7 +17,7 @@ mode = "behind"
 bind = "172.17.0.1:8080"
 traefik_dynamic_file = "/data/coolify/proxy/dynamic/weglarka.yml"   # the file must exist
 # nginx_image = "docker.io/library/nginx:1-alpine"
-# edge (docs/decisions/0035): nginx terminates TLS itself; two publishes, no Traefik file, certificates
+# edge (docs/decisions/0036): nginx terminates TLS itself; two publishes, no Traefik file, certificates
 # under <state>/nginx/tls (0600 keys) and the ACME webroot under <state>/nginx/acme.
 # mode = "edge"
 # bind = "0.0.0.0:80"

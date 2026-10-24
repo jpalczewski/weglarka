@@ -1,5 +1,5 @@
 //! Ingress container identity against a real rootless Podman 6 (issue #95,
-//! `docs/decisions/0035`): the nginx master is container uid 0 and has to read the TLS private keys
+//! `docs/decisions/0036`): the nginx master is container uid 0 and has to read the TLS private keys
 //! that the daemon writes `0600` in `<nginx_conf_dir>/tls`, while the worker (uid 101 in the image)
 //! must stay inside the reserved ingress range.
 //!

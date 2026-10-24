@@ -69,7 +69,7 @@ suffix `-http`: an instance `foo-http` would collide with the twin of `foo`. The
 map: trusted peer **and** a non-empty `X-Forwarded-Proto` other than `https`/`wss` — fail closed, e.g. `ws` from
 Traefik for a WebSocket over HTTP). `$weglarka_proto = http` is not enough: a trusted peer without the header (the
 daemon's health probe, `health.http`, docs/decisions/0010) gets the `$scheme` fallback = `http` and must not get a
-301. An untrusted peer is never redirected. `edge` mode was implemented in [0035](0035-edge-mode.md) with a different
+301. An untrusted peer is never redirected. `edge` mode was implemented in [0036](0036-edge-mode.md) with a different
 mechanism than planned here: the redirect lives in the plain-HTTP `server` (`location /`), the ACME prefix is an
 `^~` location served from `<nginx_conf_dir>/acme`, and the `behind` map is not rendered at all. Entrypoint name:
 `TraefikOptions::http_entrypoint` (default `http`). Tests: snapshots, a test of compliance with the validator
