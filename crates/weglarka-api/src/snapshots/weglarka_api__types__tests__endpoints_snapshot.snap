@@ -10,6 +10,7 @@ expression: list
   "Put /v1/apps/{name}",
   "Delete /v1/apps/{name}",
   "Post /v1/apps/{name}/deploy",
+  "Post /v1/apps/{name}/reload",
   "Get /v1/apps/{name}/secrets",
   "Put /v1/apps/{name}/secrets/{secret}",
   "Get /v1/apps/{name}/volumes",

@@ -81,6 +81,46 @@ pub struct ShowAppResponse {
     pub spec: AppSpec,
     pub state: AppState,
     pub runtime: RuntimeState,
+    /// Resolved `configs` mounts with a content fingerprint (issue #118); absent when the app
+    /// declares no config mounts. Only `GET /v1/apps/{name}` fills it — the daemon reads
+    /// `config_root` on demand and the list endpoint does not touch the filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configs: Option<Vec<ConfigMountView>>,
+}
+
+/// State of one declared config mount as the daemon sees it on disk (issue #118).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigMountStatus {
+    /// Resolved inside `config_root`; a regular file or a directory.
+    Ok,
+    /// The source does not exist under `config_root`.
+    Missing,
+    /// The app declares `configs`, but `weglarka.toml` has no `config_root`.
+    NoRoot,
+    /// After resolving symlinks the path escapes `config_root`.
+    OutsideRoot,
+    /// The source exists but is neither a regular file nor a directory.
+    NotFileOrDir,
+    /// The path is inside `config_root` but cannot be read/statted.
+    Unreadable,
+}
+
+/// One config mount of an app: what is declared (`source`, `target`), what the daemon sees now and
+/// a fingerprint of the current content (sha256 of the bytes, or of the sorted directory tree;
+/// `.git` excluded). `fingerprint` is absent when the source is not readable or is too large.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigMountView {
+    /// Path relative to `config_root`, as declared in the app spec.
+    pub source: String,
+    /// Absolute path in the container.
+    pub target: String,
+    pub status: ConfigMountStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Human-readable detail for a non-`ok` status (the path, the io error…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `PUT /v1/apps/{name}`: **full replacement** of the instance's spec (not a patch). The client reads
@@ -210,6 +250,41 @@ pub struct DeployResponse {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest>,
+}
+
+/// `POST /v1/apps/{name}/reload` (issue #118). An empty body means `recreate = false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadRequest {
+    /// Recreate the container from the pinned digest instead of reloading in place. Needed when a
+    /// single-file config mount points at the old inode (editors that save with write-and-rename).
+    #[serde(default)]
+    pub recreate: bool,
+}
+
+/// What `apps reload` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReloadAction {
+    /// The spec's `reload_signal` was sent to the running container.
+    Signalled,
+    /// No `reload_signal`: the container was stopped and started again (same container).
+    Restarted,
+    /// `recreate = true`: the container was recreated from the pinned digest (forced deploy).
+    Recreated,
+}
+
+/// `POST /v1/apps/{name}/reload` → what happened and what the app now sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadResponse {
+    pub name: InstanceName,
+    pub action: ReloadAction,
+    /// Signal actually sent (without the `SIG` prefix), for [`ReloadAction::Signalled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// The resolved config mounts and their fingerprints after the reload (issue #118); absent
+    /// when the app declares no config mounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configs: Option<Vec<ConfigMountView>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
