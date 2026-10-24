@@ -4,8 +4,8 @@
 # CLI and the daemon both reject a name that does not exist yet:
 #   weglarka apps add db ghcr.io/example/postgres:16
 #   weglarka apps add api ghcr.io/example/api:latest --domain api.example.com --port 8080 --depends-on db
-# depends_on is a start order only — each app keeps its own network, so `api` cannot reach `db` by name: the
-# shared network / shared Postgres is the other, still unimplemented part of #35. The same two apps in full
+# depends_on is a start order only — each app keeps its own network, so `api` cannot reach `db` by name unless
+# both join a shared network (`shared_networks`, docs/examples/shared-network.toml). The same two apps in full
 # (with the volume and the healthcheck of `db`):
 
 [apps.db]

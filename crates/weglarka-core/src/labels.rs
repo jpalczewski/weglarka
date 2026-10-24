@@ -42,6 +42,17 @@ pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")
 }
 
+/// Label marking a network as shared by a group of instances (issue #128). Such a network has
+/// deliberately **no** [`INSTANCE`] label, so network cleanup keyed on the instance never touches it.
+pub const SHARED_NETWORK: &str = "weglarka.shared-network";
+
+/// Podman network of a shared network. `net-shared-<name>` could read as the per-app network of an
+/// instance called `shared-<name>`, so cleanup must go by [`SHARED_NETWORK`] and never by prefix;
+/// the label is what tells the two apart.
+pub fn shared_network_name(network: &crate::app::SharedNetworkName) -> String {
+    format!("net-shared-{network}")
+}
+
 /// Podman volume name of an instance's volume. `.` cannot occur in an instance or volume name,
 /// so `<instance>.<volume>` is unambiguous.
 pub fn volume_name(instance: &InstanceName, volume: &str) -> String {

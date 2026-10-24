@@ -2106,3 +2106,160 @@ async fn the_test_harness_does_not_watch_without_a_policy() {
     }
     assert_eq!(h.sink.events().len(), baseline);
 }
+
+// ---------- shared networks (issue #128) ----------
+
+const GROUP: &str = r#"
+[shared_networks.kajet]
+
+[apps.kajet-api]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+
+[apps.kajet-proxy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+shared_networks = [{ name = "kajet", aliases = ["gateway"] }]
+
+[apps.loner]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+"#;
+
+fn group_with_members() -> String {
+    GROUP.replace(
+        "[apps.kajet-api]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n",
+        "[apps.kajet-api]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nshared_networks = [\"kajet\"]\n",
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn group_members_share_an_internal_network_and_outsiders_do_not() {
+    let h = Harness::new(&group_with_members());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    let shared = "net-shared-kajet";
+    let spec = h
+        .fake
+        .network_spec(shared)
+        .expect("created lazily by the first member");
+    assert!(spec.internal, "group traffic gets no route out");
+    assert_eq!(
+        spec.labels.get(labels::SHARED_NETWORK).map(String::as_str),
+        Some("kajet")
+    );
+    assert!(
+        !spec.labels.contains_key(labels::INSTANCE),
+        "instance-keyed cleanup must never see a group network"
+    );
+
+    let mut members = h.fake.network_members(shared);
+    members.sort();
+    assert_eq!(members, vec!["kajet-api", "kajet-proxy"]);
+
+    // The member keeps its own network first (primary); the alias rides on the group network only.
+    let proxy = h.fake.container_spec("kajet-proxy").unwrap();
+    assert_eq!(proxy.networks, vec!["net-kajet-proxy", shared]);
+    assert_eq!(
+        proxy.network_aliases,
+        BTreeMap::from([(shared.to_owned(), vec!["gateway".to_owned()])])
+    );
+    // An app outside the group is attached to its own network only.
+    let loner = h.fake.container_spec("loner").unwrap();
+    assert_eq!(loner.networks, vec!["net-loner"]);
+    assert!(
+        h.fake
+            .network_members("net-loner")
+            .contains(&"loner".to_owned())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn removing_a_member_leaves_the_group_working() {
+    let h = Harness::new(&group_with_members());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    // Drop kajet-api from the desired state.
+    let without_api = group_with_members().replace(
+        "[apps.kajet-api]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nshared_networks = [\"kajet\"]\n",
+        "",
+    );
+    h.set_apps(&without_api);
+    h.rec.reconcile().await.unwrap();
+
+    let names: Vec<String> = h.fake.containers().into_iter().map(|c| c.name).collect();
+    assert!(!names.contains(&"kajet-api".to_owned()), "{names:?}");
+    assert!(names.contains(&"kajet-proxy".to_owned()), "{names:?}");
+    // The group network is owned by its declaration, not by a member: it survives and the
+    // remaining member is still attached to it.
+    assert!(h.fake.networks().contains(&"net-shared-kajet".to_owned()));
+    assert_eq!(
+        h.fake.network_members("net-shared-kajet"),
+        vec!["kajet-proxy"]
+    );
+    assert!(
+        !h.fake.networks().contains(&"net-kajet-api".to_owned()),
+        "per-app network pruned"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn joining_or_leaving_a_group_recreates_the_container() {
+    let h = Harness::new(
+        "[shared_networks.g]\n[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n",
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let before = h.fake.container_spec("a").unwrap();
+    assert_eq!(before.networks, vec!["net-a"]);
+
+    h.set_apps(
+        "[shared_networks.g]\n[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nshared_networks = [\"g\"]\n",
+    );
+    h.rec.reconcile().await.unwrap();
+    let joined = h.fake.container_spec("a").unwrap();
+    assert_eq!(joined.networks, vec!["net-a", "net-shared-g"]);
+    assert_ne!(
+        before.labels[labels::SPEC_HASH],
+        joined.labels[labels::SPEC_HASH],
+        "the container's networks changed, so it is a different container"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_undeclared_group_networks_are_pruned() {
+    let h = Harness::new("[shared_networks.kept]\n");
+    let group_net = |group: &str| NetworkSpec {
+        name: format!("net-shared-{group}"),
+        internal: true,
+        labels: BTreeMap::from([(labels::SHARED_NETWORK.to_owned(), group.to_owned())]),
+    };
+    h.fake.network_create(&group_net("kept")).await.unwrap();
+    h.fake.network_create(&group_net("gone")).await.unwrap();
+    // Looks like the per-app network of an instance called `shared-kept` by name, but the label
+    // says it is a group network: the name must not decide.
+    h.rec.reconcile().await.unwrap();
+    let nets = h.fake.networks();
+    assert!(nets.contains(&"net-shared-kept".to_owned()), "{nets:?}");
+    assert!(!nets.contains(&"net-shared-gone".to_owned()), "{nets:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_declaration_with_members_cannot_be_removed() {
+    let h = Harness::new(&group_with_members());
+    let net = crate::app::SharedNetworkName::new("kajet").unwrap();
+    let err = h.rec.remove_shared_network(&net).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::SharedNetworkInUse { members, .. } if members == "kajet-api, kajet-proxy"),
+        "{err}"
+    );
+    // Declared, unused, then removed; removing it again is a clean "unknown".
+    h.set_apps("[shared_networks.kajet]\n");
+    h.rec.remove_shared_network(&net).await.unwrap();
+    assert!(matches!(
+        h.rec.remove_shared_network(&net).await,
+        Err(EngineError::UnknownSharedNetwork(_))
+    ));
+    // Declaring is idempotent.
+    h.rec.declare_shared_network(net.clone()).await.unwrap();
+    h.rec.declare_shared_network(net).await.unwrap();
+}

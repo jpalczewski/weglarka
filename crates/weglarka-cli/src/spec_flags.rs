@@ -4,8 +4,9 @@
 
 use clap::Args;
 use weglarka_core::app::{
-    AppSpec, ConfigMount, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedVolumeName,
-    SharedVolumeRef, VolumeMount, normalize_signal, valid_config_source, valid_volume_name,
+    AppSpec, ConfigMount, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedNetworkName,
+    SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount, normalize_signal,
+    valid_config_source, valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -46,6 +47,14 @@ pub enum ReloadSignalFlag {
     Clear,
 }
 
+/// Value of [`SpecFlags::shared_network`]: join a declared shared network (with optional extra DNS
+/// aliases), or `none` to leave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedNetworkFlag {
+    Join(SharedNetworkRef),
+    Leave,
+}
+
 /// Spec flags shared by `apps add` and `apps update`; flattened into `AddArgs` and `UpdateArgs`.
 #[derive(Debug, Default, Args)]
 pub struct SpecFlags {
@@ -82,6 +91,11 @@ pub struct SpecFlags {
     /// `apps reload` restarts the container instead. Not part of the spec hash.
     #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
     pub reload_signal: Option<ReloadSignalFlag>,
+    /// Join a shared network: NAME[:ALIAS,ALIAS] (`none` leaves it). Members of one network reach
+    /// each other by instance name (plus the aliases) on every port; a network membership replaces
+    /// the previous one. The network must be declared first (`weglarka networks add NAME`).
+    #[arg(long = "shared-network", value_name = "NAME[:ALIAS,..]|none", value_parser = parse_shared_network, conflicts_with = "spec")]
+    pub shared_network: Option<SharedNetworkFlag>,
     /// Hardening preset: read-only root, all capabilities dropped, no-new-privileges. Combine with
     /// --tmpfs for writable paths and --cap-add for what the app really needs.
     #[arg(long, conflicts_with = "spec")]
@@ -120,6 +134,7 @@ impl SpecFlags {
             && self.shared_volumes.is_empty()
             && self.configs.is_empty()
             && self.reload_signal.is_none()
+            && self.shared_network.is_none()
             && !self.hardened
             && self.read_only.is_none()
             && self.tmpfs.is_empty()
@@ -158,6 +173,11 @@ impl SpecFlags {
         match &self.reload_signal {
             Some(ReloadSignalFlag::Set(signal)) => spec.reload_signal = Some(signal.clone()),
             Some(ReloadSignalFlag::Clear) => spec.reload_signal = None,
+            None => {}
+        }
+        match &self.shared_network {
+            Some(SharedNetworkFlag::Join(net)) => spec.shared_networks = vec![net.clone()],
+            Some(SharedNetworkFlag::Leave) => spec.shared_networks.clear(),
             None => {}
         }
         let sec = &mut spec.security;
@@ -373,6 +393,24 @@ fn parse_volume(s: &str) -> Result<VolumeMount, String> {
     })
 }
 
+/// `NAME`, `NAME:alias1,alias2` or `none`. The aliases are DNS names with the instance-name
+/// alphabet; clashes between members are the daemon's to judge (it sees the other apps).
+fn parse_shared_network(s: &str) -> Result<SharedNetworkFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(SharedNetworkFlag::Leave);
+    }
+    let (name, aliases) = match s.split_once(':') {
+        Some((name, list)) => (name, list.split(',').map(str::to_owned).collect()),
+        None => (s, Vec::new()),
+    };
+    let name = SharedNetworkName::new(name).map_err(|e| e.to_string())?;
+    for alias in &aliases {
+        InstanceName::new(alias.as_str())
+            .map_err(|_| format!("invalid network alias {alias:?}: [a-z0-9-], 1–63 characters"))?;
+    }
+    Ok(SharedNetworkFlag::Join(SharedNetworkRef { name, aliases }))
+}
+
 fn parse_shared_volume(s: &str) -> Result<SharedVolumeRef, String> {
     let (name, target, read_only) = split_mount(s)?;
     let name = SharedVolumeName::new(name).map_err(|e| e.to_string())?;
@@ -503,6 +541,49 @@ mod tests {
         assert!(parse_shared_volume("kajet-data=relative").is_err());
         assert!(parse_shared_volume("kajet-data").is_err());
         assert!(parse_shared_volume("/data").is_err());
+    }
+
+    #[test]
+    fn parses_shared_network_flag() {
+        let plain = parse_shared_network("kajet").unwrap();
+        let SharedNetworkFlag::Join(r) = plain else {
+            panic!("expected a join");
+        };
+        assert_eq!((r.name.as_str(), r.aliases.len()), ("kajet", 0));
+        let SharedNetworkFlag::Join(r) = parse_shared_network("kajet:gateway,web").unwrap() else {
+            panic!("expected a join");
+        };
+        assert_eq!(r.aliases, vec!["gateway", "web"]);
+        assert_eq!(
+            parse_shared_network("NONE").unwrap(),
+            SharedNetworkFlag::Leave
+        );
+        assert!(parse_shared_network("Kajet_Net").is_err());
+        assert!(parse_shared_network("kajet:Bad_Alias").is_err());
+        assert!(parse_shared_network("kajet:").is_err());
+    }
+
+    #[test]
+    fn shared_network_flag_replaces_and_clears_the_membership() {
+        let mut spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        SpecFlags {
+            shared_network: Some(parse_shared_network("a:x").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        SpecFlags {
+            shared_network: Some(parse_shared_network("b").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert_eq!(spec.shared_networks.len(), 1);
+        assert_eq!(spec.shared_networks[0].name.as_str(), "b");
+        SpecFlags {
+            shared_network: Some(SharedNetworkFlag::Leave),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert!(spec.shared_networks.is_empty());
     }
 
     #[test]

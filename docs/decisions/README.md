@@ -36,3 +36,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0027](0027-self-update.md) | Self-update: a host-side switcher, a pinned cosign key and a schema gate |
 | [0028](0028-config-root-mounts.md) | Host config mounts (`config_root`) and app reload |
 | [0029](0029-shared-volume-groups.md) | Shared volume groups: several shared volumes per app, one uid range per group (issue #129) |
+| [0030](0030-shared-networks.md) | Shared networks: opt-in connectivity for a group of instances (issue #128) |

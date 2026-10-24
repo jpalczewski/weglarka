@@ -13,6 +13,7 @@ use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
 };
 use weglarka_core::secret_store::{SecretStore, scoped_name, split_scoped};
+use weglarka_core::shared_networks;
 use weglarka_core::shared_volumes;
 use weglarka_core::state::{self, StateFile};
 
@@ -61,6 +62,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     }
     configs(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
+    shared_network_state(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
@@ -774,6 +776,110 @@ fn join_display<T: std::fmt::Display>(items: &[T]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `state.shared_networks` (issue #128): declarations vs Podman networks vs the networks the member
+/// containers are really attached to. Everything here is a warning or a note: a broken group
+/// isolates its members from each other, it does not endanger anything else.
+async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // already reported as `state.apps_file`
+    };
+    let networks = match d.engine.podman().network_list().await {
+        Ok(n) => n,
+        Err(e) => {
+            out.push(check(
+                "state.shared_networks",
+                CheckStatus::Warn,
+                format!("cannot list Podman networks: {e}"),
+                None,
+            ));
+            return;
+        }
+    };
+    let containers = d
+        .engine
+        .podman()
+        .container_list(&ContainerFilter::default())
+        .await
+        .ok();
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    let mut hints = Vec::new();
+
+    // (a) A labelled network nobody declares: reconcile removes it once it is empty, so one that
+    // lingers still has containers attached.
+    for net in &networks {
+        let Some(group) = net.labels.get(labels::SHARED_NETWORK) else {
+            continue;
+        };
+        if apps.shared_networks.keys().any(|n| n.as_str() == group) {
+            continue;
+        }
+        warnings.push(format!(
+            "Podman network {} belongs to shared network {group:?} but apps.toml does not declare it",
+            net.name
+        ));
+        hints.push(format!(
+            "declare it again (`weglarka networks add {group}`) or detach what is left and remove it: \
+             `podman network rm {}`",
+            net.name
+        ));
+    }
+
+    for name in apps.shared_networks.keys() {
+        // (b) A group nobody joined: harmless, but usually a forgotten `--shared-network`.
+        let members = shared_networks::members(&apps, name);
+        if members.is_empty() {
+            notes.push(format!("shared network {name} has no members"));
+            continue;
+        }
+        // (c) A member whose running container is not on the group network (the spec changed and
+        // the recreate has not happened yet, or the container was created by hand).
+        let want = labels::shared_network_name(name);
+        for member in &members {
+            let Some(container) = containers.as_ref().and_then(|all| {
+                all.iter()
+                    .find(|c| c.name == labels::container_name(member))
+            }) else {
+                continue;
+            };
+            if !container.networks.contains(&want) {
+                warnings.push(format!(
+                    "{member} should be on shared network {name} but its container is not attached to {want}"
+                ));
+                hints.push(
+                    "`weglarka deploy <app>` recreates the container with its networks".to_owned(),
+                );
+            }
+        }
+    }
+
+    let (status, message) = if !warnings.is_empty() {
+        let mut message = warnings.join("; ");
+        if !notes.is_empty() {
+            message.push_str("; notes: ");
+            message.push_str(&notes.join("; "));
+        }
+        (CheckStatus::Warn, message)
+    } else if !notes.is_empty() {
+        (CheckStatus::Info, notes.join("; "))
+    } else if apps.shared_networks.is_empty() {
+        (
+            CheckStatus::Ok,
+            "no shared networks are declared".to_owned(),
+        )
+    } else {
+        (CheckStatus::Ok, "shared networks are consistent".to_owned())
+    };
+    hints.dedup();
+    let hint = (!hints.is_empty()).then(|| hints.join("; "));
+    out.push(check(
+        "state.shared_networks",
+        status,
+        message,
+        hint.as_deref(),
+    ));
 }
 
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

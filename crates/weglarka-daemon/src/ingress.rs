@@ -387,6 +387,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
                 env: BTreeMap::new(),
                 networks: networks.to_vec(),
+                network_aliases: Default::default(),
                 secrets: vec![],
                 publish: vec![PortMapping {
                     host_ip: Some(bind.ip().to_string()),

@@ -120,6 +120,16 @@ pub enum EngineError {
     /// Unknown shared volume declaration.
     #[error("unknown shared volume: {0}")]
     UnknownSharedVolume(crate::app::SharedVolumeName),
+    /// A shared network is still joined by other instances (issue #128): removing the declaration
+    /// would cut them off from each other.
+    #[error("shared network {network} is still joined by: {members}")]
+    SharedNetworkInUse {
+        network: crate::app::SharedNetworkName,
+        members: String,
+    },
+    /// Unknown shared network declaration.
+    #[error("unknown shared network: {0}")]
+    UnknownSharedNetwork(crate::app::SharedNetworkName),
     /// Changing the instance's uid range would make its existing files unreadable (docs/decisions/0017).
     #[error(
         "cannot change the uid range of {instance} from {from} to {to}: it already has volume data; \
@@ -720,6 +730,17 @@ impl<P: PodmanClient> Reconciler<P> {
             }
         };
         for net in networks {
+            // A shared network (issue #128) belongs to its declaration, not to an instance: it
+            // lives as long as `[shared_networks.<name>]` does, whoever is a member right now.
+            if let Some(group) = net.labels.get(labels::SHARED_NETWORK) {
+                let declared = crate::app::SharedNetworkName::new(group.as_str())
+                    .is_ok_and(|g| apps.shared_networks.contains_key(&g));
+                if !declared {
+                    self.remove_network(&net.name, "shared network that is no longer declared")
+                        .await;
+                }
+                continue;
+            }
             if net.name == labels::INGRESS_NETWORK || !is_weglarka_network(&net.labels) {
                 continue;
             }
@@ -733,12 +754,16 @@ impl<P: PodmanClient> Reconciler<P> {
             if apps.apps.contains_key(&instance) {
                 continue;
             }
-            match self.podman.network_remove(&net.name).await {
-                Ok(()) => tracing::info!(network = %net.name, "removed network of a removed app"),
-                Err(e) => {
-                    tracing::debug!(network = %net.name, error = %e, "network not removed yet")
-                }
-            }
+            self.remove_network(&net.name, "network of a removed app")
+                .await;
+        }
+    }
+
+    /// Best-effort removal: a network still in use is left for a later pass.
+    async fn remove_network(&self, name: &str, what: &str) {
+        match self.podman.network_remove(name).await {
+            Ok(()) => tracing::info!(network = %name, "removed {what}"),
+            Err(e) => tracing::debug!(network = %name, error = %e, "network not removed yet"),
         }
     }
 

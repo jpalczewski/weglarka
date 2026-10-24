@@ -295,6 +295,20 @@ impl FakePodman {
         self.lock().networks.keys().cloned().collect()
     }
 
+    /// The spec a network was created with (`None` = no such network).
+    pub fn network_spec(&self, name: &str) -> Option<NetworkSpec> {
+        self.lock().networks.get(name).map(|(spec, _)| spec.clone())
+    }
+
+    /// Containers attached to a network, in attach order.
+    pub fn network_members(&self, name: &str) -> Vec<String> {
+        self.lock()
+            .networks
+            .get(name)
+            .map(|(_, members)| members.clone())
+            .unwrap_or_default()
+    }
+
     fn default_digest(reference: &str) -> Digest {
         Digest::new(format!(
             "sha256:{}",

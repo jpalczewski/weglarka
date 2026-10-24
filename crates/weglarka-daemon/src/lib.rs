@@ -18,6 +18,7 @@ pub mod self_update;
 /// The service description shared by `platform install` and the switcher.
 pub mod service;
 pub mod settings;
+pub mod shared_networks;
 pub mod shared_volumes;
 pub mod update;
 pub mod volumes;

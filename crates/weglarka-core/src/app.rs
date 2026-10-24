@@ -354,6 +354,117 @@ pub struct SharedVolumeRef {
     pub read_only: bool,
 }
 
+/// Name of a shared network (key in `apps.toml`'s `[shared_networks]` section). Same character set
+/// as [`InstanceName`], so it is also safe as a component of the Podman network name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SharedNetworkName(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid shared network name {0:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-'"
+)]
+pub struct InvalidSharedNetworkName(pub String);
+
+impl SharedNetworkName {
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidSharedNetworkName> {
+        let name = name.into();
+        // The same alphabet as an instance name; reuse it instead of repeating the rule.
+        match InstanceName::new(name.clone()) {
+            Ok(_) => Ok(Self(name)),
+            Err(_) => Err(InvalidSharedNetworkName(name)),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SharedNetworkName {
+    type Error = InvalidSharedNetworkName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SharedNetworkName> for String {
+    fn from(value: SharedNetworkName) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for SharedNetworkName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Declaration of a network shared by a group of instances (issue #128,
+/// `docs/decisions/0030-shared-networks.md`). It has no options yet: the declaration is the guard
+/// against typos in `AppSpec::shared_networks` and the place where per-network options will live.
+/// Strict, like every persisted type.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedNetworkSpec {}
+
+/// Membership of one instance in a declared shared network. At most one per app in v1.
+///
+/// Written in `apps.toml` either as the bare network name (`shared_networks = ["kajet"]`) or, with
+/// extra DNS aliases, as a table (`{ name = "kajet", aliases = ["api"] }`). The instance name is
+/// always an alias in the group (it is the container name), `aliases` only adds to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SharedNetworkRefRepr", into = "SharedNetworkRefRepr")]
+pub struct SharedNetworkRef {
+    pub name: SharedNetworkName,
+    /// Extra DNS names of the container inside the group (validated like instance names).
+    pub aliases: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SharedNetworkRefRepr {
+    Name(SharedNetworkName),
+    Full(SharedNetworkRefFull),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedNetworkRefFull {
+    name: SharedNetworkName,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
+impl From<SharedNetworkRefRepr> for SharedNetworkRef {
+    fn from(repr: SharedNetworkRefRepr) -> Self {
+        match repr {
+            SharedNetworkRefRepr::Name(name) => Self {
+                name,
+                aliases: Vec::new(),
+            },
+            SharedNetworkRefRepr::Full(f) => Self {
+                name: f.name,
+                aliases: f.aliases,
+            },
+        }
+    }
+}
+
+impl From<SharedNetworkRef> for SharedNetworkRefRepr {
+    fn from(r: SharedNetworkRef) -> Self {
+        // The shorthand round-trips, so a file written without aliases stays a list of names.
+        if r.aliases.is_empty() {
+            Self::Name(r.name)
+        } else {
+            Self::Full(SharedNetworkRefFull {
+                name: r.name,
+                aliases: r.aliases,
+            })
+        }
+    }
+}
+
 /// A container port published directly on the host, next to the ingress (issue #34). Such ports
 /// bypass nginx/Traefik completely: no TLS, no routing by domain, no access log — the host firewall
 /// is the only gate, so the default bind address is loopback
@@ -627,12 +738,19 @@ pub struct AppSpec {
     /// runs in the shared volume's uid range, and at most one is allowed per app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_volumes: Vec<SharedVolumeRef>,
+    /// Shared networks this instance joins in addition to its own (issue #128,
+    /// `docs/decisions/0030-shared-networks.md`): members of one group reach each other by instance
+    /// name on every port, non-members cannot. At most one per app in v1. Part of the spec hash
+    /// while set, because it changes the container's networks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_networks: Vec<SharedNetworkRef>,
     /// Ports published directly on the host (issue #34); the ingress keeps routing `domains`/`port`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPort>,
     /// Apps that must already be running (and healthy) before this one starts (issue #35,
     /// `docs/decisions/0016-depends-on.md`). This is a **start order** only: reconcile starts the
-    /// dependencies first and the deploy gate waits for them; it implies no network connectivity.
+    /// dependencies first and the deploy gate waits for them; it implies no network connectivity
+    /// on its own (see [`AppSpec::shared_networks`] for that).
     /// Not part of the spec hash — editing it never recreates a container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<InstanceName>,
@@ -686,6 +804,10 @@ pub struct AppsFile {
     /// before `apps` so the TOML file keeps its top-level tables first.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeSpec>,
+    /// Networks shared by groups of instances (issue #128), declared once here and joined through
+    /// [`AppSpec::shared_networks`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
     #[serde(default)]
     pub apps: BTreeMap<InstanceName, AppSpec>,
 }

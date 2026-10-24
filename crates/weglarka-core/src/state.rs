@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -58,10 +58,22 @@ fn shared_volume_groups_v3(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v3 → v4: shared networks (issue #128, ADR 0030). `[shared_networks.<name>]` and
+/// `AppSpec::shared_networks` are optional and default to empty, so a v3 document needs no data
+/// transformation — the marker records that the file may carry them. A no-op that must accept a
+/// hand-edited file which already has them.
+fn shared_networks_v4(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
-const SCHEMA_STEPS: &[SchemaStep] = &[host_config_mounts_v2, shared_volume_groups_v3];
+const SCHEMA_STEPS: &[SchemaStep] = &[
+    host_config_mounts_v2,
+    shared_volume_groups_v3,
+    shared_networks_v4,
+];
 
 const _: () = assert!(
     SCHEMA_STEPS.len() as u32 == SCHEMA_VERSION - IMPLICIT_SCHEMA_VERSION,
@@ -556,6 +568,7 @@ pub fn parse_apps(path: &Path, src: &str) -> Result<AppsFile, StateError> {
     }
     crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
     crate::shared_volumes::validate(&apps).map_err(|r| invalid(path, r))?;
+    crate::shared_networks::validate(&apps).map_err(|r| invalid(path, r))?;
     Ok(apps)
 }
 
@@ -572,6 +585,7 @@ pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
     }
     crate::depends::validate(apps).map_err(|r| invalid(path, r))?;
     crate::shared_volumes::validate(apps).map_err(|r| invalid(path, r))?;
+    crate::shared_networks::validate(apps).map_err(|r| invalid(path, r))?;
     let text = toml::to_string(apps).map_err(|e| invalid(path, e.to_string()))?;
     write_atomic(path, text.as_bytes(), 0o644).map_err(io_err(path))
 }
@@ -1063,6 +1077,7 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let dir = tempfile::tempdir().unwrap();
         let apps_path = dir.path().join("apps.toml");
         fs::write(&apps_path, "[apps.a]\nimage = \"x:1\"\n").unwrap();
+        // A v1 file is migrated in memory and stamped; its content is untouched.
         let apps = load_apps(&apps_path).unwrap();
         assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
         save_apps(&apps_path, &apps).unwrap();
@@ -1186,6 +1201,7 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         // An empty (or comment-only) file is "nothing yet", not a parse error.
         fs::write(&p, "").unwrap();
         assert_eq!(load_state(&p).unwrap(), StateFile::default());
+        // A comment-only file has no marker, so it is a (migrated, stamped) empty v1 file.
         fs::write(&p, "# nothing yet\n").unwrap();
         let loaded = load_state(&p).unwrap();
         assert_eq!(loaded.schema_version, Some(SCHEMA_VERSION));
