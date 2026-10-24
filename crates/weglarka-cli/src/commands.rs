@@ -7,10 +7,10 @@ use std::path::Path;
 use serde::Serialize;
 use weglarka_api::endpoints;
 use weglarka_api::{
-    AddAppRequest, AppSummary, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
-    ListAppsResponse, ListSecretsResponse, NotifyStatusResponse, NotifyTestResponse,
-    PruneImagesRequest, PruneImagesResponse, PrunedImage, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse,
+    AddAppRequest, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest,
+    DeployResponse, DoctorReport, ListAppsResponse, ListSecretsResponse, NotifyStatusResponse,
+    NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
+    ReloadRequest, ReloadResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
 };
 use weglarka_core::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
@@ -19,7 +19,7 @@ use weglarka_core::images::human_bytes;
 
 use crate::cli::{
     AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,
-    PruneImagesArgs, RemoveArgs, SecretSetArgs, SecretsCommand,
+    PruneImagesArgs, ReloadArgs, RemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, expand_path};
 use crate::error::{CliError, Kind, exit};
@@ -42,6 +42,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
             crate::update::apps_start(json, &overrides, a).await
         }
         Command::Apps(AppsCommand::Stop(a)) => crate::update::apps_stop(json, &overrides, a).await,
+        Command::Apps(AppsCommand::Reload(a)) => apps_reload(json, &overrides, a).await,
         Command::Apps(AppsCommand::Remove(a)) => apps_remove(json, &overrides, a).await,
         Command::Apps(AppsCommand::List) => apps_list(json, &overrides).await,
         Command::Apps(AppsCommand::Show { name }) => apps_show(json, &overrides, &name).await,
@@ -183,6 +184,8 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         health: HealthGate::default(),
         volumes: vec![],
         shared_volumes: vec![],
+        configs: Vec::new(),
+        reload_signal: None,
         host_ports: Vec::new(),
         depends_on: Vec::new(),
         resources: Default::default(),
@@ -279,6 +282,38 @@ async fn apps_show(json: bool, o: &Overrides, name: &str) -> Result<i32, CliErro
         .await?;
     emit(json, &resp, || render_show(&resp));
     Ok(exit::OK)
+}
+
+/// `apps reload`: sends the spec's `reload_signal`, restarts the same container when the spec sets
+/// none, or — with `--recreate` — recreates it from the pinned digest (needed after an editor saved a
+/// single-file config mount with write-and-rename, which leaves the bind mount on the old inode).
+pub(crate) async fn apps_reload(json: bool, o: &Overrides, a: ReloadArgs) -> Result<i32, CliError> {
+    let name = instance(&a.name)?;
+    let req = ReloadRequest {
+        recreate: a.recreate,
+    };
+    let resp: ReloadResponse = client(o)?
+        .call(
+            endpoints::APPS_RELOAD,
+            &[("name", name.as_str())],
+            Some(&req),
+        )
+        .await
+        .map_err(|e| reload_conflict(e, &name))?;
+    emit(json, &resp, || render_reload(&resp));
+    Ok(exit::OK)
+}
+
+/// A 409 from `apps reload` means there is no running container to signal or restart (a busy daemon
+/// is retried by the client), so point at the command that brings the app up.
+fn reload_conflict(err: CliError, name: &InstanceName) -> CliError {
+    if err.kind == Kind::Conflict {
+        err.with_hint(format!(
+            "`{name}` is not running — start it with `weglarka apps start {name}`"
+        ))
+    } else {
+        err
+    }
 }
 
 // ---------- deploy / status ----------
@@ -612,12 +647,81 @@ fn render_apps(apps: &[AppSummary]) -> String {
 pub(crate) fn render_show(r: &ShowAppResponse) -> String {
     let spec = toml::to_string(&r.spec).unwrap_or_default();
     let waiting = crate::update::render_waiting(r.name.as_str(), &r.state);
-    format!(
+    let mut out = format!(
         "name:       {}\nruntime:    {}\ngeneration: {}\ndigest:     {}\nprevious:   {}\n{waiting}\n[spec]\n{spec}",
         r.name,
         crate::update::runtime_label(r.runtime),
         r.state.generation,
         r.state.current.as_ref().map_or("-", |d| d.as_str()),
         r.state.previous.as_ref().map_or("-", |d| d.as_str()),
-    )
+    );
+    if let Some(configs) = &r.configs
+        && !configs.is_empty()
+    {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&render_configs(configs));
+    }
+    out
+}
+
+/// `apps reload` output: what happened, then what the app now sees — the same `[configs]` block as
+/// `apps show`, so the operator can confirm the new fingerprint without a second call.
+pub(crate) fn render_reload(r: &ReloadResponse) -> String {
+    let mut out = match r.action {
+        ReloadAction::Signalled => format!(
+            "{}: signalled SIG{}\n",
+            r.name,
+            r.signal.as_deref().unwrap_or_default()
+        ),
+        ReloadAction::Restarted => format!("{}: restarted\n", r.name),
+        ReloadAction::Recreated => format!("{}: recreated (same digest)\n", r.name),
+    };
+    if let Some(configs) = &r.configs
+        && !configs.is_empty()
+    {
+        out.push_str(&render_configs(configs));
+    }
+    out
+}
+
+/// `[configs]` section shared by `apps show` and `apps reload`: one line per declared mount with the
+/// status and, for a source inside `config_root`, a short content fingerprint.
+fn render_configs(configs: &[ConfigMountView]) -> String {
+    let mut out = String::from("[configs]\n");
+    for c in configs {
+        out.push_str(&format!(
+            "{} -> {}  {}",
+            c.source,
+            c.target,
+            config_status_label(c.status)
+        ));
+        if let Some(fingerprint) = &c.fingerprint {
+            out.push(' ');
+            out.push_str(&short_fingerprint(fingerprint));
+        }
+        if let Some(detail) = &c.detail {
+            out.push_str(&format!(" ({detail})"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A short lowercase word for a mount status.
+fn config_status_label(status: ConfigMountStatus) -> &'static str {
+    match status {
+        ConfigMountStatus::Ok => "ok",
+        ConfigMountStatus::Missing => "missing",
+        ConfigMountStatus::NoRoot => "no-config-root",
+        ConfigMountStatus::OutsideRoot => "outside-root",
+        ConfigMountStatus::NotFileOrDir => "not-file-or-dir",
+        ConfigMountStatus::Unreadable => "unreadable",
+    }
+}
+
+/// The first 8 hex characters of the sha256 fingerprint — enough to compare before and after a reload.
+fn short_fingerprint(fingerprint: &str) -> String {
+    fingerprint.get(..8).unwrap_or(fingerprint).to_owned()
 }
