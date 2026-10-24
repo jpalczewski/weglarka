@@ -1,0 +1,34 @@
+# Stream a response through the ingress (issue #64): an SSE endpoint or long polling must not sit in
+# nginx's proxy buffers and must survive more than the default 60 s of silence. Add it with
+#   weglarka apps add ntfy --spec docs/examples/streaming.toml
+# or, for an app that already exists:
+#   weglarka apps update ntfy --streaming
+# This is an ingress-only setting: it re-renders nginx.conf and reloads nginx, never recreates or
+# redeploys the container. It is deliberately opt-in per app — buffering stays the default for
+# ordinary HTTP apps.
+image = "ghcr.io/example/ntfy:latest"
+domains = ["ntfy.example.com"]
+port = 2586
+
+# `streaming = true` adds, in this app's `location /` only:
+#   proxy_buffering off;            # forward each event instead of filling proxy_buffers
+#   proxy_request_buffering off;    # forward the request body while it arrives
+#   proxy_read_timeout 180s;        # idle stream no longer cut at nginx's default 60 s
+#   proxy_send_timeout 180s;
+[ingress]
+streaming = true
+
+# Idle timeout for both directions, in seconds: default 180, allowed 1..=3600. Only meaningful with
+# `streaming = true` (validation rejects it otherwise). No CLI flag in v1 — set it here or with
+# `apps update --spec`.
+# stream_timeout_secs = 180
+
+# In apps.toml the same settings are the nested table:
+#   [apps.ntfy.ingress]
+#   streaming = true
+# A stream idle for longer than `stream_timeout_secs` is closed with a 504, so an app that can be
+# quiet for a long time should send a keepalive (ntfy sends one every 45 s) instead of raising the
+# timeout; the ceiling is 3600 s.
+#
+# A slow client now holds an nginx worker connection for as long as the stream is open
+# (`worker_connections 1024`). Opt in on apps that really stream, not on every app.

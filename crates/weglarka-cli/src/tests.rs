@@ -750,6 +750,25 @@ fn add_accepts_depends_on() {
 }
 
 #[test]
+fn add_accepts_streaming() {
+    let spec = build_spec(&add_args(&["--streaming"])).unwrap();
+    assert!(spec.ingress.streaming);
+    assert_eq!(
+        spec.ingress.stream_timeout_secs,
+        weglarka_core::app::AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+    );
+    // Without the flag the whole table stays out of the spec (and out of apps.toml).
+    assert!(build_spec(&add_args(&[])).unwrap().ingress.is_default());
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(Add::try_parse_from(["add", "ntfy", "img", "--streaming", "--spec", "f"]).is_err());
+}
+
+#[test]
 fn update_flags_flip_start() {
     assert!(
         !apply_flags(app_spec(true), &update_args(&["--no-start"]))

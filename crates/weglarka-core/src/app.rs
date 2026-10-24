@@ -489,6 +489,58 @@ impl Resources {
     }
 }
 
+/// Per-app ingress behaviour (issue #64): settings that only change the generated nginx config and
+/// never the container. Ingress-only by construction — [`crate::hash::HashInput`] does not include
+/// them, so a change reloads nginx (`nginx -t` + `SIGHUP`) and never recreates the container, exactly
+/// like `domains`. The nested table leaves room for further routing knobs without touching `AppSpec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppIngress {
+    /// Streaming responses (SSE, chunked JSON, long polling): nginx stops buffering the response and
+    /// the request body and waits `stream_timeout_secs` for the upstream instead of 60 s. Opt-in per
+    /// app, because buffering is the right default for an ordinary HTTP app.
+    #[serde(default)]
+    pub streaming: bool,
+    /// Idle timeout of a streaming app (`proxy_read_timeout`/`proxy_send_timeout`), in seconds.
+    /// Rejected by validation unless `streaming = true`; the default comfortably covers SSE with
+    /// keepalives every 45 s.
+    #[serde(
+        default = "default_stream_timeout_secs",
+        skip_serializing_if = "AppIngress::is_default_stream_timeout"
+    )]
+    pub stream_timeout_secs: u64,
+}
+
+impl Default for AppIngress {
+    fn default() -> Self {
+        Self {
+            streaming: false,
+            stream_timeout_secs: Self::DEFAULT_STREAM_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl AppIngress {
+    /// Default idle timeout of a streaming app (nginx's own default of 60 s is too short for SSE).
+    pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 180;
+    /// Upper bound: a stream idle for longer than an hour is a bug, not a slow producer.
+    pub const MAX_STREAM_TIMEOUT_SECS: u64 = 3600;
+
+    /// True when the app sets nothing, so `AppSpec` omits the whole `ingress` table.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Serde helper: the default timeout is omitted, so `streaming = true` alone is a complete spec.
+    pub fn is_default_stream_timeout(value: &u64) -> bool {
+        *value == Self::DEFAULT_STREAM_TIMEOUT_SECS
+    }
+}
+
+fn default_stream_timeout_secs() -> u64 {
+    AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+}
+
 /// Desired state of a single instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -502,6 +554,10 @@ pub struct AppSpec {
     /// HTTP port in the container that ingress proxies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Ingress behaviour of this app; omitted while it is the default. Not part of the spec hash, so
+    /// changing it only re-renders the ingress.
+    #[serde(default, skip_serializing_if = "AppIngress::is_default")]
+    pub ingress: AppIngress,
     /// Plain environment variables (no secret values).
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -607,6 +663,7 @@ health = { command = ["/app", "-health"], http = { path = "/healthz" } }
             !text.contains("volumes")
                 && !text.contains("resources")
                 && !text.contains("command")
+                && !text.contains("ingress")
                 && !text.contains("host_ports")
                 && !text.contains("depends_on"),
             "{text}"
@@ -640,6 +697,57 @@ image = "ghcr.io/x/db:latest"
         assert_eq!(parsed, again);
         // The strong name type rejects typos at parse time, before any validation runs.
         let bad = "[apps.a]\nimage = \"i\"\ndepends_on = [\"B\"]\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
+    }
+
+    #[test]
+    fn ingress_streaming_parses_and_roundtrips() {
+        // Both spellings are accepted: an inline table and a `[apps.x.ingress]` table.
+        let inline: AppsFile = toml::from_str(
+            r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+domains = ["nz.example.eu"]
+port = 8085
+ingress = { streaming = true }
+"#,
+        )
+        .unwrap();
+        let spec = &inline.apps[&InstanceName::new("ntfy").unwrap()];
+        assert!(spec.ingress.streaming);
+        assert_eq!(
+            spec.ingress.stream_timeout_secs,
+            AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+        );
+
+        // The default timeout stays out of the serialized form, so `streaming = true` is complete.
+        let text = toml::to_string(&inline).unwrap();
+        assert!(text.contains("streaming = true"), "{text}");
+        assert!(!text.contains("stream_timeout_secs"), "{text}");
+
+        // A custom timeout persists and round-trips.
+        let custom: AppsFile = toml::from_str(
+            r#"
+[apps.a]
+image = "i"
+
+[apps.a.ingress]
+streaming = true
+stream_timeout_secs = 600
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&custom).unwrap();
+        assert!(text.contains("stream_timeout_secs = 600"), "{text}");
+        assert_eq!(toml::from_str::<AppsFile>(&text).unwrap(), custom);
+
+        // An app that sets nothing keeps the old shape entirely.
+        let plain: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
+        assert!(plain.ingress.is_default());
+        assert!(!toml::to_string(&plain).unwrap().contains("ingress"));
+
+        // Unknown keys under `ingress` are rejected (`deny_unknown_fields`).
+        let bad = "[apps.a]\nimage = \"i\"\n[apps.a.ingress]\nbogus = 1\n";
         assert!(toml::from_str::<AppsFile>(bad).is_err());
     }
 

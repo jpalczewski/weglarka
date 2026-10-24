@@ -31,6 +31,7 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         image: "ghcr.io/x/y:latest".into(),
         domains: domains.iter().map(|d| (*d).to_owned()).collect(),
         port,
+        ingress: Default::default(),
         env: Default::default(),
         secrets: vec![],
         health: Default::default(),

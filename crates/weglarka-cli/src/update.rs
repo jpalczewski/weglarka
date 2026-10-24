@@ -14,7 +14,7 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use weglarka_core::app::{AppSpec, InstanceName, SecretBinding, SecretTarget};
+use weglarka_core::app::{AppIngress, AppSpec, InstanceName, SecretBinding, SecretTarget};
 use weglarka_core::state::AppState;
 
 use crate::cli::{StartStopArgs, parse_pair};
@@ -46,6 +46,13 @@ pub struct UpdateArgs {
     /// Remove the port (the app is no longer routed by ingress).
     #[arg(long, conflicts_with = "spec")]
     pub unset_port: bool,
+    /// Serve streaming responses (SSE, chunked, long polling): no nginx buffering and a long idle
+    /// timeout. Ingress-only: nginx reload, the container is not recreated.
+    #[arg(long, conflicts_with_all = ["spec", "no_streaming"])]
+    pub streaming: bool,
+    /// Stop streaming: clears the whole `ingress` block, a custom `stream_timeout_secs` included.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_streaming: bool,
     /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
@@ -93,6 +100,8 @@ impl UpdateArgs {
             || !self.remove_domains.is_empty()
             || self.port.is_some()
             || self.unset_port
+            || self.streaming
+            || self.no_streaming
             || !self.env.is_empty()
             || !self.unset_env.is_empty()
             || !self.secret_env.is_empty()
@@ -139,6 +148,13 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     }
     if a.port.is_some() {
         spec.port = a.port;
+    }
+    // Ingress-only (issue #64): `--no-streaming` drops the whole block, a custom timeout included.
+    if a.streaming {
+        spec.ingress.streaming = true;
+    }
+    if a.no_streaming {
+        spec.ingress = AppIngress::default();
     }
     for k in &a.unset_env {
         if spec.env.remove(k).is_none() {
@@ -570,6 +586,51 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             _a: UpdateArgs,
         }
         assert!(W::try_parse_from(["w", "ntfy", "--host-port", "2222:22", "--spec", "f"]).is_err());
+    }
+
+    #[test]
+    fn streaming_flag_sets_and_clears_the_ingress_block() {
+        // `--streaming` opts in and leaves everything else untouched.
+        let s = apply_flags(spec(), &args(&["--streaming"])).unwrap();
+        assert!(s.ingress.streaming);
+        assert_eq!(
+            s.ingress.stream_timeout_secs,
+            AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+        );
+        assert_eq!(s.domains, spec().domains);
+
+        // A custom timeout survives a read-modify-write that names only the flag.
+        let mut custom = spec();
+        custom.ingress = AppIngress {
+            streaming: true,
+            stream_timeout_secs: 600,
+        };
+        let s = apply_flags(custom.clone(), &args(&["--streaming"])).unwrap();
+        assert_eq!(s.ingress, custom.ingress);
+
+        // `--no-streaming` clears the whole block, the custom timeout included.
+        let s = apply_flags(custom, &args(&["--no-streaming"])).unwrap();
+        assert!(s.ingress.is_default());
+
+        // It is an ordinary spec edit: counted as one and visible in the dry-run diff.
+        assert!(args(&["--streaming"]).has_edits());
+        assert!(args(&["--no-streaming"]).has_edits());
+        let streamed = apply_flags(spec(), &args(&["--streaming"])).unwrap();
+        assert!(spec_diff(&spec(), &streamed).contains("streaming = true"));
+
+        // On an app that is not streaming, `--no-streaming` is a no-op (nothing is sent).
+        let plain = apply_flags(spec(), &args(&["--no-streaming"])).unwrap();
+        assert!(spec_diff(&spec(), &plain).is_empty());
+
+        // Mutually exclusive, and neither combines with `--spec`.
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        assert!(W::try_parse_from(["w", "ntfy", "--streaming", "--no-streaming"]).is_err());
+        assert!(W::try_parse_from(["w", "ntfy", "--streaming", "--spec", "f"]).is_err());
+        assert!(W::try_parse_from(["w", "ntfy", "--no-streaming", "--spec", "f"]).is_err());
     }
 
     #[test]

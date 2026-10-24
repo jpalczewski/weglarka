@@ -11,7 +11,9 @@ use weglarka_api::{
     ListAppsResponse, ListSecretsResponse, SecretInfo, SetSecretRequest, ShowAppResponse,
     StatusResponse,
 };
-use weglarka_core::app::{AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget};
+use weglarka_core::app::{
+    AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
+};
 
 use crate::cli::{
     AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, RemoveArgs, SecretSetArgs,
@@ -166,6 +168,10 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         image,
         domains: a.domains.clone(),
         port: a.port,
+        ingress: AppIngress {
+            streaming: a.streaming,
+            ..Default::default()
+        },
         env: a.env.iter().cloned().collect(),
         secrets,
         health: HealthGate::default(),

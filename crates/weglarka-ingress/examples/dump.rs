@@ -1,5 +1,8 @@
 //! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|traefik` — prints a
-//! sample config (used in CI for `nginx -t` and the forwarded-header test).
+//! sample config (used in CI for `nginx -t`, the forwarded-header test and the streaming test).
+//!
+//! `sse` is the only app with `ingress.streaming = true` (issue #64); `blog` deliberately keeps the
+//! buffered defaults, so `.github/scripts/test-streaming.sh` can use it as the negative control.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +33,14 @@ port = 8085
 image = "ghcr.io/x/blog:latest"
 domains = ["blog.example.eu", "www.blog.example.eu"]
 port = 3000
+
+[apps.sse]
+image = "ghcr.io/x/sse:latest"
+domains = ["sse.example.eu"]
+port = 3000
+
+[apps.sse.ingress]
+streaming = true
 "#;
 
 fn main() {

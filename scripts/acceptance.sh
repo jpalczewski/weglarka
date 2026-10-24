@@ -424,6 +424,38 @@ step_traffic() {
   fi
 }
 
+# Streaming (issue #64): `--streaming` is ingress-only (outside the spec-hash), so the config is
+# re-rendered and nginx reloaded while the container stays. A changed generation or spec-hash would
+# mean a recreate — the regression this step guards against; `--no-streaming` restores the defaults.
+step_streaming() {
+  local gen hash out
+  gen=$(show_field "$CANARY" '.state.generation // empty')
+  hash=$(show_field "$CANARY" '.state.spec_hash // empty')
+  out=$(wg --json apps update "$CANARY" --streaming) \
+    || die "apps update --streaming nie powiodło się: $out"
+  printf '%s' "$out" | jq -e '.deploy == null' >/dev/null \
+    || die "apps update --streaming wdrożyło apkę (deploy ≠ null) — ingress ma tylko przeładować nginx"
+  wait_for "streaming w nginx.conf" 30 \
+    podman exec weglarka-nginx grep -qF 'proxy_buffering off;' /etc/nginx/nginx.conf \
+    || die "brak 'proxy_buffering off;' w nginx.conf po 30s — reload nginx się nie wykonał"
+  wait_for "proxy_read_timeout 180s w nginx.conf" 30 \
+    podman exec weglarka-nginx grep -qF 'proxy_read_timeout 180s;' /etc/nginx/nginx.conf \
+    || die "brak 'proxy_read_timeout 180s;' w nginx.conf po 30s — domyślny timeout streamingu nie dotarł do configu"
+  [ "$(show_field "$CANARY" '.state.generation // empty')" = "$gen" ] \
+    || die "generation zmieniło się ($gen → $(show_field "$CANARY" .state.generation)): --streaming odtworzyło kontener zamiast przeładować nginx"
+  [ "$(show_field "$CANARY" '.state.spec_hash // empty')" = "$hash" ] \
+    || die "spec-hash zmienił się przy --streaming — kontener został odtworzony zamiast samego reloadu nginx"
+  log "streaming: generation=$gen spec-hash=$hash (bez zmian)"
+
+  wg apps update "$CANARY" --no-streaming >/dev/null
+  wait_for "brak streamingu w nginx.conf" 30 \
+    bash -c "! podman exec weglarka-nginx cat /etc/nginx/nginx.conf | grep -qF 'proxy_buffering off;'" \
+    || die "streaming nadal w nginx.conf po 30s od --no-streaming — reload nie wrócił do domyślnych opcji"
+  [ "$(show_field "$CANARY" '.state.generation // empty')" = "$gen" ] \
+    || die "generation zmieniło się przy --no-streaming ($gen → $(show_field "$CANARY" .state.generation)): odtworzenie kontenera zamiast reloadu nginx"
+  note "streaming: nginx reload bez odtworzenia kontenera (generation i spec-hash bez zmian)"
+}
+
 # Plain HTTP on the canary domain redirects to HTTPS (no -L). Through Traefik this proves the `http`
 # router exists; with --direct we impersonate Traefik's http entrypoint (X-Forwarded-Proto: http).
 step_http_redirect() {
@@ -698,6 +730,7 @@ if [ -z "$DIRECT" ]; then
 else
   run_step traffic "ruch: nginx bezpośrednio → 200, nagłówki" step_traffic canary
 fi
+run_step streaming "ingress: streaming = reload nginx bez odtworzenia kontenera" step_streaming canary traffic
 run_step http_redirect "http → 301 na https (bez -L)" step_http_redirect canary traffic
 run_step webhook_protocol "webhook: 202 / 401 / 204" step_webhook_protocol canary
 if [ "$LOCAL_REGISTRY" = 1 ]; then

@@ -42,6 +42,14 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   the apps do not share a network and cannot reach each other by name. `depends_on` is not part of `spec_hash`, so
   changing it never recreates a container, while `apps remove` of a dependency is refused (409 Conflict, listing the
   dependents) until the dependents or their entries are gone. Conflicts with `--spec`, like the other spec flags.
+- `--streaming` / `--no-streaming` (`[ingress] streaming` in `--spec`): serve streaming responses — SSE,
+  chunked, long polling — with no nginx response/request buffering and a long idle timeout (issue #64).
+  Ingress-only: a change re-renders nginx.conf and reloads nginx (no deploy, no traffic gap), the container is
+  untouched and `spec_hash` does not change. `apps add --streaming` sets it, `apps update --streaming` turns it
+  on; `apps update --no-streaming` clears the whole `ingress` block, a custom timeout included, and sends
+  nothing (a no-op) when the app is not streaming. `stream_timeout_secs` — default 180, allowed 1..=3600 — has
+  no flag in v1: set it through `apps update --spec` (validation rejects it unless `streaming = true`).
+  Conflicts with `--spec`.
 - Lifecycle: `start` is a spec field (default `true`), not a one-shot flag. `apps add --no-start` provisions
   only — the image digest is pinned, the network, uid range and volumes are created, **no container**;
   `apps start` / `apps stop` flip the flag with the same read-modify-write as `apps update`

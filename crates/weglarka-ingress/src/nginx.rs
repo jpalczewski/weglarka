@@ -1,6 +1,10 @@
 //! nginx config: one server per app, `proxy_pass` by name on the app network, JSON access log with `app`;
 //! **Owner: session c.**
 //!
+//! Per-app ingress options ([`AppIngress`], issue #64) are rendered inside that app's `location` only:
+//! `streaming = true` turns response/request buffering off and raises both proxy timeouts, so other
+//! apps keep the nginx defaults.
+//!
 //! Extension points: [`ModeProfile`] (what differs between the `behind`/`edge` modes: trust headers,
 //! `listen`, TLS/ACME) and [`Backend`] (today only a proxy to a container; static sites would be
 //! another variant). The `edge` mode currently returns [`IngressError::UnsupportedMode`].
@@ -8,7 +12,7 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
 use weglarka_core::config::{HostConfig, IngressMode};
 
 use crate::plan::{Cidr, Domain, IngressError, Plan, WEBHOOK_UPSTREAM_HOST};
@@ -100,7 +104,7 @@ enum Backend<'a> {
 }
 
 impl Backend<'_> {
-    fn write_location(&self, c: &mut Conf) {
+    fn write_location(&self, c: &mut Conf, ingress: &AppIngress) {
         match self {
             Backend::Container { host, port } => {
                 // A variable in `proxy_pass` forces runtime resolution (via `resolver`): a missing
@@ -108,6 +112,22 @@ impl Backend<'_> {
                 c.block("location /", |c| {
                     c.line(&format!("set $upstream \"http://{host}:{port}\";"));
                     c.line("proxy_pass $upstream;");
+                    // Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the
+                    // right default everywhere else. Both timeouts change together — nginx would
+                    // otherwise cut an idle stream at its 60 s default. The `Connection`/`Upgrade`
+                    // headers stay global on purpose: a streaming app may still use WebSocket.
+                    if ingress.streaming {
+                        c.line("proxy_buffering off;");
+                        c.line("proxy_request_buffering off;");
+                        c.line(&format!(
+                            "proxy_read_timeout {}s;",
+                            ingress.stream_timeout_secs
+                        ));
+                        c.line(&format!(
+                            "proxy_send_timeout {}s;",
+                            ingress.stream_timeout_secs
+                        ));
+                    }
                 });
             }
         }
@@ -331,7 +351,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
                     host: app.instance.as_str(),
                     port: app.port,
                 }
-                .write_location(c);
+                .write_location(c, &app.ingress);
             });
         }
     });

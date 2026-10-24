@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
 use weglarka_core::config::{HostConfig, IngressMode};
 
 /// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
@@ -140,6 +140,9 @@ pub struct AppRoute<'a> {
     /// `spec.start`: `false` means the app is provisioned only (no container), so it is validated
     /// and reserves its domains like any other app, but the generators render no route for it.
     pub active: bool,
+    /// Per-app ingress behaviour (issue #64). Copied from the spec as-is: an app without a domain is
+    /// not rendered at all, so the options never matter there.
+    pub ingress: AppIngress,
 }
 
 /// Webhook route: public domain → Węglarka's container.
@@ -197,6 +200,7 @@ impl<'a> Plan<'a> {
                 port,
                 domains,
                 active: spec.start,
+                ingress: spec.ingress.clone(),
             });
         }
 
