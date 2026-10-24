@@ -30,6 +30,7 @@ use weglarka_core::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
+use crate::images;
 use crate::shared_volumes;
 use crate::update;
 use crate::volumes;
@@ -146,6 +147,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
         .merge(shared_volumes::routes())
+        .merge(images::routes())
         .with_state(daemon)
 }
 

@@ -20,6 +20,7 @@ pub mod webhook;
 // Logic — owned by session b (stubs). `limits` / `volumes`: iteration 2, sessions 2 / 1 (see CLAUDE.md).
 pub mod depends;
 pub mod deploy;
+pub mod images;
 pub mod limits;
 pub mod reconcile;
 pub mod secrets;

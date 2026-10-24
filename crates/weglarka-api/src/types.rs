@@ -151,6 +151,38 @@ pub struct ListSharedVolumesResponse {
     pub volumes: Vec<SharedVolumeSummary>,
 }
 
+/// `POST /v1/images/prune` (issue #40): remove images older than each app's current and previous one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneImagesRequest {
+    /// Report the images that would be removed; remove nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// One image of the local Podman store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedImage {
+    pub id: String,
+    /// `repo:tag` names (`<none>:<none>` is filtered out).
+    pub tags: Vec<String>,
+    /// `repo@sha256:…` names — an untagged leftover is still identified by these.
+    pub digests: Vec<String>,
+    /// Reported by libpod; `0` when unknown.
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneImagesResponse {
+    pub dry_run: bool,
+    /// Images removed; on a dry run — the images that *would* be removed.
+    pub removed: Vec<PrunedImage>,
+    /// An upper bound: sizes of layers shared between images are counted per image.
+    pub reclaimed_bytes: u64,
+    /// `"<id>: <error>"` for images Podman refused (e.g. still in use); the rest is still removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployRequest {
     /// Defaults to `spec.image`; a given reference overrides it for this deploy only.

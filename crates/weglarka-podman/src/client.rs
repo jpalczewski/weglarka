@@ -15,8 +15,8 @@ use crate::transport::{Lines, Transport, encode_component, name_conflict, path_n
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
-    InspectImage, InspectNetwork, ListedContainer, ListedNetwork, NetworkRmReport, PullLine,
-    PullReport, StartExec, Version, WireEvent, WireVolume, decode, health_status,
+    InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, NetworkRmReport,
+    PullLine, PullReport, StartExec, Version, WireEvent, WireVolume, decode, health_status,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -197,6 +197,18 @@ impl PodmanClient for LibpodClient {
         let path = format!("/images/{}/json", path_name(reference)?);
         let body = self.transport.call(Method::GET, &path, None).await?;
         Ok(decode::<InspectImage>(&body)?.into_domain(reference))
+    }
+
+    async fn image_list(&self) -> Result<Vec<ImageInfo>> {
+        // No `all=true`: intermediate layers are not ours to reason about (docs/decisions/0020).
+        let body = self
+            .transport
+            .call(Method::GET, "/images/json", None)
+            .await?;
+        Ok(decode::<Vec<ListedImage>>(&body)?
+            .into_iter()
+            .map(ListedImage::into_domain)
+            .collect())
     }
 
     async fn image_tag(&self, id: &str, repo: &str, tag: &str) -> Result<()> {

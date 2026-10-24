@@ -205,7 +205,14 @@ pub struct ImageInfo {
     pub id: String,
     /// Repository digest (from the manifest), if known.
     pub digest: Option<Digest>,
+    /// `repo:tag` names of the image (`<none>:<none>` is filtered out).
     pub repo_tags: Vec<String>,
+    /// `repo@sha256:…` names of the image. An image whose tag moved away keeps these, which is how an
+    /// image pulled by Węglarka stays attributable (docs/decisions/0020).
+    pub repo_digests: Vec<String>,
+    /// Uncompressed size as reported by libpod; `0` when it does not report one. Feeds the
+    /// reclaimed-space estimate, which counts shared layers per image (an upper bound).
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +330,10 @@ pub trait PodmanClient: Send + Sync {
     /// Pull as a stream; an error mid-pull appears as an `Err` in the stream.
     fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send;
     fn image_inspect(&self, reference: &str) -> impl Future<Output = Result<ImageInfo>> + Send;
+    /// Top-level images in the local store (one entry per image, intermediate layers excluded).
+    /// Feeds image retention: keep the current and the previous image, drop older ones
+    /// (docs/decisions/0020).
+    fn image_list(&self) -> impl Future<Output = Result<Vec<ImageInfo>>> + Send;
     /// Gives image `id` an additional tag (manual rollback).
     fn image_tag(&self, id: &str, repo: &str, tag: &str)
     -> impl Future<Output = Result<()>> + Send;

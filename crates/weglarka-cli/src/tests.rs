@@ -13,7 +13,8 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use weglarka_api::{
     ApiError, CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, DoctorReport, ErrorCode,
-    RuntimeState, SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
+    PruneImagesResponse, PrunedImage, RuntimeState, SetSecretRequest, ShowAppResponse,
+    UpdateAppResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
@@ -966,6 +967,84 @@ async fn start_dry_run_sends_nothing() {
     .unwrap();
     assert_eq!(code, exit::OK);
     assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn images_prune_sends_the_dry_run_flag_and_renders_the_report() {
+    let response = serde_json::to_string(&PruneImagesResponse {
+        dry_run: true,
+        removed: vec![PrunedImage {
+            id: "a".repeat(64),
+            tags: Vec::new(),
+            digests: vec![format!("ghcr.io/x/y@sha256:{}", "b".repeat(64))],
+            size_bytes: 5 * 1024 * 1024,
+        }],
+        reclaimed_bytes: 5 * 1024 * 1024,
+        failed: Vec::new(),
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    let code = crate::commands::images_prune(
+        true,
+        &overrides(&m),
+        crate::cli::PruneImagesArgs { dry_run: true },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("POST", "/v1/images/prune")
+        );
+        assert_eq!(seen[0].body, r#"{"dry_run":true}"#);
+    }
+
+    let report = PruneImagesResponse {
+        dry_run: true,
+        removed: vec![PrunedImage {
+            id: "a".repeat(64),
+            tags: Vec::new(),
+            digests: vec![format!("ghcr.io/x/y@sha256:{}", "b".repeat(64))],
+            size_bytes: 5 * 1024 * 1024,
+        }],
+        reclaimed_bytes: 5 * 1024 * 1024,
+        failed: Vec::new(),
+    };
+    let rendered = crate::commands::render_prune(&report);
+    assert!(
+        rendered.contains("would remove 1 image(s), 5.0 MiB at most"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("aaaaaaaaaaaa"), "short id: {rendered}");
+    assert!(
+        rendered.contains("ghcr.io/x/y@sha256:bbbbbbbbbbbb…"),
+        "an untagged leftover is named by its digest: {rendered}"
+    );
+}
+
+/// Images Podman refused are reported and turn the exit code non-zero (they need attention).
+#[tokio::test(flavor = "current_thread")]
+async fn images_prune_with_failures_exits_non_zero() {
+    let response = serde_json::to_string(&PruneImagesResponse {
+        dry_run: false,
+        removed: Vec::new(),
+        reclaimed_bytes: 0,
+        failed: vec!["deadbeef: image is in use by a container".to_owned()],
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    let code = crate::commands::images_prune(
+        true,
+        &overrides(&m),
+        crate::cli::PruneImagesArgs { dry_run: false },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::INTERNAL);
+    assert_eq!(m.seen.lock().unwrap()[0].body, r#"{"dry_run":false}"#);
 }
 
 #[test]

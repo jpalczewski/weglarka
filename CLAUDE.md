@@ -5,7 +5,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0019).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0020).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -112,6 +112,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
 | wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
+| retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
 | CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |

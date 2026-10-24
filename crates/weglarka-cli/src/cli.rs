@@ -50,6 +50,23 @@ pub enum Command {
     /// shared volume.
     #[command(subcommand)]
     Volumes(crate::volumes::VolumesCommand),
+    /// Local images: remove the ones older than each app's current and previous image.
+    #[command(subcommand)]
+    Images(ImagesCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImagesCommand {
+    /// Remove images of the repositories Węglarka deploys that are neither an app's current nor its
+    /// previous image and that no container uses. `--dry-run` lists them and removes nothing.
+    Prune(PruneImagesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PruneImagesArgs {
+    /// List the images that would be removed; remove nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]

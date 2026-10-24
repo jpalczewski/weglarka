@@ -554,6 +554,8 @@ pub(crate) struct InspectImage {
     repo_tags: Option<Vec<String>>,
     #[serde(rename = "RepoDigests")]
     repo_digests: Option<Vec<String>>,
+    #[serde(rename = "Size")]
+    size: Option<u64>,
     /// Manifest digest (when `RepoDigests` is absent, e.g. a locally built image).
     #[serde(rename = "Digest")]
     digest: String,
@@ -574,9 +576,51 @@ impl InspectImage {
         ImageInfo {
             id: self.id,
             digest,
-            repo_tags: self.repo_tags.unwrap_or_default(),
+            repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
+            repo_digests: useful_names(repo_digests),
+            size_bytes: self.size.unwrap_or(0),
         }
     }
+}
+
+/// `GET /images/json` — one entry per top-level image. Only the fields retention needs are decoded.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct ListedImage {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "RepoTags")]
+    repo_tags: Option<Vec<String>>,
+    #[serde(rename = "RepoDigests")]
+    repo_digests: Option<Vec<String>>,
+    #[serde(rename = "Size")]
+    size: Option<u64>,
+}
+
+impl ListedImage {
+    pub(crate) fn into_domain(self) -> ImageInfo {
+        let repo_digests = useful_names(self.repo_digests.unwrap_or_default());
+        ImageInfo {
+            id: self.id,
+            // The list reports every repository digest, not the one of a requested reference;
+            // the first is a stable answer, the full list stays in `repo_digests`.
+            digest: repo_digests
+                .iter()
+                .find_map(|d| d.split_once('@').map(|(_, digest)| digest))
+                .and_then(|d| Digest::new(d).ok()),
+            repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
+            repo_digests,
+            size_bytes: self.size.unwrap_or(0),
+        }
+    }
+}
+
+/// Drops libpod's `"<none>:<none>"` placeholder and empty names.
+fn useful_names(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| !name.is_empty() && !name.contains("<none>"))
+        .collect()
 }
 
 /// `ghcr.io/x/y:latest` / `ghcr.io/x/y@sha256:…` → `ghcr.io/x/y`.
@@ -856,6 +900,8 @@ mod tests {
             format!("sha256:{}", "2".repeat(64))
         );
         assert_eq!(ours.repo_tags, ["ghcr.io/jpalczewski/ntfy.zig:latest"]);
+        assert_eq!(ours.size_bytes, 1234);
+        assert_eq!(ours.repo_digests.len(), 2, "every repository name is kept");
         // unknown repo → the first of RepoDigests
         let other = decode::<InspectImage>(json).unwrap().into_domain("x/y:1");
         assert_eq!(
@@ -874,6 +920,29 @@ mod tests {
             format!("sha256:{}", "3".repeat(64))
         );
         assert!(info.repo_tags.is_empty());
+    }
+
+    #[test]
+    fn list_images_keeps_names_and_size_and_drops_placeholders() {
+        let listed: Vec<_> = decode::<Vec<ListedImage>>(fixture!("list_images.json"))
+            .unwrap()
+            .into_iter()
+            .map(ListedImage::into_domain)
+            .collect();
+        assert_eq!(listed.len(), 2);
+        let tagged = &listed[0];
+        assert_eq!(tagged.repo_tags, ["ghcr.io/jpalczewski/ntfy.zig:latest"]);
+        assert_eq!(tagged.size_bytes, 41_943_040);
+        let digest = format!("sha256:{}", "2".repeat(64));
+        assert_eq!(
+            tagged.digest.as_ref().map(Digest::as_str),
+            Some(digest.as_str())
+        );
+        // An untagged leftover keeps its repository digest — that is what makes it attributable.
+        let dangling = &listed[1];
+        assert!(dangling.repo_tags.is_empty(), "<none>:<none> is dropped");
+        assert_eq!(dangling.repo_digests.len(), 1);
+        assert_eq!(dangling.size_bytes, 12_345_678);
     }
 
     #[test]

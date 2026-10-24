@@ -245,6 +245,22 @@ async fn full_lifecycle() {
         Err(PodmanError::NotFound(_))
     ));
 
+    // Retention (#40): the listing carries every name of the image plus its size, and an untagged
+    // image stays attributable through its repository digest.
+    let listed = client.image_list().await.unwrap();
+    let entry = listed
+        .iter()
+        .find(|i| i.id == image.id)
+        .expect("the pulled image is listed");
+    assert!(entry.repo_tags.iter().any(|t| t == IMAGE));
+    assert!(
+        entry
+            .repo_digests
+            .iter()
+            .any(|d| d.ends_with(digest.as_str()))
+    );
+    assert!(entry.size_bytes > 0, "libpod reports the image size");
+
     // Networks: idempotent create; secrets: create overwrites.
     let net = |name: &str| NetworkSpec {
         name: name.into(),

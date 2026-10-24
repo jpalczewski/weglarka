@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::{Digest, InstanceName};
@@ -19,7 +20,7 @@ use crate::reconcile::{
 use crate::secret_store::{SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
 use crate::state::{StatePaths, load_state};
-use crate::testing::{Call, FakePodman};
+use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman};
 use crate::webhook::WebhookEvent;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
@@ -355,7 +356,7 @@ async fn rollback_uses_local_image_when_registry_cannot_serve_it() {
 
     // The old version is no longer addressable as repo@digest and the registry no longer serves it.
     let pinned = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('a'));
-    h.fake.image_remove(&pinned).await.unwrap();
+    h.fake.forget_image_reference(&pinned);
     h.fake.fail_pull(&pinned, "manifest unknown");
 
     h.fake.set_pull_digest(IMAGE, digest('b'));
@@ -1293,4 +1294,118 @@ async fn removing_a_dependency_is_refused() {
 
     h.rec.remove_app(&name("api")).await.unwrap();
     h.rec.remove_app(&name("db")).await.unwrap();
+}
+
+/// Retention of 1 (issue #40): with `current` and `previous` saved, a successful deploy removes the
+/// app's older images — and nothing else.
+#[tokio::test(start_paused = true)]
+async fn deploy_keeps_only_the_current_and_the_previous_image() {
+    let h = Harness::new(NTFY);
+    let ntfy = name("ntfy");
+    h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+    let hex = |c: char| c.to_string().repeat(64);
+
+    for (c, expected_images) in [('a', 1), ('b', 2), ('c', 2)] {
+        h.fake.set_pull_digest(IMAGE, digest(c));
+        let out = h.rec.deploy(&ntfy, false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+        assert_eq!(h.fake.images().len(), expected_images, "after deploy {c}");
+    }
+
+    let ids: Vec<String> = h.fake.images().iter().map(|i| i.id.clone()).collect();
+    assert!(
+        !ids.contains(&hex('a')),
+        "the oldest image is gone: {ids:?}"
+    );
+    assert!(
+        ids.contains(&hex('b')),
+        "the rollback target stays: {ids:?}"
+    );
+    assert!(ids.contains(&hex('c')), "the running image stays: {ids:?}");
+    assert!(
+        h.fake.calls().contains(&Call::ImageRemove(hex('a'))),
+        "the removal went through the client"
+    );
+}
+
+/// A deploy touches only the repository of the app it deploys: a stale image of another app's
+/// repository survives (`scope` in [`crate::images::plan`]).
+#[tokio::test(start_paused = true)]
+async fn a_deploy_does_not_prune_another_apps_repository() {
+    let h = Harness::new(
+        r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+health = { attempts = 3, window_secs = 6 }
+[apps.other]
+image = "ghcr.io/x/other:latest"
+port = 8086
+health = { attempts = 3, window_secs = 6 }
+"#,
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    // A leftover of an earlier deploy of the *other* app, which is never deployed here.
+    let stale = format!("ghcr.io/x/other@{}", digest('e'));
+    h.fake.set_pull_digest(&stale, digest('e'));
+    h.fake.image_pull(&stale).collect::<Vec<_>>().await;
+
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.rec.deploy(&name("ntfy"), false).await.unwrap();
+    h.fake.set_pull_digest(IMAGE, digest('c'));
+    h.rec.deploy(&name("ntfy"), false).await.unwrap();
+
+    let ids: Vec<String> = h.fake.images().iter().map(|i| i.id.clone()).collect();
+    assert!(
+        ids.contains(&'e'.to_string().repeat(64)),
+        "the other repository was not touched: {ids:?}"
+    );
+    assert!(
+        !h.fake
+            .calls()
+            .contains(&Call::ImageRemove('e'.to_string().repeat(64)))
+    );
+
+    // ... while an explicit prune does cover it — the scope above was the only thing protecting it.
+    let out = h.rec.prune_images(false).await.unwrap();
+    assert!(
+        out.removed
+            .iter()
+            .any(|i| i.id == 'e'.to_string().repeat(64)),
+        "{out:?}"
+    );
+}
+
+/// `weglarka images prune`: a dry run reports the candidates of every repository named in
+/// `apps.toml` and removes nothing; the real run removes them and reports the space.
+#[tokio::test(start_paused = true)]
+async fn prune_images_dry_run_then_removes_leftovers() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+    h.rec.reconcile().await.unwrap();
+
+    // Unknown to `state.toml`: what earlier deploys (before retention existed) left behind.
+    let stale = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('e'));
+    h.fake.set_pull_digest(&stale, digest('e'));
+    h.fake.image_pull(&stale).collect::<Vec<_>>().await;
+    assert_eq!(h.fake.images().len(), 2);
+
+    let dry = h.rec.prune_images(true).await.unwrap();
+    assert!(dry.dry_run);
+    assert!(dry.failed.is_empty());
+    assert_eq!(
+        dry.removed.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+        ['e'.to_string().repeat(64)]
+    );
+    assert_eq!(dry.reclaimed_bytes, DEFAULT_IMAGE_SIZE_BYTES);
+    assert_eq!(h.fake.images().len(), 2, "a dry run removes nothing");
+
+    let out = h.rec.prune_images(false).await.unwrap();
+    assert!(!out.dry_run);
+    assert_eq!(out.removed.len(), 1);
+    assert_eq!(out.reclaimed_bytes, DEFAULT_IMAGE_SIZE_BYTES);
+    let ids: Vec<String> = h.fake.images().iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }

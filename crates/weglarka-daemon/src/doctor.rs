@@ -43,7 +43,10 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
         format!("weglarka-daemon {}", env!("CARGO_PKG_VERSION")),
     ));
     podman(d, &mut checks).await;
-    desired_state(d, &mut checks).await;
+    let observed = desired_state(d, &mut checks).await;
+    if let Some(observed) = &observed {
+        image_retention(d, observed, &mut checks).await;
+    }
     shared_volume_state(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
@@ -83,7 +86,17 @@ async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     });
 }
 
-async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+/// What `desired_state` loaded once and hands to the later checks (image retention needs all three).
+struct Observed {
+    apps: AppsFile,
+    st: StateFile,
+    containers: Vec<ContainerInfo>,
+}
+
+async fn desired_state<P: PodmanClient>(
+    d: &Daemon<P>,
+    out: &mut Vec<DoctorCheck>,
+) -> Option<Observed> {
     let apps = state::load_apps(&d.paths.state.apps);
     let st = state::load_state(&d.paths.state.state);
     out.push(match &apps {
@@ -108,7 +121,7 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         ),
     });
     let (Ok(apps), Ok(st)) = (apps, st) else {
-        return;
+        return None;
     };
 
     let containers = match d
@@ -118,7 +131,7 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         .await
     {
         Ok(c) => c,
-        Err(_) => return, // missing Podman already reported above
+        Err(_) => return None, // missing Podman already reported above
     };
     // A deploy writes `state.toml` only after the new container passes the health gate; until then
     // the instance is reported as in progress, not as drift (issue #30).
@@ -185,6 +198,62 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         )
     });
     dependencies(&apps, &st, &containers, out);
+    Some(Observed {
+        apps,
+        st,
+        containers,
+    })
+}
+
+/// Image retention (issue #40): images of a repository Węglarka deploys that are neither an app's
+/// current nor its previous image and that no container uses. Reports only — `weglarka images prune`
+/// removes them. While a deploy runs the check is informational: the freshly pulled image is not in
+/// `state.toml` yet, so it would look unused (the same reason as [`CheckStatus::Info`] for drift).
+async fn image_retention<P: PodmanClient>(
+    d: &Daemon<P>,
+    observed: &Observed,
+    out: &mut Vec<DoctorCheck>,
+) {
+    if let Some(activity) = d.engine.in_flight() {
+        out.push(check(
+            "runtime.images",
+            CheckStatus::Info,
+            format!(
+                "{} in progress for {} — image cleanup check skipped",
+                activity.kind.label(),
+                activity.instance
+            ),
+            None,
+        ));
+        return;
+    }
+    let Ok(images) = d.engine.podman().image_list().await else {
+        return; // missing Podman already reported by `runtime.socket`
+    };
+    let plan = weglarka_core::images::plan(
+        &images,
+        &observed.containers,
+        &observed.apps,
+        &observed.st,
+        None,
+    );
+    if plan.is_empty() {
+        out.push(ok(
+            "runtime.images",
+            "no unused images from earlier deploys",
+        ));
+        return;
+    }
+    out.push(check(
+        "runtime.images",
+        CheckStatus::Warn,
+        format!(
+            "{} unused image(s) from earlier deploys ({} at most)",
+            plan.remove.len(),
+            weglarka_core::images::human_bytes(plan.reclaimable_bytes())
+        ),
+        Some("`weglarka images prune` removes them (`--dry-run` first to see the list)"),
+    ));
 }
 
 /// `depends_on` (issue #35): a **running** app whose dependency is down is a real problem, while an

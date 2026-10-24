@@ -24,3 +24,4 @@ numbered consecutively (after `0018` comes `0019`); the skeleton is [`0000-templ
 | [0017](0017-shared-volumes.md) | Volumes shared between instances: one uid range per shared volume (issue #33) |
 | [0018](0018-ingress-streaming.md) | Per-app streaming: `proxy_buffering off` and a long idle timeout (issue #64) |
 | [0019](0019-container-command.md) | Per-app container command: arguments to the image entrypoint (issue #79) |
+| [0020](0020-image-retention.md) | Image retention: keep the current and previous image, prune the rest (issue #40) |

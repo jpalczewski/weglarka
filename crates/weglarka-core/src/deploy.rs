@@ -60,7 +60,7 @@ pub fn pinned_ref(image: &str, digest: &Digest) -> String {
 }
 
 /// `(repo, tag)` for comparing webhook images with `apps.toml`; no tag = `latest`.
-fn normalize_image(image: &str) -> (String, String) {
+pub(crate) fn normalize_image(image: &str) -> (String, String) {
     let no_digest = image.split('@').next().unwrap_or(image);
     let repo = image_repo(no_digest).to_ascii_lowercase();
     let tag = no_digest[image_repo(no_digest).len()..]
@@ -486,6 +486,9 @@ impl<P: PodmanClient> Reconciler<P> {
                     digest: digest.clone(),
                     generation,
                 });
+                // Retention of 1 (issue #40): with `current` and `previous` saved, the older images
+                // of this repository are dead weight. Best effort — never fails the deploy.
+                self.retain_images_locked(image_repo(&spec.image)).await;
                 return Ok(DeployOutcome::Deployed { digest, generation });
             }
             Err(reason) => reason,
@@ -535,6 +538,9 @@ impl<P: PodmanClient> Reconciler<P> {
                     restored: prev.clone(),
                     reason: reason.clone(),
                 });
+                // The failed image is neither `current` nor `previous` now; it goes away unless it
+                // still holds the tag named by the spec (issue #40).
+                self.retain_images_locked(image_repo(&spec.image)).await;
                 Ok(DeployOutcome::RolledBack {
                     failed: digest,
                     restored: prev,
@@ -619,6 +625,7 @@ impl<P: PodmanClient> Reconciler<P> {
             instance: instance.clone(),
             digest: digest.clone(),
         });
+        self.retain_images_locked(image_repo(&spec.image)).await;
         Ok(DeployOutcome::Provisioned { digest })
     }
 

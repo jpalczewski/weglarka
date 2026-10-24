@@ -101,6 +101,13 @@ pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/doctor",
 };
+/// `POST` [`PruneImagesRequest`](crate::PruneImagesRequest) → [`PruneImagesResponse`](crate::PruneImagesResponse).
+/// Removes images of the repositories named in `apps.toml` that are neither an app's current nor its
+/// previous image and that no container uses (issue #40). `dry_run` only reports them.
+pub const IMAGES_PRUNE: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/images/prune",
+};
 
 pub const ENDPOINTS: &[Endpoint] = &[
     STATUS,
@@ -119,4 +126,5 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SHARED_VOLUMES_DECLARE,
     SHARED_VOLUMES_REMOVE,
     DOCTOR,
+    IMAGES_PRUNE,
 ];
