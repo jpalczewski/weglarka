@@ -35,6 +35,12 @@ pub enum EngineError {
     Podman(#[from] PodmanError),
     #[error("unknown instance: {0}")]
     UnknownInstance(InstanceName),
+    /// The registry refused the pull (401/403): the image may exist, but the podman user has no
+    /// (valid) credentials for it. Fix `auth.json`, do not look for a missing image.
+    #[error(
+        "registry rejected the pull of {reference} ({message}); check the podman user's credentials (`podman login`)"
+    )]
+    RegistryAuth { reference: String, message: String },
     #[error("cannot resolve image digest for {0}")]
     NoDigest(String),
     /// No free uid range of `size` left in the rootless user's subuid pool (docs/decisions/0009).

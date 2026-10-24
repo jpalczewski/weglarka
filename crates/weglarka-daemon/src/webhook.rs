@@ -1,4 +1,4 @@
-//! Webhook listener (TCP, separate router): `POST /webhook/github/{instance}`.
+//! Webhook listener (TCP, separate router): `POST /webhook/{source}/{instance}` (`github`, and `forgejo` when configured).
 //!
 //! The HMAC secret is per app (`<instance>.webhook-hmac`), hence the instance is in the path.
 //! Order: secret → signature (401) → normalization (204/400) → 202 and `handle_webhook` in the background.
@@ -15,28 +15,27 @@ use weglarka_core::deploy::instances_tracking;
 use weglarka_core::podman::PodmanClient;
 use weglarka_core::secret_store::{SecretStore, scoped_name};
 use weglarka_core::state;
-use weglarka_core::webhook::{WebhookError, WebhookRequest};
+use weglarka_core::webhook::{WebhookError, WebhookRequest, WebhookSource};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
-use crate::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER};
 
 /// Matches nginx's `webhook_max_body_bytes` (1 MiB).
 pub const BODY_LIMIT: usize = 1024 * 1024;
 
-pub const GITHUB_PATH: &str = "/webhook/github/{instance}";
+pub const PATH: &str = "/webhook/{source}/{instance}";
 
 pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
     Router::new()
-        .route(GITHUB_PATH, post(github::<P>))
+        .route(PATH, post(receive::<P>))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(daemon)
 }
 
-fn request_from(headers: &HeaderMap, body: &Bytes) -> WebhookRequest {
-    let keep = [SIGNATURE_HEADER, EVENT_HEADER, DELIVERY_HEADER];
+fn request_from(source: &dyn WebhookSource, headers: &HeaderMap, body: &Bytes) -> WebhookRequest {
     WebhookRequest {
-        headers: keep
+        headers: source
+            .headers()
             .iter()
             .filter_map(|k| {
                 let v = headers.get(*k)?.to_str().ok()?;
@@ -47,16 +46,20 @@ fn request_from(headers: &HeaderMap, body: &Bytes) -> WebhookRequest {
     }
 }
 
-async fn github<P: PodmanClient + 'static>(
+async fn receive<P: PodmanClient + 'static>(
     State(d): State<Arc<Daemon<P>>>,
-    Path(raw): Path<String>,
+    Path((source, raw)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let req = request_from(&headers, &body);
+    // An unknown or disabled source (e.g. Forgejo without `[webhook.forgejo]`) is a plain 404.
+    let Some(source) = d.webhook_source(&source) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let req = request_from(source, &headers, &body);
     // The delivery id is untrusted until the signature is verified; only a short, safe one goes to logs.
     let delivery = req
-        .header(DELIVERY_HEADER)
+        .header(source.delivery_header())
         .filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
         .unwrap_or("-")
         .to_owned();
@@ -81,11 +84,11 @@ async fn github<P: PodmanClient + 'static>(
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
-    if d.github.verify(&req, secret.expose()).is_err() {
+    if source.verify(&req, secret.expose()).is_err() {
         return reject("bad signature", StatusCode::UNAUTHORIZED);
     }
 
-    let event = match d.github.normalize(&req) {
+    let event = match source.normalize(&req) {
         Ok(Some(e)) => e,
         Ok(None) => return StatusCode::NO_CONTENT,
         Err(WebhookError::BadPayload(_)) => return reject("bad payload", StatusCode::BAD_REQUEST),

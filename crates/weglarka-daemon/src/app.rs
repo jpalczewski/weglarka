@@ -28,7 +28,8 @@ pub struct Daemon<P: PodmanClient> {
     pub engine: Arc<Reconciler<P>>,
     pub secrets: Arc<FileSecretStore>,
     pub ingress: Arc<IngressManager<P>>,
-    pub github: Box<dyn WebhookSource>,
+    /// Enabled webhook adapters; `/webhook/{source}/{instance}` picks one by `WebhookSource::name`.
+    pub webhook_sources: Vec<Box<dyn WebhookSource>>,
     /// `None` when `weglarka.toml` configures no notification channel.
     pub notify: Option<Arc<NotifyHandle>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
@@ -55,6 +56,13 @@ impl<P: PodmanClient + 'static> Daemon<P> {
 }
 
 impl<P: PodmanClient> Daemon<P> {
+    pub fn webhook_source(&self, name: &str) -> Option<&dyn WebhookSource> {
+        self.webhook_sources
+            .iter()
+            .map(|s| s.as_ref())
+            .find(|s| s.name() == name)
+    }
+
     pub fn webhook_addr(&self) -> Option<SocketAddr> {
         self.webhook_addr.get().copied()
     }

@@ -1,4 +1,4 @@
-//! `WebhookSource` trait — adapter for new-image event sources (MVP: GitHub; Forgejo later).
+//! `WebhookSource` trait — adapter for new-image event sources (GitHub, Forgejo).
 //! Deliberately synchronous and dyn-compatible: it operates on an already-read request, so the
 //! daemon can hold a `Vec<Box<dyn WebhookSource>>` without async-trait overhead.
 
@@ -38,9 +38,23 @@ pub struct WebhookEvent {
 pub trait WebhookSource: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Lower-case names of the request headers this adapter reads (signature, event, delivery);
+    /// the listener copies only these into the `WebhookRequest`.
+    fn headers(&self) -> &'static [&'static str];
+
+    /// Lower-case name of the delivery-id header (for logs before the signature is verified).
+    fn delivery_header(&self) -> &'static str;
+
     /// Verifies the signature (HMAC) with the app's secret; constant time.
     fn verify(&self, request: &WebhookRequest, secret: &[u8]) -> Result<(), WebhookError>;
 
     /// `Ok(None)` — a valid but irrelevant event (e.g. ping, other type).
     fn normalize(&self, request: &WebhookRequest) -> Result<Option<WebhookEvent>, WebhookError>;
+}
+
+/// A reference must be a single "word" from a safe alphabet — it ends up in logs and comparisons.
+pub fn valid_ref(r: &str) -> bool {
+    r.len() <= 255
+        && r.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-' | b':'))
 }
