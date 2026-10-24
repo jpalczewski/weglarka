@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Streaming responses through the generated nginx.conf (issue #64, docs/decisions/0015), with plain Docker
+# Streaming responses through the generated nginx.conf (issue #64, docs/decisions/0018), with plain Docker
 # on a CI runner: an app with `ingress.streaming = true` forwards a chunk as soon as the upstream writes
 # it and an idle stream survives nginx's 60 s default `proxy_read_timeout`; an app without the option
 # (the negative control) keeps buffering, so nginx itself delays the very same chunk.

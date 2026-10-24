@@ -112,7 +112,7 @@ impl Backend<'_> {
                 c.block("location /", |c| {
                     c.line(&format!("set $upstream \"http://{host}:{port}\";"));
                     c.line("proxy_pass $upstream;");
-                    // Streaming is opt-in per app (issue #64, docs/decisions/0015): buffering is the
+                    // Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the
                     // right default everywhere else. Both timeouts change together — nginx would
                     // otherwise cut an idle stream at its 60 s default. The `Connection`/`Upgrade`
                     // headers stay global on purpose: a streaming app may still use WebSocket.

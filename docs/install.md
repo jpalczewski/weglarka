@@ -775,6 +775,61 @@ Uwaga przy rollbacku: `depends_on` to nowe pole w `apps.toml`, a ten plik ma `de
 demon** go nie odczyta. Wracając do poprzedniej wersji Węglarki usuń wpisy `depends_on`
 (`weglarka apps update <apka> --remove-depends-on <zależność>`) — inaczej demon odmówi startu z błędem parsowania.
 
+## 6e. Streaming (SSE, long polling)
+
+Aplikacje, które trzymają odpowiedź otwartą — SSE (np. `/<topic>/sse` w ntfy), strumień chunked albo long polling —
+muszą ominąć dwa domyślne zachowania nginxa: `proxy_buffering on` (zdarzenia czekają w buforze proxy zamiast
+iść do klienta) i `proxy_read_timeout 60s` (dłuższa cisza kończy strumień błędem 504). WebSocket działa już dziś
+(nagłówki `Upgrade`/`Connection`), więc chodzi o klientów, którzy streamują po zwykłym HTTP. Decyzja i odrzucone
+alternatywy: [0018](decisions/0018-ingress-streaming.md).
+
+```toml
+# apps.toml: strumieniowanie włączone tylko dla tej apki
+[apps.ntfy.ingress]
+streaming = true
+# stream_timeout_secs = 180   # opcjonalne: domyślnie 180, dozwolone 1..=3600
+```
+
+Zastosowanie: `weglarka apps update ntfy --streaming` dla istniejącej apki, `weglarka apps add ntfy --streaming`
+przy dodawaniu. W pliku `--spec` (jedna apka, nie cały `apps.toml`) ten sam blok to zwykła tabela `[ingress]`:
+
+```toml
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+domains = ["ntfy.example.com"]
+port = 8080
+[ingress]
+streaming = true
+```
+
+Gotowy plik: [`docs/examples/streaming.toml`](examples/streaming.toml).
+
+- `streaming = true` dodaje w `location /` **tej jednej apki** cztery dyrektywy: `proxy_buffering off;`,
+  `proxy_request_buffering off;`, `proxy_read_timeout <n>s;` i `proxy_send_timeout <n>s;`. Pozostałe apki, bloki
+  webhooków i serwer domyślny zostają bez zmian — apka bez `ingress` dostaje `nginx.conf` dokładnie taki jak dziś.
+- `stream_timeout_secs` to bezczynność w obie strony: **domyślnie 180**, dozwolone **1–3600**. Samo
+  `streaming = true` wystarcza (domyślny timeout nie jest zapisywany). Ustawienie timeoutu przy
+  `streaming = false` jest odrzucane przez walidację komunikatem „requires ingress.streaming = true” — timeout,
+  który nigdy nie trafi do configu, to literówka, nie opcja. W v1 **nie ma flagi CLI** dla timeoutu: ustawiasz go
+  w `apps.toml` albo przez `apps update --spec`.
+- **Tylko ingress:** zmiana renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP — tak samo jak `--domain`.
+  Kontener apki, jego digest i `spec-hash` zostają nietknięte, nie ma deployu ani przerwy w ruchu do apki. Zmiana
+  działa na nowe połączenia; nginx domyka stare workery, więc otwarty strumień kończy się na starym.
+- `--no-streaming` czyści **cały** blok `ingress` (razem z własnym timeoutem) i nic nie wysyła, gdy apka i tak nie
+  streamuje. Flagi, jak `--domain`, wykluczają się z `--spec`.
+- **Uwaga operacyjna:** `proxy_buffering off` to cel, ale ma koszt — wolny klient trzyma połączenie workera nginxa
+  przez cały czas trwania strumienia (`worker_processes 1`, `worker_connections 1024`), a
+  `proxy_request_buffering off` rozciąga to samo na wolno wysyłane ciało żądania. Włączaj streaming apkom, które
+  naprawdę streamują, a nie wszystkim «na wszelki wypadek».
+- Apka, która ma WebSocket i włączy streaming, dostaje przy okazji dłuższy idle timeout (180 s zamiast 60 s) —
+  zwykle dokładnie to, czego chce, ale to zmiana zachowania, nie efekt uboczny.
+- **Traefik (`behind`) się nie zmienia:** przekazuje odpowiedź na bieżąco i jej nie buforuje, a jego `idleTimeout`
+  dotyczy bezczynności między żądaniami keep-alive, nie trwającego strumienia. (Tryb `edge` nie jest
+  zaimplementowany; zanim powstanie, musi to sprawdzić osobno — [0005](decisions/0005-ingress-i-platforma.md).)
+- **Bezpieczeństwo configu:** gdy nginx odrzuci wygenerowany config, `nginx -t` w demonie kończy się błędem,
+  a poprzedni, działający config zostaje przywrócony — zły wpis nie zostawia ingressu bez ruchu.
+- Rollback: `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta bloku `[apps.X.ingress]`.
+  Przed downgradem usuń go (`apps update --no-streaming` albo ręcznie) — patrz [7](#7-weryfikacja-i-rollback).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -802,6 +857,9 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
   ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
+  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
+  ([6d](#6d-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
 
 ### `apps update`: co się dzieje po zmianie
 
@@ -822,7 +880,10 @@ diff i niczego nie wysyła.
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
-| `--depends-on` / `--remove-depends-on` (`depends_on` w `--spec`) | tylko zapis: kolejność startu; `spec-hash` bez zmian, kontener nie jest odtwarzany |
+  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
+  ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
+  ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
 
 Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką, które
 mają `auto_update` i nie są zatrzymane (`start = false` — patrz 6b). Przypięcie tagu `sha-…` lub `--no-auto-update`
