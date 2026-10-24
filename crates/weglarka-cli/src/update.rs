@@ -16,6 +16,7 @@ use weglarka_api::{
 };
 use weglarka_core::app::{
     AppIngress, AppSpec, BodySizeLimit, InstanceName, SecretBinding, SecretTarget,
+    SharedVolumeName, valid_volume_name,
 };
 use weglarka_core::state::AppState;
 
@@ -91,6 +92,18 @@ pub struct UpdateArgs {
     /// Remove the binding of a secret (repeatable). The stored value is kept.
     #[arg(long = "unbind-secret", value_name = "SECRET", conflicts_with = "spec")]
     pub unbind_secrets: Vec<String>,
+    /// Detach a private volume from the spec (repeatable). No data is deleted: the flag only
+    /// unmounts the volume, its Podman volume stays until `apps remove --purge-volumes` or an
+    /// explicit purge. An unknown name is a usage error; conflicts with `--spec`.
+    #[arg(long = "remove-volume", value_name = "NAME", value_parser = parse_volume_name,
+        conflicts_with = "spec")]
+    pub remove_volumes: Vec<String>,
+    /// Detach the app from a shared volume (repeatable). No data is deleted either: detaching the
+    /// last member keeps both the `[shared_volumes.<name>]` declaration and the `wg-shared-<name>`
+    /// volume (with its uid range). An unknown name is a usage error; conflicts with `--spec`.
+    #[arg(long = "remove-shared-volume", value_name = "NAME", value_parser = parse_shared_volume_name,
+        conflicts_with = "spec")]
+    pub remove_shared_volumes: Vec<SharedVolumeName>,
     /// Remove a dependency (repeatable); the dependency itself is not touched.
     #[arg(long = "remove-depends-on", value_name = "NAME", value_parser = parse_instance, conflicts_with = "spec")]
     pub remove_depends_on: Vec<InstanceName>,
@@ -136,6 +149,8 @@ impl UpdateArgs {
             || !self.secret_env.is_empty()
             || !self.secret_mount.is_empty()
             || !self.unbind_secrets.is_empty()
+            || !self.remove_volumes.is_empty()
+            || !self.remove_shared_volumes.is_empty()
             || !self.remove_depends_on.is_empty()
             || self.auto_update
             || self.no_auto_update
@@ -153,6 +168,23 @@ fn missing(what: &str, value: &str) -> CliError {
 /// An app name used by the flag (the strong type has no `FromStr`, and the message is nicer).
 fn parse_instance(s: &str) -> Result<InstanceName, String> {
     InstanceName::new(s).map_err(|e| e.to_string())
+}
+
+/// A private volume name from a flag value; validated locally, like the `--volume` flag, so a typo
+/// is a usage error instead of a request.
+fn parse_volume_name(s: &str) -> Result<String, String> {
+    if valid_volume_name(s) {
+        Ok(s.to_owned())
+    } else {
+        Err(format!(
+            "invalid volume name {s:?}: [a-z0-9-], 1–63 characters"
+        ))
+    }
+}
+
+/// A shared volume name from a flag value; [`SharedVolumeName`] does the validation itself.
+fn parse_shared_volume_name(s: &str) -> Result<SharedVolumeName, String> {
+    SharedVolumeName::new(s).map_err(|e| e.to_string())
 }
 
 /// Applies the flags to the current spec (pure; the order is: removals, then additions).
@@ -259,6 +291,22 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     }
     if a.no_auto_update {
         spec.auto_update = false;
+    }
+    // Detaching volumes happens before `spec_flags.apply`, so `--remove-volume data --volume
+    // data=/new` means "unmount, then mount the same volume elsewhere" in one call.
+    for v in &a.remove_volumes {
+        let before = spec.volumes.len();
+        spec.volumes.retain(|x| &x.name != v);
+        if spec.volumes.len() == before {
+            return Err(missing("volume", v));
+        }
+    }
+    for v in &a.remove_shared_volumes {
+        let before = spec.shared_volumes.len();
+        spec.shared_volumes.retain(|x| &x.name != v);
+        if spec.shared_volumes.len() == before {
+            return Err(missing("shared volume", v.as_str()));
+        }
     }
     a.spec_flags.apply(&mut spec);
     if a.start {
@@ -549,7 +597,7 @@ mod tests {
     use crate::tests::mock;
     use clap::Parser;
     use weglarka_api::DeployResponse;
-    use weglarka_core::app::InstanceName;
+    use weglarka_core::app::{InstanceName, SharedVolumeRef, VolumeMount};
 
     fn args(extra: &[&str]) -> UpdateArgs {
         #[derive(Parser)]
@@ -574,6 +622,25 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
 "#,
         )
         .unwrap()
+    }
+
+    /// [`spec`] plus a second private volume, a shared volume mount and two fields a volume detach
+    /// must not touch (`start`, `[ingress] streaming`).
+    fn spec_with_volumes() -> AppSpec {
+        let mut s = spec();
+        s.volumes.push(VolumeMount {
+            name: "cache".into(),
+            target: "/cache".into(),
+            read_only: true,
+        });
+        s.shared_volumes.push(SharedVolumeRef {
+            name: SharedVolumeName::new("kajet-data").unwrap(),
+            target: "/data".into(),
+            read_only: false,
+        });
+        s.start = false;
+        s.ingress.streaming = true;
+        s
     }
 
     #[test]
@@ -625,6 +692,150 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         assert_eq!(s.shared_volumes[0].target, "/mnt/data");
         assert!(s.shared_volumes[0].read_only);
         assert_eq!(s.volumes, before.volumes);
+    }
+
+    #[test]
+    fn remove_volume_flag_detaches_one_private_volume_and_keeps_everything_else() {
+        let before = spec_with_volumes();
+        let s = apply_flags(before.clone(), &args(&["--remove-volume", "data"])).unwrap();
+        // Only `data` is gone; `cache` stays mounted.
+        assert_eq!(
+            s.volumes,
+            [VolumeMount {
+                name: "cache".into(),
+                target: "/cache".into(),
+                read_only: true,
+            }]
+        );
+        // A volume detach is not a spec reset: every other field survives.
+        assert_eq!(
+            s.shared_volumes, before.shared_volumes,
+            "shared mounts stay"
+        );
+        assert_eq!(s.env, before.env);
+        assert_eq!(s.domains, before.domains);
+        assert_eq!(s.secrets, before.secrets);
+        assert_eq!(s.ingress, before.ingress);
+        assert_eq!(
+            (s.image.as_str(), s.port, s.start, s.auto_update),
+            (
+                before.image.as_str(),
+                before.port,
+                before.start,
+                before.auto_update
+            )
+        );
+    }
+
+    #[test]
+    fn remove_shared_volume_flag_detaches_the_mount_and_keeps_the_private_volumes() {
+        let before = spec_with_volumes();
+        let s = apply_flags(
+            before.clone(),
+            &args(&["--remove-shared-volume", "kajet-data"]),
+        )
+        .unwrap();
+        assert!(s.shared_volumes.is_empty(), "the shared mount is gone");
+        assert_eq!(s.volumes, before.volumes, "private volumes stay mounted");
+        assert_eq!(s.env, before.env);
+        assert_eq!(s.secrets, before.secrets);
+    }
+
+    #[test]
+    fn removing_an_unknown_volume_is_a_usage_error() {
+        let before = spec_with_volumes();
+        // The names that are in the spec can be detached...
+        for flags in [
+            ["--remove-volume", "cache"],
+            ["--remove-shared-volume", "kajet-data"],
+        ] {
+            assert!(
+                apply_flags(before.clone(), &args(&flags)).is_ok(),
+                "{flags:?}"
+            );
+        }
+        // ...while an unknown one is the same usage error as the other removals (nothing is sent).
+        for flags in [
+            ["--remove-volume", "nope"],
+            ["--remove-shared-volume", "nope"],
+        ] {
+            let err = apply_flags(before.clone(), &args(&flags)).unwrap_err();
+            assert_eq!(err.exit_code(), exit::USAGE, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn volume_removal_flags_count_as_edits_and_conflict_with_spec() {
+        assert!(args(&["--remove-volume", "data"]).has_edits());
+        assert!(args(&["--remove-shared-volume", "kajet-data"]).has_edits());
+
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        for bad in [
+            vec!["w", "ntfy", "--remove-volume", "data", "--spec", "f"],
+            vec![
+                "w",
+                "ntfy",
+                "--remove-shared-volume",
+                "kajet-data",
+                "--spec",
+                "f",
+            ],
+            // Names are validated before anything is sent.
+            vec!["w", "ntfy", "--remove-volume", "Data"],
+            vec!["w", "ntfy", "--remove-shared-volume", "Kajet_Data"],
+        ] {
+            assert!(W::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn remove_and_re_add_in_one_call_moves_the_mount() {
+        let before = spec_with_volumes();
+        let s = apply_flags(
+            before.clone(),
+            &args(&["--remove-volume", "data", "--volume", "data=/mnt/data:ro"]),
+        )
+        .unwrap();
+        assert_eq!(
+            s.volumes.len(),
+            before.volumes.len(),
+            "the mount is replaced, not duplicated"
+        );
+        let data = s.volumes.iter().find(|v| v.name == "data").unwrap();
+        assert_eq!((data.target.as_str(), data.read_only), ("/mnt/data", true));
+    }
+
+    #[test]
+    fn diff_shows_the_detached_volumes() {
+        let before = spec_with_volumes();
+        let s = apply_flags(
+            before.clone(),
+            &args(&[
+                "--remove-volume",
+                "data",
+                "--remove-shared-volume",
+                "kajet-data",
+            ]),
+        )
+        .unwrap();
+        let d = spec_diff(&before, &s);
+        let removed: Vec<&str> = d.lines().filter(|l| l.starts_with("- ")).collect();
+        assert!(
+            removed.iter().any(|l| l.contains("\"data\"")),
+            "the private volume line is shown as removed: {d}"
+        );
+        assert!(
+            removed.iter().any(|l| l.contains("\"kajet-data\"")),
+            "the shared volume line is shown as removed: {d}"
+        );
+        assert!(
+            !d.lines().any(|l| l.starts_with("+ ")),
+            "nothing is added by a detach: {d}"
+        );
     }
 
     #[test]

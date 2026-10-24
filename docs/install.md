@@ -471,6 +471,19 @@ To samo flagami `apps add` / `apps update` (bez pliku spec): `--volume data=/dat
 odczytu; ta sama nazwa podmienia wpis), `--memory 128m`, `--pids-limit 256`, `--cpus 0.5`; `none` usuwa limit
 (`--memory none`). Literówka w polu pliku spec (np. `memory` zamiast `resources.memory`) daje błąd z listą pól.
 
+Wolumen odłącza się bez pełnej podmiany specu: `weglarka apps update <apka> --remove-volume data` odpina wolumen
+prywatny, a `weglarka apps update <apka> --remove-shared-volume kajet-data` — wolumen współdzielony (obie flagi
+powtarzalne, obie wykluczają się z `--spec`). **Żadna z nich nie usuwa danych:**
+
+- dane wolumenu prywatnego zostają w wolumenie Podmana (`<apka>.<nazwa>`) — do `weglarka apps remove <apka>
+  --purge-volumes` albo ręcznego `podman volume rm`; po odłączeniu następny reconcile odtwarza kontener bez tego
+  montowania, a ponowne `--volume data=/data` podłącza te same pliki;
+- odłączenie **ostatniego** członka wolumenu współdzielonego nie usuwa ani deklaracji `[shared_volumes.<nazwa>]`,
+  ani wolumenu `wg-shared-<nazwa>` (dane i zakres UID zostają) — deklarację sprząta dopiero
+  `weglarka volumes remove <nazwa> --purge`;
+- literówka w nazwie to błąd użycia (kod `64`, nic nie jest wysyłane), a `--dry-run` pokazuje usunięte linie
+  diffu specu.
+
 Wolumen `<instancja>.<nazwa>` (np. `szklana-pogoda.data`) powstaje przy deployu z etykietą `weglarka.instance`.
 `weglarka volumes list <apka>` pokazuje deklarowane wolumeny. `apps remove` **nie usuwa danych** (wolumeny i zakres
 UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właścicielem). Usunięcie danych:
@@ -575,8 +588,9 @@ weglarka volumes remove kajet-data --purge      # usuwa wolumen grupy (dane!) i 
 
 `weglarka volumes list <apka>` działa jak dotąd i pokazuje też wolumeny współdzielone (kolumna `SHARED`).
 `apps add` / `apps update` przyjmują `--shared-volume kajet-data=/data` (`:ro` na końcu = tylko do odczytu; ta sama
-nazwa podmienia wpis, jak `--volume`; flaga wyklucza się z `--spec`). Usunięcie montowania w v1 zostaje na `--spec`
-(pełna podmiana specu).
+nazwa podmienia wpis, jak `--volume`; flaga wyklucza się z `--spec`). Montowanie odłącza
+`weglarka apps update <apka> --remove-shared-volume kajet-data` — bez kasowania danych, deklaracja
+i `wg-shared-kajet-data` zostają ([wyżej](#wolumeny-w-spec-apki)).
 
 **Przeniesienie istniejącej apki do grupy (migracja danych).** Dołączenie do grupy zmienia efektywny zakres UID
 apki, więc pliki w jej dotychczasowych prywatnych wolumenach stałyby się nieczytelne. Węglarka tego pilnuje: jeśli

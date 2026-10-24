@@ -1751,6 +1751,70 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(e.fake.volumes().len(), 1);
     }
 
+    /// A single member of a shared volume: detaching it means leaving the group, the interesting
+    /// case for the data-retention guarantees of `apps update --remove-shared-volume`.
+    const ONE_MEMBER_APPS: &str = r#"
+[shared_volumes.kajet-data]
+
+[apps.kajet-api]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+"#;
+
+    /// The same app after `apps update --remove-shared-volume kajet-data`: the mount left the spec,
+    /// the `[shared_volumes.kajet-data]` declaration did not.
+    const ONE_MEMBER_DETACHED: &str = r#"
+[shared_volumes.kajet-data]
+
+[apps.kajet-api]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+"#;
+
+    #[tokio::test(start_paused = true)]
+    async fn detaching_the_last_member_keeps_the_volume_range_and_declaration() {
+        let e = env(ONE_MEMBER_APPS);
+        assert!(e.rec.reconcile().await.unwrap().is_clean());
+        let volume = shared_name("kajet-data");
+        let r = e.shared_range("kajet-data").expect("group range allocated");
+        let podman_name = labels::shared_volume_name(&volume);
+        assert_eq!(e.fake.container_spec("kajet-api").unwrap().volumes.len(), 1);
+
+        // `apps update --remove-shared-volume kajet-data`: only the mount leaves the spec.
+        let calls = e.fake.calls().len();
+        e.set_apps(ONE_MEMBER_DETACHED);
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(
+            e.fake.calls()[calls..].contains(&Call::ContainerCreate("kajet-api".into())),
+            "the container is recreated"
+        );
+        assert!(
+            e.fake
+                .container_spec("kajet-api")
+                .unwrap()
+                .volumes
+                .is_empty()
+        );
+
+        // Detaching is not deleting: the data, its range and the declaration all stay.
+        assert!(
+            e.fake.volumes().iter().any(|v| v.name == podman_name),
+            "the Podman volume (and its data) stays: {:?}",
+            e.fake.volumes()
+        );
+        assert_eq!(
+            e.shared_range("kajet-data"),
+            Some(r),
+            "the group's uid range stays reserved while the volume holds data"
+        );
+        assert!(
+            e.apps().shared_volumes.contains_key(&volume),
+            "the [shared_volumes.kajet-data] declaration stays"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn purge_of_a_member_with_other_members_is_refused_and_touches_nothing() {
         let e = env(SHARED_APPS);
