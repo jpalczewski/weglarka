@@ -14,7 +14,9 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use weglarka_core::app::{AppIngress, AppSpec, InstanceName, SecretBinding, SecretTarget};
+use weglarka_core::app::{
+    AppIngress, AppSpec, BodySizeLimit, InstanceName, SecretBinding, SecretTarget,
+};
 use weglarka_core::state::AppState;
 
 use crate::cli::{StartStopArgs, parse_pair};
@@ -66,6 +68,14 @@ pub struct UpdateArgs {
     /// Stop streaming: resets the streaming settings, a custom `stream_timeout_secs` included.
     #[arg(long, conflicts_with = "spec")]
     pub no_streaming: bool,
+    /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
+    /// Also streams the request to the app instead of buffering it. Ingress-only: nginx reload.
+    #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse,
+        conflicts_with_all = ["spec", "unset_max_body_size"])]
+    pub max_body_size: Option<BodySizeLimit>,
+    /// Back to the default request body limit (64m) and buffering.
+    #[arg(long, conflicts_with = "spec")]
+    pub unset_max_body_size: bool,
     /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
@@ -119,6 +129,8 @@ impl UpdateArgs {
             || self.unset_port
             || self.streaming
             || self.no_streaming
+            || self.max_body_size.is_some()
+            || self.unset_max_body_size
             || !self.env.is_empty()
             || !self.unset_env.is_empty()
             || !self.secret_env.is_empty()
@@ -179,15 +191,22 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
         spec.port = a.port;
     }
     // Ingress-only (issue #64): `--no-streaming` resets the streaming settings, a custom timeout
-    // included, and leaves `strip_prefix` (issue #130) alone.
+    // included, and leaves `strip_prefix` (issue #130) and `max_body_size` (ADR 0033) alone.
     if a.streaming {
         spec.ingress.streaming = true;
     }
     if a.no_streaming {
         spec.ingress = AppIngress {
             strip_prefix: spec.ingress.strip_prefix,
+            max_body_size: spec.ingress.max_body_size,
             ..AppIngress::default()
         };
+    }
+    if a.max_body_size.is_some() {
+        spec.ingress.max_body_size = a.max_body_size;
+    }
+    if a.unset_max_body_size {
+        spec.ingress.max_body_size = None;
     }
     if a.strip_prefix {
         spec.ingress.strip_prefix = true;
@@ -828,6 +847,43 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn max_body_size_flag_sets_clears_and_survives_no_streaming() {
+        let s = apply_flags(spec(), &args(&["--max-body-size", "4g"])).unwrap();
+        assert_eq!(
+            s.ingress.max_body_size,
+            Some(BodySizeLimit::parse("4g").unwrap())
+        );
+        assert!(!s.ingress.streaming, "the limit does not imply streaming");
+        assert!(args(&["--max-body-size", "0"]).has_edits());
+        assert!(args(&["--unset-max-body-size"]).has_edits());
+
+        // `0` is a value (no limit), not "unset".
+        let open = apply_flags(spec(), &args(&["--max-body-size", "0"])).unwrap();
+        assert_eq!(open.ingress.max_body_size, Some(BodySizeLimit::UNLIMITED));
+
+        // `--no-streaming` resets the streaming knobs only.
+        let both = apply_flags(s, &args(&["--streaming"])).unwrap();
+        let s = apply_flags(both, &args(&["--no-streaming"])).unwrap();
+        assert!(!s.ingress.streaming && s.ingress.max_body_size.is_some());
+
+        let s = apply_flags(s, &args(&["--unset-max-body-size"])).unwrap();
+        assert!(s.ingress.is_default());
+
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        for bad in [
+            vec!["w", "n", "--max-body-size", "1.5g"],
+            vec!["w", "n", "--max-body-size", "4g", "--unset-max-body-size"],
+            vec!["w", "n", "--max-body-size", "4g", "--spec", "f"],
+        ] {
+            assert!(W::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn streaming_flag_sets_and_clears_the_ingress_block() {
         // `--streaming` opts in and leaves everything else untouched.
         let s = apply_flags(spec(), &args(&["--streaming"])).unwrap();
@@ -844,6 +900,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             strip_prefix: false,
             streaming: true,
             stream_timeout_secs: 600,
+            max_body_size: None,
         };
         let s = apply_flags(custom.clone(), &args(&["--streaming"])).unwrap();
         assert_eq!(s.ingress, custom.ingress);

@@ -246,6 +246,59 @@ async fn domain_change_touches_only_ingress_and_env_change_recreates() {
 }
 
 #[tokio::test]
+async fn max_body_size_change_touches_only_ingress_and_reloads_nginx() {
+    let h = harness().await;
+    add(&h, "ntfy", spec("nz.example.eu")).await;
+    deployed(&h, "ntfy").await;
+    let conf = || read(&h.root.join("state/nginx/nginx.conf"));
+    eventually("nginx config for the app", || async {
+        conf().contains("nz.example.eu")
+    })
+    .await;
+    let before = show(&h, "ntfy").await;
+    let creates = creates_of(&h.fake, "ntfy");
+    let reloads = |fake: &FakePodman| {
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ContainerKill { signal, .. } if signal == "HUP"))
+            .count()
+    };
+    let reloads_before = reloads(&h.fake);
+
+    // `ingress.max_body_size` (ADR 0033) is routing-only: nginx is reloaded, nothing else happens.
+    let mut big = spec("nz.example.eu");
+    big["ingress"] = json!({ "max_body_size": "4g" });
+    let (s, v) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({ "spec": big }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["deploy"].is_null(), "{v}");
+    assert_eq!(
+        v["app"]["spec"]["ingress"],
+        json!({ "streaming": false, "max_body_size": "4g" })
+    );
+    eventually("nginx config with the per-app limit", || async {
+        conf().contains("client_max_body_size 4294967296;")
+    })
+    .await;
+    assert!(
+        reloads(&h.fake) > reloads_before,
+        "nginx was not reloaded: {:?}",
+        h.fake.calls()
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = show(&h, "ntfy").await;
+    assert_eq!(after["state"]["generation"], before["state"]["generation"]);
+    assert_eq!(after["state"]["spec_hash"], before["state"]["spec_hash"]);
+    assert_eq!(creates_of(&h.fake, "ntfy"), creates);
+
+    // A malformed size is refused before anything is saved.
+    let mut bad = spec("nz.example.eu");
+    bad["ingress"] = json!({ "max_body_size": "1.5g" });
+    let (s, _) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({ "spec": bad }))).await;
+    assert!(s.is_client_error(), "{s}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn streaming_change_touches_only_ingress_and_reloads_nginx() {
     let h = harness().await;
     add(&h, "ntfy", spec("nz.example.eu")).await;

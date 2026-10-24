@@ -789,6 +789,19 @@ fn add_accepts_depends_on() {
 }
 
 #[test]
+fn add_accepts_max_body_size() {
+    let spec = build_spec(&add_args(&["--max-body-size", "4g"])).unwrap();
+    assert_eq!(spec.ingress.max_body_size.map(|l| l.bytes()), Some(4 << 30));
+    assert!(
+        build_spec(&add_args(&[]))
+            .unwrap()
+            .ingress
+            .max_body_size
+            .is_none()
+    );
+}
+
+#[test]
 fn add_accepts_streaming() {
     let spec = build_spec(&add_args(&["--streaming"])).unwrap();
     assert!(spec.ingress.streaming);

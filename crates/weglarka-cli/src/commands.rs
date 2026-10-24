@@ -188,6 +188,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         ingress: AppIngress {
             streaming: a.streaming,
             strip_prefix: a.strip_prefix,
+            max_body_size: a.max_body_size,
             ..Default::default()
         },
         env: a.env.iter().cloned().collect(),

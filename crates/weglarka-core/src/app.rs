@@ -524,16 +524,89 @@ impl MemoryLimit {
 
     pub fn parse(text: &str) -> Result<Self, InvalidMemoryLimit> {
         let err = || InvalidMemoryLimit(text.to_owned());
-        let lower = text.trim().to_ascii_lowercase();
-        let (digits, shift) = match lower.chars().last() {
-            Some('k') => (&lower[..lower.len() - 1], 10),
-            Some('m') => (&lower[..lower.len() - 1], 20),
-            Some('g') => (&lower[..lower.len() - 1], 30),
-            _ => (lower.as_str(), 0),
-        };
-        let n: u64 = digits.parse().map_err(|_| err())?;
-        Self::from_bytes(n.checked_mul(1 << shift).ok_or_else(err)?).map_err(|_| err())
+        Self::from_bytes(parse_binary_size(text).ok_or_else(err)?).map_err(|_| err())
     }
+}
+
+/// `<n>[k|m|g]` (binary multiples, case-insensitive) or a plain byte count; `None` on anything else
+/// or on overflow. Zero is accepted here — each caller decides whether it means something.
+fn parse_binary_size(text: &str) -> Option<u64> {
+    let lower = text.trim().to_ascii_lowercase();
+    let (digits, shift) = match lower.chars().last() {
+        Some('k') => (&lower[..lower.len() - 1], 10),
+        Some('m') => (&lower[..lower.len() - 1], 20),
+        Some('g') => (&lower[..lower.len() - 1], 30),
+        _ => (lower.as_str(), 0),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+/// Largest byte count nginx's `off_t` holds on the platforms we run on.
+const MAX_BODY_BYTES: u64 = i64::MAX as u64;
+
+/// Request body size limit of one app (`ingress.max_body_size`, nginx `client_max_body_size`). Same
+/// syntax as [`MemoryLimit`] (bytes, or `<n>[k|m|g]`), except that `0` is valid and means *no limit*
+/// — nginx's own meaning of `client_max_body_size 0`. Serialized in the largest exact unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MemoryRepr", into = "String")]
+pub struct BodySizeLimit(u64);
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid body size limit {0:?}: expected bytes or <n>[k|m|g]; 0 means unlimited")]
+pub struct InvalidBodySizeLimit(pub String);
+
+impl BodySizeLimit {
+    /// No limit (`client_max_body_size 0`).
+    pub const UNLIMITED: Self = Self(0);
+
+    pub fn from_bytes(bytes: u64) -> Result<Self, InvalidBodySizeLimit> {
+        if bytes > MAX_BODY_BYTES {
+            return Err(InvalidBodySizeLimit(bytes.to_string()));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn parse(text: &str) -> Result<Self, InvalidBodySizeLimit> {
+        let err = || InvalidBodySizeLimit(text.to_owned());
+        Self::from_bytes(parse_binary_size(text).ok_or_else(err)?).map_err(|_| err())
+    }
+
+    /// Byte count as nginx takes it; `0` = unlimited.
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+
+    pub fn is_unlimited(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl TryFrom<MemoryRepr> for BodySizeLimit {
+    type Error = InvalidBodySizeLimit;
+    fn try_from(value: MemoryRepr) -> Result<Self, Self::Error> {
+        match value {
+            MemoryRepr::Bytes(b) => Self::from_bytes(b),
+            MemoryRepr::Text(t) => Self::parse(&t),
+        }
+    }
+}
+
+impl From<BodySizeLimit> for String {
+    fn from(value: BodySizeLimit) -> Self {
+        match value.0 {
+            0 => "0".to_owned(),
+            b => format_binary_size(b),
+        }
+    }
+}
+
+fn format_binary_size(b: u64) -> String {
+    for (shift, suffix) in [(30, "g"), (20, "m"), (10, "k")] {
+        if b.is_multiple_of(1 << shift) {
+            return format!("{}{suffix}", b >> shift);
+        }
+    }
+    b.to_string()
 }
 
 impl TryFrom<MemoryRepr> for MemoryLimit {
@@ -548,13 +621,7 @@ impl TryFrom<MemoryRepr> for MemoryLimit {
 
 impl From<MemoryLimit> for String {
     fn from(value: MemoryLimit) -> Self {
-        let b = value.0;
-        for (shift, suffix) in [(30, "g"), (20, "m"), (10, "k")] {
-            if b.is_multiple_of(1 << shift) {
-                return format!("{}{suffix}", b >> shift);
-            }
-        }
-        b.to_string()
+        format_binary_size(value.0)
     }
 }
 
@@ -670,6 +737,11 @@ pub struct AppIngress {
     /// Off by default: the app is expected to serve under its prefix. Requires a prefix other than `/`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strip_prefix: bool,
+    /// Request body limit of this app (`client_max_body_size`; ADR 0033). Unset keeps the generator's
+    /// default (64 MiB); `"0"` removes the limit. Setting it also turns request buffering off in the
+    /// app's locations, so a large upload is streamed to the app instead of spooled in nginx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<BodySizeLimit>,
 }
 
 impl Default for AppIngress {
@@ -678,6 +750,7 @@ impl Default for AppIngress {
             streaming: false,
             stream_timeout_secs: Self::DEFAULT_STREAM_TIMEOUT_SECS,
             strip_prefix: false,
+            max_body_size: None,
         }
     }
 }
@@ -1051,6 +1124,62 @@ host_ports = [
         }
         assert_eq!(String::from(MemoryLimit::parse("1024m").unwrap()), "1g");
         assert_eq!(String::from(MemoryLimit::from_bytes(1500).unwrap()), "1500");
+    }
+
+    #[test]
+    fn body_size_limit_forms() {
+        for (src, bytes) in [
+            ("4g", 4 << 30),
+            ("512M", 512 << 20),
+            ("64k", 64 << 10),
+            ("1000", 1000),
+            ("0", 0),
+            ("0g", 0),
+        ] {
+            assert_eq!(BodySizeLimit::parse(src).unwrap().bytes(), bytes, "{src}");
+        }
+        for bad in [
+            "",
+            "m",
+            "1.5g",
+            "-1",
+            "1t",
+            "99999999999999999999g",
+            "8589934592g",
+        ] {
+            assert!(BodySizeLimit::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(BodySizeLimit::UNLIMITED.is_unlimited());
+        assert_eq!(String::from(BodySizeLimit::parse("4096m").unwrap()), "4g");
+        assert_eq!(String::from(BodySizeLimit::UNLIMITED), "0");
+    }
+
+    #[test]
+    fn ingress_max_body_size_parses_roundtrips_and_stays_out_when_unset() {
+        let parsed: AppSpec =
+            toml::from_str("image = \"i\"\n[ingress]\nstreaming = true\nmax_body_size = \"4g\"\n")
+                .unwrap();
+        assert_eq!(parsed.ingress.max_body_size.unwrap().bytes(), 4 << 30);
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(text.contains("max_body_size = \"4g\""), "{text}");
+        assert_eq!(toml::from_str::<AppSpec>(&text).unwrap(), parsed);
+
+        // An integer is bytes, `0` is kept (unlimited is an explicit choice, not "unset").
+        let open: AppSpec =
+            toml::from_str("image = \"i\"\ningress = { max_body_size = 0 }\n").unwrap();
+        assert!(
+            toml::to_string(&open)
+                .unwrap()
+                .contains("max_body_size = \"0\"")
+        );
+
+        // Unset: nothing is written, so an upgrade rewrites no existing app.
+        let plain: AppSpec = toml::from_str("image = \"i\"\n").unwrap();
+        assert!(!toml::to_string(&plain).unwrap().contains("max_body_size"));
+        assert!(
+            toml::from_str::<AppSpec>("image = \"i\"\ningress = { max_body_size = \"-1\" }")
+                .is_err()
+        );
     }
 
     #[test]

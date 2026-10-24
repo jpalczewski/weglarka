@@ -184,6 +184,114 @@ fn nginx_streaming_snapshot() {
     insta::assert_snapshot!("nginx_streaming", conf);
 }
 
+/// A git/registry-shaped app (big body, streamed), a capped app and an ordinary one on separate
+/// domains, plus two apps sharing a domain under different prefixes (ADR 0031) with different limits.
+const BODY_LIMIT_APPS: &str = r#"
+[apps.git]
+image = "ghcr.io/x/git:latest"
+domains = ["git.example.eu"]
+port = 3000
+ingress = { streaming = true, max_body_size = "4g" }
+
+[apps.capped]
+image = "ghcr.io/x/capped:latest"
+domains = ["capped.example.eu"]
+port = 3001
+ingress = { max_body_size = "8m" }
+
+[apps.open]
+image = "ghcr.io/x/open:latest"
+domains = ["open.example.eu"]
+port = 3002
+ingress = { max_body_size = "0" }
+
+[apps.plain]
+image = "ghcr.io/x/plain:latest"
+domains = ["plain.example.eu"]
+port = 3003
+
+[apps.up]
+image = "ghcr.io/x/up:latest"
+domains = ["shared.example.eu"]
+paths = ["/upload"]
+port = 3004
+ingress = { max_body_size = "1g" }
+
+[apps.web]
+image = "ghcr.io/x/web:latest"
+domains = ["shared.example.eu"]
+paths = ["/"]
+port = 3005
+"#;
+
+#[test]
+fn max_body_size_is_a_location_directive_with_unbuffered_requests() {
+    let conf = nginx::generate(&host(), &apps(BODY_LIMIT_APPS), &opts()).unwrap();
+    let location = |server: &str| {
+        let block = server_block(&conf, server);
+        let at = block.find("location").expect("location");
+        block[at..].to_owned()
+    };
+
+    let git = location("git.example.eu");
+    assert!(git.contains("client_max_body_size 4294967296;"), "{git}");
+    // `streaming` already switches request buffering off: the directive appears once.
+    assert_eq!(
+        git.matches("proxy_request_buffering off;").count(),
+        1,
+        "{git}"
+    );
+
+    // Without `streaming` the limit alone must not leave the body spooled on the ingress tmpfs.
+    let capped = location("capped.example.eu");
+    assert!(capped.contains("client_max_body_size 8388608;"), "{capped}");
+    assert!(capped.contains("proxy_request_buffering off;"), "{capped}");
+    assert!(
+        !capped.contains("proxy_buffering off;"),
+        "response stays buffered: {capped}"
+    );
+    assert!(!capped.contains("proxy_read_timeout"), "{capped}");
+
+    assert!(location("open.example.eu").contains("client_max_body_size 0;"));
+
+    // An app without the field keeps the server-level default and nothing in its location.
+    let plain = location("plain.example.eu");
+    assert!(!plain.contains("client_max_body_size"), "{plain}");
+    assert!(!plain.contains("proxy_request_buffering"), "{plain}");
+    assert!(server_block(&conf, "plain.example.eu").contains("client_max_body_size 67108864;"));
+
+    // Two apps in one `server`: only the `/upload` locations carry the larger limit.
+    let shared = server_block(&conf, "shared.example.eu");
+    let (web, upload) = shared
+        .split_once("location = /upload")
+        .expect("upload location");
+    assert!(
+        upload.contains("client_max_body_size 1073741824;"),
+        "{shared}"
+    );
+    assert!(!web.contains("1073741824"), "{shared}");
+}
+
+#[test]
+fn nginx_max_body_size_snapshot() {
+    let conf = nginx::generate(&host(), &apps(BODY_LIMIT_APPS), &opts()).unwrap();
+    insta::assert_snapshot!("nginx_max_body_size", conf);
+}
+
+#[test]
+fn traefik_ignores_max_body_size() {
+    let mut limited = apps(BODY_LIMIT_APPS);
+    let with = traefik::generate(&host(), &limited, &TraefikOptions::default()).unwrap();
+    for spec in limited.values_mut() {
+        spec.ingress = Default::default();
+    }
+    let without = traefik::generate(&host(), &limited, &TraefikOptions::default()).unwrap();
+    assert_eq!(
+        with, without,
+        "Traefik has no body limit; nginx is the only one"
+    );
+}
+
 /// The `server { … }` block whose `server_name` names the given host (output nests 4 spaces per level).
 fn server_block(conf: &str, server_name: &str) -> String {
     let block = conf
