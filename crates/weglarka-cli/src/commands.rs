@@ -166,6 +166,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
     }
     let mut spec = AppSpec {
         image,
+        command: Vec::new(),
         domains: a.domains.clone(),
         port: a.port,
         ingress: AppIngress {

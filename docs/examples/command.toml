@@ -1,0 +1,36 @@
+# Run an image that declares only an ENTRYPOINT and expects the subcommand as an argument (issue #79):
+# docker.io/binwiederhier/ntfy has ENTRYPOINT ["ntfy"] and no CMD, so with no arguments it prints its help,
+# exits with status 0 and the deploy gate fails with "container not running (Stopped, exit code 0)".
+# `command` supplies that argv — here `ntfy serve`. Add it with
+#   weglarka apps add ntfy --spec docs/examples/command.toml
+# or, for an app that already exists:
+#   weglarka apps update ntfy --command serve
+image = "docker.io/binwiederhier/ntfy:latest"
+domains = ["ntfy.example.com"]
+port = 80
+# The arguments appended to the image's ENTRYPOINT: exec form, one list element = one argv element, no
+# shell and no quoting (`;`, `$VAR`, `*` are literal data). Omitted or empty keeps the image's own CMD;
+# set it to REPLACE that CMD, not to append to it. ntfy listens on :80 by default (`serve`).
+command = ["serve"]
+
+# Several arguments, one element each — a leading dash needs the `=` form on the CLI:
+#   command = ["serve", "-v"]
+#   weglarka apps add ntfy --command serve --command=-v
+# Clear it again (back to the image's CMD; on an ENTRYPOINT-only image that is the broken default):
+#   weglarka apps update ntfy --command none
+#
+# `command` is part of the spec hash when set: changing it — the order of the arguments included —
+# makes the next reconcile recreate the container from the pinned digest, without a pull. An app that
+# does not set it hashes exactly as before, so upgrading Węglarka recreates nothing.
+#
+# In apps.toml the same field is inside the app table:
+#   [apps.ntfy]
+#   image = "docker.io/binwiederhier/ntfy:latest"
+#   domains = ["ntfy.example.com"]
+#   port = 80
+#   command = ["serve"]
+#
+# A deploy whose gate fails rolls back the image DIGEST, not the spec: a wrong `command` fails the deploy
+# and the rollback (the app stays down) until it is fixed with `weglarka apps update <app> --command ...`.
+# `apps.toml` has `deny_unknown_fields`: before downgrading Węglarka, remove `command` from the apps
+# (`apps update <app> --command none` or by hand) — see docs/install.md section 7 and ADR 0019.

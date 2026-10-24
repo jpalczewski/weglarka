@@ -749,6 +749,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let helper = ContainerSpec {
             name: name.clone(),
             image,
+            command: vec![],
             labels: BTreeMap::from([
                 (labels::IMPORT_FOR.to_owned(), instance.to_string()),
                 (labels::UID_RANGE.to_owned(), labels::uid_range_label(range)),

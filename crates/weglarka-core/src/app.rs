@@ -548,6 +548,14 @@ pub struct AppSpec {
     /// Image reference (floating tag, e.g. `ghcr.io/jpalczewski/ntfy.zig:latest`).
     /// State pins the resolved digest; see [`crate::state::AppState`].
     pub image: String,
+    /// Arguments to the image's entrypoint (`Cmd` in the OCI spec), exec form — no shell and no
+    /// quoting, every element is one argument. Empty keeps the image's own `CMD`; this never
+    /// overrides the entrypoint. Images that define only an `ENTRYPOINT` and expect the subcommand as
+    /// an argument need it (e.g. `command = ["serve"]` for ntfy, issue #79). Unlike `health.command`
+    /// it configures the container's main process, not a probe. Part of the spec hash when set, so a
+    /// change recreates the container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     /// Domains routed to the app (ingress generators).
     #[serde(default)]
     pub domains: Vec<String>,
@@ -668,6 +676,26 @@ health = { command = ["/app", "-health"], http = { path = "/healthz" } }
                 && !text.contains("depends_on"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn command_parses_and_roundtrips() {
+        let toml_src = r#"
+[apps.ntfy]
+image = "docker.io/binwiederhier/ntfy:latest"
+command = ["serve"]
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        let ntfy = &parsed.apps[&InstanceName::new("ntfy").unwrap()];
+        assert_eq!(ntfy.command, ["serve"]);
+        let text = toml::to_string(&parsed).unwrap();
+        assert_eq!(text.matches("command").count(), 1, "{text}");
+        assert_eq!(toml::from_str::<AppsFile>(&text).unwrap(), parsed);
+
+        // An empty command is the image's own CMD, so it stays out of the file like an omitted field.
+        let plain: AppsFile = toml::from_str("[apps.a]\nimage = \"i\"\n").unwrap();
+        assert!(plain.apps.values().next().unwrap().command.is_empty());
+        assert!(!toml::to_string(&plain).unwrap().contains("command"));
     }
 
     #[test]

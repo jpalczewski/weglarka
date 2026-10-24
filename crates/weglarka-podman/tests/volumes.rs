@@ -681,6 +681,7 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
         .container_create(&ContainerSpec {
             name: instance.clone(),
             image: info.image.clone(),
+            command: vec![],
             labels: legacy_labels,
             env: BTreeMap::new(),
             networks: info.networks.clone(),
@@ -738,12 +739,13 @@ fn host_uid(path: &str) -> u32 {
 
 /// A member container as the engine creates one (ADR 0017): the shared volume's explicit uid range
 /// (`userns: private` + one `IdMapping`, `userns_auto = false`), the `weglarka.uid-range` label and
-/// the shared Podman volume mounted read-write. `ContainerSpec` has no command, so the member image
-/// has to keep running by itself (nginx does) and commands run through `container_exec`.
+/// the shared Podman volume mounted read-write. The test containers set no command, so the member
+/// image has to keep running by itself (nginx does) and commands run through `container_exec`.
 fn member_spec(name: &str, shared_volume: &str, range: UidRange) -> ContainerSpec {
     ContainerSpec {
         name: name.to_owned(),
         image: NGINX.to_owned(),
+        command: vec![],
         labels: BTreeMap::from([(labels::UID_RANGE.to_owned(), labels::uid_range_label(range))]),
         env: BTreeMap::new(),
         networks: vec![],

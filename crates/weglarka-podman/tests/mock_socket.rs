@@ -148,6 +148,7 @@ async fn not_found_and_name_conflict() {
     let spec = weglarka_core::podman::ContainerSpec {
         name: "x".into(),
         image: "i".into(),
+        command: vec![],
         labels: Default::default(),
         env: Default::default(),
         networks: vec![],

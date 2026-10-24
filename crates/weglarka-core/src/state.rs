@@ -168,6 +168,13 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if spec.port == Some(0) {
         return Err(format!("{name}: port must be non-zero"));
     }
+    // The command is an exec-form argv handed to libpod verbatim: an empty element is a typo, not an
+    // argument (issue #79).
+    for (i, arg) in spec.command.iter().enumerate() {
+        if arg.is_empty() {
+            return Err(format!("{name}: command argument {i} must not be empty"));
+        }
+    }
     if spec.health.attempts == 0 || spec.health.window_secs == 0 {
         return Err(format!("{name}: health attempts and window must be > 0"));
     }
@@ -459,6 +466,19 @@ mod tests {
                 .contains("duplicate depends_on")
         );
         assert!(validate_app(&name("a"), &spec("\"b\"")).is_ok());
+    }
+
+    #[test]
+    fn command_arguments_must_not_be_empty() {
+        let spec = |command: &str| -> AppSpec {
+            toml::from_str(&format!("image = \"i\"\ncommand = [{command}]")).unwrap()
+        };
+        assert!(validate_app(&name("a"), &spec("\"serve\"")).is_ok());
+        assert!(validate_app(&name("a"), &spec("\"serve\", \"-v\"")).is_ok());
+        // An empty list is the image's own CMD, so it is valid like an omitted field.
+        assert!(validate_app(&name("a"), &spec("")).is_ok());
+        let err = validate_app(&name("a"), &spec("\"serve\", \"\"")).unwrap_err();
+        assert!(err.contains("command argument 1"), "{err}");
     }
 
     #[test]

@@ -36,7 +36,8 @@ impl fmt::Display for SpecHash {
 ///
 /// Iteration 2 fields (`volumes`, `resources`, `health_command`) are appended and skipped while unset,
 /// so a spec that does not use them hashes exactly as before (`HASH_FORMAT` stays v1 and existing
-/// instances are not recreated by upgrading Węglarka).
+/// instances are not recreated by upgrading Węglarka). `command` (issue #79) is appended for the same
+/// reason: an app that does not set it keeps its hash, a change to it recreates the container.
 #[derive(Serialize)]
 struct HashInput<'a> {
     format: &'static str,
@@ -63,6 +64,11 @@ struct HashInput<'a> {
     /// volumes hashes exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shared_volumes: Vec<HashSharedVolume<'a>>,
+    /// The container's command (issue #79): arguments to the image's entrypoint, so a change — the
+    /// argument order included — recreates the container. Appended last and skipped while empty, so
+    /// an app without a command hashes exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command: &'a Vec<String>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -130,6 +136,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         security: &spec.security,
         host_ports,
         shared_volumes,
+        command: &spec.command,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -271,6 +278,27 @@ env = { B = "2", A = "1" }
             base,
             hash(&|s| s.health.http = Some(crate::app::HttpProbe::default()))
         );
+    }
+
+    #[test]
+    fn command_changes_the_hash_only_when_set() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |command: &[&str]| {
+            let mut s = spec();
+            s.command = command.iter().map(|a| (*a).to_owned()).collect();
+            spec_hash(&s, &digest('a'))
+        };
+        // Unset (and an explicitly empty list) is the image's own CMD: no recreate on upgrade.
+        assert_eq!(base, hash(&[]));
+        assert_ne!(
+            base,
+            hash(&["serve"]),
+            "the command changes what runs, so it recreates the container"
+        );
+        // The argument vector is ordered, unlike the set-like lists.
+        assert_ne!(hash(&["serve", "-v"]), hash(&["-v", "serve"]));
+        // Clearing it returns to the base hash: the image default is restored by a recreate.
+        assert_eq!(base, hash(&[]));
     }
 
     #[test]
