@@ -120,8 +120,8 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/trusted.conf"
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 192.0.2.0/24 > "$RUNNER_TEMP/untrusted.conf"
           # Single addresses, like the daemon's default (nginx's own): the probe container's, and its neighbour's.
-          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.3 > "$RUNNER_TEMP/peer.conf"
-          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.4 > "$RUNNER_TEMP/neighbor.conf"
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.200 > "$RUNNER_TEMP/peer.conf"
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.201 > "$RUNNER_TEMP/neighbor.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf" \
             "$RUNNER_TEMP/peer.conf" "$RUNNER_TEMP/neighbor.conf"
       # Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream

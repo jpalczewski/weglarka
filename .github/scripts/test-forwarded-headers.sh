@@ -7,7 +7,7 @@
 # Both configs come from `cargo run -p weglarka-ingress --example dump -- nginx 127.0.0.11 <trusted>`:
 # the first trusts Docker's bridge (the source address of a published-port request), the second does not.
 # The last two configs trust a single address (a /32, as the daemon generates from nginx's own addresses,
-# docs/decisions/0032): `$PEER_IP`, the address a probe container connects from, and 172.29.77.4, another
+# docs/decisions/0032): `$PEER_IP`, the address a probe container connects from, and 172.29.77.201, another
 # address of the same subnet — the stand-in for an app container that shares a network with nginx.
 # The sample config has the app `blog` on port 3000 and the domain blog.example.eu.
 set -euo pipefail
@@ -18,7 +18,7 @@ peer_conf=$3
 neighbor_conf=$4
 net=wg-fwd-test
 subnet=172.29.77.0/24
-PEER_IP=172.29.77.3
+PEER_IP=172.29.77.200
 fail=0
 
 # shellcheck disable=SC2329,SC2317 # invoked by the EXIT trap
