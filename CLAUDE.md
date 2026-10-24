@@ -100,13 +100,13 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `notify →
 
 | Crate | Zawartość |
 |---|---|
-| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), stan samoaktualizacji (`self_update.rs`: plik stanu + czyste `decide()`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
+| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), stan samoaktualizacji (`self_update.rs`: plik stanu + czyste `decide()`/`supervise()`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
 | `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
 | `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
 | `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); własny minimalny klient HTTP/TLS, `FakeRegistry`/`TestSigner` (feature `testing`) |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
-| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet + timer samoaktualizacji), worker powiadomień, host-side `self-update` |
+| `weglarka-daemon` | demon: admin API (unix socket, w tym `GET /v1/health`), webhooki, zapis ingressu, `Platform` systemd (quadlet + timery samoaktualizacji i watchdoga), worker powiadomień, host-side `self-update` i `supervise` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
 
 Przy pracy równoległej kilku agentów: jeden crate/obszar na agenta, a zmiany w kontrakcie (`app.rs`, `podman.rs`,
@@ -125,7 +125,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
 | configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/service.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0028) |
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
-| samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timer, `install_user_units`, `restart_service`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027) |
+| samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`/`supervise()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher + akcja fallbacku), `daemon/src/supervise.rs` (host-side watchdog: sonda `GET /v1/health`, blokada stanu), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timery, `install_user_units`, `restart_service`, `reset_failed`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027, ADR 0034) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje, w tym rozłączność `paths` na wspólnej domenie; `route_table()` dla `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs`; prefiksy ścieżek: ADR 0031, `paths`/`ingress.strip_prefix` w `core/src/app.rs`, składnia `check_path_prefix`, `docs/install.md` 6n |
 | powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
@@ -197,8 +197,13 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   schematu (label obrazu `io.weglarka.state-schema` kontra `schema_version` w `state.toml`) → pin
   `repo@sha256:…` w quadlecie → `pending` w `<state dir>/self-update.toml` (tolerancyjny, 0600) →
   restart; demon potwierdza na starcie i ustawia `current`/`previous`. Rejestr jest tylko publiczny
-  (anonimowy token GHCR), a `[self_update]` w `weglarka.toml` łamie rollback do starszego demona;
-  automatyczny powrót to #100, dziś ręczny `self-update --rollback`.
+  (anonimowy token GHCR), a `[self_update]` w `weglarka.toml` łamie rollback do starszego demona.
+  **Automatyczny powrót (ADR 0034, #100):** timer `weglarka-watchdog.timer` co minutę uruchamia
+  `weglarka-daemon supervise`; gdy nowy demon nie odpowie na `GET /v1/health` w `[self_update]
+  fallback_timeout_secs` (domyślnie 180 s), watchdog robi `reset-failed` + przypina `switch_from`
+  w quadlecie i restartuje, a demon po starcie emituje `SelfUpdateFellBack` i zostawia zepsuty digest
+  w `error` (bez ponownego pinu, dopóki tag się nie ruszy). Jedna próba: wyczerpany budżet to raport
+  (`doctor`, journal, unit watchdoga „failed”), nie pętla restartów.
 
 ## Testy
 

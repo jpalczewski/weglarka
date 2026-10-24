@@ -13,10 +13,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weglarka_api::{
     AddAppRequest, ApiError, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome,
-    DeployRequest, DeployResponse, ErrorCode, ListAppsResponse, ListSecretsResponse,
-    NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse, ReloadAction, ReloadRequest,
-    ReloadResponse, RuntimeState, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
-    endpoints,
+    DeployRequest, DeployResponse, ErrorCode, HealthResponse, ListAppsResponse,
+    ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse,
+    ReloadAction, ReloadRequest, ReloadResponse, RuntimeState, SecretInfo, SetSecretRequest,
+    ShowAppResponse, StatusResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config_mounts::{self, MountStatus, MountView};
@@ -154,6 +154,7 @@ pub(crate) async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>
 pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
     Router::new()
         .route(endpoints::STATUS.path, get(status::<P>))
+        .route(endpoints::HEALTH.path, get(health::<P>))
         .route(
             endpoints::APPS_LIST.path,
             get(list_apps::<P>).post(add_app::<P>),
@@ -315,6 +316,20 @@ async fn status<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Res
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         podman_version,
         apps: summaries(&d).await?,
+    }))
+}
+
+/// `GET /v1/health`: the admin API answers, which is the readiness signal the host-side self-update
+/// watchdog treats as "the switched daemon came up" (issue #100, `docs/decisions/0034`).
+///
+/// Deliberately cheap — no Podman call and no state read — so a Podman hiccup cannot look like a
+/// failed update. The socket is bound only after every startup precondition, so answering means the
+/// process really got that far.
+async fn health<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    Ok(json(HealthResponse {
+        status: "ok".to_owned(),
+        daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+        uptime_secs: d.started.elapsed().as_secs(),
     }))
 }
 

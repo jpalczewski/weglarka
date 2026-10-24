@@ -4,6 +4,7 @@ expression: list
 ---
 [
   "Get /v1/status",
+  "Get /v1/health",
   "Get /v1/apps",
   "Post /v1/apps",
   "Get /v1/apps/{name}",

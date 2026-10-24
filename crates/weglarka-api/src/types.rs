@@ -327,6 +327,20 @@ pub struct StatusResponse {
     pub apps: Vec<AppSummary>,
 }
 
+/// `GET /v1/health` — readiness of the admin API, not a health check of the apps (issue #100).
+///
+/// It exists for the host-side self-update watchdog: the admin socket is bound after every startup
+/// precondition, so an answer is the signal that the newly switched daemon really came up. The
+/// endpoint never calls Podman, so a Podman hiccup cannot look like a failed update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResponse {
+    /// Always `"ok"`: a response only exists while the API is serving.
+    pub status: String,
+    pub daemon_version: String,
+    /// Seconds since the daemon started, for the journal and the API client.
+    pub uptime_secs: u64,
+}
+
 /// Secret value; `Debug` does not reveal it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetSecretRequest {

@@ -219,9 +219,9 @@ Exec=run --config /etc/weglarka/weglarka.toml
 
 Quadlet ma `WantedBy=default.target` — z lingerem usługa wstaje po restarcie hosta. Przy starcie demon zakłada
 sieć `net-weglarka`, ciągnie i uruchamia kontener `weglarka-nginx` na `bind` i zapisuje plik Traefika.
-Aktualizacja samej Węglarki: automatycznie przez timer `weglarka-self-update.timer` — patrz
-[6k](#6k-samoaktualizacja-węglarki-self_update); ręcznie `platform install --image <obraz>@<digest>` +
-`systemctl --user restart weglarka.service`.
+Aktualizacja samej Węglarki: automatycznie przez timer `weglarka-self-update.timer`, a nieudaną podmianę cofa
+watchdog `weglarka-watchdog.timer` — patrz [6k](#6k-samoaktualizacja-węglarki-self_update); ręcznie
+`platform install --image <obraz>@<digest>` + `systemctl --user restart weglarka.service`.
 
 ### Weryfikacja obrazu i binarek
 
@@ -1301,9 +1301,11 @@ usługę. Decyzje i odrzucone alternatywy: [0027](decisions/0027-self-update.md)
 [`docs/examples/self-update.toml`](examples/self-update.toml).
 
 Podmiana dzieje się **na hoście**, nie w kontenerze: obraz jest `scratch` (brak `systemctl`, `/etc/passwd`,
-D-Bus), a kontener nie ma prawa zapisu do własnego unitu. `platform install` instaluje dlatego timer usera
-`weglarka-self-update.timer`, który co 10 minut uruchamia `weglarka-daemon self-update`; `interval_secs` decyduje,
-czy dany przebieg naprawdę pyta rejestr (timer bez skonfigurowanej sekcji nic nie robi).
+D-Bus), a kontener nie ma prawa zapisu do własnego unitu. `platform install` instaluje dlatego dwa timery usera:
+`weglarka-self-update.timer` (co 10 minut `weglarka-daemon self-update`; `interval_secs` decyduje, czy przebieg
+naprawdę pyta rejestr) oraz `weglarka-watchdog.timer` (co minutę `weglarka-daemon supervise`, który pilnuje, czy
+przełączony demon odpowiedział na `/v1/health` — punkt 4). Oba nic nie robią bez skonfigurowanej sekcji
+`[self_update]`. Decyzja o automacie powrotu: [0034](decisions/0034-automatic-fallback.md).
 
 **1. Klucz podpisujący (raz).** Release podpisuje obraz **dwoma** podpisami: keyless (dla ludzi, `cosign verify`)
 i kluczem statycznym, którym weryfikuje się demon. Klucz publiczny leży w repo (`cosign.pub`) i jest wkompilowany
@@ -1318,17 +1320,19 @@ gh secret set COSIGN_PASSWORD
 Rotacja klucza: podmień `cosign.pub` w repo i sekrety (nowy obraz) albo wskaż nowy klucz w
 `[self_update] public_key_file` (bez przebudowy).
 
-**2. Sekcja w `weglarka.toml` i jednorazowe przeinstalowanie unitu** (żeby powstał timer):
+**2. Sekcja w `weglarka.toml` i jednorazowe przeinstalowanie unitów** (żeby powstały oba timery):
 
 ```toml
 [self_update]
 image = "ghcr.io/jpalczewski/weglarka:latest"   # tag, nie digest — digest przypina sama Węglarka
+# fallback = true                                # automatyczny powrót (punkt 4); false = tylko ręczny --rollback
+# fallback_timeout_secs = 180                    # ile sekund nowy demon ma na odpowiedź /v1/health (30..=3600)
 ```
 
 ```sh
-weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # podgląd: quadlet + unit timera
-weglarka-daemon --config /etc/weglarka/weglarka.toml platform install             # zapis, daemon-reload, enable timera
-systemctl --user list-timers weglarka-self-update.timer
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # podgląd: quadlet + unity timerów
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install             # zapis, daemon-reload, enable timerów
+systemctl --user list-timers weglarka-self-update.timer weglarka-watchdog.timer
 ```
 
 **3. Ręcznie, bez czekania na timer:**
@@ -1339,12 +1343,22 @@ weglarka-daemon --config /etc/weglarka/weglarka.toml self-update           # to 
 weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --force   # pominąć interwał / powtórzyć nieudany digest
 ```
 
-**4. Rollback (automatyczny powrót to #100).** Stan `self-update.toml` (0600, w katalogu stanu) niesie `current`,
-`previous` i `pending`; `--rollback` przypina poprzedni digest i restartuje usługę:
+**4. Automatyczny powrót (issue #100) i ręczny rollback.** Stan `self-update.toml` (0600, w katalogu stanu) niesie
+`current`, `previous`, `pending`, a od #100 także rekord trwającej podmiany (`switch_from`/`switch_to`/`switch_at`,
+`switch_attempts`) i ostatni automatyczny powrót (`fallback_*`). `weglarka-watchdog.timer` co minutę uruchamia
+`weglarka-daemon supervise`: ten sondzi `GET /v1/health` na sockecie admina (odpowiedź = wszystkie warunki startu
+spełnione) i gdy nowy obraz nie odpowie w `fallback_timeout_secs`, przypina `switch_from` w quadlecie
+(`systemctl --user reset-failed weglarka.service`, bo pętla restartów wyczerpuje limit startów, potem restart) i
+zapisuje powrót w pliku stanu. Demon po restarcie potwierdza go i emituje zdarzenie `SelfUpdateFellBack`
+(powiadomienie); zepsuty digest trafia do `error`, więc kolejne przebiegi nie przypną go ponownie, dopóki tag się nie
+ruszy (`--force` to świadome obejście). Budżet to **jedna** automatyczna próba na podmianę — powrót, który sam nie
+wstanie, kończy się raportem (unit watchdoga „failed”, `doctor`), a nie pętlą restartów. Watchdog i switcher biorą
+wspólną blokadę (`self-update.lock`), więc nie nachodzą na siebie.
 
 ```sh
-weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --rollback
-weglarka doctor | grep self_update    # running / previous / pending i ostatni błąd
+weglarka-daemon --config /etc/weglarka/weglarka.toml supervise                # ręcznie: to samo, co robi timer (z raportem)
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --rollback   # ręczny powrót do `previous`
+weglarka doctor | grep self_update    # running / previous / pending / automatyczny powrót i ostatni błąd
 ```
 
 Gdy nowy obraz nie wstaje wcale, zadziała też ręczne przypięcie:
@@ -1353,17 +1367,32 @@ restart weglarka`.
 
 **5. Ograniczenia i diagnostyka.**
 
-- **Brak automatycznego powrotu** (#100): nowy obraz, który wstanie, ale jest zepsuty, cofa się ręcznie
-  (`--rollback`).
+- **Czego automatyczny powrót nie obejmuje:** obrazu, który wstał i odpowiada na `/v1/health`, ale jest zepsuty
+  funkcjonalnie; powrotu w poprzek bumpu schematu stanu (label `io.weglarka.state-schema` starszy niż `state.toml`
+  → raport zamiast przypięcia); obrazu, którego nie ma już w lokalnym store (retencja,
+  [0020](decisions/0020-image-retention.md)); wyczerpanego budżetu prób. W tych przypadkach
+  `weglarka-watchdog.service` kończy się błędem, `doctor` pokazuje stan, a decyzja jest operatora.
 - **Schemat stanu:** nowszy obraz może zapisać nowszy `schema_version`; Węglarka porównuje wtedy label obrazu
   `io.weglarka.state-schema` z wersją w `state.toml` **przed** podmianą i odmawia downgradu („the image writes
   state schema …”; obejście `--force` wymaga świadomej decyzji o kopii stanu) — patrz
   [6j](#wersja-schematu-plików-stanu-rollback-między-wersjami) i [0023](decisions/0023-state-schema-version.md).
 - **Niepodpisany obraz** (np. build sprzed dodania klucza) jest odrzucany: „no key-based cosign signature …”;
   nic nie jest przypinane, działa poprzednia wersja. Rejestr musi być publiczny — pull jest anonimowy.
-- Log: `journalctl --user -u weglarka-self-update.service -n 50`; stan: `weglarka doctor` (check `self_update`).
+- Log: `journalctl --user -u weglarka-self-update.service -u weglarka-watchdog.service -n 50`; stan:
+  `weglarka doctor` (check `self_update`).
 - `[self_update]` to nowa sekcja `weglarka.toml` (`deny_unknown_fields`): **starszy demon z nią nie wystartuje** —
-  usuń sekcję przed downgradem.
+  usuń sekcję (razem z `fallback`/`fallback_timeout_secs`) i wyłącz oba timery (`weglarka-self-update.timer`,
+  `weglarka-watchdog.timer`) przed downgradem.
+
+**6. Próba na hoście (opcjonalna).** CI nie ma systemd usera, więc zachowanie watchdoga sprawdza się ręcznie:
+
+1. **zepsuty obraz:** `self-update --image <tag> --force` z obrazem, który nie wstaje; po `fallback_timeout_secs`
+   quadlet wraca do poprzedniego digestu, `doctor` pokazuje automatyczny powrót, a `journalctl --user -u
+   weglarka-watchdog.service` — przebieg i powód;
+2. **reboot z `pending`:** zrestartuj host w trakcie podmiany (przed potwierdzeniem); po starcie w ciągu minuty
+   watchdog albo potwierdza nowy obraz (zdrowy), albo przywraca poprzedni (`OnBootSec=1min`);
+3. **rejestr offline:** po przypięciu odetnij rejestr (albo zatrzymaj `podman system service`); automatyczny powrót
+   nie kontaktuje się z rejestrem — bierze obraz z lokalnego store — więc nadal działa.
 ## 6m. Wspólna sieć między apkami (`shared_networks`)
 
 Domyślnie apki są odizolowane: każda ma własną sieć `net-<instancja>`. Gdy wdrożenie składa się z kilku
@@ -1525,7 +1554,7 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
   ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy))
   i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
-  weglarka-self-update.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
+  weglarka-self-update.timer weglarka-watchdog.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
   ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
   ([6n](#6n-ścieżki-na-jednej-domenie-paths)) oraz `ingress.max_body_size`
   ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)). Inaczej daemon nie wystartuje z błędem parsowania.

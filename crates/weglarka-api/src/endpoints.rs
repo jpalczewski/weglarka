@@ -19,6 +19,13 @@ pub const STATUS: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/status",
 };
+/// `GET` → [`HealthResponse`](crate::HealthResponse). Readiness only: it answers once the admin API
+/// is serving and deliberately never calls Podman, so the host-side self-update watchdog can tell a
+/// broken daemon from a Podman hiccup (issue #100).
+pub const HEALTH: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/health",
+};
 /// `GET` → [`ListAppsResponse`](crate::ListAppsResponse)
 pub const APPS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -159,6 +166,7 @@ pub const NOTIFICATIONS_TEST: Endpoint = Endpoint {
 
 pub const ENDPOINTS: &[Endpoint] = &[
     STATUS,
+    HEALTH,
     APPS_LIST,
     APPS_ADD,
     APPS_SHOW,
