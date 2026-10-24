@@ -8,7 +8,7 @@ use weglarka_core::app::{Digest, Resources, SecretTarget};
 use weglarka_core::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
     IdRange, ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError, PodmanEvent,
-    PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec,
+    PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec, image_repo,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -564,7 +564,7 @@ pub(crate) struct InspectImage {
 impl InspectImage {
     /// Prefers the digest of the repository from `reference`, then any `RepoDigests`, then `Digest`.
     pub(crate) fn into_domain(self, reference: &str) -> ImageInfo {
-        let repo = reference_repo(reference);
+        let repo = image_repo(reference);
         let repo_digests = self.repo_digests.unwrap_or_default();
         let digest = repo_digests
             .iter()
@@ -621,15 +621,6 @@ fn useful_names(names: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|name| !name.is_empty() && !name.contains("<none>"))
         .collect()
-}
-
-/// `ghcr.io/x/y:latest` / `ghcr.io/x/y@sha256:…` → `ghcr.io/x/y`.
-fn reference_repo(reference: &str) -> &str {
-    let without_digest = reference.split_once('@').map_or(reference, |(r, _)| r);
-    match without_digest.rsplit_once(':') {
-        Some((repo, tag)) if !tag.contains('/') => repo,
-        _ => without_digest,
-    }
 }
 
 /// One line of the `images/pull` stream.
@@ -943,14 +934,6 @@ mod tests {
         assert!(dangling.repo_tags.is_empty(), "<none>:<none> is dropped");
         assert_eq!(dangling.repo_digests.len(), 1);
         assert_eq!(dangling.size_bytes, 12_345_678);
-    }
-
-    #[test]
-    fn reference_repo_strips_tag_and_digest_but_not_registry_port() {
-        assert_eq!(reference_repo("ghcr.io/x/y:latest"), "ghcr.io/x/y");
-        assert_eq!(reference_repo("ghcr.io/x/y@sha256:ab"), "ghcr.io/x/y");
-        assert_eq!(reference_repo("localhost:5000/y"), "localhost:5000/y");
-        assert_eq!(reference_repo("localhost:5000/y:1"), "localhost:5000/y");
     }
 
     #[test]

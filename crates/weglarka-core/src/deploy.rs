@@ -13,7 +13,7 @@ use crate::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use crate::labels;
 use crate::podman::{
     ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
-    PortMapping, PullEvent, RestartPolicy,
+    PortMapping, PullEvent, RestartPolicy, image_repo,
 };
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
 use crate::secrets::{binding_fingerprints, materialize};
@@ -42,17 +42,6 @@ pub enum DeployOutcome {
 }
 
 // ── Helpers (pure) ──────────────────────────────────────────────────────
-
-/// Repository from an image reference: without tag and digest (`host:5000/a/b:1@sha256:…` →
-/// `host:5000/a/b`).
-pub fn image_repo(image: &str) -> &str {
-    let image = image.split('@').next().unwrap_or(image);
-    let name_start = image.rfind('/').map_or(0, |i| i + 1);
-    match image[name_start..].rfind(':') {
-        Some(i) => &image[..name_start + i],
-        None => image,
-    }
-}
 
 /// Reference pinning a digest: `repo@sha256:…`.
 pub fn pinned_ref(image: &str, digest: &Digest) -> String {
@@ -705,14 +694,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_repo_and_pinned_ref() {
-        assert_eq!(image_repo("ghcr.io/a/b:latest"), "ghcr.io/a/b");
-        assert_eq!(image_repo("ghcr.io/a/b"), "ghcr.io/a/b");
-        assert_eq!(image_repo("localhost:5000/a/b:1"), "localhost:5000/a/b");
-        assert_eq!(image_repo("localhost:5000/a"), "localhost:5000/a");
-        assert_eq!(image_repo("ghcr.io/a/b:1@sha256:abc"), "ghcr.io/a/b");
+    fn pinned_ref_pins_the_digest() {
         let d = Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
         assert_eq!(pinned_ref("ghcr.io/a/b:x", &d), format!("ghcr.io/a/b@{d}"));
+        assert_eq!(
+            pinned_ref("localhost:5000/a/b:1", &d),
+            format!("localhost:5000/a/b@{d}")
+        );
     }
 
     #[test]
