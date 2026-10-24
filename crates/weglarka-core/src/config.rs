@@ -20,7 +20,7 @@ pub struct HostConfig {
     #[serde(default)]
     pub state: StateConfig,
     /// Host directory with the app config files/directories that `apps.toml`'s `configs` mount
-    /// (issue #118, `docs/decisions/0026-config-root-mounts.md`). Absolute, or relative to the
+    /// (issue #118, `docs/decisions/0027-config-root-mounts.md`). Absolute, or relative to the
     /// directory of `weglarka.toml` (the caller resolves it, like `[state] dir`). Unset = the
     /// feature is off: an app that declares `configs` is then an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]

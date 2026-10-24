@@ -13,7 +13,8 @@ use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
     ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent,
-    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
+    PullEvent, RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -68,6 +69,10 @@ struct State {
     images: BTreeMap<String, ImageInfo>,
     pull_digests: BTreeMap<String, Digest>,
     pull_failures: BTreeMap<String, String>,
+    /// References that only pull with exactly these credentials (a private registry).
+    pull_credentials: BTreeMap<String, RegistryAuth>,
+    /// Credentials of every `image_pull_with` call, in order (`None` = anonymous).
+    pull_auths: Vec<(String, Option<RegistryAuth>)>,
     networks: BTreeMap<String, (NetworkSpec, Vec<String>)>,
     secrets: BTreeMap<String, Vec<u8>>,
     /// Volumes with the tar bytes last imported (the fake does not model file contents).
@@ -128,6 +133,19 @@ impl FakePodman {
         self.lock()
             .pull_failures
             .insert(reference.to_owned(), message.to_owned());
+    }
+
+    /// Makes `reference` a private image: a pull without exactly `auth` fails the way a registry
+    /// answers `401` (`PodmanError::is_registry_auth_failure`).
+    pub fn require_pull_auth(&self, reference: &str, auth: RegistryAuth) {
+        self.lock()
+            .pull_credentials
+            .insert(reference.to_owned(), auth);
+    }
+
+    /// `(reference, credentials)` of every pull so far, in order.
+    pub fn pull_auth_log(&self) -> Vec<(String, Option<RegistryAuth>)> {
+        self.lock().pull_auths.clone()
     }
 
     pub fn clear_pull_failure(&self, reference: &str) {
@@ -483,14 +501,27 @@ impl PodmanClient for FakePodman {
             .collect())
     }
 
-    fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send {
+    fn image_pull_with(
+        &self,
+        reference: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> impl Stream<Item = Result<PullEvent>> + Send {
         let mut s = self.lock();
         s.calls.push(Call::ImagePull(reference.to_owned()));
+        s.pull_auths.push((reference.to_owned(), auth.cloned()));
         let mut items = vec![Ok(PullEvent::Progress {
             message: format!("pulling {reference}"),
         })];
         if let Some(msg) = s.pull_failures.get(reference) {
             items.push(Err(PodmanError::Pull(msg.clone())));
+        } else if s
+            .pull_credentials
+            .get(reference)
+            .is_some_and(|required| auth != Some(required))
+        {
+            items.push(Err(PodmanError::Pull(
+                "unauthorized: authentication required".into(),
+            )));
         } else {
             let digest = s
                 .pull_digests

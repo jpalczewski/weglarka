@@ -71,7 +71,7 @@ pub struct SpecFlags {
     /// volume must be declared first (`weglarka volumes add NAME`); v1 allows at most one per app.
     #[arg(long = "shared-volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_shared_volume, conflicts_with = "spec")]
     pub shared_volumes: Vec<SharedVolumeRef>,
-    /// Read-only host config mount from `config_root` (ADR 0026): SOURCE:TARGET, with `source`
+    /// Read-only host config mount from `config_root` (ADR 0027): SOURCE:TARGET, with `source`
     /// relative to `config_root` and `target` absolute in the container (repeatable; replaces a
     /// mount with the same `source`; `none` clears the list). Independent of the global
     /// `--config FILE`; it conflicts with no other flag except `--spec`.

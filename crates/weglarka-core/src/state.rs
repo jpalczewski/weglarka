@@ -42,7 +42,7 @@ const IMPLICIT_SCHEMA_VERSION: u32 = 1;
 /// One schema migration: rewrites a parsed document in place, returning a reason on failure.
 type SchemaStep = fn(&mut toml::Table) -> Result<(), String>;
 
-/// v1 → v2: host config mounts (issue #118, ADR 0026). `AppSpec::configs` and
+/// v1 → v2: host config mounts (issue #118, ADR 0027). `AppSpec::configs` and
 /// `AppSpec::reload_signal` are optional fields with defaults, so a v1 document needs no data
 /// transformation — the version marker alone records that the file may carry them. The step is a
 /// no-op on purpose: it must also accept a hand-edited v1 file that already has the new fields.
@@ -244,6 +244,12 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         return Err(format!("{name}: health attempts and window must be > 0"));
     }
     for b in &spec.secrets {
+        if b.secret == crate::secret_store::REGISTRY_AUTH_SECRET {
+            return Err(format!(
+                "{name}: secret {:?} is reserved for registry credentials and cannot be bound to the container",
+                b.secret
+            ));
+        }
         if !crate::secret_store::valid_secret_name(&b.secret) {
             return Err(format!("{name}: invalid secret name {:?}", b.secret));
         }

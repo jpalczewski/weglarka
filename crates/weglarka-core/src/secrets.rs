@@ -12,10 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AppSpec, InstanceName};
-use crate::podman::{PodmanClient, SecretAttachment};
+use crate::podman::{PodmanClient, RegistryAuth, SecretAttachment};
 use crate::reconcile::EngineError;
 use crate::secret_store::{
-    SecretError, SecretMeta, SecretStore, SecretValue, fingerprint, scoped_name, split_scoped,
+    REGISTRY_AUTH_SECRET, SecretError, SecretMeta, SecretStore, SecretValue, fingerprint,
+    scoped_name, split_scoped,
 };
 use crate::state::write_atomic;
 
@@ -218,6 +219,29 @@ pub(crate) async fn binding_fingerprints(
         out.insert(b.secret.clone(), meta.fingerprint.clone());
     }
     Ok(out)
+}
+
+/// Registry credentials for `instance`'s image pulls: the reserved `<instance>.registry-auth`
+/// secret (`<username>:<password>`), `None` when it is not set (anonymous pull / `auth.json`).
+/// A malformed value is [`SecretError::Malformed`] — a pull must not silently fall back to anonymous.
+pub(crate) async fn registry_auth(
+    store: &Arc<dyn SecretStore>,
+    instance: &InstanceName,
+) -> Result<Option<RegistryAuth>, EngineError> {
+    let scoped = scoped_name(instance, REGISTRY_AUTH_SECRET);
+    let key = scoped.clone();
+    let Some(value) = blocking(store, move |s| s.get(&key)).await? else {
+        return Ok(None);
+    };
+    RegistryAuth::parse(value.expose())
+        .map(Some)
+        .ok_or_else(|| {
+            SecretError::Malformed {
+                name: scoped,
+                reason: "expected <username>:<password>",
+            }
+            .into()
+        })
 }
 
 /// Removes every secret of `instance` from the store — the whole `<instance>.*` scope (issue #80:

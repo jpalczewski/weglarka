@@ -19,6 +19,9 @@ pub enum SecretError {
     InvalidName(String),
     #[error("secret value for {0} is not valid UTF-8")]
     NotUtf8(String),
+    /// A reserved secret whose value has the wrong shape. Never carries the value.
+    #[error("secret {name} is malformed: {reason}")]
+    Malformed { name: String, reason: &'static str },
     #[error("insecure permissions on {path}: {reason}")]
     Permissions { path: String, reason: String },
 }
@@ -55,6 +58,11 @@ pub struct SecretMeta {
 pub fn fingerprint(value: &SecretValue) -> String {
     hex::encode(&Sha256::digest(value.expose())[..4])
 }
+
+/// Reserved app secret holding the registry credentials for the app's image pulls
+/// (`<instance>.registry-auth`, value `<username>:<password>`; docs/decisions/0026). The engine
+/// reads it on a pull; it is never bound to the container.
+pub const REGISTRY_AUTH_SECRET: &str = "registry-auth";
 
 /// Secret name in Podman and in the store: `<instance>.<name>` (a dot is not allowed in an
 /// instance name, so the composition is unambiguous).

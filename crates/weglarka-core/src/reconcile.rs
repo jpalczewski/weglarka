@@ -38,12 +38,16 @@ pub enum EngineError {
     UnknownInstance(InstanceName),
     /// The registry refused the pull (401/403): the image may exist, but the podman user has no
     /// (valid) credentials for it. Fix `auth.json`, do not look for a missing image.
-    #[error(
-        "registry rejected the pull of {reference} ({message}); check the podman user's credentials (`podman login`)"
-    )]
-    RegistryAuth { reference: String, message: String },
     #[error("cannot resolve image digest for {0}")]
     NoDigest(String),
+    /// The registry refused the pull (401/403). Names the secret to fix; never the credentials.
+    #[error("{}", registry_auth_message(.instance, .reference, *.sent_credentials))]
+    RegistryAuth {
+        instance: InstanceName,
+        reference: String,
+        /// Whether `<instance>.registry-auth` was sent (rejected) or absent (required).
+        sent_credentials: bool,
+    },
     /// No free uid range of `size` left in the rootless user's subuid pool (docs/decisions/0009).
     #[error(
         "no free uid range of {size} in the subuid pool of {pool}; enlarge the runtime user's subuid range"
@@ -56,7 +60,7 @@ pub enum EngineError {
     #[error("{0}")]
     Volume(String),
     /// An app's config mounts cannot be mounted (no `config_root`, a missing source, an escape…;
-    /// issue #118, `docs/decisions/0026-config-root-mounts.md`).
+    /// issue #118, `docs/decisions/0027-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
@@ -130,6 +134,23 @@ fn join_names(names: &[InstanceName]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Operator hint for [`EngineError::RegistryAuth`].
+fn registry_auth_message(instance: &InstanceName, reference: &str, sent: bool) -> String {
+    let secret = crate::secret_store::REGISTRY_AUTH_SECRET;
+    if sent {
+        format!(
+            "registry rejected the credentials in secret {instance}.{secret} for {reference}; \
+             check them with `weglarka secrets set {instance} {secret}` (value <username>:<password>)"
+        )
+    } else {
+        format!(
+            "registry requires credentials to pull {reference}; \
+             set them with `weglarka secrets set {instance} {secret}` (value <username>:<password>) \
+             or `podman login` as the podman user"
+        )
+    }
 }
 
 /// `dep (reason), dep (reason)` for [`EngineError::DependenciesNotReady`].
@@ -600,7 +621,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
-                // stays as it is until the operator fixes the root or the file (ADR 0026).
+                // stays as it is until the operator fixes the root or the file (ADR 0027).
                 blocked = true;
                 report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {

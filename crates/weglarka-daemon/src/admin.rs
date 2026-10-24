@@ -102,6 +102,11 @@ impl From<EngineError> for Fail {
             // unless the request forces it.
             EngineError::Secret(SecretError::NotFound(m)) => Fail::not_found(m),
             e @ EngineError::SecretInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
+            // Private-registry credentials (docs/decisions/0026): the operator fixes the secret and retries.
+            e @ (EngineError::RegistryAuth { .. }
+            | EngineError::Secret(SecretError::Malformed { .. })) => {
+                Fail(ErrorCode::Conflict, e.to_string())
+            }
             // Shared-volume guards (issue #33): the engine message carries the members / the hint.
             e @ (EngineError::SharedVolumeInUse { .. }
             | EngineError::SharedVolumeHasData { .. }

@@ -16,7 +16,7 @@ use crate::podman::{
     PortMapping, PullEvent, RestartPolicy, image_repo,
 };
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
-use crate::secrets::{binding_fingerprints, materialize};
+use crate::secrets::{binding_fingerprints, materialize, registry_auth};
 use crate::state::{self, AppState, FailedDeploy, StateFile};
 use crate::uid_range::UidRange;
 use crate::webhook::WebhookEvent;
@@ -237,29 +237,39 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    async fn pull(&self, reference: &str) -> Result<Option<Digest>, EngineError> {
-        let mut stream = std::pin::pin!(self.podman.image_pull(reference));
+    /// Pulls `reference` for `instance`, with its `registry-auth` credentials when it has any
+    /// (docs/decisions/0026). A 401/403 becomes [`EngineError::RegistryAuth`].
+    async fn pull(
+        &self,
+        instance: &InstanceName,
+        reference: &str,
+    ) -> Result<Option<Digest>, EngineError> {
+        let auth = registry_auth(&self.secrets, instance).await?;
+        let mut stream = std::pin::pin!(self.podman.image_pull_with(reference, auth.as_ref()));
         let mut digest = None;
         while let Some(ev) = stream.next().await {
-            let ev = ev.map_err(|e| {
-                if e.is_registry_auth_failure() {
-                    EngineError::RegistryAuth {
+            match ev {
+                Ok(PullEvent::Complete { digest: d, .. }) => digest = d,
+                Ok(_) => {}
+                Err(e) if e.is_registry_auth_failure() => {
+                    return Err(EngineError::RegistryAuth {
+                        instance: instance.clone(),
                         reference: reference.to_owned(),
-                        message: e.to_string(),
-                    }
-                } else {
-                    EngineError::Podman(e)
+                        sent_credentials: auth.is_some(),
+                    });
                 }
-            })?;
-            if let PullEvent::Complete { digest: d, .. } = ev {
-                digest = d;
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(digest)
     }
 
-    async fn resolve_digest(&self, reference: &str) -> Result<Digest, EngineError> {
-        match self.pull(reference).await? {
+    async fn resolve_digest(
+        &self,
+        instance: &InstanceName,
+        reference: &str,
+    ) -> Result<Digest, EngineError> {
+        match self.pull(instance, reference).await? {
             Some(d) => Ok(d),
             None => self
                 .podman
@@ -275,6 +285,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// that a rollback does not depend on the registry), and only then a pull.
     async fn ensure_image(
         &self,
+        instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         local_id: Option<&str>,
@@ -288,7 +299,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 {
                     return Ok(id.to_owned());
                 }
-                self.pull(&reference).await?;
+                self.pull(instance, &reference).await?;
                 Ok(reference)
             }
             Err(e) => Err(e.into()),
@@ -323,7 +334,7 @@ impl<P: PodmanClient> Reconciler<P> {
     > {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
-        // ADR 0026). The resolved canonical paths are what `launch` mounts.
+        // ADR 0027). The resolved canonical paths are what `launch` mounts.
         let configs = crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             .map_err(|e| EngineError::Configs(e.to_string()))?;
         self.podman
@@ -372,7 +383,7 @@ impl<P: PodmanClient> Reconciler<P> {
         generation: u64,
         local_id: Option<&str>,
     ) -> Result<Launched, EngineError> {
-        let image = self.ensure_image(spec, digest, local_id).await?;
+        let image = self.ensure_image(instance, spec, digest, local_id).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
@@ -400,7 +411,7 @@ impl<P: PodmanClient> Reconciler<P> {
             restart: RestartPolicy::Always,
             userns_auto: true,
             // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
-            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0026).
+            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0027).
             mounts: configs
                 .iter()
                 .map(|c| BindMount {
@@ -517,7 +528,7 @@ impl<P: PodmanClient> Reconciler<P> {
         self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
 
-        let digest = match self.resolve_digest(&spec.image).await {
+        let digest = match self.resolve_digest(instance, &spec.image).await {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {
@@ -679,7 +690,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
         self.assign_range(instance, spec).await?;
-        let digest = match self.resolve_digest(&spec.image).await {
+        let digest = match self.resolve_digest(instance, &spec.image).await {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {

@@ -56,7 +56,7 @@ pub enum StartError {
     SharedVolumes(String),
     /// The startup preconditions of host config mounts are not met: `config_root` is configured but
     /// unusable, or an app declares `configs` while it is unset (issue #118,
-    /// `docs/decisions/0026-config-root-mounts.md`). A single missing/escaping source is *not* a
+    /// `docs/decisions/0027-config-root-mounts.md`). A single missing/escaping source is *not* a
     /// startup error — the engine refuses to mount it and `doctor` reports it.
     #[error("config mounts: {0}")]
     Configs(#[from] ConfigError),
