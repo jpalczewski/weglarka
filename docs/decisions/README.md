@@ -1,7 +1,9 @@
 # Implementation decisions (ADR)
 
-Each decision describes the problem, the choice, the consequences and the rejected alternatives. New entries are
-numbered consecutively (after `0020` comes `0021`); the skeleton is [`0000-template.md`](0000-template.md).
+Each decision describes the problem, the choice, the consequences and the rejected alternatives. New
+entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
+[`0000-template.md`](0000-template.md). The table below is generated from the ADR titles by
+`scripts/adr.sh index`, and CI (`scripts/adr.sh lint`) verifies it is current — do not edit it by hand.
 
 | # | Topic |
 |---|---|
@@ -25,4 +27,4 @@ numbered consecutively (after `0020` comes `0021`); the skeleton is [`0000-templ
 | [0018](0018-ingress-streaming.md) | Per-app streaming: `proxy_buffering off` and a long idle timeout (issue #64) |
 | [0019](0019-container-command.md) | Per-app container command: arguments to the image entrypoint (issue #79) |
 | [0020](0020-image-retention.md) | Image retention: keep the current and previous image, prune the rest (issue #40) |
-| [0021](0021-notifications.md) | Notifications: events → severity → dedup → durable outbox → ntfy (issue #38) |
+| [0021](0021-notifications.md) | Notifications: engine events → severity → dedup → durable outbox → ntfy |

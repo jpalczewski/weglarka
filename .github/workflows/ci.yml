@@ -77,6 +77,16 @@ jobs:
             exit 1
           fi
 
+  # Numbered identifiers (ADR numbers, runbook section letters) are a shared resource across branches:
+  # a rebase that left two PRs with the same ADR number, a stale generated index or a link broken by a
+  # renumber fails here in seconds. Runs for every PR, docs-only ones included.
+  docs-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ADR numbering, generated index and internal links
+        run: scripts/adr.sh lint
+
   # fmt → clippy → test → nginx -t in ONE job: the toolchain is installed once and the debug `target/`
   # is shared, instead of four runners each paying for toolchain setup and a cold cache.
   # The cache is written only on main (`save-if`); PRs restore main's cache read-only.

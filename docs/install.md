@@ -1009,7 +1009,7 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
-  ([6d](#6d-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
+  ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
 
 ### `apps update`: co się dzieje po zmianie
 

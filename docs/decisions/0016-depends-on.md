@@ -1,4 +1,4 @@
-# 0016 — `depends_on`: start ordering and health gating between apps
+# 0016 — `depends_on`: start ordering and health gating between apps (issue #35)
 
 Status: accepted (2026-10-24, issue #35).
 

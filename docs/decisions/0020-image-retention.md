@@ -1,4 +1,4 @@
-# 0020 — Image retention: keep one previous image, prune the rest (issue #40)
+# 0020 — Image retention: keep the current and previous image, prune the rest (issue #40)
 
 Status: accepted (issue #40).
 
@@ -77,7 +77,7 @@ and rolling back a daemon stays safe. `spec_hash` is untouched: retention never 
 - The prune runs under the engine mutex, so it serialises with deploys and answers `busy` (503) after
   the admin API's 30 s mutation timeout instead of interleaving with a pull.
 - Operators must run `weglarka images prune --dry-run` and then `weglarka images prune` once after
-  upgrading (`docs/install.md` §6g).
+  upgrading ([`docs/install.md` 6g](../install.md#6g-retencja-obrazów-i-jednorazowe-sprzątanie)).
 - Tests: the pure planner in `core/src/images.rs`, engine tests on `FakePodman` (three deploys keep two
   images; a deploy ignores another app's repository), the admin API + `doctor` in
   `daemon/tests/images.rs`, and the libpod mapping in `weglarka-podman`.
