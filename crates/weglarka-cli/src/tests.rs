@@ -732,6 +732,24 @@ fn add_accepts_host_ports() {
 }
 
 #[test]
+fn add_accepts_depends_on() {
+    let spec = build_spec(&add_args(&["--depends-on", "db", "--depends-on", "cache"])).unwrap();
+    let deps: Vec<_> = spec.depends_on.iter().map(ToString::to_string).collect();
+    assert_eq!(deps, ["db", "cache"]);
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(
+        Add::try_parse_from(["add", "ntfy", "img", "--depends-on", "db", "--spec", "f"]).is_err()
+    );
+    // A name that is not a valid app name is a usage error, not a silent no-op.
+    assert!(Add::try_parse_from(["add", "ntfy", "img", "--depends-on", "DB"]).is_err());
+}
+
+#[test]
 fn update_flags_flip_start() {
     assert!(
         !apply_flags(app_spec(true), &update_args(&["--no-start"]))

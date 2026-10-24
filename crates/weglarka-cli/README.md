@@ -29,6 +29,13 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   access log) — the host firewall has to allow it. The mapping is part of `spec_hash`, so a change recreates the
   container; host ports < 1024 need `[runtime] allow_privileged_host_ports = true`. Conflicts with `--spec`,
   like `--volume` and the limit flags.
+- Spec flags without `--spec`: `--depends-on NAME` (repeatable, `none` clears the list) on `apps add`/`apps update`
+  sets the start order (issue #35): the app is started only once every app it names is running — and healthy, if
+  that app has a healthcheck — on boot, first deploy, `apps start`, deploy or a recreate with a missing container.
+  `apps update --remove-depends-on NAME` drops one entry (a usage error when absent). The relation is ordering only:
+  the apps do not share a network and cannot reach each other by name. `depends_on` is not part of `spec_hash`, so
+  changing it never recreates a container, while `apps remove` of a dependency is refused (409 Conflict, listing the
+  dependents) until the dependents or their entries are gone. Conflicts with `--spec`, like the other spec flags.
 - Lifecycle: `start` is a spec field (default `true`), not a one-shot flag. `apps add --no-start` provisions
   only — the image digest is pinned, the network, uid range and volumes are created, **no container**;
   `apps start` / `apps stop` flip the flag with the same read-modify-write as `apps update`
