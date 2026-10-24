@@ -12,15 +12,26 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 
 - `--json`: exactly one document on stdout — a type from `weglarka-api` (`ListAppsResponse`,
   `ShowAppResponse`, `DeployResponse`, `StatusResponse`, `ListSecretsResponse`, `SecretInfo`,
-  `DoctorReport`). CLI exceptions: `apps remove` → `{"removed","existed"}`, `--dry-run` →
+  `DoctorReport`). CLI exceptions: `apps remove` → `{"removed","existed"}`, a no-op of
+  `apps update`/`start`/`stop` → `{"changed":false,"app"}`, `--dry-run` →
   `{"dry_run":true,"method","path","body"}`.
 - Errors go to stderr; with `--json`: `{"error":{"code","message","hint","exit_code"}}`.
-- `--dry-run` (`apps add/remove`, `deploy`, `secrets set`): nothing is sent that would change state;
-  `remove`/`deploy` only check that the app exists (GET). The secret value is masked.
+- `--dry-run` (`apps add/remove/update/start/stop`, `deploy`, `secrets set`): nothing is sent that would
+  change state; `remove`/`deploy`/`start`/`stop` only check that the app exists (GET). The secret value is
+  masked.
 - `apps update <name>`: read-modify-write of the whole spec (`GET`, apply flags, `PUT`); `--dry-run` shows the
   diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
   Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
   runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
+- Lifecycle: `start` is a spec field (default `true`), not a one-shot flag. `apps add --no-start` provisions
+  only — the image digest is pinned, the network, uid range and volumes are created, **no container**;
+  `apps start` / `apps stop` flip the flag with the same read-modify-write as `apps update`
+  (`apps update --start`/`--no-start` do it inside a spec edit). `stop` removes the container and keeps the
+  volumes, the uid range and the pinned digest; a `start = false` app is not routed by ingress and gets no
+  webhook deploys. Output: `UpdateAppResponse` (a deploy that only provisions reports outcome `provisioned`); a
+  flip that is already in place sends nothing (`{"changed":false,"app":…}`). Runtime state: `not-started`
+  (`not_started` in JSON). `start = true` is the default and is omitted from the `AppSpec` TOML/JSON, so a spec
+  without `start` means the app runs.
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
 - Secret: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
   is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes).

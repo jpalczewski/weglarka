@@ -18,6 +18,7 @@ use weglarka_api::{
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::deploy::DeployOutcome as CoreOutcome;
+use weglarka_core::labels;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, PodmanClient,
 };
@@ -142,6 +143,20 @@ pub(crate) fn runtime_state(c: Option<&ContainerInfo>) -> RuntimeState {
     }
 }
 
+/// Runtime state that also knows the `start = false` intent: a provisioned app has a pinned digest
+/// but no container, i.e. Podman reports it as `Missing` while the spec says "not started by
+/// design" — [`RuntimeState::NotStarted`]. Everything else falls back to [`runtime_state`].
+pub(crate) fn runtime_state_for(
+    spec: &AppSpec,
+    state: Option<&AppState>,
+    container: Option<&ContainerInfo>,
+) -> RuntimeState {
+    match (container, state) {
+        (None, Some(s)) if !spec.start && s.current.is_some() => RuntimeState::NotStarted,
+        _ => runtime_state(container),
+    }
+}
+
 async fn containers_by_instance<P: PodmanClient>(
     d: &Daemon<P>,
 ) -> Option<BTreeMap<String, ContainerInfo>> {
@@ -166,20 +181,22 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
     Ok(apps
         .apps
         .iter()
-        .map(|(name, spec)| AppSummary {
-            name: name.clone(),
-            image: spec.image.clone(),
-            domains: spec.domains.clone(),
-            // Podman unavailable → unknown; `Missing` + a log warning (details: doctor).
-            runtime: update::with_waiting(
-                runtime_state(
-                    containers
-                        .as_ref()
-                        .and_then(|m| m.get(&weglarka_core::labels::container_name(name))),
+        .map(|(name, spec)| {
+            let container = containers
+                .as_ref()
+                .and_then(|m| m.get(&labels::container_name(name)));
+            let app_state = st.apps.get(name);
+            AppSummary {
+                name: name.clone(),
+                image: spec.image.clone(),
+                domains: spec.domains.clone(),
+                // Podman unavailable → unknown; `Missing` + a log warning (details: doctor).
+                runtime: update::with_waiting(
+                    runtime_state_for(spec, app_state, container),
+                    app_state,
                 ),
-                st.apps.get(name),
-            ),
-            digest: st.apps.get(name).and_then(|s| s.current.clone()),
+                digest: app_state.and_then(|s| s.current.clone()),
+            }
         })
         .collect())
 }
@@ -216,12 +233,16 @@ async fn show_app<P: PodmanClient + 'static>(
     let container = d
         .engine
         .podman()
-        .container_inspect(&weglarka_core::labels::container_name(&name))
+        .container_inspect(&labels::container_name(&name))
         .await
         .ok();
+    let app_state = st.apps.get(&name);
     Ok(json(ShowAppResponse {
-        state: st.apps.get(&name).cloned().unwrap_or_default(),
-        runtime: update::with_waiting(runtime_state(container.as_ref()), st.apps.get(&name)),
+        state: app_state.cloned().unwrap_or_default(),
+        runtime: update::with_waiting(
+            runtime_state_for(&spec, app_state, container.as_ref()),
+            app_state,
+        ),
         name,
         spec,
     }))
@@ -259,12 +280,29 @@ async fn add_app<P: PodmanClient + 'static>(
         weglarka_ingress::Plan::build(&d.host, &apps).map_err(|e| Fail::invalid(e.to_string()))?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;
     }
+    // `start = false`: provision synchronously (pin the digest, create the network, uid range and
+    // volumes) so the response can already report `not_started`. `start = true` is deployed by the
+    // reconcile woken by `changed()`.
+    if !req.spec.start {
+        d.engine.deploy(&req.name, false).await?;
+    }
     d.changed();
+    let st = state::load_state(&d.paths.state.state).map_err(Fail::internal)?;
+    let container = d
+        .engine
+        .podman()
+        .container_inspect(&labels::container_name(&req.name))
+        .await
+        .ok();
+    let app_state = st.apps.get(&req.name);
     Ok(json(ShowAppResponse {
+        runtime: update::with_waiting(
+            runtime_state_for(&req.spec, app_state, container.as_ref()),
+            app_state,
+        ),
+        state: app_state.cloned().unwrap_or_default(),
         name: req.name,
         spec: req.spec,
-        state: AppState::default(),
-        runtime: RuntimeState::Missing,
     }))
 }
 
@@ -328,6 +366,11 @@ async fn deploy_app<P: PodmanClient + 'static>(
             outcome: DeployOutcome::RolledBack,
             generation,
             digest: Some(restored),
+        },
+        CoreOutcome::Provisioned { digest } => DeployResponse {
+            outcome: DeployOutcome::Provisioned,
+            generation,
+            digest: Some(digest),
         },
         CoreOutcome::Failed { reason, .. } => {
             return Err(Fail::internal(format!("deploy failed: {reason}")));

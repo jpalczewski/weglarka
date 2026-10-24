@@ -46,6 +46,9 @@ pub enum RuntimeState {
     /// No container yet: the deploy waits for secrets bound in the spec that are not set
     /// (`AppState::waiting_for_secrets` lists them). Setting the last one deploys the app.
     WaitingForSecret,
+    /// No container by design: the spec has `start = false`, so the app is provisioned only (image
+    /// digest pinned, network, uid range and volumes ready). `apps start` brings it up.
+    NotStarted,
 }
 
 /// App summary in a list.
@@ -138,6 +141,9 @@ pub enum DeployOutcome {
     Unchanged,
     /// The new version failed the health gate; rolled back to the previous digest.
     RolledBack,
+    /// `start = false`: nothing was started. The image is pinned and the network, uid range and
+    /// volumes are ready; `apps start` deploys the app later.
+    Provisioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

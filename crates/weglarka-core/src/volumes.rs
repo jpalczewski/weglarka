@@ -511,6 +511,14 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
 image = "ghcr.io/x/szklana:latest"
 health = { attempts = 2, window_secs = 2 }
 "#;
+    /// `start = false`: provisioned (image, uid range, volumes) but no container — data must be
+    /// importable before the first start (issue #29).
+    const STOPPED_APP: &str = r#"
+[apps.szklana]
+image = "ghcr.io/x/szklana:latest"
+start = false
+volumes = [{ name = "data", target = "/data" }]
+"#;
 
     struct Env {
         _dir: tempfile::TempDir,
@@ -876,6 +884,37 @@ health = { attempts = 2, window_secs = 2 }
             e.fake.container_spec("wg-import.szklana").is_none(),
             "helper is cleaned up"
         );
+    }
+
+    /// Issue #29: `start = false` provisions the image, the uid range and the volumes without a
+    /// container, so a foreign import works before the app's first start.
+    #[tokio::test(start_paused = true)]
+    async fn foreign_import_works_before_the_first_start() {
+        let e = env(STOPPED_APP);
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(
+            report.actions.iter().all(|a| a.result.is_ok()),
+            "{report:?}"
+        );
+        assert!(e.fake.containers().is_empty());
+        let before = e.fake.calls().len();
+
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Foreign, tar(), WAIT)
+            .await
+            .unwrap();
+
+        let calls = e.fake.calls()[before..].to_vec();
+        assert!(calls.contains(&Call::ContainerCreate("wg-import.szklana".into())));
+        assert!(calls.contains(&Call::ContainerArchivePut {
+            name: "wg-import.szklana".into(),
+            path: "/data".into()
+        }));
+        assert!(
+            e.fake.containers().is_empty(),
+            "the app itself is still not started"
+        );
+        assert!(e.fake.container_spec("wg-import.szklana").is_none());
     }
 
     #[tokio::test(start_paused = true)]

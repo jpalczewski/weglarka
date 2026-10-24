@@ -371,6 +371,48 @@ async fn admin_lifecycle_add_deploy_status_remove() {
 }
 
 #[tokio::test]
+async fn provision_only_add_creates_no_container_and_deploy_provisions() {
+    let h = harness().await;
+    let mut body = app_body("ntfy", "nz.example.eu");
+    body["spec"]["start"] = json!(false);
+    body["spec"]["volumes"] = json!([{"name": "data", "target": "/data"}]);
+
+    // `start = false`: `add` provisions synchronously and the response already has the pinned digest.
+    let (s, v) = admin(&h, "POST", "/v1/apps", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["runtime"], "not_started");
+    assert_eq!(v["spec"]["start"], json!(false));
+    let digest = v["state"]["current"].clone();
+    assert!(digest.is_string(), "digest pinned: {v}");
+    let digest = digest.as_str().unwrap().to_owned();
+
+    // Nothing runs, but the network and the declared volume are ready.
+    assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
+    assert!(h.fake.networks().contains(&"net-ntfy".to_owned()));
+    assert!(h.fake.volumes().iter().any(|v| v.name == "ntfy.data"));
+
+    // Reads agree: `show` and the list report `not_started`.
+    let (s, v) = admin(&h, "GET", "/v1/apps/ntfy", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["runtime"], "not_started");
+    assert_eq!(v["state"]["current"], json!(digest));
+    let (_, v) = admin(&h, "GET", "/v1/apps", None).await;
+    assert_eq!(v["apps"][0]["runtime"], "not_started");
+
+    // A manual deploy of a `start = false` app provisions again instead of starting it.
+    let (s, v) = admin(&h, "POST", "/v1/apps/ntfy/deploy", Some(json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["outcome"], "provisioned");
+    assert_eq!(v["digest"], json!(digest));
+    assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
+
+    // Wakes from `add`/`deploy` settle without bringing the container back.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn webhook_flow() {
     let h = harness().await;
     let addr = h.running.webhook_addr;

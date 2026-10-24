@@ -10,6 +10,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 use weglarka_core::config::HostConfig;
+use weglarka_core::podman::ContainerState;
 use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::{Running, Settings, start};
 
@@ -264,6 +265,51 @@ async fn image_change_deploys_right_away() {
     assert!(h.fake.calls().contains(&Call::ImagePull(
         "ghcr.io/jpalczewski/ntfy.zig:v1.2.3".into()
     )));
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn stop_provisions_and_start_deploys_synchronously() {
+    let h = harness().await;
+    add(&h, "ntfy", spec("nz.example.eu")).await;
+    deployed(&h, "ntfy").await;
+    let digest = show(&h, "ntfy").await["state"]["current"].clone();
+    assert_eq!(show(&h, "ntfy").await["runtime"], "running");
+
+    // `apps stop`: PUT with `start = false` — provision (keep the pinned digest) and remove the
+    // container right away; the response carries the outcome.
+    let mut stopped = spec("nz.example.eu");
+    stopped["start"] = json!(false);
+    let (s, v) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({"spec": stopped}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["deploy"]["outcome"], "provisioned");
+    assert_eq!(v["deploy"]["digest"], digest);
+    assert_eq!(v["app"]["runtime"], "not_started");
+    assert_eq!(v["app"]["state"]["current"], digest);
+    assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
+    assert_eq!(show(&h, "ntfy").await["runtime"], "not_started");
+
+    // A wake from the update must not bring the container back.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
+
+    // `apps start`: PUT with `start = true` — deploy right away, the container runs.
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy",
+        Some(json!({"spec": spec("nz.example.eu")})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["deploy"]["outcome"], "deployed");
+    assert_eq!(v["app"]["runtime"], "running");
+    assert!(
+        h.fake
+            .containers()
+            .iter()
+            .any(|c| c.name == "ntfy" && c.state == ContainerState::Running)
+    );
     h.running.stop().await;
 }
 

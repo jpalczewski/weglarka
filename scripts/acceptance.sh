@@ -3,7 +3,7 @@
 #
 # Run as the runtime user (`weglarka`) with XDG_RUNTIME_DIR set; dependencies:
 # weglarka, curl, openssl, jq, podman (+ tar for --with-volume). Touches only the instances `wg-canary`,
-# `wg-webhook`, `wg-rollback` and `wg-volume` and the `wg-accept-registry` container (local test registry) — never any other apps.
+# `wg-webhook`, `wg-rollback`, `wg-volume`, `wg-nostart` and the `wg-accept-registry` container (local test registry) — never any other apps.
 #
 #   scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
 #
@@ -19,6 +19,7 @@ CANARY=wg-canary
 WEBHOOK_APP=wg-webhook
 ROLLBACK_APP=wg-rollback
 VOLUME_APP=wg-volume
+NOSTART_APP=wg-nostart
 REGISTRY_CONTAINER=wg-accept-registry
 
 CONFIG=/etc/weglarka/weglarka.toml
@@ -54,8 +55,10 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
                          Stawia tymczasowy rejestr na 127.0.0.1:<port>; usługa Podmana użytkownika musi
                          mieć wpis `insecure` dla tego adresu w registries.conf (robi to CI; na produkcji
                          nie zalecane). Bez flagi te kroki są pomijane (SKIP).
-  --with-volume          dodatkowo: wolumen (import tara obcego, remove + add zachowuje dane i zakres UID,
-                         eksport, --purge-volumes). Używa instancji wg-volume na obrazie kanarka. Wymaga tar.
+  --with-volume          dodatkowo: wolumeny (import tara obcego; remove + add zachowuje dane i zakres UID,
+                         eksport, --purge-volumes) oraz apka `start = false` (provisioning bez kontenera,
+                         import przed pierwszym startem, `apps start`, eksport i sprawdzenie danych).
+                         Używa instancji wg-volume i wg-nostart na obrazie kanarka. Wymaga tar.
   --skip-rollback        pomiń test wymuszonego rollbacku
   --skip-preflight       pomiń `doctor --preflight` (np. gdy host to nie docelowy układ)
   --strict               ostrzeżenia `doctor` traktuj jak błąd
@@ -205,6 +208,7 @@ cleanup_helpers() {
     wg apps remove --ignore-missing "$app" >/dev/null 2>&1 || true
   done
   wg apps remove --purge-volumes --ignore-missing "$VOLUME_APP" >/dev/null 2>&1 || true
+  wg apps remove --purge-volumes --ignore-missing "$NOSTART_APP" >/dev/null 2>&1 || true
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
   podman rmi -f "$REG/wg-accept/wh:t" "$REG/wg-accept/rb:t" >/dev/null 2>&1 || true
 }
@@ -602,6 +606,62 @@ step_volume() {
   note "import obcego tara, dane i zakres $start przeżyły remove + add, eksport z uid $expect, purge czyści"
 }
 
+# `start = false` (issue #29): provisioning pins the image digest, creates the network, the uid range and the
+# volume, but no container. A foreign tar can be imported before the first start; `apps start` then brings the
+# app up (the data is already in the volume) and the export carries it back.
+app_running() { # app
+  [ "$(show_field "$1" .runtime)" = running ]
+}
+
+step_volume_no_start() {
+  local start out
+  wg apps remove --purge-volumes --ignore-missing "$NOSTART_APP" >/dev/null
+  # `--no-start` is the flag form; volumes need `--spec`, and `start = false` in the file is the same field.
+  cat >"$WORK/nostart-spec.toml" <<EOF
+image = "$IMAGE"
+port = 80
+start = false
+volumes = [{ name = "data", target = "/data" }]
+
+[health]
+attempts = 2
+window_secs = ${HEALTH_WINDOW:-4}
+EOF
+  wg apps add "$NOSTART_APP" --spec "$WORK/nostart-spec.toml" >/dev/null
+  [ "$(show_field "$NOSTART_APP" .runtime)" = not_started ] \
+    || die "po provisioningu runtime to $(show_field "$NOSTART_APP" .runtime), oczekiwano not_started"
+  ! podman container exists "$NOSTART_APP" || die "start = false utworzył kontener $NOSTART_APP"
+  [ "$(wg --json volumes list "$NOSTART_APP" | jq -r '.volumes[0].exists')" = true ] \
+    || die "wolumen nie istnieje po provisioningu (bez kontenera)"
+  start=$(show_field "$NOSTART_APP" '.state.uid_range.start // empty')
+  case $start in '' | *[!0-9]*) die "brak zakresu UID w stanie ($start)" ;; esac
+
+  mkdir -p "$WORK/nostart-src"
+  printf 'v1\n' >"$WORK/nostart-src/f"
+  tar -cf "$WORK/nostart-in.tar" -C "$WORK/nostart-src" --owner=1000 --group=1000 --numeric-owner f
+  wg volumes import "$NOSTART_APP" data --from "$WORK/nostart-in.tar" >/dev/null \
+    || die "volumes import przed pierwszym startem nie przeszedł"
+  [ "$(show_field "$NOSTART_APP" .runtime)" = not_started ] \
+    || die "import uruchomił apkę z start = false (runtime=$(show_field "$NOSTART_APP" .runtime))"
+
+  wg apps start "$NOSTART_APP" >/dev/null || die "apps start nie przeszedł"
+  wait_for "apka $NOSTART_APP działa" "$DEPLOY_WAIT" app_running "$NOSTART_APP" \
+    || die "$NOSTART_APP nie wstał po apps start w ${DEPLOY_WAIT}s"
+  [ "$(show_field "$NOSTART_APP" '.state.uid_range.start')" = "$start" ] \
+    || die "zakres UID zmienił się przy apps start ($start)"
+
+  wg volumes export "$NOSTART_APP" data --out "$WORK/nostart-out.tar" 2>/dev/null \
+    || die "volumes export nie przeszedł"
+  # `tar -xOf` prints the file from the archive; no ownership changes (the archive carries the uid range).
+  out=$(tar -xOf "$WORK/nostart-out.tar" ./f 2>/dev/null || tar -xOf "$WORK/nostart-out.tar" f 2>/dev/null || true)
+  [ "$out" = v1 ] || die "w eksporcie brak zawartości pliku f (mam: ${out:-brak})"
+
+  wg apps remove --purge-volumes "$NOSTART_APP" >/dev/null
+  ! podman volume exists "$NOSTART_APP.data" || die "--purge-volumes zostawił wolumen"
+  ! podman container exists "$NOSTART_APP" || die "--purge-volumes zostawił kontener"
+  note "provisioning bez kontenera, import przed startem, apps start, dane w eksporcie, purge czyści"
+}
+
 step_cleanup() {
   local app
   for app in "$WEBHOOK_APP" "$ROLLBACK_APP"; do
@@ -655,8 +715,10 @@ else
 fi
 if [ "$WITH_VOLUME" = 1 ]; then
   run_step volume "wolumen: import, dane i zakres UID, eksport, purge" step_volume doctor
+  run_step volume_no_start "wolumen przy start = false: provisioning, import przed startem, apps start, eksport, purge" step_volume_no_start doctor
 else
   skip_step "wolumen: import, dane i zakres UID, eksport, purge" "wymaga --with-volume"
+  skip_step "wolumen przy start = false: provisioning, import przed startem, apps start, eksport, purge" "wymaga --with-volume"
 fi
 if [ "$KEEP" = 1 ]; then
   cleanup_helpers

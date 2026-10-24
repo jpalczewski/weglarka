@@ -57,6 +57,11 @@ pub enum AppsCommand {
     Add(AddArgs),
     /// Change an app's spec (read-modify-write; domains, env, secrets, image…).
     Update(crate::update::UpdateArgs),
+    /// Start the app: sets `start = true` and deploys it (a provisioned app gets its container).
+    Start(StartStopArgs),
+    /// Stop the app: sets `start = false` and removes the container; volumes, the uid range and the
+    /// pinned image digest stay.
+    Stop(StartStopArgs),
     /// Remove an app instance.
     Remove(RemoveArgs),
     /// List apps.
@@ -90,11 +95,25 @@ pub struct AddArgs {
     /// Disable auto-update (the webhook will not swap the image on its own).
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,
+    /// Provision only: pull the image, create the network, the uid range and the volumes, but do
+    /// not create or start the container. Bring it up later with `apps start`.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_start: bool,
     #[command(flatten)]
     pub spec_flags: crate::spec_flags::SpecFlags,
     /// Whole AppSpec from a TOML file (instead of the flags above); `-` = stdin.
     #[arg(long, value_name = "FILE")]
     pub spec: Option<PathBuf>,
+    /// Send nothing; show the request that would be sent.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Flags shared by `apps start` and `apps stop` (both flip `start` through `PUT /v1/apps/{name}`).
+#[derive(Debug, Args)]
+pub struct StartStopArgs {
+    /// Instance name.
+    pub name: String,
     /// Send nothing; show the request that would be sent.
     #[arg(long)]
     pub dry_run: bool,

@@ -12,6 +12,12 @@ pub enum Event {
         digest: Digest,
         generation: u64,
     },
+    /// `start = false`: image pinned, network, uid range and volumes ready, no container created
+    /// (a container left over from before the flag flip was stopped and removed).
+    Provisioned {
+        instance: InstanceName,
+        digest: Digest,
+    },
     DeployFailed {
         instance: InstanceName,
         digest: Option<Digest>,

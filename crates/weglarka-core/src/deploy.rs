@@ -36,6 +36,9 @@ pub enum DeployOutcome {
     },
     /// Deploy failed and there was nothing to return to (or the rollback failed too).
     Failed { digest: Digest, reason: String },
+    /// `start = false`: nothing was started. The image digest is pinned and the network, uid range
+    /// and volumes are ready; `apps start` deploys the app later.
+    Provisioned { digest: Digest },
 }
 
 // ── Helpers (pure) ──────────────────────────────────────────────────────
@@ -68,12 +71,14 @@ fn normalize_image(image: &str) -> (String, String) {
     (repo, tag)
 }
 
-/// Instances with `auto_update` that track the given image/tag (fan-out).
+/// Instances with `auto_update` that are meant to run (`start`) and track the given image/tag
+/// (fan-out). Apps with `start = false` are skipped: nothing may be pulled or deployed for an app
+/// that is not running; `apps start` deploys the newest image itself.
 pub fn instances_tracking(apps: &AppsFile, image_ref: &str) -> Vec<InstanceName> {
     let wanted = normalize_image(image_ref);
     apps.apps
         .iter()
-        .filter(|(_, s)| s.auto_update && normalize_image(&s.image) == wanted)
+        .filter(|(_, s)| s.auto_update && s.start && normalize_image(&s.image) == wanted)
         .map(|(n, _)| n.clone())
         .collect()
 }
@@ -390,6 +395,10 @@ impl<P: PodmanClient> Reconciler<P> {
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        // `start = false` — provision only (no container, no secrets, no health gate).
+        if !spec.start {
+            return self.provision_locked(instance, &spec).await;
+        }
         self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st: StateFile = state::load_state(&self.paths.state)?;
         self.secrets_gate(instance, &spec, &mut st).await?;
@@ -526,6 +535,66 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
+    /// `start = false`: pin the image digest, create the network, the uid range and the declared
+    /// volumes, and make sure **no container** exists. No secrets are materialized and no health
+    /// gate runs — nothing will run until `apps start` (or `start = true`).
+    ///
+    /// Idempotent: network/volume creation is idempotent and a leftover container (the flag was
+    /// flipped while it ran) is stopped and removed. `start = false` means "no container".
+    pub(crate) async fn provision_locked(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+    ) -> Result<DeployOutcome, EngineError> {
+        // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
+        // failed pull does not lose it and the next pass can retry with the same range.
+        self.assign_uid_range(instance).await?;
+        let digest = match self.resolve_digest(&spec.image).await {
+            Ok(d) => d,
+            Err(e) => {
+                self.events.emit(Event::DeployFailed {
+                    instance: instance.clone(),
+                    digest: None,
+                    reason: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        self.podman
+            .network_create(&NetworkSpec {
+                name: labels::network_name(instance),
+                internal: false,
+                labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
+            })
+            .await?;
+        let _prepared = self.prepare_container(instance, spec).await?; // uid range + volumes
+
+        let name = labels::container_name(instance);
+        match self
+            .podman
+            .container_stop(&name, self.options.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match self.podman.container_remove(&name, true).await {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let mut st = state::load_state(&self.paths.state)?;
+        let entry = st.apps.entry(instance.clone()).or_default();
+        entry.current = Some(digest.clone());
+        entry.failed = None;
+        state::save_state(&self.paths.state, &st)?;
+        self.events.emit(Event::Provisioned {
+            instance: instance.clone(),
+            digest: digest.clone(),
+        });
+        Ok(DeployOutcome::Provisioned { digest })
+    }
+
     async fn is_converged(&self, instance: &InstanceName, spec: &AppSpec, digest: &Digest) -> bool {
         let Ok(hash) = self.desired_hash(instance, spec, digest).await else {
             return false;
@@ -626,5 +695,28 @@ mod tests {
         assert!(!d.check_and_insert("b"));
         assert!(!d.check_and_insert("c")); // evicts "a"
         assert!(!d.check_and_insert("a"));
+    }
+
+    /// `start = false` apps never receive webhook-driven deploys: nothing is pulled for an app that
+    /// must not run (`apps start` deploys the newest image itself).
+    #[test]
+    fn stopped_instances_are_not_webhook_targets() {
+        let apps: AppsFile = toml::from_str(
+            r#"
+[apps.running]
+image = "ghcr.io/x/y:latest"
+[apps.stopped]
+image = "ghcr.io/x/y:latest"
+start = false
+[apps.no-auto-update]
+image = "ghcr.io/x/y:latest"
+auto_update = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            instances_tracking(&apps, "ghcr.io/x/y:latest"),
+            vec![InstanceName::new("running").unwrap()]
+        );
     }
 }

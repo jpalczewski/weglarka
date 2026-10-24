@@ -34,6 +34,10 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Apps(AppsCommand::Update(a)) => {
             crate::update::apps_update(json, &overrides, a).await
         }
+        Command::Apps(AppsCommand::Start(a)) => {
+            crate::update::apps_start(json, &overrides, a).await
+        }
+        Command::Apps(AppsCommand::Stop(a)) => crate::update::apps_stop(json, &overrides, a).await,
         Command::Apps(AppsCommand::Remove(a)) => apps_remove(json, &overrides, a).await,
         Command::Apps(AppsCommand::List) => apps_list(json, &overrides).await,
         Command::Apps(AppsCommand::Show { name }) => apps_show(json, &overrides, &name).await,
@@ -119,7 +123,8 @@ impl DryRun {
 
 // ---------- apps ----------
 
-fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
+/// Builds an `AppSpec` from the flags of `apps add` (`--spec` wins when given).
+pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
     if let Some(path) = &a.spec {
         let src = if path == Path::new("-") {
             let mut s = String::new();
@@ -167,6 +172,7 @@ fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         resources: Default::default(),
         security: Default::default(),
         auto_update: !a.no_auto_update,
+        start: !a.no_start,
     };
     a.spec_flags.apply(&mut spec);
     Ok(spec)
@@ -281,10 +287,18 @@ async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i32, CliErro
         .await?;
     emit(json, &resp, || {
         let digest = resp.digest.as_ref().map(|d| d.as_str()).unwrap_or("-");
-        format!(
-            "{}: {:?} (generation {}, digest {digest})\n",
-            name, resp.outcome, resp.generation
-        )
+        if resp.outcome == DeployOutcome::Provisioned {
+            format!(
+                "{name}: provisioned (start = false): no container started (generation {}, digest \
+                 {digest}); bring it up with `weglarka apps start {name}`\n",
+                resp.generation
+            )
+        } else {
+            format!(
+                "{}: {:?} (generation {}, digest {digest})\n",
+                name, resp.outcome, resp.generation
+            )
+        }
     });
     Ok(if resp.outcome == DeployOutcome::RolledBack {
         exit::ROLLED_BACK

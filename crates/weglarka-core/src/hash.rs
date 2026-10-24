@@ -28,8 +28,9 @@ impl fmt::Display for SpecHash {
 }
 
 /// Only fields that affect the container. `domains` and the gate's timing/HTTP probe are deliberately
-/// omitted — changing routing or the gate does not require recreating the container. The struct's
-/// field order is part of the format.
+/// omitted — changing routing or the gate does not require recreating the container. `start` (run vs
+/// provision-only intent) is omitted as well: it controls whether a container exists, not what it is
+/// made of. The struct's field order is part of the format.
 ///
 /// Iteration 2 fields (`volumes`, `resources`, `health_command`) are appended and skipped while unset,
 /// so a spec that does not use them hashes exactly as before (`HASH_FORMAT` stays v1 and existing
@@ -150,6 +151,18 @@ env = { B = "2", A = "1" }
         };
         let expected = hex::encode(Sha256::digest(serde_json::to_vec(&legacy).unwrap()));
         assert_eq!(spec_hash(&s, &d).as_str(), expected);
+    }
+
+    /// `start` toggles "should run" vs "provisioned only"; it must never recreate the container.
+    #[test]
+    fn start_does_not_change_the_hash() {
+        let running = spec();
+        let mut stopped = running.clone();
+        stopped.start = false;
+        assert_eq!(
+            spec_hash(&running, &digest('a')),
+            spec_hash(&stopped, &digest('a'))
+        );
     }
 
     #[test]

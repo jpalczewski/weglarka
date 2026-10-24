@@ -10,6 +10,9 @@
 //!   next reconcile recreates the container from the *pinned* digest (no pull);
 //! * `image` (repo or tag) is a deliberate re-pin: the update runs a deploy right away (pull, health
 //!   gate, rollback to the previous digest on failure) and the result is in the response.
+//! * `start` (run vs provision-only intent) is applied right away as well: `true` deploys (the usual
+//!   pull + health gate + rollback), `false` provisions — pins the digest, prepares the network, uid
+//!   range and volumes and removes any container — and the outcome is in the response.
 //!
 //! "Waiting for secret": the engine records `AppState::waiting_for_secrets` (see
 //! `weglarka_core::waiting`); this module only renders it (`RuntimeState::WaitingForSecret`, doctor).
@@ -31,7 +34,7 @@ use weglarka_core::podman::PodmanClient;
 use weglarka_core::reconcile::EngineError;
 use weglarka_core::state::{self, AppState};
 
-use crate::admin::{Fail, runtime_state};
+use crate::admin::{Fail, runtime_state_for};
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 
 /// Runtime state with "waiting for secret" taking the place of `Missing`: there is no container
@@ -58,7 +61,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
         serde_json::from_slice(&body).map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
     state::validate_app(&name, &req.spec).map_err(invalid)?;
 
-    let old_image = {
+    let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
         let mut apps = state::load_apps(&d.paths.state.apps)
             .map_err(internal)?
@@ -82,10 +85,11 @@ pub async fn update_app<P: PodmanClient + 'static>(
                 ));
             }
         }
-        old.image
+        (old.image, old.start)
     };
 
-    let deploy = if old_image != req.spec.image {
+    // An image change is a re-pin and a `start` flip is an explicit run/stop: both deploy right away.
+    let deploy = if old_image != req.spec.image || old_start != req.spec.start {
         redeploy(&d, &name).await?
     } else {
         None
@@ -101,7 +105,10 @@ pub async fn update_app<P: PodmanClient + 'static>(
         .ok();
     let app_state = st.apps.get(&name);
     let app = ShowAppResponse {
-        runtime: with_waiting(runtime_state(container.as_ref()), app_state),
+        runtime: with_waiting(
+            runtime_state_for(&req.spec, app_state, container.as_ref()),
+            app_state,
+        ),
         state: app_state.cloned().unwrap_or_default(),
         name,
         spec: req.spec,
@@ -152,6 +159,11 @@ async fn redeploy<P: PodmanClient + 'static>(
             outcome: DeployOutcome::RolledBack,
             generation,
             digest: Some(restored),
+        },
+        CoreOutcome::Provisioned { digest } => DeployResponse {
+            outcome: DeployOutcome::Provisioned,
+            generation,
+            digest: Some(digest),
         },
         CoreOutcome::Failed { reason, .. } => return Err(saved_but_failed(reason)),
         CoreOutcome::KnownBad { .. } => {
