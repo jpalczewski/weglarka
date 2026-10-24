@@ -20,6 +20,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
 [6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
 [6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
+[6k. Samoaktualizacja](#6k-samoaktualizacja-węglarki-self_update) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -199,7 +200,9 @@ Exec=run --config /etc/weglarka/weglarka.toml
 
 Quadlet ma `WantedBy=default.target` — z lingerem usługa wstaje po restarcie hosta. Przy starcie demon zakłada
 sieć `net-weglarka`, ciągnie i uruchamia kontener `weglarka-nginx` na `bind` i zapisuje plik Traefika.
-Aktualizacja samej Węglarki (poza MVP: automat): `podman pull <obraz> && systemctl --user restart weglarka.service`.
+Aktualizacja samej Węglarki: automatycznie przez timer `weglarka-self-update.timer` — patrz
+[6k](#6k-samoaktualizacja-węglarki-self_update); ręcznie `platform install --image <obraz>@<digest>` +
+`systemctl --user restart weglarka.service`.
 
 ### Weryfikacja obrazu i binarek
 
@@ -208,6 +211,9 @@ cosign verify \
   --certificate-identity-regexp '^https://github.com/jpalczewski/weglarka/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/jpalczewski/weglarka:latest
+
+# ten sam obraz, klucz statyczny (dokładnie to sprawdza Węglarka przed samoaktualizacją, 6k):
+cosign verify --key cosign.pub ghcr.io/jpalczewski/weglarka:latest
 
 # SBOM (SPDX) – atestacja cosign:
 cosign verify-attestation --type spdxjson <jak wyżej> ghcr.io/jpalczewski/weglarka:latest | jq -r .payload | base64 -d | jq .predicate | head
@@ -1150,6 +1156,79 @@ tylko wartość, nie wiązanie). Plik nadal jest zapisywany atomowo z prawami 06
 **starego demona** po cichu zignoruje `--purge-secrets` (usunie apkę, sekrety zostaną) i dostanie 404
 na `secrets remove` — najpierw zaktualizuj demona.
 
+## 6k. Samoaktualizacja Węglarki (`self_update`)
+
+Węglarka aktualizuje własny obraz bez ręcznego `platform install`: pobiera tag, **weryfikuje podpis cosign**
+przypiętym kluczem, sprawdza zgodność schematu stanu, przypina digest w definicji usługi (quadlet) i restartuje
+usługę. Decyzje i odrzucone alternatywy: [0027](decisions/0027-self-update.md); schemat plików stanu:
+[0023](decisions/0023-state-schema-version.md). Wycinek konfiguracji:
+[`docs/examples/self-update.toml`](examples/self-update.toml).
+
+Podmiana dzieje się **na hoście**, nie w kontenerze: obraz jest `scratch` (brak `systemctl`, `/etc/passwd`,
+D-Bus), a kontener nie ma prawa zapisu do własnego unitu. `platform install` instaluje dlatego timer usera
+`weglarka-self-update.timer`, który co 10 minut uruchamia `weglarka-daemon self-update`; `interval_secs` decyduje,
+czy dany przebieg naprawdę pyta rejestr (timer bez skonfigurowanej sekcji nic nie robi).
+
+**1. Klucz podpisujący (raz).** Release podpisuje obraz **dwoma** podpisami: keyless (dla ludzi, `cosign verify`)
+i kluczem statycznym, którym weryfikuje się demon. Klucz publiczny leży w repo (`cosign.pub`) i jest wkompilowany
+w binarkę; prywatny jest tylko w sekretach repo (`COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`):
+
+```sh
+cosign generate-key-pair                       # cosign.key (zahaszowane) + cosign.pub
+gh secret set COSIGN_PRIVATE_KEY < cosign.key
+gh secret set COSIGN_PASSWORD
+```
+
+Rotacja klucza: podmień `cosign.pub` w repo i sekrety (nowy obraz) albo wskaż nowy klucz w
+`[self_update] public_key_file` (bez przebudowy).
+
+**2. Sekcja w `weglarka.toml` i jednorazowe przeinstalowanie unitu** (żeby powstał timer):
+
+```toml
+[self_update]
+image = "ghcr.io/jpalczewski/weglarka:latest"   # tag, nie digest — digest przypina sama Węglarka
+```
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # podgląd: quadlet + unit timera
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install             # zapis, daemon-reload, enable timera
+systemctl --user list-timers weglarka-self-update.timer
+```
+
+**3. Ręcznie, bez czekania na timer:**
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --check   # pull + podpis + schemat; nic nie zmienia
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update           # to samo, co robi timer
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --force   # pominąć interwał / powtórzyć nieudany digest
+```
+
+**4. Rollback (automatyczny powrót to #100).** Stan `self-update.toml` (0600, w katalogu stanu) niesie `current`,
+`previous` i `pending`; `--rollback` przypina poprzedni digest i restartuje usługę:
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --rollback
+weglarka doctor | grep self_update    # running / previous / pending i ostatni błąd
+```
+
+Gdy nowy obraz nie wstaje wcale, zadziała też ręczne przypięcie:
+`weglarka-daemon platform install --image ghcr.io/jpalczewski/weglarka@sha256:<poprzedni>` + `systemctl --user
+restart weglarka`.
+
+**5. Ograniczenia i diagnostyka.**
+
+- **Brak automatycznego powrotu** (#100): nowy obraz, który wstanie, ale jest zepsuty, cofa się ręcznie
+  (`--rollback`).
+- **Schemat stanu:** nowszy obraz może zapisać nowszy `schema_version`; Węglarka porównuje wtedy label obrazu
+  `io.weglarka.state-schema` z wersją w `state.toml` **przed** podmianą i odmawia downgradu („the image writes
+  state schema …”; obejście `--force` wymaga świadomej decyzji o kopii stanu) — patrz
+  [6j](#wersja-schematu-plików-stanu-rollback-między-wersjami) i [0023](decisions/0023-state-schema-version.md).
+- **Niepodpisany obraz** (np. build sprzed dodania klucza) jest odrzucany: „no key-based cosign signature …”;
+  nic nie jest przypinane, działa poprzednia wersja. Rejestr musi być publiczny — pull jest anonimowy.
+- Log: `journalctl --user -u weglarka-self-update.service -n 50`; stan: `weglarka doctor` (check `self_update`).
+- `[self_update]` to nowa sekcja `weglarka.toml` (`deny_unknown_fields`): **starszy demon z nią nie wystartuje** —
+  usuń sekcję przed downgradem.
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -1181,8 +1260,9 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
   ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
-  ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy)).
-  Inaczej daemon nie wystartuje z błędem parsowania.
+  ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy))
+  i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
+  weglarka-self-update.timer`). Inaczej daemon nie wystartuje z błędem parsowania.
 
 ### Wersja schematu plików stanu (rollback między wersjami)
 

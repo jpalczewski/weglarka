@@ -311,6 +311,7 @@ mod tests {
             repo_tags: tags,
             repo_digests: digests,
             size_bytes: 1000,
+            labels: BTreeMap::new(),
         }
     }
 

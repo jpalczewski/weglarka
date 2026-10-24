@@ -8,14 +8,16 @@ use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
 use weglarka_core::config::PlatformKind;
-use weglarka_core::platform::{Hardening, Platform, ServiceSpec};
-use weglarka_daemon::ingress::WEBHOOK_NETWORK;
-use weglarka_daemon::platform::{SystemdPlatform, render, run_args};
+use weglarka_core::platform::Platform;
+use weglarka_daemon::platform::{
+    SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, render, run_args,
+};
+use weglarka_daemon::service::{
+    DEFAULT_IMAGE, SERVICE_NAME, SOCKET_ENV, host_socket, service_spec,
+};
 use weglarka_daemon::{Settings, start};
 use weglarka_podman::LibpodClient;
-
-const DEFAULT_IMAGE: &str = "ghcr.io/jpalczewski/weglarka:latest";
-const SERVICE_NAME: &str = "weglarka";
+use weglarka_registry::HttpRegistry;
 
 #[derive(Parser)]
 #[command(name = "weglarka-daemon", version, about = "The Węglarka daemon")]
@@ -41,6 +43,25 @@ enum Command {
         #[command(subcommand)]
         action: PlatformAction,
     },
+    /// Update Węglarka's own image: pull the configured tag, verify the cosign signature, pin the
+    /// digest in the service definition and restart (issue #99).
+    SelfUpdate(SelfUpdateArgs),
+}
+
+#[derive(clap::Args)]
+struct SelfUpdateArgs {
+    /// Only report: pull, verify and check the state schema, never write the unit or restart.
+    #[arg(long)]
+    check: bool,
+    /// Ignore the configured interval (and retry a digest that already failed).
+    #[arg(long)]
+    force: bool,
+    /// Pin the previous digest again — the manual fallback until the automatic one (#100).
+    #[arg(long)]
+    rollback: bool,
+    /// Follow this reference instead of `[self_update] image` (a one-shot manual update).
+    #[arg(long)]
+    image: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -87,55 +108,48 @@ fn systemd(settings: &Settings) -> Result<SystemdPlatform> {
     }
 }
 
-/// Env var carrying the Podman socket path resolved on the host: the (`scratch`) container has no `/etc/passwd`.
-const SOCKET_ENV: &str = "WEGLARKA_PODMAN_SOCKET";
-
-/// All paths are mounted under the same name as on the host so that `weglarka.toml` is
-/// valid on both sides (the host CLI reads the same file).
-fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) -> ServiceSpec {
-    let s = |p: &std::path::Path| p.display().to_string();
-    let same = |p: &std::path::Path| (s(p), s(p));
-    let mut mounts = vec![same(&podman_socket), same(&settings.paths.state_dir)];
-    if let Some(dir) = settings.host.admin.socket.parent() {
-        mounts.push(same(dir));
+/// `weglarka-daemon self-update` — the host-side switcher (issue #99). Runs from a user timer that
+/// `platform install` installs; `--check`/`--force` are for a manual run from a shell.
+async fn run_self_update(settings: Settings, options: SelfUpdateArgs) -> Result<()> {
+    let mut settings = settings;
+    if let Some(image) = options.image.as_deref() {
+        // A one-shot explicit image replaces `[self_update] image`; without a section, defaults are
+        // used, so a manual update works before the operator commits the section to the config.
+        match settings.host.self_update.as_mut() {
+            Some(config) => config.image = image.to_owned(),
+            None => {
+                settings.host.self_update = Some(weglarka_core::config::SelfUpdateConfig {
+                    image: image.to_owned(),
+                    enabled: true,
+                    interval_secs: weglarka_core::config::SelfUpdateConfig::DEFAULT_INTERVAL_SECS,
+                    public_key_file: None,
+                });
+            }
+        }
     }
-    let conf = &settings.config_path;
-    mounts.push((s(conf), format!("{}:ro", s(conf))));
-    if !settings
-        .paths
-        .nginx_conf_dir
-        .starts_with(&settings.paths.state_dir)
-    {
-        mounts.push(same(&settings.paths.nginx_conf_dir));
-    }
-    if let Some(f) = &settings.host.ingress.traefik_dynamic_file {
-        // A single file: an in-place write preserves the inode, so Traefik sees the change.
-        mounts.push(same(f));
-    }
-    ServiceSpec {
-        name: SERVICE_NAME.to_owned(),
-        image,
-        run_as_user: settings.host.runtime.user.clone(),
-        env: vec![
-            ("RUST_LOG".to_owned(), "info".to_owned()),
-            (SOCKET_ENV.to_owned(), s(&podman_socket)),
-        ],
-        mounts,
-        networks: vec![WEBHOOK_NETWORK.to_owned()],
-        args: vec!["run".to_owned(), "--config".to_owned(), s(conf)],
-        hardening: Hardening {
-            memory: Some(settings.host.platform.memory.clone()),
-            pids_limit: Some(settings.host.platform.pids_limit),
-            ..Hardening::default()
+    let platform = systemd(&settings)?;
+    let socket = host_socket(&settings, &platform).await?;
+    let podman = LibpodClient::new(socket);
+    let registry = HttpRegistry::new().context("setting up the registry client")?;
+    let report = weglarka_daemon::self_update::run(
+        &podman,
+        &registry,
+        &platform,
+        &settings,
+        weglarka_daemon::self_update::Options {
+            check: options.check,
+            force: options.force,
+            rollback: options.rollback,
         },
+        std::time::SystemTime::now(),
+    )
+    .await?;
+    println!("{report}");
+    if !report.is_success() {
+        // Non-zero so the timer unit shows a failure instead of pretending everything is fine.
+        bail!("{report}");
     }
-}
-
-async fn host_socket(settings: &Settings, platform: &SystemdPlatform) -> Result<PathBuf> {
-    Ok(match &settings.host.runtime.socket {
-        Some(s) => s.clone(),
-        None => platform.runtime_socket(&settings.host.runtime.user).await?,
-    })
+    Ok(())
 }
 
 async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> {
@@ -150,22 +164,34 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
         PlatformAction::Install { dry_run, image } => {
             let socket = host_socket(&settings, &platform).await?;
             let spec = service_spec(&settings, socket, image);
+            let units = weglarka_daemon::self_update::units(&settings)?;
             if dry_run {
                 for f in render(&spec)? {
+                    println!("# {}\n{}", f.file_name, f.content);
+                }
+                for f in &units {
                     println!("# {}\n{}", f.file_name, f.content);
                 }
                 return Ok(());
             }
             platform.install_service(&spec).await?;
+            platform.install_user_units(&units).await?;
+            platform.set_timer(SELF_UPDATE_TIMER, true).await?;
             println!(
                 "Installed. Start it with: systemctl --user start {SERVICE_NAME}.service \
-                 (requires `loginctl enable-linger {}`)",
+                 (requires `loginctl enable-linger {}`); the self-update timer is enabled and does \
+                 nothing until [self_update] is configured.",
                 settings.host.runtime.user
             );
         }
         PlatformAction::Remove => {
+            // Disable before deleting: `systemctl disable` needs the unit files.
+            platform.set_timer(SELF_UPDATE_TIMER, false).await?;
+            platform
+                .remove_user_units(&[SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER])
+                .await?;
             platform.remove_service(SERVICE_NAME).await?;
-            println!("Removed the {SERVICE_NAME} service file.");
+            println!("Removed the {SERVICE_NAME} service file and the self-update timer.");
         }
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);
@@ -211,5 +237,6 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(settings).await,
         Command::Platform { action } => run_platform(settings, action).await,
+        Command::SelfUpdate(args) => run_self_update(settings, args).await,
     }
 }

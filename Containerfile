@@ -38,12 +38,16 @@ FROM ${BIN_SOURCE} AS bin
 FROM scratch
 ARG VERSION=dev
 ARG REVISION=unknown
+# The state schema this image writes (crates/weglarka-core/src/schema.rs). The self-updater compares
+# the label with the running daemon's schema before replacing the image (docs/decisions/0023).
+ARG STATE_SCHEMA=1
 LABEL org.opencontainers.image.title="weglarka" \
       org.opencontainers.image.description="Węglarka — deploy-tool dla rootless Podmana" \
       org.opencontainers.image.source="https://github.com/jpalczewski/weglarka" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${REVISION}"
+      org.opencontainers.image.revision="${REVISION}" \
+      io.weglarka.state-schema="${STATE_SCHEMA}"
 COPY --from=bin /out/weglarka-daemon /out/weglarka /usr/local/bin/
 ENV RUST_LOG=info
 ENTRYPOINT ["/usr/local/bin/weglarka-daemon"]

@@ -39,6 +39,7 @@ weglarka-core.workspace = true
 weglarka-ingress.workspace = true
 weglarka-notify.workspace = true
 weglarka-podman.workspace = true
+weglarka-registry.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
@@ -48,3 +49,4 @@ hyper-util.workspace = true
 insta.workspace = true
 tempfile.workspace = true
 weglarka-core = { workspace = true, features = ["testing"] }
+weglarka-registry = { workspace = true, features = ["testing"] }
