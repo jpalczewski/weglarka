@@ -17,12 +17,12 @@ all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 # internal
-weglarka-api = { path = "crates/weglarka-api", version = "0.0.1" }
-weglarka-core = { path = "crates/weglarka-core", version = "0.0.1" }
-weglarka-podman = { path = "crates/weglarka-podman", version = "0.0.1" }
-weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0.1" }
-weglarka-notify = { path = "crates/weglarka-notify", version = "0.0.1" }
-weglarka-registry = { path = "crates/weglarka-registry", version = "0.0.1" }
+weglarka-api = { path = "crates/weglarka-api", version = "0.0.2" }
+weglarka-core = { path = "crates/weglarka-core", version = "0.0.2" }
+weglarka-podman = { path = "crates/weglarka-podman", version = "0.0.2" }
+weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0.2" }
+weglarka-notify = { path = "crates/weglarka-notify", version = "0.0.2" }
+weglarka-registry = { path = "crates/weglarka-registry", version = "0.0.2" }
 
 # external
 anyhow = "1"

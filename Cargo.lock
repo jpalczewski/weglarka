@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-api"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "insta",
  "serde",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "futures-util",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-daemon"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-ingress"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "insta",
  "thiserror",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-notify"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "insta",
  "rustls",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-podman"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-registry"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "ring",
