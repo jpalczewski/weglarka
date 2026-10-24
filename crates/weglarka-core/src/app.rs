@@ -236,6 +236,45 @@ pub fn valid_mount_target(target: &str) -> bool {
             .any(|c| c.is_control() || c == ',' || c == ':')
 }
 
+/// Host file or directory mounted **read-only** into the app container from the host's
+/// `config_root` (issue #118, `docs/decisions/0022-config-root-mounts.md`). `source` is always
+/// relative to the root, and there is no `read_only` flag to get wrong: configs are configuration.
+/// The list — not the content — is part of the spec hash, so mounting something else recreates the
+/// container while editing a file does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigMount {
+    /// Path under `config_root`, e.g. `prometheus/prometheus.yml`; relative, no `.`/`..` segments.
+    pub source: String,
+    /// Absolute path in the container.
+    pub target: String,
+}
+
+/// Config source rules, lexical only (`state::validate_app` runs on every load/save and must not do
+/// I/O): a non-empty relative path without `.`/`..` segments or control characters. The filesystem
+/// rules (symlinks, containment in `config_root`) live in [`crate::config_mounts`].
+pub fn valid_config_source(source: &str) -> bool {
+    !source.is_empty()
+        && !source.starts_with('/')
+        && !source.split('/').any(|s| s == "." || s == "..")
+        && !source.chars().any(char::is_control)
+}
+
+/// Normalizes `reload_signal` to the name the engine sends to the container: trimmed, upper case,
+/// without the `SIG` prefix (`"sighup"` → `Some("HUP")`). A valid name is 2–10 characters of
+/// `[A-Z][A-Z0-9]*`; anything else is rejected instead of forwarded to libpod.
+pub fn normalize_signal(raw: &str) -> Option<String> {
+    let upper = raw.trim().to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let first = name.as_bytes().first().is_some_and(u8::is_ascii_uppercase);
+    let valid = first
+        && (2..=10).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    valid.then(|| name.to_owned())
+}
+
 /// Name of a shared volume (key in `apps.toml`'s `[shared_volumes]` section). Same character set
 /// as [`InstanceName`], so it is also safe as a component of the Podman volume name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -604,6 +643,15 @@ pub struct AppSpec {
     /// Not part of the spec hash: flipping it neither recreates nor pulls anything by itself.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub start: bool,
+    /// Host config files/directories mounted read-only from `config_root` (issue #118,
+    /// `docs/decisions/0022-config-root-mounts.md`). The list — not the content — is part of the spec
+    /// hash: mounting something else recreates the container, editing a file does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configs: Vec<ConfigMount>,
+    /// Signal `apps reload` sends to the container (e.g. `SIGHUP`); omitted = restart instead. Not
+    /// part of the spec hash: it only affects reload, never what the container is made of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_signal: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -872,5 +920,89 @@ secrets = [{ secret = "config", kind = "mount", path = "/config.json" }]
         let rendered = toml::to_string(&stopped).unwrap();
         assert!(rendered.contains("start = false"), "{rendered}");
         assert_eq!(toml::from_str::<AppSpec>(&rendered).unwrap(), stopped);
+    }
+
+    #[test]
+    fn configs_and_reload_signal_parse_and_roundtrip() {
+        let toml_src = r#"
+[apps.prometheus]
+image = "docker.io/prom/prometheus:latest"
+configs = [
+  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
+  { source = "prometheus/rules", target = "/etc/prometheus/rules" },
+]
+reload_signal = "SIGHUP"
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        insta::assert_json_snapshot!(parsed);
+        let roundtripped: AppsFile = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(parsed, roundtripped);
+
+        // Both fields stay out of the file while unset, so existing specs keep their shape.
+        let plain: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
+        assert!(plain.configs.is_empty() && plain.reload_signal.is_none());
+        let text = toml::to_string(&plain).unwrap();
+        assert!(
+            !text.contains("configs") && !text.contains("reload_signal"),
+            "{text}"
+        );
+
+        // Per-entry fields are strict (`deny_unknown_fields`), so e.g. `read_only` is rejected.
+        let bad = "[apps.a]\nimage = \"i\"\n\
+                   configs = [{ source = \"a\", target = \"/a\", read_only = true }]\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
+        let bad = "[apps.a]\nimage = \"i\"\nbogus = 1\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
+    }
+
+    #[test]
+    fn config_sources_are_relative_and_inside_the_root() {
+        for good in ["a", "app/config.yml", "a-b/c_d/e.f", "dir/"] {
+            assert!(valid_config_source(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            "/etc/shadow",
+            ".",
+            "..",
+            "a/../b",
+            "a/./b",
+            "../a",
+            "a/..",
+            "a\nb",
+            "a\tb",
+        ] {
+            assert!(!valid_config_source(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn reload_signals_are_normalized_to_the_sent_name() {
+        for (raw, expected) in [
+            ("SIGHUP", "HUP"),
+            ("sighup", "HUP"),
+            ("  HUP ", "HUP"),
+            ("HUP", "HUP"),
+            ("SIGUSR1", "USR1"),
+            ("sigterm", "TERM"),
+            ("SIGRTMIN", "RTMIN"),
+        ] {
+            assert_eq!(normalize_signal(raw).as_deref(), Some(expected), "{raw:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "SIG",
+            "H",
+            "1HUP",
+            "HUP4-YOU",
+            "HU P",
+            "TOOOOOOOOOOOLONG",
+            "SIGKILL!",
+            "-HUP",
+            "HUP_1",
+        ] {
+            assert_eq!(normalize_signal(bad), None, "{bad:?}");
+        }
     }
 }
