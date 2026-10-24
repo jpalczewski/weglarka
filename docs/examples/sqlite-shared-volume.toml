@@ -1,0 +1,36 @@
+# Shared volume between several apps: one SQLite database, one Podman volume, one uid/gid range
+# (issue #33, docs/decisions/0014-shared-volumes.md).
+#
+# This is an excerpt of `apps.toml`, not an app spec for `--spec`: the volume is declared in a
+# top-level section and an app mounts it by name. Typical setup:
+#   1. declare the volume:  weglarka volumes add kajet-data
+#   2. add the members (or copy the `[apps.*]` blocks below):
+#      weglarka apps add kajet-api ghcr.io/example/kajet-api:latest --domain kajet.example.com \
+#        --port 8080 --shared-volume kajet-data=/data
+#      weglarka apps add kajet-worker ghcr.io/example/kajet-worker:latest \
+#        --shared-volume kajet-data=/data:ro
+# A group costs one uid range instead of one per app, and every member container runs in that
+# range. All member images must run as the same container USER — Węglarka never overrides USER.
+
+[shared_volumes.kajet-data]
+# No options yet: the declaration is the guard against typos (a mount of an undeclared name is
+# rejected) and the future home of per-volume options (backups, range size).
+
+[apps.kajet-api]
+image = "ghcr.io/example/kajet-api:latest"
+domains = ["kajet.example.com"]
+port = 8080
+# Podman volume: `wg-shared-kajet-data`, label `weglarka.shared-volume=kajet-data` (no
+# `weglarka.instance`, so per-instance purge and volume filters never touch it).
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+
+[apps.kajet-worker]
+image = "ghcr.io/example/kajet-worker:latest"
+# Read-only member: a process that only reads the database. Drop `read_only` and run the same
+# container USER as kajet-api if it has to write (SQLite serializes writers; set busy_timeout).
+shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
+
+# Optional: private volumes may be mixed with the shared one. They are created in the group's uid
+# range, so the other members can read them (weaker isolation inside the group, on purpose) —
+# handy for one process's own cache directory:
+# volumes = [{ name = "cache", target = "/cache" }]
