@@ -30,6 +30,17 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
   Nowy i zmieniany kod piszesz od razu po angielsku; istniejące polskie komentarze w plikach, których nie dotykasz,
   tłumaczy osobne zadanie (nie mieszaj tłumaczeń z niezwiązanymi zmianami w PR).
 
+## Commity i PR-y (Conventional Commits)
+
+- Format: `<type>(<scope>): <summary>`. Po squashu tytuł PR **jest** tytułem commita na `main`, więc tytuł PR
+  też musi być Conventional — pilnuje tego job CI `pr-title`.
+- Typy: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- Scope: obszar/crate — `core`, `podman`, `ingress`, `api`, `daemon`, `cli`, `ci`, `docs` (pomiń, gdy zmiana jest
+  repo-wide).
+- Breaking change: `feat(core)!: ...` i `BREAKING CHANGE:` w opisie; w PR opisz też rollback/kompatybilność.
+- Przykłady: `feat(core): provision apps without starting them`, `fix(podman): map libpod 500 to NotFound`,
+  `docs: index the ADRs`. Stare commity (przed 2026-10-24) nie są Conventional — historii nie przepisujemy.
+
 ## Przed PR-em (checklista)
 
 1. `git fetch origin && git rebase origin/main` — PR musi być na bieżącym `main`; inaczej GitHub pokaże konflikt
@@ -41,7 +52,9 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
    (`deny_unknown_fields` a rollback) w PR i w `docs/install.md`.
 5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md);
    indeks wszystkich decyzji: [`docs/decisions/README.md`](docs/decisions/README.md).
-6. Tytuł, commity i PR po angielsku, `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `integration-podman`).
+6. Tytuł, commity i PR w Conventional Commits (`<type>(<scope>): <summary>`, patrz wyżej), po angielsku;
+   `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `integration-podman`; zmiana tylko w
+   `docs/`/`*.md`/`.gitignore` nie buduje — job `changes`).
 
 ## Mapa crate'ów
 
@@ -106,3 +119,5 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `--with-local-registry` dodaje deploy z webhooka i wymuszony rollback — tylko w CI). Smoke testy obrazu:
   `.github/scripts/smoke-image.sh` i `smoke-quadlet.sh` (argumenty z `platform install`).
 - CI na PR buduje profilem `ci` (thin LTO), `main` i tagi — pełnym `release` (`docs/decisions/0008`).
+  PR zmieniający wyłącznie dokumentację (`docs/**`, `*.md`, `.gitignore`) nie uruchamia buildów — job
+  `changes` pomija `check`/`musl`/`integration-podman`; `changes` i `pr-title` biegną zawsze.
