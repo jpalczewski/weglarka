@@ -9,7 +9,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::client::conn::http1;
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
@@ -43,6 +43,7 @@ impl Transport {
         method: Method,
         path: &str,
         body: Option<(&'static str, UnsyncBoxBody<Bytes, std::io::Error>)>,
+        extra_header: Option<(HeaderName, HeaderValue)>,
     ) -> Result<(StatusCode, Incoming)> {
         let unreachable = |what: &str, e: &dyn std::fmt::Display| {
             PodmanError::Unreachable(format!("{}: {what}: {e}", self.socket.display()))
@@ -63,6 +64,9 @@ impl Transport {
             .method(method)
             .uri(format!("{API_PREFIX}{path}"))
             .header(HOST, "podman");
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
         let payload = match body {
             Some((content_type, body)) => {
                 request = request.header(CONTENT_TYPE, content_type);
@@ -88,7 +92,7 @@ impl Transport {
         body: Option<(&'static str, Bytes)>,
     ) -> Result<Bytes> {
         let body = body.map(|(content_type, bytes)| (content_type, whole(bytes)));
-        let (status, incoming) = self.open(method, path, body).await?;
+        let (status, incoming) = self.open(method, path, body, None).await?;
         if is_success(status) {
             read_limited(incoming, MAX_BODY).await
         } else {
@@ -122,7 +126,9 @@ impl Transport {
                 .map_err(|e| std::io::Error::other(e.to_string()))
         });
         let body = StreamBody::new(frames).boxed_unsync();
-        let (status, incoming) = self.open(method, path, Some((content_type, body))).await?;
+        let (status, incoming) = self
+            .open(method, path, Some((content_type, body)), None)
+            .await?;
         if is_success(status) {
             read_limited(incoming, MAX_BODY).await
         } else {
@@ -132,7 +138,7 @@ impl Transport {
 
     /// Call with a raw streamed *response* (volume export): chunks are passed on as they arrive.
     pub(crate) async fn bytes_stream(&self, method: Method, path: &str) -> Result<TarStream> {
-        let (status, incoming) = self.open(method, path, None).await?;
+        let (status, incoming) = self.open(method, path, None, None).await?;
         if !is_success(status) {
             return Err(error_from_response(status, incoming).await);
         }
@@ -157,8 +163,14 @@ impl Transport {
     }
 
     /// Call with a streamed response (JSON lines).
-    pub(crate) async fn lines(&self, method: Method, path: &str) -> Result<Lines> {
-        let (status, incoming) = self.open(method, path, None).await?;
+    /// `extra_header` carries credentials (`X-Registry-Auth`); the caller marks the value sensitive.
+    pub(crate) async fn lines(
+        &self,
+        method: Method,
+        path: &str,
+        extra_header: Option<(HeaderName, HeaderValue)>,
+    ) -> Result<Lines> {
+        let (status, incoming) = self.open(method, path, None, extra_header).await?;
         if is_success(status) {
             Ok(Lines::new(incoming))
         } else {

@@ -7,6 +7,7 @@
 //! Integration tests against a real Podman: `tests/` (require `WEGLARKA_PODMAN_SOCKET`).
 
 mod client;
+mod registry_auth;
 mod transport;
 mod wire;
 

@@ -33,23 +33,76 @@ pub enum PodmanError {
 }
 
 impl PodmanError {
-    /// The registry rejected our credentials (or we sent none): HTTP 401/403 from the pull call or an
-    /// "unauthorized"/"denied" error in the pull stream. Distinct from `NotFound` (image missing).
+    /// The registry refused the pull for lack of (valid) credentials: HTTP 401/403, or libpod's 500 /
+    /// mid-stream error carrying the registry's `unauthorized` / `denied` message. Drives
+    /// `EngineError::RegistryAuth`, so the operator is told to fix the credentials instead of
+    /// reading a raw libpod error.
     pub fn is_registry_auth_failure(&self) -> bool {
+        const MARKERS: [&str; 5] = [
+            "unauthorized",
+            "authentication required",
+            "requested access to the resource is denied",
+            "denied",
+            "insufficient_scope",
+        ];
+        let has_marker = |message: &str| {
+            let message = message.to_ascii_lowercase();
+            MARKERS.iter().any(|m| message.contains(m))
+        };
         match self {
-            PodmanError::Api { status, .. } => matches!(status, 401 | 403),
-            PodmanError::Pull(message) => {
-                let message = message.to_ascii_lowercase();
-                ["unauthorized", "denied", "authentication required"]
-                    .iter()
-                    .any(|needle| message.contains(needle))
-            }
+            Self::Api {
+                status: 401 | 403, ..
+            } => true,
+            Self::Api { message, .. } | Self::Pull(message) => has_marker(message),
             _ => false,
         }
     }
 }
 
 pub type Result<T, E = PodmanError> = std::result::Result<T, E>;
+
+/// Credentials for one registry, sent as `X-Registry-Auth` on a pull. `Debug` never reveals the
+/// password; the type is deliberately not `Serialize`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegistryAuth {
+    username: String,
+    password: String,
+}
+
+impl RegistryAuth {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// Parses the stored secret value `<username>:<password>` (split at the first colon, so the
+    /// password may contain colons). `None` for a malformed value (no colon, empty username or
+    /// password).
+    pub fn parse(value: &[u8]) -> Option<Self> {
+        let (username, password) = std::str::from_utf8(value).ok()?.split_once(':')?;
+        (!username.is_empty() && !password.is_empty()).then(|| Self::new(username, password))
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// For the wire encoding only — never log it.
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
@@ -359,8 +412,18 @@ pub trait PodmanClient: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ContainerInfo>>> + Send;
 
     // Images
-    /// Pull as a stream; an error mid-pull appears as an `Err` in the stream.
-    fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send;
+    /// Pull as a stream; an error mid-pull appears as an `Err` in the stream. `auth` is sent as
+    /// `X-Registry-Auth`; `None` leaves authentication to the podman user's `auth.json`
+    /// (docs/decisions/0026).
+    fn image_pull_with(
+        &self,
+        reference: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> impl Stream<Item = Result<PullEvent>> + Send;
+    /// Anonymous pull (public images, `auth.json`) — `image_pull_with` without credentials.
+    fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send {
+        self.image_pull_with(reference, None)
+    }
     fn image_inspect(&self, reference: &str) -> impl Future<Output = Result<ImageInfo>> + Send;
     /// Top-level images in the local store (one entry per image, intermediate layers excluded).
     /// Feeds image retention: keep the current and the previous image, drop older ones
@@ -427,7 +490,38 @@ pub trait PodmanClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::image_repo;
+    use super::{PodmanError, RegistryAuth, image_repo};
+
+    #[test]
+    fn registry_auth_parses_user_colon_password_and_hides_the_password() {
+        let auth = RegistryAuth::parse(b"ci:p:ss").unwrap();
+        assert_eq!((auth.username(), auth.password()), ("ci", "p:ss"));
+        for bad in [&b"nocolon"[..], b":pw", b"user:", b"", &[0xff, b':', b'x']] {
+            assert!(RegistryAuth::parse(bad).is_none(), "{bad:?}");
+        }
+        let dbg = format!("{auth:?}");
+        assert!(dbg.contains("ci") && !dbg.contains("p:ss"), "{dbg}");
+    }
+
+    #[test]
+    fn registry_auth_failure_is_status_or_message_based() {
+        let api = |status, message: &str| PodmanError::Api {
+            status,
+            message: message.into(),
+        };
+        assert!(api(401, "x").is_registry_auth_failure());
+        assert!(api(403, "x").is_registry_auth_failure());
+        assert!(
+            api(500, "pinging container registry ghcr.io: unauthorized").is_registry_auth_failure()
+        );
+        assert!(
+            PodmanError::Pull("denied: requested access to the resource is denied".into())
+                .is_registry_auth_failure()
+        );
+        assert!(!api(500, "boom").is_registry_auth_failure());
+        assert!(!PodmanError::Pull("manifest unknown".into()).is_registry_auth_failure());
+        assert!(!PodmanError::NotFound("x".into()).is_registry_auth_failure());
+    }
 
     /// Tag and digest are dropped, a registry port is not — deploy, retention and the podman wire
     /// parser all share this one helper.

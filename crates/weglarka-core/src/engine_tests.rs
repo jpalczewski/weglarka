@@ -13,12 +13,14 @@ use crate::crash;
 use crate::deploy::DeployOutcome;
 use crate::events::{Event, VecSink};
 use crate::labels;
-use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping};
+use crate::podman::{
+    ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping, RegistryAuth,
+};
 use crate::reconcile::{
     Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
     ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
 };
-use crate::secret_store::{SecretStore, SecretValue};
+use crate::secret_store::{SecretError, SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
 use crate::state::{StatePaths, load_state};
 use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman};
@@ -503,6 +505,97 @@ async fn pull_failure_leaves_everything_untouched() {
             .iter()
             .any(|e| matches!(e, Event::DeployFailed { digest: None, .. }))
     );
+}
+
+/// Per-app registry credentials (docs/decisions/0026): `<instance>.registry-auth` is sent on every
+/// pull of that app; without it the registry's 401 becomes a `RegistryAuth` error that names the
+/// secret, and nothing is created.
+#[tokio::test(start_paused = true)]
+async fn private_image_pulls_with_the_apps_registry_auth_secret() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let creds = RegistryAuth::new("ci", "tok:en");
+    h.fake.require_pull_auth(IMAGE, creds.clone());
+
+    // No secret: the registry answers 401 → actionable error, no container, a DeployFailed event.
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::RegistryAuth {
+                sent_credentials: false,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("ntfy.registry-auth") || text.contains("secrets set ntfy registry-auth"),
+        "{text}"
+    );
+    assert!(h.fake.containers().is_empty());
+    assert!(
+        h.sink
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::DeployFailed { .. }))
+    );
+
+    // Wrong credentials: rejected, reported as such, and the value is nowhere in the message.
+    h.store
+        .set("ntfy.registry-auth", SecretValue::new("ci:wrong"))
+        .unwrap();
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::RegistryAuth {
+                sent_credentials: true,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("wrong"));
+
+    // Right credentials: the pull succeeds and the same value is what was sent.
+    h.store
+        .set("ntfy.registry-auth", SecretValue::new("ci:tok:en"))
+        .unwrap();
+    h.rec.deploy(&name("ntfy"), false).await.unwrap();
+    assert_eq!(h.state("ntfy").current, Some(digest('a')));
+    let log = h.fake.pull_auth_log();
+    assert_eq!(log.last().unwrap(), &(IMAGE.to_owned(), Some(creds)));
+    // The reserved secret is never materialized as a Podman secret.
+    assert!(!h.fake.has_secret("ntfy.registry-auth"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_registry_auth_secret_fails_instead_of_pulling_anonymously() {
+    let h = Harness::new(NTFY);
+    h.store
+        .set("ntfy.registry-auth", SecretValue::new("no-colon-here"))
+        .unwrap();
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Secret(SecretError::Malformed { .. })),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("no-colon-here"));
+    assert!(h.fake.pull_auth_log().is_empty(), "no pull was attempted");
+}
+
+#[test]
+fn registry_auth_secret_cannot_be_bound_to_a_container() {
+    let apps = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+secrets = [{ secret = "registry-auth", kind = "env", var = "X" }]
+"#;
+    let file: crate::app::AppsFile = toml::from_str(apps).unwrap();
+    let err = crate::state::validate_app(&name("ntfy"), &file.apps[&name("ntfy")]).unwrap_err();
+    assert!(err.contains("reserved"), "{err}");
 }
 
 #[tokio::test(start_paused = true)]
