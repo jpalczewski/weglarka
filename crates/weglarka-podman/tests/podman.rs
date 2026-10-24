@@ -312,6 +312,9 @@ async fn full_lifecycle() {
             target: SecretTarget::Mount {
                 path: "/config.json".into(),
                 mode: Some(0o440),
+                // Container-space ids (issue #55), mapped by libpod through the instance range.
+                uid: Some(1000),
+                gid: Some(1000),
             },
         },
     ];

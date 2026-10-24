@@ -43,3 +43,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0034](0034-automatic-fallback.md) | Automatic fallback to the previous daemon image |
 | [0035](0035-webhook-delivery-persistence.md) | Persist webhook delivery dedup across restarts (issue #41) |
 | [0036](0036-edge-mode.md) | Edge mode: nginx owns 80/443 (TLS, ACME webroot, certificate reload) |
+| [0037](0037-secret-mount-ownership.md) | Owner (`uid`/`gid`) of a mounted secret |

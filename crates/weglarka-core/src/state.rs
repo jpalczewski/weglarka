@@ -18,8 +18,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
-    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, normalize_signal,
-    valid_config_source, valid_mount_target, valid_volume_name,
+    AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget, SharedVolumeName,
+    normalize_signal, valid_config_source, valid_mount_target, valid_volume_name,
 };
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -81,6 +81,14 @@ fn ingress_max_body_size_v6(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v6 → v7: owner (`uid`/`gid`) of a mounted secret (issue #55, ADR 0037). Both are optional fields of
+/// the existing `kind = "mount"` binding and default to unset, so a v6 document needs no data
+/// transformation — the marker records that the file may carry them. A no-op that must accept a
+/// hand-edited file which already has them.
+fn secret_mount_ownership_v7(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -90,6 +98,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     shared_networks_v4,
     path_prefix_routing_v5,
     ingress_max_body_size_v6,
+    secret_mount_ownership_v7,
 ];
 
 const _: () = assert!(
@@ -292,6 +301,24 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         }
         if !crate::secret_store::valid_secret_name(&b.secret) {
             return Err(format!("{name}: invalid secret name {:?}", b.secret));
+        }
+        // A mounted secret's owner is a numeric id in the container's space; Podman maps it through
+        // the instance's uid/gid range, which is exactly `DEFAULT_RANGE_SIZE` ids wide (ADR 0009), so
+        // an id outside `0..DEFAULT_RANGE_SIZE` cannot be mapped. The bound is derived from the range
+        // size on purpose: a magic 65535 would silently stop matching if the range ever changed.
+        if let SecretTarget::Mount { uid, gid, .. } = &b.target {
+            let range = crate::uid_range::DEFAULT_RANGE_SIZE;
+            for (field, id) in [("uid", uid), ("gid", gid)] {
+                if let Some(id) = id
+                    && *id >= range
+                {
+                    return Err(format!(
+                        "{name}: secret {:?}: {field} must be in 0..={} (the instance's uid/gid range is {range} ids wide, ADR 0009)",
+                        b.secret,
+                        range - 1
+                    ));
+                }
+            }
         }
     }
     validate_depends_on(name, spec)?;
@@ -723,6 +750,46 @@ mod tests {
         assert!(validate_app(&name("a"), &spec("")).is_ok());
         let err = validate_app(&name("a"), &spec("\"serve\", \"\"")).unwrap_err();
         assert!(err.contains("command argument 1"), "{err}");
+    }
+
+    /// Issue #55: a mounted secret's owner must fit the instance's uid/gid range (ADR 0009), because
+    /// Podman maps container-space ids through it; an env binding has no owner at all.
+    #[test]
+    fn mounted_secret_ownership_must_fit_the_instance_range() {
+        let spec = |secrets: &str| -> AppSpec {
+            toml::from_str(&format!("image = \"i\"\nsecrets = [{secrets}]")).unwrap()
+        };
+        let mount = |extra: &str| {
+            spec(&format!(
+                "{{ secret = \"s\", kind = \"mount\", path = \"/run/secrets/s\"{extra} }}"
+            ))
+        };
+        for id in [0, 1000, 65_535] {
+            assert!(
+                validate_app(&name("a"), &mount(&format!(", uid = {id}, gid = {id}"))).is_ok(),
+                "{id}"
+            );
+        }
+        for field in ["uid", "gid"] {
+            let err = validate_app(&name("a"), &mount(&format!(", {field} = 65_536"))).unwrap_err();
+            assert!(
+                err.contains(&format!("{field} must be in 0..=65535")),
+                "{field}: {err}"
+            );
+            assert!(err.contains("\"s\""), "the message names the secret: {err}");
+            assert!(
+                err.starts_with("a:"),
+                "the message names the instance: {err}"
+            );
+        }
+        // An env binding keeps working: it has no ownership field.
+        assert!(
+            validate_app(
+                &name("a"),
+                &spec("{ secret = \"s\", kind = \"env\", var = \"V\" }")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1247,10 +1314,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         );
 
         let state_path = dir.path().join("state.toml");
-        fs::write(&state_path, "schema_version = 7\n").unwrap();
+        fs::write(&state_path, format!("schema_version = {newer}\n")).unwrap();
         assert!(matches!(
             load_state(&state_path),
-            Err(StateError::SchemaTooNew { found: 7, .. })
+            Err(StateError::SchemaTooNew { found, .. }) if found == newer
         ));
 
         // A value beyond `u32` is still "newer", not a malformed field.

@@ -295,8 +295,11 @@ struct PortMapping<'a> {
 struct MountSecret<'a> {
     source: &'a str,
     target: &'a str,
+    /// Owner of the secret file inside the container (a numeric id in the container's space, mapped
+    /// by libpod through the instance's uid/gid range); `0` is root in the container.
     #[serde(rename = "UID")]
     uid: u32,
+    /// Owner group of the secret file inside the container, same id space as `uid`.
     #[serde(rename = "GID")]
     gid: u32,
     /// Sent explicitly: libpod takes 0 literally (mode `000`), unlike `podman run --secret`.
@@ -316,11 +319,18 @@ impl<'a> CreateContainer<'a> {
                 SecretTarget::Env { var } => {
                     secret_env.insert(var.as_str(), attachment.secret.as_str());
                 }
-                SecretTarget::Mount { path, mode } => secrets.push(MountSecret {
+                SecretTarget::Mount {
+                    path,
+                    mode,
+                    uid,
+                    gid,
+                } => secrets.push(MountSecret {
                     source: &attachment.secret,
                     target: path,
-                    uid: 0,
-                    gid: 0,
+                    // Container-space ids; libpod maps them through the instance's uid/gid range.
+                    // `0` is root in the container and the `podman run --secret` default.
+                    uid: uid.unwrap_or(0),
+                    gid: gid.unwrap_or(0),
                     mode: mode.unwrap_or(DEFAULT_SECRET_MODE),
                 }),
             }
@@ -1107,7 +1117,12 @@ mod tests {
             secrets: vec![
                 SecretAttachment {
                     secret: "ntfy-config".into(),
-                    target: SecretTarget::Mount { path: "/config.json".into(), mode: Some(0o440) },
+                    target: SecretTarget::Mount {
+                        path: "/config.json".into(),
+                        mode: Some(0o440),
+                        uid: None,
+                        gid: None,
+                    },
                 },
                 SecretAttachment {
                     secret: "ntfy-token".into(),
@@ -1204,8 +1219,8 @@ mod tests {
     }
 
     #[test]
-    fn mounted_secret_without_mode_is_world_readable_not_000() {
-        let spec = ContainerSpec {
+    fn mounted_secret_mode_and_ownership_reach_libpod() {
+        let mut spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
             command: vec![],
@@ -1218,6 +1233,8 @@ mod tests {
                 target: SecretTarget::Mount {
                     path: "/config.json".into(),
                     mode: None,
+                    uid: None,
+                    gid: None,
                 },
             }],
             publish: vec![],
@@ -1230,8 +1247,22 @@ mod tests {
             id_mapping: None,
             security: Default::default(),
         };
+        // Unset: the world-readable mode and root-in-the-container owner, like `podman run --secret`.
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         assert_eq!(body["secrets"][0]["Mode"], 0o444);
+        assert_eq!(body["secrets"][0]["UID"], 0);
+        assert_eq!(body["secrets"][0]["GID"], 0);
+
+        // Set (issue #55): the ids are passed through as container-space values.
+        if let SecretTarget::Mount { mode, uid, gid, .. } = &mut spec.secrets[0].target {
+            *mode = Some(0o400);
+            *uid = Some(1000);
+            *gid = Some(1000);
+        }
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(body["secrets"][0]["Mode"], 0o400);
+        assert_eq!(body["secrets"][0]["UID"], 1000);
+        assert_eq!(body["secrets"][0]["GID"], 1000);
     }
 
     #[test]
