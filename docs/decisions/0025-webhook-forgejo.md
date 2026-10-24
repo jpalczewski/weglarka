@@ -1,6 +1,6 @@
 # 0025 — Forgejo webhooks: `package` event, registry host from config, pulls via `auth.json` (issue #44)
 
-Status: accepted (2026-10-24, issue #44). **Payload shape and moving-tag behaviour to be confirmed on a real push.**
+Status: accepted (2026-10-24, issue #44); amended the same day after the first real delivery (Forgejo 16.0.3).
 
 ## Problem
 
@@ -16,7 +16,9 @@ authenticated "new image" event that ends in a deploy — plus a way to pull fro
    The secret stays per app (`<instance>.webhook-hmac`), the order of checks and the status codes are
    the ones from ADR 0004 (401 / 204 / 400 / 202 / 413). The adapter declares the headers it reads
    (`WebhookSource::headers`, `delivery_header`), so the listener knows nothing about a particular source.
-2. **Event.** `X-Forgejo-Event: package` with `action == "created"` and `package.type == "container"`.
+2. **Event.** The event name is read from `X-Forgejo-Event-Type`, falling back to `X-Forgejo-Event` (Forgejo 16
+   sends package events with `X-Forgejo-Event` **empty** and the name only in `-Type`; an empty value is skipped).
+   The event must be `package`, with `action == "created"` and `package.type == "container"`.
    `deleted` and everything else → 204. For container packages `package.version` is the **tag**; an
    empty version or a `sha256:…` version (untagged manifest) → 204. Of the two events a push produces
    (`main` and `sha-<commit>`), the `sha-…` one does not match an app tracking `:main` and ends in 204.
@@ -39,13 +41,14 @@ authenticated "new image" event that ends in a deploy — plus a way to pull fro
    pull stream) surfaces as `EngineError::RegistryAuth` with a message pointing at `podman login`, distinct
    from "image not found".
 
-## To confirm on a real push
+## Confirmed on a real delivery (Forgejo 16.0.3, org-level package webhook)
 
-The adapter was written from the Gitea/Forgejo `PackagePayload` documentation, not from an observed
-delivery. Verify and commit the captured payload as a snapshot (as ADR 0004 asks for GitHub):
-
-- header names and which signature header is present;
-- `package.owner.login`, `package.name`, `package.version` for a container push;
-- **whether re-pushing an existing tag (`main`) to a new digest sends `package.created` again.** Forgejo may
-  update the existing version instead. If it does not, the tracked-tag trigger cannot rely on this event and
-  #83 (match by repository, resolve the tracked tag's digest) becomes the way; the adapter stays.
+- Headers: `X-Forgejo-Event` is empty, `X-Forgejo-Event-Type: package`, `X-Forgejo-Delivery`, and a plain-hex
+  `X-Forgejo-Signature` (the `X-Gitea-*`, `X-Gogs-*` and `X-Hub-Signature-256` aliases are also sent; still not accepted).
+  The first version of the adapter required `X-Forgejo-Event` and answered 204 to every delivery.
+- Payload: `action`, `organization`, `package`, `repository` (`null` for org-level packages), `sender`;
+  `package.type = container`, `package.name`, `package.owner.login`, `package.version` = the tag
+  (`main` and `sha-<commit>` arrive as two deliveries). `deleted` has the same shape.
+- **Re-pushing an existing tag to a new digest sends `package.created` again**, so the tracked-tag trigger
+  works and #83 is not needed for this case.
+- The unit-test payload is a trimmed copy of the real one.
