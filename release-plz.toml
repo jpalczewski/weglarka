@@ -1,0 +1,40 @@
+# Independent versions and changelogs per crate (docs/decisions/0015-per-crate-versioning-and-changelogs.md).
+# Docs: https://release-plz.dev/docs/config
+
+[workspace]
+# Nothing is published to crates.io; git tags are the source of truth for "the previous release".
+git_only = true
+# The image/binaries are built by release.yml from the `v*` tag; GitHub Releases are created there.
+git_release_enable = false
+# Each crate gets a CHANGELOG.md in its own directory, generated from Conventional Commits that touched its files.
+changelog_update = true
+# Do not run `cargo update` in release PRs; Cargo.lock only changes for the version bumps.
+dependencies_update = false
+pr_labels = ["release"]
+
+# `weglarka-daemon` is the product: its tag `vX.Y.Z` triggers release.yml (image + binaries).
+[[package]]
+name = "weglarka-daemon"
+git_tag_name = "v{{ version }}"
+
+# The other crates are tagged `<crate>-vX.Y.Z`; release.yml ignores those (it only matches `v[0-9]*`).
+# The tags exist so release-plz can find the previous release of each crate.
+[[package]]
+name = "weglarka-cli"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-api"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-core"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-podman"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-ingress"
+git_tag_name = "{{ package }}-v{{ version }}"

@@ -1,0 +1,51 @@
+# 0015 — Per-crate versions and changelogs (release-plz)
+
+Status: accepted (2026-10-24)
+
+## Problem
+
+The project has no changelog and a single workspace version (`0.0.1`). The crates change at different rates
+(`weglarka-api` is a compatibility contract between CLI and daemon; `weglarka-ingress` is a pure generator), and
+we want each crate to carry its own version and its own `CHANGELOG.md`, generated from the Conventional Commits
+we already enforce (`pr-title` CI job, squash merge), without hand-written entries in every PR.
+
+## Decision
+
+- Every crate has its own `version` in its `Cargo.toml` (no more `version.workspace`). Internal path
+  dependencies in `[workspace.dependencies]` carry a `version` so release-plz can keep them in sync.
+- [release-plz](https://release-plz.dev) (`release-plz.toml`, `.github/workflows/release-plz.yml`) maintains a
+  "release" PR with version bumps and `crates/*/CHANGELOG.md`. Which crate changed is decided by the files a
+  commit touched, **not** by the commit scope; the scope only groups entries. When a release changes a version that
+  dependents require (the `version` in `[workspace.dependencies]`), release-plz updates it as well.
+- Bump rules (pre-1.0, SemVer for 0.x): `feat` → minor, `fix`/`perf`/other → patch, `!`/`BREAKING CHANGE:` →
+  minor on 0.x (major from 1.0).
+- `weglarka-daemon` is the product: its tag is `vX.Y.Z` and triggers `release.yml` (image, binaries, GitHub
+  Release). The tag must equal the daemon's `Cargo.toml` version (checked in `release.yml`). The CLI ships in the
+  same tarball but keeps its own version.
+- All other crates are tagged `<crate>-vX.Y.Z`. They do not trigger `release.yml` (it matches `v[0-9]*` only) but
+  must exist: with `publish = false` the tags are how release-plz finds each crate's previous release.
+- Nothing is published to crates.io (`git_only = true`); GitHub Releases are created by `release.yml`, not
+  release-plz.
+- The workflow needs a `RELEASE_PLZ_TOKEN` secret (fine-grained PAT or GitHub App token with contents and
+  pull-requests write). The default `GITHUB_TOKEN` cannot be used: PRs and tags it creates do not trigger CI or
+  `release.yml`.
+
+Invariants: a version bump never changes `spec_hash` or the state/API formats; compatibility between CLI and
+daemon is expressed by the `weglarka-api` version, so breaking changes to the admin API must be marked `!`.
+
+## Consequences
+
+- Contributors write nothing extra: a correct Conventional title is the changelog entry. Squash-merge titles
+  must therefore be user-meaningful (`chore`/`ci`/`docs`/`test` are omitted from changelogs).
+- Releasing = merging the release PR. The daemon tag publishes the image.
+- Bootstrap (one-off, before merging this): tag the current `main` commit `v0.0.1` and `weglarka-<crate>-v0.0.1`
+  for the other five crates, and add the `RELEASE_PLZ_TOKEN` secret; otherwise release-plz treats the first run
+  as the initial release.
+- The config was written without running release-plz locally; verify with `release-plz update --dry-run` (or a
+  first run of the workflow) and adjust `release-plz.toml` if the options differ in the installed version.
+
+## Rejected alternatives
+
+- **git-cliff alone**: one root changelog from history; simpler, but no per-crate versions or changelogs.
+- **Hand-written Keep a Changelog / per-PR fragments**: needs discipline in every PR and is easy to neglect.
+- **A single workspace version**: the simplest, but hides which crate (and which contract) actually changed.

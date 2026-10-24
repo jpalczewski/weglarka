@@ -40,6 +40,9 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 - Scope: obszar/crate — `core`, `podman`, `ingress`, `api`, `daemon`, `cli`, `ci`, `docs` (pomiń, gdy zmiana jest
   repo-wide).
 - Breaking change: `feat(core)!: ...` i `BREAKING CHANGE:` w opisie; w PR opisz też rollback/kompatybilność.
+- Changelogi i wersje są **per crate**, generowane przez release-plz z tytułów PR (ADR 0015): o tym, które crate'y
+  dotyczy zmiana, decydują zmienione pliki, nie scope; wersje crate'ów bumpuje PR wydaniowy, nie ręczne edycje
+  `version` ani `CHANGELOG.md`. Tag `vX.Y.Z` = wersja `weglarka-daemon` (uruchamia `release.yml`).
 - Przykłady: `feat(core): provision apps without starting them`, `fix(podman): map libpod 500 to NotFound`,
   `docs: index the ADRs`. Stare commity (przed 2026-10-24) nie są Conventional — historii nie przepisujemy.
 

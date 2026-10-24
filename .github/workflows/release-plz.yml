@@ -1,0 +1,51 @@
+name: Release PR
+
+# Opens/updates a "release" PR with per-crate version bumps and CHANGELOG.md files; merging it makes the
+# `release` job tag the changed crates. The daemon's `v*` tag then triggers release.yml.
+# Decisions: docs/decisions/0015-per-crate-versioning-and-changelogs.md
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - ".gitignore"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # Tags pushed with the default GITHUB_TOKEN do not trigger release.yml; RELEASE_PLZ_TOKEN is a
+          # fine-grained PAT (contents + pull requests: write) or GitHub App token.
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-pr:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
