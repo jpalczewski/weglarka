@@ -13,8 +13,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weglarka_api::{
     AddAppRequest, ApiError, AppSummary, DeployOutcome, DeployRequest, DeployResponse, ErrorCode,
-    ListAppsResponse, ListSecretsResponse, RuntimeState, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse, endpoints,
+    ListAppsResponse, ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse,
+    NotifyTestResponse, RuntimeState, SecretInfo, SetSecretRequest, ShowAppResponse,
+    StatusResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::deploy::DeployOutcome as CoreOutcome;
@@ -143,12 +144,66 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
         .route(endpoints::DOCTOR.path, get(run_doctor::<P>))
+        .route(
+            endpoints::NOTIFICATIONS_STATUS.path,
+            get(notify_status::<P>),
+        )
+        .route(endpoints::NOTIFICATIONS_TEST.path, post(notify_test::<P>))
         .fallback(|| async { Fail::not_found("no such endpoint") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
         .merge(shared_volumes::routes())
         .merge(images::routes())
         .with_state(daemon)
+}
+
+// ── Notifications (issue #38) ────────────────────────────────────────────────
+
+/// `GET /v1/notifications`: channels, the pending outbox and the last delivery error.
+async fn notify_status<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    let Some(handle) = &d.notify else {
+        return Ok(json(NotifyStatusResponse::default()));
+    };
+    let snapshot = handle.snapshot();
+    Ok(json(NotifyStatusResponse {
+        enabled: snapshot.enabled,
+        channels: snapshot
+            .channels
+            .into_iter()
+            .map(|channel| NotifyChannelSummary {
+                name: channel.name,
+                min_severity: channel.min_severity,
+                pending: u32::try_from(channel.pending).unwrap_or(u32::MAX),
+            })
+            .collect(),
+        pending: u32::try_from(snapshot.pending).unwrap_or(u32::MAX),
+        dropped: snapshot.dropped,
+        last_error: snapshot.last_error,
+        last_delivered_at: snapshot.last_delivered_at,
+    }))
+}
+
+/// `POST /v1/notifications/test`: delivers a test notification now (it bypasses the outbox, so a test
+/// is visible even while the queue is empty, and it never pollutes it).
+async fn notify_test<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    let Some(handle) = &d.notify else {
+        return Err(Fail(
+            ErrorCode::Conflict,
+            "notifications are not configured: add a [notify.ntfy] section to weglarka.toml and restart the daemon"
+                .into(),
+        ));
+    };
+    let response = match handle.test(&d.host.webhook.domain).await {
+        Ok(()) => NotifyTestResponse {
+            delivered: true,
+            error: None,
+        },
+        Err(error) => NotifyTestResponse {
+            delivered: false,
+            error: Some(error),
+        },
+    };
+    Ok(json(response))
 }
 
 // ── Reads (no engine mutex) ──────────────────────────────────────────────────

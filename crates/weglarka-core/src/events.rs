@@ -3,6 +3,8 @@
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::{Digest, InstanceName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,21 +59,70 @@ pub enum Event {
     WebhookDuplicate { delivery_id: String },
 }
 
+/// How serious an event is. Notification channels route on it (`min_severity`) and the daemon uses it
+/// for the log level. The order is meaningful: `Debug < Info < Warning < Critical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Routine bookkeeping (a container pruned, a duplicate webhook): never alerts.
+    Debug,
+    #[default]
+    Info,
+    /// A deploy or a rollback that the operator may have to act on.
+    Warning,
+    /// The app needs intervention now (a failed rollback).
+    Critical,
+}
+
+impl Severity {
+    /// Lowercase name, as used in `weglarka.toml` and `notify status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Event {
+    /// Severity used for notification routing and for the `tracing` level.
+    pub fn severity(&self) -> Severity {
+        match self {
+            Self::RollbackFailed { .. } => Severity::Critical,
+            Self::DeployFailed { .. } | Self::RolledBack { .. } => Severity::Warning,
+            Self::Pruned { .. }
+            | Self::WaitingForDependency { .. }
+            | Self::WebhookDuplicate { .. } => Severity::Debug,
+            Self::DeployOk { .. }
+            | Self::Provisioned { .. }
+            | Self::Recreated { .. }
+            | Self::WaitingForSecret { .. } => Severity::Info,
+        }
+    }
+}
+
 /// Event sink; synchronous and dyn-compatible (a future journal appends to a file).
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: Event);
 }
 
-/// Default sink: `tracing` (info level, errors as warn).
+/// Default sink: `tracing` (info level, warnings and criticals as warn).
 pub struct TracingSink;
 
 impl EventSink for TracingSink {
     fn emit(&self, event: Event) {
-        match &event {
-            Event::DeployFailed { .. } | Event::RollbackFailed { .. } => {
-                tracing::warn!(?event, "weglarka event")
-            }
-            _ => tracing::info!(?event, "weglarka event"),
+        match event.severity() {
+            Severity::Warning | Severity::Critical => tracing::warn!(?event, "weglarka event"),
+            // `Debug` events stay at info here: the daemon log keeps the volume it always had.
+            Severity::Info | Severity::Debug => tracing::info!(?event, "weglarka event"),
         }
     }
 }
@@ -89,5 +140,114 @@ impl VecSink {
 impl EventSink for VecSink {
     fn emit(&self, event: Event) {
         self.0.lock().expect("sink mutex poisoned").push(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(s: &str) -> InstanceName {
+        InstanceName::new(s).unwrap()
+    }
+
+    fn digest() -> Digest {
+        Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn severity_is_classified_per_event() {
+        let cases = [
+            (
+                Event::DeployOk {
+                    instance: name("a"),
+                    digest: digest(),
+                    generation: 1,
+                },
+                Severity::Info,
+            ),
+            (
+                Event::Provisioned {
+                    instance: name("a"),
+                    digest: digest(),
+                },
+                Severity::Info,
+            ),
+            (
+                Event::DeployFailed {
+                    instance: name("a"),
+                    digest: None,
+                    reason: "x".into(),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::RolledBack {
+                    instance: name("a"),
+                    failed: digest(),
+                    restored: digest(),
+                    reason: "x".into(),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::RollbackFailed {
+                    instance: name("a"),
+                    reason: "x".into(),
+                },
+                Severity::Critical,
+            ),
+            (
+                Event::Recreated {
+                    instance: name("a"),
+                    reason: "x".into(),
+                },
+                Severity::Info,
+            ),
+            (
+                Event::Pruned {
+                    container: "a".into(),
+                },
+                Severity::Debug,
+            ),
+            (
+                Event::WaitingForSecret {
+                    instance: name("a"),
+                    missing: vec!["t".into()],
+                },
+                Severity::Info,
+            ),
+            (
+                Event::WaitingForDependency {
+                    instance: name("a"),
+                    dependencies: vec![name("b")],
+                },
+                Severity::Debug,
+            ),
+            (
+                Event::WebhookDuplicate {
+                    delivery_id: "d".into(),
+                },
+                Severity::Debug,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(event.severity(), expected, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn severity_orders_and_serializes_lowercase() {
+        assert!(Severity::Debug < Severity::Info);
+        assert!(Severity::Info < Severity::Warning);
+        assert!(Severity::Warning < Severity::Critical);
+        assert_eq!(Severity::default(), Severity::Info);
+        assert_eq!(Severity::Warning.as_str(), "warning");
+        assert_eq!(Severity::Critical.to_string(), "critical");
+        assert_eq!(
+            serde_json::from_str::<Severity>("\"critical\"").unwrap(),
+            Severity::Critical
+        );
+        assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
     }
 }

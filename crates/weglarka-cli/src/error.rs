@@ -14,6 +14,8 @@ pub mod exit {
     pub const INVALID_REQUEST: i32 = 5;
     /// `deploy`: the new version failed the health gate, rolled back to the previous one.
     pub const ROLLED_BACK: i32 = 6;
+    /// `notify test`: the notification channel refused the test notification.
+    pub const NOTIFY_FAILED: i32 = 7;
     /// Invalid invocation, or input rejected locally.
     pub const USAGE: i32 = 64;
     /// No connection to the daemon (socket missing / no permission / daemon not running).
@@ -32,6 +34,7 @@ Exit codes:
    4  already exists / conflict
    5  daemon rejected the request (invalid_request)
    6  deploy: rolled back to the previous version (rolled_back)
+   7  notify test: the channel refused the test notification
   64  invalid invocation or input
   69  daemon unreachable (admin API socket)
   70  internal error (I/O, protocol, daemon error)

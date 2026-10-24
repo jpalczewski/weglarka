@@ -37,6 +37,7 @@ tracing-subscriber.workspace = true
 weglarka-api.workspace = true
 weglarka-core.workspace = true
 weglarka-ingress.workspace = true
+weglarka-notify.workspace = true
 weglarka-podman.workspace = true
 
 [dev-dependencies]

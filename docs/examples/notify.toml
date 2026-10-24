@@ -1,0 +1,43 @@
+# Notifications (issue #38, docs/decisions/0021-notifications.md): an excerpt of weglarka.toml, not of
+# apps.toml — the daemon reads it at startup and validates it strictly (a bad URL, topic or token file
+# stops the daemon instead of silently disabling notifications).
+#
+# ntfy is expected to run as a normal Węglarka app. Create the topic (`weglarka` below) and, unless the
+# server is public, an access token in its panel; keep the token in a 0600 file, never in this file:
+#
+#   umask 077 && printf '%s\n' 'tk_…' | sudo -u weglarka tee /var/lib/weglarka/ntfy-token >/dev/null
+#   sudo -u weglarka chmod 600 /var/lib/weglarka/ntfy-token
+#   systemctl --user restart weglarka
+#   weglarka notify test        # the install-time check: URL, DNS, ingress route and token
+#
+# Without a [notify] section the daemon only logs events (the behaviour before this feature). The
+# section is read at startup only — restart the daemon after editing it.
+
+[notify]
+# Repeated events of one kind for one app are coalesced: the first is delivered immediately, the rest
+# become one summary when the window closes ("3 more: deploy failed: ntfy"). 0 disables coalescing.
+dedup_window_secs = 300
+
+[notify.ntfy]
+# The public URL of the ntfy server. It must be reachable *from the Węglarka container*, which shares
+# only `net-weglarka` with the ingress — if the container cannot hairpin to the host's public domain,
+# use the internal route below instead.
+url = "https://nz.example.com"
+#
+# Internal route through the ingress container (plain HTTP inside `net-weglarka`; `host` is both the
+# `Host` header and the TLS server name, so it must be the ntfy app's domain):
+# url = "http://weglarka-nginx:8080"
+# host = "nz.example.com"
+
+# ntfy topic to publish to ([A-Za-z0-9_-], 1–64 characters).
+topic = "weglarka"
+
+# Optional access token file (0600; group/other permissions are refused). Omit it for a public topic.
+token_file = "/var/lib/weglarka/ntfy-token"
+
+# Lowest severity published to this channel: debug | info | warning | critical.
+#   info      deploy ok/failed/rolled back, rollback failed, provisioned, recreated, waiting for secrets
+#   warning   only failures and rollbacks
+#   critical  only a failed rollback
+#   debug     also container pruning, waiting for dependencies and duplicate webhooks
+min_severity = "info"

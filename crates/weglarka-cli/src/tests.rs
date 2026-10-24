@@ -13,15 +13,17 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use weglarka_api::{
     ApiError, CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, DoctorReport, ErrorCode,
-    PruneImagesResponse, PrunedImage, RuntimeState, SetSecretRequest, ShowAppResponse,
-    UpdateAppResponse, endpoints,
+    NotifyStatusResponse, PruneImagesResponse, PrunedImage, RuntimeState, SetSecretRequest,
+    ShowAppResponse, UpdateAppResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
 
 use crate::cli::{AddArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
-use crate::commands::{build_spec, read_secret_value};
+use crate::commands::{
+    build_spec, notify_status, notify_test, read_secret_value, render_notify_status,
+};
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
 use crate::preflight::testing::FakeHost;
@@ -1055,5 +1057,86 @@ fn runtime_labels_cover_the_lifecycle() {
     assert_eq!(
         runtime_label(RuntimeState::WaitingForSecret),
         "waiting-for-secret"
+    );
+}
+
+// ---------- notifications (issue #38) ----------
+
+fn notify_status_body(enabled: bool) -> String {
+    serde_json::json!({
+        "enabled": enabled,
+        "channels": if enabled {
+            serde_json::json!([{ "name": "ntfy", "min_severity": "warning", "pending": 2 }])
+        } else {
+            serde_json::json!([])
+        },
+        "pending": if enabled { 2 } else { 0 },
+        "dropped": if enabled { 1 } else { 0 },
+        "last_error": if enabled { Some("ntfy answered 500") } else { None },
+        "last_delivered_at": if enabled { Some("2026-10-24T13:40:00Z") } else { None }
+    })
+    .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn notify_status_and_test_call_the_documented_endpoints() {
+    let m = mock(|method, path| match (method, path) {
+        ("GET", "/v1/notifications") => (200, notify_status_body(true)),
+        ("POST", "/v1/notifications/test") => (
+            200,
+            serde_json::json!({ "delivered": false, "error": "ntfy refused the access token" })
+                .to_string(),
+        ),
+        _ => (404, api_err(ErrorCode::NotFound, "no such endpoint")),
+    })
+    .await;
+
+    let code = notify_status(true, &overrides(&m)).await.unwrap();
+    assert_eq!(code, exit::OK);
+    let code = notify_test(true, &overrides(&m)).await.unwrap();
+    assert_eq!(code, exit::NOTIFY_FAILED, "a refused test is a failure");
+
+    let seen = m.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("GET", "/v1/notifications")
+    );
+    assert_eq!(
+        (seen[1].method.as_str(), seen[1].path.as_str()),
+        ("POST", "/v1/notifications/test")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_delivered_notify_test_exits_zero() {
+    let m = mock(|_, _| (200, serde_json::json!({ "delivered": true }).to_string())).await;
+    assert_eq!(notify_test(true, &overrides(&m)).await.unwrap(), exit::OK);
+}
+
+#[test]
+fn notify_status_rendering_covers_off_pending_and_errors() {
+    let off: NotifyStatusResponse = serde_json::from_str(&notify_status_body(false)).unwrap();
+    let rendered = render_notify_status(&off);
+    assert!(rendered.contains("notifications: off"), "{rendered}");
+
+    let on: NotifyStatusResponse = serde_json::from_str(&notify_status_body(true)).unwrap();
+    let rendered = render_notify_status(&on);
+    assert!(
+        rendered.contains("ntfy: min severity warning"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("2 notifications queued"), "{rendered}");
+    assert!(
+        rendered.contains("outbox: 2 pending, 1 dropped"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("last delivered: 2026-10-24T13:40:00Z"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("last error: ntfy answered 500"),
+        "{rendered}"
     );
 }

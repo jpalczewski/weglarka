@@ -53,6 +53,9 @@ pub enum Command {
     /// Local images: remove the ones older than each app's current and previous image.
     #[command(subcommand)]
     Images(ImagesCommand),
+    /// Notifications: channel status and a test delivery.
+    #[command(subcommand)]
+    Notify(NotifyCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,6 +70,14 @@ pub struct PruneImagesArgs {
     /// List the images that would be removed; remove nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotifyCommand {
+    /// Show the configured channels, the pending outbox and the last delivery error.
+    Status,
+    /// Send a test notification now (bypasses the outbox and the dedup window).
+    Test,
 }
 
 #[derive(Debug, Subcommand)]

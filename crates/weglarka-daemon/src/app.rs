@@ -11,6 +11,7 @@ use weglarka_core::podman::PodmanClient;
 use weglarka_core::reconcile::{Reconciler, Trigger};
 use weglarka_core::secrets::FileSecretStore;
 use weglarka_core::webhook::WebhookSource;
+use weglarka_notify::NotifyHandle;
 
 use crate::ingress::IngressManager;
 use crate::settings::Paths;
@@ -28,6 +29,8 @@ pub struct Daemon<P: PodmanClient> {
     pub secrets: Arc<FileSecretStore>,
     pub ingress: Arc<IngressManager<P>>,
     pub github: Box<dyn WebhookSource>,
+    /// `None` when `weglarka.toml` configures no notification channel.
+    pub notify: Option<Arc<NotifyHandle>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
     pub desired_lock: tokio::sync::Mutex<()>,
     pub(crate) triggers: mpsc::Sender<Trigger>,
