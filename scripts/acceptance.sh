@@ -251,8 +251,8 @@ canary_request() {
   local -a extra=()
   if [ -n "$DIRECT" ]; then
     url=$DIRECT/
-    # Impersonate Traefik: the request reaches nginx through the port forwarder, which is a trusted
-    # peer by default, so the header must arrive at the app (docs/decisions/0007).
+    # Impersonate Traefik: the request reaches nginx through the port forwarder, which dials from one of
+    # nginx's own addresses — trusted by default — so the header must arrive at the app (docs/decisions/0032).
     extra=(-H "Host: $CANARY_DOMAIN" -H 'X-Forwarded-Proto: https')
   fi
   code=$(curl -sS --max-time 10 -o "$WORK/body" -w '%{http_code}' ${extra[@]+"${extra[@]}"} "$url" 2>"$WORK/curl_err") || rc=$?
@@ -416,7 +416,7 @@ step_traffic() {
     || { sed 's/^/  | /' "$WORK/body"; die "brak X-Forwarded-Host: $CANARY_DOMAIN w odpowiedzi whoami (nginx/Traefik nie przekazały nagłówka)"; }
   body_has 'X-Forwarded-For:' || die "brak X-Forwarded-For w odpowiedzi whoami"
   body_has 'X-Forwarded-Proto: https' \
-    || die "brak X-Forwarded-Proto: https (nginx nie ufa peerowi? sprawdź [ingress] trusted_proxies, docs/decisions/0007)"
+    || die "brak X-Forwarded-Proto: https (nginx nie ufa peerowi? porównaj \`remote_addr\` z logu nginx z własnymi adresami kontenera i sprawdź [ingress] trusted_proxies, docs/decisions/0032)"
   if [ -z "$DIRECT" ]; then
     note "https://$CANARY_DOMAIN/ → 200, cert ważny, nagłówki forwardowane"
   else

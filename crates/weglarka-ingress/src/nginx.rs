@@ -26,7 +26,8 @@ pub struct NginxOptions {
     /// Port nginx listens on *inside* the container (published on `ingress.bind`).
     pub listen_port: u16,
     /// Peers we trust for `X-Forwarded-*` and `real_ip` (`behind` mode: whoever connects to the
-    /// published port — with rootless Podman that is the port forwarder, not Traefik itself).
+    /// published port — with rootless Podman that is the port forwarder, not Traefik itself, and it
+    /// dials from one of nginx's own addresses, `docs/decisions/0032`).
     pub trusted_proxies: Vec<Cidr>,
     /// Webhook path prefixes (start and end with `/`); the rest of the domain → 404.
     pub webhook_paths: Vec<String>,
@@ -50,7 +51,7 @@ impl NginxOptions {
 
     /// Sets the trusted peers (CIDRs or bare addresses). There is deliberately no default: trusting
     /// a whole Podman address range would let any app container forge `X-Forwarded-*`
-    /// (`docs/decisions/0007`); callers pass the forwarder's network or the configured list.
+    /// (`docs/decisions/0007`); callers pass nginx's own addresses or the configured list.
     pub fn with_trusted_proxies(mut self, entries: &[String]) -> Result<Self, IngressError> {
         self.trusted_proxies = entries
             .iter()

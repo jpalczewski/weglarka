@@ -104,8 +104,9 @@ traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # root-owy path
 nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421428ce13bd1eaa412404953859cf7a5b6512c25e67a60"
 # Kontener nginx jest zawsze osłoniony (0014): read-only root, cap_drop ALL (+ CHOWN/SETGID/SETUID),
 # no-new-privileges. Własny obraz musi to tolerować (nie może pisać po swoim rootfs przy starcie).
-# Opcjonalnie: peery, którym nginx ufa w sprawie X-Forwarded-* (0007). Domyślnie podsieć `net-weglarka`
-# (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE domyślną. Zwykle zostaw nieustawione.
+# Opcjonalnie: peery, którym nginx ufa w sprawie X-Forwarded-* (0007, 0032). Domyślnie *własne adresy*
+# kontenera nginx we wszystkich jego sieciach (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE
+# domyślną i jest statyczna (adresy kontenera mogą się zmienić). Zwykle zostaw nieustawione.
 # trusted_proxies = ["10.89.1.2"]
 
 [admin]
@@ -132,6 +133,16 @@ pids_limit = 256                                           # limit procesów/wą
 i przekazuje go kontenerowi zmienną `WEGLARKA_PODMAN_SOCKET` w quadlecie. Jawne `socket` ma pierwszeństwo przed zmienną.
 Demon w kontenerze nie czyta `/etc/passwd` (obraz jest na `scratch`); bez socketu w configu i bez zmiennej kończy się
 czytelnym błędem.
+
+**Zaufanie nginx do `X-Forwarded-*` (0032).** Bez `trusted_proxies` demon przy każdym `apply` czyta *własne adresy*
+kontenera `weglarka-nginx` (we wszystkich jego sieciach: `net-weglarka` i `net-<apka>`) i ufa dokładnie im (wpisy
+`/32`). Forwarder portów rootless Podmana otwiera połączenie od środka netns nginx, więc jego adres źródłowy to
+któryś z tych adresów — niekoniecznie z `net-weglarka`. Kontenery apek łączące się po `net-<apka>` mają inne adresy
+i nie mogą podrobić nagłówków. Adres nginx w nowo dołączonej sieci (albo po odtworzeniu kontenera) poznajemy dopiero
+po jego pojawieniu się, więc ten sam przebieg `apply` czyta adresy ponownie i w razie zmiany regeneruje config
+oraz przeładowuje nginx. Restart kontenera przez Podmana, który zmienia adresy, zostanie zauważony dopiero przy
+następnym okresowym `apply`. Objaw rozjazdu: apka sprawdzająca schemat (np. OIDC wymagające https)
+odpowiada 400; porównaj `remote_addr` z logu nginx z `podman inspect weglarka-nginx` (pole `IPAddress` każdej sieci).
 
 ## 3. Binarki na hoście (`platform install`)
 

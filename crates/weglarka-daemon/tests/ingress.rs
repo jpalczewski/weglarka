@@ -84,10 +84,19 @@ async fn nginx_lifecycle() {
             .unwrap()
             .contains("h.example.eu")
     );
+    // The config rendered before the container existed could not know its addresses (bootstrap: the
+    // webhook network); the same pass regenerated it and reloaded, so nothing stale is left behind.
+    assert_eq!(kills(&fake), 1);
     assert_eq!(nginx_action(manager.apply().await), None);
-    // Default trust = the webhook network only, never an app network.
+    // Default trust = nginx's own addresses (/32), never a whole network (docs/decisions/0032).
     let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
-    assert!(conf.contains("set_real_ip_from 10.89.0.0/24;"));
+    let own = fake
+        .container_inspect("weglarka-nginx")
+        .await
+        .unwrap()
+        .addresses;
+    assert_eq!(own.len(), 1);
+    assert!(conf.contains(&format!("set_real_ip_from {}/32;", own[0])));
     assert_eq!(conf.matches("set_real_ip_from").count(), 1);
 
     // A new app with a domain: its network is connected to the running container and the config
@@ -101,14 +110,27 @@ async fn nginx_lifecycle() {
     let nginx = fake.container_inspect("weglarka-nginx").await.unwrap();
     assert_eq!(nginx.id, id_before);
     assert!(nginx.networks.contains(&"net-blog".to_owned()));
-    assert_eq!(kills(&fake), 1);
+    assert_eq!(
+        kills(&fake),
+        3,
+        "bootstrap swap + the new app (config, then its new address)"
+    );
     let calls = fake.calls();
-    let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap();
-    let connect =
-        pos(&|c| matches!(c, Call::NetworkConnect { network, .. } if network == "net-blog"));
-    let test =
-        pos(&|c| matches!(c, Call::ContainerExec { cmd, .. } if cmd[..2] == ["nginx", "-t"]));
-    let hup = pos(&|c| matches!(c, Call::ContainerKill { signal, .. } if signal == "HUP"));
+    let pos = |from: usize, pred: &dyn Fn(&Call) -> bool| {
+        from + calls[from..].iter().position(pred).unwrap()
+    };
+    let connect = pos(
+        0,
+        &|c| matches!(c, Call::NetworkConnect { network, .. } if network == "net-blog"),
+    );
+    let test = pos(
+        connect,
+        &|c| matches!(c, Call::ContainerExec { cmd, .. } if cmd[..2] == ["nginx", "-t"]),
+    );
+    let hup = pos(
+        connect,
+        &|c| matches!(c, Call::ContainerKill { signal, .. } if signal == "HUP"),
+    );
     assert!(
         connect < test && test < hup,
         "connect, then nginx -t, then HUP"
@@ -128,7 +150,7 @@ async fn nginx_lifecycle() {
         nginx_action(manager.apply().await),
         Some(NginxAction::Reloaded)
     );
-    assert_eq!(kills(&fake), 2);
+    assert_eq!(kills(&fake), 4);
     let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
     assert!(conf.contains("new.example.eu") && !conf.contains("blog.example.eu"));
     assert!(
@@ -144,7 +166,7 @@ async fn nginx_lifecycle() {
     set_apps(&[("blog", "newer.example.eu")]);
     let err = manager.apply().await.unwrap_err();
     assert!(err.to_string().contains("nginx -t"), "{err}");
-    assert_eq!(kills(&fake), 2);
+    assert_eq!(kills(&fake), 4);
     assert_eq!(
         std::fs::read_to_string(manager.conf_path()).unwrap(),
         good_conf
@@ -271,4 +293,72 @@ async fn failed_network_detach_does_not_block_traefik_file() {
     manager.apply().await.unwrap();
     let nginx = fake.container_inspect("weglarka-nginx").await.unwrap();
     assert_eq!(nginx.networks, ["net-weglarka"]);
+}
+
+/// Regression: the rootless port forwarder dials from inside nginx's network namespace, so its source
+/// is nginx's own address on *any* attached network (measured: the address on an app network, not
+/// `net-weglarka`). That address must be trusted; an app container's address on the same network, and
+/// the networks themselves, must not (docs/decisions/0032).
+#[tokio::test]
+async fn trusts_nginx_own_addresses_on_app_networks_but_not_app_containers() {
+    use futures_util::StreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"behind\"\nbind=\"127.0.0.1:18080\"\n[admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+        root.display()
+    ))
+    .unwrap();
+    let paths = StatePaths::in_dir(root);
+    let fake = FakePodman::new();
+    let engine = Arc::new(Reconciler::new(
+        fake.clone(),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        paths.clone(),
+        ReconcilerOptions::default(),
+    ));
+    let manager = IngressManager::new(engine, host, root.join("nginx"));
+    let mut file = state::load_apps(&paths.apps).unwrap();
+    file.apps
+        .insert(InstanceName::new("blog").unwrap(), spec("blog.example.eu"));
+    state::save_apps(&paths.apps, &file).unwrap();
+
+    // The app container shares `net-blog` with nginx.
+    manager.apply().await.unwrap();
+    let mut pull = std::pin::pin!(fake.image_pull("ghcr.io/x/y:latest"));
+    while let Some(event) = pull.next().await {
+        event.unwrap();
+    }
+    fake.add_foreign_container("blog", "ghcr.io/x/y:latest");
+    fake.network_connect("net-blog", "blog").await.unwrap();
+    // The pass that joined the app network re-renders with nginx's new address in the same run.
+    manager.apply().await.unwrap();
+    assert_eq!(
+        manager.apply().await.unwrap(),
+        ApplyReport::Unchanged,
+        "stable once the addresses are known"
+    );
+
+    let nginx = fake.container_inspect("weglarka-nginx").await.unwrap();
+    let app = fake.container_inspect("blog").await.unwrap();
+    assert_eq!(nginx.networks, ["net-blog", "net-weglarka"]);
+    assert_eq!(nginx.addresses.len(), 2, "one address per attached network");
+    assert_eq!(app.addresses.len(), 1);
+
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    for addr in &nginx.addresses {
+        assert!(
+            conf.contains(&format!("set_real_ip_from {addr}/32;")),
+            "{conf}"
+        );
+        assert!(conf.contains(&format!("{addr}/32 1;")), "{conf}");
+    }
+    assert_eq!(conf.matches("set_real_ip_from").count(), 2);
+    let forged = app.addresses[0];
+    assert!(
+        !conf.contains(&forged.to_string()),
+        "app container trusted: {conf}"
+    );
+    assert!(!conf.contains("/24"), "whole network trusted: {conf}");
 }

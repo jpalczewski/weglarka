@@ -855,6 +855,7 @@ mod tests {
             health: None,
             restarts: 0,
             networks: vec![],
+            addresses: vec![],
         }
     }
     fn target(inst: &str, pinned: Option<char>) -> (Target, SpecHash) {

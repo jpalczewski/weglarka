@@ -252,6 +252,7 @@ mod tests {
             health,
             restarts,
             networks: vec![],
+            addresses: vec![],
         }
     }
 

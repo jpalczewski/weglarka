@@ -2,6 +2,7 @@
 //! Scripting: pull digests, pull errors, healthcheck result queue, events.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
@@ -187,6 +188,7 @@ impl FakePodman {
                 exit_code: None,
                 health: None,
                 networks: Vec::new(),
+                addresses: Vec::new(),
                 restarts: 0,
             },
         );
@@ -352,12 +354,31 @@ impl State {
     /// Container snapshot with `networks` filled in from network membership.
     fn with_networks(&self, c: &ContainerInfo) -> ContainerInfo {
         let mut info = c.clone();
-        info.networks = self
+        let joined: Vec<(usize, &String, usize)> = self
             .networks
             .iter()
-            .filter(|(_, (_, members))| members.contains(&c.name))
-            .map(|(n, _)| n.clone())
+            .enumerate()
+            .filter_map(|(index, (n, (_, members)))| {
+                members
+                    .iter()
+                    .position(|m| *m == c.name)
+                    .map(|slot| (index, n, slot))
+            })
             .collect();
+        info.networks = joined.iter().map(|(_, n, _)| (*n).clone()).collect();
+        // Deterministic addresses in the subnet `network_inspect` reports (`10.89.N.0/24`): the gateway
+        // is `.1`, members get `.2`, `.3`, … in the order they joined. A stopped container has none.
+        info.addresses = if c.state == ContainerState::Running {
+            joined
+                .iter()
+                .map(|(index, _, slot)| {
+                    let octet = u8::try_from(index % 250).unwrap_or(0);
+                    IpAddr::from([10, 89, octet, u8::try_from(slot + 2).unwrap_or(254)])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         info
     }
 
@@ -451,6 +472,7 @@ impl PodmanClient for FakePodman {
                 health,
                 restarts: 0,
                 networks: Vec::new(),
+                addresses: Vec::new(),
             },
         );
         Ok(id)
