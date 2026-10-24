@@ -21,8 +21,9 @@ use crate::events::{Event, EventSink, TracingSink};
 use crate::hash::SpecHash;
 use crate::labels;
 use crate::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient, PodmanError};
-use crate::secret_store::{SecretError, SecretStore};
+use crate::secret_store::{SecretError, SecretStore, scoped_name};
 use crate::state::{self, StateError, StatePaths};
+use crate::volumes::RemoveAppOptions;
 use crate::waiting::{apply_waiting, missing_secrets};
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,12 @@ pub enum EngineError {
     Podman(#[from] PodmanError),
     #[error("unknown instance: {0}")]
     UnknownInstance(InstanceName),
+    /// The registry refused the pull (401/403): the image may exist, but the podman user has no
+    /// (valid) credentials for it. Fix `auth.json`, do not look for a missing image.
+    #[error(
+        "registry rejected the pull of {reference} ({message}); check the podman user's credentials (`podman login`)"
+    )]
+    RegistryAuth { reference: String, message: String },
     #[error("cannot resolve image digest for {0}")]
     NoDigest(String),
     /// No free uid range of `size` left in the rootless user's subuid pool (docs/decisions/0009).
@@ -49,7 +56,7 @@ pub enum EngineError {
     #[error("{0}")]
     Volume(String),
     /// An app's config mounts cannot be mounted (no `config_root`, a missing source, an escape…;
-    /// issue #118, `docs/decisions/0023-config-root-mounts.md`).
+    /// issue #118, `docs/decisions/0026-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
@@ -108,6 +115,12 @@ pub enum EngineError {
         from: String,
         to: String,
     },
+    /// `secrets remove` of a secret the app's spec still binds (issue #80). Not an error in the
+    /// engine: the binding has to go first, or the caller passes `force` (the app then waits).
+    #[error(
+        "secret {secret} is still bound by the spec of {name}; unbind it first or pass --force"
+    )]
+    SecretInUse { name: InstanceName, secret: String },
 }
 
 /// `a, b` for error messages.
@@ -488,14 +501,44 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
+    /// `apps remove` without purging: the instance's volumes (and their data) and secrets stay, so a
+    /// re-added app finds them again. The lock moves into [`Self::remove_app_with_purges`].
     pub async fn remove_app(&self, name: &InstanceName) -> Result<(), EngineError> {
+        self.remove_app_with_purges(name, RemoveAppOptions::default())
+            .await
+    }
+
+    /// Deletes one of the instance's secrets from the store (`secrets remove`, issue #80).
+    ///
+    /// Refused with [`EngineError::SecretInUse`] while the app's spec still binds it and `force` is
+    /// not set — the running container would keep the old value while the next launch has none. With
+    /// `force` the secret goes away and the app waits for it again (`waiting_for_secrets`). The app
+    /// need not exist in `apps.toml`: that is how the leftovers of a removed app are cleaned up.
+    /// An absent secret is [`EngineError::Secret`] wrapping [`SecretError::NotFound`].
+    pub async fn remove_secret(
+        &self,
+        instance: &InstanceName,
+        secret: &str,
+        force: bool,
+    ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        crate::depends::ensure_not_depended_on(&apps, name)?;
-        if apps.apps.remove(name).is_none() {
-            return Err(EngineError::UnknownInstance(name.clone()));
+        let apps = state::load_apps(&self.paths.apps)?;
+        if !force {
+            let bound = apps
+                .apps
+                .get(instance)
+                .is_some_and(|spec| spec.secrets.iter().any(|b| b.secret == secret));
+            if bound {
+                return Err(EngineError::SecretInUse {
+                    name: instance.clone(),
+                    secret: secret.to_owned(),
+                });
+            }
         }
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+        let key = scoped_name(instance, secret);
+        crate::secrets::blocking(&self.secrets, move |store| store.remove(&key)).await?;
+        tracing::info!(instance = %instance, secret = %secret, "secret removed");
+        Ok(())
     }
 
     /// A single reconcile pass.
@@ -557,7 +600,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
-                // stays as it is until the operator fixes the root or the file (ADR 0023).
+                // stays as it is until the operator fixes the root or the file (ADR 0026).
                 blocked = true;
                 report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {

@@ -424,6 +424,76 @@ async fn update_that_would_change_the_range_with_private_data_is_refused() {
 }
 
 #[tokio::test]
+async fn joining_a_group_after_stopping_the_app_is_refused() {
+    let h = harness().await;
+    // A deployed app with a private volume: it owns a range and the volume holds data.
+    let spec = json!({
+        "image": IMAGE,
+        "health": { "attempts": 1, "window_secs": 1 },
+        "volumes": [{ "name": "data", "target": "/data" }]
+    });
+    add(&h, "szklana", spec.clone()).await;
+    deploy(&h, "szklana").await;
+    let old_range = state_file(&h)
+        .apps
+        .get(&instance("szklana"))
+        .and_then(|a| a.uid_range)
+        .expect("deployed app owns a range");
+
+    // `apps stop`: provision only — the container goes away, the private volume and range stay.
+    let mut stopped = spec.clone();
+    stopped["start"] = json!(false);
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/szklana",
+        Some(json!({ "spec": stopped })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        h.fake.containers().iter().all(|c| c.name != "szklana"),
+        "provisioning removes the container"
+    );
+
+    // Joining the group would move the app into the group's range; the data owner is in state.
+    declare(&h, GROUP).await;
+    let mut joining = spec.clone();
+    joining["shared_volumes"] = json!([{ "name": GROUP, "target": "/group" }]);
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/szklana",
+        Some(json!({ "spec": joining })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let message = body["message"].as_str().unwrap_or_default().to_owned();
+    assert!(message.contains("uid range"), "{message}");
+
+    // Nothing was persisted and nothing started.
+    assert!(
+        apps_file(&h)
+            .apps
+            .get(&instance("szklana"))
+            .is_some_and(|s| s.shared_volumes.is_empty())
+    );
+    assert_eq!(
+        state_file(&h)
+            .apps
+            .get(&instance("szklana"))
+            .and_then(|a| a.uid_range),
+        Some(old_range)
+    );
+    let containers = h.fake.containers();
+    assert!(
+        containers.iter().all(|c| c.name != "szklana"),
+        "nothing was started for the app: {containers:?}"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn mounting_an_undeclared_shared_volume_is_a_bad_request() {
     let h = harness().await;
     let (status, body) = admin(

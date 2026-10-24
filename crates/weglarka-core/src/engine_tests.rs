@@ -24,6 +24,7 @@ use crate::secret_store::{SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
 use crate::state::{StatePaths, load_state};
 use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman};
+use crate::volumes::RemoveAppOptions;
 use crate::webhook::WebhookEvent;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
@@ -795,6 +796,202 @@ async fn missing_secrets_mean_waiting_not_failure_and_setting_them_deploys() {
     assert!(st.waiting_for_secrets.is_empty() && st.failed.is_none());
 }
 
+const BOUND_SECRET: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+health = { attempts = 1, window_secs = 1 }
+secrets = [{ secret = "token", kind = "env", var = "TOKEN" }]
+"#;
+
+/// Issue #80: a secret the spec still binds is refused without `force` (nothing is touched); with
+/// `force` it is gone and the app waits for it — its running container is left alone.
+#[tokio::test(start_paused = true)]
+async fn removing_a_bound_secret_needs_force_and_leaves_the_container_running() {
+    let h = Harness::new(BOUND_SECRET);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.store.set("ntfy.token", SecretValue::new("t1")).unwrap();
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.fake.containers().len(), 1);
+
+    let err = h
+        .rec
+        .remove_secret(&name("ntfy"), "token", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::SecretInUse { name: inst, secret }
+            if inst == &name("ntfy") && secret == "token"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "secret token is still bound by the spec of ntfy; unbind it first or pass --force"
+    );
+    assert!(
+        h.store.get("ntfy.token").unwrap().is_some(),
+        "a refused removal touches the store"
+    );
+
+    h.rec
+        .remove_secret(&name("ntfy"), "token", true)
+        .await
+        .unwrap();
+    assert!(h.store.get("ntfy.token").unwrap().is_none());
+
+    // The next pass reports waiting and leaves the container (still holding the old value) in place.
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty(), "{report:?}");
+    assert_eq!(
+        report.waiting,
+        vec![(name("ntfy"), vec!["token".to_owned()])]
+    );
+    assert_eq!(h.state("ntfy").waiting_for_secrets, ["token"]);
+    assert_eq!(h.fake.containers().len(), 1);
+}
+
+const TWO_APPS_WITH_SECRETS: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+health = { attempts = 1, window_secs = 1 }
+secrets = [
+  { secret = "config", kind = "mount", path = "/config.json" },
+  { secret = "token", kind = "env", var = "TOKEN" },
+]
+[apps.other]
+image = "ghcr.io/x/other:latest"
+health = { attempts = 1, window_secs = 1 }
+secrets = [{ secret = "key", kind = "env", var = "KEY" }]
+"#;
+
+/// Issue #80: `apps remove --purge-secrets` deletes the whole `<instance>.*` scope (unbound
+/// `webhook-hmac` included) and nothing of another app. Re-adding the app under the same name with
+/// the same binding then waits for the secret instead of deploying the stale value.
+#[tokio::test(start_paused = true)]
+async fn purge_secrets_drops_only_the_instances_scope_and_a_readded_app_waits() {
+    let h = Harness::new(TWO_APPS_WITH_SECRETS);
+    for (key, value) in [
+        ("ntfy.config", "{}"),
+        ("ntfy.token", "t1"),
+        // Set lazily by the webhook flow and not bound by the spec: still part of the scope.
+        ("ntfy.webhook-hmac", "hmac"),
+        ("other.key", "k1"),
+    ] {
+        h.store.set(key, SecretValue::new(value)).unwrap();
+    }
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(h.fake.containers().len(), 2);
+
+    h.rec
+        .remove_app_with_purges(
+            &name("ntfy"),
+            RemoveAppOptions {
+                purge_volumes: false,
+                purge_secrets: true,
+            },
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    assert_eq!(names, ["other.key"], "only the instance's scope is gone");
+    assert!(
+        !crate::state::load_apps(&h.rec.paths().apps)
+            .unwrap()
+            .apps
+            .contains_key(&name("ntfy"))
+    );
+
+    // Re-adding the app: the bindings have no values any more, so it waits — the stale secret is not
+    // silently reused (plain `apps remove` keeps secrets, `--purge-secrets` does not).
+    h.set_apps(TWO_APPS_WITH_SECRETS);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert!(report.actions.is_empty(), "{report:?}");
+    assert_eq!(
+        report.waiting,
+        vec![(name("ntfy"), vec!["config".to_owned(), "token".to_owned()])]
+    );
+    assert!(h.fake.container_spec("ntfy").is_some(), "left alone");
+}
+
+/// Issue #80: `secrets remove` needs no app in `apps.toml` — that is how leftovers of a renamed or
+/// removed instance are cleaned up. An absent secret is `SecretError::NotFound`.
+#[tokio::test(start_paused = true)]
+async fn remove_secret_works_for_an_app_absent_from_apps_toml() {
+    let h = Harness::new(NTFY);
+    h.store.set("ntfy.token", SecretValue::new("t1")).unwrap();
+    h.store.set("gone.old", SecretValue::new("v")).unwrap();
+
+    h.rec
+        .remove_secret(&name("gone"), "old", false)
+        .await
+        .unwrap();
+    assert!(h.store.get("gone.old").unwrap().is_none());
+    assert!(
+        h.store.get("ntfy.token").unwrap().is_some(),
+        "another scope is untouched"
+    );
+
+    // Leftovers of a removed app as well (`apps remove` keeps secrets by default).
+    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_secret(&name("ntfy"), "token", false)
+        .await
+        .unwrap();
+    assert!(h.store.get("ntfy.token").unwrap().is_none());
+
+    let err = h
+        .rec
+        .remove_secret(&name("ntfy"), "token", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::Secret(crate::secret_store::SecretError::NotFound(_))
+        ),
+        "{err:?}"
+    );
+}
+
+/// Issue #80: purging an app that is not in `apps.toml` fails before any purge runs — neither the
+/// secrets of another scope nor `apps.toml` are touched.
+#[tokio::test(start_paused = true)]
+async fn purge_of_an_unknown_app_errors_and_touches_state_nor_secrets() {
+    let h = Harness::new(NTFY);
+    h.store.set("ntfy.token", SecretValue::new("t1")).unwrap();
+    h.store.set("nope.left", SecretValue::new("v")).unwrap();
+    let apps_before = std::fs::read(&h.rec.paths().apps).unwrap();
+
+    let err = h
+        .rec
+        .remove_app_with_purges(
+            &name("nope"),
+            RemoveAppOptions {
+                purge_volumes: true,
+                purge_secrets: true,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::UnknownInstance(_)), "{err:?}");
+    assert_eq!(
+        std::fs::read(&h.rec.paths().apps).unwrap(),
+        apps_before,
+        "apps.toml is untouched"
+    );
+    assert!(
+        h.store.get("nope.left").unwrap().is_some(),
+        "the secret purge is not reached"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn new_secret_binding_on_a_running_app_keeps_the_old_container() {
     let h = Harness::new(NTFY);
@@ -1426,7 +1623,7 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
-// ── config_root mounts and reload (issue #118, ADR 0023) ────────────────────────
+// ── config_root mounts and reload (issue #118, ADR 0026) ────────────────────────
 
 /// App with two config mounts (a file and a directory) and a signal-based reload.
 const WITH_CONFIGS: &str = r#"

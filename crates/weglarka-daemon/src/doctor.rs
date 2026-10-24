@@ -1,7 +1,7 @@
 //! Daemon-side `doctor`: what makes sense to check from inside the running process.
 //! Host checks (subuid, linger, cgroups…) are done by `weglarka doctor --preflight`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 
 use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
@@ -12,7 +12,7 @@ use weglarka_core::labels;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
 };
-use weglarka_core::secret_store::{SecretStore, scoped_name};
+use weglarka_core::secret_store::{SecretStore, scoped_name, split_scoped};
 use weglarka_core::shared_volumes;
 use weglarka_core::state::{self, StateFile};
 
@@ -35,6 +35,17 @@ fn check(
 
 fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
     check(id, CheckStatus::Ok, message, None)
+}
+
+/// A state file written by a newer Węglarka needs a different remedy than a malformed one
+/// (issue #98): do not tell the operator to delete it.
+fn state_hint(error: &state::StateError, malformed: &'static str) -> &'static str {
+    match error {
+        state::StateError::SchemaTooNew { .. } => {
+            "written by a newer Węglarka: roll forward, or restore this file from before the upgrade"
+        }
+        _ => malformed,
+    }
 }
 
 pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
@@ -110,7 +121,7 @@ async fn desired_state<P: PodmanClient>(
             "state.apps_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("fix or remove apps.toml"),
+            Some(state_hint(e, "fix or remove apps.toml")),
         ),
     });
     out.push(match &st {
@@ -119,7 +130,10 @@ async fn desired_state<P: PodmanClient>(
             "state.state_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("removing state.toml is safe (instances get a fresh deploy)"),
+            Some(state_hint(
+                e,
+                "removing state.toml is safe (instances get a fresh deploy)",
+            )),
         ),
     });
     let (Ok(apps), Ok(st)) = (apps, st) else {
@@ -646,7 +660,7 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let (Ok(apps), Ok(list)) = (state::load_apps(&d.paths.state.apps), d.secrets.list()) else {
         return;
     };
-    let have: BTreeSet<String> = list.into_iter().map(|m| m.name).collect();
+    let have: BTreeSet<String> = list.iter().map(|m| m.name.clone()).collect();
     let missing: Vec<String> = apps
         .apps
         .iter()
@@ -664,6 +678,35 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some("`weglarka secrets set <app> webhook-hmac` (use the same secret in the GitHub webhook)"),
         )
     });
+    // Orphans (issue #80): secrets of an instance that is no longer in `apps.toml` — the leftovers of
+    // a removed or renamed app. A warning, not a failure: they break nothing at runtime, they are a
+    // hygiene problem (the store is never written by the removal unless `--purge-secrets` is used).
+    let mut orphans: BTreeMap<InstanceName, Vec<&str>> = BTreeMap::new();
+    for meta in &list {
+        let Ok((instance, name)) = split_scoped(&meta.name) else {
+            continue; // a malformed key is reported by the store itself (`state.secrets_file`)
+        };
+        if apps.apps.contains_key(&instance) {
+            continue;
+        }
+        orphans.entry(instance).or_default().push(name);
+    }
+    if !orphans.is_empty() {
+        let listed = orphans
+            .iter()
+            .map(|(app, names)| format!("{app} ({})", names.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(check(
+            "state.orphan_secrets",
+            CheckStatus::Warn,
+            format!("secrets of apps not in apps.toml: {listed}"),
+            Some(
+                "`weglarka secrets remove <app> <name>`; `weglarka apps remove <app> --purge-secrets` \
+                 deletes the whole scope next time",
+            ),
+        ));
+    }
 }
 
 async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

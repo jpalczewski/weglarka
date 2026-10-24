@@ -7,6 +7,7 @@
 pub mod admin;
 pub mod app;
 pub mod doctor;
+pub mod forgejo;
 pub mod github;
 pub mod health_probe;
 pub mod images;
@@ -23,6 +24,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use weglarka_core::webhook::WebhookSource;
 
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, watch};
@@ -54,7 +56,7 @@ pub enum StartError {
     SharedVolumes(String),
     /// The startup preconditions of host config mounts are not met: `config_root` is configured but
     /// unusable, or an app declares `configs` while it is unset (issue #118,
-    /// `docs/decisions/0023-config-root-mounts.md`). A single missing/escaping source is *not* a
+    /// `docs/decisions/0026-config-root-mounts.md`). A single missing/escaping source is *not* a
     /// startup error — the engine refuses to mount it and `doctor` reports it.
     #[error("config mounts: {0}")]
     Configs(#[from] ConfigError),
@@ -62,6 +64,9 @@ pub enum StartError {
     /// opt-in, but once configured they must work — a silent no-op would hide a broken deployment.
     #[error("notifications: {0}")]
     Notify(#[from] weglarka_notify::NotifySettingsError),
+    /// `[webhook.forgejo]` is present but unusable.
+    #[error("{0}")]
+    Webhook(String),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -200,6 +205,12 @@ pub async fn start<P: PodmanClient + 'static>(
         host.clone(),
         paths.nginx_conf_dir.clone(),
     ));
+    let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];
+    if let Some(forgejo) = &host.webhook.forgejo {
+        webhook_sources.push(Box::new(
+            forgejo::Forgejo::new(forgejo).map_err(StartError::Webhook)?,
+        ));
+    }
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let daemon = Arc::new(Daemon {
         host: host.clone(),
@@ -207,7 +218,7 @@ pub async fn start<P: PodmanClient + 'static>(
         engine: engine.clone(),
         secrets,
         ingress: ingress.clone(),
-        github: Box::new(github::GitHub),
+        webhook_sources,
         notify: notify.clone(),
         desired_lock: tokio::sync::Mutex::new(()),
         triggers: trigger_tx,

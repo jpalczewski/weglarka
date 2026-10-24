@@ -56,8 +56,10 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 2. `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 3. Snapshoty: `INSTA_UPDATE=always cargo test`, przejrzyj diff `.snap` i commituj `.snap` (`.snap.new` jest ignorowany).
 4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
-   w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Opisz też kompatybilność wstecz
-   (`deny_unknown_fields` a rollback) w PR i w `docs/install.md`.
+   w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Nowe pole `apps.toml`/`state.toml`
+   (także `AppState`) → podbij `state::SCHEMA_VERSION` i dopisz krok w `SCHEMA_STEPS` (kompilacja tego pilnuje,
+   ADR 0023); kompatybilność wstecz (`deny_unknown_fields` a rollback) opisz w PR i w `docs/install.md`
+   — dla plików stanu to [wersja schematu](docs/install.md#wersja-schematu-plików-stanu-rollback-między-wersjami).
 5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md).
    Tabelę indeksu generuje `scripts/adr.sh index` — nie edytuj jej ręcznie. Numer ADR to zasób wspólny
    dla równoległych gałęzi: zarezerwuj go wcześnie (push + draft PR ze stubem ADR-a) i scalaj szybko;
@@ -114,13 +116,13 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 
 | Obszar | Pliki |
 |---|---|
-| model i walidacja apki | `core/src/app.rs`, `core/src/state.rs` (`AppSpec`, `AppsFile`, `validate_app`) |
+| model i walidacja apki | `core/src/app.rs`, `core/src/state.rs` (`AppSpec`, `AppsFile`, `validate_app`, `SCHEMA_VERSION` + bramka schematu) |
 | pętla reconcile | `core/src/reconcile.rs` — czyste `plan()` (`Target`/`Action`) + `execute()` (jedyny pisarz stanu) |
 | deploy | `core/src/deploy.rs` — `deploy_locked`: pull → stop → create+start → bramka → rollback; `provision_locked` |
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
 | wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
-| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0023) |
+| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0026) |
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
@@ -134,8 +136,12 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 
 - **Nowe pola `AppSpec` / `ContainerSpec` są opcjonalne i nie zmieniają `spec_hash`, gdy nie są ustawione**
   (`skip_serializing_if` w `HashInput`) — inaczej aktualizacja Węglarki odtworzy wszystkie działające apki.
-- **TOML-e mają `deny_unknown_fields`:** nowe pole w `state.toml`/`apps.toml` łamie rollback do starszego demona —
-  opisz to w PR i w notatce do wdrożenia.
+- **Wersjonowanie schematu stanu (ADR 0023):** `apps.toml`/`state.toml` mogą nieść `schema_version`; plik bez
+  znacznika to v1 (dzisiejszy kształt — demon celowo go nie dopisuje, żeby nie łamać najbliższego rollbacku),
+  a każde nowe pole wymaga podbicia `state::SCHEMA_VERSION` i wpisu w `SCHEMA_STEPS` (pilnuje tego const-assert).
+  Starszy demon odmawia startu z czytelnym komunikatem zamiast błędu parsowania; rollback przez granicę wersji
+  schematu wymaga kopii plików sprzed aktualizacji. `secrets.toml` nie jest (jeszcze) wersjonowany, a `[notify]`
+  w `weglarka.toml` nadal trzeba usunąć ręcznie przed downgradem.
 - **Rollback przywraca digest, nie spec:** nieudany deploy wznawia poprzedni obraz *z nowym spec-em*, więc zmiana
   specu, która psuje start (`command`, `env`, mount), obleje deploy **i** rollback — apka leży do czasu poprawki
   specu. Nie opisuj nowego pola `AppSpec` jako „rollback-safe” (przykład: `command`, ADR 0019).
@@ -155,21 +161,31 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
   rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
-- **Configi z hosta (ADR 0023):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
+- **Configi z hosta (ADR 0026):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
   demona w `platform install` — po upgrade trzeba go przeinstalować), `configs = [{ source, target }]` w spec
   apki (source względny do rootu, walidacja składniowa w `validate_app`; start i zapis sprawdzają tylko sam
   `config_root`, a canonicalize/containment źródła — reconcile i moment tworzenia kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
   **lista `configs` jest w hashu**; `reload_signal` poza hashem. Zmianę treści aplikuje `apps reload` (sygnał albo
   restart), a single-file bind mount po write-and-rename wymaga `--recreate`. Oba pliki TOML mają
-  `deny_unknown_fields` → przed downgradem usunąć `config_root`, `configs`, `reload_signal`. Pliki runtime usera
+  `deny_unknown_fields`, a `apps.toml` dostaje `schema_version = 2` (`state::SCHEMA_VERSION` + no-op
+  `SCHEMA_STEPS`, ADR 0023) → przed downgradem usunąć `config_root`, `configs`, `reload_signal` i marker
+  `schema_version` (albo przywrócić pliki z kopii). Pliki runtime usera
   widoczne w zakresie UID apki jako `nobody` → 0644/0755. Szczegóły:
-  [`docs/decisions/0023-config-root-mounts.md`](docs/decisions/0023-config-root-mounts.md) i
-  [`docs/install.md` 6j](docs/install.md#6j-configi-z-hosta-config_root-i-apps-reload).
+  [`docs/decisions/0026-config-root-mounts.md`](docs/decisions/0026-config-root-mounts.md) i
+  [`docs/install.md` 6k](docs/install.md#6k-configi-z-hosta-config_root-i-apps-reload).
 - **Detekcja awarii (ADR 0022):** watcher crash loopów działa w przejściu reconcile — `container_list` już
   robi inspect każdego kontenera, więc licznik restartów (`RestartCount` → `ContainerInfo.restarts`) nie
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
   ustala baseline), pod mutexem silnika, a granicą baseline'u jest etykieta `weglarka.generation`. Progi w
   `[monitor]` (nowa sekcja → kolejny caveat downgrade'u), zdarzenia idą tym samym `EventSink`-iem co deploye.
+- **Sekrety są w zakresie per instancja (ADR 0024, `<apka>.<nazwa>` w `secrets.toml`)** — `apps remove`
+  domyślnie **zachowuje** je (dane i poświadczenia to osobne decyzje), więc nowa apka pod starą nazwą
+  dziedziczy stare wartości. Sprzątanie przy usuwaniu: `apps remove --purge-secrets` (cały zakres
+  `<apka>.*`, także `webhook-hmac`, niezależnie od `--purge-volumes`, przed zapisem `apps.toml`).
+  `secrets remove` działa **także po usunięciu apki** (sprząta pozostałości po zmianie nazwy instancji),
+  a `doctor` ostrzega checkiem `state.orphan_secrets`. Szczegóły:
+  [`docs/decisions/0024-secret-removal-and-purge.md`](docs/decisions/0024-secret-removal-and-purge.md) i
+  [`docs/install.md` 6j](docs/install.md#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 

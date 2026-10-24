@@ -6,7 +6,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 use weglarka_core::podman::image_repo;
-use weglarka_core::webhook::{WebhookError, WebhookEvent, WebhookRequest, WebhookSource};
+use weglarka_core::webhook::{
+    WebhookError, WebhookEvent, WebhookRequest, WebhookSource, valid_ref,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -53,13 +55,6 @@ struct Tag {
     name: String,
 }
 
-/// A reference must be a single "word" from a safe alphabet — it ends up in logs and comparisons.
-fn valid_ref(r: &str) -> bool {
-    r.len() <= 255
-        && r.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-' | b':'))
-}
-
 impl Package {
     fn image_ref(&self) -> Result<Option<String>, WebhookError> {
         if !self.package_type.is_empty() && !self.package_type.eq_ignore_ascii_case("container") {
@@ -90,6 +85,14 @@ impl Package {
 impl WebhookSource for GitHub {
     fn name(&self) -> &'static str {
         "github"
+    }
+
+    fn headers(&self) -> &'static [&'static str] {
+        &[SIGNATURE_HEADER, EVENT_HEADER, DELIVERY_HEADER]
+    }
+
+    fn delivery_header(&self) -> &'static str {
+        DELIVERY_HEADER
     }
 
     fn verify(&self, request: &WebhookRequest, secret: &[u8]) -> Result<(), WebhookError> {

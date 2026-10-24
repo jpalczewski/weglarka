@@ -1,4 +1,4 @@
-# 0023 — Host config mounts (`config_root`) and app reload
+# 0026 — Host config mounts (`config_root`) and app reload
 
 Status: proposed (2026-10-24, issue #118)
 
@@ -106,9 +106,15 @@ is group/world-writable.
 
 ## Consequences
 
-- New `weglarka.toml` key and two new optional `AppSpec` fields. All are inside `deny_unknown_fields`
-  files: **an older daemon refuses to start with them** — rollback requires removing `config_root` and
-  `configs`/`reload_signal` first. Documented in `docs/install.md` and in the PR.
+- New `weglarka.toml` key and two new optional `AppSpec` fields. `apps.toml` gained a field, so
+  `state::SCHEMA_VERSION` goes to 2 with a no-op `SCHEMA_STEPS` entry (the fields have defaults and
+  need no data migration; ADR 0023). From the first save afterwards the file carries
+  `schema_version = 2` and an older daemon refuses to start with the schema message instead of a TOML
+  parse error. Rolling back across the bump means restoring `apps.toml`/`state.toml` from before the
+  upgrade, or removing the new fields **and** the marker. `weglarka.toml` stays unversioned
+  (human-written config), so `config_root` must be removed by hand. Documented in `docs/install.md`
+  ([the install guide](../install.md#wersja-schematu-plików-stanu-rollback-między-wersjami) and its
+  section 6k) and in the PR.
 - No `spec_hash` change for apps that do not use configs (golden snapshot stays); adding `configs`
   recreates the container on the next deploy.
 - Existing installs must re-run `weglarka platform install` to gain the read-only `config_root` mount

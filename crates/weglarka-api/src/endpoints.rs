@@ -41,7 +41,8 @@ pub const APPS_UPDATE: Endpoint = Endpoint {
     path: "/v1/apps/{name}",
 };
 /// `DELETE` → 204. Query [`RemoveAppQuery`](crate::RemoveAppQuery): `?purge_volumes=true` also removes
-/// the instance's volumes (kept by default).
+/// the instance's volumes (kept by default), `?purge_secrets=true` also removes the instance's secrets
+/// (kept by default; independent of the volumes).
 pub const APPS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/apps/{name}",
@@ -67,6 +68,15 @@ pub const SECRETS_LIST: Endpoint = Endpoint {
 /// Overwrite only; there is no endpoint for reading the value back.
 pub const SECRETS_SET: Endpoint = Endpoint {
     method: Method::Put,
+    path: "/v1/apps/{name}/secrets/{secret}",
+};
+/// `DELETE` → 204. Query [`RemoveSecretQuery`](crate::RemoveSecretQuery): `?force=true` removes the
+/// secret even though the app's spec still binds it (the app then waits for it). Refused with 409
+/// while the spec binds it and `force` is not set; 404 when the store has no such secret. The app
+/// need not exist in `apps.toml` — that is how the leftovers of a removed app are cleaned up
+/// (issue #80).
+pub const SECRETS_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
     path: "/v1/apps/{name}/secrets/{secret}",
 };
 /// `GET` → [`ListVolumesResponse`](crate::ListVolumesResponse): volumes declared in the app's spec.
@@ -139,6 +149,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_RELOAD,
     SECRETS_LIST,
     SECRETS_SET,
+    SECRETS_REMOVE,
     VOLUMES_LIST,
     VOLUMES_EXPORT,
     VOLUMES_IMPORT,

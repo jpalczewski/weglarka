@@ -19,7 +19,8 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
 [6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
 [6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
-[6j. Configi z hosta](#6j-configi-z-hosta-config_root-i-apps-reload) ·
+[6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
+[6k. Configi z hosta](#6k-configi-z-hosta-config_root-i-apps-reload) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -266,8 +267,9 @@ opcjonalne (`--with-local-registry`) — wymagają tymczasowego rejestru na `127
 usługi Podmana (czyta go przy starcie). Skrypt sam niczego nie konfiguruje; bez wpisu deploy kończy się FAIL
 z podpowiedzią. Na produkcji nie zalecane.
 
-Uwaga: `secrets.toml` zachowuje sekret `webhook-hmac` kanarka po jego usunięciu (jednorazowa wartość testowa,
-nadpisywana przy kolejnym uruchomieniu).
+Uwaga: `apps remove` domyślnie **zachowuje** sekrety kanarka w `secrets.toml` (`webhook-hmac`); skrypt
+sprząta je w kroku „sprzątanie” przez `--purge-secrets`, więc po przebiegu nie zostają osierocone wpisy
+(i `doctor` nie zgłasza ich w `state.orphan_secrets`). Sprzątanie po fakcie — [6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
 
 ## 6. Pierwsza apka: ntfy.zig
 
@@ -285,6 +287,9 @@ weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:latest \
 weglarka secrets set ntfy config < ./config.json                # plik trafia pod /config.json
 weglarka apps show ntfy                                         # deploy rusza sam: pull, bramka zdrowia
 ```
+
+`secrets set` tylko nadpisuje wartość — sekret usuwa się przez `secrets remove`, a cały zakres apki
+sprząta `apps remove --purge-secrets` ([6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce)).
 
 ### Wartość sekretu: `< plik`, nie `/dev/stdin`
 
@@ -335,6 +340,37 @@ Po pierwszym pushu sprawdź *Recent Deliveries*: `latest` → **202**, `sha-…`
 zły sekret, 204 dla `latest` = niezgodna nazwa obrazu. Nazwy pól payloadu są jeszcze niepotwierdzone na prawdziwym
 pushu (0004) — pierwsza dostawa jest też testem.
 
+### Webhook Forgejo (prywatne obrazy)
+
+Adapter Forgejo (ADR 0025) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
+Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyżej (`webhook-hmac`, per apka).
+
+1. **Rejestr z konfiguracji.** Payload nie zawiera hosta rejestru, więc podaj go w `weglarka.toml`:
+
+   ```toml
+   [webhook.forgejo]
+   registry = "git.example.eu"   # sam host[:port], bez schematu i ścieżki
+   ```
+
+   Bez tej sekcji trasa odpowiada 404. Starszy demon nie wystartuje z tą sekcją (`deny_unknown_fields`) —
+   przed downgradem usuń ją, tak samo jak `[notify]`.
+2. **Obraz apki** to `<registry>/<org>/<nazwa>:<tag>` (małe litery), np. `git.example.eu/acme/shop:main`.
+3. **Webhook w Forgejo** (repo lub organizacja → Settings → Webhooks → Forgejo): URL jak wyżej, content type
+   `application/json`, Secret = wartość `webhook-hmac`, zdarzenie **Package**.
+4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0025). Zaloguj
+   się raz jako użytkownik uruchamiający Podmana, kontem serwisowym z tokenem tylko do odczytu pakietów:
+
+   ```sh
+   podman login git.example.eu     # login konta serwisowego + token read:package
+   ```
+
+   Token leży w `auth.json` na hoście, poza magazynem sekretów Węglarki. Gdy rejestr odrzuci pull (401/403),
+   deploy kończy się błędem „registry rejected the pull of …; check the podman user's credentials”, a nie
+   „image not found”.
+5. **Dostawy:** push `main` + `sha-<commit>` daje 202 dla `main` i 204 dla `sha-…` (apka śledzi `:main`).
+   Nazwy pól payloadu i to, czy ponowny push ruchomego tagu wysyła `package.created`, są jeszcze niepotwierdzone
+   na prawdziwej instancji — jeśli nie wysyła, potrzebne jest #83.
+
 ## 6a. Wolumeny, zakresy UID i import z Coolify (iteracja 2)
 
 Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md). Import danych przed pierwszym startem apki
@@ -352,6 +388,11 @@ brak miejsca = instancja zablokowana z komunikatem w logu reconcile (powiększ `
 się nie zmienia).
 Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi właścicielami (czas i miejsce w
 `~/.local/share/containers` przy pierwszym starcie obrazu w nowym zakresie).
+
+`state.toml` trzyma też `effective_uid_range` — ostatni zakres, w którym przygotowano kontener i wolumeny apki (jej
+własny albo zakres wolumenu współdzielonego). To z niego korzysta guard zmiany zakresu, gdy kontenera nie ma
+(apka provisionowana `start = false` albo po `apps stop`), więc dane w wolumenach prywatnych nie zmieniają
+właściciela po cichu ([#75](https://github.com/jpalczewski/weglarka/issues/75)).
 
 ### Wolumeny w spec apki
 
@@ -408,6 +449,12 @@ go równolegle z działającym CLI.
   (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
 - `start = false` członka provisionuje zakres i wolumen **bez kontenera** ([6b](#6b-zatrzymywanie-apek-start--false)),
   więc dane można zaimportować przed pierwszym startem.
+- **Zmiana zakresu UID przy danych jest odrzucana także bez kontenera:** dołączenie apki z prywatnymi wolumenami do
+  grupy (albo wystąpienie z niej) kończy się `409` (`PUT /v1/apps/<nazwa>`) albo błędem akcji reconcile — również
+  wtedy, gdy apka jest tylko provisionowana lub zatrzymana, bo guard czyta ostatni zakres z `state.toml`
+  (`effective_uid_range`). Provisioning i deploy mają wspólny prolog, więc ręczna edycja `apps.toml` przy
+  zatrzymanym demonie też nie przejdzie. Zmiana zakresu jest bezpieczna dopiero po usunięciu danych
+  (`apps remove --purge-volumes` albo ręcznie skasowane wolumeny).
 - **`doctor`:** `state.shared_volumes` raportuje dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
   --purge`), zadeklarowany a jeszcze nieutworzony wolumen, rozjazd etykiety `weglarka.uid-range` i przypomnienie,
   że wszystkie obrazy grupy muszą działać jako ten sam `USER` — porównania użytkowników `doctor` nie robi za Ciebie.
@@ -634,6 +681,20 @@ Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być
 3. Kontenery członków działają w zakresie grupy, dopóki stary demon ich nie odtworzy — a odtworzy je we własnych
    zakresach i dane w wolumenie staną się nieczytelne. Przed downgradem zrób `volumes export` i zatrzymaj apki
    (`apps stop`).
+
+### Rollback do Węglarki bez pola `effective_uid_range` (issue #75)
+
+`effective_uid_range` w `state.toml` to nowe pole `AppState`, a `state.toml` ma `deny_unknown_fields` — **starszy
+demon nie odczyta pliku**. Wartość jest pochodna (kopia `uid_range` apki albo `shared_volumes.<nazwa>.uid_range`),
+więc przed downgradem wystarczy:
+
+1. Zatrzymaj apki (`apps stop`) i zrób kopię `state.toml` — nowszy demon odtworzy pole przy najbliższym
+   provision/deploy.
+2. Usuń z `state.toml` linie `effective_uid_range` (albo przywróć kopię sprzed wdrożenia) i uruchom starszego demona.
+   Bez tego daemon odmówi startu z błędem parsowania stanu.
+3. **Aktualizuj CLI razem z demonem:** starsze CLI nie odczyta odpowiedzi `apps show`, `apps add`, `apps update`
+   oraz `apps start`/`apps stop`, bo `AppState` w API też ma `deny_unknown_fields`. Nowe CLI czyta starszy demon bez
+   zmian.
 
 ## 6b. Zatrzymywanie apek: `start = false`
 
@@ -986,11 +1047,11 @@ Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, 
 `[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
 nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
 
-## 6j. Configi z hosta (`config_root`) i `apps reload`
+## 6k. Configi z hosta (`config_root`) i `apps reload`
 
 Infra-apki (Authelia #88, Prometheus, Grafana, Loki) potrzebują plików konfiguracyjnych. Zamiast wrzucać je do
 obrazu, do sekretów albo importować do wolumenu, Węglarka montuje je **read-only** z jednego katalogu na hoście i
-pozwala wskazać, jak apka ma je przeładować. Decyzja: [0023](decisions/0023-config-root-mounts.md); gotowy
+pozwala wskazać, jak apka ma je przeładować. Decyzja: [0026](decisions/0026-config-root-mounts.md); gotowy
 przykład: [`docs/examples/configs.toml`](examples/configs.toml).
 
 **1. Katalog.** W `weglarka.toml` dodaj `config_root` — absolutny albo względny do katalogu tego pliku:
@@ -1064,9 +1125,13 @@ chmod -R u=rwX,go=rX /var/lib/weglarka/config
 ostrzega o brakującym źródle, ucieczce poza katalog, zbyt luźnych uprawnieniach oraz o tym, że sam katalog jest
 group/world-writable.
 
-**6. Rollback Węglarki.** `weglarka.toml` i `apps.toml` mają `deny_unknown_fields`: starszy demon nie wystartuje z
-`config_root`, `configs` ani `reload_signal`. Przed downgradem usuń te pola (configi zostają na dysku, po prostu
-nie są montowane).
+**6. Rollback Węglarki.** `weglarka.toml` i `apps.toml` mają `deny_unknown_fields`, a `apps.toml` niesie teraz
+`schema_version = 2` ([0023](decisions/0023-state-schema-version.md), powód: `configs`/`reload_signal` z #118):
+starszy demon odmówi startu z komunikatem o wersji schematu. Przed downgradem (1) usuń `config_root` z
+`weglarka.toml`, (2) usuń `configs`/`reload_signal` z apek, (3) usuń linię `schema_version` z `apps.toml` i
+`state.toml` — albo prościej: przywróć oba pliki z kopii sprzed aktualizacji (patrz
+[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Configi zostają na dysku, po prostu
+nie są montowane.
 ## 6i. Wykrywanie awarii apek (crash loop, unhealthy)
 
 Apka, która w kółko pada, nie jest dziś widoczna: każdy kontener chodzi z `restart = always`, więc Podman
@@ -1106,6 +1171,61 @@ unhealthy_observations = 2     # ile kolejnych obserwacji z failing healthcheck 
   (sekcja 6h) nadal zbiorą ewentualne podsumowanie, gdy apka migocze między awarią a powrotem.
 - **Rollback:** `[monitor]` to nowa sekcja w `weglarka.toml`, więc starszy demon jej nie odczyta — przed
   downgradem usuń ją razem z `[notify]` (patrz [7](#7-weryfikacja-i-rollback)).
+## 6j. Sekrety: usuwanie i sprzątanie po apce
+
+Sekrety trzyma się per instancja, w zakresie `<apka>.<nazwa>` w `secrets.toml` (0600). Do tej pory nic
+ich nie usuwało: `apps remove` kasowało apkę, a jej sekrety — w tym `webhook-hmac` — zostawały. Plik
+rósł, a **nowa apka pod starą nazwą dziedziczyła stare wartości** (np. stary `webhook-hmac`, który nie
+zgadza się już z webhookiem w GitHubie). Decyzja i odrzucone alternatywy: [0024](decisions/0024-secret-removal-and-purge.md).
+
+**Pojedynczy sekret: `secrets remove`.**
+
+```sh
+weglarka secrets list ntfy                     # nazwy, fingerprint, data — bez wartości
+weglarka secrets remove ntfy config            # 409, gdy spec apki nadal wiąże ten sekret
+weglarka secrets remove ntfy config --force    # usuwa mimo wiązania; apka czeka na sekret
+weglarka secrets remove ntfy config --dry-run  # pokazuje, co by usunął
+```
+
+- **409 domyślnie:** dopóki spec apki wiąże sekret (`--secret-env`/`--secret-mount`), usunięcie jest
+  odrzucane — apka bez wartości nigdy nie wstanie. Najpierw odwiąż go
+  (`weglarka apps update ntfy --unbind-secret config`) albo użyj `--force`.
+- **`--force`:** wartość znika, a apka przy kolejnym reconcile przechodzi w stan „czeka na sekret”
+  ([6](#6-pierwsza-apka-ntfyzig)) — to nie błąd, deploy czeka na `secrets set`. Działający kontener
+  zachowuje zmaterializowaną wartość do najbliższego odtworzenia; samo usunięcie **nie** wywołuje
+  deployu.
+- **404**, gdy takiego sekretu nie ma; **400** przy niepoprawnej nazwie apki/sekretu.
+- **Apka nie musi istnieć w `apps.toml`** — właśnie po to jest ten endpoint: sprząta pozostałości po
+  usuniętej apecie i **po zmianie nazwy instancji** (stary zakres `<stara-nazwa>.*` zostaje w pliku,
+  dopóki go nie usuniesz).
+
+**Cały zakres apki: `apps remove --purge-secrets`.**
+
+```sh
+weglarka apps remove ntfy --purge-secrets                  # apka + wszystkie jej sekrety
+weglarka apps remove ntfy --purge-secrets --purge-volumes  # + wolumeny (dane)
+```
+
+- Usuwa **cały** zakres `<apka>.*`, w tym `webhook-hmac`. `--purge-secrets` i `--purge-volumes` są
+  niezależne: dane domyślnie przeżywają `remove` + `add`, a poświadczenia nie muszą być trzymane tylko
+  dlatego, że dane zostają.
+- Purge dzieje się **przed** zapisem `apps.toml`: jeśli się nie uda, apka zostaje zarejestrowana
+  i można spróbować ponownie.
+- Działa tylko dla apki obecnej w `apps.toml`; po fakcie użyj `secrets remove` (wyżej).
+- Nie rusza **zmaterializowanych sekretów Podmana** — te powstają z magazynu przy każdym deployu
+  i pozostają po usuniętej apecie do czasu osobnego sprzątania (znana luka, opisana w 0024).
+
+**Pozostałości po apecie: ostrzeżenie w `doctor`.** Check `state.orphan_secrets` zgłasza `warn` z listą
+sekretów, których instancji nie ma już w `apps.toml`, z podpowiedzią (`weglarka secrets remove <apka>
+<nazwa>`; przy kolejnym usuwaniu — `apps remove --purge-secrets`). Gdy wszystko jest czyste, checka nie
+ma. Ostrzeżenie niczego nie blokuje — zostawione sekrety nie psują działania, są problemem higieny
+i bezpieczeństwa.
+
+**Czego to nie zmienia:** format `secrets.toml`/`apps.toml`/`state.toml` zostaje ten sam, więc upgrade
+i rollback demona są bezpieczne, a usunięcie sekretu nie zmienia specu ani `spec_hash` (zmienia się
+tylko wartość, nie wiązanie). Plik nadal jest zapisywany atomowo z prawami 0600. Nowe CLI wobec
+**starego demona** po cichu zignoruje `--purge-secrets` (usunie apkę, sekrety zostaną) i dostanie 404
+na `secrets remove` — najpierw zaktualizuj demona.
 
 ## 7. Weryfikacja i rollback
 
@@ -1128,19 +1248,50 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   Zmiana obrazu przez `update` deployuje od razu (pull, bramka zdrowia; nieudana bramka = automatyczny rollback
   do poprzedniego digestu, kod wyjścia 6). Wróć na `:latest` tak samo, z `--auto-update`:
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
-- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, więc starszy demon nie odczyta
-  `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
+- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, a `apps.toml` i
+  `state.toml` mogą nieść `schema_version` — demon, który zastanie plik nowszy niż rozumie, odmawia
+  startu z czytelnym komunikatem ([wersja schematu plików
+  stanu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Przed downgradem do wersji, która
+  dane pole dopiero wprowadziła, usuń je ręcznie: z apek `start = false`
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on)),
   wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
   ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
   ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)), a także `config_root` w `weglarka.toml` i `configs`/
-  `reload_signal` w apkach ([6i](#6j-configi-z-hosta-config_root-i-apps-reload)); inaczej daemon nie wystartuje z
-  błędem parsowania.
-  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
-  ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
+  ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy)).
+  oraz `config_root`, a z apek `configs`/`reload_signal`
+  ([6k](#6k-configi-z-hosta-config_root-i-apps-reload)).
+  Inaczej daemon nie wystartuje z błędem parsowania.
 
+### Wersja schematu plików stanu (rollback między wersjami)
+
+`apps.toml` i `state.toml` mogą nieść pole `schema_version` (decyzja:
+[0023](decisions/0023-state-schema-version.md)). Zasady:
+
+- **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
+  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 2**
+  (configi z hosta, issue #118, [0026](decisions/0026-config-root-mounts.md)): plik v1 wczytuje się
+  bez zmian, a pierwszy zwykły zapis dopisuje `schema_version = 2`.
+- Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
+  `apps.toml`/`state.toml`); taka wersja uruchamia migrację przy odczycie, a pierwszy zwykły zapis
+  dopisuje nowy numer.
+- **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
+
+  ```text
+  /var/lib/weglarka/state.toml: schema version 2 is newer than this daemon supports (1); written by
+  a newer Węglarka — roll forward to that version, or restore apps.toml and state.toml from before
+  the upgrade
+  ```
+
+  To nie jest błąd pliku, tylko sygnał, że obraz Węglarki jest starszy niż stan. Wyjścia: wróć na
+  nowszy obraz (roll forward) albo przywróć `apps.toml` i `state.toml` z kopii sprzed aktualizacji.
+  `weglarka doctor --preflight` czyta `apps.toml` sam i pokazuje ten sam komunikat jeszcze przed
+  restartem demona.
+- **Przed każdą aktualizacją Węglarki** zrób kopię katalogu stanu (albo przynajmniej `apps.toml`,
+  `state.toml` i `secrets.toml`). Ta kopia jest jedyną drogą powrotu przez granicę wersji schematu:
+  nowszy demon migruje pliki, a starszy ich potem nie odczyta.
+- Po przywróceniu starszej kopii `state.toml` reconcile uzupełni zakresy UID z etykiet kontenerów, ale
+  apki bez przypiętego `current` mogą zostać wdrożone od nowa (pull + bramka zdrowia).
 ### `apps update`: co się dzieje po zmianie
 
 Gdy demon jest zajęty innym deployem (bramka zdrowia trwa do kilkudziesięciu sekund), CLI nie zwraca od razu
@@ -1161,7 +1312,7 @@ diff i niczego nie wysyła.
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
-| `--config-mount` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6j-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
+| `--config-mount` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6k-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
   ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`

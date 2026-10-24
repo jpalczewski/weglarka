@@ -5,7 +5,6 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use weglarka_api::DoctorCheck;
-use weglarka_core::app::AppsFile;
 use weglarka_core::config::{IngressMode, PlatformKind};
 
 use super::host::{CmdOutput, FileKind, Host};
@@ -787,17 +786,17 @@ impl Check for TraefikSync {
             );
         };
         let apps = match cx.host.read_to_string(&cx.apps_path) {
-            Ok(src) => match toml::from_str::<AppsFile>(&src) {
+            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
                 Ok(a) => a,
                 Err(e) => {
-                    return warn(
-                        self.id(),
-                        format!(
-                            "{TRAEFIK_SYNC_UNIT} active; cannot parse {}: {e}",
-                            cx.apps_path.display()
-                        ),
-                        "fix apps.toml to check the domains against the policy",
-                    );
+                    let hint = match &e {
+                        weglarka_core::state::StateError::SchemaTooNew { .. } => {
+                            "apps.toml was written by a newer Węglarka: roll forward, or restore it \
+                             from before the upgrade"
+                        }
+                        _ => "fix apps.toml to check the domains against the policy",
+                    };
+                    return warn(self.id(), format!("{TRAEFIK_SYNC_UNIT} active; {e}"), hint);
                 }
             },
             Err(_) => {
@@ -865,14 +864,17 @@ impl Check for HostPortsFree {
         let id = self.id();
         let host = cx.config.as_ref().expect("applies");
         let apps = match cx.host.read_to_string(&cx.apps_path) {
-            Ok(src) => match toml::from_str::<AppsFile>(&src) {
+            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
                 Ok(apps) => apps,
                 Err(e) => {
-                    return fail(
-                        id,
-                        format!("cannot parse {}: {e}", cx.apps_path.display()),
-                        "fix apps.toml; host ports cannot be checked until it parses",
-                    );
+                    let hint = match &e {
+                        weglarka_core::state::StateError::SchemaTooNew { .. } => {
+                            "apps.toml was written by a newer Węglarka: roll forward, or restore it \
+                             from before the upgrade"
+                        }
+                        _ => "fix apps.toml; host ports cannot be checked until it parses",
+                    };
+                    return fail(id, e.to_string(), hint);
                 }
             },
             Err(e) if e.kind() == ErrorKind::NotFound => {

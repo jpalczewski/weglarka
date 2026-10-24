@@ -157,6 +157,16 @@ impl Prepared {
     }
 }
 
+/// What `apps remove` deletes besides the desired-state entry. Both are kept by default: data and
+/// credentials survive `remove` + `add` under the same name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoveAppOptions {
+    /// Delete the instance's named volumes and release its uid range.
+    pub purge_volumes: bool,
+    /// Delete the whole `<instance>.*` scope from the secret store.
+    pub purge_secrets: bool,
+}
+
 impl<P: PodmanClient> Reconciler<P> {
     /// First free range of `size` among everything `state.toml` has handed out (instances, shared
     /// volumes and the ingress nginx alike).
@@ -233,8 +243,10 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Ownership and volumes for a container about to be created. The range must already be assigned
-    /// ([`Self::assign_range`]); volumes (private and shared) are created here, before the old
-    /// container is touched.
+    /// ([`Self::assign_range`]) and the range-change guard must have run; volumes (private and
+    /// shared) are created here, before the old container is touched. The returned
+    /// [`Prepared::range`] is what the caller persists as the data owner
+    /// (`AppState::effective_uid_range`, issue #75).
     pub(crate) async fn prepare_container(
         &self,
         instance: &InstanceName,
@@ -246,6 +258,9 @@ impl<P: PodmanClient> Reconciler<P> {
         if let Some(mount) = shared_volumes::mount(spec) {
             ensure_shared_volume(&self.podman, &mount.name).await?;
         }
+        // The caller persists `Prepared.range` as `AppState::effective_uid_range` together with the
+        // rest of the deploy state, so the range-change guard still knows the data owner when the
+        // container is gone (issue #75).
         Ok(Prepared {
             range,
             volumes: attachments(instance, spec),
@@ -289,8 +304,9 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// State of instances no longer in `apps.toml`: dropped, unless volumes of the instance remain —
-    /// then only its `uid_range` is kept (reserved) so a later `apps add` finds its files owned
-    /// correctly. Returns whether `st` changed.
+    /// then only its `uid_range`/`effective_uid_range` are kept (reserved and remembered as the data
+    /// owner) so a later `apps add` finds its files owned correctly and cannot silently move them
+    /// into another range. Returns whether `st` changed.
     pub(crate) async fn settle_orphan_state(&self, st: &mut StateFile, apps: &AppsFile) -> bool {
         let orphans: Vec<InstanceName> = st
             .apps
@@ -301,23 +317,23 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut changed = false;
         for name in orphans {
             let current = st.apps[&name].clone();
-            let keep = match current.uid_range {
-                None => None,
-                Some(range) => {
-                    let filter = VolumeFilter {
-                        labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
-                    };
-                    // Cannot tell → keep: freeing a range that still owns data is the worse error.
-                    let has_volumes = self
-                        .podman
-                        .volume_list(&filter)
-                        .await
-                        .map_or(true, |v| !v.is_empty());
-                    has_volumes.then_some(AppState {
-                        uid_range: Some(range),
-                        ..AppState::default()
-                    })
-                }
+            let keep = if current.uid_range.is_none() && current.effective_uid_range.is_none() {
+                None
+            } else {
+                let filter = VolumeFilter {
+                    labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
+                };
+                // Cannot tell → keep: freeing a range that still owns data is the worse error.
+                let has_volumes = self
+                    .podman
+                    .volume_list(&filter)
+                    .await
+                    .map_or(true, |v| !v.is_empty());
+                has_volumes.then_some(AppState {
+                    uid_range: current.uid_range,
+                    effective_uid_range: current.effective_uid_range,
+                    ..AppState::default()
+                })
             };
             if keep.as_ref() == Some(&current) {
                 continue;
@@ -361,15 +377,17 @@ impl<P: PodmanClient> Reconciler<P> {
         changed
     }
 
-    /// `apps remove`. Without `purge_volumes` the instance's volumes (and range) stay. With it, the
+    /// `apps remove`. Without `purge_volumes` the instance's volumes (and range) stay; with it, the
     /// container and every volume labelled with the instance are deleted and the range is released.
+    /// `purge_secrets` removes the instance's secrets **before** `apps.toml` is saved, so a store
+    /// failure leaves the app intact and the removal retryable (issue #80).
     ///
     /// A member of a shared volume is refused (nothing is touched) while other members exist: their
     /// data lives in the same volume (issue #33).
-    pub async fn remove_app_with_volumes(
+    pub async fn remove_app_with_purges(
         &self,
         name: &InstanceName,
-        purge_volumes: bool,
+        options: RemoveAppOptions,
     ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
@@ -379,7 +397,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let Some(spec) = apps.apps.get(name).cloned() else {
             return Err(EngineError::UnknownInstance(name.clone()));
         };
-        if purge_volumes {
+        if options.purge_volumes {
             for mount in &spec.shared_volumes {
                 let others = shared_volumes::other_members(&apps, name, &mount.name);
                 if !others.is_empty() {
@@ -390,9 +408,17 @@ impl<P: PodmanClient> Reconciler<P> {
                 }
             }
         }
+        if options.purge_secrets {
+            let removed = crate::secrets::remove_instance_secrets(&self.secrets, name).await?;
+            tracing::info!(
+                instance = %name,
+                count = removed.len(),
+                "removed the instance's secrets"
+            );
+        }
         apps.apps.remove(name);
         state::save_apps(&self.paths.apps, &apps)?;
-        if !purge_volumes {
+        if !options.purge_volumes {
             return Ok(());
         }
         // A volume in use cannot be removed: the container goes first (desired state no longer lists it).
@@ -491,8 +517,8 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Refuses a uid-range change when the instance already has private volume data: the files are
     /// owned by the old range and a recreate with a new map would make them unreadable
-    /// (docs/decisions/0017). `None` as the old label means "no label yet" (pre-range container) and
-    /// is always allowed.
+    /// (docs/decisions/0017). `None` as the old label means "no owner known yet" (a brand-new
+    /// instance) and is always allowed.
     pub(crate) async fn range_change_guard_locked(
         &self,
         instance: &InstanceName,
@@ -503,7 +529,15 @@ impl<P: PodmanClient> Reconciler<P> {
             .container_inspect(&labels::container_name(instance))
             .await
             .ok()
-            .and_then(|c| c.labels.get(labels::UID_RANGE).cloned());
+            .and_then(|c| c.labels.get(labels::UID_RANGE).cloned())
+            .or_else(|| {
+                // No container (provisioned with `start = false`, or removed): the last effective
+                // range recorded by `prepare_container` is the owner of the data (issue #75).
+                state::load_state(&self.paths.state)
+                    .ok()
+                    .and_then(|st| st.apps.get(instance).and_then(|s| s.effective_uid_range))
+                    .map(labels::uid_range_label)
+            });
         let Some(old_label) = old else {
             return Ok(());
         };
@@ -841,6 +875,13 @@ image = "ghcr.io/x/szklana:latest"
 start = false
 volumes = [{ name = "data", target = "/data" }]
 "#;
+    /// The same app as [`APP`], but provisioned only: the container is removed, the data stays.
+    const STOPPED_WITH_VOLUMES: &str = r#"
+[apps.szklana]
+image = "ghcr.io/x/szklana:latest"
+start = false
+volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cache", read_only = true }]
+"#;
 
     struct Env {
         _dir: tempfile::TempDir,
@@ -1076,7 +1117,7 @@ volumes = [{ name = "data", target = "/data" }]
         let r = e.range("szklana").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("szklana"), false)
+            .remove_app_with_purges(&name("szklana"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1088,8 +1129,10 @@ volumes = [{ name = "data", target = "/data" }]
             st.apps[&name("szklana")],
             AppState {
                 uid_range: Some(r),
+                effective_uid_range: Some(r),
                 ..Default::default()
-            }
+            },
+            "the reserved range and the data owner survive apps remove"
         );
 
         // Re-adding the app finds its files owned correctly: same range, same volumes.
@@ -1099,7 +1142,13 @@ volumes = [{ name = "data", target = "/data" }]
         assert_eq!(e.mapping("szklana"), id_mapping(r));
 
         e.rec
-            .remove_app_with_volumes(&name("szklana"), true)
+            .remove_app_with_purges(
+                &name("szklana"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(e.fake.containers().is_empty());
@@ -1158,7 +1207,7 @@ volumes = [{ name = "data", target = "/data" }]
         e.rec.reconcile().await.unwrap();
         assert!(e.range("ntfy").is_some());
         e.rec
-            .remove_app_with_volumes(&name("ntfy"), false)
+            .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1171,7 +1220,13 @@ volumes = [{ name = "data", target = "/data" }]
         e.rec.reconcile().await.unwrap();
         let err = e
             .rec
-            .remove_app_with_volumes(&name("nope"), true)
+            .remove_app_with_purges(
+                &name("nope"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::UnknownInstance(_)));
@@ -1503,7 +1558,7 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let r = e.shared_range("kajet-data").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("kajet-api"), false)
+            .remove_app_with_purges(&name("kajet-api"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1532,7 +1587,13 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
 
         let err = e
             .rec
-            .remove_app_with_volumes(&name("kajet-api"), true)
+            .remove_app_with_purges(
+                &name("kajet-api"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         match err {
@@ -1552,11 +1613,17 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let r = e.shared_range("kajet-data").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("kajet-api"), false)
+            .remove_app_with_purges(&name("kajet-api"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec
-            .remove_app_with_volumes(&name("kajet-mcp"), true)
+            .remove_app_with_purges(
+                &name("kajet-mcp"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -1655,6 +1722,110 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(e.mapping("szklana"), old_map);
         assert_eq!(e.range("szklana"), Some(old_range));
         assert_eq!(e.fake.volumes().len(), 2, "private volumes keep their data");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joining_a_group_after_provisioning_is_refused() {
+        let e = env(APP); // szklana owns private volumes with data
+        e.rec.reconcile().await.unwrap();
+        let old_range = e.range("szklana").unwrap();
+
+        // `apps stop` removes the container but keeps the data and the range (issue #75).
+        e.set_apps(STOPPED_WITH_VOLUMES);
+        e.rec.reconcile().await.unwrap();
+        assert!(
+            e.fake.containers().is_empty(),
+            "provisioning removes the container"
+        );
+        assert_eq!(e.fake.volumes().len(), 2, "the private volumes survive");
+
+        // The early check of `PUT /v1/apps/{name}` must still see the data owner.
+        let new_spec: AppSpec = toml::from_str(&format!(
+            "image = \"{IMAGE}\"\nport = 8080\nshared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ))
+        .unwrap();
+        let err = e
+            .rec
+            .check_range_change(&name("szklana"), &new_spec)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::RangeChangeWithData { .. }),
+            "{err:?}"
+        );
+
+        // The reconcile path (a hand-edited apps.toml) must refuse too: nothing may start in the
+        // group's range while the files belong to the old one.
+        e.set_apps(&format!(
+            "[shared_volumes.kajet-data]\n\n[apps.szklana]\nimage = \"{IMAGE}\"\nport = 8080\n\
+             shared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ));
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(
+            report.actions.iter().any(|a| a.result.is_err()),
+            "{report:?}"
+        );
+        assert!(
+            e.fake.containers().is_empty(),
+            "no container in the shared range over files of the old range"
+        );
+        assert_eq!(e.range("szklana"), Some(old_range));
+        assert_eq!(e.fake.volumes().len(), 2, "nothing new was created");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_with_private_data_cannot_join_a_group() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let old_range = e.range("szklana").unwrap();
+        let old_map = e.mapping("szklana");
+
+        // One edit (e.g. apps.toml written while the daemon was stopped): stop and join a group.
+        e.set_apps(&format!(
+            "[shared_volumes.kajet-data]\n\n[apps.szklana]\nimage = \"{IMAGE}\"\nport = 8080\n\
+             start = false\n\
+             volumes = [{{ name = \"data\", target = \"/data\" }}, \
+             {{ name = \"cache\", target = \"/cache\", read_only = true }}]\n\
+             shared_volumes = [{{ name = \"kajet-data\", target = \"/group\" }}]\n"
+        ));
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(
+            report.actions.iter().any(|a| a.result.is_err()),
+            "provisioning must refuse the range change before removing the container: {report:?}"
+        );
+        assert_eq!(
+            e.mapping("szklana"),
+            old_map,
+            "the old container is untouched"
+        );
+        assert_eq!(e.range("szklana"), Some(old_range));
+        assert_eq!(e.fake.volumes().len(), 2, "nothing new was created");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn re_adding_a_removed_app_cannot_join_a_group_over_its_data() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        e.rec
+            .remove_app_with_purges(&name("szklana"), RemoveAppOptions::default())
+            .await
+            .unwrap();
+        e.rec.reconcile().await.unwrap();
+        assert_eq!(e.fake.volumes().len(), 2, "the data survives apps remove");
+
+        let joining: AppSpec = toml::from_str(&format!(
+            "image = \"{IMAGE}\"\nport = 8080\nshared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ))
+        .unwrap();
+        let err = e
+            .rec
+            .check_range_change(&name("szklana"), &joining)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::RangeChangeWithData { .. }),
+            "the removed app's data owner is still known: {err:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

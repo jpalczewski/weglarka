@@ -32,6 +32,23 @@ pub enum PodmanError {
     Protocol(String),
 }
 
+impl PodmanError {
+    /// The registry rejected our credentials (or we sent none): HTTP 401/403 from the pull call or an
+    /// "unauthorized"/"denied" error in the pull stream. Distinct from `NotFound` (image missing).
+    pub fn is_registry_auth_failure(&self) -> bool {
+        match self {
+            PodmanError::Api { status, .. } => matches!(status, 401 | 403),
+            PodmanError::Pull(message) => {
+                let message = message.to_ascii_lowercase();
+                ["unauthorized", "denied", "authentication required"]
+                    .iter()
+                    .any(|needle| message.contains(needle))
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T, E = PodmanError> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,6 +470,28 @@ mod fake_tests {
             id_mapping: None,
             security: Default::default(),
         }
+    }
+
+    #[test]
+    fn registry_auth_failures_are_told_apart_from_missing_images() {
+        let api = |status| PodmanError::Api {
+            status,
+            message: String::new(),
+        };
+        assert!(api(401).is_registry_auth_failure());
+        assert!(api(403).is_registry_auth_failure());
+        assert!(!api(500).is_registry_auth_failure());
+        assert!(!PodmanError::NotFound("x".into()).is_registry_auth_failure());
+        for m in [
+            "unauthorized: authentication required",
+            "requested access to the resource is denied",
+        ] {
+            assert!(
+                PodmanError::Pull(m.into()).is_registry_auth_failure(),
+                "{m}"
+            );
+        }
+        assert!(!PodmanError::Pull("manifest unknown".into()).is_registry_auth_failure());
     }
 
     #[tokio::test]

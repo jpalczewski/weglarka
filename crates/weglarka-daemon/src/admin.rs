@@ -8,7 +8,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weglarka_api::{
@@ -28,9 +28,10 @@ use weglarka_core::podman::{
 };
 use weglarka_core::reconcile::EngineError;
 use weglarka_core::secret_store::{
-    SecretStore, SecretValue, fingerprint, scoped_name, valid_secret_name,
+    SecretError, SecretStore, SecretValue, fingerprint, scoped_name, valid_secret_name,
 };
 use weglarka_core::state::{self, AppState};
+use weglarka_core::volumes::RemoveAppOptions;
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
@@ -97,6 +98,10 @@ impl From<EngineError> for Fail {
             ),
             // Removing an app another one depends on: nothing was deleted.
             e @ EngineError::DependencyInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
+            // `secrets remove` (issue #80): an absent secret is a 404, a spec-bound one a 409
+            // unless the request forces it.
+            EngineError::Secret(SecretError::NotFound(m)) => Fail::not_found(m),
+            e @ EngineError::SecretInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
             // Shared-volume guards (issue #33): the engine message carries the members / the hint.
             e @ (EngineError::SharedVolumeInUse { .. }
             | EngineError::SharedVolumeHasData { .. }
@@ -152,6 +157,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .route(endpoints::APPS_RELOAD.path, post(reload_app::<P>))
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
+        .route(endpoints::SECRETS_REMOVE.path, delete(remove_secret::<P>))
         .route(endpoints::DOCTOR.path, get(run_doctor::<P>))
         .route(
             endpoints::NOTIFICATIONS_STATUS.path,
@@ -456,10 +462,13 @@ async fn remove_app<P: PodmanClient + 'static>(
     let name = parse_name(&raw)?;
     {
         let _g = d.desired_lock.lock().await;
-        mutating(
-            d.engine
-                .remove_app_with_volumes(&name, volumes::flag(query.as_deref(), "purge_volumes")),
-        )
+        mutating(d.engine.remove_app_with_purges(
+            &name,
+            RemoveAppOptions {
+                purge_volumes: volumes::flag(query.as_deref(), "purge_volumes"),
+                purge_secrets: volumes::flag(query.as_deref(), "purge_secrets"),
+            },
+        ))
         .await?;
     }
     d.changed();
@@ -644,6 +653,27 @@ async fn set_secret<P: PodmanClient + 'static>(
     .map_err(Fail::internal)??;
     d.changed();
     Ok(json(info))
+}
+
+/// `DELETE /v1/apps/{name}/secrets/{secret}` (issue #80): removes one secret from the store.
+///
+/// The app need **not** exist in `apps.toml` — that is how the leftovers of a removed (or renamed)
+/// instance are cleaned up, so this handler deliberately skips [`load_spec`]. A secret the app's
+/// spec still binds is a 409 unless `?force=true`; the app then waits for it again on the next
+/// reconcile (the removal itself never deploys).
+async fn remove_secret<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path((raw, secret)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult<StatusCode> {
+    let name = parse_name(&raw)?;
+    if !valid_secret_name(&secret) {
+        return Err(Fail::invalid("secret name must match [A-Za-z0-9_-]{1,64}"));
+    }
+    let force = volumes::flag(query.as_deref(), "force");
+    mutating(d.engine.remove_secret(&name, &secret, force)).await?;
+    d.changed();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn run_doctor<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {

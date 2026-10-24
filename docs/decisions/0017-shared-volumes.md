@@ -121,13 +121,18 @@ is left out deliberately; see rejected alternatives.
 ### Guard against range changes with data
 
 An instance whose effective range would change must not be recreated silently when that would make
-its existing files unreadable. Before the old container is touched, `launch` compares the old
-container's `weglarka.uid-range` label with the new range and, if they differ and the instance has
-existing private volumes, fails with `EngineError::RangeChangeWithData`; the old container keeps
-running and the reconcile pass reports the instance as blocked. `PUT /v1/apps/{name}` runs the same
-check early and returns 409 with the migration hint. Joining or leaving a group **without** private
-volumes is allowed and is the normal way to migrate: provision the member (`start = false`), import
-the data with the foreign mode, then start it.
+its existing files unreadable. Before the old container is touched, the shared `launch`/`provision`
+prologue (`Reconciler::begin_instance`) compares the old range with the new one and, if they differ
+and the instance has existing private volumes, fails with `EngineError::RangeChangeWithData`; the
+old container keeps running and the reconcile pass reports the instance as blocked. The old range
+comes from the container's `weglarka.uid-range` label, or — when there is no container (an app
+provisioned with `start = false`, stopped with `apps stop`, or removed) — from
+`AppState::effective_uid_range`, the last range the container and volumes were prepared in, written
+by every deploy/recreate/provision (issue #75). The range guard therefore cannot be skipped by a
+path that removes the container first, and a hand-edited `apps.toml` is refused as well.
+`PUT /v1/apps/{name}` runs the same check early and returns 409 with the migration hint. Joining or
+leaving a group **without** private volumes is allowed and is the normal way to migrate: provision
+the member (`start = false`), import the data with the foreign mode, then start it.
 
 ### Validation
 
@@ -143,6 +148,12 @@ declared but not created, range/label drift, member user mismatch.
 * New `apps.toml` section and `state.toml` field. Both files are `deny_unknown_fields`, so **a
   rollback to an older daemon requires removing them** (and deleting `wg-shared-*` volumes by hand
   — the old daemon cannot see them). Documented in `docs/install.md` and in the PR.
+* `state.toml` also gains `apps.<name>.effective_uid_range` (issue #75): a derived mirror of the
+  effective range, used by the range guard when no container exists. It is not part of the
+  disjoint-ranges validation. The same `deny_unknown_fields` rule applies — a downgrade needs the
+  line removed — and an older CLI cannot decode `apps show/add/update` and `apps start/stop`
+  responses, because `AppState` is part of the API (new CLI with an old daemon is fine). Both are
+  documented in `docs/install.md`.
 * API: `PUT /v1/volumes/{volume}`, `GET /v1/volumes`, `DELETE /v1/volumes/{volume}?purge=true`,
   an additive `VolumeSummary.shared`, and the 409 on `apps remove --purge-volumes`. The endpoints
   snapshot test changes.
