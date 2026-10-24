@@ -27,7 +27,6 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use weglarka_core::app::AppsFile;
 use weglarka_core::config_mounts::ConfigError;
 use weglarka_core::podman::PodmanClient;
 use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};

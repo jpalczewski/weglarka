@@ -657,11 +657,8 @@ domain = "weglarka.example.eu"
         validate_host(&host(None), &apps("")).unwrap();
         // A configured root is checked even before an app uses it: a missing directory is a typo or
         // a missing mount, not something to discover at the first deploy.
-        let err = validate_host(
-            &host(Some(&root.path().join("missing-dir"))),
-            &apps(""),
-        )
-        .unwrap_err();
+        let err =
+            validate_host(&host(Some(&root.path().join("missing-dir"))), &apps("")).unwrap_err();
         assert!(matches!(err, ConfigError::RootUnavailable { .. }), "{err}");
         // A declared mount without a root is an error that names the app.
         let err = validate_host(
