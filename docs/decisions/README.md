@@ -40,3 +40,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0031](0031-path-prefix-routing.md) | Path-prefix routing (several instances behind one domain) |
 | [0032](0032-trust-nginx-own-addresses.md) | Trust nginx's own addresses as the port forwarder's source |
 | [0033](0033-ingress-max-body-size.md) | Per-app request body limit: `ingress.max_body_size` |
+| [0034](0034-automatic-fallback.md) | Automatic fallback to the previous daemon image |
