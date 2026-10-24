@@ -646,32 +646,70 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
 
     let podman_names: BTreeSet<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
     for name in apps.shared_volumes.keys() {
-        // (b) The declaration owns a range but Podman does not know the volume yet.
+        let group = shared_volumes::volume_group(&apps, name);
+        // (b) The group owns a range but Podman does not know the volume yet.
         if let Some(label) = st
             .shared_volumes
-            .get(name)
+            .get(&group)
             .and_then(|s| s.uid_range)
             .map(labels::uid_range_label)
             && !podman_names.contains(labels::shared_volume_name(name).as_str())
         {
             notes.push(format!(
-                "shared volume {name} has range {label} but no Podman volume; the next deploy or \
-                 reconcile creates it"
+                "shared volume {name} (group {group}) has range {label} but no Podman volume; the \
+                 next deploy or reconcile creates it"
             ));
         }
-        // (d) The shared range aligns host owners only when every member process uses the same
-        // container uid; Węglarka does not override the image's USER, so this is a documented
-        // requirement (ADR 0017) and the comparison itself is a follow-up.
-        let members = shared_volumes::members(&apps, name);
+        // (e) The volume exists in another group than the declared one (hand-edited apps.toml):
+        // its files belong to the recorded group's range (ADR 0029).
+        if let Some(info) = volumes
+            .iter()
+            .find(|v| v.name == labels::shared_volume_name(name))
+        {
+            let recorded = info
+                .labels
+                .get(labels::SHARED_GROUP)
+                .map_or(name.as_str(), String::as_str);
+            if recorded != group.as_str() {
+                warnings.push(format!(
+                    "shared volume {name} is declared in group {group} but its data belongs to \
+                     group {recorded}"
+                ));
+                hints.push(format!(
+                    "restore `group` in apps.toml, or `weglarka volumes remove {name} --purge` and \
+                     declare it again"
+                ));
+            }
+        }
+    }
+    // (d) The shared range aligns host owners only when every member process uses the same
+    // container uid; Węglarka does not override the image's USER, so this is a documented
+    // requirement (ADR 0017) and the comparison itself is a follow-up. Reported per group, which
+    // also shows the group membership (issue #129).
+    let groups: BTreeSet<_> = apps
+        .shared_volumes
+        .keys()
+        .map(|v| shared_volumes::volume_group(&apps, v))
+        .collect();
+    for group in &groups {
+        let group_volumes = shared_volumes::group_volumes(&apps, group);
+        let members = shared_volumes::group_members(&apps, group);
+        if group_volumes.len() > 1 {
+            notes.push(format!(
+                "group {group}: volumes {}; members {}",
+                join_display(&group_volumes),
+                if members.is_empty() {
+                    "none".to_owned()
+                } else {
+                    join_display(&members)
+                }
+            ));
+        }
         if members.len() > 1 {
             notes.push(format!(
-                "shared volume {name} is mounted by {}: every member image must run the same \
-                 container USER (Węglarka does not override it)",
-                members
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "group {group} is mounted by {}: every member image must run the same container \
+                 USER (Węglarka does not override it)",
+                join_display(&members)
             ));
             hints.push(
                 "check with `podman inspect <container> --format '{{.Config.User}}'`".to_owned(),
@@ -681,12 +719,12 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
 
     // (c) A member whose container runs in another range than the group's cannot read its data.
     for (name, spec) in &apps.apps {
-        let Some(mount) = shared_volumes::mount(spec) else {
+        let Some(group) = shared_volumes::spec_group(&apps, spec) else {
             continue;
         };
         let want = st
             .shared_volumes
-            .get(&mount.name)
+            .get(&group)
             .and_then(|s| s.uid_range)
             .map(labels::uid_range_label);
         let Some(container) = containers
@@ -698,9 +736,9 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
         let got = container.labels.get(labels::UID_RANGE);
         if got != want.as_ref() {
             warnings.push(format!(
-                "{name}: container uid-range {} but shared volume {} is {}",
+                "{name}: container uid-range {} but shared volume group {} is {}",
                 got.map_or("unset", String::as_str),
-                mount.name,
+                group,
                 want.as_deref().unwrap_or("not allocated"),
             ));
         }
@@ -727,6 +765,15 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
         message,
         hint.as_deref(),
     ));
+}
+
+/// `a, b, c` for a doctor message.
+fn join_display<T: std::fmt::Display>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

@@ -189,6 +189,10 @@ pub struct SharedVolumeSummary {
     pub name: SharedVolumeName,
     /// Podman volume name (`wg-shared-<name>`).
     pub podman_name: String,
+    /// Group whose uid range the volume lives in (issue #129): the declared `group`, otherwise the
+    /// volume's own name. Omitted by daemons that predate groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<SharedVolumeName>,
     /// Instances mounting it, sorted by name (empty while it is declared but unused).
     pub members: Vec<InstanceName>,
     /// Allocated on the first member's deploy; `None` before that.

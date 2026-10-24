@@ -46,6 +46,10 @@ pub enum VolumesCommand {
 pub struct DeclareArgs {
     /// Shared volume name ([a-z0-9-], 1–63 characters).
     pub name: String,
+    /// Put the volume in a group: volumes of one group share a uid range, so one app can mount
+    /// several of them. Default: a group named after the volume. Fixed while the volume exists.
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
     /// Send nothing; show the request.
     #[arg(long)]
     pub dry_run: bool,
@@ -177,6 +181,9 @@ fn shared_volumes_table(resp: &ListSharedVolumesResponse) -> String {
         .map(|v| {
             vec![
                 v.name.to_string(),
+                v.group
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), ToString::to_string),
                 v.podman_name.clone(),
                 if v.members.is_empty() {
                     "-".to_owned()
@@ -194,7 +201,7 @@ fn shared_volumes_table(resp: &ListSharedVolumesResponse) -> String {
         })
         .collect();
     table(
-        &["NAME", "PODMAN NAME", "MEMBERS", "RANGE", "EXISTS"],
+        &["NAME", "GROUP", "PODMAN NAME", "MEMBERS", "RANGE", "EXISTS"],
         &rows,
     )
 }
@@ -228,14 +235,33 @@ struct Declared {
 
 async fn declare(json: bool, o: &Overrides, a: DeclareArgs) -> Result<i32, CliError> {
     let name = shared_volume_name(&a.name)?;
+    let group = a.group.as_deref().map(shared_volume_name).transpose()?;
     let params = [("volume", name.as_str())];
     if a.dry_run {
-        DryRun::new(endpoints::SHARED_VOLUMES_DECLARE, &params, None).print(json);
+        let mut dry = DryRun::new(endpoints::SHARED_VOLUMES_DECLARE, &params, None);
+        if let Some(group) = &group {
+            dry.path.push_str(&format!("?group={group}"));
+        }
+        dry.print(json);
         return Ok(exit::OK);
     }
-    client(o)?
-        .call_empty(endpoints::SHARED_VOLUMES_DECLARE, &params)
-        .await?;
+    let client = client(o)?;
+    match &group {
+        Some(group) => {
+            client
+                .call_empty_query(
+                    endpoints::SHARED_VOLUMES_DECLARE,
+                    &params,
+                    &format!("group={group}"),
+                )
+                .await?
+        }
+        None => {
+            client
+                .call_empty(endpoints::SHARED_VOLUMES_DECLARE, &params)
+                .await?
+        }
+    }
     let out = Declared {
         declared: name.to_string(),
     };
@@ -607,6 +633,7 @@ mod tests {
                 SharedVolumeSummary {
                     name: name("kajet-data"),
                     podman_name: "wg-shared-kajet-data".into(),
+                    group: Some(name("kajet")),
                     members: vec![
                         InstanceName::new("kajet-api").unwrap(),
                         InstanceName::new("kajet-mcp").unwrap(),
@@ -620,6 +647,7 @@ mod tests {
                 SharedVolumeSummary {
                     name: name("future"),
                     podman_name: "wg-shared-future".into(),
+                    group: None,
                     members: vec![],
                     uid_range: None,
                     exists: false,
@@ -663,6 +691,7 @@ mod tests {
         assert!(t.contains("wg-shared-kajet-data"), "{t}");
         assert!(t.contains("kajet-api, kajet-mcp"), "{t}");
         assert!(t.contains("100000+65536"), "{t}");
+        assert!(t.contains("GROUP"), "{t}");
         let unused: Vec<&str> = t
             .lines()
             .find(|l| l.starts_with("future"))
@@ -671,7 +700,7 @@ mod tests {
             .collect();
         assert_eq!(
             unused,
-            ["future", "wg-shared-future", "-", "-", "not", "yet"],
+            ["future", "-", "wg-shared-future", "-", "-", "not", "yet"],
             "no members, no range, not created yet"
         );
         assert!(
@@ -720,6 +749,7 @@ mod tests {
             &o,
             DeclareArgs {
                 name: "kajet-data".into(),
+                group: None,
                 dry_run: true,
             },
         )
@@ -732,6 +762,7 @@ mod tests {
                 &o,
                 DeclareArgs {
                     name: "kajet-data".into(),
+                    group: None,
                     dry_run: false,
                 },
             )
@@ -746,6 +777,42 @@ mod tests {
             ("PUT", "/v1/volumes/kajet-data")
         );
         assert!(seen[0].2.is_empty(), "the declaration has no body");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_with_a_group_sends_it_as_a_query_parameter() {
+        let (socket, seen) = mock("sgrp", 204, b"").await;
+        let o = overrides(&socket);
+        declare(
+            true,
+            &o,
+            DeclareArgs {
+                name: "kajet-workspaces".into(),
+                group: Some("kajet".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                (seen[0].0.as_str(), seen[0].1.as_str()),
+                ("PUT", "/v1/volumes/kajet-workspaces?group=kajet")
+            );
+        }
+        let err = declare(
+            true,
+            &o,
+            DeclareArgs {
+                name: "kajet-workspaces".into(),
+                group: Some("Kajet_Group".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -810,6 +877,7 @@ mod tests {
             &o,
             DeclareArgs {
                 name: "Kajet_Data".into(),
+                group: None,
                 dry_run: false,
             },
         )

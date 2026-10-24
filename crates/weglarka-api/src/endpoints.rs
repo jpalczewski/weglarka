@@ -102,7 +102,9 @@ pub const SHARED_VOLUMES_LIST: Endpoint = Endpoint {
     path: "/v1/volumes",
 };
 /// `PUT` with no body → 204. Declares a shared volume (idempotent); apps mount it through
-/// `shared_volumes = [...]` (issue #33).
+/// `shared_volumes = [...]` (issue #33). Query `group=<name>` puts it in a group that shares one uid
+/// range with its other volumes (issue #129); declaring an existing volume with another group is a
+/// 409.
 pub const SHARED_VOLUMES_DECLARE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/volumes/{volume}",

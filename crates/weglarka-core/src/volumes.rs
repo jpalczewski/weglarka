@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::app::{AppSpec, AppsFile, Digest, InstanceName, SharedVolumeName};
+use crate::app::{AppSpec, AppsFile, Digest, InstanceName, SharedVolumeName, SharedVolumeSpec};
 use crate::deploy::pinned_ref;
 use crate::labels;
 use crate::podman::{
@@ -54,26 +54,29 @@ pub fn id_mapping(range: UidRange) -> IdMapping {
     }
 }
 
-/// The uid/gid range a container of `instance` runs in: the shared volume's range when the spec
-/// mounts one (all members share it, docs/decisions/0017), otherwise the instance's own range.
+/// The uid/gid range a container of `instance` runs in: the range of its shared volumes' group when
+/// the spec mounts any (all members share it, docs/decisions/0017 and 0029), otherwise the
+/// instance's own range. `st.shared_volumes` is keyed by group name.
 pub fn effective_range(
+    apps: &AppsFile,
     st: &StateFile,
     instance: &InstanceName,
     spec: &AppSpec,
 ) -> Option<UidRange> {
-    match shared_volumes::mount(spec) {
-        Some(mount) => st.shared_volumes.get(&mount.name).and_then(|s| s.uid_range),
+    match shared_volumes::spec_group(apps, spec) {
+        Some(group) => st.shared_volumes.get(&group).and_then(|s| s.uid_range),
         None => st.apps.get(instance).and_then(|s| s.uid_range),
     }
 }
 
 /// [`effective_range`] as the value of the container's `weglarka.uid-range` label.
 pub fn effective_range_label(
+    apps: &AppsFile,
     st: &StateFile,
     instance: &InstanceName,
     spec: &AppSpec,
 ) -> Option<String> {
-    effective_range(st, instance, spec).map(labels::uid_range_label)
+    effective_range(apps, st, instance, spec).map(labels::uid_range_label)
 }
 
 /// Podman volume name and labels for an instance's volume.
@@ -85,10 +88,13 @@ fn volume_spec(instance: &InstanceName, name: &str) -> VolumeSpec {
 }
 
 /// Podman volume name and labels for a shared volume (no `weglarka.instance` label on purpose).
-fn shared_volume_spec(name: &SharedVolumeName) -> VolumeSpec {
+fn shared_volume_spec(name: &SharedVolumeName, group: &SharedVolumeName) -> VolumeSpec {
     VolumeSpec {
         name: labels::shared_volume_name(name),
-        labels: BTreeMap::from([(labels::SHARED_VOLUME.to_owned(), name.to_string())]),
+        labels: BTreeMap::from([
+            (labels::SHARED_VOLUME.to_owned(), name.to_string()),
+            (labels::SHARED_GROUP.to_owned(), group.to_string()),
+        ]),
     }
 }
 
@@ -106,12 +112,57 @@ pub async fn ensure_volumes<P: PodmanClient>(
     Ok(())
 }
 
-/// Creates a shared volume (idempotent, labelled `weglarka.shared-volume`).
+/// Group recorded on an existing shared volume: the [`labels::SHARED_GROUP`] label, or — for a
+/// volume created before groups existed — the volume's own name.
+fn recorded_group(name: &SharedVolumeName, labels: &BTreeMap<String, String>) -> SharedVolumeName {
+    labels
+        .get(labels::SHARED_GROUP)
+        .and_then(|g| SharedVolumeName::new(g).ok())
+        .unwrap_or_else(|| name.clone())
+}
+
+/// Creates a shared volume (idempotent, labelled `weglarka.shared-volume` and
+/// `weglarka.shared-group`). An existing volume keeps its labels, so a volume whose recorded group
+/// differs from the declared one is refused: its files belong to the old group's uid range
+/// (docs/decisions/0029).
 pub async fn ensure_shared_volume<P: PodmanClient>(
     podman: &P,
     name: &SharedVolumeName,
-) -> Result<()> {
-    podman.volume_create(&shared_volume_spec(name)).await
+    group: &SharedVolumeName,
+) -> Result<(), EngineError> {
+    match podman
+        .volume_inspect(&labels::shared_volume_name(name))
+        .await
+    {
+        Ok(info) => {
+            let recorded = recorded_group(name, &info.labels);
+            if recorded != *group {
+                return Err(EngineError::SharedGroupChange {
+                    volume: name.clone(),
+                    from: recorded,
+                    to: group.clone(),
+                });
+            }
+            Ok(())
+        }
+        Err(PodmanError::NotFound(_)) => Ok(podman
+            .volume_create(&shared_volume_spec(name, group))
+            .await?),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`ensure_shared_volume`] for every shared volume the spec mounts.
+pub async fn ensure_shared_volumes<P: PodmanClient>(
+    podman: &P,
+    apps: &AppsFile,
+    spec: &AppSpec,
+) -> Result<(), EngineError> {
+    for mount in &spec.shared_volumes {
+        let group = shared_volumes::volume_group(apps, &mount.name);
+        ensure_shared_volume(podman, &mount.name, &group).await?;
+    }
+    Ok(())
 }
 
 /// Container-side mounts for the instance's declared private volumes and shared volumes.
@@ -182,8 +233,9 @@ impl<P: PodmanClient> Reconciler<P> {
         allocate(&used, pool, size).ok_or(EngineError::UidPoolExhausted { pool, size })
     }
 
-    /// Range of a shared volume; allocated and persisted on first use. Caller holds the engine lock
-    /// and calls this *before* loading the state it is going to modify (it writes `state.toml` itself).
+    /// Range of a shared volume group; allocated and persisted on first use. Caller holds the engine
+    /// lock and calls this *before* loading the state it is going to modify (it writes `state.toml`
+    /// itself).
     async fn assign_shared_range(&self, name: &SharedVolumeName) -> Result<UidRange, EngineError> {
         let mut st = state::load_state(&self.paths.state)?;
         if let Some(r) = st.shared_volumes.get(name).and_then(|s| s.uid_range) {
@@ -193,10 +245,10 @@ impl<P: PodmanClient> Reconciler<P> {
         st.shared_volumes.entry(name.clone()).or_default().uid_range = Some(range);
         state::save_state(&self.paths.state, &st)?;
         tracing::info!(
-            volume = %name,
+            group = %name,
             start = range.start,
             size = range.size,
-            "assigned uid range for a shared volume"
+            "assigned uid range for a shared volume group"
         );
         Ok(range)
     }
@@ -210,8 +262,9 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<UidRange, EngineError> {
-        if let Some(mount) = shared_volumes::mount(spec) {
-            return self.assign_shared_range(&mount.name).await;
+        let apps = state::load_apps(&self.paths.apps)?;
+        if let Some(group) = shared_volumes::spec_group(&apps, spec) {
+            return self.assign_shared_range(&group).await;
         }
         let mut st = state::load_state(&self.paths.state)?;
         if let Some(r) = st.apps.get(instance).and_then(|s| s.uid_range) {
@@ -252,12 +305,16 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<Prepared, EngineError> {
-        let range = effective_range(&state::load_state(&self.paths.state)?, instance, spec)
-            .ok_or_else(|| EngineError::Volume(format!("{instance}: no uid range assigned")))?;
+        let apps = state::load_apps(&self.paths.apps)?;
+        let range = effective_range(
+            &apps,
+            &state::load_state(&self.paths.state)?,
+            instance,
+            spec,
+        )
+        .ok_or_else(|| EngineError::Volume(format!("{instance}: no uid range assigned")))?;
         ensure_volumes(&self.podman, instance, spec).await?;
-        if let Some(mount) = shared_volumes::mount(spec) {
-            ensure_shared_volume(&self.podman, &mount.name).await?;
-        }
+        ensure_shared_volumes(&self.podman, &apps, spec).await?;
         // The caller persists `Prepared.range` as `AppState::effective_uid_range` together with the
         // rest of the deploy state, so the range-change guard still knows the data owner when the
         // container is gone (issue #75).
@@ -277,10 +334,13 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
         container_labels: &BTreeMap<String, String>,
     ) -> bool {
-        state::load_state(&self.paths.state)
-            .ok()
-            .and_then(|st| effective_range_label(&st, instance, spec))
-            .as_deref()
+        let (Ok(apps), Ok(st)) = (
+            state::load_apps(&self.paths.apps),
+            state::load_state(&self.paths.state),
+        ) else {
+            return false;
+        };
+        effective_range_label(&apps, &st, instance, spec).as_deref()
             == container_labels.get(labels::UID_RANGE).map(String::as_str)
     }
 
@@ -295,7 +355,7 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         for (name, spec) in &apps.apps {
             let needs = st.apps.get(name).is_some_and(|s| s.current.is_some())
-                && effective_range_label(&st, name, spec).is_none();
+                && effective_range_label(apps, &st, name, spec).is_none();
             if needs && let Err(e) = self.assign_range(name, spec).await {
                 failed.insert(name.clone(), e.to_string());
             }
@@ -351,26 +411,34 @@ impl<P: PodmanClient> Reconciler<P> {
         changed
     }
 
-    /// State of shared volumes whose data is gone: an entry is dropped (and its range released) only
-    /// when the Podman volume does not exist **and** no member references it. Data for an undeclared
-    /// volume keeps its range reserved — freeing a range that still owns data is the worse error.
-    /// Returns whether `st` changed.
+    /// Whether any Podman volume still belongs to `group` (a volume labelled with the group, or a
+    /// volume created before groups whose own name is the group). If Podman cannot tell, the answer
+    /// is "yes": freeing a range that still owns data is the worse error.
+    async fn group_has_volumes(&self, group: &SharedVolumeName) -> bool {
+        for key in [labels::SHARED_GROUP, labels::SHARED_VOLUME] {
+            let filter = VolumeFilter {
+                labels: BTreeMap::from([(key.to_owned(), group.to_string())]),
+            };
+            match self.podman.volume_list(&filter).await {
+                Ok(v) if v.is_empty() => {}
+                Ok(_) | Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// State of shared volume groups whose data is gone: an entry (keyed by group) is dropped, and
+    /// its range released, only when no Podman volume of the group exists **and** no member
+    /// references any volume of the group. Data for an undeclared volume keeps the range reserved —
+    /// freeing a range that still owns data is the worse error. Returns whether `st` changed.
     pub(crate) async fn settle_shared_volumes(&self, st: &mut StateFile, apps: &AppsFile) -> bool {
-        let names: Vec<SharedVolumeName> = st.shared_volumes.keys().cloned().collect();
+        let groups: Vec<SharedVolumeName> = st.shared_volumes.keys().cloned().collect();
         let mut changed = false;
-        for name in names {
-            if !shared_volumes::members(apps, &name).is_empty() {
+        for group in groups {
+            if !shared_volumes::group_members(apps, &group).is_empty() {
                 continue; // still in use by a member
             }
-            let filter = VolumeFilter {
-                labels: BTreeMap::from([(labels::SHARED_VOLUME.to_owned(), name.to_string())]),
-            };
-            let exists = match self.podman.volume_list(&filter).await {
-                Ok(v) => !v.is_empty(),
-                // Cannot tell → keep: the declaration may still own the data.
-                Err(_) => true,
-            };
-            if !exists && st.shared_volumes.remove(&name).is_some() {
+            if !self.group_has_volumes(&group).await && st.shared_volumes.remove(&group).is_some() {
                 changed = true;
             }
         }
@@ -416,6 +484,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 "removed the instance's secrets"
             );
         }
+        let apps_before = apps.clone();
         apps.apps.remove(name);
         state::save_apps(&self.paths.apps, &apps)?;
         if !options.purge_volumes {
@@ -449,8 +518,13 @@ impl<P: PodmanClient> Reconciler<P> {
         }
         let mut st = state::load_state(&self.paths.state)?;
         let mut changed = st.apps.remove(name).is_some();
-        for mount in &spec.shared_volumes {
-            changed |= st.shared_volumes.remove(&mount.name).is_some();
+        // The group's range is released with its last volume (and last member), not with this
+        // app's mounts: other volumes of the group may still hold data in it (issue #129).
+        if let Some(group) = shared_volumes::spec_group(&apps_before, &spec)
+            && shared_volumes::group_members(&apps, &group).is_empty()
+            && !self.group_has_volumes(&group).await
+        {
+            changed |= st.shared_volumes.remove(&group).is_some();
         }
         if changed {
             state::save_state(&self.paths.state, &st)?;
@@ -458,14 +532,30 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(())
     }
 
-    /// Declares a shared volume (idempotent, issue #33). Apps mount it through `shared_volumes`.
-    pub async fn declare_shared_volume(&self, name: SharedVolumeName) -> Result<(), EngineError> {
+    /// Declares a shared volume (idempotent, issue #33), optionally in a `group` that shares one uid
+    /// range (issue #129). Apps mount it through `shared_volumes`. Declaring an existing volume again
+    /// is a no-op when the group matches and refused (`SharedGroupChange`) when it does not: a
+    /// volume's group is fixed while it exists, because its files belong to the group's range.
+    pub async fn declare_shared_volume(
+        &self,
+        name: SharedVolumeName,
+        group: Option<SharedVolumeName>,
+    ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
-        if apps.shared_volumes.contains_key(&name) {
-            return Ok(());
+        // A group equal to the volume's own name is the default, kept implicit in the file.
+        let group = group.filter(|g| *g != name);
+        if let Some(existing) = apps.shared_volumes.get(&name) {
+            if existing.group == group {
+                return Ok(());
+            }
+            return Err(EngineError::SharedGroupChange {
+                volume: name.clone(),
+                from: shared_volumes::volume_group(&apps, &name),
+                to: group.unwrap_or_else(|| name.clone()),
+            });
         }
-        apps.shared_volumes.insert(name, Default::default());
+        apps.shared_volumes.insert(name, SharedVolumeSpec { group });
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
@@ -500,6 +590,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 volume: name.clone(),
             });
         }
+        let group = shared_volumes::volume_group(&apps, name);
         apps.shared_volumes.remove(name);
         state::save_apps(&self.paths.apps, &apps)?;
         if exists {
@@ -508,9 +599,14 @@ impl<P: PodmanClient> Reconciler<P> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let mut st = state::load_state(&self.paths.state)?;
-        if st.shared_volumes.remove(name).is_some() {
-            state::save_state(&self.paths.state, &st)?;
+        // The range goes with the group's last volume: siblings may still hold data in it.
+        if shared_volumes::group_members(&apps, &group).is_empty()
+            && !self.group_has_volumes(&group).await
+        {
+            let mut st = state::load_state(&self.paths.state)?;
+            if st.shared_volumes.remove(&group).is_some() {
+                state::save_state(&self.paths.state, &st)?;
+            }
         }
         Ok(())
     }
@@ -565,9 +661,13 @@ impl<P: PodmanClient> Reconciler<P> {
         new_spec: &AppSpec,
     ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
-        let new_label = state::load_state(&self.paths.state)
-            .ok()
-            .and_then(|st| effective_range_label(&st, instance, new_spec));
+        let new_label = match (
+            state::load_apps(&self.paths.apps),
+            state::load_state(&self.paths.state),
+        ) {
+            (Ok(apps), Ok(st)) => effective_range_label(&apps, &st, instance, new_spec),
+            _ => None,
+        };
         self.range_change_guard_locked(instance, new_label.as_deref())
             .await
     }
@@ -646,7 +746,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let app = st.apps.get(instance);
         let (Some(digest), Some(range)) = (
             app.and_then(|s| s.current.clone()),
-            effective_range(&st, instance, &spec),
+            effective_range(&apps, &st, instance, &spec),
         ) else {
             return Err(EngineError::Volume(format!(
                 "{instance} is not deployed yet; deploy it once before importing"
@@ -674,7 +774,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
             }
         }
-        self.ensure_import_target(instance, &spec, shared.as_ref())
+        self.ensure_import_target(instance, &apps, &spec, shared.as_ref())
             .await?;
 
         let app_container = labels::container_name(instance);
@@ -697,7 +797,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 Ok(()) | Err(PodmanError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
-            self.ensure_import_target(instance, &spec, shared.as_ref())
+            self.ensure_import_target(instance, &apps, &spec, shared.as_ref())
                 .await?;
         }
         let result = match mode {
@@ -736,11 +836,15 @@ impl<P: PodmanClient> Reconciler<P> {
     async fn ensure_import_target(
         &self,
         instance: &InstanceName,
+        apps: &AppsFile,
         spec: &AppSpec,
         shared: Option<&SharedVolumeName>,
     ) -> Result<(), EngineError> {
         match shared {
-            Some(name) => ensure_shared_volume(&self.podman, name).await?,
+            Some(name) => {
+                let group = shared_volumes::volume_group(apps, name);
+                ensure_shared_volume(&self.podman, name, &group).await?
+            }
             None => ensure_volumes(&self.podman, instance, spec).await?,
         }
         Ok(())
@@ -1642,13 +1746,19 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
     async fn shared_volume_declaration_lifecycle() {
         let e = env(PLAIN);
         let volume = shared_name("kajet-data");
-        e.rec.declare_shared_volume(volume.clone()).await.unwrap();
-        e.rec.declare_shared_volume(volume.clone()).await.unwrap(); // idempotent
+        e.rec
+            .declare_shared_volume(volume.clone(), None)
+            .await
+            .unwrap();
+        e.rec
+            .declare_shared_volume(volume.clone(), None)
+            .await
+            .unwrap(); // idempotent
         assert!(e.apps().shared_volumes.contains_key(&volume));
 
         // The volume exists but no member uses it: dropping the declaration needs --purge.
         e.fake
-            .volume_create(&shared_volume_spec(&volume))
+            .volume_create(&shared_volume_spec(&volume, &volume))
             .await
             .unwrap();
         assert!(matches!(
@@ -1665,6 +1775,216 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             e.rec.remove_shared_volume(&volume, true).await.unwrap_err(),
             EngineError::UnknownSharedVolume(_)
         ));
+    }
+
+    // ── Groups of shared volumes (issue #129, docs/decisions/0029-shared-volume-groups.md) ────
+
+    const GROUPED_APPS: &str = r#"
+[shared_volumes.kajet-data]
+group = "kajet"
+
+[shared_volumes.kajet-workspaces]
+group = "kajet"
+
+[apps.kajet-api]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+shared_volumes = [
+  { name = "kajet-data", target = "/data" },
+  { name = "kajet-workspaces", target = "/workspaces" },
+]
+
+[apps.kajet-mcp]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+"#;
+
+    fn purge() -> RemoveAppOptions {
+        RemoveAppOptions {
+            purge_volumes: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn volumes_of_one_group_share_one_range_and_one_mapping() {
+        let e = env(GROUPED_APPS);
+        e.fake.set_subuid_pool(70_000); // room for exactly one full range
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+
+        let state = e.state();
+        assert_eq!(
+            state.shared_volumes.keys().collect::<Vec<_>>(),
+            [&shared_name("kajet")],
+            "the range is keyed by group, not by volume"
+        );
+        let r = e.shared_range("kajet").unwrap();
+        assert_eq!(e.mapping("kajet-api"), id_mapping(r));
+        assert_eq!(e.mapping("kajet-mcp"), id_mapping(r));
+
+        let api = e.fake.container_spec("kajet-api").unwrap();
+        assert_eq!(api.volumes.len(), 2, "{:?}", api.volumes);
+        assert_eq!(e.fake.container_spec("kajet-mcp").unwrap().volumes.len(), 1);
+
+        let vols = e.fake.volumes();
+        assert_eq!(vols.len(), 2, "{vols:?}");
+        for v in &vols {
+            assert_eq!(
+                v.labels.get(labels::SHARED_GROUP).map(String::as_str),
+                Some("kajet")
+            );
+            assert!(!v.labels.contains_key(labels::INSTANCE));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn purge_keeps_the_group_range_until_the_last_volume_is_gone() {
+        // api owns the data volume, worker the workspaces: purging one must not free the range.
+        let e = env(r#"
+[shared_volumes.kajet-data]
+group = "kajet"
+
+[shared_volumes.kajet-workspaces]
+group = "kajet"
+
+[apps.kajet-api]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+
+[apps.kajet-worker]
+image = "ghcr.io/x/szklana:latest"
+health = { attempts = 2, window_secs = 2 }
+shared_volumes = [{ name = "kajet-workspaces", target = "/workspaces" }]
+"#);
+        e.rec.reconcile().await.unwrap();
+        let r = e.shared_range("kajet").unwrap();
+        assert_eq!(e.fake.volumes().len(), 2);
+
+        e.rec
+            .remove_app_with_purges(&name("kajet-api"), purge())
+            .await
+            .unwrap();
+        assert_eq!(e.fake.volumes().len(), 1, "only the data volume is purged");
+        assert_eq!(
+            e.shared_range("kajet"),
+            Some(r),
+            "the sibling volume still lives in the range"
+        );
+
+        e.rec
+            .remove_app_with_purges(&name("kajet-worker"), purge())
+            .await
+            .unwrap();
+        assert!(e.fake.volumes().is_empty());
+        assert!(
+            e.state().shared_volumes.is_empty(),
+            "last volume → released"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn purge_is_refused_while_another_member_mounts_any_volume_of_the_mount() {
+        let e = env(GROUPED_APPS);
+        e.rec.reconcile().await.unwrap();
+        // kajet-mcp also mounts kajet-data, so api's purge would delete data it uses.
+        let err = e
+            .rec
+            .remove_app_with_purges(&name("kajet-api"), purge())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::SharedVolumeInUse { .. }),
+            "{err:?}"
+        );
+        assert_eq!(e.fake.volumes().len(), 2);
+        assert!(e.apps().apps.contains_key(&name("kajet-api")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_volume_cannot_move_to_another_group_while_it_exists() {
+        let e = env(GROUPED_APPS);
+        e.rec.reconcile().await.unwrap();
+
+        // Through the declaration API.
+        let err = e
+            .rec
+            .declare_shared_volume(shared_name("kajet-data"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::SharedGroupChange { .. }),
+            "{err:?}"
+        );
+        e.rec
+            .declare_shared_volume(shared_name("kajet-data"), Some(shared_name("kajet")))
+            .await
+            .unwrap(); // same group: idempotent
+
+        // And through a hand-edited apps.toml: the volume keeps its recorded group.
+        let err = ensure_shared_volume(&e.fake, &shared_name("kajet-data"), &shared_name("other"))
+            .await
+            .unwrap_err();
+        match err {
+            EngineError::SharedGroupChange { from, to, .. } => {
+                assert_eq!((from, to), (shared_name("kajet"), shared_name("other")));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn declaring_with_a_group_is_persisted_and_the_default_group_stays_implicit() {
+        let e = env(PLAIN);
+        e.rec
+            .declare_shared_volume(shared_name("kajet-data"), Some(shared_name("kajet")))
+            .await
+            .unwrap();
+        e.rec
+            .declare_shared_volume(shared_name("solo"), Some(shared_name("solo")))
+            .await
+            .unwrap();
+        let apps = e.apps();
+        assert_eq!(
+            apps.shared_volumes[&shared_name("kajet-data")].group,
+            Some(shared_name("kajet"))
+        );
+        assert_eq!(
+            apps.shared_volumes[&shared_name("solo")].group,
+            None,
+            "a group equal to the volume name is the default and is not written"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_declaration_keeps_the_range_while_a_sibling_has_data() {
+        let e = env(GROUPED_APPS);
+        e.rec.reconcile().await.unwrap();
+        e.rec
+            .remove_app_with_purges(&name("kajet-mcp"), RemoveAppOptions::default())
+            .await
+            .unwrap();
+        e.rec
+            .remove_app_with_purges(&name("kajet-api"), RemoveAppOptions::default())
+            .await
+            .unwrap();
+        let r = e.shared_range("kajet").unwrap();
+        e.rec
+            .remove_shared_volume(&shared_name("kajet-data"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            e.shared_range("kajet"),
+            Some(r),
+            "kajet-workspaces still has data"
+        );
+        e.rec
+            .remove_shared_volume(&shared_name("kajet-workspaces"), true)
+            .await
+            .unwrap();
+        assert!(e.state().shared_volumes.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

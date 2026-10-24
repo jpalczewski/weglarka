@@ -188,11 +188,12 @@ async fn declare_is_idempotent_and_listed_without_members() {
         list,
         json!({"volumes": [{
             "name": GROUP,
+            "group": GROUP,
             "podman_name": PODMAN_GROUP,
             "members": [],
             "exists": false,
         }]}),
-        "uid_range is omitted until the first member's deploy"
+        "uid_range is omitted until the first member's deploy; the default group is the volume"
     );
     assert!(apps_file(&h).shared_volumes.contains_key(&shared(GROUP)));
 
@@ -245,6 +246,91 @@ async fn member_provisioning_allocates_the_group_range_and_creates_the_volume() 
         None,
         "members do not own a private range"
     );
+    h.running.stop().await;
+}
+
+/// An app mounting several volumes (issue #129).
+fn multi_spec(volumes: &[(&str, &str)]) -> Value {
+    let mounts: Vec<Value> = volumes
+        .iter()
+        .map(|(name, target)| json!({ "name": name, "target": target }))
+        .collect();
+    json!({
+        "image": IMAGE,
+        "start": false,
+        "health": { "attempts": 1, "window_secs": 1 },
+        "shared_volumes": mounts
+    })
+}
+
+#[tokio::test]
+async fn two_volumes_of_one_group_share_a_range_and_two_groups_are_rejected() {
+    let h = harness().await;
+    for (name, group) in [("kajet-data", "kajet"), ("kajet-workspaces", "kajet")] {
+        let (status, _) = admin(
+            &h,
+            "PUT",
+            &format!("/v1/volumes/{name}?group={group}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "declare {name}");
+    }
+    declare(&h, "other").await;
+    add(
+        &h,
+        "kajet-api",
+        multi_spec(&[("kajet-data", "/data"), ("kajet-workspaces", "/workspaces")]),
+    )
+    .await;
+
+    let (status, list) = admin(&h, "GET", "/v1/volumes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let volumes = list["volumes"].as_array().unwrap();
+    let data = volumes.iter().find(|v| v["name"] == "kajet-data").unwrap();
+    let workspaces = volumes
+        .iter()
+        .find(|v| v["name"] == "kajet-workspaces")
+        .unwrap();
+    assert_eq!(data["group"], "kajet");
+    assert_eq!(workspaces["group"], "kajet");
+    assert_eq!(data["members"], json!(["kajet-api"]));
+    assert!(data["uid_range"].is_object(), "{list}");
+    assert_eq!(
+        data["uid_range"], workspaces["uid_range"],
+        "volumes of a group report one range"
+    );
+    assert_eq!(data["exists"], true);
+    assert_eq!(workspaces["exists"], true);
+    let st = state_file(&h);
+    assert_eq!(
+        st.shared_volumes.keys().collect::<Vec<_>>(),
+        [&shared("kajet")],
+        "state is keyed by group"
+    );
+
+    // A volume from a different group cannot be mounted next to them.
+    let (status, body) = admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(json!({
+            "name": "mixed",
+            "spec": multi_spec(&[("kajet-data", "/data"), ("other", "/other")])
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["message"].as_str().unwrap_or_default().to_owned();
+    assert!(message.contains("different groups"), "{message}");
+
+    // A volume's group is fixed while it exists.
+    let (status, body) = admin(&h, "PUT", "/v1/volumes/kajet-data?group=elsewhere", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, _) = admin(&h, "PUT", "/v1/volumes/kajet-data?group=kajet", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "same group is idempotent");
+    let (status, _) = admin(&h, "PUT", "/v1/volumes/kajet-data?group=Bad_Name", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     h.running.stop().await;
 }
 
@@ -669,5 +755,35 @@ async fn doctor_hints_that_members_must_share_the_container_user() {
     );
     let hint = check["hint"].as_str().unwrap_or_default();
     assert!(hint.contains("Config.User"), "{hint}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_reports_group_membership() {
+    let h = harness().await;
+    for name in ["kajet-data", "kajet-workspaces"] {
+        let (status, _) = admin(&h, "PUT", &format!("/v1/volumes/{name}?group=kajet"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    add(
+        &h,
+        "kajet-api",
+        multi_spec(&[("kajet-data", "/data"), ("kajet-workspaces", "/workspaces")]),
+    )
+    .await;
+
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "state.shared_volumes")
+        .expect("state.shared_volumes check exists");
+    assert_eq!(check["status"], "info", "{check}");
+    let message = check["message"].as_str().unwrap();
+    assert!(
+        message.contains("group kajet: volumes kajet-data, kajet-workspaces; members kajet-api"),
+        "{message}"
+    );
     h.running.stop().await;
 }

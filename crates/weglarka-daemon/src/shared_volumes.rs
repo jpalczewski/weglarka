@@ -1,12 +1,13 @@
 //! Admin endpoints for volumes shared between instances (issue #33,
 //! [`docs/decisions/0017-shared-volumes.md`](../../../docs/decisions/0017-shared-volumes.md)):
-//! `GET /v1/volumes` lists the declarations, `PUT /v1/volumes/{volume}` declares one (idempotent,
-//! no body) and `DELETE /v1/volumes/{volume}?purge=true` drops the declaration — with `purge` also
+//! `GET /v1/volumes` lists the declarations, `PUT /v1/volumes/{volume}[?group=]` declares one
+//! (idempotent, no body) and `DELETE /v1/volumes/{volume}?purge=true` drops the declaration — with `purge` also
 //! its data.
 //!
 //! The mounts are part of the app specs (`AppSpec::shared_volumes`): declaring a volume only makes
-//! the name mountable. The volume owns one uid/gid range and every member container runs in it; the
-//! engine creates the Podman volume (`wg-shared-<name>`, labelled `weglarka.shared-volume`) on the
+//! the name mountable. The volume's group (its own name unless `?group=` says otherwise, issue #129)
+//! owns one uid/gid range and every member container runs in it; the engine creates the Podman
+//! volume (`wg-shared-<name>`, labelled `weglarka.shared-volume` and `weglarka.shared-group`) on the
 //! first member's deploy. This module is the API surface plus the read model
 //! ([`SharedVolumeSummary`]): `apps.toml` + `state.toml` + what Podman knows.
 
@@ -79,7 +80,12 @@ async fn list_shared_volumes<P: PodmanClient + 'static>(
         .into_iter()
         .map(|(name, podman_name, exists)| SharedVolumeSummary {
             members: shared_volumes::members(&apps, &name),
-            uid_range: st.shared_volumes.get(&name).and_then(|s| s.uid_range),
+            // `state.toml` is keyed by group: volumes of one group report the same range.
+            group: Some(shared_volumes::volume_group(&apps, &name)),
+            uid_range: st
+                .shared_volumes
+                .get(&shared_volumes::volume_group(&apps, &name))
+                .and_then(|s| s.uid_range),
             name,
             podman_name,
             exists,
@@ -88,16 +94,29 @@ async fn list_shared_volumes<P: PodmanClient + 'static>(
     Ok(axum::Json(ListSharedVolumesResponse { volumes }).into_response())
 }
 
-/// `PUT /v1/volumes/{volume}`: declares a shared volume (idempotent).
+/// Value of `key` in a raw query string (no percent-decoding: names are `[a-z0-9-]`).
+fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query?
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find_map(|(k, v)| (k == key).then_some(v))
+}
+
+/// `PUT /v1/volumes/{volume}?group=<name>`: declares a shared volume (idempotent), optionally in a
+/// group that shares one uid range (issue #129).
 async fn declare_shared_volume<P: PodmanClient + 'static>(
     State(d): Shared<P>,
     Path(raw): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<StatusCode, Fail> {
     let name = parse_volume(&raw)?;
+    let group = query_value(query.as_deref(), "group")
+        .map(parse_volume)
+        .transpose()?;
     {
         // Serializes with the desired-state edits of `apps add`/`apps update` (both write apps.toml).
         let _g = d.desired_lock.lock().await;
-        mutating(d.engine.declare_shared_volume(name)).await?;
+        mutating(d.engine.declare_shared_volume(name, group)).await?;
     }
     d.changed();
     Ok(StatusCode::NO_CONTENT)

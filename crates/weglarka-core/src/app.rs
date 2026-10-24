@@ -333,10 +333,17 @@ impl fmt::Display for SharedVolumeName {
 /// where per-volume options (backups, range size) will live. Strict, like every persisted type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SharedVolumeSpec {}
+pub struct SharedVolumeSpec {
+    /// Group the volume belongs to (issue #129, `docs/decisions/0029-shared-volume-groups.md`). The
+    /// uid/gid range is allocated per **group**; an app may mount any number of volumes of exactly
+    /// one group. Unset = a group named after the volume itself (the behaviour before groups), so
+    /// existing files keep their meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<SharedVolumeName>,
+}
 
-/// Mount of a declared shared volume in one instance's container. At most one per app in v1: a
-/// shared volume is a uid/gid-range boundary (all members run in its range).
+/// Mount of a declared shared volume in one instance's container. An app may mount several, but
+/// only of one group: all members of a group run in the group's uid/gid range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedVolumeRef {
