@@ -155,5 +155,35 @@ expression: rendered
       "white_check_mark"
     ],
     "click": "https://nz.example.com"
+  },
+  {
+    "severity": "info",
+    "key": "self-update:daemon",
+    "title": "Węglarka updated",
+    "body": "aaaaaaaaaaaa → dddddddddddd",
+    "priority": 3,
+    "tags": [
+      "arrow_up"
+    ]
+  },
+  {
+    "severity": "info",
+    "key": "self-update:daemon",
+    "title": "Węglarka updated",
+    "body": "dddddddddddd",
+    "priority": 3,
+    "tags": [
+      "arrow_up"
+    ]
+  },
+  {
+    "severity": "warning",
+    "key": "self-update:daemon",
+    "title": "Węglarka self-update did not take effect",
+    "body": "pinned dddddddddddd but the container runs aaaaaaaaaaaa; `weglarka-daemon self-update --rollback` returns to the previous image",
+    "priority": 4,
+    "tags": [
+      "warning"
+    ]
   }
 ]

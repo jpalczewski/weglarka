@@ -113,6 +113,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1195,6 +1201,7 @@ dependencies = [
  "weglarka-ingress",
  "weglarka-notify",
  "weglarka-podman",
+ "weglarka-registry",
 ]
 
 [[package]]
@@ -1242,6 +1249,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "weglarka-core",
+]
+
+[[package]]
+name = "weglarka-registry"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
  "weglarka-core",
 ]
 

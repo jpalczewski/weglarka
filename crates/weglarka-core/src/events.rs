@@ -69,6 +69,13 @@ pub enum Event {
     /// A crashing or unhealthy instance is running normally again: no new restarts for a full window, or
     /// the healthcheck passes again.
     Recovered { instance: InstanceName },
+    /// The host-side switcher replaced Węglarka's image and this daemon started from the new digest
+    /// (issue #99, `docs/decisions/0027`). `from` is the previous digest, the rollback target.
+    SelfUpdated { from: Option<Digest>, to: Digest },
+    /// A switch was requested but the container runs a different image — the pinned digest did not
+    /// take effect (`docs/decisions/0027`). Not critical: `weglarka-daemon self-update --rollback`
+    /// returns to the previous image, and #100 will automate that.
+    SelfUpdatePending { expected: Digest, actual: Digest },
 }
 
 /// How serious an event is. Notification channels route on it (`min_severity`) and the daemon uses it
@@ -109,9 +116,10 @@ impl Event {
     pub fn severity(&self) -> Severity {
         match self {
             Self::RollbackFailed { .. } | Self::CrashLooping { .. } => Severity::Critical,
-            Self::DeployFailed { .. } | Self::RolledBack { .. } | Self::Unhealthy { .. } => {
-                Severity::Warning
-            }
+            Self::DeployFailed { .. }
+            | Self::RolledBack { .. }
+            | Self::Unhealthy { .. }
+            | Self::SelfUpdatePending { .. } => Severity::Warning,
             Self::Pruned { .. }
             | Self::WaitingForDependency { .. }
             | Self::WebhookDuplicate { .. } => Severity::Debug,
@@ -119,7 +127,8 @@ impl Event {
             | Self::Provisioned { .. }
             | Self::Recreated { .. }
             | Self::WaitingForSecret { .. }
-            | Self::Recovered { .. } => Severity::Info,
+            | Self::Recovered { .. }
+            | Self::SelfUpdated { .. } => Severity::Info,
         }
     }
 }

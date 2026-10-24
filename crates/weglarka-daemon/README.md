@@ -68,6 +68,30 @@ TimeoutStopSec=70
 WantedBy=default.target
 ```
 
+## Self-update (issue #99, decision 0027)
+
+`platform install` also writes and enables `weglarka-self-update.service` and its timer in
+`~/.config/systemd/user`: every 10 minutes the oneshot service runs
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml self-update
+```
+
+which does nothing until `[self_update]` is configured, and otherwise pulls `[self_update] image`, verifies its
+cosign signature against the key embedded from `cosign.pub`, refuses a state-schema downgrade, pins
+`repo@sha256:<digest>` in the quadlet and restarts the service. The switch must run on the host: the container is
+`scratch` (no `systemctl`, no `/etc/passwd`, no D-Bus) and must not be able to rewrite its own unit.
+
+- `self-update --check` — pull, verify and check the schema, change nothing (also skips the interval).
+- `self-update --force` — ignore the interval and retry a digest that already failed.
+- `self-update --rollback` — pin the previous digest recorded in `<state dir>/self-update.toml` and restart
+  (the manual fallback until #100).
+- `self-update --image <ref>` — follow another reference for this run.
+
+The daemon confirms the outcome on its next start and exposes it as the `doctor` check `self_update`; a switch
+that did not take effect is reported there (and as a `SelfUpdatePending` notification) instead of being assumed.
+Operator runbook: `docs/install.md` section 6k.
+
 ## Known limitations (before deployment)
 
 - Image and release: `Containerfile`, `.github/workflows/release.yml`, decision 0006 (`DEFAULT_IMAGE` = `:latest`, exists after the first `v*` tag).

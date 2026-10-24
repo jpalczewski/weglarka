@@ -1,0 +1,33 @@
+[package]
+name = "weglarka-registry"
+description = "Węglarka: OCI registry lookups for cosign signatures and their verification"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# In-memory `Registry` and a helper that signs payloads with a throw-away key — for daemon tests.
+testing = []
+
+[dependencies]
+base64.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+weglarka-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

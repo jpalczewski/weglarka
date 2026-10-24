@@ -1,0 +1,25 @@
+# Self-update (issue #99, docs/decisions/0027): an excerpt of weglarka.toml, not of apps.toml.
+#
+# Węglarka follows its own image tag, verifies the cosign signature with the key embedded in the
+# binary (cosign.pub in the repository root) and, once a new digest passes the check, pins it in the
+# systemd unit and restarts itself. The switch runs from the host — `weglarka-daemon self-update` —
+# because the container has no `systemctl` and must not be able to rewrite its own unit; a user timer
+# installed by `platform install` wakes it every 10 minutes and the interval below decides whether it
+# really runs. The daemon inside the container only reports the outcome (`weglarka doctor`).
+#
+# Without a [self_update] section the timer still exists but every run returns immediately.
+# Enabling or changing the image needs no service reinstall; changing the timer itself does.
+
+[self_update]
+# The tag to follow. Must be a tag, not a digest: the switcher resolves the digest itself and pins it.
+image = "ghcr.io/jpalczewski/weglarka:latest"
+
+# Pause the checks without deleting the section.
+# enabled = true
+
+# Minimum time between two checks, seconds (at least 300). Measured from the last completed check,
+# including a refused one, so a broken release is not retried every ten minutes.
+# interval_secs = 3600
+
+# Public key that overrides the one embedded in the binary — for rotating the signing key.
+# public_key_file = "/etc/weglarka/cosign.pub"

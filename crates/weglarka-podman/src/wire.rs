@@ -564,6 +564,9 @@ pub(crate) struct InspectImage {
     /// Manifest digest (when `RepoDigests` is absent, e.g. a locally built image).
     #[serde(rename = "Digest")]
     digest: String,
+    /// OCI labels; `null` for a locally built image without labels.
+    #[serde(rename = "Labels")]
+    labels: Option<BTreeMap<String, String>>,
 }
 
 impl InspectImage {
@@ -584,6 +587,7 @@ impl InspectImage {
             repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
             repo_digests: useful_names(repo_digests),
             size_bytes: self.size.unwrap_or(0),
+            labels: self.labels.unwrap_or_default(),
         }
     }
 }
@@ -616,6 +620,9 @@ impl ListedImage {
             repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
             repo_digests,
             size_bytes: self.size.unwrap_or(0),
+            // The list endpoint does report `Labels`, but only `image_inspect` feeds decisions
+            // (self-update's schema label); retention needs names and sizes only.
+            labels: BTreeMap::new(),
         }
     }
 }
