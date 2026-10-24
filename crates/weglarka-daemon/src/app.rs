@@ -34,6 +34,9 @@ pub struct Daemon<P: PodmanClient> {
     pub notify: Option<Arc<NotifyHandle>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
     pub desired_lock: tokio::sync::Mutex<()>,
+    /// When the process started: reported by `GET /v1/health`, the readiness probe the host-side
+    /// self-update watchdog uses (issue #100).
+    pub started: std::time::Instant,
     pub(crate) triggers: mpsc::Sender<Trigger>,
     pub(crate) webhook_addr: OnceLock<SocketAddr>,
     pub(crate) tasks: Mutex<JoinSet<()>>,

@@ -74,8 +74,11 @@ pub enum Event {
     SelfUpdated { from: Option<Digest>, to: Digest },
     /// A switch was requested but the container runs a different image — the pinned digest did not
     /// take effect (`docs/decisions/0027`). Not critical: `weglarka-daemon self-update --rollback`
-    /// returns to the previous image, and #100 will automate that.
+    /// returns to the previous image.
     SelfUpdatePending { expected: Digest, actual: Digest },
+    /// The watchdog restored the previous digest because the switched daemon did not answer the admin
+    /// API within its deadline (issue #100, `docs/decisions/0034`). `from` is the digest that failed.
+    SelfUpdateFellBack { from: Digest, to: Digest },
 }
 
 /// How serious an event is. Notification channels route on it (`min_severity`) and the daemon uses it
@@ -119,7 +122,8 @@ impl Event {
             Self::DeployFailed { .. }
             | Self::RolledBack { .. }
             | Self::Unhealthy { .. }
-            | Self::SelfUpdatePending { .. } => Severity::Warning,
+            | Self::SelfUpdatePending { .. }
+            | Self::SelfUpdateFellBack { .. } => Severity::Warning,
             Self::Pruned { .. }
             | Self::WaitingForDependency { .. }
             | Self::WebhookDuplicate { .. } => Severity::Debug,

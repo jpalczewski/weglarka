@@ -246,3 +246,83 @@ async fn an_unusable_self_update_section_stops_the_daemon() {
     let message = err.to_string();
     assert!(message.contains("no tag"), "{message}");
 }
+
+/// Issue #100: `GET /v1/health` is the readiness signal the host-side watchdog probes. It must answer
+/// on the admin socket without touching Podman.
+#[tokio::test]
+async fn health_answers_once_the_admin_api_serves() {
+    let env = Env::new(SELF_UPDATE);
+    let running = env.start().await;
+    let stream = UnixStream::connect(&running.admin_socket).await.unwrap();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/health")
+        .header("host", "weglarka")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (status, bytes) = send(stream, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(
+        body["daemon_version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()),
+        "{body}"
+    );
+    assert!(body["uptime_secs"].as_u64().is_some(), "{body}");
+    running.stop().await;
+}
+
+/// Issue #100: a fallback recorded by the watchdog is confirmed at startup, the failed digest never
+/// becomes the rollback target, and `doctor` reports what happened.
+#[tokio::test]
+async fn a_fallback_is_confirmed_and_reported_by_doctor() {
+    let env = Env::new(SELF_UPDATE);
+    // The container really runs the restored image: that is what the fallback pinned.
+    let restored = env.pull(IMAGE).await;
+    env.own_container(IMAGE);
+    let failed = digest('f');
+    let mut state = SelfUpdateState {
+        current: Some(failed.clone()),
+        ..SelfUpdateState::default()
+    };
+    state.begin_switch(
+        Some(restored.clone()),
+        failed.clone(),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+    state.record_fallback(
+        failed.clone(),
+        restored.clone(),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(300),
+    );
+    state.record_error(
+        "the switch to the new image did not become healthy",
+        Some(failed.clone()),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(300),
+    );
+    self_update::save(&env.state_dir(), &state).unwrap();
+
+    let running = env.start().await;
+    let state = self_update::load(&env.state_dir()).unwrap();
+    assert_eq!(state.current, Some(restored.clone()));
+    assert_eq!(
+        state.previous, None,
+        "the failed image is not a rollback target"
+    );
+    assert!(state.pending.is_none(), "the fallback is confirmed");
+
+    let report = doctor(&running).await;
+    let su = check(&report, "self_update");
+    assert_eq!(status(su), "warn", "{su}");
+    let message = su["message"].as_str().unwrap();
+    assert!(message.contains("automatic fallback"), "{message}");
+    assert!(message.contains("failed"), "{message}");
+    running.stop().await;
+}

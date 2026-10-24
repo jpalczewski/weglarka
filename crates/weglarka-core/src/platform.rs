@@ -100,6 +100,14 @@ pub trait Platform: Send + Sync {
     /// restart is the switcher's, not the container's, error to report.
     fn restart_service(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
 
+    /// Clears the service manager's failure state before a restart (systemd: `reset-failed`).
+    ///
+    /// A crash-looping service has exhausted its start limit, and a plain restart then fails with
+    /// "start request repeated too quickly". The automatic fallback of the self-update watchdog has
+    /// to restart exactly such a service (issue #100, `docs/decisions/0034`), so it clears the state
+    /// first. A missing unit is not an error.
+    fn reset_failed(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
+
     /// Enables (or disables) a user timer and starts (stops) it now.
     fn set_timer(&self, name: &str, enabled: bool) -> impl Future<Output = Result<()>> + Send;
 }

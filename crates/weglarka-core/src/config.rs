@@ -295,6 +295,14 @@ pub struct SelfUpdateConfig {
     /// interval has passed it returns without touching the network.
     #[serde(default = "SelfUpdateConfig::default_interval_secs")]
     pub interval_secs: u64,
+    /// Automatic fallback to the previous digest when the switched daemon does not become healthy
+    /// (issue #100, `docs/decisions/0034`). `false` leaves only the manual `self-update --rollback`.
+    #[serde(default = "SelfUpdateConfig::default_fallback")]
+    pub fallback: bool,
+    /// How long the switched daemon gets to answer the admin API's `/v1/health` after the restart the
+    /// switcher performed, in seconds (issue #100).
+    #[serde(default = "SelfUpdateConfig::default_fallback_timeout_secs")]
+    pub fallback_timeout_secs: u64,
     /// PEM public key overriding the one embedded in the binary (`cosign.pub`) — for rotating the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key_file: Option<PathBuf>,
@@ -312,6 +320,14 @@ impl SelfUpdateConfig {
 
     fn default_interval_secs() -> u64 {
         Self::DEFAULT_INTERVAL_SECS
+    }
+
+    fn default_fallback() -> bool {
+        true
+    }
+
+    fn default_fallback_timeout_secs() -> u64 {
+        crate::self_update::FallbackPolicy::DEFAULT_TIMEOUT_SECS
     }
 
     /// Rejects a configuration that cannot work. Called at startup (inside the container) and by the
@@ -348,6 +364,18 @@ impl SelfUpdateConfig {
             .is_some_and(|p| p.as_os_str().is_empty())
         {
             return Err("[self_update] public_key_file is empty".to_owned());
+        }
+        // The watchdog deadline (issue #100): below the minimum it would race the container start,
+        // above the maximum a broken release would keep the old image out of service for too long.
+        let (min, max) = (
+            crate::self_update::FallbackPolicy::MIN_TIMEOUT_SECS,
+            crate::self_update::FallbackPolicy::MAX_TIMEOUT_SECS,
+        );
+        if !(min..=max).contains(&self.fallback_timeout_secs) {
+            return Err(format!(
+                "[self_update] fallback_timeout_secs must be between {min} and {max} (got {})",
+                self.fallback_timeout_secs
+            ));
         }
         Ok(())
     }
@@ -632,6 +660,11 @@ kind = "systemd"
         );
         assert_eq!(su.interval_secs, SelfUpdateConfig::DEFAULT_INTERVAL_SECS);
         assert_eq!(su.public_key_file, None);
+        assert!(su.fallback, "the automatic fallback is on by default");
+        assert_eq!(
+            su.fallback_timeout_secs,
+            crate::self_update::FallbackPolicy::DEFAULT_TIMEOUT_SECS
+        );
         su.validate().unwrap();
     }
 
@@ -658,6 +691,32 @@ kind = "systemd"
 
         let src =
             format!("{SAMPLE}\n[self_update]\nimage = \"ghcr.io/o/w:latest\"\ninterval_secs = 5\n");
+        assert!(
+            HostConfig::from_toml_str(&src)
+                .unwrap()
+                .self_update
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        // The watchdog deadline has to leave the container time to start (issue #100).
+        for timeout in [0, crate::self_update::FallbackPolicy::MIN_TIMEOUT_SECS - 1] {
+            let src = format!(
+                "{SAMPLE}\n[self_update]\nimage = \"ghcr.io/o/w:latest\"\nfallback_timeout_secs = {timeout}\n"
+            );
+            let err = HostConfig::from_toml_str(&src)
+                .unwrap()
+                .self_update
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("fallback_timeout_secs"), "{timeout}: {err}");
+        }
+        let src = format!(
+            "{SAMPLE}\n[self_update]\nimage = \"ghcr.io/o/w:latest\"\nfallback_timeout_secs = {}\n",
+            crate::self_update::FallbackPolicy::MAX_TIMEOUT_SECS + 1
+        );
         assert!(
             HostConfig::from_toml_str(&src)
                 .unwrap()

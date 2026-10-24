@@ -84,12 +84,25 @@ cosign signature against the key embedded from `cosign.pub`, refuses a state-sch
 
 - `self-update --check` — pull, verify and check the schema, change nothing (also skips the interval).
 - `self-update --force` — ignore the interval and retry a digest that already failed.
-- `self-update --rollback` — pin the previous digest recorded in `<state dir>/self-update.toml` and restart
-  (the manual fallback until #100).
+- `self-update --rollback` — pin the previous digest recorded in `<state dir>/self-update.toml` and restart.
 - `self-update --image <ref>` — follow another reference for this run.
 
+A switch that never becomes healthy is reverted automatically (issue #100, decision 0034): `platform install`
+also enables `weglarka-watchdog.timer`, whose oneshot runs
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml supervise
+```
+
+every minute. It probes `GET /v1/health` on the admin socket, and when the switched daemon has not answered within
+`[self_update] fallback_timeout_secs` (default 180 s) it restores the digest the switch started from — no registry
+access, the image must be in the local store, the state-schema gate still applies — after `systemctl --user
+reset-failed`, so a crash-looping unit can restart. One attempt per switch: an exhausted budget is reported, not
+looped.
+
 The daemon confirms the outcome on its next start and exposes it as the `doctor` check `self_update`; a switch
-that did not take effect is reported there (and as a `SelfUpdatePending` notification) instead of being assumed.
+that did not take effect is reported there (and as a `SelfUpdatePending` notification) instead of being assumed,
+and a confirmed fallback becomes a `SelfUpdateFellBack` notification.
 Operator runbook: `docs/install.md` section 6k.
 
 ## Known limitations (before deployment)

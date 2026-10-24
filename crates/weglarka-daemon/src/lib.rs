@@ -20,6 +20,9 @@ pub mod service;
 pub mod settings;
 pub mod shared_networks;
 pub mod shared_volumes;
+/// Host-side watchdog of a switch in flight: the automatic fallback of issue #100
+/// (`docs/decisions/0034`).
+pub mod supervise;
 pub mod update;
 pub mod volumes;
 pub mod webhook;
@@ -245,6 +248,7 @@ pub async fn start<P: PodmanClient + 'static>(
         webhook_sources,
         notify: notify.clone(),
         desired_lock: tokio::sync::Mutex::new(()),
+        started: std::time::Instant::now(),
         triggers: trigger_tx,
         webhook_addr: OnceLock::new(),
         tasks: Mutex::new(JoinSet::new()),
