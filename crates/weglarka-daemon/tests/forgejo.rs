@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tokio::net::{TcpStream, UnixStream};
 use weglarka_core::config::HostConfig;
 use weglarka_core::testing::{Call, FakePodman};
-use weglarka_daemon::forgejo::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign};
+use weglarka_daemon::forgejo::{
+    DELIVERY_HEADER, EVENT_HEADER, EVENT_TYPE_HEADER, SIGNATURE_HEADER, sign,
+};
 use weglarka_daemon::{Running, Settings, start};
 
 const SECRET: &str = "hunter2-webhook";
@@ -127,7 +129,9 @@ async fn hook(
         .method("POST")
         .uri(format!("/webhook/{source}/{instance}"))
         .header("host", "hooks.example.eu")
-        .header(EVENT_HEADER, event)
+        // As Forgejo 16 sends it: the legacy header empty, the name in `-Type`.
+        .header(EVENT_HEADER, "")
+        .header(EVENT_TYPE_HEADER, event)
         .header(DELIVERY_HEADER, delivery);
     if let Some(sig) = signature {
         req = req.header(SIGNATURE_HEADER, sig);

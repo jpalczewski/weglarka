@@ -13,6 +13,8 @@ use weglarka_core::webhook::{
 type HmacSha256 = Hmac<Sha256>;
 
 pub const SIGNATURE_HEADER: &str = "x-forgejo-signature";
+/// Forgejo 16 puts the event name here for package events and leaves `X-Forgejo-Event` empty.
+pub const EVENT_TYPE_HEADER: &str = "x-forgejo-event-type";
 pub const EVENT_HEADER: &str = "x-forgejo-event";
 pub const DELIVERY_HEADER: &str = "x-forgejo-delivery";
 
@@ -84,7 +86,12 @@ impl WebhookSource for Forgejo {
     }
 
     fn headers(&self) -> &'static [&'static str] {
-        &[SIGNATURE_HEADER, EVENT_HEADER, DELIVERY_HEADER]
+        &[
+            SIGNATURE_HEADER,
+            EVENT_TYPE_HEADER,
+            EVENT_HEADER,
+            DELIVERY_HEADER,
+        ]
     }
 
     fn delivery_header(&self) -> &'static str {
@@ -105,7 +112,12 @@ impl WebhookSource for Forgejo {
     }
 
     fn normalize(&self, request: &WebhookRequest) -> Result<Option<WebhookEvent>, WebhookError> {
-        if request.header(EVENT_HEADER) != Some("package") {
+        // `X-Forgejo-Event` may be present but empty, so an empty value falls through to the other one.
+        let event = [EVENT_TYPE_HEADER, EVENT_HEADER]
+            .into_iter()
+            .filter_map(|h| request.header(h))
+            .find(|v| !v.is_empty());
+        if event != Some("package") {
             return Ok(None);
         }
         let payload: Payload = serde_json::from_slice(&request.body)
@@ -163,8 +175,8 @@ mod tests {
         }
     }
 
-    // Shape follows the Gitea/Forgejo `PackagePayload`; replace with a captured delivery (ADR 0025).
-    const CREATED: &str = r#"{"action":"created","package":{"id":7,"owner":{"login":"Acme"},"type":"container","name":"Shop","version":"main"},"sender":{"login":"ci"}}"#;
+    // Trimmed from a real Forgejo 16 delivery (org-level package, so `repository` is null; ADR 0025).
+    const CREATED: &str = r#"{"action":"created","package":{"id":7,"owner":{"login":"Acme"},"type":"container","name":"Shop","version":"main"},"repository":null,"sender":{"login":"ci"}}"#;
 
     #[test]
     fn verifies_signature() {
@@ -196,6 +208,23 @@ mod tests {
             e.delivery_id.as_deref(),
             Some("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed")
         );
+    }
+
+    #[test]
+    fn reads_the_event_name_from_event_type_when_event_is_empty() {
+        // As sent by Forgejo 16: `X-Forgejo-Event` empty, `X-Forgejo-Event-Type: package`.
+        let mut r = req("", CREATED);
+        r.headers.push((EVENT_TYPE_HEADER.into(), "package".into()));
+        let e = adapter().normalize(&r).unwrap().unwrap();
+        assert_eq!(e.image_ref, "git.example.eu/acme/shop:main");
+
+        // The empty legacy header alone is still "not a package event".
+        assert_eq!(adapter().normalize(&req("", CREATED)).unwrap(), None);
+
+        // A non-package `-Type` is not rescued by a `package` in the legacy header.
+        let mut r = req("package", CREATED);
+        r.headers.push((EVENT_TYPE_HEADER.into(), "push".into()));
+        assert_eq!(adapter().normalize(&r).unwrap(), None);
     }
 
     #[test]
