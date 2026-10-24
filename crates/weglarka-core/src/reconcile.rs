@@ -65,6 +65,40 @@ pub enum EngineError {
         name: InstanceName,
         dependents: Vec<InstanceName>,
     },
+    /// A shared volume is still mounted by other instances (issue #33): purging the instance's
+    /// volumes would delete data they use.
+    #[error("shared volume {volume} is still mounted by: {members}")]
+    SharedVolumeInUse {
+        volume: crate::app::SharedVolumeName,
+        members: String,
+    },
+    /// A shared volume still holds data, so its declaration cannot be dropped without purging it.
+    #[error("shared volume {volume} still holds data; pass --purge to delete it")]
+    SharedVolumeHasData {
+        volume: crate::app::SharedVolumeName,
+    },
+    /// A shared volume is in use by running instances, so it cannot be imported into (or replaced).
+    #[error(
+        "shared volume {volume} is used by running instances: {members}; stop them first \
+         (`weglarka apps stop <app>`)"
+    )]
+    SharedVolumeBusy {
+        volume: crate::app::SharedVolumeName,
+        members: String,
+    },
+    /// Unknown shared volume declaration.
+    #[error("unknown shared volume: {0}")]
+    UnknownSharedVolume(crate::app::SharedVolumeName),
+    /// Changing the instance's uid range would make its existing files unreadable (docs/decisions/0014).
+    #[error(
+        "cannot change the uid range of {instance} from {from} to {to}: it already has volume data; \
+         export the data and import it in the new range first"
+    )]
+    RangeChangeWithData {
+        instance: InstanceName,
+        from: String,
+        to: String,
+    },
 }
 
 /// `a, b` for error messages.
@@ -499,8 +533,7 @@ impl<P: PodmanClient> Reconciler<P> {
             }
             let uid_range = pinned
                 .as_ref()
-                .and_then(|_| app_state.and_then(|s| s.uid_range))
-                .map(labels::uid_range_label);
+                .and_then(|_| crate::volumes::effective_range_label(&st, name, spec));
             targets.push(Target {
                 instance: name.clone(),
                 pinned,
@@ -544,7 +577,9 @@ impl<P: PodmanClient> Reconciler<P> {
         // We clean up orphan state after their containers are removed.
         // The actions above saved state.toml themselves; settle on a fresh copy, not on `st`.
         let mut st = state::load_state(&self.paths.state)?;
-        if self.settle_orphan_state(&mut st, &apps).await {
+        let mut settled = self.settle_orphan_state(&mut st, &apps).await;
+        settled |= self.settle_shared_volumes(&mut st, &apps).await;
+        if settled {
             state::save_state(&self.paths.state, &st)?;
         }
         self.prune_networks(&apps).await;

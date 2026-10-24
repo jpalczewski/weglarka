@@ -78,6 +78,24 @@ pub const VOLUMES_IMPORT: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/volumes/{volume}/import",
 };
+/// `GET` → [`ListSharedVolumesResponse`](crate::ListSharedVolumesResponse): shared volumes declared in
+/// `apps.toml` with their members, uid range and whether Podman knows them (issue #33).
+pub const SHARED_VOLUMES_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/volumes",
+};
+/// `PUT` with no body → 204. Declares a shared volume (idempotent); apps mount it through
+/// `shared_volumes = [...]` (issue #33).
+pub const SHARED_VOLUMES_DECLARE: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/volumes/{volume}",
+};
+/// `DELETE` → 204. Query `purge=true` also deletes the Podman volume (its data). Refused while an app
+/// mounts it, and without `purge` while it still holds data (issue #33).
+pub const SHARED_VOLUMES_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
+    path: "/v1/volumes/{volume}",
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -97,5 +115,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     VOLUMES_LIST,
     VOLUMES_EXPORT,
     VOLUMES_IMPORT,
+    SHARED_VOLUMES_LIST,
+    SHARED_VOLUMES_DECLARE,
+    SHARED_VOLUMES_REMOVE,
     DOCTOR,
 ];

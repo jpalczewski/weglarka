@@ -74,6 +74,9 @@ struct State {
     volumes: BTreeMap<String, (VolumeInfo, Vec<u8>)>,
     /// The spec each live container was created from.
     container_specs: BTreeMap<String, ContainerSpec>,
+    /// Every spec ever created, including containers removed since (tests that inspect a short-lived
+    /// helper container after it was cleaned up).
+    create_history: Vec<ContainerSpec>,
     /// Exit code returned by `container_exec` (default 0).
     exec_exit_codes: BTreeMap<String, i32>,
     health_scripts: BTreeMap<String, VecDeque<HealthStatus>>,
@@ -177,6 +180,11 @@ impl FakePodman {
         self.lock().container_specs.get(name).cloned()
     }
 
+    /// Every container spec ever created, in creation order (helpers included, even after cleanup).
+    pub fn created_specs(&self) -> Vec<ContainerSpec> {
+        self.lock().create_history.clone()
+    }
+
     pub fn volumes(&self) -> Vec<VolumeInfo> {
         self.lock()
             .volumes
@@ -251,6 +259,7 @@ impl PodmanClient for FakePodman {
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {
         let mut s = self.lock();
         s.calls.push(Call::ContainerCreate(spec.name.clone()));
+        s.create_history.push(spec.clone());
         if s.containers.contains_key(&spec.name) {
             return Err(PodmanError::Conflict(spec.name.clone()));
         }

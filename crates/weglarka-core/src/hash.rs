@@ -57,6 +57,19 @@ struct HashInput<'a> {
     /// meaningful), and skipped while empty so existing instances keep their hash.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     host_ports: Vec<HashHostPort<'a>>,
+    /// Shared-volume mounts (issue #33): the mount is a container setting, so a change recreates the
+    /// container. Appended after `host_ports` and skipped while empty, so an app without shared
+    /// volumes hashes exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shared_volumes: Vec<HashSharedVolume<'a>>,
+}
+
+/// One shared-volume mount as it enters the hash: the volume name and the mount point.
+#[derive(Serialize)]
+struct HashSharedVolume<'a> {
+    name: &'a crate::app::SharedVolumeName,
+    target: &'a str,
+    read_only: bool,
 }
 
 /// One `host_ports` entry as it enters the hash: the effective address (loopback when the spec names
@@ -93,6 +106,17 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         })
         .collect();
     host_ports.sort_by(|a, b| (a.ip, a.host, a.container).cmp(&(b.ip, b.host, b.container)));
+    let mut shared_volumes: Vec<HashSharedVolume> = spec
+        .shared_volumes
+        .iter()
+        .map(|v| HashSharedVolume {
+            name: &v.name,
+            target: &v.target,
+            read_only: v.read_only,
+        })
+        .collect();
+    shared_volumes
+        .sort_by(|a, b| (&a.name, &a.target, a.read_only).cmp(&(&b.name, &b.target, b.read_only)));
     let input = HashInput {
         format: HASH_FORMAT,
         image_digest,
@@ -104,6 +128,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         health_command: spec.health.command.as_ref(),
         security: &spec.security,
         host_ports,
+        shared_volumes,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -325,6 +350,50 @@ env = { B = "2", A = "1" }
         let b = hash(&|s| {
             s.host_ports.push(port(2223, 22, Some("10.0.0.5")));
             s.host_ports.push(port(2222, 22, None));
+        });
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shared_volume_mounts_are_container_settings() {
+        use crate::app::{SharedVolumeName, SharedVolumeRef};
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        let mount = |name: &str, target: &str, read_only: bool| SharedVolumeRef {
+            name: SharedVolumeName::new(name).unwrap(),
+            target: target.into(),
+            read_only,
+        };
+        assert_eq!(base, hash(&|_| {}), "no shared mounts hashes as before");
+        assert_ne!(
+            base,
+            hash(&|s| s.shared_volumes.push(mount("data", "/data", false)))
+        );
+        assert_ne!(
+            hash(&|s| s.shared_volumes.push(mount("data", "/data", false))),
+            hash(&|s| s.shared_volumes.push(mount("other", "/data", false))),
+            "the volume name is part of the mount"
+        );
+        assert_ne!(
+            hash(&|s| s.shared_volumes.push(mount("data", "/data", false))),
+            hash(&|s| s.shared_volumes.push(mount("data", "/cache", false)))
+        );
+        assert_ne!(
+            hash(&|s| s.shared_volumes.push(mount("data", "/data", false))),
+            hash(&|s| s.shared_volumes.push(mount("data", "/data", true)))
+        );
+        // The order in the spec is not meaningful.
+        let a = hash(&|s| {
+            s.shared_volumes.push(mount("a", "/a", false));
+            s.shared_volumes.push(mount("b", "/b", true));
+        });
+        let b = hash(&|s| {
+            s.shared_volumes.push(mount("b", "/b", true));
+            s.shared_volumes.push(mount("a", "/a", false));
         });
         assert_eq!(a, b);
     }

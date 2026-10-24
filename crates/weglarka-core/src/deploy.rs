@@ -280,6 +280,16 @@ impl<P: PodmanClient> Reconciler<P> {
             .await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
+        // A changed uid range would make the instance's existing files unreadable
+        // (docs/decisions/0014-shared-volumes.md): refuse before creating volumes or touching the
+        // old container. The range was assigned by the caller, so `state.toml` already has it.
+        let new_label = crate::volumes::effective_range_label(
+            &state::load_state(&self.paths.state)?,
+            instance,
+            spec,
+        );
+        self.range_change_guard_locked(instance, new_label.as_deref())
+            .await?;
         let prepared = self.prepare_container(instance, spec).await?; // uid range + volumes
 
         let name = labels::container_name(instance);
@@ -414,7 +424,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // `state.toml` is written only after the health gate, so until then the instance is
         // "in flight": `doctor` must not read the lagging state as drift.
         let _activity = self.begin_activity(instance, ActivityKind::Deploy);
-        self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
+        self.assign_range(instance, &spec).await?; // before `st` is loaded: it writes state.toml
         let mut st: StateFile = state::load_state(&self.paths.state)?;
         self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
@@ -564,7 +574,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let _activity = self.begin_activity(instance, ActivityKind::Provision);
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
-        self.assign_uid_range(instance).await?;
+        self.assign_range(instance, spec).await?;
         let digest = match self.resolve_digest(&spec.image).await {
             Ok(d) => d,
             Err(e) => {
@@ -623,7 +633,7 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(c) => {
                 c.state == ContainerState::Running
                     && c.labels.get(labels::SPEC_HASH).map(String::as_str) == Some(hash.as_str())
-                    && self.uid_range_matches(instance, &c.labels)
+                    && self.uid_range_matches(instance, spec, &c.labels)
             }
             Err(_) => false,
         }
@@ -643,7 +653,7 @@ impl<P: PodmanClient> Reconciler<P> {
             self.dependency_gate(instance, &spec).await?;
         }
         let _activity = self.begin_activity(instance, ActivityKind::Recreate);
-        self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
+        self.assign_range(instance, &spec).await?; // before `st` is loaded: it writes state.toml
         let mut st = state::load_state(&self.paths.state)?;
         let cur = st.apps.get(instance).cloned().unwrap_or_default();
         let digest = cur
