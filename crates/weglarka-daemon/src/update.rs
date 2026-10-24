@@ -34,7 +34,7 @@ use weglarka_core::podman::PodmanClient;
 use weglarka_core::reconcile::EngineError;
 use weglarka_core::state::{self, AppState};
 
-use crate::admin::{Fail, runtime_state_for};
+use crate::admin::{Fail, runtime_state_for, validate_config_mounts};
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 
 /// Runtime state with "waiting for secret" taking the place of `Missing`: there is no container
@@ -60,6 +60,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
     let req: UpdateAppRequest =
         serde_json::from_slice(&body).map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
     state::validate_app(&name, &req.spec).map_err(invalid)?;
+    validate_config_mounts(&d, &req.spec)?;
 
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
@@ -118,6 +119,8 @@ pub async fn update_app<P: PodmanClient + 'static>(
             app_state,
         ),
         state: app_state.cloned().unwrap_or_default(),
+        // Only `GET /v1/apps/{name}` resolves the mounts: update never touches `config_root`.
+        configs: None,
         name,
         spec: req.spec,
     };

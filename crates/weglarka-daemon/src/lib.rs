@@ -51,6 +51,10 @@ pub enum StartError {
     /// (issue #33).
     #[error("invalid shared volumes in apps.toml: {0}")]
     SharedVolumes(String),
+    /// An app's `configs` cannot be mounted: no `config_root`, a source missing under it, a symlink
+    /// escaping it (issue #118, `docs/decisions/0022-config-root-mounts.md`).
+    #[error("config mounts: {0}")]
+    Configs(#[from] weglarka_core::config_mounts::ConfigError),
     /// The `[notify]` section is invalid (bad URL/topic, unreadable token file…). Notifications are
     /// opt-in, but once configured they must work — a silent no-op would hide a broken deployment.
     #[error("notifications: {0}")]
@@ -142,6 +146,9 @@ pub async fn start<P: PodmanClient + 'static>(
     // Shared-volume mounts must resolve to a declaration (issue #33). `load_apps` already enforces
     // it; kept here next to the host rules so a broken `apps.toml` is rejected at startup loudly.
     weglarka_core::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
+    // Host config mounts (issue #118): the `config_root` is set when an app declares `configs`, and
+    // every source resolves inside it. Fails before anything is bound, like the rules above.
+    weglarka_core::config_mounts::validate_host(&host, &apps)?;
 
     // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
     // stops the daemon instead of failing silently at the first deploy.
@@ -151,11 +158,17 @@ pub async fn start<P: PodmanClient + 'static>(
         paths.notifications.clone(),
     )?;
     let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
+    // The engine resolves and mounts an app's `configs` against the same root the API and doctor
+    // read (issue #118); `None` keeps the feature off.
+    let options = ReconcilerOptions {
+        config_root: paths.config_root.clone(),
+        ..ReconcilerOptions::default()
+    };
     let mut reconciler = Reconciler::new(
         podman,
         secrets.clone() as Arc<dyn SecretStore>,
         paths.state.clone(),
-        ReconcilerOptions::default(),
+        options,
     )
     .with_http_prober(Arc::new(health_probe::NginxProber::default_target()));
     if let Some(notifier) = &notifier {
