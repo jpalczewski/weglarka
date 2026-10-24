@@ -2,7 +2,8 @@
 //!
 //! `apply` is idempotent: with no change to the config or the container it does nothing (notably it
 //! does not touch the Traefik file, which has a ~2 s reload throttle). The nginx container carries
-//! a `weglarka.ingress-hash` label (image + publishing — what cannot change on a live container).
+//! a `weglarka.ingress-hash` label (image + publishing + hardening — what cannot change on a live
+//! container).
 //! App networks are *not* part of it: they are connected/disconnected on the running container, and
 //! a config change is validated with `nginx -t` (rolled back on failure) and applied with `SIGHUP`.
 
@@ -16,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, watch};
-use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::app::{AppSpec, InstanceName, Security};
 use weglarka_core::config::{HostConfig, IngressMode};
 use weglarka_core::labels;
 use weglarka_core::podman::{
@@ -279,7 +281,13 @@ impl<P: PodmanClient> IngressManager<P> {
         // The range is part of the container's identity: nginx created before ranges existed is
         // recreated once, now on its own map instead of libpod's shared default (docs/decisions/0009).
         let range = self.engine.ensure_ingress_range().await?;
-        let hash = ingress_hash(image, &bind.to_string(), listen_port, range);
+        let hash = ingress_hash(
+            image,
+            &bind.to_string(),
+            listen_port,
+            range,
+            &nginx_security(),
+        );
 
         let existing = podman
             .container_list(&ContainerFilter::default())
@@ -394,7 +402,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 resources: Default::default(),
                 healthcheck: None,
                 id_mapping: Some(volumes::id_mapping(range)),
-                security: Default::default(),
+                security: nginx_security(),
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;
@@ -417,18 +425,68 @@ impl<P: PodmanClient> IngressManager<P> {
     }
 }
 
+/// Version of the ingress hash input; bump when its shape changes (recreates every nginx container).
+const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v2";
+
+/// Hardened profile of the nginx container — ours to choose, unlike an app's `security`, so it is always
+/// on (docs/decisions/0014): read-only root with libpod's writable `/tmp`, `/var/tmp` and `/run` tmpfs
+/// (`read_write_tmpfs`, the `podman run --read-only` default), every capability dropped, and only the
+/// three nginx genuinely needs added back, plus `no-new-privileges`.
+///
+/// The three are not a safety margin, they are what the official image does even though our generated
+/// config has no `user` directive: nginx falls back to the worker user compiled into the image
+/// (`nginx`, uid 101), chowns its temp directories to it (`CHOWN`) and the master drops to it
+/// (`SETGID`, `SETUID`). Measured on `nginx:1-alpine` with exactly this profile: without `CHOWN` the
+/// container dies with `chown("/tmp/client_body", 101) failed`, with `CHOWN` only the worker dies with
+/// `setgid(101) failed`. `NET_BIND_SERVICE` is not needed (8080), and `pid` plus every `*_temp_path`
+/// already live under `/tmp` (`weglarka-ingress/src/nginx.rs`), the one writable place this profile
+/// leaves — the generator test keeps that invariant.
+fn nginx_security() -> Security {
+    Security {
+        read_only: true,
+        tmpfs: vec![],
+        cap_drop: vec!["ALL".to_owned()],
+        cap_add: ["CHOWN", "SETGID", "SETUID"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        no_new_privileges: true,
+    }
+}
+
 /// Spec hash of the nginx container: only what cannot change on a live container. The set of app
 /// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
-fn ingress_hash(image: &str, bind: &str, listen_port: u16, range: UidRange) -> String {
-    let mut h = Sha256::new();
-    for part in [image, bind] {
-        h.update(part.as_bytes());
-        h.update([0]);
-    }
-    h.update(listen_port.to_be_bytes());
-    h.update(range.start.to_be_bytes());
-    h.update(range.size.to_be_bytes());
-    hex::encode(&h.finalize()[..8])
+/// Hardening is in: changing the profile must recreate the container, not leave an old, writable one.
+fn ingress_hash(
+    image: &str,
+    bind: &str,
+    listen_port: u16,
+    range: UidRange,
+    security: &Security,
+) -> String {
+    let input = IngressHashInput {
+        format: INGRESS_HASH_FORMAT,
+        image,
+        bind,
+        listen_port,
+        range_start: range.start,
+        range_size: range.size,
+        security,
+    };
+    let json = serde_json::to_vec(&input).expect("ingress hash input is always serializable");
+    hex::encode(&Sha256::digest(json)[..8])
+}
+
+/// Field order is part of the hash format (mirrors `weglarka_core::hash::HashInput`).
+#[derive(Serialize)]
+struct IngressHashInput<'a> {
+    format: &'static str,
+    image: &'a str,
+    bind: &'a str,
+    listen_port: u16,
+    range_start: u32,
+    range_size: u32,
+    security: &'a Security,
 }
 
 /// Overwrites a file in place (truncate + write + fsync), without `rename`: the ACL on the Traefik
@@ -474,16 +532,31 @@ mod tests {
     }
 
     #[test]
+    fn hardened_profile_is_read_only_yet_workable() {
+        let s = nginx_security();
+        assert!(s.read_only, "read-only root");
+        assert!(s.no_new_privileges, "no-new-privileges");
+        assert_eq!(s.cap_drop, ["ALL"]);
+        assert_eq!(
+            s.cap_add,
+            ["CHOWN", "SETGID", "SETUID"],
+            "worker-uid drop and temp-dir chown, nothing more"
+        );
+        assert!(s.tmpfs.is_empty(), "libpod's writable /tmp is enough");
+    }
+
+    #[test]
     fn hash_covers_image_bind_port_and_uid_range() {
         let r = UidRange {
             start: 1,
             size: 4096,
         };
-        let a = ingress_hash("i", "x", 80, r);
-        assert_eq!(a, ingress_hash("i", "x", 80, r));
-        assert_ne!(a, ingress_hash("j", "x", 80, r));
-        assert_ne!(a, ingress_hash("i", "y", 80, r));
-        assert_ne!(a, ingress_hash("i", "x", 81, r));
+        let sec = nginx_security();
+        let a = ingress_hash("i", "x", 80, r, &sec);
+        assert_eq!(a, ingress_hash("i", "x", 80, r, &sec));
+        assert_ne!(a, ingress_hash("j", "x", 80, r, &sec));
+        assert_ne!(a, ingress_hash("i", "y", 80, r, &sec));
+        assert_ne!(a, ingress_hash("i", "x", 81, r, &sec));
         assert_ne!(
             a,
             ingress_hash(
@@ -493,8 +566,31 @@ mod tests {
                 UidRange {
                     start: 4097,
                     size: 4096
-                }
+                },
+                &sec
             )
+        );
+    }
+
+    /// Upgrading from a build without hardening must recreate nginx: the profile is in the hash.
+    #[test]
+    fn hash_covers_hardening() {
+        let r = UidRange {
+            start: 1,
+            size: 4096,
+        };
+        let hardened = nginx_security();
+        let unhardened = Security::default();
+        assert_ne!(
+            ingress_hash("i", "x", 80, r, &hardened),
+            ingress_hash("i", "x", 80, r, &unhardened),
+            "a profile change must not leave the old container in place"
+        );
+        let mut no_nnp = hardened.clone();
+        no_nnp.no_new_privileges = false;
+        assert_ne!(
+            ingress_hash("i", "x", 80, r, &hardened),
+            ingress_hash("i", "x", 80, r, &no_nnp)
         );
     }
 }

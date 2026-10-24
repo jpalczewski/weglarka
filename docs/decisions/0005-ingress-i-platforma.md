@@ -55,8 +55,9 @@ reason.
   a measurement.
 - `weglarka-daemon platform run-args` prints the same options as `podman run` arguments; the smoke test in CI
   (`.github/scripts/smoke-quadlet.sh`) starts the image with exactly those, with a config without `runtime.socket`.
-- Out of scope (follow-up): hardening of the `weglarka-nginx` container created by the daemon (cap drop, memory
-  limit) — it requires extending `ContainerSpec` and the libpod wire.
+- Out of scope at the time (follow-up): hardening of the `weglarka-nginx` container created by the daemon (cap drop,
+  memory limit) — it requires extending `ContainerSpec` and the libpod wire. The security part is now done in
+  [0014](0014-ingress-nginx-hardening.md); a memory limit is still open.
 
 ## HTTP → HTTPS (`behind` mode)
 
