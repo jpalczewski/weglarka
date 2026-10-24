@@ -1,7 +1,7 @@
 //! Admin API request/response types.
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedVolumeName};
+use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
 use weglarka_core::events::Severity;
 use weglarka_core::state::AppState;
 use weglarka_core::uid_range::UidRange;
@@ -205,6 +205,23 @@ pub struct SharedVolumeSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSharedVolumesResponse {
     pub volumes: Vec<SharedVolumeSummary>,
+}
+
+/// A shared network declared once in `apps.toml` and joined by several instances (issue #128).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedNetworkSummary {
+    pub name: SharedNetworkName,
+    /// Podman network name (`net-shared-<name>`).
+    pub podman_name: String,
+    /// Instances joining it, sorted by name (empty while it is declared but unused).
+    pub members: Vec<InstanceName>,
+    /// `false` until the first member's deploy creates it.
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSharedNetworksResponse {
+    pub networks: Vec<SharedNetworkSummary>,
 }
 
 /// `POST /v1/images/prune` (issue #40): remove images older than each app's current and previous one.

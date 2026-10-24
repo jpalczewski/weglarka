@@ -50,6 +50,10 @@ pub enum Command {
     /// shared volume.
     #[command(subcommand)]
     Volumes(crate::volumes::VolumesCommand),
+    /// Shared networks: list, declare and remove the networks that let a group of apps reach each
+    /// other.
+    #[command(subcommand)]
+    Networks(crate::networks::NetworksCommand),
     /// Local images: remove the ones older than each app's current and previous image.
     #[command(subcommand)]
     Images(ImagesCommand),

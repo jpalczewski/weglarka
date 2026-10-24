@@ -6,7 +6,8 @@
 //! * the deploy-side gate ([`Reconciler::dependency_gate`]): before Węglarka starts a container that
 //!   was not running, every app in `depends_on` must be running (and healthy when it declares a
 //!   probe). It is a **start order only** — every app keeps its own `net-<instance>` network, so
-//!   `depends_on` gives no connectivity. The shared-database part of issue #35 is separate.
+//!   `depends_on` gives no connectivity by itself; joining a shared network (issue #128) is what
+//!   gives it, and the two compose. The shared-database part of issue #35 is separate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

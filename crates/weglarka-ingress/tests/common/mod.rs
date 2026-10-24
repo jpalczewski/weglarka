@@ -38,6 +38,7 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         health: Default::default(),
         volumes: vec![],
         shared_volumes: vec![],
+        shared_networks: vec![],
         host_ports: vec![],
         depends_on: vec![],
         resources: Default::default(),

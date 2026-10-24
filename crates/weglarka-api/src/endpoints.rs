@@ -115,6 +115,23 @@ pub const SHARED_VOLUMES_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/volumes/{volume}",
 };
+/// `GET` → [`ListSharedNetworksResponse`](crate::ListSharedNetworksResponse): shared networks declared
+/// in `apps.toml` with their members and whether Podman knows them (issue #128).
+pub const SHARED_NETWORKS_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/networks",
+};
+/// `PUT` with no body → 204. Declares a shared network (idempotent); apps join it through
+/// `shared_networks = [...]` (issue #128).
+pub const SHARED_NETWORKS_DECLARE: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/networks/{network}",
+};
+/// `DELETE` → 204. Refused (409) while an app joins it (issue #128).
+pub const SHARED_NETWORKS_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
+    path: "/v1/networks/{network}",
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -158,6 +175,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SHARED_VOLUMES_LIST,
     SHARED_VOLUMES_DECLARE,
     SHARED_VOLUMES_REMOVE,
+    SHARED_NETWORKS_LIST,
+    SHARED_NETWORKS_DECLARE,
+    SHARED_NETWORKS_REMOVE,
     DOCTOR,
     IMAGES_PRUNE,
     NOTIFICATIONS_STATUS,

@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod commands;
 mod error;
+mod networks;
 mod output;
 mod preflight;
 mod settings;

@@ -190,6 +190,10 @@ pub struct ContainerSpec {
     pub env: BTreeMap<String, String>,
     /// Networks the container joins on creation (first = primary).
     pub networks: Vec<String>,
+    /// Extra DNS aliases per joined network (network name → aliases; issue #128). The container
+    /// name is always an alias already; a network missing from here gets no extras. Names not in
+    /// `networks` are ignored.
+    pub network_aliases: BTreeMap<String, Vec<String>>,
     pub secrets: Vec<SecretAttachment>,
     pub publish: Vec<PortMapping>,
     pub restart: RestartPolicy,
@@ -556,6 +560,7 @@ mod fake_tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::Always,

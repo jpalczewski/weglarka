@@ -894,6 +894,7 @@ impl<P: PodmanClient> Reconciler<P> {
             ]),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::No,

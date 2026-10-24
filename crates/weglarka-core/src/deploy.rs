@@ -344,6 +344,20 @@ impl<P: PodmanClient> Reconciler<P> {
                 labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
             })
             .await?;
+        if let Some(net) = crate::shared_networks::membership(spec) {
+            self.podman
+                .network_create(&NetworkSpec {
+                    name: labels::shared_network_name(&net.name),
+                    // Group traffic stays on the group: no route out, unlike the per-app network
+                    // that carries the ingress and the app's own egress.
+                    internal: true,
+                    labels: BTreeMap::from([(
+                        labels::SHARED_NETWORK.to_owned(),
+                        net.name.to_string(),
+                    )]),
+                })
+                .await?;
+        }
         // A changed uid range would make the instance's existing files unreadable
         // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
         // old container. The range was assigned by the caller, so `state.toml` already has it.
@@ -390,6 +404,17 @@ impl<P: PodmanClient> Reconciler<P> {
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
         let network = labels::network_name(instance);
+        // The instance's own network stays first (the primary one: egress, ingress); the group
+        // network is added next to it, with the declared aliases on top of the container name.
+        let mut networks = vec![network];
+        let mut network_aliases = BTreeMap::new();
+        if let Some(net) = crate::shared_networks::membership(spec) {
+            let shared = labels::shared_network_name(&net.name);
+            if !net.aliases.is_empty() {
+                network_aliases.insert(shared.clone(), net.aliases.clone());
+            }
+            networks.push(shared);
+        }
 
         let mut container = ContainerSpec {
             name: name.clone(),
@@ -397,7 +422,8 @@ impl<P: PodmanClient> Reconciler<P> {
             command: spec.command.clone(),
             labels: labels::container_labels(instance, generation, &hash),
             env: spec.env.clone(),
-            networks: vec![network],
+            networks,
+            network_aliases,
             secrets,
             publish: spec
                 .host_ports

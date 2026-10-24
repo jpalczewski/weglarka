@@ -158,6 +158,7 @@ async fn not_found_and_name_conflict() {
         labels: Default::default(),
         env: Default::default(),
         networks: vec![],
+        network_aliases: Default::default(),
         secrets: vec![],
         publish: vec![],
         restart: weglarka_core::podman::RestartPolicy::No,

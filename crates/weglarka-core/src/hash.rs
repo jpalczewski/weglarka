@@ -68,6 +68,11 @@ struct HashInput<'a> {
     /// volumes hashes exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shared_volumes: Vec<HashSharedVolume<'a>>,
+    /// Shared-network membership (issue #128): it changes the container's networks, so a change
+    /// recreates the container. Appended after `shared_volumes` and skipped while empty, so an app
+    /// outside any group hashes exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shared_networks: Vec<HashSharedNetwork<'a>>,
     /// The container's command (issue #79): arguments to the image's entrypoint, so a change — the
     /// argument order included — recreates the container. Appended last and skipped while empty, so
     /// an app without a command hashes exactly as before (the format version stays v1).
@@ -87,6 +92,14 @@ struct HashSharedVolume<'a> {
     name: &'a crate::app::SharedVolumeName,
     target: &'a str,
     read_only: bool,
+}
+
+/// One shared-network membership as it enters the hash: the network and the sorted extra aliases
+/// (their order in the spec is not meaningful).
+#[derive(Serialize)]
+struct HashSharedNetwork<'a> {
+    name: &'a crate::app::SharedNetworkName,
+    aliases: Vec<&'a str>,
 }
 
 /// One `host_ports` entry as it enters the hash: the effective address (loopback when the spec names
@@ -136,6 +149,20 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         .sort_by(|a, b| (&a.name, &a.target, a.read_only).cmp(&(&b.name, &b.target, b.read_only)));
     let mut configs: Vec<&ConfigMount> = spec.configs.iter().collect();
     configs.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    let mut shared_networks: Vec<HashSharedNetwork> = spec
+        .shared_networks
+        .iter()
+        .map(|n| {
+            let mut aliases: Vec<&str> = n.aliases.iter().map(String::as_str).collect();
+            aliases.sort_unstable();
+            aliases.dedup();
+            HashSharedNetwork {
+                name: &n.name,
+                aliases,
+            }
+        })
+        .collect();
+    shared_networks.sort_by(|a, b| a.name.cmp(b.name));
     let input = HashInput {
         format: HASH_FORMAT,
         image_digest,
@@ -148,6 +175,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         security: &spec.security,
         host_ports,
         shared_volumes,
+        shared_networks,
         command: &spec.command,
         configs,
     };
@@ -446,6 +474,38 @@ env = { B = "2", A = "1" }
             s.shared_volumes.push(mount("a", "/a", false));
         });
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shared_network_membership_is_a_container_setting() {
+        use crate::app::{SharedNetworkName, SharedNetworkRef};
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        let join = |name: &str, aliases: &[&str]| SharedNetworkRef {
+            name: SharedNetworkName::new(name).unwrap(),
+            aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
+        };
+        assert_eq!(base, hash(&|_| {}), "no membership hashes as before");
+        assert_ne!(base, hash(&|s| s.shared_networks.push(join("g", &[]))));
+        assert_ne!(
+            hash(&|s| s.shared_networks.push(join("g", &[]))),
+            hash(&|s| s.shared_networks.push(join("h", &[]))),
+            "the group is part of the membership"
+        );
+        assert_ne!(
+            hash(&|s| s.shared_networks.push(join("g", &[]))),
+            hash(&|s| s.shared_networks.push(join("g", &["web"]))),
+            "an alias changes how the container is found"
+        );
+        // The order of the aliases is not meaningful.
+        assert_eq!(
+            hash(&|s| s.shared_networks.push(join("g", &["a", "b"]))),
+            hash(&|s| s.shared_networks.push(join("g", &["b", "a"])))
+        );
     }
 
     #[test]

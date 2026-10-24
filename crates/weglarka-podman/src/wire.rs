@@ -115,7 +115,7 @@ pub(crate) struct CreateContainer<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     netns: Option<Namespace>,
     #[serde(rename = "Networks", skip_serializing_if = "BTreeMap::is_empty")]
-    networks: BTreeMap<&'a str, EmptyObject>,
+    networks: BTreeMap<&'a str, PerNetworkOptions<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     portmappings: Vec<PortMapping<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -271,8 +271,13 @@ struct Namespace {
     nsmode: &'static str,
 }
 
+/// Per-network options of a container (`PerNetworkOptions` in libpod): only the DNS aliases are
+/// used. An empty object keeps the pre-aliases wire shape for networks without extras.
 #[derive(Serialize)]
-struct EmptyObject {}
+struct PerNetworkOptions<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<&'a str>,
+}
 
 #[derive(Serialize)]
 struct PortMapping<'a> {
@@ -355,7 +360,14 @@ impl<'a> CreateContainer<'a> {
             networks: spec
                 .networks
                 .iter()
-                .map(|n| (n.as_str(), EmptyObject {}))
+                .map(|n| {
+                    let aliases = spec
+                        .network_aliases
+                        .get(n)
+                        .map(|a| a.iter().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    (n.as_str(), PerNetworkOptions { aliases })
+                })
                 .collect(),
             portmappings: spec
                 .publish
@@ -1010,6 +1022,40 @@ mod tests {
     }
 
     #[test]
+    fn network_aliases_are_sent_per_network() {
+        let mut spec = ContainerSpec {
+            name: "api".into(),
+            image: "img".into(),
+            command: vec![],
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec!["net-api".into(), "net-shared-kajet".into()],
+            network_aliases: BTreeMap::from([("net-shared-kajet".into(), vec!["gateway".into()])]),
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::Always,
+            userns_auto: true,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+            security: Default::default(),
+        };
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        // A network without extras stays an empty object, as before aliases existed.
+        assert_eq!(body["Networks"]["net-api"], serde_json::json!({}));
+        assert_eq!(
+            body["Networks"]["net-shared-kajet"],
+            serde_json::json!({ "aliases": ["gateway"] })
+        );
+        // Aliases for a network the container does not join are ignored.
+        spec.networks.truncate(1);
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert!(body["Networks"].get("net-shared-kajet").is_none());
+    }
+
+    #[test]
     fn decode_error_is_protocol() {
         let err = decode::<Version>(b"<html>").err().unwrap();
         assert!(matches!(err, PodmanError::Protocol(_)));
@@ -1024,6 +1070,7 @@ mod tests {
             labels: BTreeMap::from([("weglarka.instance".into(), "ntfy".into())]),
             env: BTreeMap::from([("CONFIG_FILE".into(), "/config.json".into())]),
             networks: vec!["net-ntfy".into()],
+            network_aliases: Default::default(),
             secrets: vec![
                 SecretAttachment {
                     secret: "ntfy-config".into(),
@@ -1058,6 +1105,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::No,
@@ -1081,6 +1129,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::No,
@@ -1130,6 +1179,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![SecretAttachment {
                 secret: "a.config".into(),
                 target: SecretTarget::Mount {
@@ -1166,6 +1216,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::Always,
@@ -1205,6 +1256,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::No,
@@ -1249,6 +1301,7 @@ mod tests {
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
+            network_aliases: Default::default(),
             secrets: vec![],
             publish: vec![],
             restart: RestartPolicy::No,

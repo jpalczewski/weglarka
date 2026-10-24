@@ -140,6 +140,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         labels,
         env: BTreeMap::from([("WEGLARKA_IT".into(), "1".into())]),
         networks: vec![],
+        network_aliases: Default::default(),
         secrets: vec![],
         publish: vec![],
         restart: RestartPolicy::No,

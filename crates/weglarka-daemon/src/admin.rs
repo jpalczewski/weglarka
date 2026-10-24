@@ -36,6 +36,7 @@ use weglarka_core::volumes::RemoveAppOptions;
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
 use crate::images;
+use crate::shared_networks;
 use crate::shared_volumes;
 use crate::update;
 use crate::volumes;
@@ -80,6 +81,9 @@ impl From<EngineError> for Fail {
             EngineError::UnknownSharedVolume(n) => {
                 Fail::not_found(format!("unknown shared volume: {n}"))
             }
+            EngineError::UnknownSharedNetwork(n) => {
+                Fail::not_found(format!("unknown shared network: {n}"))
+            }
             EngineError::Volume(m) => Fail::invalid(m),
             EngineError::Busy => Fail(
                 ErrorCode::Busy,
@@ -112,6 +116,7 @@ impl From<EngineError> for Fail {
             | EngineError::SharedVolumeHasData { .. }
             | EngineError::SharedVolumeBusy { .. }
             | EngineError::SharedGroupChange { .. }
+            | EngineError::SharedNetworkInUse { .. }
             | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
             // Config mounts (issue #118): a spec/source problem is the request's fault (400).
             EngineError::Configs(message) => Fail::invalid(message),
@@ -174,6 +179,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
         .merge(shared_volumes::routes())
+        .merge(shared_networks::routes())
         .merge(images::routes())
         .with_state(daemon)
 }
@@ -422,6 +428,8 @@ async fn add_app<P: PodmanClient + 'static>(
         // Every shared-volume mount must name a declared volume (issue #33): a typo would silently
         // create a second empty volume. Cross-app rule, so it sees the candidate app set.
         weglarka_core::shared_volumes::validate(&apps).map_err(Fail::invalid)?;
+        // Same for a shared-network membership (issue #128), plus the alias rules.
+        weglarka_core::shared_networks::validate(&apps).map_err(Fail::invalid)?;
         // Host-wide `host_ports` rules first (privileged ports, another app on the same socket, the
         // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
         weglarka_core::host_ports::validate(&d.host, &apps)

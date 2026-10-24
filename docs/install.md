@@ -22,6 +22,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
 [6k. Samoaktualizacja](#6k-samoaktualizacja-węglarki-self_update) ·
 [6l. Configi z hosta](#6l-configi-z-hosta-config_root-i-apps-reload) ·
+[6m. Wspólna sieć między apkami](#6m-wspólna-sieć-między-apkami-shared_networks) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -863,8 +864,9 @@ z dwiema apkami (nie `--spec`: plik specu opisuje jedną apkę). Flagi: `--depen
 jej nie ma); jak `--host-port`, wykluczają się z `--spec`.
 
 - `depends_on` to **tylko kolejność startu i bramka zdrowia**, nie sieć: każda apka ma własną sieć `net-<instancja>`
-  (0009), więc `api` nie rozwiąże nazwy `db` i nie połączy się z nią. Wspólna sieć / wspólny Postgres to pozostała,
-  niezaimplementowana część #35.
+  (0009), więc `api` nie rozwiąże nazwy `db` i nie połączy się z nią. Łączność daje osobna, jawna deklaracja:
+  [wspólna sieć grupy (6m)](#6m-wspólna-sieć-między-apkami-shared_networks) — obie rzeczy się składają (najpierw
+  startuje `db`, potem `api`, która się z nią łączy), ale jedna nie implikuje drugiej.
 - Kolejność obowiązuje tam, gdzie Węglarka **startuje** kontener: reconcile po starcie demona, pierwszy deploy,
   `apps start`, deploy z CLI i z webhooka oraz recreate, gdy kontenera nie ma. Nie dotyczy podmiany działającego
   kontenera przy zmianie spec-hash (apka już działa) ani provisioningu (`start = false` — nie ma kontenera).
@@ -1349,6 +1351,51 @@ restart weglarka`.
 - Log: `journalctl --user -u weglarka-self-update.service -n 50`; stan: `weglarka doctor` (check `self_update`).
 - `[self_update]` to nowa sekcja `weglarka.toml` (`deny_unknown_fields`): **starszy demon z nią nie wystartuje** —
   usuń sekcję przed downgradem.
+## 6m. Wspólna sieć między apkami (`shared_networks`)
+
+Domyślnie apki są odizolowane: każda ma własną sieć `net-<instancja>`. Gdy wdrożenie składa się z kilku
+kontenerów, które rozmawiają po sieci (worker i broker, reverse proxy przed API, apka i baza), zadeklaruj grupę.
+Decyzja i odrzucone alternatywy: [0030](decisions/0030-shared-networks.md). Gotowy fragment:
+[`docs/examples/shared-network.toml`](examples/shared-network.toml).
+
+```toml
+# apps.toml
+[shared_networks.kajet]          # deklaracja; sieć Podmana powstaje przy wdrożeniu pierwszego członka
+
+[apps.kajet-api]
+shared_networks = ["kajet"]      # dołącza do net-shared-kajet; nazwa instancji jest nazwą DNS w grupie
+
+[apps.kajet-proxy]
+shared_networks = [{ name = "kajet", aliases = ["gateway"] }]   # dodatkowe nazwy DNS w grupie
+```
+
+CLI: `weglarka networks add kajet`, potem `weglarka apps add kajet-api … --shared-network kajet` (albo
+`apps update … --shared-network kajet:gateway`; `--shared-network none` wyprowadza apkę z grupy). Lista:
+`weglarka networks list` (członkowie i to, czy sieć już istnieje); `weglarka networks remove kajet` kończy się
+409, dopóki jakaś apka jeszcze dołącza. Flaga wyklucza się z `--spec`, jak inne flagi specu.
+
+- **Kompromis bezpieczeństwa:** członkowie grupy widzą się nawzajem na **każdym porcie** — nie ma polityki per
+  para ani per port. Apki spoza grupy nie rozwiążą ich nazw i do nich nie dotrą. Dodawaj do grupy tylko apki,
+  którym i tak ufasz na tym poziomie. Przynależność nie daje dostępu do danych: wolumeny, sekrety i zakresy UID
+  zostają per instancja (lub per wolumen współdzielony, [6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)).
+- Grupa to **dodatkowa** sieć: kontener zachowuje własną `net-<instancja>` jako pierwszą (ruch z ingressu, wyjście
+  na zewnątrz, porty publikowane), a sieć grupy jest `internal` — bez trasy na zewnątrz — i nigdy nie niesie
+  publikowanych portów. Ingress nie dołącza do niej; z zewnątrz dostępna jest tylko apka z `domains` (w przykładzie
+  proxy).
+- **Co najwyżej jedna grupa na apkę** (v1). Aliasy muszą być poprawnymi nazwami DNS (`[a-z0-9-]`), unikalnymi
+  w grupie i różnymi od nazw instancji członków; demon odrzuca konflikt przy zapisie specu (400).
+- **Przynależność wchodzi do `spec-hash`** (nazwa grupy i aliasy): dołączenie, wyjście lub zmiana aliasu odtwarza
+  kontener raz. Apka bez `shared_networks` ma ten sam hash co dotąd, więc aktualizacja Węglarki nic nie odtwarza.
+- Usunięcie apki z grupy zostawia grupę i pozostałych członków w spokoju; sieć znika dopiero po
+  `networks remove` (reconcile usuwa pustą sieć bez deklaracji, gdy nic już do niej nie jest podłączone).
+- Sprawdzenie: `weglarka doctor` — check `state.shared_networks`: Warn, gdy sieć grupy istnieje bez deklaracji albo
+  gdy kontener członka nie jest podłączony do sieci grupy (np. spec zmieniono, a recreate jeszcze nie nastąpił);
+  Info, gdy deklaracja nie ma członków.
+
+**Rollback:** to zmiana schematu plików stanu (wersja 4) — `apps.toml` i `state.toml` dostają `schema_version = 4`
+przy pierwszym zapisie po aktualizacji, niezależnie od tego, czy używasz sieci grup. Starszy demon odmówi startu
+z komunikatem o wersji schematu; wracając do poprzedniej wersji przywróć `apps.toml` i `state.toml` **z kopii sprzed
+aktualizacji** ([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
 
 ## 7. Weryfikacja i rollback
 
@@ -1401,6 +1448,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   dopisuje nowy numer. **Wersja 3** (issue #129, [0029](decisions/0029-shared-volume-groups.md)) dodaje opcjonalne
   `group` w `[shared_volumes.<nazwa>]`: od aktualizacji do niej oba pliki dostają `schema_version = 3` przy pierwszym
   zapisie, także gdy nie używasz grup, a rollback do wcześniejszego wydania wymaga kopii plików sprzed aktualizacji.
+  **Wersja 4** (issue #128, [0030](decisions/0030-shared-networks.md)) dodaje `[shared_networks.<nazwa>]` i
+  `shared_networks` w specu apki ([6m](#6m-wspólna-sieć-między-apkami-shared_networks)); te same zasady rollbacku.
 - **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
 
   ```text
