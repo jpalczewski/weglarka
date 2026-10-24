@@ -245,6 +245,17 @@ async fn a_dependent_does_not_deploy_while_its_dependency_is_stopped() {
     // The refusal left the running dependent untouched.
     assert_eq!(show(&h, "api").await["runtime"], json!("running"));
 
+    // An image change runs a deploy right after the spec write; the same gate answers 409, not 500.
+    let mut bumped = with_deps(spec("api.example.eu"), &["db"]);
+    bumped["image"] = json!("ghcr.io/jpalczewski/ntfy.zig:v2");
+    let (s, v) = put(&h, "api", bumped).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("conflict")),
+        "{v}"
+    );
+    assert!(v["message"].as_str().unwrap().contains("db"), "{v}");
+
     // `doctor` calls the configuration out instead of silently leaving the app in place.
     let (s, v) = admin(&h, "GET", "/v1/doctor", None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
