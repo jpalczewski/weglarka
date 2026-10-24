@@ -55,7 +55,7 @@ http {
         '' close;
     }
 
-    # Nazwa apki dla access logu; ustawiana w każdym `server`.
+    # App name for the access log; set in each `server`.
     log_format weglarka escape=json
         '{"time":"$time_iso8601","app":"$app","host":"$host","remote_addr":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_response_time":"$upstream_response_time","request_id":"$request_id","user_agent":"$http_user_agent"}';
     access_log /dev/stdout weglarka;

@@ -64,16 +64,16 @@ async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                 check(
                     "runtime.api_version",
                     CheckStatus::Fail,
-                    format!("libpod API {} (wymagane ≥ 6.0)", v.api_version),
-                    Some("zainstaluj Podman 6 (repo alvistack)"),
+                    format!("libpod API {} (requires ≥ 6.0)", v.api_version),
+                    Some("install Podman 6 (alvistack repo)"),
                 )
             }
         }
         Err(e) => check(
             "runtime.socket",
             CheckStatus::Fail,
-            format!("socket Podmana niedostępny: {e}"),
-            Some("sprawdź `podman.socket` użytkownika runtime'u i montowanie socketu do kontenera"),
+            format!("Podman socket unavailable: {e}"),
+            Some("check the runtime user's `podman.socket` and that the socket is mounted into the container"),
         ),
     });
 }
@@ -84,22 +84,22 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
     out.push(match &apps {
         Ok(a) => ok(
             "state.apps_file",
-            format!("apps.toml: {} apek", a.apps.len()),
+            format!("apps.toml: {} apps", a.apps.len()),
         ),
         Err(e) => check(
             "state.apps_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("popraw lub usuń apps.toml"),
+            Some("fix or remove apps.toml"),
         ),
     });
     out.push(match &st {
-        Ok(_) => ok("state.state_file", "state.toml poprawny"),
+        Ok(_) => ok("state.state_file", "state.toml is valid"),
         Err(e) => check(
             "state.state_file",
             CheckStatus::Fail,
             e.to_string(),
-            Some("usunięcie state.toml jest bezpieczne (instancje dostaną świeży deploy)"),
+            Some("removing state.toml is safe (instances get a fresh deploy)"),
         ),
     });
     let (Ok(apps), Ok(st)) = (apps, st) else {
@@ -133,21 +133,19 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
             .find(|c| c.name == labels::container_name(name));
         match (app_state.and_then(|s| s.current.as_ref()), container) {
             (None, _) => match app_state.and_then(|s| s.failed.as_ref()) {
-                Some(f) => {
-                    problems.push(format!("{name}: pierwszy deploy nieudany ({})", f.reason))
-                }
-                None => problems.push(format!("{name}: jeszcze niewdrożona")),
+                Some(f) => problems.push(format!("{name}: first deploy failed ({})", f.reason)),
+                None => problems.push(format!("{name}: not deployed yet")),
             },
-            (Some(_), None) => problems.push(format!("{name}: brak kontenera")),
+            (Some(_), None) => problems.push(format!("{name}: missing container")),
             (Some(_), Some(c)) => {
                 if c.state != ContainerState::Running {
-                    problems.push(format!("{name}: kontener nie działa ({:?})", c.state));
+                    problems.push(format!("{name}: container not running ({:?})", c.state));
                 }
                 let want = app_state
                     .and_then(|s| s.spec_hash.as_ref())
                     .map(|h| h.to_string());
                 if want.is_some() && c.labels.get(labels::SPEC_HASH) != want.as_ref() {
-                    problems.push(format!("{name}: dryf spec-hash"));
+                    problems.push(format!("{name}: spec-hash drift"));
                 }
             }
         }
@@ -157,7 +155,7 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         if let Some(i) = c.labels.get(labels::INSTANCE)
             && !known.contains(i)
         {
-            problems.push(format!("{}: sierota (brak w apps.toml)", c.name));
+            problems.push(format!("{}: orphan (not in apps.toml)", c.name));
         }
     }
     if !active.is_empty() {
@@ -165,20 +163,20 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
             "state.deploying",
             CheckStatus::Info,
             format!(
-                "deploy w toku: {} — pominięto w ocenie dryfu",
+                "deploy in progress: {} — skipped in the drift assessment",
                 active.join(", ")
             ),
             None,
         ));
     }
     out.push(if problems.is_empty() {
-        ok("state.drift", "stan faktyczny zgodny z pożądanym")
+        ok("state.drift", "actual state matches the desired state")
     } else {
         check(
             "state.drift",
             CheckStatus::Warn,
             problems.join("; "),
-            Some("reconcile naprawia dryf w kolejnym przebiegu; `weglarka deploy <app>` wymusza deploy"),
+            Some("reconcile fixes drift on the next pass; `weglarka deploy <app>` forces a deploy"),
         )
     });
 }
@@ -187,7 +185,7 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     out.push(match d.secrets.check_permissions() {
         Ok(()) => ok(
             "state.secrets_file",
-            "secrets.toml: prawa 0600 (lub plik jeszcze nie istnieje)",
+            "secrets.toml: permissions 0600 (or the file does not exist yet)",
         ),
         Err(e) => check(
             "state.secrets_file",
@@ -208,13 +206,13 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         .map(|(n, _)| n.to_string())
         .collect();
     out.push(if missing.is_empty() {
-        ok("state.webhook_secrets", "każda apka z auto_update ma sekret HMAC")
+        ok("state.webhook_secrets", "every app with auto_update has an HMAC secret")
     } else {
         check(
             "state.webhook_secrets",
             CheckStatus::Warn,
-            format!("brak sekretu `{WEBHOOK_SECRET}` dla: {}", missing.join(", ")),
-            Some("`weglarka secrets set <app> webhook-hmac` (ten sam sekret wpisz w webhooku GitHub)"),
+            format!("missing `{WEBHOOK_SECRET}` secret for: {}", missing.join(", ")),
+            Some("`weglarka secrets set <app> webhook-hmac` (use the same secret in the GitHub webhook)"),
         )
     });
 }
@@ -225,43 +223,41 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     {
         let writable = std::fs::OpenOptions::new().write(true).open(path);
         out.push(match writable {
-            Ok(_) => ok("ingress.traefik_file", format!("{} zapisywalny", path.display())),
+            Ok(_) => ok("ingress.traefik_file", format!("{} is writable", path.display())),
             Err(e) => check(
                 "ingress.traefik_file",
                 CheckStatus::Fail,
                 format!("{}: {e}", path.display()),
-                Some("plik musi istnieć i należeć do użytkownika runtime'u (ACL tylko przejście przez katalog)"),
+                Some("the file must exist and belong to the runtime user (ACL only for traversing the directory)"),
             ),
         });
     }
     out.push(match d.ingress.last_error() {
-        None => ok("ingress.apply", "ostatnie generowanie ingressu bez błędów"),
+        None => ok("ingress.apply", "last ingress generation had no errors"),
         Some(e) => check(
             "ingress.apply",
             CheckStatus::Fail,
             e,
-            Some(
-                "popraw przyczynę; ingress zostanie przeliczony przy następnej zmianie lub w pętli",
-            ),
+            Some("fix the cause; ingress will be recomputed on the next change or in the loop"),
         ),
     });
     if let Ok(c) = d.engine.podman().container_inspect(NGINX_CONTAINER).await {
         out.push(if c.state == ContainerState::Running {
-            ok("ingress.nginx", "kontener nginx działa")
+            ok("ingress.nginx", "nginx container is running")
         } else {
             check(
                 "ingress.nginx",
                 CheckStatus::Fail,
-                format!("kontener nginx: {:?}", c.state),
-                Some("zostanie uruchomiony przy najbliższym przeliczeniu ingressu"),
+                format!("nginx container: {:?}", c.state),
+                Some("it will be started on the next ingress recompute"),
             )
         });
     } else {
         out.push(check(
             "ingress.nginx",
             CheckStatus::Warn,
-            "kontener nginx nie istnieje (jeszcze)",
-            Some("powstaje przy pierwszym przeliczeniu ingressu"),
+            "nginx container does not exist (yet)",
+            Some("it is created on the first ingress recompute"),
         ));
     }
     // Admin socket: mode 0600.
@@ -276,7 +272,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             check(
                 "admin.socket",
                 CheckStatus::Fail,
-                format!("prawa {mode:o}, oczekiwane 600"),
+                format!("permissions {mode:o}, expected 600"),
                 Some("chmod 600"),
             )
         });
@@ -288,7 +284,7 @@ async fn webhook<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         out.push(check(
             "webhook.listener",
             CheckStatus::Fail,
-            "listener nie wystartował",
+            "listener did not start",
             None,
         ));
         return;
@@ -303,12 +299,12 @@ async fn webhook<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     out.push(match connect.await {
         Ok(Ok(_)) => ok(
             "webhook.listener",
-            format!("listener webhooków odpowiada ({addr})"),
+            format!("webhook listener responds ({addr})"),
         ),
         _ => check(
             "webhook.listener",
             CheckStatus::Fail,
-            format!("brak odpowiedzi na {addr}"),
+            format!("no response on {addr}"),
             None,
         ),
     });

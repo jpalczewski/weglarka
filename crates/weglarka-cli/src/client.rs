@@ -77,7 +77,7 @@ impl ApiClient {
         let bytes = self.send(endpoint, params, body).await?;
         serde_json::from_slice(&bytes).map_err(|e| {
             CliError::internal(format!("unexpected response from daemon: {e}"))
-                .with_hint("wersja CLI i demona może się różnić — sprawdź `weglarka status`")
+                .with_hint("CLI and daemon versions may differ — check `weglarka status`")
         })
     }
 
@@ -272,8 +272,8 @@ impl ApiClient {
             format!("cannot connect to {}: {cause}", self.socket.display()),
         )
         .with_hint(
-            "czy demon działa i czy masz prawa do socketu? \
-             Ścieżkę zmienisz przez --socket / WEGLARKA_SOCKET; diagnoza bez demona: `weglarka doctor --preflight`",
+            "is the daemon running and do you have permission for the socket? \
+             Change the path with --socket / WEGLARKA_SOCKET; diagnosis without the daemon: `weglarka doctor --preflight`",
         )
     }
 }
@@ -284,7 +284,7 @@ fn error_from_response(status: StatusCode, body: &[u8]) -> CliError {
         Err(_) => CliError::internal(format!(
             "daemon returned HTTP {status} with an unrecognised body"
         ))
-        .with_hint("wersja CLI i demona może się różnić"),
+        .with_hint("CLI and daemon versions may differ"),
     }
 }
 

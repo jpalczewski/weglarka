@@ -59,7 +59,7 @@ pub(crate) fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
 pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {
     InstanceName::new(name).map_err(|e| {
         CliError::usage(e.to_string())
-            .with_hint("nazwy instancji: małe litery, cyfry i myślniki, np. `ntfy-zig`")
+            .with_hint("instance names: lowercase letters, digits and hyphens, e.g. `ntfy-zig`")
     })
 }
 
@@ -73,7 +73,7 @@ fn secret_name(name: &str) -> Result<&str, CliError> {
         Ok(name)
     } else {
         Err(CliError::usage(format!("invalid secret name {name:?}"))
-            .with_hint("dozwolone: [A-Za-z0-9_-], 1–64 znaki"))
+            .with_hint("allowed: [A-Za-z0-9_-], 1–64 characters"))
     }
 }
 
@@ -137,8 +137,9 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
                 .map_err(|e| CliError::usage(format!("cannot read spec {}: {e}", path.display())))?
         };
         return toml::from_str(&src).map_err(|e| {
-            CliError::usage(format!("invalid spec: {e}"))
-                .with_hint("format: pola AppSpec z apps.toml (image, domains, port, env, secrets…)")
+            CliError::usage(format!("invalid spec: {e}")).with_hint(
+                "format: AppSpec fields from apps.toml (image, domains, port, env, secrets…)",
+            )
         });
     }
     let image = a
@@ -340,7 +341,7 @@ pub fn read_secret_value(
             if stdin_is_terminal {
                 return Err(CliError::usage("refusing to read a secret from a terminal")
                     .with_hint(
-                        "podaj wartość potokiem (`pbpaste | weglarka secrets set …`) lub przez --from-file",
+                        "supply the value through a pipe (`pbpaste | weglarka secrets set …`) or with --from-file",
                     ));
             }
             stdin
@@ -350,7 +351,7 @@ pub fn read_secret_value(
     }
     let mut value = String::from_utf8(bytes).map_err(|_| {
         CliError::usage("secret value is not valid UTF-8")
-            .with_hint("API przyjmuje wartości tekstowe (UTF-8)")
+            .with_hint("the API accepts text values (UTF-8)")
     })?;
     if !raw && value.ends_with('\n') {
         value.pop();
@@ -360,7 +361,7 @@ pub fn read_secret_value(
     }
     if value.is_empty() {
         return Err(CliError::usage("secret value is empty")
-            .with_hint("pusta wartość nie jest dozwolona; sprawdź źródło"));
+            .with_hint("an empty value is not allowed; check the source"));
     }
     Ok(value)
 }

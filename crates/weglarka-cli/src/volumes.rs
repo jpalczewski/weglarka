@@ -125,7 +125,7 @@ async fn export(o: &Overrides, a: ExportArgs) -> Result<i32, CliError> {
         None => {
             if std::io::stdout().is_terminal() {
                 return Err(CliError::usage("refusing to write a tar to the terminal")
-                    .with_hint("przekieruj wyjście (`> backup.tar`) albo użyj --out FILE"));
+                    .with_hint("redirect the output (`> backup.tar`) or use --out FILE"));
             }
             client
                 .download(endpoints::VOLUMES_EXPORT, &params, &mut tokio::io::stdout())
@@ -185,7 +185,7 @@ async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliErro
         None => {
             if std::io::stdin().is_terminal() {
                 return Err(CliError::usage("refusing to read a tar from the terminal")
-                    .with_hint("podaj plik (--from FILE) albo przekieruj stdin (`< backup.tar`)"));
+                    .with_hint("pass a file (--from FILE) or redirect stdin (`< backup.tar`)"));
             }
             chunks(tokio::io::stdin(), counter.clone())
         }

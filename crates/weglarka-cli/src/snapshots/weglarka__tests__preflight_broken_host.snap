@@ -5,24 +5,24 @@ expression: render(&r)
 [ OK ] config.file              /etc/weglarka/weglarka.toml parses
 [ OK ] runtime.user             user weglarka exists (uid 1001)
 [FAIL] runtime.subuid           only 1000 ids for weglarka in /etc/subuid (need ≥ 65536)
-                                hint: dodaj zakres: `usermod --add-sub-uids <start>-<koniec> weglarka` (≥ 1000000 id zalecane, 65536 minimum)
+                                hint: add a range: `usermod --add-sub-uids <start>-<end> weglarka` (≥ 1000000 ids recommended, 65536 minimum)
 [ OK ] runtime.subgid           2000000 ids for weglarka in /etc/subgid
 [ OK ] runtime.cgroups          cgroups v2
 [FAIL] runtime.linger           linger disabled for weglarka
-                                hint: `loginctl enable-linger weglarka` — bez tego usługi usera zatrzymają się po wylogowaniu
+                                hint: `loginctl enable-linger weglarka` — without it the user's services stop on logout
 [ OK ] runtime.socket           podman socket /run/user/1001/podman/podman.sock responds
 [FAIL] runtime.podman_version   libpod API 5.7 is too old (need ≥ 6.0)
-                                hint: zainstaluj Podmana 6 z repo alvistack (notatka MVP, decyzja 1); v4/v5 nie są wspierane
+                                hint: install Podman 6 from the alvistack repo (MVP note, decision 1); v4/v5 are not supported
 [WARN] runtime.podman_source    podman is not installed from alvistack
-                                hint: zainstaluj podman z repo `home:alvistack` i przypnij stos Podmana w apt preferences (źródło musi zawierać „alvistack”)
+                                hint: install podman from the `home:alvistack` repo and pin the Podman stack in apt preferences (the source must contain “alvistack”)
 [ OK ] runtime.netavark         netavark 2.0.1, firewall driver nftables (NETAVARK_FW)
 [FAIL] runtime.pasta            pasta not found
-                                hint: zainstaluj pakiet `passt` (pasta = domyślna sieć rootless w Podmanie ≥ 5)
+                                hint: install the `passt` package (pasta = the default rootless network in Podman ≥ 5)
 [ OK ] runtime.apparmor_userns  apparmor_restrict_unprivileged_userns=1 and profile podman is loaded
 [FAIL] ingress.traefik_file     /data/traefik/weglarka.yml is not writable by weglarka (mode 0644, uid 0)
-                                hint: `chown weglarka /data/traefik/weglarka.yml` i `chmod 0644 /data/traefik/weglarka.yml`
+                                hint: `chown weglarka /data/traefik/weglarka.yml` and `chmod 0644 /data/traefik/weglarka.yml`
 [FAIL] ingress.bind             172.17.0.1 is not assigned to any host interface
-                                hint: adres musi należeć do interfejsu hosta (dla Traefika z Coolify: gateway docker0, np. 172.17.0.1)
+                                hint: the address must belong to a host interface (for Traefik from Coolify: the docker0 gateway, e.g. 172.17.0.1)
 [ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
 [ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
 [FAIL] state.secrets_file       /etc/weglarka/secrets.toml has mode 0644 (expected 0600)

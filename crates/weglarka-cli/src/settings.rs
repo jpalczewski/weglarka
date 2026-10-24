@@ -21,7 +21,7 @@ pub fn load_config(path: &Path) -> Result<HostConfig, CliError> {
             Kind::Config,
             format!("cannot read config {}: {e}", path.display()),
         )
-        .with_hint("podaj plik przez --config / WEGLARKA_CONFIG albo wskaż socket przez --socket / WEGLARKA_SOCKET")
+        .with_hint("pass the file with --config / WEGLARKA_CONFIG or point to the socket with --socket / WEGLARKA_SOCKET")
     })?;
     HostConfig::from_toml_str(&src).map_err(|e| {
         CliError::new(
@@ -29,7 +29,7 @@ pub fn load_config(path: &Path) -> Result<HostConfig, CliError> {
             format!("invalid config {}: {e}", path.display()),
         )
         .with_hint(
-            "wymagane sekcje: [ingress], [admin], [webhook]; przykład: docs/install.md (sekcja 2)",
+            "required sections: [ingress], [admin], [webhook]; example: docs/install.md (section 2)",
         )
     })
 }
