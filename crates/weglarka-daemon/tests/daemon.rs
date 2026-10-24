@@ -1,105 +1,25 @@
 //! Daemon tests on `FakePodman`: admin API over a real unix socket, webhooks over TCP.
 
+mod common;
+
+use common::*;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
 use weglarka_core::config::HostConfig;
 use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign};
-use weglarka_daemon::{Running, Settings, start};
+use weglarka_daemon::{Settings, start};
 
 const SECRET: &str = "hunter2-webhook";
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
-
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-/// The host configuration every test uses, pointed at `root` (a short path for the unix socket).
-fn settings(root: &Path) -> Settings {
-    let host = HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-"#,
-        root = root.display()
-    ))
-    .unwrap();
-    Settings::from_host(host, root.join("weglarka.toml"))
-}
-
-async fn harness() -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let fake = FakePodman::new();
-    let running = start(settings(&root), fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        fake,
-        running,
-    }
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
 
 async fn hook(
     addr: SocketAddr,
@@ -139,16 +59,6 @@ fn app_body(name: &str, domain: &str) -> Value {
     })
 }
 
-async fn eventually<F: Fn() -> Fut, Fut: Future<Output = bool>>(what: &str, f: F) {
-    for _ in 0..100 {
-        if f().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for: {what}");
-}
-
 async fn current_digest(h: &Harness, name: &str) -> Option<String> {
     let (status, v) = admin(h, "GET", &format!("/v1/apps/{name}"), None).await;
     assert_eq!(status, StatusCode::OK, "{v}");
@@ -175,10 +85,6 @@ fn pulls(fake: &FakePodman) -> usize {
         .iter()
         .filter(|c| matches!(c, Call::ImagePull(r) if r == IMAGE))
         .count()
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 #[tokio::test]
@@ -645,13 +551,14 @@ async fn webhook_dedup_survives_daemon_restart() {
         root,
         fake,
         running,
+        ..
     } = h;
     running.stop().await;
     assert!(
         root.join("state/webhook-deliveries.toml").is_file(),
         "the handled delivery is persisted"
     );
-    let running = start(settings(&root), fake.clone()).await.unwrap();
+    let running = start(settings(&root, "", ""), fake.clone()).await.unwrap();
     let addr = running.webhook_addr;
     // Let the startup reconcile settle before sampling the pull counter.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -699,13 +606,8 @@ async fn refuses_loose_secrets_permissions() {
 
 #[tokio::test]
 async fn refuses_a_state_schema_from_a_newer_daemon() {
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path();
+    let (_dir, root) = tempdir("wg");
     std::fs::create_dir_all(root.join("state")).unwrap();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
 
     // `state.toml` written by a newer schema stops the daemon before it binds anything.
     let newer = weglarka_core::state::SCHEMA_VERSION + 1;
@@ -714,7 +616,7 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
         format!("schema_version = {newer}\n"),
     )
     .unwrap();
-    let err = match start(settings(root), FakePodman::new()).await {
+    let err = match start(settings(&root, "", ""), FakePodman::new()).await {
         Ok(_) => panic!("a newer state schema must refuse to start"),
         Err(e) => e,
     };
@@ -731,36 +633,11 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
         format!("schema_version = {newer}\n[apps.a]\nimage = \"x:1\"\n"),
     )
     .unwrap();
-    let err = match start(settings(root), FakePodman::new()).await {
+    let err = match start(settings(&root, "", ""), FakePodman::new()).await {
         Ok(_) => panic!("a newer apps schema must refuse to start"),
         Err(e) => e,
     };
     assert!(err.to_string().contains("apps.toml"), "{err}");
-}
-
-/// Same as [`admin`] but for a raw [`Running`] (tests that do not build the whole [`Harness`]).
-async fn admin_running(
-    running: &Running<FakePodman>,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
 }
 
 /// An `edge` daemon (issue #95): two public ports, no Traefik, certificates under `<state>/nginx/tls`.
@@ -790,11 +667,7 @@ dir = "{root}/state"
 
 #[tokio::test]
 async fn refuses_an_edge_config_without_https_bind() {
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path();
+    let (_dir, root) = tempdir("wg");
     std::fs::create_dir_all(root.join("state")).unwrap();
     let host = HostConfig::from_toml_str(&format!(
         "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\n[admin]\nsocket=\"{r}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n[state]\ndir=\"{r}/state\"\n",
