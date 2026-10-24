@@ -370,26 +370,22 @@ fn config_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<Co
     })
 }
 
-/// `apps add`/`apps update`: an app with `configs` needs `config_root` in `weglarka.toml`, and every
-/// source must resolve inside it (filesystem rules at write time, ADR 0022 — the same check the
-/// daemon startup, reconcile and `launch` run).
+/// `apps add`/`apps update`: an app with `configs` needs `config_root` in `weglarka.toml`. The
+/// sources themselves are not checked here — a file that does not exist yet must not block adding
+/// the app; reconcile blocks the instance and `doctor` warns until the source appears. The lexical
+/// rules (`relative`, no `..`, unique `target`) are already enforced by `state::validate_app`.
 pub(crate) fn validate_config_mounts<P: PodmanClient>(
     d: &Daemon<P>,
     spec: &AppSpec,
 ) -> ApiResult<()> {
-    if spec.configs.is_empty() {
+    if spec.configs.is_empty() || d.paths.config_root.is_some() {
         return Ok(());
     }
-    let Some(root) = d.paths.config_root.as_deref() else {
-        return Err(Fail::invalid(
-            "the app declares `configs`, but weglarka.toml sets no `config_root`; set it to the host \
-             directory with the config files, then re-run `weglarka platform install` so the daemon \
-             container mounts it read-only",
-        ));
-    };
-    config_mounts::resolve_all(Some(root), spec)
-        .map(|_| ())
-        .map_err(|e| Fail::invalid(e.to_string()))
+    Err(Fail::invalid(
+        "the app declares `configs`, but weglarka.toml sets no `config_root`; set it to the host \
+         directory with the config files, then re-run `weglarka platform install` so the daemon \
+         container mounts it read-only",
+    ))
 }
 
 // ── Mutations ────────────────────────────────────────────────────────────────
@@ -547,6 +543,18 @@ async fn reload_app<P: PodmanClient + 'static>(
     };
     let spec = load_spec(&d, &name)?;
     let (action, signal) = if req.recreate {
+        // Recreating still needs a container to replace: a provisioned (`start = false`) or stopped
+        // app gets the same conflict as a plain reload, with the `apps start` hint.
+        let running = matches!(
+            d.engine
+                .podman()
+                .container_inspect(&labels::container_name(&name))
+                .await,
+            Ok(info) if info.state == ContainerState::Running
+        );
+        if !running {
+            return Err(Fail::from(EngineError::ReloadNotRunning(name)));
+        }
         // A forced deploy goes through the existing recreate path (`launch`): ADR 0022 prescribes it
         // for editors that save with write-and-rename. Like a deploy, it holds the engine mutex
         // through the health gate, so it is not wrapped in `mutating()`.

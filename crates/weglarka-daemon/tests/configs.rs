@@ -58,6 +58,12 @@ dir = "{root}/state"
 
 /// A `config_root` with one real config file, and a daemon that mounts it when `with_config_root`.
 async fn harness(with_config_root: bool) -> Harness {
+    harness_with_apps(with_config_root, "").await
+}
+
+/// [`harness`] with `apps.toml` written **before** startup: the per-source tolerance is only
+/// observable when the broken mount is already declared when the daemon starts.
+async fn harness_with_apps(with_config_root: bool, apps: &str) -> Harness {
     // Short path: `sun_path` is limited to ~104 characters.
     let dir = tempfile::Builder::new()
         .prefix("wg")
@@ -72,6 +78,10 @@ async fn harness(with_config_root: bool) -> Harness {
         "global:\n  scrape_interval: 30s\n",
     )
     .unwrap();
+    if !apps.is_empty() {
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("state/apps.toml"), apps).unwrap();
+    }
     let host = host_toml(&root, with_config_root.then_some(config_root.as_path()));
     let fake = FakePodman::new();
     let settings = Settings::from_host(host, root.join("weglarka.toml"));
@@ -221,37 +231,67 @@ async fn startup_rejects_configs_without_a_config_root() {
 }
 
 #[tokio::test]
-async fn startup_rejects_a_missing_or_escaping_config_source() {
-    let dir = startup_dir();
-    let root = dir.path().to_owned();
-    let config_root = root.join("config");
-    std::fs::create_dir_all(config_root.join("prometheus")).unwrap();
-    std::fs::write(config_root.join(CONFIG_SOURCE), "a: 1\n").unwrap();
-
-    // A source that does not exist under the root.
-    let err = start_result(
-        &root,
-        Some(&config_root),
-        &apps_toml("configs = [{ source = \"missing.yml\", target = \"/missing.yml\" }]"),
-    )
-    .await
-    .err()
-    .expect("startup must refuse a missing config source");
-    assert!(err.to_string().contains("does not exist"), "{err}");
-
-    // A symlink inside the root that resolves outside it.
+async fn startup_tolerates_a_missing_or_escaping_source() {
     let outside = startup_dir();
     std::fs::write(outside.path().join("secret.yml"), "secret\n").unwrap();
-    std::os::unix::fs::symlink(outside.path(), config_root.join("escape")).unwrap();
+    // Declared before the files exist: startup must not refuse them — reconcile blocks the instance
+    // and `doctor` reports the mounts instead.
+    let apps = format!(
+        "[apps.prometheus]\nimage = {IMAGE:?}\n\
+         configs = [{{ source = \"missing.yml\", target = \"/missing.yml\" }}]\n\
+         [apps.escaping]\nimage = {IMAGE:?}\n\
+         configs = [{{ source = \"escape\", target = \"/escape\" }}]\n"
+    );
+    let h = harness_with_apps(true, &apps).await;
+    std::os::unix::fs::symlink(outside.path(), h.config_root.join("escape")).unwrap();
+
+    let (s, v) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mounts = doctor_check(&v, "configs.mounts").expect("configs.mounts reported");
+    assert_eq!(mounts["status"], "warn", "{mounts}");
+    let message = mounts["message"].as_str().unwrap_or_default();
+    assert!(message.contains("missing.yml"), "{message}");
+    assert!(message.contains("does not exist"), "{message}");
+    assert!(message.contains("escape"), "{message}");
+    assert!(message.contains("outside config_root"), "{message}");
+
+    // Nothing was deployed: the instance is blocked, not silently shipped without its config.
+    let drift = doctor_check(&v, "state.drift").expect("state.drift reported");
+    assert_eq!(drift["status"], "warn", "{drift}");
+    let drift_message = drift["message"].as_str().unwrap_or_default();
+    assert!(drift_message.contains("prometheus"), "{drift_message}");
+    assert!(drift_message.contains("not deployed"), "{drift_message}");
+    assert!(h.fake.containers().iter().all(|c| c.name != "prometheus"));
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn startup_rejects_an_unusable_config_root() {
+    let dir = startup_dir();
+    let root = dir.path();
+
+    // A configured but missing directory would hide every config: the daemon refuses to start.
+    let missing = root.join("config");
     let err = start_result(
-        &root,
-        Some(&config_root),
-        &apps_toml("configs = [{ source = \"escape\", target = \"/escape\" }]"),
+        root,
+        Some(&missing),
+        &apps_toml("configs = [{ source = \"app.yml\", target = \"/app.yml\" }]"),
     )
     .await
     .err()
-    .expect("startup must refuse a source escaping config_root");
-    assert!(err.to_string().contains("outside config_root"), "{err}");
+    .expect("startup must refuse a missing config_root");
+    let message = err.to_string();
+    assert!(message.contains("config mounts"), "{message}");
+    assert!(message.contains("unavailable"), "{message}");
+
+    // The same for a path that is not a directory, even with no app declaring configs.
+    let file = root.join("config-file");
+    std::fs::write(&file, "x").unwrap();
+    let err = start_result(root, Some(&file), &apps_toml(""))
+        .await
+        .err()
+        .expect("startup must refuse a config_root that is not a directory");
+    assert!(err.to_string().contains("not a directory"), "{err}");
 }
 
 // ── `apps reload` ────────────────────────────────────────────────────────────────
@@ -382,6 +422,45 @@ async fn reload_of_an_app_that_is_not_running_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn reload_recreate_of_a_provisioned_app_is_a_conflict() {
+    let h = harness(true).await;
+    // `start = false`: provisioned, no container to replace.
+    let (s, v) = admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(app_body(
+            "prometheus",
+            "prom.example.eu",
+            json!({ "start": false, "configs": configs_field() }),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["runtime"], "not_started");
+    let before = h.fake.created_specs().len();
+
+    let (s, v) = admin(
+        &h,
+        "POST",
+        "/v1/apps/prometheus/reload",
+        Some(json!({ "recreate": true })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "conflict");
+    let message = v["message"].as_str().unwrap_or_default();
+    assert!(message.contains("apps start"), "{message}");
+    assert_eq!(
+        h.fake.created_specs().len(),
+        before,
+        "nothing was recreated or started"
+    );
+    assert!(h.fake.containers().iter().all(|c| c.name != "prometheus"));
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn reload_recreate_recreates_from_the_pinned_digest() {
     let h = harness(true).await;
     let digest = add_deployed(
@@ -488,8 +567,10 @@ async fn add_and_update_reject_configs_without_a_config_root() {
 }
 
 #[tokio::test]
-async fn add_rejects_a_config_source_that_does_not_resolve() {
+async fn add_accepts_a_config_source_that_does_not_exist_yet() {
     let h = harness(true).await;
+    // `apps add` only checks that the feature is on: the files may follow (reconcile blocks the
+    // instance and `doctor` warns until they do).
     let (s, v) = admin(
         &h,
         "POST",
@@ -497,19 +578,31 @@ async fn add_rejects_a_config_source_that_does_not_resolve() {
         Some(app_body(
             "prometheus",
             "prom.example.eu",
-            json!({ "configs": [{ "source": "missing.yml", "target": "/missing.yml" }] }),
+            json!({ "configs": [{ "source": "later.yml", "target": "/later.yml" }] }),
         )),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "invalid_request");
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "prometheus");
+
+    let (s, v) = admin(&h, "GET", "/v1/apps/prometheus", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["configs"][0]["status"], "missing", "{v}");
+    assert!(v["configs"][0].get("fingerprint").is_none(), "{v}");
     assert!(
-        v["message"]
+        v["configs"][0]["detail"]
             .as_str()
             .unwrap_or_default()
             .contains("does not exist"),
         "{v}"
     );
+
+    // As soon as the file exists the same spec resolves — nothing has to be re-saved.
+    std::fs::write(h.config_root.join("later.yml"), "a: 1\n").unwrap();
+    let (s, v) = admin(&h, "GET", "/v1/apps/prometheus", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["configs"][0]["status"], "ok", "{v}");
+    assert!(v["configs"][0]["fingerprint"].is_string(), "{v}");
     h.running.stop().await;
 }
 
