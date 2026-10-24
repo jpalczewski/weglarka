@@ -3,6 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    # A docs-only push to `main` builds nothing (no code changed): the whole workflow is skipped,
+    # same rule as for a docs-only PR below. Tags are not affected (this workflow has none).
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".gitignore"
   pull_request:
 
 env:
@@ -15,10 +22,67 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Docs-only PRs (`docs/**`, `*.md`, `.gitignore`) do not build anything: every heavy job below is
+  # gated on `changes.code`. On `main` the output is always `true`, so a push there gets the full run.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect code changes
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          echo "changed files:"; printf '%s\n' "$changed"
+          code=false
+          while IFS= read -r file; do
+            case "$file" in
+              ''|docs/*|*.md|.gitignore) ;;
+              *) code=true ;;
+            esac
+          done <<< "$changed"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = false ]; then
+            echo "docs-only change: skipping the build/test jobs"
+          fi
+
+  # The squashed commit on `main` takes the PR title, so the title must already be a Conventional
+  # Commit (CLAUDE.md -> "Commity i PR-y"). Runs for every PR, including docs-only ones.
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(feat|fix|docs|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: .+$'
+          if ! printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "::error::PR title must follow Conventional Commits: <type>(<scope>): <summary>"
+            printf 'got: %s\n' "$TITLE"
+            echo "types: feat fix docs refactor perf test build ci chore revert"
+            echo "scopes: core podman ingress api daemon cli ci docs"
+            exit 1
+          fi
+
   # fmt → clippy → test → nginx -t in ONE job: the toolchain is installed once and the debug `target/`
   # is shared, instead of four runners each paying for toolchain setup and a cold cache.
   # The cache is written only on main (`save-if`); PRs restore main's cache read-only.
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +115,8 @@ jobs:
   # binaries run by the smoke test. PRs build the cheap `ci` profile, main the full `release` profile
   # (docs/decisions/0008).
   musl:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PROFILE: ${{ github.event_name == 'pull_request' && 'ci' || 'release' }}
@@ -93,8 +159,9 @@ jobs:
   # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host). The tests (session a) read
   # WEGLARKA_PODMAN_SOCKET and skip themselves when the variable is not set.
   integration-podman:
+    needs: [changes, musl]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    needs: musl
     steps:
       - uses: actions/checkout@v4
       - name: Add the alvistack repository

@@ -1,0 +1,12 @@
+# Provision without starting (issue #29): pull and pin the image, create the network, the uid range
+# and the volumes — but no container. Then import data, set secrets and start:
+#   weglarka apps add <name> --spec docs/examples/sqlite-provision-only.toml
+#   weglarka volumes import <name> data --from data.tar
+#   weglarka secrets set <name> token < token.txt
+#   weglarka apps start <name>
+image = "ghcr.io/example/app:latest"
+domains = ["app.example.com"]
+port = 8080
+start = false
+volumes = [{ name = "data", target = "/data" }]
+secrets = [{ secret = "token", kind = "env", var = "TOKEN" }]
