@@ -20,8 +20,9 @@ use crate::events::{Event, EventSink, TracingSink};
 use crate::hash::SpecHash;
 use crate::labels;
 use crate::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient, PodmanError};
-use crate::secret_store::{SecretError, SecretStore};
+use crate::secret_store::{SecretError, SecretStore, scoped_name};
 use crate::state::{self, StateError, StatePaths};
+use crate::volumes::RemoveAppOptions;
 use crate::waiting::{apply_waiting, missing_secrets};
 
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +101,12 @@ pub enum EngineError {
         from: String,
         to: String,
     },
+    /// `secrets remove` of a secret the app's spec still binds (issue #80). Not an error in the
+    /// engine: the binding has to go first, or the caller passes `force` (the app then waits).
+    #[error(
+        "secret {secret} is still bound by the spec of {name}; unbind it first or pass --force"
+    )]
+    SecretInUse { name: InstanceName, secret: String },
 }
 
 /// `a, b` for error messages.
@@ -475,14 +482,44 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
+    /// `apps remove` without purging: the instance's volumes (and their data) and secrets stay, so a
+    /// re-added app finds them again. The lock moves into [`Self::remove_app_with_purges`].
     pub async fn remove_app(&self, name: &InstanceName) -> Result<(), EngineError> {
+        self.remove_app_with_purges(name, RemoveAppOptions::default())
+            .await
+    }
+
+    /// Deletes one of the instance's secrets from the store (`secrets remove`, issue #80).
+    ///
+    /// Refused with [`EngineError::SecretInUse`] while the app's spec still binds it and `force` is
+    /// not set — the running container would keep the old value while the next launch has none. With
+    /// `force` the secret goes away and the app waits for it again (`waiting_for_secrets`). The app
+    /// need not exist in `apps.toml`: that is how the leftovers of a removed app are cleaned up.
+    /// An absent secret is [`EngineError::Secret`] wrapping [`SecretError::NotFound`].
+    pub async fn remove_secret(
+        &self,
+        instance: &InstanceName,
+        secret: &str,
+        force: bool,
+    ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        crate::depends::ensure_not_depended_on(&apps, name)?;
-        if apps.apps.remove(name).is_none() {
-            return Err(EngineError::UnknownInstance(name.clone()));
+        let apps = state::load_apps(&self.paths.apps)?;
+        if !force {
+            let bound = apps
+                .apps
+                .get(instance)
+                .is_some_and(|spec| spec.secrets.iter().any(|b| b.secret == secret));
+            if bound {
+                return Err(EngineError::SecretInUse {
+                    name: instance.clone(),
+                    secret: secret.to_owned(),
+                });
+            }
         }
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+        let key = scoped_name(instance, secret);
+        crate::secrets::blocking(&self.secrets, move |store| store.remove(&key)).await?;
+        tracing::info!(instance = %instance, secret = %secret, "secret removed");
+        Ok(())
     }
 
     /// A single reconcile pass.

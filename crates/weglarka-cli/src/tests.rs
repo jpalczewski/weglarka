@@ -19,10 +19,11 @@ use weglarka_api::{
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
 
-use crate::cli::{AddArgs, RemoveArgs, StartStopArgs};
+use crate::cli::{AddArgs, RemoveArgs, SecretRemoveArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
 use crate::commands::{
-    build_spec, notify_status, notify_test, read_secret_value, render_notify_status,
+    apps_remove, build_spec, notify_status, notify_test, read_secret_value, remove_dry_run,
+    remove_query, remove_suffix, render_notify_status, secret_remove_dry_run, secrets_remove,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -37,6 +38,7 @@ use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_l
 pub(crate) struct Seen {
     pub(crate) method: String,
     pub(crate) path: String,
+    /// Query string without the leading `?` (`None` when the request had none).
     pub(crate) query: Option<String>,
     host: Option<String>,
     pub(crate) body: String,
@@ -1001,41 +1003,123 @@ async fn start_dry_run_sends_nothing() {
     assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
 }
 
+// ---------- apps remove / secrets remove (issue #80) ----------
+
+/// `apps remove` flags as parsed from the command line.
+fn remove_args(extra: &[&str]) -> RemoveArgs {
+    #[derive(clap::Parser)]
+    struct Rm {
+        #[command(flatten)]
+        a: RemoveArgs,
+    }
+    let mut argv = vec!["remove", "ntfy"];
+    argv.extend_from_slice(extra);
+    Rm::try_parse_from(argv).unwrap().a
+}
+
+/// `secrets remove` flags as parsed from the command line.
+fn secret_remove_args(extra: &[&str]) -> SecretRemoveArgs {
+    #[derive(clap::Parser)]
+    struct Rm {
+        #[command(flatten)]
+        a: SecretRemoveArgs,
+    }
+    let mut argv = vec!["remove", "ntfy", "token"];
+    argv.extend_from_slice(extra);
+    Rm::try_parse_from(argv).unwrap().a
+}
+
 #[test]
-fn apps_remove_dry_run_shows_the_purge_query() {
-    // `--purge-volumes` deletes the data, so the dry run must show it in the path.
+fn apps_remove_query_joins_the_purge_flags() {
+    assert_eq!(remove_query(&remove_args(&[])), "");
     assert_eq!(
-        crate::commands::remove_dry_run("ntfy", true).path,
+        remove_query(&remove_args(&["--purge-volumes"])),
+        "purge_volumes=true"
+    );
+    assert_eq!(
+        remove_query(&remove_args(&["--purge-secrets"])),
+        "purge_secrets=true"
+    );
+    assert_eq!(
+        remove_query(&remove_args(&["--purge-secrets", "--purge-volumes"])),
+        "purge_volumes=true&purge_secrets=true"
+    );
+    // The human line says what was deleted along with the app.
+    assert_eq!(remove_suffix(&remove_args(&[])), "");
+    assert_eq!(
+        remove_suffix(&remove_args(&["--purge-volumes"])),
+        " (with its data)"
+    );
+    assert_eq!(
+        remove_suffix(&remove_args(&["--purge-secrets"])),
+        " (with its secrets)"
+    );
+    assert_eq!(
+        remove_suffix(&remove_args(&["--purge-volumes", "--purge-secrets"])),
+        " (with its data and secrets)"
+    );
+}
+
+#[test]
+fn apps_remove_dry_run_shows_the_query() {
+    assert_eq!(
+        remove_dry_run("ntfy", &remove_args(&[])).path,
+        "/v1/apps/ntfy"
+    );
+    assert_eq!(
+        remove_dry_run("ntfy", &remove_args(&["--purge-volumes"])).path,
         "/v1/apps/ntfy?purge_volumes=true"
     );
     assert_eq!(
-        crate::commands::remove_dry_run("ntfy", false).path,
-        "/v1/apps/ntfy"
+        remove_dry_run(
+            "ntfy",
+            &remove_args(&["--purge-volumes", "--purge-secrets"])
+        )
+        .path,
+        "/v1/apps/ntfy?purge_volumes=true&purge_secrets=true"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn apps_remove_dry_run_sends_only_the_existence_check() {
-    let show = serde_json::to_string(&show_app(false)).unwrap();
-    let m = mock(move |_, _| (200, show.clone())).await;
-    let code = crate::commands::apps_remove(
+async fn apps_remove_sends_both_purge_flags_and_the_dry_run_sends_nothing() {
+    // `--dry-run` only checks that the app exists (GET) and prints the query.
+    let get = serde_json::to_string(&show_app(true)).unwrap();
+    let m = mock(move |_, _| (200, get.clone())).await;
+    let code = apps_remove(
         true,
         &overrides(&m),
-        RemoveArgs {
-            name: "ntfy".into(),
-            ignore_missing: false,
-            purge_volumes: true,
-            dry_run: true,
-        },
+        remove_args(&["--purge-volumes", "--purge-secrets", "--dry-run"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("GET", "/v1/apps/ntfy")
+        );
+    }
+
+    let m = mock(|_, _| (204, String::new())).await;
+    let code = apps_remove(
+        true,
+        &overrides(&m),
+        remove_args(&["--purge-volumes", "--purge-secrets"]),
     )
     .await
     .unwrap();
     assert_eq!(code, exit::OK);
     let seen = m.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1, "only the existence check travels");
+    assert_eq!(seen.len(), 1);
     assert_eq!(
         (seen[0].method.as_str(), seen[0].path.as_str()),
-        ("GET", "/v1/apps/ntfy")
+        ("DELETE", "/v1/apps/ntfy")
+    );
+    assert_eq!(
+        seen[0].query.as_deref(),
+        Some("purge_volumes=true&purge_secrets=true")
     );
 }
 
@@ -1043,13 +1127,14 @@ async fn apps_remove_dry_run_sends_only_the_existence_check() {
 async fn apps_remove_sends_purge_volumes_only_when_asked() {
     for (purge_volumes, expected) in [(true, Some("purge_volumes=true")), (false, None)] {
         let m = mock(|_, _| (204, String::new())).await;
-        let code = crate::commands::apps_remove(
+        let code = apps_remove(
             true,
             &overrides(&m),
             RemoveArgs {
                 name: "ntfy".into(),
                 ignore_missing: false,
                 purge_volumes,
+                purge_secrets: false,
                 dry_run: false,
             },
         )
@@ -1061,6 +1146,150 @@ async fn apps_remove_sends_purge_volumes_only_when_asked() {
         assert_eq!(seen[0].method, "DELETE");
         assert_eq!(seen[0].query.as_deref(), expected);
     }
+}
+
+#[test]
+fn clap_parses_secrets_remove_without_a_value_argument() {
+    use crate::cli::{Cli, Command, SecretsCommand};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["weglarka", "secrets", "remove", "ntfy", "token"]).unwrap();
+    match cli.command {
+        Command::Secrets(SecretsCommand::Remove(a)) => {
+            assert_eq!((a.app.as_str(), a.name.as_str()), ("ntfy", "token"));
+            assert!(!a.force);
+            assert!(!a.dry_run);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "weglarka",
+        "secrets",
+        "remove",
+        "ntfy",
+        "token",
+        "--force",
+        "--dry-run",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Secrets(SecretsCommand::Remove(a)) => {
+            assert!(a.force);
+            assert!(a.dry_run);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // A value argument is rejected, as for `secrets set`: values never reach the command line.
+    assert!(
+        Cli::try_parse_from(["weglarka", "secrets", "remove", "ntfy", "token", "hunter2"]).is_err()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secrets_remove_deletes_without_and_with_force() {
+    let m = mock(|_, _| (204, String::new())).await;
+    let code = secrets_remove(true, &overrides(&m), secret_remove_args(&[]))
+        .await
+        .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("DELETE", "/v1/apps/ntfy/secrets/token")
+        );
+        assert_eq!(seen[0].query, None);
+    }
+
+    // `--force` is the `force=true` query; the app itself need not exist (no GET first).
+    let m = mock(|_, _| (204, String::new())).await;
+    let code = secrets_remove(true, &overrides(&m), secret_remove_args(&["--force"]))
+        .await
+        .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("DELETE", "/v1/apps/ntfy/secrets/token")
+    );
+    assert_eq!(seen[0].query.as_deref(), Some("force=true"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secrets_remove_dry_run_sends_nothing_and_shows_force() {
+    // No server lookup at all: `--dry-run` must work for an app that was already removed.
+    let m = mock(|_, _| (204, String::new())).await;
+    let code = secrets_remove(
+        true,
+        &overrides(&m),
+        secret_remove_args(&["--force", "--dry-run"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    assert!(m.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        secret_remove_dry_run("ntfy", "token", false).path,
+        "/v1/apps/ntfy/secrets/token"
+    );
+    assert_eq!(
+        secret_remove_dry_run("ntfy", "token", true).path,
+        "/v1/apps/ntfy/secrets/token?force=true"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secrets_remove_maps_conflict_and_not_found_to_hints() {
+    let m = mock(|_, _| {
+        (
+            409,
+            api_err(
+                ErrorCode::Conflict,
+                "the app's spec still binds secret token",
+            ),
+        )
+    })
+    .await;
+    let err = secrets_remove(true, &overrides(&m), secret_remove_args(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::Conflict);
+    let hint = err.hint.unwrap();
+    assert!(hint.contains("--unbind-secret token"), "{hint}");
+    assert!(hint.contains("--force"), "{hint}");
+
+    let m = mock(|_, _| (404, api_err(ErrorCode::NotFound, "no such secret"))).await;
+    let err = secrets_remove(true, &overrides(&m), secret_remove_args(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::NotFound);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some("check the stored secrets: `weglarka secrets list ntfy`")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secrets_remove_validates_names_locally() {
+    let m = mock(|_, _| (204, String::new())).await;
+    let o = overrides(&m);
+    let mut a = secret_remove_args(&[]);
+    a.name = "bad name".into();
+    assert_eq!(
+        secrets_remove(true, &o, a).await.unwrap_err().exit_code(),
+        exit::USAGE
+    );
+    let mut a = secret_remove_args(&[]);
+    a.app = "Bad Name".into();
+    assert_eq!(
+        secrets_remove(true, &o, a).await.unwrap_err().exit_code(),
+        exit::USAGE
+    );
+    assert!(m.seen.lock().unwrap().is_empty(), "nothing was sent");
 }
 
 #[tokio::test(flavor = "current_thread")]

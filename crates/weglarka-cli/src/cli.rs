@@ -41,7 +41,7 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Daemon and app status.
     Status,
-    /// App secrets (set/list). Values are never returned by the API.
+    /// App secrets (set/list/remove). Values are never returned by the API.
     #[command(subcommand)]
     Secrets(SecretsCommand),
     /// Self-diagnosis; `--preflight` runs locally, without the daemon.
@@ -163,6 +163,10 @@ pub struct RemoveArgs {
     /// stay, and `apps add` of the same name picks them up again.
     #[arg(long)]
     pub purge_volumes: bool,
+    /// Also delete the app's stored secrets. Independent of --purge-volumes; without it the secrets
+    /// survive `apps remove` + `apps add` of the same name.
+    #[arg(long)]
+    pub purge_secrets: bool,
     /// Remove nothing; check that the app exists and show the request.
     #[arg(long)]
     pub dry_run: bool,
@@ -185,6 +189,9 @@ pub enum SecretsCommand {
     Set(SecretSetArgs),
     /// List an app's secrets (name, fingerprint, date) — without values.
     List { app: String },
+    /// Remove a stored secret. Refused while the app's spec still binds it (use --force); the app
+    /// need not exist, so the leftovers of a removed app can be cleaned up.
+    Remove(SecretRemoveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +206,21 @@ pub struct SecretSetArgs {
     #[arg(long)]
     pub raw: bool,
     /// Send nothing; validate the input and show the request (the value is masked).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretRemoveArgs {
+    pub app: String,
+    /// Secret name ([A-Za-z0-9_-], 1–64 characters).
+    pub name: String,
+    /// Remove the secret even though the app's spec still binds it; the app then waits for the
+    /// secret (a running container keeps the old value).
+    #[arg(long)]
+    pub force: bool,
+    /// Send nothing; validate the names locally and show the request (no server lookup, so it works
+    /// for a removed app too).
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -157,6 +157,16 @@ impl Prepared {
     }
 }
 
+/// What `apps remove` deletes besides the desired-state entry. Both are kept by default: data and
+/// credentials survive `remove` + `add` under the same name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoveAppOptions {
+    /// Delete the instance's named volumes and release its uid range.
+    pub purge_volumes: bool,
+    /// Delete the whole `<instance>.*` scope from the secret store.
+    pub purge_secrets: bool,
+}
+
 impl<P: PodmanClient> Reconciler<P> {
     /// First free range of `size` among everything `state.toml` has handed out (instances, shared
     /// volumes and the ingress nginx alike).
@@ -367,15 +377,17 @@ impl<P: PodmanClient> Reconciler<P> {
         changed
     }
 
-    /// `apps remove`. Without `purge_volumes` the instance's volumes (and range) stay. With it, the
+    /// `apps remove`. Without `purge_volumes` the instance's volumes (and range) stay; with it, the
     /// container and every volume labelled with the instance are deleted and the range is released.
+    /// `purge_secrets` removes the instance's secrets **before** `apps.toml` is saved, so a store
+    /// failure leaves the app intact and the removal retryable (issue #80).
     ///
     /// A member of a shared volume is refused (nothing is touched) while other members exist: their
     /// data lives in the same volume (issue #33).
-    pub async fn remove_app_with_volumes(
+    pub async fn remove_app_with_purges(
         &self,
         name: &InstanceName,
-        purge_volumes: bool,
+        options: RemoveAppOptions,
     ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
@@ -385,7 +397,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let Some(spec) = apps.apps.get(name).cloned() else {
             return Err(EngineError::UnknownInstance(name.clone()));
         };
-        if purge_volumes {
+        if options.purge_volumes {
             for mount in &spec.shared_volumes {
                 let others = shared_volumes::other_members(&apps, name, &mount.name);
                 if !others.is_empty() {
@@ -396,9 +408,17 @@ impl<P: PodmanClient> Reconciler<P> {
                 }
             }
         }
+        if options.purge_secrets {
+            let removed = crate::secrets::remove_instance_secrets(&self.secrets, name).await?;
+            tracing::info!(
+                instance = %name,
+                count = removed.len(),
+                "removed the instance's secrets"
+            );
+        }
         apps.apps.remove(name);
         state::save_apps(&self.paths.apps, &apps)?;
-        if !purge_volumes {
+        if !options.purge_volumes {
             return Ok(());
         }
         // A volume in use cannot be removed: the container goes first (desired state no longer lists it).
@@ -1097,7 +1117,7 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         let r = e.range("szklana").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("szklana"), false)
+            .remove_app_with_purges(&name("szklana"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1122,7 +1142,13 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         assert_eq!(e.mapping("szklana"), id_mapping(r));
 
         e.rec
-            .remove_app_with_volumes(&name("szklana"), true)
+            .remove_app_with_purges(
+                &name("szklana"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(e.fake.containers().is_empty());
@@ -1181,7 +1207,7 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         e.rec.reconcile().await.unwrap();
         assert!(e.range("ntfy").is_some());
         e.rec
-            .remove_app_with_volumes(&name("ntfy"), false)
+            .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1194,7 +1220,13 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         e.rec.reconcile().await.unwrap();
         let err = e
             .rec
-            .remove_app_with_volumes(&name("nope"), true)
+            .remove_app_with_purges(
+                &name("nope"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::UnknownInstance(_)));
@@ -1526,7 +1558,7 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let r = e.shared_range("kajet-data").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("kajet-api"), false)
+            .remove_app_with_purges(&name("kajet-api"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();
@@ -1555,7 +1587,13 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
 
         let err = e
             .rec
-            .remove_app_with_volumes(&name("kajet-api"), true)
+            .remove_app_with_purges(
+                &name("kajet-api"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
         match err {
@@ -1575,11 +1613,17 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let r = e.shared_range("kajet-data").unwrap();
 
         e.rec
-            .remove_app_with_volumes(&name("kajet-api"), false)
+            .remove_app_with_purges(&name("kajet-api"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec
-            .remove_app_with_volumes(&name("kajet-mcp"), true)
+            .remove_app_with_purges(
+                &name("kajet-mcp"),
+                RemoveAppOptions {
+                    purge_volumes: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -1763,7 +1807,7 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let e = env(APP);
         e.rec.reconcile().await.unwrap();
         e.rec
-            .remove_app_with_volumes(&name("szklana"), false)
+            .remove_app_with_purges(&name("szklana"), RemoveAppOptions::default())
             .await
             .unwrap();
         e.rec.reconcile().await.unwrap();

@@ -721,7 +721,15 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
     );
 
     // Purge: container, volume and range are gone.
-    rec.remove_app_with_volumes(&name, true).await.unwrap();
+    rec.remove_app_with_purges(
+        &name,
+        weglarka_core::volumes::RemoveAppOptions {
+            purge_volumes: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert!(client.container_inspect(&instance).await.is_err());
     assert!(
         client

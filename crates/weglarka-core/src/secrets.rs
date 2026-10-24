@@ -220,6 +220,37 @@ pub(crate) async fn binding_fingerprints(
     Ok(out)
 }
 
+/// Removes every secret of `instance` from the store — the whole `<instance>.*` scope (issue #80:
+/// `apps remove --purge-secrets`). Returns the removed scoped names; a missing entry is tolerated
+/// (the store is the single writer, but a concurrent removal is not an error). One `spawn_blocking`
+/// for the whole scope, so the read-modify-write cycles of the file store are not interleaved.
+pub(crate) async fn remove_instance_secrets(
+    store: &Arc<dyn SecretStore>,
+    instance: &InstanceName,
+) -> Result<Vec<String>, EngineError> {
+    let instance = instance.clone();
+    blocking(store, move |s| {
+        let mut removed = Vec::new();
+        for meta in s.list()? {
+            let owner = match split_scoped(&meta.name) {
+                Ok((owner, _)) => owner,
+                // Unreachable for a store that validates its names; skip instead of failing the purge.
+                Err(_) => continue,
+            };
+            if owner != instance {
+                continue;
+            }
+            match s.remove(&meta.name) {
+                Ok(()) => removed.push(meta.name),
+                Err(SecretError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    })
+    .await
+}
+
 /// Writes the instance's secrets as Podman secrets (`create` overwrites) and returns the attachments
 /// for `ContainerSpec`.
 pub(crate) async fn materialize<P: PodmanClient>(
