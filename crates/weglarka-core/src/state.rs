@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
-    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, valid_mount_target,
-    valid_volume_name,
+    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, normalize_signal,
+    valid_config_source, valid_mount_target, valid_volume_name,
 };
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
@@ -293,6 +293,36 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if !seen_targets.insert(v.target.trim_end_matches('/')) {
             return Err(format!("{name}: duplicate volume target {:?}", v.target));
         }
+    }
+    // Host config mounts (issue #118): lexical rules only. Whether the root is set and the sources
+    // really stay inside it is a filesystem question answered by `crate::config_mounts::validate_host`
+    // (and by `launch`/reconcile/reload, which do have the host config).
+    for mount in &spec.configs {
+        if !valid_config_source(&mount.source) {
+            return Err(format!(
+                "{name}: config source {:?} must be a relative path inside config_root (no '..')",
+                mount.source
+            ));
+        }
+        if !valid_mount_target(&mount.target) {
+            return Err(format!(
+                "{name}: config mount target {:?} must be an absolute path (no '..', ':' or ',')",
+                mount.target
+            ));
+        }
+        if !seen_targets.insert(mount.target.trim_end_matches('/')) {
+            return Err(format!(
+                "{name}: duplicate config target {:?}",
+                mount.target
+            ));
+        }
+    }
+    if let Some(signal) = &spec.reload_signal
+        && normalize_signal(signal).is_none()
+    {
+        return Err(format!(
+            "{name}: invalid reload_signal {signal:?} (expected a signal name like HUP or SIGHUP)"
+        ));
     }
     validate_security(name, &spec.security)?;
     if spec.resources.pids_limit == Some(0) {
@@ -777,6 +807,59 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         )
         .unwrap();
         assert!(matches!(load_state(&p), Err(StateError::Invalid { .. })));
+    }
+
+    #[test]
+    fn config_mounts_and_reload_signal_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("apps.toml");
+        let load = |src: &str| {
+            fs::write(&p, src).unwrap();
+            load_apps(&p)
+        };
+        let app = |extra: &str| format!("[apps.a]\nimage = \"x:1\"\n{extra}\n");
+
+        // A file and a directory mount, plus a signal spelled any way: all valid. These are lexical
+        // rules only — whether `config_root` is set is a host question answered by config_mounts.
+        assert!(
+            load(&app("configs = [\
+                 { source = \"app/config.yml\", target = \"/etc/app/config.yml\" }, \
+                 { source = \"app/conf.d\", target = \"/etc/app/conf.d\" }]\n\
+                 reload_signal = \"sighup\""))
+            .is_ok()
+        );
+
+        for bad in [
+            "configs = [{ source = \"\", target = \"/a\" }]",
+            "configs = [{ source = \"/etc/shadow\", target = \"/a\" }]",
+            "configs = [{ source = \"a/../b\", target = \"/a\" }]",
+            "configs = [{ source = \"a/./b\", target = \"/a\" }]",
+            "configs = [{ source = \"a\", target = \"relative\" }]",
+            "configs = [{ source = \"a\", target = \"/a:ro\" }]",
+            "configs = [{ source = \"a\", target = \"/a/../b\" }]",
+            "configs = [{ source = \"a\", target = \"/a\" }, { source = \"b\", target = \"/a/\" }]",
+            "volumes = [{ name = \"d\", target = \"/data\" }]\n\
+             configs = [{ source = \"a\", target = \"/data/\" }]",
+            "reload_signal = \"SIG\"",
+            "reload_signal = \"\"",
+            "reload_signal = \"HU P\"",
+            "reload_signal = \"H\"",
+        ] {
+            assert!(
+                matches!(load(&app(bad)), Err(StateError::Invalid { .. })),
+                "{bad}"
+            );
+        }
+
+        // Config targets share the uniqueness namespace with shared-volume mounts.
+        assert!(matches!(
+            load(
+                "[shared_volumes.d]\n[apps.a]\nimage = \"x:1\"\n\
+                 shared_volumes = [{ name = \"d\", target = \"/data\" }]\n\
+                 configs = [{ source = \"a\", target = \"/data/\" }]\n"
+            ),
+            Err(StateError::Invalid { .. })
+        ));
     }
 
     #[test]

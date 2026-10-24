@@ -1,0 +1,30 @@
+---
+source: crates/weglarka-core/src/app.rs
+expression: parsed
+---
+{
+  "apps": {
+    "prometheus": {
+      "image": "docker.io/prom/prometheus:latest",
+      "domains": [],
+      "env": {},
+      "secrets": [],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30
+      },
+      "auto_update": true,
+      "configs": [
+        {
+          "source": "prometheus/prometheus.yml",
+          "target": "/etc/prometheus/prometheus.yml"
+        },
+        {
+          "source": "prometheus/rules",
+          "target": "/etc/prometheus/rules"
+        }
+      ],
+      "reload_signal": "SIGHUP"
+    }
+  }
+}

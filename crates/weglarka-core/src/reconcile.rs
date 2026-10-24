@@ -7,6 +7,7 @@
 //! without a pinned digest (fresh) gets its first deploy with a pull.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,13 @@ pub enum EngineError {
     /// A volume operation the request cannot be served for (unknown volume, app not deployed yet…).
     #[error("{0}")]
     Volume(String),
+    /// An app's config mounts cannot be mounted (no `config_root`, a missing source, an escape…;
+    /// issue #118, `docs/decisions/0022-config-root-mounts.md`).
+    #[error("invalid config mounts: {0}")]
+    Configs(String),
+    /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
+    #[error("app {0} has no running container; use `weglarka apps start {0}`")]
+    ReloadNotRunning(InstanceName),
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),
@@ -129,7 +137,7 @@ pub enum SecretChangePolicy {
     NextDeploy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
     /// Time allowed for gracefully stopping the old container.
@@ -137,6 +145,10 @@ pub struct ReconcilerOptions {
     /// How long a start waits for the apps in `depends_on` (issue #35). `0` means a single check
     /// (no waiting); the default stays below the admin API's mutation timeout.
     pub dependency_wait_secs: u32,
+    /// Host directory with app config files/directories (`weglarka.toml`'s `config_root`, issue #118),
+    /// already resolved against the config file's directory by the caller. `None` = the feature is
+    /// off: an app that declares `configs` then fails validation instead of mounting anything.
+    pub config_root: Option<PathBuf>,
 }
 
 impl Default for ReconcilerOptions {
@@ -145,6 +157,7 @@ impl Default for ReconcilerOptions {
             secret_change: SecretChangePolicy::default(),
             stop_timeout_secs: 10,
             dependency_wait_secs: 10,
+            config_root: None,
         }
     }
 }
@@ -515,6 +528,13 @@ impl<P: PodmanClient> Reconciler<P> {
             } else if let Some(why) = unranged.get(name) {
                 blocked = true;
                 report.blocked.push((name.clone(), why.clone()));
+            } else if let Err(e) =
+                crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
+            {
+                // A config mount that cannot be mounted is not a deploy failure: the running container
+                // stays as it is until the operator fixes the root or the file (ADR 0022).
+                blocked = true;
+                report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {
                 match self.desired_hash(name, spec, d).await {
                     Ok(h) => expected_hash = Some(h),

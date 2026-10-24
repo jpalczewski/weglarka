@@ -9,10 +9,12 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::{Digest, InstanceName};
-use crate::deploy::DeployOutcome;
+use crate::deploy::{DeployOutcome, ReloadOutcome};
 use crate::events::{Event, VecSink};
 use crate::labels;
-use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping};
+use crate::podman::{
+    BindMount, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping,
+};
 use crate::reconcile::{
     Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
     ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
@@ -47,6 +49,16 @@ impl Harness {
     }
 
     fn with_policy(apps_toml: &str, policy: SecretChangePolicy) -> Self {
+        Self::with_options(
+            apps_toml,
+            ReconcilerOptions {
+                secret_change: policy,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn with_options(apps_toml: &str, options: ReconcilerOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, apps_toml).unwrap();
@@ -55,16 +67,7 @@ impl Harness {
         let sink = Arc::new(VecSink::default());
         let secrets: Arc<dyn SecretStore> = store.clone();
         let rec = Arc::new(
-            Reconciler::new(
-                fake.clone(),
-                secrets,
-                paths,
-                ReconcilerOptions {
-                    secret_change: policy,
-                    ..Default::default()
-                },
-            )
-            .with_events(sink.clone()),
+            Reconciler::new(fake.clone(), secrets, paths, options).with_events(sink.clone()),
         );
         Self {
             dir,
@@ -1408,4 +1411,246 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(out.reclaimed_bytes, DEFAULT_IMAGE_SIZE_BYTES);
     let ids: Vec<String> = h.fake.images().iter().map(|i| i.id.clone()).collect();
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
+}
+
+// ── config_root mounts and reload (issue #118, ADR 0022) ────────────────────────
+
+/// App with two config mounts (a file and a directory) and a signal-based reload.
+const WITH_CONFIGS: &str = r#"
+[apps.prometheus]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+health = { attempts = 1, window_secs = 1 }
+configs = [
+  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
+  { source = "prometheus/rules", target = "/etc/prometheus/rules" },
+]
+reload_signal = "SIGHUP"
+"#;
+
+/// A spec whose config source does not exist under the root.
+const MISSING_CONFIG: &str = r#"
+[apps.prometheus]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+health = { attempts = 1, window_secs = 1 }
+configs = [{ source = "missing.yml", target = "/etc/prometheus/missing.yml" }]
+"#;
+
+/// `start = false` with a config source that does not exist: provisioning must validate too.
+const STOPPED_WITH_MISSING_CONFIG: &str = r#"
+[apps.gate]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+start = false
+configs = [{ source = "missing.yml", target = "/etc/gate.yml" }]
+"#;
+
+/// A temporary `config_root` with the tree `WITH_CONFIGS` expects.
+fn config_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("prometheus/rules")).unwrap();
+    std::fs::write(
+        root.path().join("prometheus/prometheus.yml"),
+        "global: {}\n",
+    )
+    .unwrap();
+    root
+}
+
+fn with_config_root(apps_toml: &str, root: &std::path::Path) -> Harness {
+    Harness::with_options(
+        apps_toml,
+        ReconcilerOptions {
+            config_root: Some(root.to_owned()),
+            ..Default::default()
+        },
+    )
+}
+
+/// Every config mount reaches libpod as a read-only `BindMount` from the **canonical** host path.
+#[tokio::test(start_paused = true)]
+async fn configs_are_mounted_read_only_from_the_canonical_root() {
+    let root = config_root();
+    let root = root.path();
+    let h = with_config_root(WITH_CONFIGS, root);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    let spec = h
+        .fake
+        .container_spec("prometheus")
+        .expect("the container exists");
+    let canonical = root.canonicalize().unwrap();
+    assert_eq!(
+        spec.mounts,
+        vec![
+            BindMount {
+                source: canonical
+                    .join("prometheus/prometheus.yml")
+                    .display()
+                    .to_string(),
+                target: "/etc/prometheus/prometheus.yml".into(),
+                read_only: true,
+            },
+            BindMount {
+                source: canonical.join("prometheus/rules").display().to_string(),
+                target: "/etc/prometheus/rules".into(),
+                read_only: true,
+            },
+        ]
+    );
+    // The container is created from the pinned digest, as usual.
+    assert_eq!(h.state("prometheus").current, Some(digest('a')));
+}
+
+/// A broken config fails the deploy **before** the old container is touched: no stop, no remove, no
+/// rollback that would only bring back the same broken spec.
+#[tokio::test(start_paused = true)]
+async fn a_missing_config_source_fails_the_deploy_before_touching_the_old_container() {
+    let root = config_root();
+    let h = with_config_root(NTFY, root.path());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let old = h.container_digest_ref("ntfy");
+
+    h.set_apps(&format!(
+        "{NTFY}configs = [{{ source = \"missing.yml\", target = \"/etc/app.yml\" }}]\n"
+    ));
+    let before = h.fake.calls().len();
+    let err = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+    assert!(matches!(&err, EngineError::Configs(_)), "{err:?}");
+    let calls = h.fake.calls()[before..].to_vec();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            Call::ContainerStop(_) | Call::ContainerRemove(_) | Call::ContainerCreate(_)
+        )),
+        "the old container must not be touched: {calls:?}"
+    );
+    assert_eq!(h.container_digest_ref("ntfy"), old);
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// Provisioning validates the mounts too: nothing is pinned, pulled or created for a broken spec.
+#[tokio::test(start_paused = true)]
+async fn provisioning_validates_the_config_mounts() {
+    let root = config_root();
+    let h = with_config_root(STOPPED_WITH_MISSING_CONFIG, root.path());
+    let err = h.rec.deploy(&name("gate"), false).await.unwrap_err();
+    assert!(matches!(&err, EngineError::Configs(_)), "{err:?}");
+    assert_eq!(h.state("gate").current, None);
+    assert!(h.fake.containers().is_empty() && h.fake.networks().is_empty());
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::ImagePull(_) | Call::ContainerCreate(_)))
+    );
+}
+
+/// A config that cannot be mounted blocks the instance in reconcile instead of failing a deploy.
+#[tokio::test(start_paused = true)]
+async fn reconcile_blocks_an_instance_whose_configs_cannot_be_mounted() {
+    let root = config_root();
+    let h = with_config_root(MISSING_CONFIG, root.path());
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty(), "{report:?}");
+    assert_eq!(report.blocked.len(), 1, "{report:?}");
+    assert_eq!(report.blocked[0].0, name("prometheus"));
+    assert!(report.blocked[0].1.contains("missing.yml"), "{report:?}");
+    assert!(h.fake.containers().is_empty());
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::ImagePull(_)))
+    );
+
+    // Declaring configs while the host sets no `config_root` blocks it the same way.
+    let h = Harness::new(WITH_CONFIGS);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty(), "{report:?}");
+    assert_eq!(report.blocked.len(), 1, "{report:?}");
+    assert!(report.blocked[0].1.contains("config_root"), "{report:?}");
+    assert!(h.fake.containers().is_empty());
+}
+
+/// `reload` sends `reload_signal` (normalized, without `SIG`) to the running container and does not
+/// recreate, stop or pull anything. No state is written.
+#[tokio::test(start_paused = true)]
+async fn reload_signals_the_running_container() {
+    let root = config_root();
+    let h = with_config_root(WITH_CONFIGS, root.path());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    let before = h.fake.calls().len();
+    let outcome = h.rec.reload(&name("prometheus")).await.unwrap();
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Signalled {
+            signal: "HUP".into()
+        }
+    );
+    let calls = h.fake.calls()[before..].to_vec();
+    assert_eq!(
+        calls,
+        vec![Call::ContainerKill {
+            name: "prometheus".into(),
+            signal: "HUP".into(),
+        }],
+        "only the signal, nothing else"
+    );
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+    // Reload is not a deploy: the pinned state and the generation are untouched.
+    let st = h.state("prometheus");
+    assert_eq!(st.current, Some(digest('a')));
+    assert_eq!(st.generation, 1);
+}
+
+/// Without `reload_signal` the same container is stopped and started again — never recreated.
+#[tokio::test(start_paused = true)]
+async fn reload_without_a_signal_restarts_the_container() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    let before = h.fake.calls().len();
+    assert_eq!(
+        h.rec.reload(&name("ntfy")).await.unwrap(),
+        ReloadOutcome::Restarted
+    );
+    let calls = h.fake.calls()[before..].to_vec();
+    let stop = first_call(&calls, Call::ContainerStop("ntfy".into())).expect("stopped");
+    let start = first_call(&calls, Call::ContainerStart("ntfy".into())).expect("started");
+    assert!(stop < start, "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::ContainerCreate(_) | Call::ContainerRemove(_))),
+        "a restart reuses the container: {calls:?}"
+    );
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// Reload refuses an app with no running container (missing or exited) instead of starting it.
+#[tokio::test(start_paused = true)]
+async fn reload_of_a_non_running_app_is_refused() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    // Not deployed at all: no container exists.
+    let err = h.rec.reload(&name("ntfy")).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::ReloadNotRunning(instance) if instance.as_str() == "ntfy"),
+        "{err:?}"
+    );
+
+    h.rec.reconcile().await.unwrap();
+    h.fake.crash_container("ntfy", 1);
+    let before = h.fake.calls().len();
+    let err = h.rec.reload(&name("ntfy")).await.unwrap_err();
+    assert!(matches!(&err, EngineError::ReloadNotRunning(_)), "{err:?}");
+    assert!(
+        h.fake.calls()[before..].is_empty(),
+        "an exited container is neither signalled nor restarted"
+    );
 }
