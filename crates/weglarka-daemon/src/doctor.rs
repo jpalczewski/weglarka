@@ -8,8 +8,11 @@ use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_core::app::{AppsFile, InstanceName};
 use weglarka_core::config::IngressMode;
 use weglarka_core::labels;
-use weglarka_core::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient};
+use weglarka_core::podman::{
+    ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
+};
 use weglarka_core::secret_store::{SecretStore, scoped_name};
+use weglarka_core::shared_volumes;
 use weglarka_core::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
@@ -41,6 +44,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     ));
     podman(d, &mut checks).await;
     desired_state(d, &mut checks).await;
+    shared_volume_state(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
     ingress(d, &mut checks).await;
@@ -246,6 +250,147 @@ fn dependencies(
     } else {
         ok("state.dependencies", "every dependency is running")
     });
+}
+
+/// `state.shared_volumes` (issue #33): `apps.toml` declarations vs `state.toml` ranges vs the
+/// Podman volumes vs the ranges the member containers actually run in.
+async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let (Ok(apps), Ok(st)) = (
+        state::load_apps(&d.paths.state.apps),
+        state::load_state(&d.paths.state.state),
+    ) else {
+        return; // already reported as `state.apps_file` / `state.state_file`
+    };
+    let volumes = match d
+        .engine
+        .podman()
+        .volume_list(&VolumeFilter::default())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            out.push(check(
+                "state.shared_volumes",
+                CheckStatus::Warn,
+                format!("cannot list Podman volumes: {e}"),
+                None,
+            ));
+            return;
+        }
+    };
+    let containers = d
+        .engine
+        .podman()
+        .container_list(&ContainerFilter::default())
+        .await
+        .ok();
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    let mut hints = Vec::new();
+
+    // (a) Data without a declaration: nothing will ever create, purge or reclaim that volume, so the
+    // operator has to decide (the engine deliberately keeps the range reserved, ADR 0017).
+    for volume in &volumes {
+        let Some(shared) = volume.labels.get(labels::SHARED_VOLUME) else {
+            continue;
+        };
+        if apps.shared_volumes.keys().any(|n| n.as_str() == shared) {
+            continue;
+        }
+        warnings.push(format!(
+            "Podman volume {} is labelled as shared volume {shared:?} but apps.toml does not declare it",
+            volume.name
+        ));
+        hints.push(format!(
+            "declare it again to delete the data (`weglarka volumes add {shared}`, then \
+             `weglarka volumes remove {shared} --purge`), or remove it by hand: `podman volume rm {}`",
+            volume.name
+        ));
+    }
+
+    let podman_names: BTreeSet<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
+    for name in apps.shared_volumes.keys() {
+        // (b) The declaration owns a range but Podman does not know the volume yet.
+        if let Some(label) = st
+            .shared_volumes
+            .get(name)
+            .and_then(|s| s.uid_range)
+            .map(labels::uid_range_label)
+            && !podman_names.contains(labels::shared_volume_name(name).as_str())
+        {
+            notes.push(format!(
+                "shared volume {name} has range {label} but no Podman volume; the next deploy or \
+                 reconcile creates it"
+            ));
+        }
+        // (d) The shared range aligns host owners only when every member process uses the same
+        // container uid; Węglarka does not override the image's USER, so this is a documented
+        // requirement (ADR 0017) and the comparison itself is a follow-up.
+        let members = shared_volumes::members(&apps, name);
+        if members.len() > 1 {
+            notes.push(format!(
+                "shared volume {name} is mounted by {}: every member image must run the same \
+                 container USER (Węglarka does not override it)",
+                members
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            hints.push(
+                "check with `podman inspect <container> --format '{{.Config.User}}'`".to_owned(),
+            );
+        }
+    }
+
+    // (c) A member whose container runs in another range than the group's cannot read its data.
+    for (name, spec) in &apps.apps {
+        let Some(mount) = shared_volumes::mount(spec) else {
+            continue;
+        };
+        let want = st
+            .shared_volumes
+            .get(&mount.name)
+            .and_then(|s| s.uid_range)
+            .map(labels::uid_range_label);
+        let Some(container) = containers
+            .as_ref()
+            .and_then(|all| all.iter().find(|c| c.name == labels::container_name(name)))
+        else {
+            continue;
+        };
+        let got = container.labels.get(labels::UID_RANGE);
+        if got != want.as_ref() {
+            warnings.push(format!(
+                "{name}: container uid-range {} but shared volume {} is {}",
+                got.map_or("unset", String::as_str),
+                mount.name,
+                want.as_deref().unwrap_or("not allocated"),
+            ));
+        }
+    }
+
+    let (status, message) = if !warnings.is_empty() {
+        let mut message = warnings.join("; ");
+        if !notes.is_empty() {
+            message.push_str("; notes: ");
+            message.push_str(&notes.join("; "));
+        }
+        (CheckStatus::Warn, message)
+    } else if !notes.is_empty() {
+        (CheckStatus::Info, notes.join("; "))
+    } else if apps.shared_volumes.is_empty() {
+        (CheckStatus::Ok, "no shared volumes are declared".to_owned())
+    } else {
+        (CheckStatus::Ok, "shared volumes are consistent".to_owned())
+    };
+    let hint = (!hints.is_empty()).then(|| hints.join("; "));
+    out.push(check(
+        "state.shared_volumes",
+        status,
+        message,
+        hint.as_deref(),
+    ));
 }
 
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

@@ -12,6 +12,7 @@ pub mod health_probe;
 pub mod ingress;
 pub mod platform;
 pub mod settings;
+pub mod shared_volumes;
 pub mod update;
 pub mod volumes;
 pub mod webhook;
@@ -45,6 +46,10 @@ pub enum StartError {
     /// `host_ports` that cannot work on this host (privileged ports, conflicts, the ingress bind).
     #[error(transparent)]
     HostPorts(#[from] weglarka_core::host_ports::HostPortError),
+    /// `apps.toml` mounts a shared volume that is not declared in `[shared_volumes.<name>]`
+    /// (issue #33).
+    #[error("invalid shared volumes in apps.toml: {0}")]
+    SharedVolumes(String),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -127,6 +132,9 @@ pub async fn start<P: PodmanClient + 'static>(
     // Host-wide `host_ports` rules (privileged ports, two apps on one socket, the ingress bind)
     // stop the daemon instead of failing at container start (`docs/decisions/0013-host-ports.md`).
     weglarka_core::host_ports::validate(&host, &apps)?;
+    // Shared-volume mounts must resolve to a declaration (issue #33). `load_apps` already enforces
+    // it; kept here next to the host rules so a broken `apps.toml` is rejected at startup loudly.
+    weglarka_core::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
 
     let engine = Arc::new(
         Reconciler::new(

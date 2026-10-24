@@ -9,13 +9,14 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [3. Binarki na hoście](#3-binarki-na-hoście-platform-install) · [4. Quadlet i start](#4-quadlet-i-start) ·
 [5. CLI z laptopa](#5-cli-z-laptopa-macos-przez-tunel-ssh) · [Odbiór](#odbiór-na-hoście-scriptsacceptancesh) ·
 [6. Pierwsza apka](#6-pierwsza-apka-ntfyzig) ·
-[6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2) ·
+[6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2)
+([wolumeny współdzielone](#wolumeny-współdzielone-grupa-uid-iteracja-2)) ·
 [6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
 [6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
 [6d. Zależności między apkami](#6d-zależności-między-apkami-depends_on) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
-Gotowe specy apek (kopiuj-wklej): [`docs/examples/`](examples/).
+Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
 
 ## 1. Wymagania hosta
 
@@ -329,12 +330,16 @@ pushu (0004) — pierwsza dostawa jest też testem.
 Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md). Import danych przed pierwszym startem apki
 (provisioning z `start = false`) i zatrzymywanie apek: [6b](#6b-zatrzymywanie-apek-start--false).
 
-**Każdy kontener Węglarki dostaje własny zakres UID** z puli subuid użytkownika runtime'u (`userns: private` +
-jawne `UIDMap`/`GIDMap`): apka — 65 536 UID, nginx ingressu — 4 096. Zakres jest przydzielany raz (w `state.toml`:
-`uid_range`, `ingress_uid_range`) i **nigdy nie zmienia się** dla istniejącej instancji, więc pliki w wolumenie mają
-tego samego właściciela po każdym deployu i rollbacku. Pulę Węglarka pyta u Podmana (`GET /info`), nie czyta
-`/etc/subuid` (demon w kontenerze go nie widzi). Pula 2 000 000 mieści zakres ingressu i 30 apek; brak miejsca =
-instancja zablokowana z komunikatem w logu reconcile (powiększ `subuid` w Ansible, rozmiar zakresu się nie zmienia).
+**Każdy kontener Węglarki działa w jawnym zakresie UID** z puli subuid użytkownika runtime'u (`userns: private` +
+jawne `UIDMap`/`GIDMap`): zwykła apka ma własny zakres (65 536 UID), **wolumen współdzielony** — jeden zakres na
+całą swoją grupę apek ([niżej](#wolumeny-współdzielone-grupa-uid-iteracja-2)), a nginx ingressu ma własny (4 096).
+Zakres trafia do `state.toml` (`uid_range`, `shared_volumes.<nazwa>.uid_range`, `ingress_uid_range`) i **nie zmienia
+się, dopóki istnieją dane**: apka dostaje go przy pierwszym deployu, wolumen współdzielony — przy pierwszym
+deployu/provisioningu pierwszego członka; dzięki temu pliki w wolumenie mają tego samego właściciela po każdym
+deployu i rollbacku, a grupa N apek kosztuje **jeden** zakres zamiast N. Pulę Węglarka pyta u Podmana (`GET /info`),
+nie czyta `/etc/subuid` (demon w kontenerze go nie widzi). Pula 2 000 000 mieści zakres ingressu i 30 apek lub grup;
+brak miejsca = instancja zablokowana z komunikatem w logu reconcile (powiększ `subuid` w Ansible, rozmiar zakresu
+się nie zmienia).
 Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi właścicielami (czas i miejsce w
 `~/.local/share/containers` przy pierwszym starcie obrazu w nowym zakresie).
 
@@ -357,9 +362,98 @@ UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właśc
 Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów. Sieć apki (`net-<instancja>`) demon usuwa
 sam przy najbliższym przebiegu reconcile po `apps remove` (gdy nic już z niej nie korzysta).
 
+### Wolumeny współdzielone (grupa UID, iteracja 2)
+
+Kilka apek (kontenerów) może pracować na **jednym** wolumenie — typowy przypadek to SQLite i procesy obok niego
+(api, mcp, worker). Decyzja i odrzucone alternatywy: [0014](decisions/0017-shared-volumes.md). Wolumen deklaruje się
+**raz**, w sekcji najwyższego poziomu `apps.toml`, a apka montuje go po nazwie:
+
+```toml
+[shared_volumes.kajet-data]   # deklaracja: na razie bez pól (miejsce na przyszłe opcje wolumenu)
+
+[apps.kajet-api]
+image = "ghcr.io/.../kajet-api:latest"
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+
+[apps.kajet-worker]
+image = "ghcr.io/.../kajet-worker:latest"
+shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]   # tylko do odczytu
+```
+
+Gotowy plik (deklaracja + dwie apki): [`docs/examples/sqlite-shared-volume.toml`](examples/sqlite-shared-volume.toml).
+Sekcję `[shared_volumes]` dopisuje `weglarka volumes add <nazwa>`; `apps.toml` jest plikiem demona, więc nie edytuj
+go równolegle z działającym CLI.
+
+- Kontener Podmana nazywa się `wg-shared-<nazwa>` i ma etykietę `weglarka.shared-volume=<nazwa>`, **bez**
+  `weglarka.instance` — dlatego `apps remove --purge-volumes`, sprzątanie osieroconych wolumenów i filtry wolumenów
+  per instancja nigdy go nie ruszają.
+- **Jeden zakres UID na grupę:** wszyscy członkowie dostają ten sam `UIDMap`/`GIDMap` i tę samą etykietę
+  `weglarka.uid-range`, więc ten sam plik ma w każdym kontenerze tego samego właściciela. Członek **nie** dostaje
+  własnego `uid_range` w `state.toml`; każdy członek ma nadal swój kontener, sieć i domeny.
+- Deklaracja chroni przed literówką: `shared_volumes` z nazwą, której nie ma w `[shared_volumes]`, odrzuca
+  walidacja (HTTP 400, podpowiedź `weglarka volumes add <nazwa>`), a `apps.toml` z takim wpisem nie wczyta się przy
+  starcie demona.
+- **Maks. jeden wolumen współdzielony na apkę** (v1): jeden wolumen = jedna granica zakresu UID. Wolumeny prywatne
+  (`volumes`) można łączyć ze współdzielonym — powstają w zakresie grupy, więc pozostali członkowie mogą je czytać
+  (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
+- `start = false` członka provisionuje zakres i wolumen **bez kontenera** ([6b](#6b-zatrzymywanie-apek-start--false)),
+  więc dane można zaimportować przed pierwszym startem.
+- **`doctor`:** `state.shared_volumes` raportuje dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
+  --purge`), zadeklarowany a jeszcze nieutworzony wolumen, rozjazd etykiety `weglarka.uid-range` i przypomnienie,
+  że wszystkie obrazy grupy muszą działać jako ten sam `USER` — porównania użytkowników `doctor` nie robi za Ciebie.
+- **Sprzątanie:** `apps remove` (bez `--purge-volumes`) **nie usuwa danych** — wolumen i zakres zostają, a ponowne
+  `apps add` znajduje te same pliki. `apps remove --purge-volumes` członka, gdy w grupie są **inni** członkowie,
+  kończy się `409` z listą członków i **niczego nie kasuje**: usuń apkę bez `--purge-volumes` (dane zostają dla
+  reszty grupy) albo najpierw przenieś dane poza Węglarkę (`volumes export`). Purge **ostatniego** członka usuwa
+  wolumen grupy i zwalnia zakres; deklaracja w `apps.toml` **zostaje**, a następny członek dostaje nowy, pusty
+  wolumen.
+
+Deklaracja i sprzątanie z CLI (przez API, jak `apps`):
+
+```sh
+weglarka volumes add kajet-data                 # deklaracja w apps.toml (idempotentna; PUT /v1/volumes/<nazwa>)
+weglarka volumes list                           # bez apki: wszystkie wolumeny współdzielone
+                                                # (NAME, PODMAN NAME, MEMBERS, RANGE, EXISTS)
+weglarka volumes remove kajet-data              # 409, gdy wolumen montuje jakakolwiek apka; bez danych usuwa
+                                                # deklarację (bez --purge nie rusza wolumenu z danymi)
+weglarka volumes remove kajet-data --purge      # usuwa wolumen grupy (dane!) i wpis w state.toml; 409, dopóki
+                                                # są członkowie (najpierw usuń/odłącz apki)
+```
+
+`weglarka volumes list <apka>` działa jak dotąd i pokazuje też wolumeny współdzielone (kolumna `SHARED`).
+`apps add` / `apps update` przyjmują `--shared-volume kajet-data=/data` (`:ro` na końcu = tylko do odczytu; ta sama
+nazwa podmienia wpis, jak `--volume`; flaga wyklucza się z `--spec`). Usunięcie montowania w v1 zostaje na `--spec`
+(pełna podmiana specu).
+
+**Przeniesienie istniejącej apki do grupy (migracja danych).** Dołączenie do grupy zmienia efektywny zakres UID
+apki, więc pliki w jej dotychczasowych prywatnych wolumenach stałyby się nieczytelne. Węglarka tego pilnuje: jeśli
+stary kontener miał etykietę `weglarka.uid-range` różną od nowej, a instancja ma już wolumeny prywatne (etykieta
+`weglarka.instance`), deploy jest odrzucany z błędem o zmianie zakresu z danymi, a `PUT /v1/apps/<apka>` zwraca
+`409` — **stary kontener działa dalej**. Kolejność migracji:
+
+1. Zatrzymaj apkę i zrób kopię: `weglarka apps stop <apka>`,
+   `weglarka volumes export <apka> <wolumen> --out kopia.tar` dla każdego prywatnego wolumenu (bazę SQLite
+   najlepiej przez `.backup`/`VACUUM INTO`).
+2. Usuń dane prywatne, żeby strażnik przepuścił zmianę zakresu: `weglarka apps remove <apka> --purge-volumes`
+   (albo `podman volume rm <apka>.<wolumen>`) — nieodwracalne, dlatego najpierw kopia.
+3. Dodaj apkę z montowaniem wolumenu współdzielonego i `start = false` (provisioning bez kontenera).
+4. `weglarka volumes import <apka> kajet-data --from kopia.tar` — tryb domyślny (obcy tar) spłaszcza
+   właścicieli do użytkownika kontenera, czyli poprawnie do zakresu grupy.
+5. `weglarka apps start <apka>` i weryfikacja danych.
+
+Odejście z grupy (usunięcie montowania) to ta sama zmiana zakresu i ten sam strażnik. Gdy członek ma własne
+wolumeny prywatne, `apps remove --purge-volumes` jest zablokowane przez pozostałych członków, więc: eksport →
+`apps stop <apka>` → `podman volume rm <apka>.<wolumen>` (ręcznie) → `apps update --spec` bez współdzielonego
+wolumenu.
+
+Wymagania dla SQLite z kilkoma pisarzami (wspólny `USER` obrazów, WAL, `busy_timeout`, kopia grupy) i zasady
+importu/eksportu wolumenu współdzielonego: [„Import danych z Coolify”](#import-danych-z-coolify-np-szklanapogoda)
+niżej.
+
 ### Osłonienie kontenera (`security`)
 
-Domyślnie kontener apki ma tylko izolację UID (osobny zakres per instancja) i ewentualne limity. Dla apek z
+Domyślnie kontener apki ma tylko izolację UID (osobny zakres per instancja, a przy wolumenie współdzielonym —
+wspólny zakres grupy, [wyżej](#wolumeny-współdzielone-grupa-uid-iteracja-2)) i ewentualne limity. Dla apek z
 sekretami (klucze API, tokeny) i prywatnymi danymi włącz osłonienie — to samo, co Coolify dawał usługom
 z `read_only` / `cap_drop` / `no-new-privileges`:
 
@@ -455,6 +549,25 @@ weglarka volumes import szklana-pogoda data --from backup.tar --own
 Nie myl trybów: obcy tar zaimportowany z `--own` ląduje **po cichu** na złych UID-ach; eksport Węglarki
 zaimportowany bez `--own` traci właścicieli (wszystko dostaje użytkownika kontenera).
 
+**SQLite w wolumenie współdzielonym (kilku pisarzy).** Wspólny zakres UID wyrównuje właścicieli plików tylko
+wtedy, gdy **wszystkie obrazy członków działają jako ten sam użytkownik kontenera** — Węglarka nie nadpisuje
+`USER` z obrazu, a uid 1000 w kontenerze to `zakres.start + 1000`, uid 999 to `zakres.start + 999`. Sprawdź przed
+dodaniem grupy: `podman inspect <kontener> --format '{{.Config.User}}'` (pusty wynik = root, uid 0 — też musi być
+taki sam w całej grupie); `doctor` (`state.shared_volumes`) tylko przypomina o tym i wypisuje członków.
+
+Do tego zwykłe zasady SQLite: `journal_mode=WAL` zapisuje się w pliku bazy i zostaje po restarcie; zapisy i tak
+serializuje SQLite (jeden pisarz naraz), więc ustaw `busy_timeout` — bez niego drugi proces dostanie `SQLITE_BUSY`
+zamiast poczekać. Wolumen musi leżeć na **lokalnym** dysku (na NFS blokady POSIX są zawodne), a kopię rób przez
+`.backup`/`VACUUM INTO` przy zatrzymanej grupie albo z wnętrza kontenera. Litestream zakłada jednego pisarza — to
+issue #37; tutaj są tylko wymagania, nie konfiguracja.
+
+**Import/eksport wolumenu współdzielonego.** `volumes export <apka> <wolumen>` działa, ale dla spójnej kopii
+SQLite zatrzymaj najpierw **całą grupę** (`apps stop` każdego członka). Import jest odrzucany (`409`, komunikat z
+listą działających członków), dopóki którykolwiek członek działa — pisanie do bazy pod żywymi procesami ją psuje.
+`--replace` usuwa i zakłada wolumen grupy od nowa (w grupie jest więc jeszcze bardziej ryzykowne), a `--own` jest
+poprawne tylko dla eksportu z **tego samego** zakresu, czyli z tej samej grupy; obcy tar importuj trybem domyślnym.
+Nazwą wolumenu w tych komendach jest nazwa z deklaracji (`kajet-data`), nie `wg-shared-kajet-data`.
+
 ### Migracja apki z SQLite (na przykładzie szklana.pogoda)
 
 Wnioski z migracji szklana.pogoda (2026-10-23, przerwa ≈ 46 s, z czego ~25 s dało się uniknąć):
@@ -495,6 +608,22 @@ jednorazowo**:
 
 Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być czytelne dla „obcych” UID-ów
 (0644 w katalogu 0755 — tak je zapisuje demon).
+
+### Rollback do Węglarki bez wolumenów współdzielonych
+
+`[shared_volumes]` w `apps.toml` i sekcja `shared_volumes` w `state.toml` to nowe pola, a oba pliki mają
+`deny_unknown_fields` — **starszy demon ich nie odczyta**. Przed downgradem:
+
+1. Usuń z apek wszystkie wpisy `shared_volumes` (albo najpierw `apps remove` członków) i sekcję `[shared_volumes.*]`
+   z `apps.toml` oraz sekcję `shared_volumes` ze `state.toml` — albo po prostu przywróć oba pliki z kopii zrobionej
+   przed wdrożeniem wolumenów współdzielonych.
+2. Stara Węglarka nie widzi wolumenów `wg-shared-*` (brak etykiety `weglarka.instance`) i **nie da się jej
+   wskazać** takiego wolumenu jako prywatnego wolumenu apki. Jeśli dane nie są potrzebne:
+   `podman volume rm wg-shared-<nazwa>`; jeśli są — skopiuj je do prywatnego wolumenu apki przed downgradem
+   (pamiętając, że stara Węglarka odtworzy kontener we własnym zakresie UID) albo zostaw wolumen na później.
+3. Kontenery członków działają w zakresie grupy, dopóki stary demon ich nie odtworzy — a odtworzy je we własnych
+   zakresach i dane w wolumenie staną się nieczytelne. Przed downgradem zrób `volumes export` i zatrzymaj apki
+   (`apps stop`).
 
 ## 6b. Zatrzymywanie apek: `start = false`
 
@@ -669,8 +798,9 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
 - **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, więc starszy demon nie odczyta
   `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
-  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on))
-  oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on)),
+  wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
+  ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
 
 ### `apps update`: co się dzieje po zmianie
@@ -687,6 +817,7 @@ diff i niczego nie wysyła.
 |---|---|
 | `--domain` / `--remove-domain` | tylko ingress (nginx reload, plik Traefika); kontener bez zmian |
 | `--env`/`--unset-env`, `--port`/`--unset-port`, `--secret-env`/`--secret-mount`/`--unbind-secret`, wolumeny, limity, `health.command` | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu) |
+| `--shared-volume` (`shared_volumes` w `--spec`) | jak wolumeny: zmienia `spec-hash` → kolejny reconcile odtwarza kontener w zakresie wspólnej grupy UID (zmiana `target`/`read_only` też). Zmiana zakresu przy istniejących wolumenach prywatnych jest odrzucana — patrz [6a](#wolumeny-współdzielone-grupa-uid-iteracja-2). Pusta lista hashuje się jak dotąd |
 | obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |

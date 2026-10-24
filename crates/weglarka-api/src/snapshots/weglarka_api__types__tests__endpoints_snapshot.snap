@@ -15,5 +15,8 @@ expression: list
   "Get /v1/apps/{name}/volumes",
   "Get /v1/apps/{name}/volumes/{volume}/export",
   "Put /v1/apps/{name}/volumes/{volume}/import",
+  "Get /v1/volumes",
+  "Put /v1/volumes/{volume}",
+  "Delete /v1/volumes/{volume}",
   "Get /v1/doctor"
 ]

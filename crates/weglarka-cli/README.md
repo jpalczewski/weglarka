@@ -12,17 +12,23 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 
 - `--json`: exactly one document on stdout — a type from `weglarka-api` (`ListAppsResponse`,
   `ShowAppResponse`, `DeployResponse`, `StatusResponse`, `ListSecretsResponse`, `SecretInfo`,
-  `DoctorReport`). CLI exceptions: `apps remove` → `{"removed","existed"}`, a no-op of
-  `apps update`/`start`/`stop` → `{"changed":false,"app"}`, `--dry-run` →
+  `ListVolumesResponse`, `ListSharedVolumesResponse`, `DoctorReport`). CLI exceptions: `apps remove` →
+  `{"removed","existed"}`, `volumes add` → `{"declared"}`, `volumes remove` → `{"removed","purged"}`,
+  a no-op of `apps update`/`start`/`stop` → `{"changed":false,"app"}`, `--dry-run` →
   `{"dry_run":true,"method","path","body"}`.
 - Errors go to stderr; with `--json`: `{"error":{"code","message","hint","exit_code"}}`.
-- `--dry-run` (`apps add/remove/update/start/stop`, `deploy`, `secrets set`): nothing is sent that would
-  change state; `remove`/`deploy`/`start`/`stop` only check that the app exists (GET). The secret value is
-  masked.
+- `--dry-run` (`apps add/remove/update/start/stop`, `deploy`, `secrets set`, `volumes add/remove`):
+  nothing is sent that would change state; `remove`/`deploy`/`start`/`stop` only check that the app
+  exists (GET). The secret value is masked.
 - `apps update <name>`: read-modify-write of the whole spec (`GET`, apply flags, `PUT`); `--dry-run` shows the
   diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
   Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
   runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
+- Spec flags without `--spec`: `--volume NAME=/PATH[:ro]` (repeatable) adds a private named volume;
+  `--shared-volume NAME=/PATH[:ro]` (repeatable) mounts a volume shared with other apps (issue #33).
+  A shared volume must be declared first (`weglarka volumes add NAME`), at most one per app; a mount
+  of the same name is replaced; `--shared-volume` conflicts with `--spec` like `--volume`. Omitting
+  the flags keeps the volumes already in the spec (read-modify-write).
 - Spec flags without `--spec`: `--host-port [IP:]HOST:CONTAINER` (repeatable) publishes a container port
   directly on the host (issue #34): omitting `IP` binds loopback (`127.0.0.1`), `--host-port 0.0.0.0:2222:22`
   exposes it, `none` clears the list. TCP only, and the port bypasses the ingress (no TLS, no routing, no
@@ -48,6 +54,25 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
 - Secret: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
   is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes).
+
+## Volumes
+
+- `volumes list [app]` — with an app: the app's volumes (private and shared) with a `SHARED`
+  column; without an app: the shared volumes declared in `apps.toml` — `NAME`, `PODMAN NAME`,
+  `MEMBERS`, `RANGE` (`<start>+<size>`, `-` before the first deploy), `EXISTS`.
+- `volumes add <name>` — declare a shared volume (`PUT /v1/volumes/{name}`, idempotent, 204). The
+  name is validated locally before anything is sent; `--dry-run` prints the request.
+- `volumes remove <name> [--purge]` — remove a declaration (`DELETE /v1/volumes/{name}`; with
+  `--purge` the query is `?purge=true` and the Podman volume is deleted with its data). Refused with
+  409 while an app still mounts it; without `--purge` also while the volume holds data.
+  `--dry-run` prints the request including the query.
+- `volumes export <app> <volume>` / `volumes import <app> <volume>` — stream a tar to/from a file or
+  stdin/stdout; a shared volume is resolved through a member app (the import helper runs in the
+  group's uid range). An import into a shared volume is refused while another member runs.
+- Shared volumes (`docs/decisions/0017-shared-volumes.md`) own one uid range: `wg-shared-<name>`,
+  created on the first member's deploy. `apps add/update --shared-volume NAME=/PATH[:ro]` mounts
+  one; `apps remove` keeps the data, while `apps remove --purge-volumes` on a member is refused
+  (409) while other members exist.
 
 ## Exit codes
 

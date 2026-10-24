@@ -9,19 +9,27 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
+use weglarka_core::app::SharedVolumeName;
+use weglarka_core::labels;
 use weglarka_core::podman::{
-    PodmanClient, PodmanError, PullEvent, TarStream, VolumeFilter, VolumeSpec,
+    ContainerSpec, PodmanClient, PodmanError, PullEvent, RestartPolicy, TarStream,
+    VolumeAttachment, VolumeFilter, VolumeSpec,
 };
 use weglarka_core::uid_range::{UidRange, allocate};
+use weglarka_core::volumes::id_mapping;
 use weglarka_podman::LibpodClient;
 
 const ALPINE: &str = "docker.io/library/alpine:3.20";
+/// Image of the shared-volume test: unlike alpine it keeps running without a command
+/// (`ContainerSpec` has no command field), so the test can `exec` into it.
+const NGINX: &str = "docker.io/library/nginx:1-alpine";
 /// Instance range used by the tests; small, but covers uid 1000.
 const RANGE: u32 = 4096;
 
@@ -74,8 +82,9 @@ fn raw(socket: &str, method: &str, path: &str, body: Option<&Value>) -> Result<S
     }
 }
 
-/// Size of the current user's subuid pool from /etc/subuid.
-fn subuid_pool_size() -> u64 {
+/// The current user's first `/etc/subuid` entry — the rootless pool Podman maps subuid offsets
+/// onto (`host_id` 1 is `start`; ADR 0009, finding 6).
+fn subuid_pool() -> (u64, u64) {
     let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
         .unwrap()
         .trim()
@@ -85,10 +94,20 @@ fn subuid_pool_size() -> u64 {
         .lines()
         .filter_map(|l| {
             let mut p = l.split(':');
-            (p.next()? == user).then_some(p.nth(1)?.parse().ok()?)
+            if p.next()? != user {
+                return None;
+            }
+            let start = p.next()?.parse().ok()?;
+            let size = p.next()?.parse().ok()?;
+            Some((start, size))
         })
         .next()
         .expect("the CI user has a /etc/subuid entry")
+}
+
+/// Size of the current user's subuid pool from /etc/subuid.
+fn subuid_pool_size() -> u64 {
+    subuid_pool().1
 }
 
 /// Removes everything the test created, also on panic.
@@ -157,6 +176,45 @@ impl Env {
             })
             .await
             .unwrap();
+    }
+
+    /// Shared volume exactly as the engine creates it (ADR 0017): `wg-shared-<name>` labelled
+    /// `weglarka.shared-volume=<name>` and deliberately **without** the `weglarka.instance` label.
+    async fn shared_volume(&mut self, name: &SharedVolumeName) -> String {
+        let volume = labels::shared_volume_name(name);
+        self.volumes.push(volume.clone());
+        self.client
+            .volume_create(&VolumeSpec {
+                name: volume.clone(),
+                labels: BTreeMap::from([(labels::SHARED_VOLUME.to_owned(), name.to_string())]),
+            })
+            .await
+            .unwrap();
+        volume
+    }
+
+    /// Pulls an image and checks the stream completed; member images have to keep running by
+    /// themselves (`ContainerSpec` has no command), so the test needs its own image.
+    async fn pull(&self, image: &str) {
+        let events: Vec<_> = self.client.image_pull(image).collect().await;
+        assert!(
+            matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+            "pull {image}: {events:?}"
+        );
+    }
+
+    /// Creates and starts a container through the typed client, so the test sends the exact wire
+    /// shape the engine sends for a member (`userns: private` + explicit `IdMapping`).
+    async fn spawn(&mut self, spec: &ContainerSpec) {
+        self.containers.push(spec.name.clone());
+        self.client
+            .container_create(spec)
+            .await
+            .unwrap_or_else(|e| panic!("create {}: {e}", spec.name));
+        self.client
+            .container_start(&spec.name)
+            .await
+            .unwrap_or_else(|e| panic!("start {}: {e}", spec.name));
     }
 
     /// Container with an explicit instance range (`private` + maps, as the wire layer sends).
@@ -671,4 +729,163 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
             .is_err()
     );
     assert!(!load_state(&paths.state).unwrap().apps.contains_key(&name));
+}
+
+/// Host owner of a file in a volume mountpoint, as the rootless Podman user sees it.
+fn host_uid(path: &str) -> u32 {
+    fs::metadata(path).unwrap().uid()
+}
+
+/// A member container as the engine creates one (ADR 0017): the shared volume's explicit uid range
+/// (`userns: private` + one `IdMapping`, `userns_auto = false`), the `weglarka.uid-range` label and
+/// the shared Podman volume mounted read-write. `ContainerSpec` has no command, so the member image
+/// has to keep running by itself (nginx does) and commands run through `container_exec`.
+fn member_spec(name: &str, shared_volume: &str, range: UidRange) -> ContainerSpec {
+    ContainerSpec {
+        name: name.to_owned(),
+        image: NGINX.to_owned(),
+        labels: BTreeMap::from([(labels::UID_RANGE.to_owned(), labels::uid_range_label(range))]),
+        env: BTreeMap::new(),
+        networks: vec![],
+        secrets: vec![],
+        publish: vec![],
+        restart: RestartPolicy::No,
+        userns_auto: false,
+        mounts: vec![],
+        volumes: vec![VolumeAttachment {
+            volume: shared_volume.to_owned(),
+            target: "/data".to_owned(),
+            read_only: false,
+        }],
+        resources: Default::default(),
+        healthcheck: None,
+        id_mapping: Some(id_mapping(range)),
+        security: Default::default(),
+    }
+}
+
+/// Issue #33 data plane (ADR 0017): two containers of one shared volume run in the **same** explicit
+/// uid range and read/overwrite the same file with one stable owner across recreation, while a
+/// container with a disjoint range cannot touch the volume.
+#[tokio::test]
+async fn shared_volume_two_members_one_range_read_write_recreate_and_isolate() {
+    let Some(socket) = socket() else { return };
+    let mut env = Env::new(socket).await;
+    env.pull(NGINX).await;
+    let id = run_id();
+    let (range, other) = (env.range(), env.range());
+    assert!(!range.overlaps(other), "the test needs two disjoint ranges");
+    let in_range = |range: UidRange| {
+        format!(
+            r"grep -Eq '^ *0 +{} +{} *$' /proc/self/uid_map",
+            range.start, range.size
+        )
+    };
+
+    // The engine creates the labelled shared volume before the first member's container; every
+    // member's launch calls ensure again, so the create is idempotent and label-preserving.
+    let shared = SharedVolumeName::new(format!("it-share-{id}")).unwrap();
+    let volume = env.shared_volume(&shared).await;
+    let _ = env.shared_volume(&shared).await;
+    let info = env.client.volume_inspect(&volume).await.unwrap();
+    let shared_label = shared.to_string();
+    assert_eq!(info.labels.get(labels::SHARED_VOLUME), Some(&shared_label));
+    assert!(
+        !info.labels.contains_key(labels::INSTANCE),
+        "a shared volume must not look like an instance volume: {:?}",
+        info.labels
+    );
+    let mountpoint = info.mountpoint.clone().expect("volume mountpoint");
+
+    // A writes a private file as the container user of the shared range.
+    let a = format!("wgit-share-a-{id}");
+    env.spawn(&member_spec(&a, &volume, range)).await;
+    assert_eq!(
+        env.sh(&a, &in_range(range)).await,
+        0,
+        "A runs in the shared range"
+    );
+    assert_eq!(
+        env.sh(
+            &a,
+            "echo v1 > /data/f && chmod 600 /data/f && id -u > /data/uid"
+        )
+        .await,
+        0
+    );
+    // Host-side ownership: `range.start` is an offset into the subuid pool (offset 1 = the pool's
+    // first subuid), so the on-disk owner is `subuid_start + range.start + container_uid - 1`
+    // (ADR 0009, finding 6).
+    let container_uid: u32 = fs::read_to_string(format!("{mountpoint}/uid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let owner =
+        u32::try_from(subuid_pool().0 + u64::from(range.start) + u64::from(container_uid) - 1)
+            .unwrap();
+    assert_eq!(
+        host_uid(&format!("{mountpoint}/f")),
+        owner,
+        "A's file is owned through the shared range"
+    );
+
+    // B — the same range, the same volume, A still running — reads A's file and overwrites it.
+    let b = format!("wgit-share-b-{id}");
+    env.spawn(&member_spec(&b, &volume, range)).await;
+    assert_eq!(
+        env.sh(&b, &in_range(range)).await,
+        0,
+        "B runs in the same shared range"
+    );
+    let read_write = r#"test "$(id -u)" = "$(cat /data/uid)" && test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v1 /data/f && echo v2 > /data/f"#;
+    assert_eq!(
+        env.sh(&b, read_write).await,
+        0,
+        "B reads and overwrites A's file"
+    );
+    assert_eq!(
+        host_uid(&format!("{mountpoint}/f")),
+        owner,
+        "B keeps the owner A created"
+    );
+
+    // Recreation (the deploy path) keeps ownership: the new A reads what B wrote.
+    env.remove(&a);
+    env.spawn(&member_spec(&a, &volume, range)).await;
+    let recreated =
+        r#"test "$(stat -c %u /data/f)" = "$(id -u)" && grep -q v2 /data/f && echo v3 > /data/f"#;
+    assert_eq!(
+        env.sh(&a, recreated).await,
+        0,
+        "recreated A reads B's content with the same owner"
+    );
+    assert_eq!(
+        host_uid(&format!("{mountpoint}/f")),
+        owner,
+        "the owner survives the recreate"
+    );
+
+    // Isolation: a container with a disjoint range cannot read or write the shared volume's files.
+    let intruder = format!("wgit-share-intruder-{id}");
+    env.spawn(&member_spec(&intruder, &volume, other)).await;
+    assert_eq!(
+        env.sh(&intruder, &in_range(other)).await,
+        0,
+        "the intruder has the disjoint range"
+    );
+    assert_ne!(
+        env.sh(&intruder, "cat /data/f").await,
+        0,
+        "disjoint range cannot read"
+    );
+    assert_ne!(
+        env.sh(&intruder, "echo x > /data/evil").await,
+        0,
+        "disjoint range cannot write"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{mountpoint}/evil")).exists(),
+        "nothing appeared on the volume"
+    );
 }

@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppSpec, AppsFile, Digest, HostPort, InstanceName, valid_volume_name};
+use crate::app::{
+    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, valid_mount_target,
+    valid_volume_name,
+};
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
 
@@ -75,6 +78,20 @@ pub struct StateFile {
     /// instances, it must not stay on libpod's default map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_uid_range: Option<UidRange>,
+    /// Shared volumes between instances (issue #33, docs/decisions/0017): the uid/gid range belongs
+    /// to the volume, not to an instance, and members run in it. `None` until a member is deployed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeState>,
+}
+
+/// Runtime state of one shared volume (issue #33).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedVolumeState {
+    /// Fixed uid/gid range shared by every member instance; `None` until the first member is
+    /// deployed or provisioned. Kept as long as the volume holds data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid_range: Option<UidRange>,
 }
 
 /// Location of the state files (the daemon's single data directory).
@@ -216,14 +233,7 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if !valid_volume_name(&v.name) {
             return Err(format!("{name}: invalid volume name {:?}", v.name));
         }
-        let target_ok = v.target.starts_with('/')
-            && v.target.len() > 1
-            && !v.target.split('/').any(|s| s == "." || s == "..")
-            && !v
-                .target
-                .chars()
-                .any(|c| c.is_control() || c == ',' || c == ':');
-        if !target_ok {
+        if !valid_mount_target(&v.target) {
             return Err(format!(
                 "{name}: volume {:?} target must be an absolute path (no '..', ':' or ',')",
                 v.name
@@ -231,6 +241,23 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         }
         if !seen_names.insert(&v.name) {
             return Err(format!("{name}: duplicate volume name {:?}", v.name));
+        }
+        if !seen_targets.insert(v.target.trim_end_matches('/')) {
+            return Err(format!("{name}: duplicate volume target {:?}", v.target));
+        }
+    }
+    if spec.shared_volumes.len() > 1 {
+        return Err(format!(
+            "{name}: at most one shared volume per app (a shared volume is a uid-range boundary; \
+             see docs/decisions/0017-shared-volumes.md)"
+        ));
+    }
+    for v in &spec.shared_volumes {
+        if !valid_mount_target(&v.target) {
+            return Err(format!(
+                "{name}: shared volume {:?} target must be an absolute path (no '..', ':' or ',')",
+                v.name
+            ));
         }
         if !seen_targets.insert(v.target.trim_end_matches('/')) {
             return Err(format!("{name}: duplicate volume target {:?}", v.target));
@@ -311,6 +338,7 @@ pub fn load_apps(path: &Path) -> Result<AppsFile, StateError> {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
     crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
+    crate::shared_volumes::validate(&apps).map_err(|r| invalid(path, r))?;
     Ok(apps)
 }
 
@@ -319,6 +347,7 @@ pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
     crate::depends::validate(apps).map_err(|r| invalid(path, r))?;
+    crate::shared_volumes::validate(apps).map_err(|r| invalid(path, r))?;
     let text = toml::to_string(apps).map_err(|e| invalid(path, e.to_string()))?;
     write_atomic(path, text.as_bytes(), 0o644).map_err(io_err(path))
 }
@@ -337,6 +366,12 @@ fn validate_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
         .apps
         .iter()
         .filter_map(|(n, s)| s.uid_range.map(|r| (n.to_string(), r)))
+        .chain(
+            state
+                .shared_volumes
+                .iter()
+                .filter_map(|(n, s)| s.uid_range.map(|r| (format!("shared volume {n}"), r))),
+        )
         .chain(state.ingress_uid_range.map(|r| (ingress, r)))
         .collect();
     for (i, (a, ra)) in ranges.iter().enumerate() {
@@ -590,6 +625,72 @@ mod tests {
         ] {
             assert!(!check(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn shared_volumes_are_validated_across_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("apps.toml");
+        let load = |src: &str| {
+            fs::write(&p, src).unwrap();
+            load_apps(&p)
+        };
+        // A declared shared volume mounted by two apps, mixed with a private volume, is valid and
+        // round-trips through the daemon's writer.
+        let good = r#"
+[shared_volumes.kajet-data]
+
+[apps.a]
+image = "x:1"
+volumes = [{ name = "own", target = "/own" }]
+shared_volumes = [{ name = "kajet-data", target = "/data" }]
+
+[apps.b]
+image = "x:1"
+shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
+"#;
+        let apps = load(good).expect("valid");
+        save_apps(&p, &apps).unwrap();
+        assert_eq!(load(&fs::read_to_string(&p).unwrap()).unwrap(), apps);
+
+        // Mounting an undeclared shared volume is a typo, not a new volume.
+        let err = load(
+            "[apps.a]\nimage = \"x:1\"\nshared_volumes = [{ name = \"d\", target = \"/d\" }]\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, StateError::Invalid { .. }), "{err:?}");
+        // At most one shared volume per app (a shared volume is a uid-range boundary).
+        assert!(matches!(
+            load(
+                "[shared_volumes.a]\n[shared_volumes.b]\n\
+                 [apps.x]\nimage = \"x:1\"\n\
+                 shared_volumes = [{ name = \"a\", target = \"/a\" }, { name = \"b\", target = \"/b\" }]\n"
+            ),
+            Err(StateError::Invalid { .. })
+        ));
+        // Mount targets are unique across private and shared mounts.
+        assert!(matches!(
+            load(
+                "[shared_volumes.d]\n\
+                 [apps.x]\nimage = \"x:1\"\n\
+                 volumes = [{ name = \"own\", target = \"/data\" }]\n\
+                 shared_volumes = [{ name = \"d\", target = \"/data/\" }]\n"
+            ),
+            Err(StateError::Invalid { .. })
+        ));
+        // The declaration itself is strict (`deny_unknown_fields`).
+        assert!(matches!(
+            load("[shared_volumes.d]\nbogus = 1\n"),
+            Err(StateError::Parse { .. })
+        ));
+        // A shared range must not overlap an instance range.
+        fs::write(
+            &p,
+            "[apps.a]\nuid_range = { start = 1, size = 100 }\n\
+             [shared_volumes.v]\nuid_range = { start = 50, size = 100 }\n",
+        )
+        .unwrap();
+        assert!(matches!(load_state(&p), Err(StateError::Invalid { .. })));
     }
 
     #[test]

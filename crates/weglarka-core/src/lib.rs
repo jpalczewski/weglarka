@@ -12,6 +12,7 @@ pub mod labels;
 pub mod platform;
 pub mod podman;
 pub mod secret_store;
+pub mod shared_volumes;
 pub mod state;
 pub mod uid_range;
 pub mod webhook;

@@ -48,6 +48,17 @@ pub fn volume_name(instance: &InstanceName, volume: &str) -> String {
     format!("{instance}.{volume}")
 }
 
+/// Label marking a volume as shared between instances (issue #33). Such a volume deliberately has
+/// **no** [`INSTANCE`] label, so instance purge / orphan settling / volume filters never touch it.
+pub const SHARED_VOLUME: &str = "weglarka.shared-volume";
+
+/// Podman volume name of a shared volume. It contains no `.`, while every per-instance volume is
+/// `<instance>.<volume>` (instance and volume names are `[a-z0-9-]`), so the two namespaces cannot
+/// collide.
+pub fn shared_volume_name(volume: &crate::app::SharedVolumeName) -> String {
+    format!("wg-shared-{volume}")
+}
+
 /// Value of the [`UID_RANGE`] label.
 pub fn uid_range_label(range: crate::uid_range::UidRange) -> String {
     format!("{}+{}", range.start, range.size)

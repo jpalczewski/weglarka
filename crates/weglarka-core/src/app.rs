@@ -225,6 +225,89 @@ pub fn valid_volume_name(name: &str) -> bool {
     InstanceName::new(name).is_ok()
 }
 
+/// Mount target in the container: an absolute path without `.`/`..` segments, `:` or `,`
+/// (the separator of libpod's volume syntax). Shared by instance volumes and shared volumes.
+pub fn valid_mount_target(target: &str) -> bool {
+    target.starts_with('/')
+        && target.len() > 1
+        && !target.split('/').any(|s| s == "." || s == "..")
+        && !target
+            .chars()
+            .any(|c| c.is_control() || c == ',' || c == ':')
+}
+
+/// Name of a shared volume (key in `apps.toml`'s `[shared_volumes]` section). Same character set
+/// as [`InstanceName`], so it is also safe as a component of the Podman volume name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SharedVolumeName(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid shared volume name {0:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-'"
+)]
+pub struct InvalidSharedVolumeName(pub String);
+
+impl SharedVolumeName {
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidSharedVolumeName> {
+        let name = name.into();
+        let ok = (1..=63).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !name.starts_with('-')
+            && !name.ends_with('-');
+        if ok {
+            Ok(Self(name))
+        } else {
+            Err(InvalidSharedVolumeName(name))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SharedVolumeName {
+    type Error = InvalidSharedVolumeName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SharedVolumeName> for String {
+    fn from(value: SharedVolumeName) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for SharedVolumeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Declaration of a volume shared between instances (issue #33,
+/// `docs/decisions/0017-shared-volumes.md`). It has no options yet: the declaration itself is the
+/// guard against typos in `AppSpec::shared_volumes` (an undeclared name is rejected) and the place
+/// where per-volume options (backups, range size) will live. Strict, like every persisted type.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedVolumeSpec {}
+
+/// Mount of a declared shared volume in one instance's container. At most one per app in v1: a
+/// shared volume is a uid/gid-range boundary (all members run in its range).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedVolumeRef {
+    pub name: SharedVolumeName,
+    /// Absolute path in the container.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
 /// A container port published directly on the host, next to the ingress (issue #34). Such ports
 /// bypass nginx/Traefik completely: no TLS, no routing by domain, no access log — the host firewall
 /// is the only gate, so the default bind address is loopback
@@ -429,6 +512,11 @@ pub struct AppSpec {
     /// Named volumes (iteration 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeMount>,
+    /// Mounts of shared volumes declared in `AppsFile::shared_volumes` (issue #33,
+    /// `docs/decisions/0017-shared-volumes.md`). Not part of the instance's own data: the container
+    /// runs in the shared volume's uid range, and at most one is allowed per app.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_volumes: Vec<SharedVolumeRef>,
     /// Ports published directly on the host (issue #34); the ingress keeps routing `domains`/`port`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPort>,
@@ -468,6 +556,11 @@ fn is_true(value: &bool) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppsFile {
+    /// Volumes shared between instances (issue #33, `docs/decisions/0017-shared-volumes.md`),
+    /// declared once here and mounted by apps through [`AppSpec::shared_volumes`]. Serialized
+    /// before `apps` so the TOML file keeps its top-level tables first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeSpec>,
     #[serde(default)]
     pub apps: BTreeMap<InstanceName, AppSpec>,
 }

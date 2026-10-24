@@ -30,6 +30,7 @@ use weglarka_core::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
+use crate::shared_volumes;
 use crate::update;
 use crate::volumes;
 
@@ -49,7 +50,7 @@ impl Fail {
     fn not_found(msg: impl Into<String>) -> Self {
         Self(ErrorCode::NotFound, msg.into())
     }
-    fn internal(msg: impl ToString) -> Self {
+    pub(crate) fn internal(msg: impl ToString) -> Self {
         Self(ErrorCode::Internal, msg.to_string())
     }
 }
@@ -70,6 +71,9 @@ impl From<EngineError> for Fail {
     fn from(e: EngineError) -> Self {
         match e {
             EngineError::UnknownInstance(n) => Fail::not_found(format!("unknown app: {n}")),
+            EngineError::UnknownSharedVolume(n) => {
+                Fail::not_found(format!("unknown shared volume: {n}"))
+            }
             EngineError::Volume(m) => Fail::invalid(m),
             EngineError::Busy => Fail(
                 ErrorCode::Busy,
@@ -88,6 +92,11 @@ impl From<EngineError> for Fail {
             ),
             // Removing an app another one depends on: nothing was deleted.
             e @ EngineError::DependencyInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
+            // Shared-volume guards (issue #33): the engine message carries the members / the hint.
+            e @ (EngineError::SharedVolumeInUse { .. }
+            | EngineError::SharedVolumeHasData { .. }
+            | EngineError::SharedVolumeBusy { .. }
+            | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
             other => Fail::internal(other),
         }
     }
@@ -106,7 +115,7 @@ fn parse_name(raw: &str) -> ApiResult<InstanceName> {
 }
 
 /// Mutations wait for the engine mutex at most `MUTATION_TIMEOUT`; then 409 instead of hanging.
-async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>>) -> ApiResult<T> {
+pub(crate) async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>>) -> ApiResult<T> {
     match tokio::time::timeout(MUTATION_TIMEOUT, fut).await {
         Ok(r) => Ok(r?),
         Err(_) => Err(Fail(
@@ -136,6 +145,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .fallback(|| async { Fail::not_found("no such endpoint") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
+        .merge(shared_volumes::routes())
         .with_state(daemon)
 }
 
@@ -281,6 +291,9 @@ async fn add_app<P: PodmanClient + 'static>(
             ));
         }
         apps.apps.insert(req.name.clone(), req.spec.clone());
+        // Every shared-volume mount must name a declared volume (issue #33): a typo would silently
+        // create a second empty volume. Cross-app rule, so it sees the candidate app set.
+        weglarka_core::shared_volumes::validate(&apps).map_err(Fail::invalid)?;
         // Host-wide `host_ports` rules first (privileged ports, another app on the same socket, the
         // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
         weglarka_core::host_ports::validate(&d.host, &apps)

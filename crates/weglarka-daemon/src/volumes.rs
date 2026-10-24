@@ -1,6 +1,11 @@
 //! Admin endpoints for volumes (`VOLUMES_LIST`, `VOLUMES_EXPORT`, `VOLUMES_IMPORT`); the
 //! `?purge_volumes` flag of `APPS_REMOVE` is handled by `admin.rs` through [`flag`].
 //!
+//! A `{volume}` segment resolves to a private volume of the instance (`<instance>.<name>`) or to a
+//! shared volume the app mounts (`wg-shared-<name>`, issue #33); in both cases the path segment is
+//! the name declared in the spec. The shared volumes' own endpoints live in
+//! [`crate::shared_volumes`].
+//!
 //! Tars are streamed in both directions: nothing is buffered in the daemon. Węglarka extracts no
 //! archive itself — Podman does, in its own chroot — so there is no path-traversal surface in this
 //! module; what it does enforce is a cap on the number of bytes it forwards ([`MAX_IMPORT_BYTES`]).
@@ -21,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
 use weglarka_api::{ErrorCode, ListVolumesResponse, VolumeSummary, endpoints};
-use weglarka_core::app::{AppSpec, InstanceName, VolumeMount};
+use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::labels;
 use weglarka_core::podman::{PodmanClient, PodmanError, TarStream};
 use weglarka_core::state;
@@ -67,32 +72,74 @@ fn load_spec<P: PodmanClient>(d: &Daemon<P>, name: &InstanceName) -> ApiResult<A
         .ok_or_else(|| Fail(ErrorCode::NotFound, format!("unknown app: {name}")))
 }
 
+/// A volume the endpoints can address: a private volume of the instance, or a shared volume the app
+/// mounts (issue #33). `name` is the `{volume}` path segment — the private volume's name within the
+/// instance or the shared volume's declared name (`kajet-data`, not `wg-shared-kajet-data`).
+struct VolumeTarget {
+    instance: InstanceName,
+    name: String,
+    podman_name: String,
+    shared: bool,
+}
+
 fn declared_volume<P: PodmanClient>(
     d: &Daemon<P>,
     app: &str,
     volume: &str,
-) -> ApiResult<(InstanceName, VolumeMount)> {
+) -> ApiResult<VolumeTarget> {
     let name = parse_name(app)?;
-    let mount = load_spec(d, &name)?
-        .volumes
-        .into_iter()
-        .find(|v| v.name == volume)
-        .ok_or_else(|| {
-            Fail(
-                ErrorCode::NotFound,
-                format!("{name} declares no volume {volume:?}"),
-            )
-        })?;
-    Ok((name, mount))
+    let spec = load_spec(d, &name)?;
+    if let Some(v) = spec.volumes.iter().find(|v| v.name == volume) {
+        return Ok(VolumeTarget {
+            podman_name: labels::volume_name(&name, &v.name),
+            name: v.name.clone(),
+            instance: name,
+            shared: false,
+        });
+    }
+    if let Some(v) = spec
+        .shared_volumes
+        .iter()
+        .find(|v| v.name.as_str() == volume)
+    {
+        return Ok(VolumeTarget {
+            podman_name: labels::shared_volume_name(&v.name),
+            name: v.name.to_string(),
+            instance: name,
+            shared: true,
+        });
+    }
+    Err(Fail(
+        ErrorCode::NotFound,
+        format!("{name} declares no volume {volume:?}"),
+    ))
 }
 
-fn podman_fail(e: PodmanError, what: &str) -> Fail {
+/// What to tell the operator when the Podman volume does not exist yet (the volume endpoints are
+/// usable only after a deploy creates it).
+fn not_found_hint(target: &VolumeTarget) -> &'static str {
+    if target.shared {
+        "deploy one of its members once first"
+    } else {
+        "deploy the app once first"
+    }
+}
+
+fn podman_fail(e: PodmanError, what: &str, hint: &str) -> Fail {
     match e {
         PodmanError::NotFound(_) => Fail(
             ErrorCode::NotFound,
-            format!("{what} does not exist yet; deploy the app once first"),
+            format!("{what} does not exist yet; {hint}"),
         ),
         other => Fail(ErrorCode::Internal, other.to_string()),
+    }
+}
+
+async fn volume_exists<P: PodmanClient>(d: &Daemon<P>, podman_name: &str) -> ApiResult<bool> {
+    match d.engine.podman().volume_inspect(podman_name).await {
+        Ok(_) => Ok(true),
+        Err(PodmanError::NotFound(_)) => Ok(false),
+        Err(e) => Err(Fail(ErrorCode::Internal, e.to_string())),
     }
 }
 
@@ -102,19 +149,26 @@ async fn list_volumes<P: PodmanClient + 'static>(
 ) -> ApiResult<Response> {
     let name = parse_name(&app)?;
     let spec = load_spec(&d, &name)?;
-    let mut volumes = Vec::with_capacity(spec.volumes.len());
-    for v in spec.volumes {
+    let mut volumes = Vec::with_capacity(spec.volumes.len() + spec.shared_volumes.len());
+    for v in &spec.volumes {
         let podman_name = labels::volume_name(&name, &v.name);
-        let exists = match d.engine.podman().volume_inspect(&podman_name).await {
-            Ok(_) => true,
-            Err(PodmanError::NotFound(_)) => false,
-            Err(e) => return Err(Fail(ErrorCode::Internal, e.to_string())),
-        };
         volumes.push(VolumeSummary {
-            name: v.name,
-            target: v.target,
+            name: v.name.clone(),
+            target: v.target.clone(),
+            exists: volume_exists(&d, &podman_name).await?,
             podman_name,
-            exists,
+            shared: false,
+        });
+    }
+    // Shared volumes the app mounts: same list, marked `shared`, addressed by their declared name.
+    for v in &spec.shared_volumes {
+        let podman_name = labels::shared_volume_name(&v.name);
+        volumes.push(VolumeSummary {
+            name: v.name.to_string(),
+            target: v.target.clone(),
+            exists: volume_exists(&d, &podman_name).await?,
+            podman_name,
+            shared: true,
         });
     }
     Ok(axum::Json(ListVolumesResponse { volumes }).into_response())
@@ -124,14 +178,19 @@ async fn export_volume<P: PodmanClient + 'static>(
     State(d): Shared<P>,
     Path((app, volume)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let (name, mount) = declared_volume(&d, &app, &volume)?;
-    let podman_name = labels::volume_name(&name, &mount.name);
+    let target = declared_volume(&d, &app, &volume)?;
     let tar = d
         .engine
         .podman()
-        .volume_export(&podman_name)
+        .volume_export(&target.podman_name)
         .await
-        .map_err(|e| podman_fail(e, &format!("volume {podman_name}")))?;
+        .map_err(|e| {
+            podman_fail(
+                e,
+                &format!("volume {}", target.podman_name),
+                not_found_hint(&target),
+            )
+        })?;
     Ok((
         [(header::CONTENT_TYPE, "application/x-tar")],
         Body::from_stream(tar),
@@ -145,16 +204,18 @@ async fn import_volume<P: PodmanClient + 'static>(
     RawQuery(query): RawQuery,
     body: Body,
 ) -> ApiResult<StatusCode> {
-    let (name, mount) = declared_volume(&d, &app, &volume)?;
+    let target = declared_volume(&d, &app, &volume)?;
     let mode = if flag(query.as_deref(), "foreign") {
         ImportMode::Foreign
     } else {
         ImportMode::Own
     };
+    // The engine resolves the name to the private volume or to a shared volume the app mounts; for a
+    // shared volume it also refuses while another member runs (issue #33).
     d.engine
         .import_volume_with(
-            &name,
-            &mount.name,
+            &target.instance,
+            &target.name,
             mode,
             flag(query.as_deref(), "replace"),
             capped(body, MAX_IMPORT_BYTES),

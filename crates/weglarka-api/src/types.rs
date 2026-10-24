@@ -1,8 +1,9 @@
 //! Admin API request/response types.
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{AppSpec, Digest, InstanceName};
+use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedVolumeName};
 use weglarka_core::state::AppState;
+use weglarka_core::uid_range::UidRange;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,19 +112,43 @@ pub struct RemoveAppQuery {
 /// A volume declared in the app's spec, with what Podman knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSummary {
-    /// Name within the instance (`VolumeMount::name`).
+    /// Name within the instance (`VolumeMount::name`), or the shared volume's name.
     pub name: String,
     /// Mount path in the container.
     pub target: String,
-    /// Podman volume name (`<instance>.<name>`).
+    /// Podman volume name (`<instance>.<name>` or `wg-shared-<name>`).
     pub podman_name: String,
     /// `false` until the first deploy creates it.
     pub exists: bool,
+    /// `true` when this is a shared volume the app mounts (issue #33); the field is omitted for
+    /// instance volumes, so existing responses keep their shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListVolumesResponse {
     pub volumes: Vec<VolumeSummary>,
+}
+
+/// A shared volume declared once in `apps.toml` and mounted by several instances (issue #33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedVolumeSummary {
+    pub name: SharedVolumeName,
+    /// Podman volume name (`wg-shared-<name>`).
+    pub podman_name: String,
+    /// Instances mounting it, sorted by name (empty while it is declared but unused).
+    pub members: Vec<InstanceName>,
+    /// Allocated on the first member's deploy; `None` before that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid_range: Option<UidRange>,
+    /// `false` until the first member's deploy creates it.
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSharedVolumesResponse {
+    pub volumes: Vec<SharedVolumeSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
