@@ -769,6 +769,25 @@ fn add_accepts_streaming() {
 }
 
 #[test]
+fn add_accepts_command_arguments() {
+    let spec = build_spec(&add_args(&["--command", "serve", "--command=--no-log"])).unwrap();
+    assert_eq!(spec.command, ["serve", "--no-log"]);
+    // Without the flag the field stays out of the spec (and out of apps.toml).
+    assert!(build_spec(&add_args(&[])).unwrap().command.is_empty());
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(
+        Add::try_parse_from(["add", "ntfy", "img", "--command", "serve", "--spec", "f"]).is_err()
+    );
+    // The dash-leading form is parsed, the naive one is rejected by clap as an unknown flag.
+    assert!(Add::try_parse_from(["add", "ntfy", "img", "--command", "-v"]).is_err());
+}
+
+#[test]
 fn update_flags_flip_start() {
     assert!(
         !apply_flags(app_spec(true), &update_args(&["--no-start"]))

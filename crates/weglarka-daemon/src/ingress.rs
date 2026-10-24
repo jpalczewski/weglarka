@@ -381,6 +381,8 @@ impl<P: PodmanClient> IngressManager<P> {
             .container_create(&ContainerSpec {
                 name: NGINX_CONTAINER.to_owned(),
                 image: image.clone(),
+                // The image's own CMD starts nginx; nothing to add.
+                command: vec![],
                 // No `weglarka.instance` — reconcile would treat the container as an orphan.
                 labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
                 env: BTreeMap::new(),

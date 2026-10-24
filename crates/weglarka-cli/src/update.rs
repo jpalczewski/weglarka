@@ -589,6 +589,28 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn command_flag_replaces_and_none_clears() {
+        let mut before = spec();
+        before.command = vec!["serve".into()];
+        // The whole argv is replaced, so no duplicated arguments (unlike the set-like list flags).
+        let s = apply_flags(before, &args(&["--command", "serve", "--command=--no-log"])).unwrap();
+        assert_eq!(s.command, ["serve", "--no-log"]);
+        // Everything else stays as it was.
+        assert_eq!(s.volumes, spec().volumes);
+        assert_eq!(s.domains, spec().domains);
+        // `none` restores the image's own CMD.
+        let s = apply_flags(s, &args(&["--command", "none"])).unwrap();
+        assert!(s.command.is_empty());
+        // Same rules as the other spec flags: incompatible with --spec.
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        assert!(W::try_parse_from(["w", "ntfy", "--command", "serve", "--spec", "f"]).is_err());
+    }
+
+    #[test]
     fn streaming_flag_sets_and_clears_the_ingress_block() {
         // `--streaming` opts in and leaves everything else untouched.
         let s = apply_flags(spec(), &args(&["--streaming"])).unwrap();

@@ -309,6 +309,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut container = ContainerSpec {
             name: name.clone(),
             image,
+            command: spec.command.clone(),
             labels: labels::container_labels(instance, generation, &hash),
             env: spec.env.clone(),
             networks: vec![network],

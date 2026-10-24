@@ -583,6 +583,55 @@ host_ports = [{ host = 2222, container = 22 }]
     assert_eq!(publish(&h)[0].host_ip.as_deref(), Some("0.0.0.0"));
 }
 
+/// `command` reaches libpod through `ContainerSpec.command` (arguments to the image's entrypoint) and
+/// a change recreates the container — it is part of the spec hash (issue #79).
+#[tokio::test(start_paused = true)]
+async fn command_reaches_the_container_and_a_change_recreates() {
+    const NTFY: &str = r#"
+[apps.ntfy]
+image = "docker.io/binwiederhier/ntfy:latest"
+port = 80
+domains = ["ntfy.example.eu"]
+"#;
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let command = |h: &Harness| {
+        h.fake
+            .container_spec("ntfy")
+            .expect("the container exists")
+            .command
+    };
+    assert!(command(&h).is_empty(), "no command = the image's own CMD");
+
+    // An image with only an ENTRYPOINT needs its subcommand as an argument.
+    h.set_apps(&NTFY.replace("port = 80", "port = 80\ncommand = [\"serve\"]"));
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.actions[0].action,
+        Action::Recreate {
+            instance: name("ntfy"),
+            reason: RecreateReason::SpecDrift
+        }
+    );
+    assert_eq!(command(&h), ["serve"]);
+
+    // The argument vector is ordered, so a different order is a different container.
+    h.set_apps(&NTFY.replace(
+        "port = 80",
+        "port = 80\ncommand = [\"serve\", \"--no-log\"]",
+    ));
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.actions[0].action,
+        Action::Recreate {
+            instance: name("ntfy"),
+            reason: RecreateReason::SpecDrift
+        }
+    );
+    assert_eq!(command(&h), ["serve", "--no-log"]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn removed_app_is_pruned_with_its_state() {
     let h = Harness::new(NTFY);

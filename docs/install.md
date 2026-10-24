@@ -14,6 +14,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
 [6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
 [6d. Zależności między apkami](#6d-zależności-między-apkami-depends_on) ·
+[6f. Komenda i argumenty](#6f-komenda-i-argumenty-kontenera-command) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -830,6 +831,58 @@ Gotowy plik: [`docs/examples/streaming.toml`](examples/streaming.toml).
 - Rollback: `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta bloku `[apps.X.ingress]`.
   Przed downgradem usuń go (`apps update --no-streaming` albo ręcznie) — patrz [7](#7-weryfikacja-i-rollback).
 
+## 6f. Komenda i argumenty kontenera (`command`)
+
+Obraz może definiować tylko `ENTRYPOINT` i oczekiwać podkomendy jako argumentu: `docker.io/binwiederhier/ntfy`
+ma `ENTRYPOINT ["ntfy"]` i nie ma `CMD`, więc kontener startuje bez argumentów, wypisuje pomoc i kończy się
+kodem 0 — a bramka zdrowia zgłasza „container not running (Stopped, exit code 0)”. To nie awaria obrazu ani
+brakujący healthcheck: brakuje argumentu `serve`. Opcjonalne pole `command` podaje argv kontenera. Decyzja
+i odrzucone alternatywy: [0019](decisions/0019-container-command.md).
+
+```toml
+# apps.toml / --spec: ntfy uruchamia się jako `ntfy serve`
+[apps.ntfy]
+image = "docker.io/binwiederhier/ntfy:latest"
+domains = ["ntfy.example.com"]
+port = 80
+command = ["serve"]             # argv kontenera: ["ntfy", "serve"]
+```
+
+Zastosowanie: `weglarka apps add ntfy docker.io/binwiederhier/ntfy:latest --command serve` dla nowej apki,
+`weglarka apps update ntfy --command serve` dla istniejącej; w pliku `--spec` `command` jest polem
+najwyższego poziomu (jak `image`). Gotowy plik: [`docs/examples/command.toml`](examples/command.toml).
+
+- **Exec form, bez shella:** każdy element listy to dokładnie jeden argument argv — nic nie jest cytowane,
+  dzielone ani rozwijane. `command = ["serve", "-v"]` to dwa argumenty, `command = ["serve -v"]` to jeden
+  argument ze spacją, a `$VAR`, `*`, `;` i `&&` są danymi, nie składnią shella (obraz bez shella, np.
+  `scratch`, działa tak samo).
+- **To nie jest nadpisanie entrypointu:** pole trafia do `Cmd` / `SpecGenerator.command` w libpodzie, czyli
+  jest doklejane do `ENTRYPOINT` obrazu (dla ntfy: `["ntfy", "serve"]`). Osobne pole `entrypoint` jest poza
+  zakresem tej zmiany — to inna decyzja o innym znaczeniu (podmiana `["ntfy"]`, nie dodanie argumentu).
+- **Puste = `CMD` obrazu, ustawione zastępuje `CMD`** (nie dopisuje): obraz z `CMD ["serve"]` i
+  `command = ["worker"]` uruchomi `worker`, a nie `serve worker`; obraz bez `ENTRYPOINT` dostaje całe argv
+  z `command`. Puste `command` znaczy to samo co brak pola („bez argumentów” to dokładnie domyślny `CMD`).
+- **`spec-hash`:** `command` wchodzi do hasha **tylko gdy jest ustawione** (dopisywane na końcu wejścia,
+  format v1 bez zmian), więc upgrade Węglarki nie odtworzy żadnego istniejącego kontenera. Zmiana `command`
+  — także kolejność argumentów — zmienia `spec-hash`, a kolejny reconcile odtwarza kontener z **przypiętego
+  digestu** (bez pullu).
+- **CLI:** `--command ARG` jest powtarzalna — jedno wystąpienie to jeden element argv; argument zaczynający
+  się od myślnika wymaga formy z `=`: `apps update ntfy --command serve --command=-v`. Flagi **zastępują
+  cały wektor** (nie dopisują do niego), a `--command none` (wielkość liter bez znaczenia) czyści pole do
+  `CMD` obrazu — na obrazie z samym `ENTRYPOINT` to powrót do zepsutego domyślnego zachowania. Jak inne
+  flagi specu, `--command` wyklucza się z `--spec`; `--dry-run` pokazuje diff i niczego nie wysyła.
+- **Walidacja:** każdy argument musi być niepusty; pusty string kończy się HTTP 400 z komunikatem
+  `command argument <i> must not be empty`. Pusta **lista** to nie błąd — to „nie ustawiono”, czyli `CMD`
+  obrazu.
+- **Uwaga operacyjna (rollback):** bramka zdrowia po nieudanym deployu przywraca tylko poprzedni **digest**,
+  nie spec. Błędny `command` obleje więc deploy *i* rollback (stary digest, te same złe argumenty) i apka
+  zostanie zatrzymana, dopóki spec nie zostanie poprawiony: `weglarka apps update <apka> --command ...`
+  (kolejny reconcile odtworzy kontener z przypiętego digestu, bez pullu). Rozpoznanie objawu: deploy pada
+  na bramce z kodem wyjścia 0 i pomocą obrazu — to brakujące lub złe `command`, nie zły obraz.
+- **Downgrade:** `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta `command`. Przed
+  powrotem do starszej Węglarki usuń pole z apek (`apps update <apka> --command none` albo ręcznie) — patrz
+  [7](#7-weryfikacja-i-rollback).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -855,7 +908,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   `apps.toml`/`weglarka.toml` z nowymi polami. Przed downgradem usuń z apek `start = false`
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on)),
   wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
-  ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
+  ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
+  ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
@@ -879,6 +933,7 @@ diff i niczego nie wysyła.
 | obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
+| `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
   ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`

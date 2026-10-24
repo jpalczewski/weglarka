@@ -1,7 +1,7 @@
 # Implementation decisions (ADR)
 
 Each decision describes the problem, the choice, the consequences and the rejected alternatives. New entries are
-numbered consecutively (after `0017` comes `0018`); the skeleton is [`0000-template.md`](0000-template.md).
+numbered consecutively (after `0018` comes `0019`); the skeleton is [`0000-template.md`](0000-template.md).
 
 | # | Topic |
 |---|---|
@@ -23,3 +23,4 @@ numbered consecutively (after `0017` comes `0018`); the skeleton is [`0000-templ
 | [0016](0016-depends-on.md) | `depends_on`: start ordering and health gating between apps (issue #35) |
 | [0017](0017-shared-volumes.md) | Volumes shared between instances: one uid range per shared volume (issue #33) |
 | [0018](0018-ingress-streaming.md) | Per-app streaming: `proxy_buffering off` and a long idle timeout (issue #64) |
+| [0019](0019-container-command.md) | Per-app container command: arguments to the image entrypoint (issue #79) |

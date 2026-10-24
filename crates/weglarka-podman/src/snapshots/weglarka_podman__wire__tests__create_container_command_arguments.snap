@@ -1,0 +1,15 @@
+---
+source: crates/weglarka-podman/src/wire.rs
+expression: "CreateContainer::new(&spec)"
+---
+{
+  "name": "ntfy",
+  "image": "docker.io/binwiederhier/ntfy:latest",
+  "command": [
+    "serve",
+    "--no-log"
+  ],
+  "userns": {
+    "nsmode": "auto"
+  }
+}

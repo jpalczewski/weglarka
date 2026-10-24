@@ -132,6 +132,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
     ContainerSpec {
         name: name.into(),
         image: IMAGE.into(),
+        command: vec![],
         labels,
         env: BTreeMap::from([("WEGLARKA_IT".into(), "1".into())]),
         networks: vec![],
@@ -524,4 +525,54 @@ async fn hardened_container_starts_with_read_only_root_dropped_caps_and_no_new_p
         host["Tmpfs"]
     );
     assert_eq!(v["State"]["Status"], "running");
+}
+
+/// Issue #79: `ContainerSpec.command` reaches libpod as the arguments after the image's ENTRYPOINT
+/// (`SpecGenerator.command` → OCI `Cmd`), not as an entrypoint override. `pause -v` prints its
+/// version and exits 0, while `pause` with no arguments runs forever — so a zero exit code proves
+/// the argument was delivered, and an entrypoint override would fail to exec.
+#[tokio::test]
+async fn command_reaches_libpod_as_arguments_to_the_image_entrypoint() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-command-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(IMAGE).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.command = vec!["-v".into()];
+    client.container_create(&s).await.unwrap();
+    let (ok, body) = raw(&socket, "GET", &format!("/containers/{name}/json"), None);
+    assert!(ok, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(created["Config"]["Cmd"], serde_json::json!(["-v"]));
+
+    client.container_start(&name).await.unwrap();
+    let deadline = tokio::time::Instant::now() + STEP;
+    let state = loop {
+        let (ok, body) = raw(&socket, "GET", &format!("/containers/{name}/json"), None);
+        assert!(ok, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let status = v["State"]["Status"].as_str().unwrap_or_default();
+        if status == "exited" || status == "stopped" {
+            break v["State"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "container still {status} (no argument reached it?)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(state["ExitCode"], 0, "{state}");
 }

@@ -94,6 +94,10 @@ impl Version {
 pub(crate) struct CreateContainer<'a> {
     name: &'a str,
     image: &'a str,
+    /// `SpecGenerator.command` → OCI `Cmd`: arguments to the image's entrypoint, not an entrypoint
+    /// override (issue #79). Omitted keeps the image's own `CMD`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command: &'a Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     labels: &'a BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -318,6 +322,7 @@ impl<'a> CreateContainer<'a> {
         Self {
             name: &spec.name,
             image: &spec.image,
+            command: &spec.command,
             labels: &spec.labels,
             env: &spec.env,
             restart_policy: match spec.restart {
@@ -947,6 +952,7 @@ mod tests {
         let spec = ContainerSpec {
             name: "ntfy-1".into(),
             image: "ghcr.io/jpalczewski/ntfy.zig@sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+            command: vec![],
             labels: BTreeMap::from([("weglarka.instance".into(), "ntfy".into())]),
             env: BTreeMap::from([("CONFIG_FILE".into(), "/config.json".into())]),
             networks: vec!["net-ntfy".into()],
@@ -973,11 +979,37 @@ mod tests {
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
 
+    /// `command` is `SpecGenerator.command` (the OCI `Cmd`, arguments to the image's entrypoint);
+    /// omitted when empty, so an app without it sends the same body as before (issue #79).
+    #[test]
+    fn create_container_command_arguments() {
+        let spec = ContainerSpec {
+            name: "ntfy".into(),
+            image: "docker.io/binwiederhier/ntfy:latest".into(),
+            command: vec!["serve".into(), "--no-log".into()],
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: true,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+            security: Default::default(),
+        };
+        insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
     #[test]
     fn security_maps_to_libpod_fields_and_is_omitted_when_unset() {
         let mut spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1000,6 +1032,7 @@ mod tests {
             "cap_add",
             "no_new_privileges",
             "mounts",
+            "command",
         ] {
             assert!(plain.get(key).is_none(), "{key} omitted when unset");
         }
@@ -1025,6 +1058,7 @@ mod tests {
         let spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1060,6 +1094,7 @@ mod tests {
         let spec = ContainerSpec {
             name: "pogoda".into(),
             image: "i".into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1098,6 +1133,7 @@ mod tests {
         let spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1141,6 +1177,7 @@ mod tests {
         let spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],

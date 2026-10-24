@@ -1,6 +1,6 @@
-//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes, hardening, ports
-//! published directly on the host and start dependencies. Before these existed, they could only be
-//! set through `--spec <file.toml>`.
+//! Spec flags shared by `apps add` and `apps update`: the container command, resource limits,
+//! volumes, hardening, ports published directly on the host and start dependencies. Before these
+//! existed, they could only be set through `--spec <file.toml>`.
 
 use clap::Args;
 use weglarka_core::app::{
@@ -30,10 +30,15 @@ pub enum DependsOnFlag {
     Clear,
 }
 
-/// Limits, volumes, hardening, host ports and start dependencies; flattened into `AddArgs` and
-/// `UpdateArgs`.
+/// Spec flags shared by `apps add` and `apps update`; flattened into `AddArgs` and `UpdateArgs`.
 #[derive(Debug, Default, Args)]
 pub struct SpecFlags {
+    /// Argument to the image's entrypoint (exec form, repeatable — one flag per argument; `none`
+    /// clears it). Replaces the whole command: the argument order is significant, so unlike
+    /// --tmpfs it does not append. Images with only an ENTRYPOINT need it, e.g. `--command serve`.
+    /// Use `--command=<arg>` for arguments that start with a dash.
+    #[arg(long = "command", value_name = "ARG|none", conflicts_with = "spec")]
+    pub command: Vec<String>,
     /// Memory limit, e.g. 128m or 1g (`none` removes it). Default: no limit.
     #[arg(long, value_name = "SIZE|none", value_parser = parse_memory, conflicts_with = "spec")]
     pub memory: Option<Limit<MemoryLimit>>,
@@ -80,7 +85,8 @@ pub struct SpecFlags {
 
 impl SpecFlags {
     pub fn is_empty(&self) -> bool {
-        self.memory.is_none()
+        self.command.is_empty()
+            && self.memory.is_none()
             && self.pids_limit.is_none()
             && self.cpus.is_none()
             && self.volumes.is_empty()
@@ -97,6 +103,16 @@ impl SpecFlags {
 
     /// Applies the flags to `spec`; everything not mentioned is kept.
     pub fn apply(&self, spec: &mut AppSpec) {
+        // The command is an ordered argv, so --command replaces it as a whole instead of appending
+        // (unlike the set-like --tmpfs/--cap-* lists); `none` drops it back to the image's own CMD.
+        if !self.command.is_empty() {
+            spec.command = self
+                .command
+                .iter()
+                .filter(|arg| !arg.eq_ignore_ascii_case("none"))
+                .cloned()
+                .collect();
+        }
         let r = &mut spec.resources;
         apply(&mut r.memory, &self.memory);
         apply(&mut r.pids_limit, &self.pids_limit);
@@ -342,6 +358,33 @@ mod tests {
         assert!(matches!(parse_memory("128m").unwrap(), Limit::Set(m) if m.bytes() == 128 << 20));
         assert!(parse_memory("lots").is_err());
         assert!(matches!(parse_cpus("0.5").unwrap(), Limit::Set(c) if c.millis() == 500));
+    }
+
+    #[test]
+    fn apply_replaces_and_clears_the_command() {
+        let mut spec: AppSpec = toml::from_str("image = \"i\"\ncommand = [\"serve\"]\n").unwrap();
+        let flags = SpecFlags {
+            command: vec!["serve".into(), "--no-log".into()],
+            ..SpecFlags::default()
+        };
+        assert!(!flags.is_empty(), "the flag counts as an edit");
+        flags.apply(&mut spec);
+        assert_eq!(
+            spec.command,
+            ["serve", "--no-log"],
+            "replaced as a whole, not appended to the existing command"
+        );
+
+        SpecFlags {
+            command: vec!["none".into()],
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert!(spec.command.is_empty(), "none restores the image's own CMD");
+
+        // Not giving the flag keeps the spec untouched.
+        SpecFlags::default().apply(&mut spec);
+        assert!(spec.command.is_empty());
     }
 
     #[test]

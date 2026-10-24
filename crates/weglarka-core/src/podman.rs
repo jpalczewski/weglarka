@@ -113,6 +113,9 @@ pub struct ContainerSpec {
     pub name: String,
     /// Image reference or digest (`repo@sha256:…`) — reconcile pins the digest.
     pub image: String,
+    /// Arguments to the image's entrypoint (`Cmd`); empty keeps the image's own `CMD` and this never
+    /// overrides the entrypoint (issue #79).
+    pub command: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     /// Networks the container joins on creation (first = primary).
@@ -390,6 +393,7 @@ mod fake_tests {
         ContainerSpec {
             name: name.into(),
             image: image.into(),
+            command: vec![],
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],

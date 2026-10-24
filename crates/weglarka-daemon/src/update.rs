@@ -6,8 +6,8 @@
 //!
 //! * `domains` and the health-gate settings are not part of the `spec-hash`: only ingress is
 //!   re-rendered (nginx reload), the container is untouched;
-//! * `port`, `env`, `secrets`, `volumes`, `resources`, `health.command` change the `spec-hash`: the
-//!   next reconcile recreates the container from the *pinned* digest (no pull);
+//! * `port`, `env`, `secrets`, `volumes`, `resources`, `health.command`, `command` change the
+//!   `spec-hash`: the next reconcile recreates the container from the *pinned* digest (no pull);
 //! * `image` (repo or tag) is a deliberate re-pin: the update runs a deploy right away (pull, health
 //!   gate, rollback to the previous digest on failure) and the result is in the response.
 //! * `start` (run vs provision-only intent) is applied right away as well: `true` deploys (the usual
