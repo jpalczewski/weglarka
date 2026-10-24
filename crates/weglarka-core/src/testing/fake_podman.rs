@@ -73,6 +73,8 @@ struct State {
     pull_credentials: BTreeMap<String, RegistryAuth>,
     /// Credentials of every `image_pull_with` call, in order (`None` = anonymous).
     pull_auths: Vec<(String, Option<RegistryAuth>)>,
+    /// OCI labels the pulled image reports (`image_inspect`); empty when not scripted.
+    pull_labels: BTreeMap<String, BTreeMap<String, String>>,
     networks: BTreeMap<String, (NetworkSpec, Vec<String>)>,
     secrets: BTreeMap<String, Vec<u8>>,
     /// Volumes with the tar bytes last imported (the fake does not model file contents).
@@ -128,6 +130,18 @@ impl FakePodman {
             .insert(reference.to_owned(), digest);
     }
 
+    /// OCI labels the image pulled from `reference` reports through `image_inspect` (the self-update
+    /// reads `io.weglarka.state-schema` there).
+    pub fn set_pull_labels(&self, reference: &str, labels: &[(&str, &str)]) {
+        self.lock().pull_labels.insert(
+            reference.to_owned(),
+            labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        );
+    }
+
     /// Pulling this reference ends with an error mid-stream.
     pub fn fail_pull(&self, reference: &str, message: &str) {
         self.lock()
@@ -150,6 +164,32 @@ impl FakePodman {
 
     pub fn clear_pull_failure(&self, reference: &str) {
         self.lock().pull_failures.remove(reference);
+    }
+
+    /// Inserts a running container that Węglarka did not create and therefore does not label — the
+    /// daemon's own container, or anything an operator started by hand. Like Podman, the image (a
+    /// reference that was pulled first) has to exist.
+    pub fn add_foreign_container(&self, name: &str, reference: &str) {
+        let mut s = self.lock();
+        let Some(image) = s.images.get(reference).cloned() else {
+            panic!("pull {reference} before adding a container that runs it");
+        };
+        let id = s.next_id();
+        s.containers.insert(
+            name.to_owned(),
+            ContainerInfo {
+                id,
+                name: name.to_owned(),
+                image: reference.to_owned(),
+                image_id: image.id,
+                labels: BTreeMap::new(),
+                state: ContainerState::Running,
+                exit_code: None,
+                health: None,
+                networks: Vec::new(),
+                restarts: 0,
+            },
+        );
     }
 
     /// Successive `healthcheck_run`s / container health reads; the last element repeats forever.
@@ -551,6 +591,7 @@ impl PodmanClient for FakePodman {
                 repo_tags,
                 repo_digests,
                 size_bytes: DEFAULT_IMAGE_SIZE_BYTES,
+                labels: s.pull_labels.get(reference).cloned().unwrap_or_default(),
             };
             if !reference.contains('@') {
                 // A tag moves to the freshly pulled build: the previous holder loses that name and

@@ -1,4 +1,4 @@
-# 0027 — Host config mounts (`config_root`) and app reload
+# 0028 — Host config mounts (`config_root`) and app reload
 
 Status: proposed (2026-10-24, issue #118)
 

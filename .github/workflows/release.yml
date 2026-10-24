@@ -71,6 +71,25 @@ jobs:
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Podpis obrazu (keyless)
         run: cosign sign --yes "$IMAGE@${{ steps.build.outputs.digest }}"
+      # Second signature, with the long-lived key the daemon can verify offline (`cosign.pub` in the
+      # repository is the public half; the daemon embeds it). Keyless stays for humans. No Rekor
+      # upload: the verifier needs nothing but the key and the payload (docs/decisions/0024).
+      - name: Podpis obrazu kluczem statycznym (samoaktualizacja)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::COSIGN_PRIVATE_KEY is not set — a release must be verifiable by the self-updater"
+              exit 1
+            fi
+            echo "::warning::COSIGN_PRIVATE_KEY is not set — the image is not signed with the static key, self-update will refuse it"
+            exit 0
+          fi
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY --tlog-upload=false \
+            "$IMAGE@${{ steps.build.outputs.digest }}"
       - name: SBOM (SPDX) jako atestacja cosign
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:

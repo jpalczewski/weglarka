@@ -13,6 +13,8 @@ pub mod labels;
 pub mod platform;
 pub mod podman;
 pub mod secret_store;
+/// Self-update bookkeeping shared by the daemon and the host-side switcher (issue #99).
+pub mod self_update;
 pub mod shared_volumes;
 pub mod state;
 pub mod uid_range;

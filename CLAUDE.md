@@ -95,17 +95,18 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `cli → api, core`;
-`daemon → wszystko`.
+Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `registry → core`;
+`cli → api, core`; `daemon → wszystko`.
 
 | Crate | Zawartość |
 |---|---|
-| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
+| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), stan samoaktualizacji (`self_update.rs`: plik stanu + czyste `decide()`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
 | `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
 | `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
+| `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); własny minimalny klient HTTP/TLS, `FakeRegistry`/`TestSigner` (feature `testing`) |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
-| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet), worker powiadomień |
+| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet + timer samoaktualizacji), worker powiadomień, host-side `self-update` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
 
 Przy pracy równoległej kilku agentów: jeden crate/obszar na agenta, a zmiany w kontrakcie (`app.rs`, `podman.rs`,
@@ -122,8 +123,9 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
 | wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
-| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0027) |
+| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0028) |
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
+| samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timer, `install_user_units`, `restart_service`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
 | powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
@@ -161,7 +163,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
   rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
-- **Configi z hosta (ADR 0027):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
+- **Configi z hosta (ADR 0028):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
   demona w `platform install` — po upgrade trzeba go przeinstalować), `configs = [{ source, target }]` w spec
   apki (source względny do rootu, walidacja składniowa w `validate_app`; start i zapis sprawdzają tylko sam
   `config_root`, a canonicalize/containment źródła — reconcile i moment tworzenia kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
@@ -171,8 +173,8 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `SCHEMA_STEPS`, ADR 0023) → przed downgradem usunąć `config_root`, `configs`, `reload_signal` i marker
   `schema_version` (albo przywrócić pliki z kopii). Pliki runtime usera
   widoczne w zakresie UID apki jako `nobody` → 0644/0755. Szczegóły:
-  [`docs/decisions/0027-config-root-mounts.md`](docs/decisions/0027-config-root-mounts.md) i
-  [`docs/install.md` 6k](docs/install.md#6k-configi-z-hosta-config_root-i-apps-reload).
+  [`docs/decisions/0028-config-root-mounts.md`](docs/decisions/0028-config-root-mounts.md) i
+  [`docs/install.md` 6l](docs/install.md#6l-configi-z-hosta-config_root-i-apps-reload).
 - **Detekcja awarii (ADR 0022):** watcher crash loopów działa w przejściu reconcile — `container_list` już
   robi inspect każdego kontenera, więc licznik restartów (`RestartCount` → `ContainerInfo.restarts`) nie
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
@@ -188,6 +190,15 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   [`docs/install.md` 6j](docs/install.md#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
+- **Samoaktualizacja (ADR 0027):** demon siedzi w kontenerze `scratch` (brak `systemctl`, `/etc/passwd`,
+  D-Bus) i nie ma prawa zapisu do własnego unitu, więc podmiana obrazu jest **host-side**:
+  `weglarka-daemon self-update` + timer usera instalowany przez `platform install`. Kolejność: pull →
+  weryfikacja podpisu (statyczny klucz cosign z `cosign.pub` w repo, `ring`, bez Rekor/TUF) → bramka
+  schematu (label obrazu `io.weglarka.state-schema` kontra `schema_version` w `state.toml`) → pin
+  `repo@sha256:…` w quadlecie → `pending` w `<state dir>/self-update.toml` (tolerancyjny, 0600) →
+  restart; demon potwierdza na starcie i ustawia `current`/`previous`. Rejestr jest tylko publiczny
+  (anonimowy token GHCR), a `[self_update]` w `weglarka.toml` łamie rollback do starszego demona;
+  automatyczny powrót to #100, dziś ręczny `self-update --rollback`.
 
 ## Testy
 

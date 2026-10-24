@@ -60,7 +60,10 @@ fn instance_of(event: &Event) -> Option<&InstanceName> {
         | Event::CrashLooping { instance, .. }
         | Event::Unhealthy { instance }
         | Event::Recovered { instance } => Some(instance),
-        Event::Pruned { .. } | Event::WebhookDuplicate { .. } => None,
+        Event::Pruned { .. }
+        | Event::WebhookDuplicate { .. }
+        | Event::SelfUpdated { .. }
+        | Event::SelfUpdatePending { .. } => None,
     }
 }
 
@@ -191,6 +194,27 @@ pub fn build(event: &Event) -> Message {
             format!("running again: {instance}"),
             "no new restarts and the healthcheck passes".to_owned(),
             tag("white_check_mark"),
+        ),
+        // The two events below concern Węglarka itself, not an app: no click-through link.
+        Event::SelfUpdated { from, to } => (
+            "self-update:daemon".to_owned(),
+            "Węglarka updated".to_owned(),
+            match from {
+                Some(from) => format!("{} → {}", short(from), short(to)),
+                None => short(to).to_owned(),
+            },
+            tag("arrow_up"),
+        ),
+        Event::SelfUpdatePending { expected, actual } => (
+            "self-update:daemon".to_owned(),
+            "Węglarka self-update did not take effect".to_owned(),
+            format!(
+                "pinned {} but the container runs {}; \
+                 `weglarka-daemon self-update --rollback` returns to the previous image",
+                short(expected),
+                short(actual)
+            ),
+            tag("warning"),
         ),
     };
     Message {
@@ -363,6 +387,27 @@ image = "ghcr.io/x/worker:1"
                 },
                 Severity::Info,
             ),
+            (
+                Event::SelfUpdated {
+                    from: Some(digest('a')),
+                    to: digest('d'),
+                },
+                Severity::Info,
+            ),
+            (
+                Event::SelfUpdated {
+                    from: None,
+                    to: digest('d'),
+                },
+                Severity::Info,
+            ),
+            (
+                Event::SelfUpdatePending {
+                    expected: digest('d'),
+                    actual: digest('a'),
+                },
+                Severity::Warning,
+            ),
         ]
     }
 
@@ -385,8 +430,9 @@ image = "ghcr.io/x/worker:1"
         for (message, severity) in rendered {
             assert_eq!(message.severity, severity, "{message:?}");
             assert_eq!(message.priority, priority(severity), "{message:?}");
-            let has_instance =
-                !message.key.starts_with("pruned:") && !message.key.starts_with("webhook-dup:");
+            let has_instance = !message.key.starts_with("pruned:")
+                && !message.key.starts_with("webhook-dup:")
+                && !message.key.starts_with("self-update:");
             if has_instance {
                 assert_eq!(
                     message.click.as_deref(),

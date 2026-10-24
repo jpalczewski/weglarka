@@ -13,6 +13,10 @@ pub mod health_probe;
 pub mod images;
 pub mod ingress;
 pub mod platform;
+/// Host-side switcher of Węglarka's own image (issue #99, `docs/decisions/0027`).
+pub mod self_update;
+/// The service description shared by `platform install` and the switcher.
+pub mod service;
 pub mod settings;
 pub mod shared_volumes;
 pub mod update;
@@ -56,7 +60,7 @@ pub enum StartError {
     SharedVolumes(String),
     /// The startup preconditions of host config mounts are not met: `config_root` is configured but
     /// unusable, or an app declares `configs` while it is unset (issue #118,
-    /// `docs/decisions/0027-config-root-mounts.md`). A single missing/escaping source is *not* a
+    /// `docs/decisions/0028-config-root-mounts.md`). A single missing/escaping source is *not* a
     /// startup error — the engine refuses to mount it and `doctor` reports it.
     #[error("config mounts: {0}")]
     Configs(#[from] ConfigError),
@@ -67,6 +71,9 @@ pub enum StartError {
     /// `[webhook.forgejo]` is present but unusable.
     #[error("{0}")]
     Webhook(String),
+    /// `[self_update]` cannot work (a digest instead of a tag, an interval that is too short…).
+    #[error("[self_update] {0}")]
+    SelfUpdateConfig(String),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -160,6 +167,13 @@ pub async fn start<P: PodmanClient + 'static>(
     // Corrupt TOMLs surface immediately rather than at the first reconcile.
     let apps = state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
+    // Self-update (issue #99): `[self_update]` must be valid even inside the container, so a typo
+    // stops the daemon instead of silently never updating it.
+    if let Some(self_update) = &host.self_update {
+        self_update
+            .validate()
+            .map_err(StartError::SelfUpdateConfig)?;
+    }
     // Host-wide `host_ports` rules (privileged ports, two apps on one socket, the ingress bind)
     // stop the daemon instead of failing at container start (`docs/decisions/0013-host-ports.md`).
     weglarka_core::host_ports::validate(&host, &apps)?;
@@ -179,6 +193,15 @@ pub async fn start<P: PodmanClient + 'static>(
         paths.notifications.clone(),
     )?;
     let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
+    // Self-update (issue #99): confirm which image this process really runs and resolve a switch the
+    // host-side switcher requested, before anything reconciles against the old world.
+    {
+        let events: Arc<dyn weglarka_core::events::EventSink> = match &notifier {
+            Some(notifier) => notifier.sink(),
+            None => Arc::new(weglarka_core::events::TracingSink),
+        };
+        self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
+    }
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
     let options = ReconcilerOptions {

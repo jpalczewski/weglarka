@@ -63,9 +63,94 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     shared_volume_state(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
+    self_update(d, &mut checks);
     ingress(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }
+}
+
+/// Self-update (issue #99): configured or not, the digest the switcher pinned, and whether the
+/// checks still run — a configured `[self_update]` with no recent check means the timer is missing.
+fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Some(config) = d.host.self_update.as_ref() else {
+        out.push(ok(
+            "self_update",
+            "off ([self_update] absent): no automatic update of Węglarka",
+        ));
+        return;
+    };
+    if !config.enabled {
+        out.push(ok("self_update", "paused by [self_update] enabled = false"));
+        return;
+    }
+    let state_path = weglarka_core::self_update::path(&d.paths.state_dir);
+    let state = match weglarka_core::self_update::load(&d.paths.state_dir) {
+        Ok(state) => state,
+        Err(e) => {
+            out.push(check(
+                "self_update",
+                CheckStatus::Warn,
+                e.to_string(),
+                Some("the switcher will not run until the file is valid or removed"),
+            ));
+            return;
+        }
+    };
+    let mut parts = Vec::new();
+    match &state.current {
+        Some(digest) => parts.push(format!("running {}", short(digest))),
+        None => parts.push("running digest unknown".to_owned()),
+    }
+    match &state.previous {
+        Some(digest) => parts.push(format!("previous {} (--rollback)", short(digest))),
+        None => parts.push("no previous image yet".to_owned()),
+    }
+    let now = weglarka_core::self_update::secs(std::time::SystemTime::now());
+    if let Some(pending) = &state.pending {
+        let age = state.pending_at.map_or(0, |at| now.saturating_sub(at));
+        parts.push(format!("pending {} for {age}s", short(pending)));
+    }
+    if let Some(error) = &state.error {
+        let age = now.saturating_sub(error.at);
+        parts.push(format!("last attempt failed {age}s ago: {}", error.message));
+    }
+    let stale_after = config.interval_secs.saturating_mul(3);
+    let stale = state
+        .checked_at
+        .is_none_or(|at| now.saturating_sub(at) > stale_after);
+    let (status, hint) = if state.error.is_some() {
+        (
+            CheckStatus::Warn,
+            Some("see the state file and the journal of weglarka-self-update.service"),
+        )
+    } else if state.pending.is_some() {
+        (
+            CheckStatus::Warn,
+            Some(
+                "the pinned image did not take effect; `weglarka-daemon self-update --rollback` returns to the previous one",
+            ),
+        )
+    } else if stale {
+        (
+            CheckStatus::Warn,
+            Some(
+                "the switcher has not run recently — is weglarka-self-update.timer enabled? (re-run `platform install`)",
+            ),
+        )
+    } else {
+        (CheckStatus::Ok, None)
+    };
+    out.push(check(
+        "self_update",
+        status,
+        format!("{} ({})", parts.join("; "), state_path.display()),
+        hint,
+    ));
+}
+
+/// First 12 hex digits of a digest, for a readable check.
+fn short(digest: &weglarka_core::app::Digest) -> &str {
+    &digest.as_str()[7..19]
 }
 
 async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

@@ -60,7 +60,7 @@ pub enum EngineError {
     #[error("{0}")]
     Volume(String),
     /// An app's config mounts cannot be mounted (no `config_root`, a missing source, an escape…;
-    /// issue #118, `docs/decisions/0027-config-root-mounts.md`).
+    /// issue #118, `docs/decisions/0028-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
@@ -621,7 +621,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
-                // stays as it is until the operator fixes the root or the file (ADR 0027).
+                // stays as it is until the operator fixes the root or the file (ADR 0028).
                 blocked = true;
                 report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {

@@ -22,10 +22,12 @@ weglarka-core = { path = "crates/weglarka-core", version = "0.0.1" }
 weglarka-podman = { path = "crates/weglarka-podman", version = "0.0.1" }
 weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0.1" }
 weglarka-notify = { path = "crates/weglarka-notify", version = "0.0.1" }
+weglarka-registry = { path = "crates/weglarka-registry", version = "0.0.1" }
 
 # external
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 futures-core = "0.3"
@@ -39,6 +41,9 @@ insta = { version = "1", features = ["json"] }
 # TLS for outbound notifications: `ring` (no C toolchain beyond `cc`, no OpenSSL) and bundled roots,
 # because the daemon image is `scratch` and has no CA store (docs/decisions/0021).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Signature verification of the self-update image (ECDSA P-256, docs/decisions/0024) — the same provider
+# rustls uses, so pinning it directly adds no crypto implementation to the binary.
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

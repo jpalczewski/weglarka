@@ -1,4 +1,4 @@
-//! Host config mounts (`configs`, issue #118, `docs/decisions/0027-config-root-mounts.md`).
+//! Host config mounts (`configs`, issue #118, `docs/decisions/0028-config-root-mounts.md`).
 //!
 //! There is one `config_root` in `weglarka.toml` and one rule for everything below it: the source is
 //! resolved (symlinks included), must stay inside the **canonical** root and must be a regular file

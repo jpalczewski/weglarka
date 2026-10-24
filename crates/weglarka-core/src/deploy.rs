@@ -334,7 +334,7 @@ impl<P: PodmanClient> Reconciler<P> {
     > {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
-        // ADR 0027). The resolved canonical paths are what `launch` mounts.
+        // ADR 0028). The resolved canonical paths are what `launch` mounts.
         let configs = crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             .map_err(|e| EngineError::Configs(e.to_string()))?;
         self.podman
@@ -411,7 +411,7 @@ impl<P: PodmanClient> Reconciler<P> {
             restart: RestartPolicy::Always,
             userns_auto: true,
             // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
-            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0027).
+            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
             mounts: configs
                 .iter()
                 .map(|c| BindMount {

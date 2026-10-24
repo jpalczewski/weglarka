@@ -1714,7 +1714,7 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
-// ── config_root mounts and reload (issue #118, ADR 0027) ────────────────────────
+// ── config_root mounts and reload (issue #118, ADR 0028) ────────────────────────
 
 /// App with two config mounts (a file and a directory) and a signal-based reload.
 const WITH_CONFIGS: &str = r#"

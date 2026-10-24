@@ -20,7 +20,7 @@ pub struct HostConfig {
     #[serde(default)]
     pub state: StateConfig,
     /// Host directory with the app config files/directories that `apps.toml`'s `configs` mount
-    /// (issue #118, `docs/decisions/0027-config-root-mounts.md`). Absolute, or relative to the
+    /// (issue #118, `docs/decisions/0028-config-root-mounts.md`). Absolute, or relative to the
     /// directory of `weglarka.toml` (the caller resolves it, like `[state] dir`). Unset = the
     /// feature is off: an app that declares `configs` is then an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +31,9 @@ pub struct HostConfig {
     /// Failure detection (crash loops, failing healthchecks); defaults apply when absent.
     #[serde(default)]
     pub monitor: MonitorConfig,
+    /// Automatic update of Węglarka's own image; absent = off (issue #99, `docs/decisions/0027`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<SelfUpdateConfig>,
 }
 
 impl HostConfig {
@@ -154,7 +157,7 @@ pub struct WebhookConfig {
 
 /// Forgejo's `package` payload names the owner and the package but not the registry host, and
 /// a host taken from a payload would let a signed event point a pull at another registry — so the
-/// host comes from here (docs/decisions/0025).
+/// host comes from here (docs/decisions/0026).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgejoWebhookConfig {
@@ -270,6 +273,83 @@ impl MonitorConfig {
 
     fn default_unhealthy_observations() -> u32 {
         2
+    }
+}
+
+/// `[self_update]`: Węglarka keeps its own image up to date (issue #99, `docs/decisions/0027`).
+///
+/// The section is read by the **host-side** switcher (`weglarka-daemon self-update`): the container has
+/// no `systemctl` and no write access to its own service definition, so it cannot replace itself. The
+/// daemon only reads the section for `doctor` (is the switcher configured, has it run recently).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfUpdateConfig {
+    /// Image reference to follow, e.g. `ghcr.io/jpalczewski/weglarka:latest`. Must be a tag — the
+    /// switcher resolves the digest and pins it in the service definition, so a digest here would
+    /// never move again.
+    pub image: String,
+    /// `false` pauses the checks without removing the section.
+    #[serde(default = "SelfUpdateConfig::default_enabled")]
+    pub enabled: bool,
+    /// Minimum time between two checks (seconds). The timer wakes the switcher more often; until this
+    /// interval has passed it returns without touching the network.
+    #[serde(default = "SelfUpdateConfig::default_interval_secs")]
+    pub interval_secs: u64,
+    /// PEM public key overriding the one embedded in the binary (`cosign.pub`) — for rotating the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_file: Option<PathBuf>,
+}
+
+impl SelfUpdateConfig {
+    /// Checks run at most hourly by default.
+    pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
+    /// A shorter interval would hammer the registry; reject it instead of silently clamping.
+    pub const MIN_INTERVAL_SECS: u64 = 300;
+
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_interval_secs() -> u64 {
+        Self::DEFAULT_INTERVAL_SECS
+    }
+
+    /// Rejects a configuration that cannot work. Called at startup (inside the container) and by the
+    /// switcher (on the host), so a typo stops Węglarka instead of silently never updating it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.image.is_empty() {
+            return Err("[self_update] image is empty".to_owned());
+        }
+        if self.image.contains('@') {
+            return Err(format!(
+                "[self_update] image {:?} is a digest reference: give the tag to follow, the switcher \
+                 pins the digest itself",
+                self.image
+            ));
+        }
+        // The tag is the part after the last '/' of the last segment (`localhost:5000/app:1`).
+        let last_segment = self.image.rsplit('/').next().unwrap_or_default();
+        if !last_segment.contains(':') {
+            return Err(format!(
+                "[self_update] image {:?} has no tag (expected e.g. ghcr.io/owner/weglarka:latest)",
+                self.image
+            ));
+        }
+        if self.interval_secs < Self::MIN_INTERVAL_SECS {
+            return Err(format!(
+                "[self_update] interval_secs must be at least {} (got {})",
+                Self::MIN_INTERVAL_SECS,
+                self.interval_secs
+            ));
+        }
+        if self
+            .public_key_file
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("[self_update] public_key_file is empty".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -532,5 +612,71 @@ kind = "systemd"
         assert_eq!(monitor.crash_loop_restarts, 3);
         assert_eq!(monitor.crash_loop_window_secs, 600);
         assert_eq!(monitor.unhealthy_observations, 2);
+    }
+
+    #[test]
+    fn self_update_section_is_off_by_default_and_parses_with_defaults() {
+        let cfg = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(cfg.self_update.is_none());
+        assert!(!toml::to_string(&cfg).unwrap().contains("self_update"));
+
+        let src =
+            format!("{SAMPLE}\n[self_update]\nimage = \"ghcr.io/jpalczewski/weglarka:latest\"\n");
+        let su = HostConfig::from_toml_str(&src)
+            .unwrap()
+            .self_update
+            .unwrap();
+        assert!(
+            su.enabled,
+            "the section is the opt-in, so it starts enabled"
+        );
+        assert_eq!(su.interval_secs, SelfUpdateConfig::DEFAULT_INTERVAL_SECS);
+        assert_eq!(su.public_key_file, None);
+        su.validate().unwrap();
+    }
+
+    #[test]
+    fn self_update_rejects_unknown_fields_and_unusable_images() {
+        let bad =
+            format!("{SAMPLE}\n[self_update]\nimage = \"ghcr.io/o/w:latest\"\nbogus = true\n");
+        assert!(HostConfig::from_toml_str(&bad).is_err(), "unknown field");
+
+        for (image, why) in [
+            ("ghcr.io/o/w", "no tag"),
+            ("ghcr.io/o/w@sha256:abc", "digest reference"),
+            ("", "empty"),
+        ] {
+            let src = format!("{SAMPLE}\n[self_update]\nimage = \"{image}\"\n");
+            let err = HostConfig::from_toml_str(&src)
+                .unwrap()
+                .self_update
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(why), "{image:?}: {err}");
+        }
+
+        let src =
+            format!("{SAMPLE}\n[self_update]\nimage = \"ghcr.io/o/w:latest\"\ninterval_secs = 5\n");
+        assert!(
+            HostConfig::from_toml_str(&src)
+                .unwrap()
+                .self_update
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_self_update_example_parses() {
+        // `docs/examples/self-update.toml` is a `weglarka.toml` excerpt: keep it valid.
+        let example = include_str!("../../../docs/examples/self-update.toml");
+        let su = HostConfig::from_toml_str(&format!("{SAMPLE}\n{example}"))
+            .unwrap()
+            .self_update
+            .unwrap();
+        assert!(su.enabled);
+        su.validate().unwrap();
     }
 }

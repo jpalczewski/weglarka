@@ -298,6 +298,9 @@ pub struct ImageInfo {
     /// Uncompressed size as reported by libpod; `0` when it does not report one. Feeds the
     /// reclaimed-space estimate, which counts shared layers per image (an upper bound).
     pub size_bytes: u64,
+    /// OCI labels of the image. The self-update reads `io.weglarka.state-schema` here before it
+    /// replaces the daemon image (docs/decisions/0023); `image_list` does not fill this in.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
