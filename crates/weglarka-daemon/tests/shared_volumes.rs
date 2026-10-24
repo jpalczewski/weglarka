@@ -1,4 +1,4 @@
-//! Shared-volume API (issue #33, `docs/decisions/0015-shared-volumes.md`) on `FakePodman`, over the
+//! Shared-volume API (issue #33, `docs/decisions/0017-shared-volumes.md`) on `FakePodman`, over the
 //! real admin socket: declarations (`/v1/volumes`), member mounts, the purge/range-change guards and
 //! import/export through the app's volume endpoints.
 

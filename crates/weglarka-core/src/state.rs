@@ -78,7 +78,7 @@ pub struct StateFile {
     /// instances, it must not stay on libpod's default map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_uid_range: Option<UidRange>,
-    /// Shared volumes between instances (issue #33, docs/decisions/0015): the uid/gid range belongs
+    /// Shared volumes between instances (issue #33, docs/decisions/0017): the uid/gid range belongs
     /// to the volume, not to an instance, and members run in it. `None` until a member is deployed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeState>,
@@ -249,7 +249,7 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
     if spec.shared_volumes.len() > 1 {
         return Err(format!(
             "{name}: at most one shared volume per app (a shared volume is a uid-range boundary; \
-             see docs/decisions/0015-shared-volumes.md)"
+             see docs/decisions/0017-shared-volumes.md)"
         ));
     }
     for v in &spec.shared_volumes {

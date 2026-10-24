@@ -289,7 +289,7 @@ impl fmt::Display for SharedVolumeName {
 }
 
 /// Declaration of a volume shared between instances (issue #33,
-/// `docs/decisions/0015-shared-volumes.md`). It has no options yet: the declaration itself is the
+/// `docs/decisions/0017-shared-volumes.md`). It has no options yet: the declaration itself is the
 /// guard against typos in `AppSpec::shared_volumes` (an undeclared name is rejected) and the place
 /// where per-volume options (backups, range size) will live. Strict, like every persisted type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,7 +513,7 @@ pub struct AppSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeMount>,
     /// Mounts of shared volumes declared in `AppsFile::shared_volumes` (issue #33,
-    /// `docs/decisions/0015-shared-volumes.md`). Not part of the instance's own data: the container
+    /// `docs/decisions/0017-shared-volumes.md`). Not part of the instance's own data: the container
     /// runs in the shared volume's uid range, and at most one is allowed per app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_volumes: Vec<SharedVolumeRef>,
@@ -556,7 +556,7 @@ fn is_true(value: &bool) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppsFile {
-    /// Volumes shared between instances (issue #33, `docs/decisions/0015-shared-volumes.md`),
+    /// Volumes shared between instances (issue #33, `docs/decisions/0017-shared-volumes.md`),
     /// declared once here and mounted by apps through [`AppSpec::shared_volumes`]. Serialized
     /// before `apps` so the TOML file keeps its top-level tables first.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

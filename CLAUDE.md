@@ -5,7 +5,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0016).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0017).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -86,7 +86,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | pętla reconcile | `core/src/reconcile.rs` — czyste `plan()` (`Target`/`Action`) + `execute()` (jedyny pisarz stanu) |
 | deploy | `core/src/deploy.rs` — `deploy_locked`: pull → stop → create+start → bramka → rollback; `provision_locked` |
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
-| wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0015) |
+| wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
@@ -105,12 +105,12 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 - **Ingress:** każda zmiana generatorów przechodzi snapshoty, `nginx -t`, test nagłówków `X-Forwarded-*`
   (`.github/scripts/test-forwarded-headers.sh`) i `scripts/acceptance.sh`. Pamiętaj o obu entrypointach (http i https).
 - **Import danych SQLite:** WAL — `volumes import --replace`, weryfikacja razem z `-wal`/`-shm`; kopia przez `.backup`.
-- **Wolumen współdzielony (ADR 0015):** deklaracja `[shared_volumes.<nazwa>]` w `apps.toml`, montaż przez
+- **Wolumen współdzielony (ADR 0017):** deklaracja `[shared_volumes.<nazwa>]` w `apps.toml`, montaż przez
   `shared_volumes = [...]` w spec apki; wolumen posiada **jeden zakres UID** dla wszystkich członków, a jego
   `wg-shared-<nazwa>` ma label `weglarka.shared-volume` i nigdy `weglarka.instance`. `apps remove
   --purge-volumes` członka przy innych członkach = 409 (nic nie usuwane), import wymaga zatrzymanych
   członków, a zmiana zakresu przy istniejących prywatnych danych jest odrzucana (`RangeChangeWithData`).
-  Szczegóły: `docs/decisions/0015-shared-volumes.md` i `docs/install.md` §6a.
+  Szczegóły: `docs/decisions/0017-shared-volumes.md` i `docs/install.md` §6a.
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 

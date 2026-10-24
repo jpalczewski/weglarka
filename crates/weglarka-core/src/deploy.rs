@@ -281,7 +281,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // A changed uid range would make the instance's existing files unreadable
-        // (docs/decisions/0015-shared-volumes.md): refuse before creating volumes or touching the
+        // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
         // old container. The range was assigned by the caller, so `state.toml` already has it.
         let new_label = crate::volumes::effective_range_label(
             &state::load_state(&self.paths.state)?,

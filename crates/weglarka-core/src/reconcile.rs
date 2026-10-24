@@ -89,7 +89,7 @@ pub enum EngineError {
     /// Unknown shared volume declaration.
     #[error("unknown shared volume: {0}")]
     UnknownSharedVolume(crate::app::SharedVolumeName),
-    /// Changing the instance's uid range would make its existing files unreadable (docs/decisions/0015).
+    /// Changing the instance's uid range would make its existing files unreadable (docs/decisions/0017).
     #[error(
         "cannot change the uid range of {instance} from {from} to {to}: it already has volume data; \
          export the data and import it in the new range first"

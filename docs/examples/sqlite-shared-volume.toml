@@ -1,5 +1,5 @@
 # Shared volume between several apps: one SQLite database, one Podman volume, one uid/gid range
-# (issue #33, docs/decisions/0015-shared-volumes.md).
+# (issue #33, docs/decisions/0017-shared-volumes.md).
 #
 # This is an excerpt of `apps.toml`, not an app spec for `--spec`: the volume is declared in a
 # top-level section and an app mounts it by name. Typical setup:

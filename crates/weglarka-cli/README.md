@@ -69,7 +69,7 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 - `volumes export <app> <volume>` / `volumes import <app> <volume>` — stream a tar to/from a file or
   stdin/stdout; a shared volume is resolved through a member app (the import helper runs in the
   group's uid range). An import into a shared volume is refused while another member runs.
-- Shared volumes (`docs/decisions/0015-shared-volumes.md`) own one uid range: `wg-shared-<name>`,
+- Shared volumes (`docs/decisions/0017-shared-volumes.md`) own one uid range: `wg-shared-<name>`,
   created on the first member's deploy. `apps add/update --shared-volume NAME=/PATH[:ro]` mounts
   one; `apps remove` keeps the data, while `apps remove --purge-volumes` on a member is refused
   (409) while other members exist.
