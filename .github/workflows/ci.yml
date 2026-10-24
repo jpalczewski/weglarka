@@ -269,7 +269,7 @@ jobs:
       - run: cargo test -p weglarka-podman -- --nocapture
       # Image smoke test (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
       # The image is assembled from the exact binaries the `musl` job built (docs/decisions/0008); no compilation here.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: musl-bin
           path: bin
