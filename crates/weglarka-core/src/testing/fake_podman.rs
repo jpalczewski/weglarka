@@ -13,7 +13,7 @@ use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
     ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent,
-    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -159,6 +159,21 @@ impl FakePodman {
         if let Some(c) = self.lock().containers.get_mut(name) {
             c.state = ContainerState::Exited;
             c.exit_code = Some(exit_code);
+        }
+    }
+
+    /// libpod's `RestartCount` seen by `container_inspect`/`container_list` (crash-loop detection).
+    pub fn set_restarts(&self, name: &str, restarts: u32) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.restarts = restarts;
+        }
+    }
+
+    /// Health status seen by `container_inspect`/`container_list`; `None` = the image has no healthcheck
+    /// (unlike `script_health`, which feeds the deploy health gate).
+    pub fn set_health(&self, name: &str, health: Option<HealthStatus>) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.health = health;
         }
     }
 
@@ -362,6 +377,7 @@ impl PodmanClient for FakePodman {
                 state: ContainerState::Created,
                 exit_code: None,
                 health,
+                restarts: 0,
                 networks: Vec::new(),
             },
         );
@@ -490,10 +506,7 @@ impl PodmanClient for FakePodman {
                     vec![reference.to_owned()],
                 )
             } else {
-                let repo = reference
-                    .rsplit_once(':')
-                    .map_or(reference, |(r, _)| r)
-                    .to_owned();
+                let repo = image_repo(reference);
                 let digest_name = format!("{repo}@{digest}");
                 (
                     vec![reference.to_owned()],

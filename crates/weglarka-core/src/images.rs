@@ -15,8 +15,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app::{AppsFile, Digest, InstanceName};
-use crate::deploy::{image_repo, normalize_image};
-use crate::podman::{ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError};
+use crate::deploy::normalize_image;
+use crate::podman::{
+    ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
+};
 use crate::reconcile::{EngineError, Reconciler};
 use crate::state::{self, StateFile};
 
@@ -322,6 +324,7 @@ mod tests {
             state: ContainerState::Running,
             exit_code: None,
             health: None,
+            restarts: 0,
             networks: Vec::new(),
         }
     }

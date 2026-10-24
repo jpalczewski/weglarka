@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::time::{MissedTickBehavior, interval_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::app::{AppSpec, AppsFile, Digest, InstanceName};
+use crate::crash;
 use crate::deploy::{DeliveryDedup, DeployOutcome};
 use crate::events::{Event, EventSink, TracingSink};
 use crate::hash::SpecHash;
@@ -48,7 +49,7 @@ pub enum EngineError {
     #[error("{0}")]
     Volume(String),
     /// An app's config mounts cannot be mounted (no `config_root`, a missing source, an escape…;
-    /// issue #118, `docs/decisions/0022-config-root-mounts.md`).
+    /// issue #118, `docs/decisions/0023-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
@@ -398,6 +399,10 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
     /// The instance being mutated right now (`None` when the engine is idle). See [`InFlight`].
     pub(crate) activity: std::sync::Mutex<Option<InFlight>>,
+    /// Crash-loop and health policy (`[monitor]`); [`crash::Policy::default`] unless overridden.
+    pub(crate) monitor: crash::Policy,
+    /// Per-instance observation state for that policy; in memory only, rebuilt after a restart.
+    pub(crate) watch: std::sync::Mutex<crash::Watcher>,
 }
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -417,11 +422,19 @@ impl<P: PodmanClient> Reconciler<P> {
             lock: tokio::sync::Mutex::new(()),
             dedup: std::sync::Mutex::new(DeliveryDedup::new(256)),
             activity: std::sync::Mutex::new(None),
+            monitor: crash::Policy::default(),
+            watch: std::sync::Mutex::new(crash::Watcher::default()),
         }
     }
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Crash-loop / unhealthy thresholds (from `[monitor]`); the default is the production policy.
+    pub fn with_monitor(mut self, policy: crash::Policy) -> Self {
+        self.monitor = policy;
         self
     }
 
@@ -499,6 +512,18 @@ impl<P: PodmanClient> Reconciler<P> {
             .filter(|c| c.labels.contains_key(labels::INSTANCE))
             .collect();
 
+        // Crash loops and failing healthchecks: observation only — the counter arrives with the list
+        // above, nothing is written and no extra libpod call is made (`docs/decisions/0022`). Emitted
+        // before the actions so the events describe the state this pass observed.
+        let watched = self
+            .watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(&observed, &apps, &self.monitor, Instant::now());
+        for event in watched {
+            self.events.emit(event);
+        }
+
         let mut report = ReconcileReport::default();
         let mut targets = Vec::with_capacity(apps.apps.len());
         let mut waiting_changed = false;
@@ -532,7 +557,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
-                // stays as it is until the operator fixes the root or the file (ADR 0022).
+                // stays as it is until the operator fixes the root or the file (ADR 0023).
                 blocked = true;
                 report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {
@@ -728,6 +753,7 @@ mod tests {
             state,
             exit_code: None,
             health: None,
+            restarts: 0,
             networks: vec![],
         }
     }

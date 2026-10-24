@@ -21,7 +21,7 @@ use crate::cli::{
     AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,
     PruneImagesArgs, RemoveArgs, SecretSetArgs, SecretsCommand,
 };
-use crate::client::{ApiClient, expand_path};
+use crate::client::{ApiClient, append_query, request_path};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
 use crate::preflight;
@@ -108,9 +108,16 @@ impl DryRun {
                 weglarka_api::Method::Put => "PUT",
                 weglarka_api::Method::Delete => "DELETE",
             },
-            path: expand_path(ep, params),
+            path: request_path(ep, params, ""),
             body,
         }
+    }
+
+    /// Adds the query string the request would send; it becomes part of the printed `path`, so
+    /// `--dry-run --json` shows exactly what would be sent. An empty query keeps the path as is.
+    pub(crate) fn with_query(mut self, query: &str) -> Self {
+        self.path = append_query(self.path, query);
+        self
     }
 
     pub(crate) fn print(&self, json: bool) {
@@ -218,7 +225,23 @@ struct Removed {
     existed: bool,
 }
 
-async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, CliError> {
+/// Query of the `apps remove` request: `--purge-volumes` is the only flag that travels as a query
+/// parameter, so the dry run and the real call take it from the same place.
+fn remove_query(purge_volumes: bool) -> &'static str {
+    if purge_volumes {
+        "purge_volumes=true"
+    } else {
+        ""
+    }
+}
+
+/// The request `apps remove --dry-run` shows; its endpoint, params and query match the real call.
+pub(crate) fn remove_dry_run(name: &str, purge_volumes: bool) -> DryRun {
+    let params = [("name", name)];
+    DryRun::new(endpoints::APPS_REMOVE, &params, None).with_query(remove_query(purge_volumes))
+}
+
+pub(crate) async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, CliError> {
     let name = instance(&a.name)?;
     let params = [("name", name.as_str())];
     let client = client(o)?;
@@ -231,16 +254,16 @@ async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, Cl
             Err(e) if e.kind == Kind::NotFound && a.ignore_missing => {}
             Err(e) => return Err(e),
         }
-        DryRun::new(endpoints::APPS_REMOVE, &params, None).print(json);
+        remove_dry_run(name.as_str(), a.purge_volumes).print(json);
         return Ok(exit::OK);
     }
-    let removal = if a.purge_volumes {
-        client
-            .call_empty_query(endpoints::APPS_REMOVE, &params, "purge_volumes=true")
-            .await
-    } else {
-        client.call_empty(endpoints::APPS_REMOVE, &params).await
-    };
+    let removal = client
+        .call_empty_query(
+            endpoints::APPS_REMOVE,
+            &params,
+            remove_query(a.purge_volumes),
+        )
+        .await;
     let existed = match removal {
         Ok(()) => true,
         Err(e) if e.kind == Kind::NotFound && a.ignore_missing => false,

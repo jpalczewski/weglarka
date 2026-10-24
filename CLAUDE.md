@@ -98,7 +98,7 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `notify →
 
 | Crate | Zawartość |
 |---|---|
-| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
+| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
 | `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
 | `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
@@ -120,11 +120,12 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
 | wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
-| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0022) |
+| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0023) |
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
 | powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
+| wykrywanie awarii | `core/src/crash.rs` (polityka `Policy` + maszyna stanu `Watcher`), wywołanie w `core/src/reconcile.rs` (`Reconciler::with_monitor`, raz na przejście), sekcja `[monitor]`: `core/src/config.rs`, zdarzenia: `core/src/events.rs`, testy: `core/src/engine_tests.rs` (ADR 0022) |
 | CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |
 | testy silnika | `core/src/engine_tests.rs` (scenariusze na `FakePodman`), testy modułu w `core/src/volumes.rs` |
 | testy daemon/API | `daemon/tests/*.rs` (prawdziwy unix socket + `FakePodman`) |
@@ -154,7 +155,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
   rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
-- **Configi z hosta (ADR 0022):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
+- **Configi z hosta (ADR 0023):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
   demona w `platform install` — po upgrade trzeba go przeinstalować), `configs = [{ source, target }]` w spec
   apki (source względny do rootu, walidacja składniowa w `validate_app`, a canonicalize/containment przy starcie,
   zapisie, reconcile i przed startem kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
@@ -162,8 +163,13 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   restart), a single-file bind mount po write-and-rename wymaga `--recreate`. Oba pliki TOML mają
   `deny_unknown_fields` → przed downgradem usunąć `config_root`, `configs`, `reload_signal`. Pliki runtime usera
   widoczne w zakresie UID apki jako `nobody` → 0644/0755. Szczegóły:
-  [`docs/decisions/0022-config-root-mounts.md`](docs/decisions/0022-config-root-mounts.md) i
-  [`docs/install.md` 6i](docs/install.md#6i-configi-z-hosta-config_root-i-apps-reload).
+  [`docs/decisions/0023-config-root-mounts.md`](docs/decisions/0023-config-root-mounts.md) i
+  [`docs/install.md` 6j](docs/install.md#6j-configi-z-hosta-config_root-i-apps-reload).
+- **Detekcja awarii (ADR 0022):** watcher crash loopów działa w przejściu reconcile — `container_list` już
+  robi inspect każdego kontenera, więc licznik restartów (`RestartCount` → `ContainerInfo.restarts`) nie
+  kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
+  ustala baseline), pod mutexem silnika, a granicą baseline'u jest etykieta `weglarka.generation`. Progi w
+  `[monitor]` (nowa sekcja → kolejny caveat downgrade'u), zdarzenia idą tym samym `EventSink`-iem co deploye.
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 

@@ -50,7 +50,7 @@
 # `weglarka doctor` warns about missing sources and loose permissions.
 #
 # `weglarka.toml` and `apps.toml` have `deny_unknown_fields`: before downgrading Węglarka, remove
-# `config_root` and the apps' `configs`/`reload_signal` — see docs/install.md section 6i and ADR 0022.
+# `config_root` and the apps' `configs`/`reload_signal` — see docs/install.md section 6j and ADR 0023.
 image = "docker.io/prom/prometheus:latest"
 domains = ["prometheus.example.com"]
 port = 9090

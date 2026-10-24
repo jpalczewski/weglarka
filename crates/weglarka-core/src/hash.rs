@@ -38,7 +38,7 @@ impl fmt::Display for SpecHash {
 /// so a spec that does not use them hashes exactly as before (`HASH_FORMAT` stays v1 and existing
 /// instances are not recreated by upgrading Węglarka). `command` (issue #79) is appended for the same
 /// reason: an app that does not set it keeps its hash, a change to it recreates the container.
-/// `configs` (issue #118, `docs/decisions/0022-config-root-mounts.md`) is appended last the same way:
+/// `configs` (issue #118, `docs/decisions/0023-config-root-mounts.md`) is appended last the same way:
 /// the **list** of host config mounts is a container setting, while the file content is deliberately
 /// outside the hash — editing a config must not recreate the container. `reload_signal` is omitted
 /// entirely: it only affects `apps reload`, never what the container is made of.

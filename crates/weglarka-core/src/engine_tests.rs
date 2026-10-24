@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::app::{Digest, InstanceName};
+use crate::crash;
 use crate::deploy::{DeployOutcome, ReloadOutcome};
 use crate::events::{Event, VecSink};
 use crate::labels;
@@ -58,7 +59,17 @@ impl Harness {
         )
     }
 
+    /// Harness with failure detection enabled at `monitor` (the crash-loop / health scenarios).
+    fn with_monitor(apps_toml: &str, monitor: crash::Policy) -> Self {
+        Self::build(apps_toml, ReconcilerOptions::default(), monitor)
+    }
+
+    /// Harness with explicit reconciler options (e.g. a `config_root`, issue #118).
     fn with_options(apps_toml: &str, options: ReconcilerOptions) -> Self {
+        Self::build(apps_toml, options, crash::Policy::disabled())
+    }
+
+    fn build(apps_toml: &str, options: ReconcilerOptions, monitor: crash::Policy) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, apps_toml).unwrap();
@@ -67,7 +78,9 @@ impl Harness {
         let sink = Arc::new(VecSink::default());
         let secrets: Arc<dyn SecretStore> = store.clone();
         let rec = Arc::new(
-            Reconciler::new(fake.clone(), secrets, paths, options).with_events(sink.clone()),
+            Reconciler::new(fake.clone(), secrets, paths, options)
+                .with_events(sink.clone())
+                .with_monitor(monitor),
         );
         Self {
             dir,
@@ -1413,7 +1426,7 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
-// ── config_root mounts and reload (issue #118, ADR 0022) ────────────────────────
+// ── config_root mounts and reload (issue #118, ADR 0023) ────────────────────────
 
 /// App with two config mounts (a file and a directory) and a signal-based reload.
 const WITH_CONFIGS: &str = r#"
@@ -1653,4 +1666,155 @@ async fn reload_of_a_non_running_app_is_refused() {
         h.fake.calls()[before..].is_empty(),
         "an exited container is neither signalled nor restarted"
     );
+}
+
+// ---------- crash loops and failing healthchecks (issue #112) ----------
+
+fn monitor_policy() -> crash::Policy {
+    crash::Policy {
+        crash_loop_restarts: 3,
+        crash_loop_window: Duration::from_secs(60),
+        unhealthy_observations: 2,
+    }
+}
+
+/// Deploy the single `ntfy` app and take one more pass, so the watcher has seen the container once
+/// (its first observation only sets the restart baseline).
+async fn deployed_and_watched(h: &Harness) {
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap(); // first deploy
+    h.rec.reconcile().await.unwrap(); // the container is observed for the first time
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_crash_loop_is_reported_once_and_recovers_after_a_quiet_window() {
+    let h = Harness::with_monitor(NTFY, monitor_policy());
+    deployed_and_watched(&h).await;
+    let baseline = h.sink.events().len();
+
+    h.fake.set_restarts("ntfy", 2);
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.sink.events().len(), baseline, "below the threshold");
+
+    h.fake.set_restarts("ntfy", 3);
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().last(),
+        Some(&Event::CrashLooping {
+            instance: name("ntfy"),
+            restarts: 3,
+        })
+    );
+    let alerted = h.sink.events().len();
+
+    // The same streak is not reported again.
+    h.rec.reconcile().await.unwrap();
+    h.fake.set_restarts("ntfy", 4);
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.sink.events().len(), alerted);
+
+    // A full quiet window means the loop is over.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().last(),
+        Some(&Event::Recovered {
+            instance: name("ntfy"),
+        })
+    );
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(h.sink.events().len(), alerted + 1, "recovery once");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recreated_container_resets_the_crash_counters() {
+    let h = Harness::with_monitor(NTFY, monitor_policy());
+    deployed_and_watched(&h).await;
+    h.fake.set_restarts("ntfy", 3);
+    h.rec.reconcile().await.unwrap();
+    assert!(matches!(
+        h.sink.events().last(),
+        Some(Event::CrashLooping { restarts: 3, .. })
+    ));
+
+    // The container disappears and is recreated from the pinned digest: new generation, count 0.
+    h.fake.container_remove("ntfy", true).await.unwrap();
+    h.rec.reconcile().await.unwrap();
+    assert!(
+        matches!(h.sink.events().last(), Some(Event::Recreated { .. })),
+        "the recreate is reported; the old alert is dropped without a recovery"
+    );
+    h.rec.reconcile().await.unwrap(); // observe the new container (baseline 0)
+    let mark = h.sink.events().len();
+
+    h.fake.set_restarts("ntfy", 2);
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().len(),
+        mark,
+        "the new container counts from zero"
+    );
+
+    h.fake.set_restarts("ntfy", 3);
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().last(),
+        Some(&Event::CrashLooping {
+            instance: name("ntfy"),
+            restarts: 3,
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_healthcheck_is_reported_once_and_recovers() {
+    let h = Harness::with_monitor(NTFY, monitor_policy());
+    deployed_and_watched(&h).await;
+    let baseline = h.sink.events().len();
+
+    h.fake.set_health("ntfy", Some(HealthStatus::Unhealthy));
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().len(),
+        baseline,
+        "one failed observation is a flaky probe"
+    );
+
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().last(),
+        Some(&Event::Unhealthy {
+            instance: name("ntfy"),
+        })
+    );
+    let alerted = h.sink.events().len();
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().len(),
+        alerted,
+        "one alert per unhealthy streak"
+    );
+
+    h.fake.set_health("ntfy", Some(HealthStatus::Healthy));
+    h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        h.sink.events().last(),
+        Some(&Event::Recovered {
+            instance: name("ntfy"),
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_test_harness_does_not_watch_without_a_policy() {
+    // The rest of the engine tests assert their event lists: detection is explicitly disabled there.
+    let h = Harness::new(NTFY);
+    deployed_and_watched(&h).await;
+    let baseline = h.sink.events().len();
+    h.fake.set_restarts("ntfy", 5);
+    h.fake.set_health("ntfy", Some(HealthStatus::Unhealthy));
+    for _ in 0..3 {
+        h.rec.reconcile().await.unwrap();
+    }
+    assert_eq!(h.sink.events().len(), baseline);
 }

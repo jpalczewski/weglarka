@@ -1,0 +1,22 @@
+# Failure detection: crash loops and failing healthchecks (issue #112,
+# docs/decisions/0022-crash-loop-detection.md). An excerpt of weglarka.toml, not of apps.toml: the daemon
+# reads it at startup, applies the defaults for anything omitted, and restarts are compared across its
+# reconcile passes (the default period is one minute). The events are engine events: with a `[notify]`
+# channel they arrive as push notifications, without one they stay in the daemon log.
+#
+# A container that keeps dying is invisible otherwise: every app runs with `restart = always`, so Podman
+# restarts it before the next pass sees anything wrong.
+
+[monitor]
+# How many *new* restarts inside the window make it a crash loop. The counter comes from libpod's
+# `RestartCount`; a recreate starts at 0. 0 disables crash-loop detection.
+crash_loop_restarts = 3
+
+# The window for that counter (seconds). It is also the quiet period after which a crash loop counts as
+# recovered: the same value bounds the reminder cadence.
+crash_loop_window_secs = 600
+
+# Consecutive observations with a failing healthcheck before the app is reported unhealthy. One
+# observation ignores a single flaky probe; 0 disables the health detector (a container without a
+# healthcheck is never reported this way).
+unhealthy_observations = 2

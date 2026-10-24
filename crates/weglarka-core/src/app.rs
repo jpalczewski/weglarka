@@ -237,7 +237,7 @@ pub fn valid_mount_target(target: &str) -> bool {
 }
 
 /// Host file or directory mounted **read-only** into the app container from the host's
-/// `config_root` (issue #118, `docs/decisions/0022-config-root-mounts.md`). `source` is always
+/// `config_root` (issue #118, `docs/decisions/0023-config-root-mounts.md`). `source` is always
 /// relative to the root, and there is no `read_only` flag to get wrong: configs are configuration.
 /// The list — not the content — is part of the spec hash, so mounting something else recreates the
 /// container while editing a file does not.
@@ -644,7 +644,7 @@ pub struct AppSpec {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub start: bool,
     /// Host config files/directories mounted read-only from `config_root` (issue #118,
-    /// `docs/decisions/0022-config-root-mounts.md`). The list — not the content — is part of the spec
+    /// `docs/decisions/0023-config-root-mounts.md`). The list — not the content — is part of the spec
     /// hash: mounting something else recreates the container, editing a file does not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configs: Vec<ConfigMount>,
