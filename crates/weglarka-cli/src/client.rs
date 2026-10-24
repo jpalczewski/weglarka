@@ -43,6 +43,22 @@ pub fn expand_path(endpoint: Endpoint, params: &[(&str, &str)]) -> String {
     path
 }
 
+/// The request target for `endpoint`: the expanded path plus `?query` when the query is non-empty
+/// (no dangling `?`). The dry run prints the same string, so the shown request cannot drift from
+/// the one actually sent.
+pub(crate) fn request_path(endpoint: Endpoint, params: &[(&str, &str)], query: &str) -> String {
+    append_query(expand_path(endpoint, params), query)
+}
+
+/// Appends `?query` to a path unless the query is empty.
+pub(crate) fn append_query(mut path: String, query: &str) -> String {
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(query);
+    }
+    path
+}
+
 fn method_str(m: Method) -> &'static str {
     match m {
         Method::Get => "GET",
@@ -103,7 +119,7 @@ impl ApiClient {
             ),
             None => Bytes::new(),
         };
-        let uri = expand_path(endpoint, params);
+        let uri = request_path(endpoint, params, "");
         let json = body.is_some();
         retry_while_busy(self.busy_wait, || {
             self.send_once(endpoint.method, &uri, json, payload.clone())
@@ -169,14 +185,15 @@ impl ApiClient {
         Ok(sender)
     }
 
-    /// Call without a response body (204), with a query string (`a=b&c`) appended to the path.
+    /// Call without a response body (204), with an optional query string (`a=b&c`) appended to the
+    /// path; an empty query leaves the path untouched.
     pub async fn call_empty_query(
         &self,
         endpoint: Endpoint,
         params: &[(&str, &str)],
         query: &str,
     ) -> Result<(), CliError> {
-        let path = format!("{}?{query}", expand_path(endpoint, params));
+        let path = request_path(endpoint, params, query);
         retry_while_busy(self.busy_wait, || {
             self.send_once(endpoint.method, &path, false, Bytes::new())
         })
@@ -193,11 +210,7 @@ impl ApiClient {
         query: &str,
         body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     ) -> Result<(), CliError> {
-        let mut path = expand_path(endpoint, params);
-        if !query.is_empty() {
-            path.push('?');
-            path.push_str(query);
-        }
+        let path = request_path(endpoint, params, query);
         let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
         let req = Request::builder()
             .method(method_str(endpoint.method))
@@ -234,7 +247,7 @@ impl ApiClient {
     ) -> Result<u64, CliError> {
         let req = Request::builder()
             .method(method_str(endpoint.method))
-            .uri(expand_path(endpoint, params))
+            .uri(request_path(endpoint, params, ""))
             .header(HOST, "weglarka")
             .body(Full::new(Bytes::new()))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
