@@ -5,11 +5,12 @@ use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 
 use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
+use weglarka_core::app::{AppsFile, InstanceName};
 use weglarka_core::config::IngressMode;
 use weglarka_core::labels;
-use weglarka_core::podman::{ContainerFilter, ContainerState, PodmanClient};
+use weglarka_core::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient};
 use weglarka_core::secret_store::{SecretStore, scoped_name};
-use weglarka_core::state;
+use weglarka_core::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::ingress::NGINX_CONTAINER;
@@ -178,6 +179,72 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
             problems.join("; "),
             Some("reconcile fixes drift on the next pass; `weglarka deploy <app>` forces a deploy"),
         )
+    });
+    dependencies(&apps, &st, &containers, out);
+}
+
+/// `depends_on` (issue #35): a **running** app whose dependency is down is a real problem, while an
+/// app that has not started yet and waits for its dependencies is expected (the next reconcile
+/// retries). A dependency with `start = false` can never satisfy a dependent, so it is always a
+/// warning. The check only appears when at least one app declares dependencies.
+fn dependencies(
+    apps: &AppsFile,
+    st: &StateFile,
+    containers: &[ContainerInfo],
+    out: &mut Vec<DoctorCheck>,
+) {
+    if apps.apps.values().all(|spec| spec.depends_on.is_empty()) {
+        return;
+    }
+    let running = |name: &InstanceName| {
+        containers
+            .iter()
+            .any(|c| c.name == labels::container_name(name) && c.state == ContainerState::Running)
+    };
+    let mut problems = Vec::new();
+    let mut waiting = Vec::new();
+    for (name, spec) in &apps.apps {
+        if spec.depends_on.is_empty() {
+            continue;
+        }
+        let mut down = Vec::new();
+        for dep in &spec.depends_on {
+            if apps.apps.get(dep).is_some_and(|s| !s.start) {
+                down.push(format!("{dep} (start = false)"));
+            } else if !running(dep) {
+                down.push(dep.to_string());
+            }
+        }
+        if down.is_empty() {
+            continue;
+        }
+        let down = down.join(", ");
+        let deployed = st.apps.get(name).and_then(|s| s.current.as_ref()).is_some();
+        if running(name) || (deployed && spec.start) {
+            problems.push(format!("{name} depends on {down} (not running)"));
+        } else {
+            waiting.push(format!("{name}: {down}"));
+        }
+    }
+    out.push(if !problems.is_empty() {
+        check(
+            "state.dependencies",
+            CheckStatus::Warn,
+            problems.join("; "),
+            Some("start the dependency first: `weglarka apps start <app>`"),
+        )
+    } else if !waiting.is_empty() {
+        check(
+            "state.dependencies",
+            CheckStatus::Info,
+            format!(
+                "waiting for dependencies (not started yet): {}",
+                waiting.join("; ")
+            ),
+            None,
+        )
+    } else {
+        ok("state.dependencies", "every dependency is running")
     });
 }
 
