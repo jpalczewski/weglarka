@@ -61,6 +61,30 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
    `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `integration-podman`; zmiana tylko w
    `docs/`/`*.md`/`.gitignore` nie buduje — job `changes`).
 
+## Worktrees (praca równoległa)
+
+Jedno zadanie = jeden checkout: gałąź żyje we własnym worktree, więc dwie sesje nie edytują tych samych plików,
+a nieudany eksperyment usuwa się razem z katalogiem. W DSH robi to bundle **Git Worktrees**: z **głównego
+checkoutu** wołaj `create_worktree({ name })` — tworzy `.agents/worktrees/<name>` na nowej gałęzi o tej nazwie
+od `HEAD`, wchodzi do niego i zwraca `path`/`branch`/`baseCommit`. Nie kopiuje niezacommitowanych plików i nie
+robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
+
+- **Startuj z głównego checkoutu, nie z wnętrza worktree.** Granica `workspace-write` to katalog, w którym sesja
+  wystartowała, a nie ten, do którego później wchodzi (`create_worktree`, `working_directory`). Z głównego
+  checkoutu `.agents/worktrees/*`, wspólne `.git` i `target/` są w granicach zapisu; sesja wystartowana
+  w worktree ma główne `.git` i `target/` poza granicami (zapisy gita wymagają eskalacji).
+- Build z dowolnego checkoutu na jednym cache: `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"`; sesja
+  wystartowana w worktree używa `$PWD/target` (główny checkout jest wtedy poza sandboxem).
+- Wyjście: `cd` z powrotem do checkoutu (worktree i gałąź zostają). Po merge'u PR-a:
+  `git worktree remove .agents/worktrees/<name> && git branch -D <name>`, potem `git worktree prune`.
+  `.agents/worktrees/.gitignore` (`*`) trzyma pulę poza `git status`.
+- Agent Teams: narzędzie zmienia katalog tylko wywołującej sesji. Jeden pisarz = jedno worktree: albo Lead
+  tworzy je przed spawnem teammate'ów, albo każdy członek tworzy własne i wpisuje je w `write_scopes` zadania;
+  teammate nigdy nie pracuje w checkoutcie Leada.
+- Bez bundla (`create_worktree` niedostępne): `git worktree add .agents/worktrees/<name> -b <name> origin/main`
+  i wejdź tam — pozostałe zasady bez zmian.
+- Stare `.claude/worktrees/` (sesje Claude Code) są wykluczone z wyszukiwań; nie używaj ich do nowej pracy.
+
 ## Mapa crate'ów
 
 Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → api, core`; `daemon → wszystko`.
