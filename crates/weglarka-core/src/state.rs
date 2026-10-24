@@ -159,7 +159,23 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
             return Err(format!("{name}: invalid secret name {:?}", b.secret));
         }
     }
+    validate_depends_on(name, spec)?;
     validate_iteration2(name, spec)
+}
+
+/// `depends_on` rules an app can break on its own. The cross-app rules (an unknown target, a cycle)
+/// live in [`crate::depends::validate`], which needs the whole `apps.toml`.
+fn validate_depends_on(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for dep in &spec.depends_on {
+        if dep == name {
+            return Err(format!("{name}: depends_on must not list the app itself"));
+        }
+        if !seen.insert(dep) {
+            return Err(format!("{name}: duplicate depends_on entry \"{dep}\""));
+        }
+    }
+    Ok(())
 }
 
 /// Hardening values end up in the container spec verbatim, so they are checked strictly.
@@ -294,6 +310,7 @@ pub fn load_apps(path: &Path) -> Result<AppsFile, StateError> {
     for (name, spec) in &apps.apps {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
+    crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
     Ok(apps)
 }
 
@@ -301,6 +318,7 @@ pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
     for (name, spec) in &apps.apps {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
+    crate::depends::validate(apps).map_err(|r| invalid(path, r))?;
     let text = toml::to_string(apps).map_err(|e| invalid(path, e.to_string()))?;
     write_atomic(path, text.as_bytes(), 0o644).map_err(io_err(path))
 }
@@ -364,6 +382,24 @@ mod tests {
 
     fn name(s: &str) -> InstanceName {
         InstanceName::new(s).unwrap()
+    }
+
+    #[test]
+    fn depends_on_self_and_duplicates_are_rejected() {
+        let spec = |deps: &str| -> AppSpec {
+            toml::from_str(&format!("image = \"i\"\ndepends_on = [{deps}]")).unwrap()
+        };
+        assert!(
+            validate_app(&name("a"), &spec("\"a\""))
+                .unwrap_err()
+                .contains("app itself")
+        );
+        assert!(
+            validate_app(&name("a"), &spec("\"b\", \"b\""))
+                .unwrap_err()
+                .contains("duplicate depends_on")
+        );
+        assert!(validate_app(&name("a"), &spec("\"b\"")).is_ok());
     }
 
     #[test]

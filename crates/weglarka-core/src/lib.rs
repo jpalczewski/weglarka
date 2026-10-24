@@ -17,6 +17,7 @@ pub mod uid_range;
 pub mod webhook;
 
 // Logic — owned by session b (stubs). `limits` / `volumes`: iteration 2, sessions 2 / 1 (see CLAUDE.md).
+pub mod depends;
 pub mod deploy;
 pub mod limits;
 pub mod reconcile;

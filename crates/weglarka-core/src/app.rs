@@ -432,6 +432,12 @@ pub struct AppSpec {
     /// Ports published directly on the host (issue #34); the ingress keeps routing `domains`/`port`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPort>,
+    /// Apps that must already be running (and healthy) before this one starts (issue #35,
+    /// `docs/decisions/0016-depends-on.md`). This is a **start order** only: reconcile starts the
+    /// dependencies first and the deploy gate waits for them; it implies no network connectivity.
+    /// Not part of the spec hash — editing it never recreates a container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<InstanceName>,
     /// Resource limits (iteration 2); all unlimited by default.
     #[serde(default, skip_serializing_if = "Resources::is_unlimited")]
     pub resources: Resources,
@@ -498,16 +504,50 @@ health = { command = ["/app", "-health"], http = { path = "/healthz" } }
     fn old_specs_stay_unlimited_and_serialize_without_new_fields() {
         let spec: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
         assert!(
-            spec.resources.is_unlimited() && spec.volumes.is_empty() && spec.host_ports.is_empty()
+            spec.resources.is_unlimited()
+                && spec.volumes.is_empty()
+                && spec.host_ports.is_empty()
+                && spec.depends_on.is_empty()
         );
         let text = toml::to_string(&spec).unwrap();
         assert!(
             !text.contains("volumes")
                 && !text.contains("resources")
                 && !text.contains("command")
-                && !text.contains("host_ports"),
+                && !text.contains("host_ports")
+                && !text.contains("depends_on"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn depends_on_roundtrip_and_defaults_to_empty() {
+        let toml_src = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+depends_on = ["db", "cache"]
+
+[apps.db]
+image = "ghcr.io/x/db:latest"
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        insta::assert_json_snapshot!(parsed);
+        let api = &parsed.apps[&InstanceName::new("api").unwrap()];
+        assert_eq!(
+            api.depends_on,
+            vec![
+                InstanceName::new("db").unwrap(),
+                InstanceName::new("cache").unwrap()
+            ]
+        );
+        // An empty list is not serialized, so an app without dependencies keeps its shape.
+        let text = toml::to_string(&parsed).unwrap();
+        assert_eq!(text.matches("depends_on").count(), 1, "{text}");
+        let again: AppsFile = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, again);
+        // The strong name type rejects typos at parse time, before any validation runs.
+        let bad = "[apps.a]\nimage = \"i\"\ndepends_on = [\"B\"]\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
     }
 
     #[test]

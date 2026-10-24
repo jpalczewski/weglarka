@@ -47,6 +47,12 @@ pub enum Event {
         instance: InstanceName,
         missing: Vec<String>,
     },
+    /// The app cannot start yet: an app it lists in `depends_on` is not running (or not healthy).
+    /// Not a failure — the deploy/reconcile retries once the dependencies are up (issue #35).
+    WaitingForDependency {
+        instance: InstanceName,
+        dependencies: Vec<InstanceName>,
+    },
     /// Webhook rejected as a duplicate (`delivery_id` already seen).
     WebhookDuplicate { delivery_id: String },
 }
