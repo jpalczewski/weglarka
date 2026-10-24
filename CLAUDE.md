@@ -50,7 +50,9 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 ## Przed PR-em (checklista)
 
 1. `git fetch origin && git rebase origin/main` — PR musi być na bieżącym `main`; inaczej GitHub pokaże konflikt
-   i nie uruchomi CI.
+   i nie uruchomi CI. W sesji agentskiej `git rebase --continue` czeka na edytor, więc wołaj je jako
+   `GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git rebase --continue`; po rebase przejdź `scripts/adr.sh lint`
+   (numer ADR-a i linki do sekcji mogły się zderzyć z upstreamem — patrz punkt 5).
 2. `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 3. Snapshoty: `INSTA_UPDATE=always cargo test`, przejrzyj diff `.snap` i commituj `.snap` (`.snap.new` jest ignorowany).
 4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
@@ -161,8 +163,14 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`Operation not permitted`), ustaw `CARGO_TARGET_DIR` na katalog zapisywalny w sandboxie. **Worktree nie buduje
   własnego `target/`:** wskaż wspólny katalog głównego checkoutu — `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"` —
   żeby zależności z crates.io skompilowały się raz dla wszystkich worktree (skrypt zwraca ten sam katalog z głównego
-  checkoutu i z `git worktree`; równoległe buildy czekają wtedy na locku cargo, zamiast kompilować to samo drugi raz).
-  Przy sesji, której workspace *jest* worktree, główny checkout bywa poza sandboxem — wtedy zostaje `$PWD/target`.
+  checkoutu i z `git worktree`). Przy sesji, której workspace *jest* worktree, główny checkout bywa poza sandboxem —
+  wtedy zostaje `$PWD/target`.
+- **Wspólny `target/` potrafi skłamać** (zmierzone 2026-10-24): gdy pisze do niego równolegle inny proces (druga
+  sesja, świeży `git rebase`), cargo może zlinkować **stary** `libweglarka_{core,api}` i zgłosić błędy, których
+  w kodzie nie ma — np. `unresolved import weglarka_core::images`, `no field repo_digests on type ImageInfo`,
+  `ContainerSpec has no field command`. Nie „naprawiaj" wtedy kodu: powtórz na prywatnym katalogu
+  `CARGO_TARGET_DIR="$PWD/target" cargo test --workspace` (pełny rebuild, minuty, ale wiarygodny). Nie chowaj też
+  werdyktu w potoku: `cargo test … > /tmp/log 2>&1; echo "EXIT: $?"` — `| tail` maskuje kod wyjścia.
 - Fake: `weglarka-core` z `features = ["testing"]` → `weglarka_core::testing::FakePodman`
   (skryptowalne digesty pulla, błędy w środku pulla, kolejka wyników healthchecka, log wywołań).
 - Integracyjne z prawdziwym Podmanem 6.1 (`weglarka-podman/tests/`): wymagają `WEGLARKA_PODMAN_SOCKET`
