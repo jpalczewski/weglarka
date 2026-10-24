@@ -1,4 +1,4 @@
-# 0019 — Per-app container command (arguments to the image's entrypoint)
+# 0019 — Per-app container command: arguments to the image entrypoint (issue #79)
 
 Status: accepted (2026-10-24, issue #79).
 

@@ -1,4 +1,4 @@
-# 0017 — Volumes shared between instances
+# 0017 — Volumes shared between instances: one uid range per shared volume (issue #33)
 
 Status: proposed (2026-10-24, issue #33)
 

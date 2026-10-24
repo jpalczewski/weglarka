@@ -5,7 +5,8 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0021).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` — indeks generowany z tytułów ADR-ów:
+[`docs/decisions/README.md`](docs/decisions/README.md).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -55,8 +56,11 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
    w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Opisz też kompatybilność wstecz
    (`deny_unknown_fields` a rollback) w PR i w `docs/install.md`.
-5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md);
-   indeks wszystkich decyzji: [`docs/decisions/README.md`](docs/decisions/README.md).
+5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md).
+   Tabelę indeksu generuje `scripts/adr.sh index` — nie edytuj jej ręcznie. Numer ADR to zasób wspólny
+   dla równoległych gałęzi: zarezerwuj go wcześnie (push + draft PR ze stubem ADR-a) i scalaj szybko;
+   jeśli rebase ujawni kolizję, przenumeruj jedną komendą: `scripts/adr.sh renumber OLD NEW`.
+   Przed PR-em uruchom też `scripts/adr.sh lint` (to samo robi job `docs-lint`).
 6. Tytuł, commity i PR w Conventional Commits (`<type>(<scope>): <summary>`, patrz wyżej), po angielsku;
    `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `integration-podman`; zmiana tylko w
    `docs/`/`*.md`/`.gitignore` nie buduje — job `changes`).
@@ -141,7 +145,8 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `wg-shared-<nazwa>` ma label `weglarka.shared-volume` i nigdy `weglarka.instance`. `apps remove
   --purge-volumes` członka przy innych członkach = 409 (nic nie usuwane), import wymaga zatrzymanych
   członków, a zmiana zakresu przy istniejących prywatnych danych jest odrzucana (`RangeChangeWithData`).
-  Szczegóły: `docs/decisions/0017-shared-volumes.md` i `docs/install.md` §6a.
+  Szczegóły: [`docs/decisions/0017-shared-volumes.md`](docs/decisions/0017-shared-volumes.md) i
+  [`docs/install.md` 6a](docs/install.md#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2).
 - **Powiadomienia (ADR 0021):** `EventSink::emit` jest wołane pod mutexem silnika, więc sink **tylko kolejkuje**
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie

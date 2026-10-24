@@ -1,4 +1,4 @@
-# 0014 — Hardening the ingress nginx container
+# 0014 — Hardening the ingress nginx container (issue #31)
 
 Status: accepted (2026-10-24, issue #31).
 

@@ -1,4 +1,4 @@
-# 0018 — Per-app streaming through the ingress (no response buffering, long idle timeout)
+# 0018 — Per-app streaming: `proxy_buffering off` and a long idle timeout (issue #64)
 
 Status: accepted (2026-10-24, issue #64).
 

@@ -1,4 +1,4 @@
-# 0013 — `host_ports`: publishing app container ports directly on the host
+# 0013 — `host_ports`: app container ports published directly on the host (issue #34)
 
 Status: accepted (2026-10-24, issue #34).
 
