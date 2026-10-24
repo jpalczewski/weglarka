@@ -81,6 +81,13 @@ impl From<EngineError> for Fail {
                     "{e}; set them with `weglarka secrets set` and the deploy starts by itself"
                 ),
             ),
+            // `depends_on` apps are not up yet: the start is refused, nothing was deployed.
+            e @ EngineError::DependenciesNotReady { .. } => Fail(
+                ErrorCode::Conflict,
+                format!("{e}; start the dependencies first and retry the same command"),
+            ),
+            // Removing an app another one depends on: nothing was deleted.
+            e @ EngineError::DependencyInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
             other => Fail::internal(other),
         }
     }
@@ -278,6 +285,8 @@ async fn add_app<P: PodmanClient + 'static>(
         // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
         weglarka_core::host_ports::validate(&d.host, &apps)
             .map_err(|e| Fail::invalid(e.to_string()))?;
+        // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
+        weglarka_core::depends::validate(&apps).map_err(Fail::invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps)
             .map_err(|e| Fail::invalid(e.to_string()))?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;

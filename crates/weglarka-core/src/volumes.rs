@@ -258,6 +258,9 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
+        // An app another app depends on cannot be removed (its `depends_on` would dangle, and with
+        // `--purge-volumes` its data may still be in use). Nothing is modified on refusal.
+        crate::depends::ensure_not_depended_on(&apps, name)?;
         if apps.apps.remove(name).is_none() {
             return Err(EngineError::UnknownInstance(name.clone()));
         }

@@ -30,7 +30,8 @@ impl fmt::Display for SpecHash {
 /// Only fields that affect the container. `domains` and the gate's timing/HTTP probe are deliberately
 /// omitted — changing routing or the gate does not require recreating the container. `start` (run vs
 /// provision-only intent) is omitted as well: it controls whether a container exists, not what it is
-/// made of. The struct's field order is part of the format.
+/// made of. `depends_on` is omitted for the same reason: it is a start order between apps, so editing
+/// it never recreates a container (issue #35). The struct's field order is part of the format.
 ///
 /// Iteration 2 fields (`volumes`, `resources`, `health_command`) are appended and skipped while unset,
 /// so a spec that does not use them hashes exactly as before (`HASH_FORMAT` stays v1 and existing
@@ -187,6 +188,18 @@ env = { B = "2", A = "1" }
         assert_eq!(
             spec_hash(&running, &digest('a')),
             spec_hash(&stopped, &digest('a'))
+        );
+    }
+
+    /// `depends_on` is a start order between apps, not a container setting (issue #35).
+    #[test]
+    fn depends_on_does_not_change_the_hash() {
+        let base = spec();
+        let mut dependent = base.clone();
+        dependent.depends_on = vec![crate::app::InstanceName::new("db").unwrap()];
+        assert_eq!(
+            spec_hash(&base, &digest('a')),
+            spec_hash(&dependent, &digest('a'))
         );
     }
 

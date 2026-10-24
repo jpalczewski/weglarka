@@ -1,0 +1,33 @@
+# Start ordering between apps (issue #35): an app with `depends_on` is started only after every app it names
+# is running — and healthy, if that app has a healthcheck (`health.command` or the image's own). This is an
+# `apps.toml` excerpt, not a `--spec` file (a `--spec` file describes one app); add the dependency first, the
+# CLI and the daemon both reject a name that does not exist yet:
+#   weglarka apps add db ghcr.io/example/postgres:16
+#   weglarka apps add api ghcr.io/example/api:latest --domain api.example.com --port 8080 --depends-on db
+# depends_on is a start order only — each app keeps its own network, so `api` cannot reach `db` by name: the
+# shared network / shared Postgres is the other, still unimplemented part of #35. The same two apps in full
+# (with the volume and the healthcheck of `db`):
+
+[apps.db]
+image = "ghcr.io/example/postgres:16"
+volumes = [{ name = "data", target = "/var/lib/postgresql/data" }]
+# A dependency with a healthcheck must be healthy, not merely running, before `api` starts:
+health = { command = ["pg_isready", "-U", "postgres"] }
+
+[apps.api]
+image = "ghcr.io/example/api:latest"
+domains = ["api.example.com"]
+port = 8080
+# Not part of the spec hash: editing, reordering or clearing this line never recreates a container.
+depends_on = ["db"]
+
+# Variant: the dependency is provisioned but not started — it has no container, so the dependent never starts:
+# reconcile reports "waiting for dependencies" and `doctor` warns until `weglarka apps start db`:
+# [apps.db]
+# start = false
+
+# `apps remove db` is refused while another app names it (409 Conflict, nothing is deleted — volumes and uid
+# range stay too, also with `--purge-volumes`). Drop the dependent, or just its entry, first:
+#   weglarka apps remove api
+#   weglarka apps update api --remove-depends-on db
+#   weglarka apps remove db

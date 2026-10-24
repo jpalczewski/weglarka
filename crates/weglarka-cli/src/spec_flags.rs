@@ -1,10 +1,10 @@
-//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes, hardening and
-//! ports published directly on the host. Before these existed, they could only be set through
-//! `--spec <file.toml>`.
+//! Spec flags shared by `apps add` and `apps update`: resource limits, volumes, hardening, ports
+//! published directly on the host and start dependencies. Before these existed, they could only be
+//! set through `--spec <file.toml>`.
 
 use clap::Args;
 use weglarka_core::app::{
-    AppSpec, CpuLimit, HostPort, MemoryLimit, VolumeMount, valid_volume_name,
+    AppSpec, CpuLimit, HostPort, InstanceName, MemoryLimit, VolumeMount, valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -22,7 +22,15 @@ pub enum HostPortFlag {
     Clear,
 }
 
-/// Limits, volumes, hardening and host ports; flattened into `AddArgs` and `UpdateArgs`.
+/// Value of [`SpecFlags::depends_on`]: an app name, or `none` to clear the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependsOnFlag {
+    Set(InstanceName),
+    Clear,
+}
+
+/// Limits, volumes, hardening, host ports and start dependencies; flattened into `AddArgs` and
+/// `UpdateArgs`.
 #[derive(Debug, Default, Args)]
 pub struct SpecFlags {
     /// Memory limit, e.g. 128m or 1g (`none` removes it). Default: no limit.
@@ -57,6 +65,9 @@ pub struct SpecFlags {
     /// address defaults to 127.0.0.1, `none` clears the list).
     #[arg(long = "host-port", value_name = "IP:HOST:CONTAINER", value_parser = parse_host_port, conflicts_with = "spec")]
     pub host_ports: Vec<HostPortFlag>,
+    /// App that must be running before this one starts (repeatable; `none` clears the list).
+    #[arg(long = "depends-on", value_name = "NAME|none", value_parser = parse_depends_on, conflicts_with = "spec")]
+    pub depends_on: Vec<DependsOnFlag>,
     /// no-new-privileges (setuid and file capabilities cannot raise privileges).
     #[arg(long, value_name = "true|false", conflicts_with = "spec")]
     pub no_new_privileges: Option<bool>,
@@ -74,6 +85,7 @@ impl SpecFlags {
             && self.cap_drop.is_empty()
             && self.cap_add.is_empty()
             && self.host_ports.is_empty()
+            && self.depends_on.is_empty()
             && self.no_new_privileges.is_none()
     }
 
@@ -105,6 +117,7 @@ impl SpecFlags {
         extend_list(&mut sec.cap_drop, &upper(&self.cap_drop));
         extend_list(&mut sec.cap_add, &upper(&self.cap_add));
         apply_host_ports(&mut spec.host_ports, &self.host_ports);
+        apply_depends_on(&mut spec.depends_on, &self.depends_on);
     }
 }
 
@@ -151,6 +164,31 @@ fn apply_host_ports(spec: &mut Vec<HostPort>, flags: &[HostPortFlag]) {
             }
         }
     }
+}
+
+/// `none` clears the list; app names are appended once each and validated by the daemon
+/// (an unknown target or a cycle is rejected when the spec is written, issue #35).
+fn apply_depends_on(spec: &mut Vec<InstanceName>, flags: &[DependsOnFlag]) {
+    for flag in flags {
+        match flag {
+            DependsOnFlag::Clear => spec.clear(),
+            DependsOnFlag::Set(dep) => {
+                if !spec.contains(dep) {
+                    spec.push(dep.clone());
+                }
+            }
+        }
+    }
+}
+
+/// A known app name, or `none` to clear the list.
+fn parse_depends_on(s: &str) -> Result<DependsOnFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(DependsOnFlag::Clear);
+    }
+    InstanceName::new(s)
+        .map(DependsOnFlag::Set)
+        .map_err(|e| e.to_string())
 }
 
 fn apply<T: Clone>(slot: &mut Option<T>, flag: &Option<Limit<T>>) {
@@ -408,5 +446,39 @@ mod hardening_tests {
         assert!(!s.security.read_only && s.security.no_new_privileges);
         assert!(s.security.cap_add.is_empty());
         assert_eq!(s.security.cap_drop, ["ALL"], "untouched");
+    }
+
+    #[test]
+    fn depends_on_flag_appends_once_and_none_clears() {
+        let mut s = spec();
+        SpecFlags {
+            depends_on: vec![
+                DependsOnFlag::Set(InstanceName::new("db").unwrap()),
+                DependsOnFlag::Set(InstanceName::new("cache").unwrap()),
+                DependsOnFlag::Set(InstanceName::new("db").unwrap()),
+            ],
+            ..SpecFlags::default()
+        }
+        .apply(&mut s);
+        assert_eq!(
+            s.depends_on,
+            [
+                InstanceName::new("db").unwrap(),
+                InstanceName::new("cache").unwrap()
+            ]
+        );
+        SpecFlags {
+            depends_on: vec![DependsOnFlag::Clear],
+            ..SpecFlags::default()
+        }
+        .apply(&mut s);
+        assert!(s.depends_on.is_empty());
+
+        assert_eq!(parse_depends_on("none").unwrap(), DependsOnFlag::Clear);
+        assert_eq!(
+            parse_depends_on("db").unwrap(),
+            DependsOnFlag::Set(InstanceName::new("db").unwrap())
+        );
+        assert!(parse_depends_on("DB").is_err());
     }
 }

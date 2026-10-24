@@ -384,7 +384,7 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    async fn http_probe(
+    pub(crate) async fn http_probe(
         &self,
         spec: &AppSpec,
         probe: &crate::app::HttpProbe,
@@ -408,6 +408,9 @@ impl<P: PodmanClient> Reconciler<P> {
         if !spec.start {
             return self.provision_locked(instance, &spec).await;
         }
+        // A deploy starts a container: every app in `depends_on` has to be running/healthy first
+        // (issue #35). Not a failure — the start is retried once the dependency is up.
+        self.dependency_gate(instance, &spec).await?;
         // `state.toml` is written only after the health gate, so until then the instance is
         // "in flight": `doctor` must not read the lagging state as drift.
         let _activity = self.begin_activity(instance, ActivityKind::Deploy);
@@ -634,6 +637,11 @@ impl<P: PodmanClient> Reconciler<P> {
         reason: RecreateReason,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        // Recreating a **missing** container is a start, so the dependencies must be up first.
+        // Replacing a container that is already running (`SpecDrift`) is not gated.
+        if reason == RecreateReason::Missing {
+            self.dependency_gate(instance, &spec).await?;
+        }
         let _activity = self.begin_activity(instance, ActivityKind::Recreate);
         self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st = state::load_state(&self.paths.state)?;

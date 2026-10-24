@@ -1044,3 +1044,204 @@ async fn http_probe_without_a_prober_fails_closed() {
         "{out:?}"
     );
 }
+
+// ── depends_on: start order and the dependency gate (issue #35) ─────────────────
+
+/// `db` + `api`, where `api` must start after `db`.
+const DEPENDS: &str = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+depends_on = ["db"]
+
+[apps.db]
+image = "ghcr.io/x/db:latest"
+"#;
+
+fn first_call(calls: &[Call], needle: Call) -> Option<usize> {
+    calls.iter().position(|c| *c == needle)
+}
+
+#[tokio::test(start_paused = true)]
+async fn depends_on_starts_dependencies_first() {
+    let h = Harness::new(DEPENDS);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert!(report.waiting_for_dependencies.is_empty(), "{report:?}");
+
+    let calls = h.fake.calls();
+    let db = first_call(&calls, Call::ContainerCreate("db".into())).expect("db created");
+    let api = first_call(&calls, Call::ContainerCreate("api".into())).expect("api created");
+    assert!(db < api, "db must be created before api: {calls:?}");
+    assert!(h.state("db").current.is_some());
+    assert!(h.state("api").current.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_dependency_leaves_the_dependent_waiting_not_failed() {
+    let h = Harness::new(
+        r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+depends_on = ["db"]
+
+[apps.db]
+image = "ghcr.io/x/db:latest"
+health = { attempts = 1, window_secs = 1 }
+"#,
+    );
+    h.fake.script_health("db", [HealthStatus::Unhealthy]);
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.waiting_for_dependencies,
+        vec![(name("api"), vec![name("db")])],
+        "{report:?}"
+    );
+    assert!(
+        h.state("api").failed.is_none(),
+        "a broken dependency is not the app's failed deploy"
+    );
+    assert!(h.state("api").current.is_none());
+    assert!(h.fake.containers().iter().all(|c| c.name != "api"));
+
+    // Once the dependency deploys, the dependent follows on the next pass.
+    h.fake.script_health("db", [HealthStatus::Healthy]);
+    h.rec.deploy(&name("db"), true).await.unwrap();
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert!(h.state("api").current.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_provision_only_dependency_keeps_the_dependent_waiting() {
+    let h = Harness::new(
+        r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+depends_on = ["db"]
+
+[apps.db]
+image = "ghcr.io/x/db:latest"
+start = false
+"#,
+    );
+    let report = h.rec.reconcile().await.unwrap();
+    assert_eq!(
+        report.waiting_for_dependencies,
+        vec![(name("api"), vec![name("db")])],
+        "{report:?}"
+    );
+    // `start = false` app stays "not started" by design: provisioned (digest pinned), no container.
+    assert!(h.state("api").current.is_none());
+    assert!(h.state("api").failed.is_none());
+    assert!(h.state("db").current.is_some());
+    assert!(h.fake.containers().iter().all(|c| c.name != "db"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_gate_polls_a_starting_dependency_before_starting_the_dependent() {
+    let h = Harness::new(
+        r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+depends_on = ["db"]
+health = { command = ["/app", "-health"], attempts = 1, window_secs = 1 }
+
+[apps.db]
+image = "ghcr.io/x/db:latest"
+health = { command = ["/app", "-health"], attempts = 1, window_secs = 1 }
+"#,
+    );
+    h.fake.script_health("db", [HealthStatus::Healthy]);
+    h.fake.script_health("api", [HealthStatus::Healthy]);
+    h.rec.reconcile().await.unwrap();
+
+    // Both crash; the next pass starts `db` first, and `api`'s gate has to poll `db` to health.
+    h.fake.crash_container("db", 1);
+    h.fake.crash_container("api", 1);
+    h.fake
+        .script_health("db", [HealthStatus::Starting, HealthStatus::Healthy]);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+
+    let calls = h.fake.calls();
+    let api_start = calls
+        .iter()
+        .rposition(|c| *c == Call::ContainerStart("api".into()))
+        .expect("api started");
+    assert_eq!(
+        calls[api_start - 1],
+        Call::HealthcheckRun("db".into()),
+        "the last thing before starting api is the dependency's health: {calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_deploy_is_refused_while_the_dependency_is_down() {
+    let h = Harness::new(DEPENDS);
+    h.rec.reconcile().await.unwrap();
+    h.fake.crash_container("db", 1);
+    let err = h.rec.deploy(&name("api"), true).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::DependenciesNotReady { pending, .. }
+            if pending.iter().any(|(dep, _)| dep == &name("db"))),
+        "{err:?}"
+    );
+    // Nothing was touched: the dependent still has its previous container and state.
+    assert!(h.state("api").current.is_some());
+    assert!(
+        h.fake
+            .containers()
+            .iter()
+            .any(|c| c.name == "api" && c.state == ContainerState::Running)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacing_a_running_container_is_not_blocked_by_its_dependency() {
+    let h = Harness::new(DEPENDS);
+    h.rec.reconcile().await.unwrap();
+    let creates = |h: &Harness| {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| **c == Call::ContainerCreate("api".into()))
+            .count()
+    };
+    assert_eq!(creates(&h), 1);
+
+    // `db` becomes provision-only (its container is removed) and `api` gets a spec change. Replacing
+    // a container that is already running is not a start, so the gate must not block the recreate.
+    let apps = DEPENDS.replace(
+        "[apps.db]\nimage = \"ghcr.io/x/db:latest\"\n",
+        "[apps.db]\nimage = \"ghcr.io/x/db:latest\"\nstart = false\n",
+    );
+    let apps = apps.replace(
+        "depends_on = [\"db\"]",
+        "depends_on = [\"db\"]\nenv = { A = \"1\" }",
+    );
+    h.set_apps(&apps);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert!(report.waiting_for_dependencies.is_empty(), "{report:?}");
+    assert_eq!(
+        creates(&h),
+        2,
+        "api was recreated despite the dependency being down"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn removing_a_dependency_is_refused() {
+    let h = Harness::new(DEPENDS);
+    let err = h.rec.remove_app(&name("db")).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::DependencyInUse { dependents, .. }
+            if dependents == &vec![name("api")]),
+        "{err:?}"
+    );
+    let apps = crate::state::load_apps(&h.rec.paths().apps).unwrap();
+    assert!(apps.apps.contains_key(&name("db")), "nothing was removed");
+
+    h.rec.remove_app(&name("api")).await.unwrap();
+    h.rec.remove_app(&name("db")).await.unwrap();
+}

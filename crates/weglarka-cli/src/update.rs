@@ -14,7 +14,7 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use weglarka_core::app::{AppSpec, SecretBinding, SecretTarget};
+use weglarka_core::app::{AppSpec, InstanceName, SecretBinding, SecretTarget};
 use weglarka_core::state::AppState;
 
 use crate::cli::{StartStopArgs, parse_pair};
@@ -61,6 +61,9 @@ pub struct UpdateArgs {
     /// Remove the binding of a secret (repeatable). The stored value is kept.
     #[arg(long = "unbind-secret", value_name = "SECRET", conflicts_with = "spec")]
     pub unbind_secrets: Vec<String>,
+    /// Remove a dependency (repeatable); the dependency itself is not touched.
+    #[arg(long = "remove-depends-on", value_name = "NAME", value_parser = parse_instance, conflicts_with = "spec")]
+    pub remove_depends_on: Vec<InstanceName>,
     /// Enable auto-update (the webhook swaps the image on its own).
     #[arg(long, conflicts_with_all = ["spec", "no_auto_update"])]
     pub auto_update: bool,
@@ -95,6 +98,7 @@ impl UpdateArgs {
             || !self.secret_env.is_empty()
             || !self.secret_mount.is_empty()
             || !self.unbind_secrets.is_empty()
+            || !self.remove_depends_on.is_empty()
             || self.auto_update
             || self.no_auto_update
             || self.start
@@ -106,6 +110,11 @@ impl UpdateArgs {
 fn missing(what: &str, value: &str) -> CliError {
     CliError::usage(format!("{what} {value:?} is not in the app's spec"))
         .with_hint("check the current spec with `weglarka apps show <name>`")
+}
+
+/// An app name used by the flag (the strong type has no `FromStr`, and the message is nicer).
+fn parse_instance(s: &str) -> Result<InstanceName, String> {
+    InstanceName::new(s).map_err(|e| e.to_string())
 }
 
 /// Applies the flags to the current spec (pure; the order is: removals, then additions).
@@ -163,6 +172,13 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
             secret: secret.clone(),
             target,
         });
+    }
+    for dep in &a.remove_depends_on {
+        let before = spec.depends_on.len();
+        spec.depends_on.retain(|x| x != dep);
+        if spec.depends_on.len() == before {
+            return Err(missing("dependency", dep.as_str()));
+        }
     }
     if a.auto_update {
         spec.auto_update = true;
@@ -549,6 +565,32 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         // Adding an existing domain is a no-op, not a duplicate.
         let s = apply_flags(spec(), &args(&["--domain", "old.example.eu"])).unwrap();
         assert_eq!(s.domains, ["old.example.eu"]);
+    }
+
+    #[test]
+    fn depends_on_flags_add_and_remove() {
+        let mut with_deps = spec();
+        with_deps.depends_on = vec![InstanceName::new("db").unwrap()];
+        let s = apply_flags(with_deps.clone(), &args(&["--depends-on", "cache"])).unwrap();
+        assert_eq!(
+            s.depends_on,
+            [
+                InstanceName::new("db").unwrap(),
+                InstanceName::new("cache").unwrap()
+            ]
+        );
+        let s = apply_flags(with_deps, &args(&["--remove-depends-on", "db"])).unwrap();
+        assert!(s.depends_on.is_empty());
+        // Removing an absent dependency is a usage error, like the other removals.
+        let err = apply_flags(spec(), &args(&["--remove-depends-on", "db"])).unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
+        // `--depends-on` conflicts with `--spec`, like every other spec flag.
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        assert!(W::try_parse_from(["w", "ntfy", "--depends-on", "db", "--spec", "f"]).is_err());
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub async fn update_app<P: PodmanClient + 'static>(
         // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
         // by another app), as in `add`. Both see the candidate app set.
         weglarka_core::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
+        // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
+        weglarka_core::depends::validate(&apps).map_err(invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;
         match tokio::time::timeout(
             MUTATION_TIMEOUT,
@@ -130,15 +132,11 @@ async fn redeploy<P: PodmanClient + 'static>(
     let mut outcome = match d.engine.deploy(name, false).await {
         Ok(o) => o,
         Err(EngineError::MissingSecrets(_)) => return Ok(None),
-        Err(e) => return Err(saved_but_failed(e)),
+        Err(e) => return Err(deploy_failed(e)),
     };
     if matches!(outcome, CoreOutcome::KnownBad { .. }) {
         // An explicit image change is the operator's will: retry a known-bad digest.
-        outcome = d
-            .engine
-            .deploy(name, true)
-            .await
-            .map_err(saved_but_failed)?;
+        outcome = d.engine.deploy(name, true).await.map_err(deploy_failed)?;
     }
     let generation = state::load_state(&d.paths.state.state)
         .map_err(internal)?
@@ -178,6 +176,15 @@ fn saved_but_failed(why: impl ToString) -> Fail {
         "spec saved, but the deploy failed: {}",
         why.to_string()
     ))
+}
+
+/// Error of the deploy that follows a spec write. An unmet dependency is a conflict (409) with the
+/// dependencies listed, not a failed deploy: the start was never attempted (issue #35).
+fn deploy_failed(e: EngineError) -> Fail {
+    match e {
+        e @ EngineError::DependenciesNotReady { .. } => Fail::from(e),
+        e => saved_but_failed(e),
+    }
 }
 
 /// Doctor: apps waiting for secrets are a warning with the exact command to fix it.

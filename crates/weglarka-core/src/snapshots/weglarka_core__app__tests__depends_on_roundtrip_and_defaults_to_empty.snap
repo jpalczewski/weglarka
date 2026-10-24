@@ -1,0 +1,34 @@
+---
+source: crates/weglarka-core/src/app.rs
+expression: parsed
+---
+{
+  "apps": {
+    "api": {
+      "image": "ghcr.io/x/api:latest",
+      "domains": [],
+      "env": {},
+      "secrets": [],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30
+      },
+      "depends_on": [
+        "db",
+        "cache"
+      ],
+      "auto_update": true
+    },
+    "db": {
+      "image": "ghcr.io/x/db:latest",
+      "domains": [],
+      "env": {},
+      "secrets": [],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30
+      },
+      "auto_update": true
+    }
+  }
+}

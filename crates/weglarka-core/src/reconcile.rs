@@ -49,6 +49,40 @@ pub enum EngineError {
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),
+    /// The apps in `depends_on` are not running/healthy yet. Not a failure: the start is retried
+    /// once they are, and reconcile reports it as waiting (`docs/decisions/0016-depends-on.md`).
+    #[error("waiting for dependencies of {instance}: {}", format_pending(pending))]
+    DependenciesNotReady {
+        instance: InstanceName,
+        pending: Vec<(InstanceName, String)>,
+    },
+    /// `apps remove` of an app that another app lists in `depends_on` (issue #35).
+    #[error(
+        "app {name} is a dependency of: {}; remove those depends_on entries first",
+        join_names(dependents)
+    )]
+    DependencyInUse {
+        name: InstanceName,
+        dependents: Vec<InstanceName>,
+    },
+}
+
+/// `a, b` for error messages.
+fn join_names(names: &[InstanceName]) -> String {
+    names
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `dep (reason), dep (reason)` for [`EngineError::DependenciesNotReady`].
+fn format_pending(pending: &[(InstanceName, String)]) -> String {
+    pending
+        .iter()
+        .map(|(dep, why)| format!("{dep} ({why})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What to do on a secret value change (decision: a daemon config option).
@@ -66,6 +100,9 @@ pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
     /// Time allowed for gracefully stopping the old container.
     pub stop_timeout_secs: u32,
+    /// How long a start waits for the apps in `depends_on` (issue #35). `0` means a single check
+    /// (no waiting); the default stays below the admin API's mutation timeout.
+    pub dependency_wait_secs: u32,
 }
 
 impl Default for ReconcilerOptions {
@@ -73,6 +110,7 @@ impl Default for ReconcilerOptions {
         Self {
             secret_change: SecretChangePolicy::default(),
             stop_timeout_secs: 10,
+            dependency_wait_secs: 10,
         }
     }
 }
@@ -95,6 +133,9 @@ pub struct Target {
     pub uid_range: Option<String>,
     /// `spec.start`: `false` means provision-only — no container may exist (one is removed).
     pub start: bool,
+    /// Apps that must be running before this one starts (`spec.depends_on`, issue #35). Used by
+    /// [`plan`] for the start order and by the executor's dependency gate.
+    pub depends_on: Vec<InstanceName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,8 +162,9 @@ pub enum Action {
     Remove { container: String },
 }
 
-/// Compares desired state with observed containers. Order: cleanup first, then
-/// instances alphabetically. Does no I/O.
+/// Compares desired state with observed containers. Order: cleanup first, then instances in
+/// `depends_on` order (dependencies first, alphabetical among the ready ones — plain alphabetical
+/// when no app declares dependencies). Does no I/O.
 pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
     let mut by_instance: BTreeMap<&str, Vec<&ContainerInfo>> = BTreeMap::new();
     for c in observed {
@@ -141,9 +183,17 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
     }
 
     let mut actions = removals;
-    let mut ordered: Vec<&Target> = targets.iter().collect();
-    ordered.sort_by(|a, b| a.instance.cmp(&b.instance));
-    for t in ordered {
+    let by_name: BTreeMap<&InstanceName, &Target> =
+        targets.iter().map(|t| (&t.instance, t)).collect();
+    let edges: Vec<(&InstanceName, &[InstanceName])> = targets
+        .iter()
+        .map(|t| (&t.instance, t.depends_on.as_slice()))
+        .collect();
+    for name in crate::depends::order(edges) {
+        let Some(t) = by_name.get(&name) else {
+            continue;
+        };
+        let t = *t;
         let own = by_instance.get(t.instance.as_str());
         let main_name = labels::container_name(&t.instance);
         let main = own.and_then(|cs| cs.iter().find(|c| c.name == main_name));
@@ -228,6 +278,9 @@ pub struct ReconcileReport {
     pub blocked: Vec<(InstanceName, String)>,
     /// Instances left alone because the spec binds secrets that are not set (not a problem).
     pub waiting: Vec<(InstanceName, Vec<String>)>,
+    /// Instances whose start waits for an app in their `depends_on` that is not running/healthy yet
+    /// (not a problem: the next pass retries once the dependency is up, issue #35).
+    pub waiting_for_dependencies: Vec<(InstanceName, Vec<InstanceName>)>,
 }
 
 impl ReconcileReport {
@@ -378,6 +431,7 @@ impl<P: PodmanClient> Reconciler<P> {
     pub async fn remove_app(&self, name: &InstanceName) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
+        crate::depends::ensure_not_depended_on(&apps, name)?;
         if apps.apps.remove(name).is_none() {
             return Err(EngineError::UnknownInstance(name.clone()));
         }
@@ -454,6 +508,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 blocked,
                 uid_range,
                 start: spec.start,
+                depends_on: spec.depends_on.clone(),
             });
         }
 
@@ -461,11 +516,29 @@ impl<P: PodmanClient> Reconciler<P> {
             state::save_state(&self.paths.state, &st)?;
         }
         for action in plan(&targets, &observed) {
-            let result = self.execute(&apps, action.clone()).await;
-            if let Err(e) = &result {
-                tracing::warn!(?action, error = %e, "reconcile action failed");
+            match self.execute(&apps, action.clone()).await {
+                Ok(outcome) => report.actions.push(ActionReport {
+                    action,
+                    result: Ok(outcome),
+                }),
+                Err(EngineError::DependenciesNotReady { instance, pending }) => {
+                    tracing::info!(
+                        instance = %instance,
+                        pending = %format_pending(&pending),
+                        "waiting for dependencies"
+                    );
+                    report
+                        .waiting_for_dependencies
+                        .push((instance, pending.into_iter().map(|(dep, _)| dep).collect()));
+                }
+                Err(e) => {
+                    tracing::warn!(?action, error = %e, "reconcile action failed");
+                    report.actions.push(ActionReport {
+                        action,
+                        result: Err(e),
+                    });
+                }
             }
-            report.actions.push(ActionReport { action, result });
         }
 
         // We clean up orphan state after their containers are removed.
@@ -524,7 +597,11 @@ impl<P: PodmanClient> Reconciler<P> {
                 Ok(ActionOutcome::Recreated(outcome))
             }
             Action::Start { instance } => {
-                debug_assert!(apps.apps.contains_key(&instance));
+                let spec = apps
+                    .apps
+                    .get(&instance)
+                    .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
+                self.dependency_gate(&instance, spec).await?;
                 self.podman
                     .container_start(&labels::container_name(&instance))
                     .await?;
@@ -609,6 +686,7 @@ mod tests {
                 blocked: false,
                 uid_range: None,
                 start: true,
+                depends_on: vec![],
             },
             h,
         )
@@ -726,6 +804,30 @@ mod tests {
                 Action::Deploy {
                     instance: name("b")
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn dependencies_are_planned_first() {
+        // `api` sorts before `db`, but `db` must be started first (issue #35).
+        let (mut api, _) = target("api", None);
+        api.depends_on = vec![name("db")];
+        let (db, _) = target("db", None);
+        let (cache, _) = target("cache", None);
+        let acts = plan(&[api, db, cache], &[]);
+        assert_eq!(
+            acts,
+            vec![
+                Action::Deploy {
+                    instance: name("cache")
+                },
+                Action::Deploy {
+                    instance: name("db")
+                },
+                Action::Deploy {
+                    instance: name("api")
+                },
             ]
         );
     }
