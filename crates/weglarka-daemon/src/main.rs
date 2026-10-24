@@ -158,14 +158,14 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
             }
             platform.install_service(&spec).await?;
             println!(
-                "Zainstalowano. Uruchom: systemctl --user start {SERVICE_NAME}.service \
-                 (wymaga `loginctl enable-linger {}`)",
+                "Installed. Start it with: systemctl --user start {SERVICE_NAME}.service \
+                 (requires `loginctl enable-linger {}`)",
                 settings.host.runtime.user
             );
         }
         PlatformAction::Remove => {
             platform.remove_service(SERVICE_NAME).await?;
-            println!("Usunięto plik serwisu {SERVICE_NAME}.");
+            println!("Removed the {SERVICE_NAME} service file.");
         }
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);

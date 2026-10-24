@@ -44,7 +44,7 @@ fn runtime_user<'a>(cx: &'a Context<'_>, id: &str) -> Result<&'a RuntimeUser, Do
         warn(
             id,
             format!("skipped: runtime user {:?} not found", cx.runtime.user),
-            "najpierw napraw `runtime.user`",
+            "fix `runtime.user` first",
         )
     })
 }
@@ -71,8 +71,8 @@ impl Check for ConfigFile {
             (None, err) => fail(
                 self.id(),
                 err.clone().unwrap_or_else(|| "config not loaded".into()),
-                "utwórz weglarka.toml (Ansible) albo wskaż plik przez --config / WEGLARKA_CONFIG; \
-                 dalsze sprawdzenia używają wartości domyślnych",
+                "create weglarka.toml (Ansible) or point to a file with --config / WEGLARKA_CONFIG; \
+                 the remaining checks use defaults",
             ),
         }
     }
@@ -90,8 +90,8 @@ impl Check for RuntimeUserExists {
                 self.id(),
                 format!("user {:?} does not exist", cx.runtime.user),
                 format!(
-                    "utwórz usera (`useradd --create-home --shell /usr/sbin/nologin {}`) \
-                     lub popraw [runtime] user w weglarka.toml",
+                    "create the user (`useradd --create-home --shell /usr/sbin/nologin {}`) \
+                     or fix [runtime] user in weglarka.toml",
                     cx.runtime.user
                 ),
             ),
@@ -128,7 +128,7 @@ impl Check for SubIds {
             Err(c) => return c,
         };
         let hint = format!(
-            "dodaj zakres: `usermod --add-{}s <start>-<koniec> {}` (≥ {RECOMMENDED_SUBID_COUNT} id zalecane, {MIN_SUBID_COUNT} minimum)",
+            "add a range: `usermod --add-{}s <start>-<end> {}` (≥ {RECOMMENDED_SUBID_COUNT} ids recommended, {MIN_SUBID_COUNT} minimum)",
             if self.file.ends_with("subuid") {
                 "sub-uid"
             } else {
@@ -183,7 +183,7 @@ impl Check for CgroupsV2 {
             return fail(
                 self.id(),
                 "cgroups v2 (unified hierarchy) not detected",
-                "uruchom system z `systemd.unified_cgroup_hierarchy=1` (cgroups v2 jest wymagane przez rootless Podmana)",
+                "boot the system with `systemd.unified_cgroup_hierarchy=1` (cgroups v2 is required by rootless Podman)",
             );
         }
         if let Some(u) = &cx.user {
@@ -204,7 +204,7 @@ impl Check for CgroupsV2 {
                             u.name,
                             missing.join(", ")
                         ),
-                        "utwórz /etc/systemd/system/user@.service.d/delegate.conf z `[Service]\\nDelegate=cpu cpuset io memory pids`",
+                        "create /etc/systemd/system/user@.service.d/delegate.conf with `[Service]\\nDelegate=cpu cpuset io memory pids`",
                     );
                 }
             }
@@ -234,7 +234,7 @@ impl Check for Linger {
                 self.id(),
                 format!("linger disabled for {}", user.name),
                 format!(
-                    "`loginctl enable-linger {}` — bez tego usługi usera zatrzymają się po wylogowaniu",
+                    "`loginctl enable-linger {}` — without it the user's services stop on logout",
                     user.name
                 ),
             )
@@ -252,7 +252,7 @@ impl Check for PodmanSocket {
             return warn(
                 self.id(),
                 "skipped: socket path unknown (no runtime user)",
-                "ustaw [runtime] socket albo popraw usera",
+                "set [runtime] socket or fix the user",
             );
         };
         match cx.host.podman_ping(&socket) {
@@ -267,17 +267,17 @@ impl Check for PodmanSocket {
                     socket.display(),
                     p.status
                 ),
-                "sprawdź `systemctl --user status podman.socket` jako user runtime'u",
+                "check `systemctl --user status podman.socket` as the runtime user",
             ),
             Err(e) if e.kind() == ErrorKind::PermissionDenied => warn(
                 self.id(),
                 format!("no permission to connect to {}", socket.display()),
-                "uruchom preflight jako user runtime'u (`sudo -u <user> weglarka doctor --preflight`)",
+                "run the preflight as the runtime user (`sudo -u <user> weglarka doctor --preflight`)",
             ),
             Err(e) => fail(
                 self.id(),
                 format!("cannot reach podman socket {}: {e}", socket.display()),
-                "włącz socket: `systemctl --user enable --now podman.socket` (jako user runtime'u, wymaga linger)",
+                "enable the socket: `systemctl --user enable --now podman.socket` (as the runtime user, requires linger)",
             ),
         }
     }
@@ -293,7 +293,7 @@ impl Check for PodmanApiVersion {
             return warn(
                 self.id(),
                 "skipped: socket path unknown",
-                "napraw `runtime.socket`",
+                "fix `runtime.socket`",
             );
         };
         let ping = match cx.host.podman_ping(&socket) {
@@ -302,7 +302,7 @@ impl Check for PodmanApiVersion {
                 return warn(
                     self.id(),
                     format!("skipped: podman unreachable ({e})"),
-                    "napraw `runtime.socket`",
+                    "fix `runtime.socket`",
                 );
             }
         };
@@ -317,12 +317,12 @@ impl Check for PodmanApiVersion {
             Some((major, minor)) => fail(
                 self.id(),
                 format!("libpod API {major}.{minor} is too old (need ≥ {MIN_PODMAN_MAJOR}.0)"),
-                "zainstaluj Podmana 6 z repo alvistack (notatka MVP, decyzja 1); v4/v5 nie są wspierane",
+                "install Podman 6 from the alvistack repo (MVP note, decision 1); v4/v5 are not supported",
             ),
             None => fail(
                 self.id(),
                 "podman did not report Libpod-API-Version",
-                "to nie wygląda na socket libpod — sprawdź ścieżkę [runtime] socket",
+                "this does not look like a libpod socket — check the [runtime] socket path",
             ),
         }
     }
@@ -335,7 +335,7 @@ impl Check for PodmanSource {
     }
     fn run(&self, cx: &Context<'_>) -> DoctorCheck {
         let hint = format!(
-            "zainstaluj podman z repo `home:alvistack` i przypnij stos Podmana w apt preferences (źródło musi zawierać „{PINNED_PODMAN_SOURCE}”)"
+            "install podman from the `home:alvistack` repo and pin the Podman stack in apt preferences (the source must contain “{PINNED_PODMAN_SOURCE}”)"
         );
         match cx.host.run("apt-cache", &["policy", "podman"]) {
             Err(_) => warn(
@@ -377,7 +377,7 @@ impl Check for Netavark {
             return fail(
                 self.id(),
                 "netavark not found",
-                "zainstaluj netavark 2 (zależność Podmana 6)",
+                "install netavark 2 (a Podman 6 dependency)",
             );
         };
         let version = out.stdout.trim().to_owned();
@@ -427,19 +427,19 @@ impl Check for Netavark {
             Some(other) => fail(
                 self.id(),
                 format!("{version}, firewall driver pinned to {other:?}"),
-                "ustaw NETAVARK_FW=nftables (Podman 6 + nftables jest wymagany)",
+                "set NETAVARK_FW=nftables (Podman 6 + nftables is required)",
             ),
             None if nft => warn(
                 self.id(),
                 format!(
                     "{version}, firewall driver not pinned (nft present; netavark may pick iptables)"
                 ),
-                "przypnij: `[engine]\\nenv = [\"NETAVARK_FW=nftables\"]` w containers.conf usera runtime'u",
+                "pin it: `[engine]\\nenv = [\"NETAVARK_FW=nftables\"]` in the runtime user's containers.conf",
             ),
             None => fail(
                 self.id(),
                 format!("{version}, but `nft` is missing"),
-                "zainstaluj pakiet nftables i ustaw NETAVARK_FW=nftables",
+                "install the nftables package and set NETAVARK_FW=nftables",
             ),
         }
     }
@@ -475,7 +475,7 @@ impl Check for Pasta {
             None => fail(
                 self.id(),
                 "pasta not found",
-                "zainstaluj pakiet `passt` (pasta = domyślna sieć rootless w Podmanie ≥ 5)",
+                "install the `passt` package (pasta = the default rootless network in Podman ≥ 5)",
             ),
         }
     }
@@ -506,8 +506,8 @@ impl Check for AppArmorUserns {
             }
             Ok(_) => {}
         }
-        let hint = "załaduj profil podman: `apparmor_parser -r /etc/apparmor.d/podman` (pakiet podman z alvistack/Ubuntu go dostarcza; \
-                    profil musi mieć `userns,`) albo ustaw sysctl `kernel.apparmor_restrict_unprivileged_userns=0`";
+        let hint = "load the podman profile: `apparmor_parser -r /etc/apparmor.d/podman` (the podman package from alvistack/Ubuntu provides it; \
+                    the profile must have `userns,`) or set the sysctl `kernel.apparmor_restrict_unprivileged_userns=0`";
         match cx.host.read_to_string(Path::new(Self::PROFILES)) {
             Ok(src) => {
                 let loaded = src
@@ -536,7 +536,7 @@ impl Check for AppArmorUserns {
                         if file { "exists" } else { "is missing" }
                     ),
                     if file {
-                        "uruchom preflight jako root, by potwierdzić załadowanie profilu (`aa-status`)"
+                        "run the preflight as root to confirm the profile is loaded (`aa-status`)"
                     } else {
                         hint
                     },
@@ -565,7 +565,7 @@ impl Check for TraefikFile {
             return fail(
                 self.id(),
                 "ingress.mode = behind, but traefik_dynamic_file is not set",
-                "ustaw [ingress] traefik_dynamic_file w weglarka.toml",
+                "set [ingress] traefik_dynamic_file in weglarka.toml",
             );
         };
         let st = match cx.host.stat(path) {
@@ -574,14 +574,14 @@ impl Check for TraefikFile {
                 return fail(
                     self.id(),
                     format!("{} does not exist", path.display()),
-                    "załóż plik z góry (Ansible) i oddaj go userowi runtime'u — Węglarka nadpisuje go w miejscu",
+                    "create the file up front (Ansible) and give it to the runtime user — Węglarka overwrites it in place",
                 );
             }
             Err(e) => {
                 return warn(
                     self.id(),
                     format!("cannot stat {}: {e}", path.display()),
-                    "uruchom preflight jako user runtime'u, by sprawdzić dostęp",
+                    "run the preflight as the runtime user to check access",
                 );
             }
         };
@@ -589,7 +589,7 @@ impl Check for TraefikFile {
             return fail(
                 self.id(),
                 format!("{} is not a regular file", path.display()),
-                "wskaż zwykły plik YAML",
+                "point to a regular YAML file",
             );
         }
         let user = match runtime_user(cx, self.id()) {
@@ -612,7 +612,7 @@ impl Check for TraefikFile {
                     st.uid
                 ),
                 format!(
-                    "`chown {0} {1}` i `chmod 0644 {1}`",
+                    "`chown {0} {1}` and `chmod 0644 {1}`",
                     user.name,
                     path.display()
                 ),
@@ -635,7 +635,7 @@ impl Check for BindAddress {
         if ip.is_unspecified() {
             return ok(self.id(), format!("{bind} listens on all interfaces"));
         }
-        let hint = "adres musi należeć do interfejsu hosta (dla Traefika z Coolify: gateway docker0, np. 172.17.0.1)";
+        let hint = "the address must belong to a host interface (for Traefik from Coolify: the docker0 gateway, e.g. 172.17.0.1)";
         let out = match cx.host.run("ip", &["-j", "addr", "show"]) {
             Ok(o) if o.success => o,
             _ => return warn(self.id(), "cannot list interfaces (`ip` unavailable)", hint),
@@ -684,7 +684,7 @@ impl Check for BindFree {
                 return warn(
                     self.id(),
                     format!("cannot read /proc/net/tcp: {e}"),
-                    "nie można sprawdzić zajętości portu",
+                    "cannot check whether the port is in use",
                 );
             }
         };
@@ -705,7 +705,7 @@ impl Check for BindFree {
         if holders.iter().all(|l| Some(l.uid) == ours) {
             return ok(
                 self.id(),
-                format!("{bind} is held by the runtime user (nginx Węglarki running)"),
+                format!("{bind} is held by the runtime user (Węglarka's nginx running)"),
             );
         }
         let other = holders
@@ -719,7 +719,7 @@ impl Check for BindFree {
                 bind.port(),
                 other.uid
             ),
-            "wybierz wolny port w [ingress] bind (np. 8088; na niechybnie 8080 zajmuje Traefik z Coolify) — sprawdź `ss -ltnp`",
+            "pick a free port in [ingress] bind (e.g. 8088; on niechybnie 8080 is taken by Traefik from Coolify) — check `ss -ltnp`",
         )
     }
 }
@@ -751,7 +751,7 @@ impl Check for TraefikSync {
                 return warn(
                     self.id(),
                     format!("cannot read {TRAEFIK_POLICY_PATH}: {e}"),
-                    "uruchom preflight z dostępem do pliku polityki",
+                    "run the preflight with access to the policy file",
                 );
             }
         };
@@ -761,7 +761,7 @@ impl Check for TraefikSync {
                 return fail(
                     self.id(),
                     format!(
-                        "{TRAEFIK_SYNC_UNIT} is {} — zmiany pliku Traefika nie będą publikowane",
+                        "{TRAEFIK_SYNC_UNIT} is {} — changes to the Traefik file will not be published",
                         out.stdout.trim()
                     ),
                     format!(
@@ -773,7 +773,7 @@ impl Check for TraefikSync {
                 return warn(
                     self.id(),
                     "cannot query systemd (`systemctl` unavailable)",
-                    format!("sprawdź ręcznie `systemctl is-active {TRAEFIK_SYNC_UNIT}`"),
+                    format!("check manually `systemctl is-active {TRAEFIK_SYNC_UNIT}`"),
                 );
             }
         }
@@ -783,7 +783,7 @@ impl Check for TraefikSync {
                 format!(
                     "{TRAEFIK_SYNC_UNIT} active, but {TRAEFIK_POLICY_PATH} has no readable domain allowlist"
                 ),
-                "oczekiwana tablica stringów `allowed_domains` (albo `domains`) w polityce",
+                "expected a string array `allowed_domains` (or `domains`) in the policy",
             );
         };
         let apps = match cx.host.read_to_string(&cx.apps_path) {
@@ -796,7 +796,7 @@ impl Check for TraefikSync {
                             "{TRAEFIK_SYNC_UNIT} active; cannot parse {}: {e}",
                             cx.apps_path.display()
                         ),
-                        "popraw apps.toml, by sprawdzić domeny względem polityki",
+                        "fix apps.toml to check the domains against the policy",
                     );
                 }
             },
@@ -830,7 +830,7 @@ impl Check for TraefikSync {
                     rejected.join(", ")
                 ),
                 format!(
-                    "dodaj domeny do `weglarka_allowed_domains` w roli Ansible i wdróż politykę ({TRAEFIK_POLICY_PATH})"
+                    "add the domains to `weglarka_allowed_domains` in the Ansible role and deploy the policy ({TRAEFIK_POLICY_PATH})"
                 ),
             )
         }
@@ -859,17 +859,17 @@ impl Check for SecretsFile {
             Err(e) if e.kind() == ErrorKind::NotFound => warn(
                 self.id(),
                 format!("{} not found", path.display()),
-                "to normalne przed pierwszym `secrets set`; inna lokalizacja: --secrets-file / WEGLARKA_SECRETS_FILE",
+                "this is normal before the first `secrets set`; a different location: --secrets-file / WEGLARKA_SECRETS_FILE",
             ),
             Err(e) => warn(
                 self.id(),
                 format!("cannot stat {}: {e}", path.display()),
-                "uruchom jako user z dostępem do pliku",
+                "run as a user with access to the file",
             ),
             Ok(st) if st.kind != FileKind::File => fail(
                 self.id(),
                 format!("{} is not a regular file", path.display()),
-                "usuń i załóż zwykły plik 0600",
+                "remove it and create a regular 0600 file",
             ),
             Ok(st) if st.mode & 0o777 != 0o600 => fail(
                 self.id(),

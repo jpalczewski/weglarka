@@ -121,25 +121,25 @@ impl CliError {
     /// Daemon response error (`ApiError`) with a code-dependent hint.
     pub fn from_api(code: ErrorCode, message: String) -> Self {
         let (kind, hint) = match code {
-            ErrorCode::NotFound => (Kind::NotFound, Some("sprawdź nazwy: `weglarka apps list`")),
+            ErrorCode::NotFound => (Kind::NotFound, Some("check names: `weglarka apps list`")),
             ErrorCode::AlreadyExists => (
                 Kind::Conflict,
                 Some(
-                    "instancja już istnieje: `weglarka apps show <nazwa>`, usuń ją przez `apps remove`",
+                    "the instance already exists: `weglarka apps show <name>`, remove it with `apps remove`",
                 ),
             ),
             ErrorCode::Conflict => (
                 Kind::Conflict,
-                Some("operacja koliduje z trwającą inną — spróbuj ponownie za chwilę"),
+                Some("the operation conflicts with another in progress — try again in a moment"),
             ),
             ErrorCode::Busy => (
                 Kind::Conflict,
-                Some("demon wciąż jest zajęty (trwa deploy) — spróbuj ponownie za chwilę"),
+                Some("the daemon is still busy (deploy in progress) — try again in a moment"),
             ),
             ErrorCode::InvalidRequest => (Kind::InvalidRequest, None),
             ErrorCode::Internal => (
                 Kind::Internal,
-                Some("szczegóły w logach demona (`journalctl --user -u weglarka`)"),
+                Some("details in the daemon logs (`journalctl --user -u weglarka`)"),
             ),
         };
         let mut err = Self::new(kind, message);

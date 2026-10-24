@@ -265,7 +265,7 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
             c.line("'' close;");
         });
         c.blank();
-        c.line("# Nazwa apki dla access logu; ustawiana w każdym `server`.");
+        c.line("# App name for the access log; set in each `server`.");
         c.line("log_format weglarka escape=json");
         c.line(&format!("    '{LOG_FORMAT}';"));
         c.line("access_log /dev/stdout weglarka;");
