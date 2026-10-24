@@ -5,7 +5,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0018).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0019).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -124,6 +124,9 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`skip_serializing_if` w `HashInput`) — inaczej aktualizacja Węglarki odtworzy wszystkie działające apki.
 - **TOML-e mają `deny_unknown_fields`:** nowe pole w `state.toml`/`apps.toml` łamie rollback do starszego demona —
   opisz to w PR i w notatce do wdrożenia.
+- **Rollback przywraca digest, nie spec:** nieudany deploy wznawia poprzedni obraz *z nowym spec-em*, więc zmiana
+  specu, która psuje start (`command`, `env`, mount), obleje deploy **i** rollback — apka leży do czasu poprawki
+  specu. Nie opisuj nowego pola `AppSpec` jako „rollback-safe” (przykład: `command`, ADR 0019).
 - **libpod zwraca czasem 500 zamiast 404** (np. `no such container` w trakcie usuwania) — klient mapuje je na
   `NotFound`; operacje sprzątające (disconnect, remove) są best effort i idempotentne.
 - **Ingress:** każda zmiana generatorów przechodzi snapshoty, `nginx -t`, test nagłówków `X-Forwarded-*`
