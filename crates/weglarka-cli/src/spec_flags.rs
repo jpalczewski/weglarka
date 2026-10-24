@@ -4,7 +4,8 @@
 
 use clap::Args;
 use weglarka_core::app::{
-    AppSpec, CpuLimit, HostPort, InstanceName, MemoryLimit, VolumeMount, valid_volume_name,
+    AppSpec, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedVolumeName, SharedVolumeRef,
+    VolumeMount, valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -45,6 +46,10 @@ pub struct SpecFlags {
     /// Named volume: NAME=/PATH[:ro] (repeatable; replaces a volume of that name).
     #[arg(long = "volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_volume, conflicts_with = "spec")]
     pub volumes: Vec<VolumeMount>,
+    /// Shared volume mount: NAME=/PATH[:ro] (repeatable; replaces a mount of that name). The
+    /// volume must be declared first (`weglarka volumes add NAME`); v1 allows at most one per app.
+    #[arg(long = "shared-volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_shared_volume, conflicts_with = "spec")]
+    pub shared_volumes: Vec<SharedVolumeRef>,
     /// Hardening preset: read-only root, all capabilities dropped, no-new-privileges. Combine with
     /// --tmpfs for writable paths and --cap-add for what the app really needs.
     #[arg(long, conflicts_with = "spec")]
@@ -79,6 +84,7 @@ impl SpecFlags {
             && self.pids_limit.is_none()
             && self.cpus.is_none()
             && self.volumes.is_empty()
+            && self.shared_volumes.is_empty()
             && !self.hardened
             && self.read_only.is_none()
             && self.tmpfs.is_empty()
@@ -98,6 +104,10 @@ impl SpecFlags {
         for v in &self.volumes {
             spec.volumes.retain(|x| x.name != v.name);
             spec.volumes.push(v.clone());
+        }
+        for v in &self.shared_volumes {
+            spec.shared_volumes.retain(|x| x.name != v.name);
+            spec.shared_volumes.push(v.clone());
         }
         let sec = &mut spec.security;
         if self.hardened {
@@ -229,7 +239,8 @@ fn parse_cpus(s: &str) -> Result<Limit<CpuLimit>, String> {
     })
 }
 
-fn parse_volume(s: &str) -> Result<VolumeMount, String> {
+/// Splits `NAME=/PATH[:ro]` into its parts (`:ro` selects a read-only mount).
+fn split_mount(s: &str) -> Result<(&str, &str, bool), String> {
     let (name, rest) = s
         .split_once('=')
         .ok_or_else(|| format!("expected NAME=/PATH[:ro], got {s:?}"))?;
@@ -237,6 +248,11 @@ fn parse_volume(s: &str) -> Result<VolumeMount, String> {
         Some(t) => (t, true),
         None => (rest, false),
     };
+    Ok((name, target, read_only))
+}
+
+fn parse_volume(s: &str) -> Result<VolumeMount, String> {
+    let (name, target, read_only) = split_mount(s)?;
     if !valid_volume_name(name) {
         return Err(format!(
             "invalid volume name {name:?}: [a-z0-9-], 1–63 characters"
@@ -247,6 +263,21 @@ fn parse_volume(s: &str) -> Result<VolumeMount, String> {
     }
     Ok(VolumeMount {
         name: name.to_owned(),
+        target: target.to_owned(),
+        read_only,
+    })
+}
+
+fn parse_shared_volume(s: &str) -> Result<SharedVolumeRef, String> {
+    let (name, target, read_only) = split_mount(s)?;
+    let name = SharedVolumeName::new(name).map_err(|e| e.to_string())?;
+    if !target.starts_with('/') {
+        return Err(format!(
+            "shared volume path must be absolute, got {target:?}"
+        ));
+    }
+    Ok(SharedVolumeRef {
+        name,
         target: target.to_owned(),
         read_only,
     })
@@ -324,6 +355,59 @@ mod tests {
         assert!(parse_volume("Data=/data").is_err());
         assert!(parse_volume("data=relative").is_err());
         assert!(parse_volume("/data").is_err());
+    }
+
+    #[test]
+    fn parses_shared_volumes() {
+        let v = parse_shared_volume("kajet-data=/data").unwrap();
+        assert_eq!(
+            (v.name.as_str(), v.target.as_str(), v.read_only),
+            ("kajet-data", "/data", false)
+        );
+        let ro = parse_shared_volume("kajet-data=/data:ro").unwrap();
+        assert!(ro.read_only);
+        // The name has to be a valid shared volume name; the path has to be absolute.
+        assert!(parse_shared_volume("Kajet_Data=/data").is_err());
+        assert!(parse_shared_volume("kajet-data=relative").is_err());
+        assert!(parse_shared_volume("kajet-data").is_err());
+        assert!(parse_shared_volume("/data").is_err());
+    }
+
+    #[test]
+    fn apply_replaces_a_shared_volume_of_the_same_name() {
+        let mut spec = toml::from_str::<AppSpec>(
+            "image = \"i\"\nshared_volumes = [{ name = \"kajet-data\", target = \"/old\" }]\n",
+        )
+        .unwrap();
+        let flags = SpecFlags {
+            shared_volumes: vec![parse_shared_volume("kajet-data=/data:ro").unwrap()],
+            ..SpecFlags::default()
+        };
+        assert!(!flags.is_empty());
+        flags.apply(&mut spec);
+        assert_eq!(spec.shared_volumes.len(), 1);
+        assert_eq!(spec.shared_volumes[0].target, "/data");
+        assert!(spec.shared_volumes[0].read_only);
+
+        // Like --volume, --shared-volume conflicts with --spec.
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Add {
+            #[command(flatten)]
+            _a: crate::cli::AddArgs,
+        }
+        assert!(
+            Add::try_parse_from([
+                "add",
+                "ntfy",
+                "ghcr.io/x/ntfy:latest",
+                "--shared-volume",
+                "kajet-data=/data",
+                "--spec",
+                "f",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

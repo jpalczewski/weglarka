@@ -46,7 +46,8 @@ pub enum Command {
     Secrets(SecretsCommand),
     /// Self-diagnosis; `--preflight` runs locally, without the daemon.
     Doctor(DoctorArgs),
-    /// App volumes (list/export/import).
+    /// Volumes: list app volumes or declared shared volumes, export/import, declare/remove a
+    /// shared volume.
     #[command(subcommand)]
     Volumes(crate::volumes::VolumesCommand),
 }

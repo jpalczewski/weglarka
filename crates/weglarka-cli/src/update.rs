@@ -534,6 +534,26 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn shared_volume_flag_keeps_the_private_volumes() {
+        let before = spec();
+        let s = apply_flags(
+            before.clone(),
+            &args(&["--shared-volume", "kajet-data=/data"]),
+        )
+        .unwrap();
+        assert_eq!(s.volumes, before.volumes, "private volumes are untouched");
+        assert_eq!(s.shared_volumes.len(), 1);
+        assert_eq!(s.shared_volumes[0].name.as_str(), "kajet-data");
+        assert!(!s.shared_volumes[0].read_only);
+        // A second mount of the same volume replaces the first; `:ro` is parsed.
+        let s = apply_flags(s, &args(&["--shared-volume", "kajet-data=/mnt/data:ro"])).unwrap();
+        assert_eq!(s.shared_volumes.len(), 1);
+        assert_eq!(s.shared_volumes[0].target, "/mnt/data");
+        assert!(s.shared_volumes[0].read_only);
+        assert_eq!(s.volumes, before.volumes);
+    }
+
+    #[test]
     fn host_port_flag_appends_and_none_clears() {
         let s = apply_flags(spec(), &args(&["--host-port", "2222:22"])).unwrap();
         assert_eq!(s.host_ports.len(), 1);
