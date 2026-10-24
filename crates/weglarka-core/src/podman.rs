@@ -203,6 +203,18 @@ pub struct ContainerInfo {
     pub networks: Vec<String>,
 }
 
+/// Repository from an image reference — without tag and digest but **with** the registry port:
+/// `host:5000/a/b:1@sha256:…` → `host:5000/a/b`. Only a `:` after the last `/` starts a tag, so
+/// `localhost:5000/y` keeps its port instead of being cut to `localhost`.
+pub fn image_repo(image: &str) -> &str {
+    let image = image.split('@').next().unwrap_or(image);
+    let name_start = image.rfind('/').map_or(0, |i| i + 1);
+    match image[name_start..].rfind(':') {
+        Some(i) => &image[..name_start + i],
+        None => image,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
     pub id: String,
@@ -396,6 +408,25 @@ pub trait PodmanClient: Send + Sync {
     fn events(&self, filter: &EventFilter) -> impl Stream<Item = Result<PodmanEvent>> + Send;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::image_repo;
+
+    /// Tag and digest are dropped, a registry port is not — deploy, retention and the podman wire
+    /// parser all share this one helper.
+    #[test]
+    fn image_repo_strips_tag_and_digest_but_not_registry_port() {
+        assert_eq!(image_repo("ghcr.io/a/b:latest"), "ghcr.io/a/b");
+        assert_eq!(image_repo("ghcr.io/a/b"), "ghcr.io/a/b");
+        assert_eq!(image_repo("localhost:5000/a/b:1"), "localhost:5000/a/b");
+        assert_eq!(image_repo("localhost:5000/a"), "localhost:5000/a");
+        assert_eq!(image_repo("ghcr.io/a/b:1@sha256:abc"), "ghcr.io/a/b");
+        assert_eq!(image_repo("ghcr.io/x/y@sha256:ab"), "ghcr.io/x/y");
+        assert_eq!(image_repo("localhost:5000/y"), "localhost:5000/y");
+        assert_eq!(image_repo("localhost:5000/y:1"), "localhost:5000/y");
+    }
+}
+
 #[cfg(all(test, feature = "testing"))]
 mod fake_tests {
     use futures_util::StreamExt;
@@ -468,5 +499,28 @@ mod fake_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PodmanError::NotFound(_)));
+    }
+
+    /// A registry port is not a tag: a pull of `localhost:5000/y` registers the image under the
+    /// full repository, exactly as libpod names it (#76).
+    #[tokio::test]
+    async fn pull_registers_the_image_under_the_repository_with_the_registry_port() {
+        let fake = FakePodman::new();
+        let events: Vec<_> = fake.image_pull("localhost:5000/y").collect().await;
+        let digest = match events.last() {
+            Some(Ok(PullEvent::Complete {
+                digest: Some(digest),
+                ..
+            })) => digest.clone(),
+            other => panic!("pull did not complete: {other:?}"),
+        };
+
+        let pinned = format!("localhost:5000/y@{digest}");
+        assert!(fake.image_inspect(&pinned).await.is_ok());
+        let port_as_repo = format!("localhost@{digest}");
+        assert!(matches!(
+            fake.image_inspect(&port_as_repo).await,
+            Err(PodmanError::NotFound(_))
+        ));
     }
 }

@@ -13,7 +13,7 @@ use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
     ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent,
-    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    PullEvent, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -506,10 +506,7 @@ impl PodmanClient for FakePodman {
                     vec![reference.to_owned()],
                 )
             } else {
-                let repo = reference
-                    .rsplit_once(':')
-                    .map_or(reference, |(r, _)| r)
-                    .to_owned();
+                let repo = image_repo(reference);
                 let digest_name = format!("{repo}@{digest}");
                 (
                     vec![reference.to_owned()],

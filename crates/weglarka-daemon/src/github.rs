@@ -5,7 +5,7 @@
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use weglarka_core::deploy::image_repo;
+use weglarka_core::podman::image_repo;
 use weglarka_core::webhook::{WebhookError, WebhookEvent, WebhookRequest, WebhookSource};
 
 type HmacSha256 = Hmac<Sha256>;
