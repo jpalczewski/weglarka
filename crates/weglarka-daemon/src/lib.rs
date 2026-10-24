@@ -55,7 +55,7 @@ pub enum StartError {
     SharedVolumes(String),
     /// The startup preconditions of host config mounts are not met: `config_root` is configured but
     /// unusable, or an app declares `configs` while it is unset (issue #118,
-    /// `docs/decisions/0022-config-root-mounts.md`). A single missing/escaping source is *not* a
+    /// `docs/decisions/0023-config-root-mounts.md`). A single missing/escaping source is *not* a
     /// startup error — the engine refuses to mount it and `doctor` reports it.
     #[error("config mounts: {0}")]
     Configs(#[from] ConfigError),
@@ -87,28 +87,6 @@ fn io(what: impl Into<String>) -> impl FnOnce(std::io::Error) -> StartError {
 /// still be recovered from: the engine's `launch`/reconcile/`reload` refuse a missing or escaping
 /// source, and `doctor` reports each mount's status. `config_root` here is the path already resolved
 /// against the config directory by [`Paths::resolve`].
-fn validate_config_root(paths: &Paths, apps: &AppsFile) -> Result<(), ConfigError> {
-    let Some(root) = paths.config_root.as_deref() else {
-        return match apps.apps.iter().find(|(_, spec)| !spec.configs.is_empty()) {
-            Some((instance, _)) => Err(ConfigError::NoRootFor {
-                instance: instance.clone(),
-            }),
-            None => Ok(()),
-        };
-    };
-    match std::fs::metadata(root) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(ConfigError::RootUnavailable {
-            root: root.to_owned(),
-            reason: "not a directory".to_owned(),
-        }),
-        Err(e) => Err(ConfigError::RootUnavailable {
-            root: root.to_owned(),
-            reason: e.to_string(),
-        }),
-    }
-}
-
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -187,7 +165,7 @@ pub async fn start<P: PodmanClient + 'static>(
     // Host config mounts (issue #118): only the root's own preconditions stop the daemon — a single
     // missing/escaping source is refused by the engine at launch and reported by `doctor`, so that an
     // app added before its files exist does not keep the daemon from starting.
-    validate_config_root(&paths, &apps)?;
+    weglarka_core::config_mounts::validate_host(&host, &apps)?;
 
     // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
     // stops the daemon instead of failing silently at the first deploy.

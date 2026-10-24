@@ -187,22 +187,23 @@ pub fn describe(root: Option<&Path>, spec: &AppSpec) -> Vec<MountView> {
         .collect()
 }
 
-/// Validates the **host** side of `configs`: when any app declares a config mount, `config_root` must
-/// be set and usable (an existing directory). Individual sources are deliberately **not** resolved
-/// here: a file the operator has not created yet must not keep the daemon from starting. An
-/// unresolvable source blocks only the app (reconcile), is refused when the container is about to be
-/// created (`launch`) and is reported by `doctor`.
+/// Validates the **host** side of `configs`: a configured `config_root` must be a usable directory
+/// (checked even before an app uses it — a typo or a missing mount is a host misconfiguration), and
+/// declaring `configs` without a `config_root` is an error naming the app. Individual sources are
+/// deliberately **not** resolved here: a file the operator has not created yet must not keep the
+/// daemon from starting. An unresolvable source blocks only the app (reconcile), is refused when the
+/// container is about to be created (`launch`) and is reported by `doctor`.
 pub fn validate_host(host: &HostConfig, apps: &AppsFile) -> Result<(), ConfigError> {
-    let Some((first, _)) = apps.apps.iter().find(|(_, spec)| !spec.configs.is_empty()) else {
-        return Ok(());
-    };
-    let root = host
-        .config_root
-        .as_deref()
-        .ok_or_else(|| ConfigError::NoRootFor {
-            instance: first.clone(),
-        })?;
-    canonical_root(root)?;
+    if let Some(root) = host.config_root.as_deref() {
+        canonical_root(root)?;
+    }
+    if host.config_root.is_none()
+        && let Some((instance, _)) = apps.apps.iter().find(|(_, spec)| !spec.configs.is_empty())
+    {
+        return Err(ConfigError::NoRootFor {
+            instance: instance.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -654,6 +655,14 @@ domain = "weglarka.example.eu"
 
         // No configs anywhere: no root needed.
         validate_host(&host(None), &apps("")).unwrap();
+        // A configured root is checked even before an app uses it: a missing directory is a typo or
+        // a missing mount, not something to discover at the first deploy.
+        let err = validate_host(
+            &host(Some(&root.path().join("missing-dir"))),
+            &apps(""),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::RootUnavailable { .. }), "{err}");
         // A declared mount without a root is an error that names the app.
         let err = validate_host(
             &host(None),

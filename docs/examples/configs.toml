@@ -19,10 +19,10 @@
 #
 # Flags added for apps where a whole TOML file is overkill:
 #   weglarka apps update prometheus \
-#     --config prometheus/prometheus.yml:/etc/prometheus/prometheus.yml \
-#     --config prometheus/rules:/etc/prometheus/rules \
+#     --config-mount prometheus/prometheus.yml:/etc/prometheus/prometheus.yml \
+#     --config-mount prometheus/rules:/etc/prometheus/rules \
 #     --reload-signal SIGHUP
-#   weglarka apps update prometheus --config none      # clear the list
+#   weglarka apps update prometheus --config-mount none      # clear the list
 #
 # What recreates the container and what does not:
 # - the `configs` list (source/target) is part of the spec hash, so adding/removing/retargeting a mount

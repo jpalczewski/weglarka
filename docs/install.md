@@ -1021,8 +1021,9 @@ configs = [
 reload_signal = "SIGHUP"   # opcjonalnie: bez niego `apps reload` restartuje kontener
 ```
 
-Przez flagi CLI: `weglarka apps update prometheus --config prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
---reload-signal SIGHUP` (flaga zastępuje wpis o tym samym `source`; `--config none` czyści listę).
+Przez flagi CLI: `weglarka apps update prometheus --config-mount prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+--reload-signal SIGHUP` (flaga zastępuje wpis o tym samym `source`; `--config-mount none` czyści listę). To flaga
+specu apki — globalne `--config plik.toml` (plik konfiguracji hosta) jej nie koliduje i dalej działa jak dotąd.
 
 Bezpieczeństwo: `source` musi być względny, bez `.`/`..`, po rozwiązaniu symlinków musi zostać wewnątrz
 `config_root`, a `target` podlega regułom wolumenów. Sekretów nie trzymaj w `config_root` — apka powinna czytać je
@@ -1160,7 +1161,7 @@ diff i niczego nie wysyła.
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
-| `--config` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6j-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
+| `--config-mount` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6j-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
   ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`

@@ -12,17 +12,19 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use weglarka_api::{
-    ApiError, CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, DoctorReport, ErrorCode,
-    NotifyStatusResponse, PruneImagesResponse, PrunedImage, RuntimeState, SetSecretRequest,
-    ShowAppResponse, UpdateAppResponse, endpoints,
+    ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
+    DoctorCheck, DoctorReport, ErrorCode, NotifyStatusResponse, PruneImagesResponse, PrunedImage,
+    ReloadAction, ReloadResponse, RuntimeState, SetSecretRequest, ShowAppResponse,
+    UpdateAppResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
 
-use crate::cli::{AddArgs, RemoveArgs, StartStopArgs};
+use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
 use crate::commands::{
-    build_spec, notify_status, notify_test, read_secret_value, render_notify_status,
+    apps_reload, build_spec, notify_status, notify_test, read_secret_value, render_notify_status,
+    render_reload, render_show,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -656,6 +658,7 @@ fn show_app(start: bool) -> ShowAppResponse {
         } else {
             RuntimeState::NotStarted
         },
+        configs: None,
     }
 }
 
@@ -791,6 +794,214 @@ fn add_accepts_command_arguments() {
     );
     // The dash-leading form is parsed, the naive one is rejected by clap as an unknown flag.
     assert!(Add::try_parse_from(["add", "ntfy", "img", "--command", "-v"]).is_err());
+}
+
+#[test]
+fn add_accepts_config_mounts_and_reload_signal() {
+    let spec = build_spec(&add_args(&[
+        "--config-mount",
+        "prometheus/prometheus.yml:/etc/prometheus/prometheus.yml",
+        "--config-mount",
+        "prometheus/rules:/etc/prometheus/rules",
+        "--reload-signal",
+        "SIGHUP",
+    ]))
+    .unwrap();
+    assert_eq!(spec.configs.len(), 2);
+    assert_eq!(spec.configs[1].source, "prometheus/rules");
+    assert_eq!(spec.configs[1].target, "/etc/prometheus/rules");
+    assert_eq!(
+        spec.reload_signal.as_deref(),
+        Some("HUP"),
+        "normalized to the name the engine sends"
+    );
+    // Without the flags the fields stay out of the spec (and out of apps.toml).
+    let plain = build_spec(&add_args(&[])).unwrap();
+    assert!(plain.configs.is_empty() && plain.reload_signal.is_none());
+    // `none` clears them, like the other list flags.
+    let cleared = build_spec(&add_args(&[
+        "--config-mount",
+        "none",
+        "--reload-signal",
+        "none",
+    ]))
+    .unwrap();
+    assert!(cleared.configs.is_empty() && cleared.reload_signal.is_none());
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(
+        Add::try_parse_from([
+            "add",
+            "ntfy",
+            "img",
+            "--config-mount",
+            "app/config.yml:/etc/app.yml",
+            "--spec",
+            "f",
+        ])
+        .is_err()
+    );
+}
+
+fn config_mounts() -> Vec<ConfigMountView> {
+    vec![
+        ConfigMountView {
+            source: "prometheus/prometheus.yml".into(),
+            target: "/etc/prometheus/prometheus.yml".into(),
+            status: ConfigMountStatus::Ok,
+            fingerprint: Some("3f2a1b9c".repeat(8)),
+            detail: None,
+        },
+        ConfigMountView {
+            source: "prometheus/rules".into(),
+            target: "/etc/prometheus/rules".into(),
+            status: ConfigMountStatus::Missing,
+            fingerprint: None,
+            detail: Some("no such file: /srv/config/prometheus/rules".into()),
+        },
+    ]
+}
+
+#[test]
+fn show_renders_config_mounts_with_short_fingerprints_and_details() {
+    let mut app = show_app(true);
+    app.configs = Some(config_mounts());
+    let out = render_show(&app);
+    assert!(out.contains("[configs]"), "{out}");
+    assert!(
+        out.contains("prometheus/prometheus.yml -> /etc/prometheus/prometheus.yml  ok 3f2a1b9c"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "prometheus/rules -> /etc/prometheus/rules  missing (no such file: \
+             /srv/config/prometheus/rules)"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&"3f2a1b9c".repeat(8)),
+        "the fingerprint is abbreviated: {out}"
+    );
+    // No mounts in the response: no section at all (the daemon omits the field for such apps).
+    assert!(!render_show(&show_app(true)).contains("[configs]"));
+}
+
+fn reload_response(action: ReloadAction) -> ReloadResponse {
+    ReloadResponse {
+        name: InstanceName::new("prometheus").unwrap(),
+        action,
+        signal: matches!(action, ReloadAction::Signalled).then(|| "HUP".to_owned()),
+        configs: None,
+    }
+}
+
+#[test]
+fn reload_rendering_covers_every_action() {
+    assert_eq!(
+        render_reload(&reload_response(ReloadAction::Signalled)),
+        "prometheus: signalled SIGHUP\n"
+    );
+    assert_eq!(
+        render_reload(&reload_response(ReloadAction::Restarted)),
+        "prometheus: restarted\n"
+    );
+    assert_eq!(
+        render_reload(&reload_response(ReloadAction::Recreated)),
+        "prometheus: recreated (same digest)\n"
+    );
+    // The response carries the mounts after the reload: print the same block as `apps show`.
+    let mut with_configs = reload_response(ReloadAction::Signalled);
+    with_configs.configs = Some(config_mounts());
+    let out = render_reload(&with_configs);
+    assert!(
+        out.starts_with("prometheus: signalled SIGHUP\n[configs]\n"),
+        "{out}"
+    );
+    assert!(out.contains("  ok 3f2a1b9c"), "{out}");
+    assert!(out.contains("  missing (no such file"), "{out}");
+}
+
+#[test]
+fn reload_flags_parse() {
+    #[derive(clap::Parser)]
+    struct W {
+        #[command(flatten)]
+        a: ReloadArgs,
+    }
+    let a = W::try_parse_from(["w", "prometheus"]).unwrap().a;
+    assert_eq!(a.name, "prometheus");
+    assert!(!a.recreate);
+    assert!(
+        W::try_parse_from(["w", "prometheus", "--recreate"])
+            .unwrap()
+            .a
+            .recreate
+    );
+    // The instance name is still required.
+    assert!(W::try_parse_from(["w"]).is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_reload_posts_the_reload_endpoint_and_the_recreate_flag() {
+    for recreate in [false, true] {
+        let action = if recreate {
+            ReloadAction::Recreated
+        } else {
+            ReloadAction::Signalled
+        };
+        let response = serde_json::to_string(&reload_response(action)).unwrap();
+        let m = mock(move |_, _| (200, response.clone())).await;
+        let code = apps_reload(
+            true,
+            &overrides(&m),
+            ReloadArgs {
+                name: "prometheus".into(),
+                recreate,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, exit::OK);
+        {
+            let seen = m.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                (seen[0].method.as_str(), seen[0].path.as_str()),
+                ("POST", "/v1/apps/prometheus/reload")
+            );
+            let body: weglarka_api::ReloadRequest = serde_json::from_str(&seen[0].body).unwrap();
+            assert_eq!(body.recreate, recreate, "body {recreate:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_of_a_stopped_app_hints_at_apps_start() {
+    let m = mock(|_, _| (409, api_err(ErrorCode::Conflict, "app ntfy is not running"))).await;
+    let err = apps_reload(
+        false,
+        &overrides(&m),
+        ReloadArgs {
+            name: "ntfy".into(),
+            recreate: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.exit_code(), exit::CONFLICT);
+    assert!(
+        err.hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("weglarka apps start ntfy"),
+        "hint: {:?}",
+        err.hint
+    );
 }
 
 #[test]
