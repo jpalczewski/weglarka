@@ -19,7 +19,7 @@ use weglarka_api::{
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
 
-use crate::cli::{AddArgs, StartStopArgs};
+use crate::cli::{AddArgs, RemoveArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
 use crate::commands::{
     build_spec, notify_status, notify_test, read_secret_value, render_notify_status,
@@ -37,6 +37,7 @@ use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_l
 pub(crate) struct Seen {
     pub(crate) method: String,
     pub(crate) path: String,
+    pub(crate) query: Option<String>,
     host: Option<String>,
     pub(crate) body: String,
 }
@@ -79,6 +80,7 @@ pub(crate) async fn mock(
                     async move {
                         let method = req.method().to_string();
                         let path = req.uri().path().to_owned();
+                        let query = req.uri().query().map(str::to_owned);
                         let host = req
                             .headers()
                             .get("host")
@@ -87,6 +89,7 @@ pub(crate) async fn mock(
                         seen.lock().unwrap().push(Seen {
                             method: method.clone(),
                             path: path.clone(),
+                            query,
                             host,
                             body: String::from_utf8_lossy(&body).into_owned(),
                         });
@@ -969,6 +972,68 @@ async fn start_dry_run_sends_nothing() {
     .unwrap();
     assert_eq!(code, exit::OK);
     assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+}
+
+#[test]
+fn apps_remove_dry_run_shows_the_purge_query() {
+    // `--purge-volumes` deletes the data, so the dry run must show it in the path.
+    assert_eq!(
+        crate::commands::remove_dry_run("ntfy", true).path,
+        "/v1/apps/ntfy?purge_volumes=true"
+    );
+    assert_eq!(
+        crate::commands::remove_dry_run("ntfy", false).path,
+        "/v1/apps/ntfy"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_remove_dry_run_sends_only_the_existence_check() {
+    let show = serde_json::to_string(&show_app(false)).unwrap();
+    let m = mock(move |_, _| (200, show.clone())).await;
+    let code = crate::commands::apps_remove(
+        true,
+        &overrides(&m),
+        RemoveArgs {
+            name: "ntfy".into(),
+            ignore_missing: false,
+            purge_volumes: true,
+            dry_run: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "only the existence check travels");
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("GET", "/v1/apps/ntfy")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_remove_sends_purge_volumes_only_when_asked() {
+    for (purge_volumes, expected) in [(true, Some("purge_volumes=true")), (false, None)] {
+        let m = mock(|_, _| (204, String::new())).await;
+        let code = crate::commands::apps_remove(
+            true,
+            &overrides(&m),
+            RemoveArgs {
+                name: "ntfy".into(),
+                ignore_missing: false,
+                purge_volumes,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, exit::OK);
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "DELETE");
+        assert_eq!(seen[0].query.as_deref(), expected);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
