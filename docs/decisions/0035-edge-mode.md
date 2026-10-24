@@ -1,9 +1,8 @@
 # 0035 — Edge mode: nginx owns 80/443 (TLS, ACME webroot, certificate reload)
 
-Status: proposed (2026-10-24, issue #95). The uid-map half (below, “Ingress container identity”) is
-accepted only once `integration-podman` runs `crates/weglarka-podman/tests/ingress_identity.rs` green —
-there was no rootless Podman 6 on the development machine, so it is measured in CI, not locally. The
-nginx half was measured locally (see “Verification”).
+Status: accepted (2026-10-24, issue #95). The nginx half was measured locally and in the `check` job (Docker);
+the uid-map half has no local rootless Podman 6, so it was measured by `integration-podman`
+(`crates/weglarka-podman/tests/ingress_identity.rs`, green on the PR) — see “Verification”.
 
 ## Problem
 
@@ -127,12 +126,16 @@ mounted at `/etc/nginx/tls`, webroot at `/etc/nginx/acme`):
 * a routed domain without a certificate → redirect over HTTP, TLS handshake rejected with
   `unrecognized_name`; unknown SNI rejected the same way.
 
-CI: `check` runs `nginx -t` on an `edge` config with a mounted certificate and
-`.github/scripts/test-edge.sh` (Docker: redirect, ACME, TLS, fail-closed paths, forwarded headers,
-unknown SNI); `integration-podman` runs `smoke-image.sh … edge` (two publishes, hardened profile,
-acceptance in `edge`, certificate change → reload without recreate) and
-`crates/weglarka-podman/tests/ingress_identity.rs` (the uid map: master reads a `0600` file, an
-app-style container on the plain map cannot, `/proc/self/uid_map` matches the two lines). Snapshots:
+CI (measured 2026-10-24 on the PR, rootless Podman 6.1 on an `ubuntu-24.04` runner): `check` runs
+`nginx -t` on an `edge` config with a mounted certificate and `.github/scripts/test-edge.sh` (Docker:
+redirect, ACME, TLS, fail-closed paths, forwarded headers, unknown SNI); `integration-podman` runs
+`smoke-image.sh … edge` — both publishes on the hardened container, `scripts/acceptance.sh` in `edge`
+(HTTPS via the self-signed canary certificate, `301` from the HTTP publish, ACME token `200` without a
+redirect, forged `X-Forwarded-*` overwritten) and a second domain's certificate changing `nginx.conf`
+with an unchanged nginx container id — and `crates/weglarka-podman/tests/ingress_identity.rs`, which is
+the uid-map measurement: libpod accepted the two-line map rootless, `/proc/self/uid_map` showed
+`0 0 1` + the ingress range, the master (uid 0) read a host `0600` file and an app-style container on
+the plain map could not. Snapshots:
 `crates/weglarka-ingress/tests/snapshots/generators__nginx_edge_*.snap`, with the `behind` snapshots
 unchanged. Daemon tests cover the two publishes, the map, directory modes, certificate scan/reload and
 the doctor check; CLI preflight tests cover `ingress.config`, `ingress.tls` and
