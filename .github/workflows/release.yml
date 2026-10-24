@@ -29,7 +29,7 @@ jobs:
       packages: write
       id-token: write # cosign keyless (GitHub OIDC)
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag matches the weglarka-daemon version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -90,7 +90,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show active-toolchain || rustup toolchain install
       - run: rustup target add ${{ matrix.target }}
       - if: matrix.target == 'x86_64-unknown-linux-musl'
