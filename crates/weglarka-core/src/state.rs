@@ -177,6 +177,7 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         }
     }
     validate_depends_on(name, spec)?;
+    validate_ingress(name, &spec.ingress)?;
     validate_iteration2(name, spec)
 }
 
@@ -191,6 +192,29 @@ fn validate_depends_on(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if !seen.insert(dep) {
             return Err(format!("{name}: duplicate depends_on entry \"{dep}\""));
         }
+    }
+    Ok(())
+}
+
+/// Ingress options are rendered into `nginx.conf` verbatim, so they are checked here rather than in the
+/// generator. A timeout without `streaming` would be a silent no-op, hence an error.
+fn validate_ingress(name: &InstanceName, ingress: &crate::app::AppIngress) -> Result<(), String> {
+    use crate::app::AppIngress;
+    if !ingress.streaming {
+        return if ingress.is_default() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{name}: ingress.stream_timeout_secs requires ingress.streaming = true"
+            ))
+        };
+    }
+    if !(1..=AppIngress::MAX_STREAM_TIMEOUT_SECS).contains(&ingress.stream_timeout_secs) {
+        return Err(format!(
+            "{name}: ingress.stream_timeout_secs must be 1..={} (default {})",
+            AppIngress::MAX_STREAM_TIMEOUT_SECS,
+            AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+        ));
     }
     Ok(())
 }
@@ -435,6 +459,48 @@ mod tests {
                 .contains("duplicate depends_on")
         );
         assert!(validate_app(&name("a"), &spec("\"b\"")).is_ok());
+    }
+
+    #[test]
+    fn ingress_options_are_validated() {
+        use crate::app::AppIngress;
+        let check = |ingress: AppIngress| {
+            let spec = AppSpec {
+                ingress,
+                ..toml::from_str("image = \"i\"").unwrap()
+            };
+            validate_app(&name("a"), &spec)
+        };
+        assert!(check(AppIngress::default()).is_ok());
+        assert!(
+            check(AppIngress {
+                streaming: true,
+                stream_timeout_secs: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            check(AppIngress {
+                streaming: true,
+                stream_timeout_secs: AppIngress::MAX_STREAM_TIMEOUT_SECS,
+            })
+            .is_ok()
+        );
+        for bad in [0, AppIngress::MAX_STREAM_TIMEOUT_SECS + 1] {
+            let err = check(AppIngress {
+                streaming: true,
+                stream_timeout_secs: bad,
+            })
+            .unwrap_err();
+            assert!(err.contains("stream_timeout_secs"), "{bad}: {err}");
+        }
+        // A timeout without streaming would be a silent no-op, so it is refused.
+        let err = check(AppIngress {
+            streaming: false,
+            stream_timeout_secs: 600,
+        })
+        .unwrap_err();
+        assert!(err.contains("requires ingress.streaming = true"), "{err}");
     }
 
     #[test]

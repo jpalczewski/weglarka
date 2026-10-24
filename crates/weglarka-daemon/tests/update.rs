@@ -246,6 +246,111 @@ async fn domain_change_touches_only_ingress_and_env_change_recreates() {
 }
 
 #[tokio::test]
+async fn streaming_change_touches_only_ingress_and_reloads_nginx() {
+    let h = harness().await;
+    add(&h, "ntfy", spec("nz.example.eu")).await;
+    deployed(&h, "ntfy").await;
+    let conf = || read(&h.root.join("state/nginx/nginx.conf"));
+    eventually("nginx config for the app", || async {
+        conf().contains("nz.example.eu")
+    })
+    .await;
+    let traefik_before = read(&h.root.join("traefik.yml"));
+    let before = show(&h, "ntfy").await;
+    let creates = creates_of(&h.fake, "ntfy");
+    let reloads = |fake: &FakePodman| {
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ContainerKill { signal, .. } if signal == "HUP"))
+            .count()
+    };
+    let reloads_before = reloads(&h.fake);
+
+    // `ingress.streaming` is a routing-only setting: nginx is reloaded, nothing else happens.
+    let mut streaming = spec("nz.example.eu");
+    streaming["ingress"] = json!({ "streaming": true, "stream_timeout_secs": 300 });
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy",
+        Some(json!({ "spec": streaming })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["deploy"].is_null(), "{v}");
+    assert_eq!(
+        v["app"]["spec"]["ingress"],
+        json!({ "streaming": true, "stream_timeout_secs": 300 })
+    );
+    eventually("nginx config without buffering", || async {
+        let c = conf();
+        c.contains("proxy_buffering off;") && c.contains("proxy_read_timeout 300s;")
+    })
+    .await;
+    // The config was applied with a reload (SIGHUP), not by recreating anything.
+    assert!(
+        reloads(&h.fake) > reloads_before,
+        "nginx was not reloaded: {:?}",
+        h.fake.calls()
+    );
+    // The Traefik file carries routers only, so streaming does not change it.
+    assert_eq!(read(&h.root.join("traefik.yml")), traefik_before);
+    // Let any reconcile pass triggered by the update finish before looking at the container.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = show(&h, "ntfy").await;
+    assert_eq!(after["state"]["generation"], before["state"]["generation"]);
+    assert_eq!(after["state"]["spec_hash"], before["state"]["spec_hash"]);
+    assert_eq!(creates_of(&h.fake, "ntfy"), creates);
+
+    // Turning it off removes the directives again, still without touching the container.
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy",
+        Some(json!({ "spec": spec("nz.example.eu") })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    eventually("nginx config back to the defaults", || async {
+        !conf().contains("proxy_buffering")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        show(&h, "ntfy").await["state"]["generation"],
+        before["state"]["generation"]
+    );
+    assert_eq!(creates_of(&h.fake, "ntfy"), creates);
+
+    // A timeout without `streaming` is a silent no-op, so the API refuses it before saving.
+    let mut bad = spec("nz.example.eu");
+    bad["ingress"] = json!({ "stream_timeout_secs": 600 });
+    let (s, v) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({ "spec": bad }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ingress.streaming"),
+        "{v}"
+    );
+    // A malformed timeout is refused as well.
+    let mut too_long = spec("nz.example.eu");
+    too_long["ingress"] = json!({ "streaming": true, "stream_timeout_secs": 7200 });
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy",
+        Some(json!({ "spec": too_long })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    // Neither rejection changed the stored spec.
+    assert!(show(&h, "ntfy").await["spec"].get("ingress").is_none());
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn image_change_deploys_right_away() {
     let h = harness().await;
     add(&h, "ntfy", spec("nz.example.eu")).await;

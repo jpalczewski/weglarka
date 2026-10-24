@@ -103,6 +103,101 @@ fn nginx_ipv6_resolver_and_extra_trust() {
     assert!(conf.contains("set_real_ip_from 10.0.0.0/8;"));
 }
 
+/// One streaming app with a custom timeout and one ordinary app: the directives must not leak.
+const STREAMING_APPS: &str = r#"
+[apps.sse]
+image = "ghcr.io/x/sse:latest"
+domains = ["sse.example.eu"]
+port = 3000
+
+[apps.sse.ingress]
+streaming = true
+stream_timeout_secs = 600
+
+[apps.buffered]
+image = "ghcr.io/x/buffered:latest"
+domains = ["buffered.example.eu"]
+port = 3001
+"#;
+
+#[test]
+fn streaming_apps_get_an_unbuffered_location() {
+    let conf = nginx::generate(&host(), &apps(STREAMING_APPS), &opts()).unwrap();
+
+    let sse = server_block(&conf, "sse.example.eu");
+    for directive in [
+        "proxy_buffering off;",
+        "proxy_request_buffering off;",
+        "proxy_read_timeout 600s;",
+        "proxy_send_timeout 600s;",
+    ] {
+        assert!(sse.contains(directive), "{directive} missing from\n{sse}");
+    }
+    // They sit inside `location /`, after `proxy_pass`.
+    let location = sse.find("location / {").expect("location block");
+    assert!(location < sse.find("proxy_buffering off;").unwrap());
+
+    // An app without the option keeps the nginx defaults (the negative control in CI).
+    let buffered = server_block(&conf, "buffered.example.eu");
+    assert!(!buffered.contains("proxy_buffering"), "{buffered}");
+    assert!(!buffered.contains("proxy_read_timeout"), "{buffered}");
+
+    // Neither does the webhook server.
+    let webhook = server_block(&conf, "weglarka.example.eu");
+    assert!(!webhook.contains("proxy_buffering"), "{webhook}");
+}
+
+#[test]
+fn streaming_timeout_defaults_to_three_minutes() {
+    let conf = nginx::generate(
+        &host(),
+        &apps(
+            r#"
+[apps.sse]
+image = "i"
+domains = ["sse.example.eu"]
+port = 3000
+ingress = { streaming = true }
+"#,
+        ),
+        &opts(),
+    )
+    .unwrap();
+    assert!(conf.contains("proxy_read_timeout 180s;"), "{conf}");
+    assert!(conf.contains("proxy_send_timeout 180s;"), "{conf}");
+}
+
+#[test]
+fn traefik_ignores_streaming() {
+    let mut streamed = apps(STREAMING_APPS);
+    let with = traefik::generate(&host(), &streamed, &TraefikOptions::default()).unwrap();
+    for spec in streamed.values_mut() {
+        spec.ingress = Default::default();
+    }
+    let without = traefik::generate(&host(), &streamed, &TraefikOptions::default()).unwrap();
+    assert_eq!(with, without, "ingress options are an nginx-only concern");
+}
+
+#[test]
+fn nginx_streaming_snapshot() {
+    let conf = nginx::generate(&host(), &apps(STREAMING_APPS), &opts()).unwrap();
+    insta::assert_snapshot!("nginx_streaming", conf);
+}
+
+/// The `server { … }` block whose `server_name` names the given host (output nests 4 spaces per level).
+fn server_block(conf: &str, server_name: &str) -> String {
+    let block = conf
+        .split("    server {\n")
+        .skip(1)
+        .find(|b| {
+            b.lines()
+                .any(|l| l.trim_start().starts_with("server_name ") && l.contains(server_name))
+        })
+        .unwrap_or_else(|| panic!("no server block for {server_name} in\n{conf}"));
+    // A server block closes at the `http` level (4 spaces) before any `location` does (8 spaces).
+    block.split("\n    }").next().unwrap_or(block).to_owned()
+}
+
 #[test]
 fn rejects_malicious_domains() {
     let evil = [

@@ -84,6 +84,11 @@ pub struct AddArgs {
     /// HTTP port in the container.
     #[arg(long, conflicts_with = "spec")]
     pub port: Option<u16>,
+    /// Serve streaming responses (SSE, chunked, long polling): no nginx response/request buffering
+    /// and a long idle timeout. Ingress-only, so it never recreates the container; the timeout
+    /// itself is set through `--spec` (`stream_timeout_secs`, default 180 s).
+    #[arg(long, conflicts_with = "spec")]
+    pub streaming: bool,
     /// Environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
