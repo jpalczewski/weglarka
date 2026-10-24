@@ -1,4 +1,4 @@
-//! Loading `weglarka.toml` and deriving paths (state, secrets, nginx directory).
+//! Loading `weglarka.toml` and deriving paths (state, secrets, nginx directory, config root).
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,9 @@ pub struct Paths {
     pub nginx_conf_dir: PathBuf,
     /// Durable queue of notifications that have not been delivered yet (issue #38).
     pub notifications: PathBuf,
+    /// Host directory with the apps' config files/directories (issue #118), resolved from
+    /// `weglarka.toml`'s `config_root`. `None` = config mounts are off.
+    pub config_root: Option<PathBuf>,
 }
 
 impl Paths {
@@ -35,6 +38,15 @@ impl Paths {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let state_dir = host.state.dir_or(config_dir);
+        // `config_root` may be relative to the `weglarka.toml` directory (ADR 0022): the daemon
+        // usually runs in another container, so its cwd says nothing about the host layout.
+        let config_root = host.config_root.as_ref().map(|root| {
+            if root.is_absolute() {
+                root.clone()
+            } else {
+                config_dir.join(root)
+            }
+        });
         Self {
             state: StatePaths::in_dir(&state_dir),
             secrets: state_dir.join("secrets.toml"),
@@ -44,6 +56,7 @@ impl Paths {
                 .clone()
                 .unwrap_or_else(|| state_dir.join("nginx")),
             notifications: state_dir.join("notifications.toml"),
+            config_root,
             state_dir,
         }
     }
@@ -112,5 +125,38 @@ domain = "w.example.eu"
         let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
         assert_eq!(p.state.state, Path::new("/var/lib/weglarka/state.toml"));
         assert_eq!(p.secrets, Path::new("/var/lib/weglarka/secrets.toml"));
+    }
+
+    #[test]
+    fn config_root_is_optional() {
+        let host = HostConfig::from_toml_str(HOST).unwrap();
+        let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
+        assert_eq!(p.config_root, None);
+    }
+
+    #[test]
+    fn config_root_absolute_stays_absolute() {
+        let host =
+            HostConfig::from_toml_str(&format!("config_root = \"/srv/weglarka/config\"\n{HOST}"))
+                .unwrap();
+        let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
+        assert_eq!(
+            p.config_root.as_deref(),
+            Some(Path::new("/srv/weglarka/config"))
+        );
+    }
+
+    #[test]
+    fn config_root_relative_is_resolved_against_the_config_directory() {
+        let host =
+            HostConfig::from_toml_str(&format!("config_root = \"configs\"\n{HOST}")).unwrap();
+        let p = Paths::resolve(&host, Path::new("/etc/weglarka/weglarka.toml"));
+        assert_eq!(
+            p.config_root.as_deref(),
+            Some(Path::new("/etc/weglarka/configs"))
+        );
+        // A `weglarka.toml` given without a directory: relative to the current directory.
+        let p = Paths::resolve(&host, Path::new("weglarka.toml"));
+        assert_eq!(p.config_root.as_deref(), Some(Path::new("./configs")));
     }
 }

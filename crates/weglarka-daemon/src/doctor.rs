@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 
 use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
-use weglarka_core::app::{AppsFile, InstanceName};
+use weglarka_core::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_core::config::IngressMode;
+use weglarka_core::config_mounts::{self, MountStatus};
 use weglarka_core::labels;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
@@ -47,6 +48,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     if let Some(observed) = &observed {
         image_retention(d, observed, &mut checks).await;
     }
+    configs(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
@@ -318,6 +320,172 @@ fn dependencies(
         )
     } else {
         ok("state.dependencies", "every dependency is running")
+    });
+}
+
+/// `configs.root` / `configs.mounts` (issue #118, ADR 0022). The feature is off when neither
+/// `config_root` nor an app's `configs` exists, in which case nothing is reported. Otherwise:
+///
+/// * the root is set (an app declaring configs without it is an error at startup/write time, so this
+///   is a hand-edited `apps.toml`), is visible in the daemon container (`platform install` mounts it
+///   read-only), is a readable directory and is not group/world-writable — anyone who can write the
+///   root decides what the apps mount;
+/// * every declared source resolves inside it and the app's uid range can read it. The app runs in
+///   its own uid range, so a runtime-user file appears there as `nobody` (ADR 0009): files need the
+///   "other read" bit (0644) and directories "other execute" (0755).
+///
+/// Report-only, like the rest of doctor: nothing here touches the files or the containers.
+fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    let users: Vec<(&InstanceName, &AppSpec)> = apps
+        .apps
+        .iter()
+        .filter(|(_, spec)| !spec.configs.is_empty())
+        .collect();
+    let root = d.paths.config_root.as_deref();
+    if root.is_none() && users.is_empty() {
+        return; // config mounts are off
+    }
+
+    let mut canonical_root = None;
+    out.push(match root {
+        None => check(
+            "configs.root",
+            CheckStatus::Warn,
+            format!(
+                "config_root is not set, but {} declare configs: {}",
+                users.len(),
+                users
+                    .iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(
+                "set `config_root` in weglarka.toml and re-run `weglarka platform install` so the \
+                 daemon container mounts it read-only",
+            ),
+        ),
+        Some(root) => match std::fs::metadata(root) {
+            Err(e) => check(
+                "configs.root",
+                CheckStatus::Warn,
+                format!("config_root {} is not available: {e}", root.display()),
+                Some(
+                    "the daemon container must mount config_root read-only: set it in weglarka.toml \
+                     and re-run `weglarka platform install`",
+                ),
+            ),
+            Ok(meta) if !meta.is_dir() => check(
+                "configs.root",
+                CheckStatus::Warn,
+                format!("config_root {} is not a directory", root.display()),
+                Some("point `config_root` at the directory holding the app config files"),
+            ),
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                match std::fs::read_dir(root) {
+                    Err(e) => check(
+                        "configs.root",
+                        CheckStatus::Warn,
+                        format!("cannot read config_root {}: {e}", root.display()),
+                        Some("the runtime user needs r+x on config_root"),
+                    ),
+                    Ok(_) => {
+                        canonical_root = root.canonicalize().ok();
+                        if mode & 0o022 != 0 {
+                            let hint = format!(
+                                "chmod -R go-w {}: anyone who can write the root decides what the \
+                                 apps mount",
+                                root.display()
+                            );
+                            check(
+                                "configs.root",
+                                CheckStatus::Warn,
+                                format!(
+                                    "config_root {} is group/world-writable ({mode:o})",
+                                    root.display()
+                                ),
+                                Some(&hint),
+                            )
+                        } else {
+                            ok(
+                                "configs.root",
+                                format!("config_root {} ({mode:o})", root.display()),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    });
+
+    if users.is_empty() {
+        return;
+    }
+    let mut problems = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut mounts = 0usize;
+    for (name, spec) in users {
+        for view in config_mounts::describe(root, spec) {
+            mounts += 1;
+            match view.status {
+                MountStatus::Ok => {
+                    let Some(path) = canonical_root
+                        .as_ref()
+                        .map(|canonical| canonical.join(&view.source))
+                    else {
+                        continue;
+                    };
+                    let Ok(meta) = std::fs::metadata(&path) else {
+                        continue;
+                    };
+                    let mode = meta.permissions().mode() & 0o777;
+                    // The app runs in its own uid range, so only the "other" bits apply (ADR 0009).
+                    let needed = if meta.is_dir() { 0o001 } else { 0o004 };
+                    if mode & needed == 0 {
+                        unreadable.push(format!("{name}: {} ({mode:o})", view.source));
+                    }
+                }
+                _ => problems.push(format!(
+                    "{name}: {}",
+                    view.detail
+                        .unwrap_or_else(|| "config mount is not usable".to_owned())
+                )),
+            }
+        }
+    }
+    let mut hints = Vec::new();
+    let mut message = problems;
+    if !message.is_empty() {
+        hints.push(
+            "fix the listed sources under config_root; `weglarka apps show <app>` reports every mount",
+        );
+    }
+    if !unreadable.is_empty() {
+        message.push(format!(
+            "not readable by the app's uid range: {}",
+            unreadable.join(", ")
+        ));
+        hints.push(
+            "`chmod -R u=rwX,go=rX <config_root>` gives 0644 files / 0755 directories; files owned \
+             by the runtime user appear as nobody in the app's uid range (ADR 0009)",
+        );
+    }
+    out.push(if message.is_empty() {
+        ok(
+            "configs.mounts",
+            format!("{mounts} config mount(s) resolve and are readable"),
+        )
+    } else {
+        check(
+            "configs.mounts",
+            CheckStatus::Warn,
+            message.join("; "),
+            Some(&hints.join("; ")),
+        )
     });
 }
 
