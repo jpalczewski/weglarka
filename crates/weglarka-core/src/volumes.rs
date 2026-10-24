@@ -233,8 +233,10 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Ownership and volumes for a container about to be created. The range must already be assigned
-    /// ([`Self::assign_range`]); volumes (private and shared) are created here, before the old
-    /// container is touched.
+    /// ([`Self::assign_range`]) and the range-change guard must have run; volumes (private and
+    /// shared) are created here, before the old container is touched. The returned
+    /// [`Prepared::range`] is what the caller persists as the data owner
+    /// (`AppState::effective_uid_range`, issue #75).
     pub(crate) async fn prepare_container(
         &self,
         instance: &InstanceName,
@@ -246,6 +248,9 @@ impl<P: PodmanClient> Reconciler<P> {
         if let Some(mount) = shared_volumes::mount(spec) {
             ensure_shared_volume(&self.podman, &mount.name).await?;
         }
+        // The caller persists `Prepared.range` as `AppState::effective_uid_range` together with the
+        // rest of the deploy state, so the range-change guard still knows the data owner when the
+        // container is gone (issue #75).
         Ok(Prepared {
             range,
             volumes: attachments(instance, spec),
@@ -289,8 +294,9 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// State of instances no longer in `apps.toml`: dropped, unless volumes of the instance remain —
-    /// then only its `uid_range` is kept (reserved) so a later `apps add` finds its files owned
-    /// correctly. Returns whether `st` changed.
+    /// then only its `uid_range`/`effective_uid_range` are kept (reserved and remembered as the data
+    /// owner) so a later `apps add` finds its files owned correctly and cannot silently move them
+    /// into another range. Returns whether `st` changed.
     pub(crate) async fn settle_orphan_state(&self, st: &mut StateFile, apps: &AppsFile) -> bool {
         let orphans: Vec<InstanceName> = st
             .apps
@@ -301,23 +307,23 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut changed = false;
         for name in orphans {
             let current = st.apps[&name].clone();
-            let keep = match current.uid_range {
-                None => None,
-                Some(range) => {
-                    let filter = VolumeFilter {
-                        labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
-                    };
-                    // Cannot tell → keep: freeing a range that still owns data is the worse error.
-                    let has_volumes = self
-                        .podman
-                        .volume_list(&filter)
-                        .await
-                        .map_or(true, |v| !v.is_empty());
-                    has_volumes.then_some(AppState {
-                        uid_range: Some(range),
-                        ..AppState::default()
-                    })
-                }
+            let keep = if current.uid_range.is_none() && current.effective_uid_range.is_none() {
+                None
+            } else {
+                let filter = VolumeFilter {
+                    labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
+                };
+                // Cannot tell → keep: freeing a range that still owns data is the worse error.
+                let has_volumes = self
+                    .podman
+                    .volume_list(&filter)
+                    .await
+                    .map_or(true, |v| !v.is_empty());
+                has_volumes.then_some(AppState {
+                    uid_range: current.uid_range,
+                    effective_uid_range: current.effective_uid_range,
+                    ..AppState::default()
+                })
             };
             if keep.as_ref() == Some(&current) {
                 continue;
@@ -491,8 +497,8 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Refuses a uid-range change when the instance already has private volume data: the files are
     /// owned by the old range and a recreate with a new map would make them unreadable
-    /// (docs/decisions/0017). `None` as the old label means "no label yet" (pre-range container) and
-    /// is always allowed.
+    /// (docs/decisions/0017). `None` as the old label means "no owner known yet" (a brand-new
+    /// instance) and is always allowed.
     pub(crate) async fn range_change_guard_locked(
         &self,
         instance: &InstanceName,
@@ -503,7 +509,15 @@ impl<P: PodmanClient> Reconciler<P> {
             .container_inspect(&labels::container_name(instance))
             .await
             .ok()
-            .and_then(|c| c.labels.get(labels::UID_RANGE).cloned());
+            .and_then(|c| c.labels.get(labels::UID_RANGE).cloned())
+            .or_else(|| {
+                // No container (provisioned with `start = false`, or removed): the last effective
+                // range recorded by `prepare_container` is the owner of the data (issue #75).
+                state::load_state(&self.paths.state)
+                    .ok()
+                    .and_then(|st| st.apps.get(instance).and_then(|s| s.effective_uid_range))
+                    .map(labels::uid_range_label)
+            });
         let Some(old_label) = old else {
             return Ok(());
         };
@@ -1095,8 +1109,10 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
             st.apps[&name("szklana")],
             AppState {
                 uid_range: Some(r),
+                effective_uid_range: Some(r),
                 ..Default::default()
-            }
+            },
+            "the reserved range and the data owner survive apps remove"
         );
 
         // Re-adding the app finds its files owned correctly: same range, same volumes.
@@ -1673,7 +1689,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         // `apps stop` removes the container but keeps the data and the range (issue #75).
         e.set_apps(STOPPED_WITH_VOLUMES);
         e.rec.reconcile().await.unwrap();
-        assert!(e.fake.containers().is_empty(), "provisioning removes the container");
+        assert!(
+            e.fake.containers().is_empty(),
+            "provisioning removes the container"
+        );
         assert_eq!(e.fake.volumes().len(), 2, "the private volumes survive");
 
         // The early check of `PUT /v1/apps/{name}` must still see the data owner.
@@ -1730,7 +1749,11 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             report.actions.iter().any(|a| a.result.is_err()),
             "provisioning must refuse the range change before removing the container: {report:?}"
         );
-        assert_eq!(e.mapping("szklana"), old_map, "the old container is untouched");
+        assert_eq!(
+            e.mapping("szklana"),
+            old_map,
+            "the old container is untouched"
+        );
         assert_eq!(e.range("szklana"), Some(old_range));
         assert_eq!(e.fake.volumes().len(), 2, "nothing new was created");
     }

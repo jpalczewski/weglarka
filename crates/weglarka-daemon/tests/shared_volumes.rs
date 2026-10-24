@@ -485,7 +485,11 @@ async fn joining_a_group_after_stopping_the_app_is_refused() {
             .and_then(|a| a.uid_range),
         Some(old_range)
     );
-    assert!(h.fake.containers().is_empty(), "nothing was started");
+    let containers = h.fake.containers();
+    assert!(
+        containers.iter().all(|c| c.name != "szklana"),
+        "nothing was started for the app: {containers:?}"
+    );
     h.running.stop().await;
 }
 
