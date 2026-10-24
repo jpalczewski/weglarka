@@ -213,14 +213,15 @@ sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
 
 Wymaganie: domena kanarka jest w DNS (wskazuje na host) **i na allowliście walidatora**
 (`weglarka_allowed_domains`) — bez tego Traefik nie dostanie routera i krok „ruch” skończy się timeoutem.
-Skrypt dotyka tylko instancji `wg-canary` (domyślnie) oraz `wg-webhook`/`wg-rollback` i kontenera
-`wg-accept-registry` z `--with-local-registry` — nigdy `ntfy`. Opcje: `--canary-image`, `--webhook-base`, `--keep`
-(kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`, `--json` (raport
-maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa tego CI).
-Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
-Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`. Opcjonalne `--with-volume` (też w CI; wymaga `tar`) dodaje krok
-wolumenu na instancji `wg-volume`: import obcego tara, dane i zakres UID przeżywają `apps remove` + `apps add`,
-eksport z właścicielem `uid_range.start`, `--purge-volumes`.
+Skrypt dotyka tylko instancji `wg-canary` (domyślnie), `wg-webhook`/`wg-rollback` (z `--with-local-registry`),
+`wg-volume`/`wg-nostart` (z `--with-volume`) i kontenera `wg-accept-registry` — nigdy `ntfy`. Opcje: `--canary-image`,
+`--webhook-base`, `--keep` (kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`,
+`--json` (raport maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa
+tego CI). Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
+Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`. Opcjonalne `--with-volume` (też w CI; wymaga `tar`) dodaje
+dwa kroki wolumenów: na instancji `wg-volume` import obcego tara, dane i zakres UID przeżywają `apps remove` + `apps add`,
+eksport z właścicielem `uid_range.start`, `--purge-volumes`; na instancji `wg-nostart` apka dodana z `start = false`
+(bez kontenera), import przed pierwszym `apps start`, eksport ze sprawdzeniem zawartości.
 
 **Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
 zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
@@ -362,15 +363,35 @@ spłaszczone do jednego (dla SQLite w jednym użytkowniku to właśnie to, o co 
 ```sh
 # Na hoście Coolify: sam plik z wolumenu, nieskompresowany tar (rozpakuj .tar.gz przez gunzip)
 tar -cf szklana-data.tar -C /var/lib/docker/volumes/<wolumen>/_data .
-
-# Po stronie Węglarki: apka dodana ze spec z volumes i wdrożona RAZ (potrzebny obraz i zakres UID)
-weglarka apps add szklana-pogoda --spec szklana.toml && weglarka deploy szklana-pogoda
-weglarka volumes import szklana-pogoda data --from szklana-data.tar    # lub: < szklana-data.tar
 ```
 
-Import zatrzymuje kontener apki, wypakowuje tar (robi to Podman w pomocniczym, niestartowanym kontenerze tego
-samego obrazu — Węglarka niczego nie rozpakowuje) i uruchamia apkę z powrotem. Pliki o tej samej ścieżce są
-nadpisywane, pozostałe zostają; przerwany import zostawia część plików. Limit jednego importu: 8 GiB.
+Apki nie trzeba najpierw uruchamiać: `start = false` ją **provisionuje** — pull obrazu i przypięcie digestu, sieć,
+zakres UID i wolumeny — ale nie tworzy kontenera. Import tego nie wymaga, bo tar wypakowuje pomocniczy, niestartowany
+kontener z tego samego obrazu. Cała kolejność: provisioning → import → sekrety → pierwszy start:
+
+```toml
+# szklana.toml — apka przygotowana, ale jeszcze nie uruchomiona
+image = "ghcr.io/.../szklana-pogoda:latest"
+start = false
+volumes = [{ name = "data", target = "/data" }]
+```
+
+```sh
+# Po stronie Węglarki:
+weglarka apps add szklana-pogoda --spec szklana.toml                    # obraz, zakres UID, wolumen — bez kontenera
+weglarka volumes import szklana-pogoda data --from szklana-data.tar     # lub: < szklana-data.tar
+weglarka secrets set szklana-pogoda config < config.json                # jeśli apka ma sekrety
+weglarka apps start szklana-pogoda                                      # pull, bramka zdrowia, kontener i router
+```
+
+Dopiero `apps start` zdejmuje `start = false`: pull najnowszego tagu, bramka zdrowia (rollback przy porażce), kontener
+i router w ingressie. Dane z importu czekają w wolumenie z poprawnym właścicielem (zakres UID), więc apka startuje z nimi
+od pierwszego ruchu. Odpowiednik flagowy zamiast pliku: `apps add ... --no-start` (ale wolumeny wymagają `--spec`).
+
+Import zatrzymuje działający kontener apki, wypakowuje tar (robi to Podman w pomocniczym, niestartowanym kontenerze tego
+samego obrazu — Węglarka niczego nie rozpakowuje) i uruchamia apkę z powrotem. Dla apki z `start = false` nie ma czego
+zatrzymywać ani uruchamiać: import tylko wypakowuje dane. Pliki o tej samej ścieżce są nadpisywane, pozostałe zostają;
+przerwany import zostawia część plików. Limit jednego importu: 8 GiB.
 
 **`--replace` — import do pustego wolumenu.** Bez niej pliki spoza tara zostają w wolumenie. Przy SQLite w trybie
 **WAL** to pułapka: jeśli apka wystartowała przed importem, w wolumenie leżą jej `*.db-wal`/`*.db-shm`, a po starcie
@@ -431,6 +452,36 @@ jednorazowo**:
 Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być czytelne dla „obcych” UID-ów
 (0644 w katalogu 0755 — tak je zapisuje demon).
 
+## 6b. Zatrzymywanie apek: `start = false`
+
+`start` w spec apki (domyślnie `true`, w `apps.toml` zapisywany tylko jako `start = false`) mówi, czy apka ma
+**działać**, czy być tylko **przygotowana**. Decyzja i odrzucone alternatywy: [0011](decisions/0011-start-false-provisioning.md).
+
+```sh
+weglarka apps add stara-apka ghcr.io/.../stara:latest --domain stara.descriptortable.eu --port 8080 --no-start
+weglarka apps start stara-apka               # start = true: pull tagu, bramka zdrowia, kontener i router
+weglarka apps stop stara-apka                # start = false: usuwa kontener, zostawia wolumeny i zakres UID
+weglarka apps update stara-apka --no-start   # to samo co `apps stop`, przez update spec
+weglarka apps update stara-apka --start      # to samo co `apps start`
+```
+
+- Apka z `start = false` jest **provisionowana**: przypięty digest obrazu, sieć apki, zakres UID i wolumeny —
+  bez kontenera. `weglarka status` / `apps show` pokazują wtedy `not_started` i to jest stan poprawny (brak
+  kontenera z założenia), a nie błąd ani „czeka na sekret”.
+- `apps stop` **usuwa** kontener (nie tylko go zatrzymuje); wolumeny, zakres UID i sekrety zostają. Zakres i dane
+  zwalnia dopiero `apps remove --purge-volumes`.
+- Dopóki apka stoi, webhook/auto-update są wstrzymane: pakiet z GitHuba nie robi dla niej pullu ani deployu.
+  `apps start` sam pobiera najnowszy tag, więc apka wstaje z aktualnym obrazem (stop nie zamraża wersji).
+- Apka z `start = false` **nie dostaje routera** w nginx/Traefik — nie ma dokąd kierować ruchu. Jej domeny
+  pozostają jednak zarezerwowane i walidowane: duplikat domeny (także z drugą, działającą apką) nadal jest
+  błędem. Dzięki temu możesz trzymać domenę w Coolify i przygotować Węglarkę wcześniej, a przełączyć się bez
+  kolizji routerów.
+- `apps update --spec plik.toml` podmienia **całą** spec: jeśli w pliku nie ma `start`, obowiązuje domyślne `true`
+  i apka wstanie. Zatrzymaną apkę opisuj w pliku z `start = false`.
+- Uwaga przy rollbacku: `start` to nowe pole w `apps.toml` z `deny_unknown_fields`, więc **starszy** demon/CLI
+  nie odczyta specu zatrzymanej apki (`start = false`). Wracając do poprzedniej wersji Węglarki usuń `start = false`
+  z `apps.toml` (albo najpierw `weglarka apps start`) — inaczej daemon odmówi startu z błędem parsowania.
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -459,7 +510,8 @@ błędu „busy”, tylko ponawia żądanie przez maks. 3 min (komunikat „daem
 
 
 `weglarka apps update <app> [flagi]` czyta obecną spec, nakłada flagi i wysyła **całą** spec (pełna podmiana;
-`--spec plik.toml` podmienia ją w całości z pliku). `--dry-run` pokazuje diff i niczego nie wysyła.
+`--spec plik.toml` podmienia ją w całości z pliku — brak `start` w pliku to `start = true`). `--dry-run` pokazuje
+diff i niczego nie wysyła.
 
 | Zmiana | Skutek |
 |---|---|
@@ -467,8 +519,10 @@ błędu „busy”, tylko ponawia żądanie przez maks. 3 min (komunikat „daem
 | `--env`/`--unset-env`, `--port`/`--unset-port`, `--secret-env`/`--secret-mount`/`--unbind-secret`, wolumeny, limity, `health.command` | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu) |
 | obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
 | `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
+| `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 
-Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką i które
-mają `auto_update`. Przypięcie tagu `sha-…` lub `--no-auto-update` to więc ręczny „pin” — webhook jej nie ruszy,
-dopóki nie wrócisz na `:latest`. Rollback (retencja 1) działa jak przy każdym deployu: wraca do poprzedniego
-digestu, a nieudany digest jest zapamiętany (ponowny deploy go pominie, dopóki nie wymusisz `deploy`).
+Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką, które
+mają `auto_update` i nie są zatrzymane (`start = false` — patrz 6b). Przypięcie tagu `sha-…` lub `--no-auto-update`
+to więc ręczny „pin” — webhook jej nie ruszy, dopóki nie wrócisz na `:latest`. Rollback (retencja 1) działa jak przy
+każdym deployu: wraca do poprzedniego digestu, a nieudany digest jest zapamiętany (ponowny deploy go pominie, dopóki
+nie wymusisz `deploy`).
