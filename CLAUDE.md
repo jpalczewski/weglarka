@@ -112,7 +112,11 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 
 - `cargo test --workspace` — jednostkowe + snapshoty, bez Podmana.
 - Środowiska z sandboxem (agent / CI w kontenerze): jeśli cargo nie może pisać do globalnego `target-dir`
-  (`Operation not permitted`), ustaw `CARGO_TARGET_DIR=$PWD/target` — katalog `target/` jest w `.gitignore`.
+  (`Operation not permitted`), ustaw `CARGO_TARGET_DIR` na katalog zapisywalny w sandboxie. **Worktree nie buduje
+  własnego `target/`:** wskaż wspólny katalog głównego checkoutu — `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"` —
+  żeby zależności z crates.io skompilowały się raz dla wszystkich worktree (skrypt zwraca ten sam katalog z głównego
+  checkoutu i z `git worktree`; równoległe buildy czekają wtedy na locku cargo, zamiast kompilować to samo drugi raz).
+  Przy sesji, której workspace *jest* worktree, główny checkout bywa poza sandboxem — wtedy zostaje `$PWD/target`.
 - Fake: `weglarka-core` z `features = ["testing"]` → `weglarka_core::testing::FakePodman`
   (skryptowalne digesty pulla, błędy w środku pulla, kolejka wyników healthchecka, log wywołań).
 - Integracyjne z prawdziwym Podmanem 6.1 (`weglarka-podman/tests/`): wymagają `WEGLARKA_PODMAN_SOCKET`
