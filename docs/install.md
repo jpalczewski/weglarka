@@ -18,6 +18,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6f. Komenda i argumenty](#6f-komenda-i-argumenty-kontenera-command) ·
 [6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
 [6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
+[6i. Configi z hosta](#6i-configi-z-hosta-config_root-i-apps-reload) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -111,6 +112,10 @@ domain = "weglarka.descriptortable.eu"                     # wystawiane są tylk
 
 [state]
 dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
+
+# Katalog z plikami konfiguracyjnymi apek (sekcja 6i). Montowany read-only do kontenera Węglarki.
+# Absolutny albo względny do katalogu weglarka.toml. Nieustawione = funkcja wyłączona.
+# config_root = "/var/lib/weglarka/config"
 
 [platform]
 kind = "systemd"
@@ -979,6 +984,85 @@ Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, 
 `[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
 nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
 
+## 6i. Configi z hosta (`config_root`) i `apps reload`
+
+Infra-apki (Authelia #88, Prometheus, Grafana, Loki) potrzebują plików konfiguracyjnych. Zamiast wrzucać je do
+obrazu, do sekretów albo importować do wolumenu, Węglarka montuje je **read-only** z jednego katalogu na hoście i
+pozwala wskazać, jak apka ma je przeładować. Decyzja: [0022](decisions/0022-config-root-mounts.md); gotowy
+przykład: [`docs/examples/configs.toml`](examples/configs.toml).
+
+**1. Katalog.** W `weglarka.toml` dodaj `config_root` — absolutny albo względny do katalogu tego pliku:
+
+```toml
+# config_root = "/var/lib/weglarka/config"
+```
+
+Katalog należy do użytkownika runtime'u (zwykle trzyma się go jako repo git: commituj zmiany, `git checkout` to
+rollback). Demon montuje ten katalog do **swojego** kontenera read-only (potrzebuje go do `apps show` i
+`doctor`), a kontenery apek dostają własne bind-mounty read-only z libpoda. Bez `config_root` funkcja jest
+wyłączona; apka z `configs` przy pustym `config_root` jest odrzucana przy zapisie, a config spoza katalogu
+zatrzymuje demona przy starcie.
+
+Po aktualizacji Węglarki **uruchom ponownie `weglarka platform install`** (quadlet dostaje nowy mount) — bez tego
+demon nie widzi katalogu i `doctor` to zgłosi.
+
+**2. Spec apki.** `source` jest zawsze względny do `config_root`, `target` to ścieżka w kontenerze. Mount jest
+zawsze read-only (nie ma flagi rw). Lista `configs` jest częścią `spec-hash` — zmiana **co** jest montowane
+odtwarza kontener; zmiana **treści** plików już nie.
+
+```toml
+# apps.toml / --spec
+configs = [
+  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
+  { source = "prometheus/rules", target = "/etc/prometheus/rules" },   # katalog
+]
+reload_signal = "SIGHUP"   # opcjonalnie: bez niego `apps reload` restartuje kontener
+```
+
+Przez flagi CLI: `weglarka apps update prometheus --config prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+--reload-signal SIGHUP` (flaga zastępuje wpis o tym samym `source`; `--config none` czyści listę).
+
+Bezpieczeństwo: `source` musi być względny, bez `.`/`..`, po rozwiązaniu symlinków musi zostać wewnątrz
+`config_root`, a `target` podlega regułom wolumenów. Sekretów nie trzymaj w `config_root` — apka powinna czytać je
+przez `*_FILE`/env. Kolejność walidacji jest dwuwarstwowa: reguły składniowe przy każdym `apps.toml`, a reguły
+systemu plików przy zapisie specu, starcie demona, w reconcile i przed startem kontenera.
+
+**3. Zmiana i reload.** Treść plików nie jest częścią `spec-hash`, więc pętla reconcile niczego nie odtwarza.
+Aplikuj zmianę jawnie:
+
+```sh
+vim /var/lib/weglarka/config/prometheus/prometheus.yml
+weglarka apps reload prometheus        # SIGHUP (spec ma reload_signal) albo restart kontenera
+git -C /var/lib/weglarka/config commit -am "scrape nowy cel"
+```
+
+`apps reload` bierze mutex silnika (serializuje się z deployem), nie zmienia `apps.toml`/`state.toml` i odmawia
+(409), gdy kontener nie działa — wtedy `weglarka apps start`. Rollback configu to `git checkout` + `apps reload`;
+rollback obrazu przywraca digest, nie pliki.
+
+**4. Edytor, inode i `--recreate`.** Edytory zapisujące przez write-and-rename zostawiają single-file bind mount
+na starym inodzie — apka nadal widzi poprzednią treść, mimo poprawnego `git status`. Rozwiązania: mountować
+**katalog** (`source = "prometheus"`, `target = "/etc/prometheus"`) albo po takim zapisie:
+
+```sh
+weglarka apps reload prometheus --recreate   # odtworzenie kontenera z przypiętego digestu (bez pullu)
+```
+
+**5. Uprawnienia i widoczność.** Pliki użytkownika runtime'u są w zakresie UID apki widoczne jako `nobody`
+([0009](decisions/0009-volume-ownership.md)), więc wystarczą `0644` dla plików i `0755` dla katalogów:
+
+```sh
+chmod -R u=rwX,go=rX /var/lib/weglarka/config
+```
+
+`weglarka apps show prometheus` wypisuje każdy mount z aktualnym fingerprintem treści, a `weglarka doctor`
+ostrzega o brakującym źródle, ucieczce poza katalog, zbyt luźnych uprawnieniach oraz o tym, że sam katalog jest
+group/world-writable.
+
+**6. Rollback Węglarki.** `weglarka.toml` i `apps.toml` mają `deny_unknown_fields`: starszy demon nie wystartuje z
+`config_root`, `configs` ani `reload_signal`. Przed downgradem usuń te pola (configi zostają na dysku, po prostu
+nie są montowane).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -1006,7 +1090,9 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
   ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
   ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)); inaczej daemon nie wystartuje z błędem parsowania.
+  ([6c](#6c-porty-publikowane-na-hoście-host_ports)), a także `config_root` w `weglarka.toml` i `configs`/
+  `reload_signal` w apkach ([6i](#6i-configi-z-hosta-config_root-i-apps-reload)); inaczej daemon nie wystartuje z
+  błędem parsowania.
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
   ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
@@ -1031,6 +1117,7 @@ diff i niczego nie wysyła.
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
+| `--config` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6i-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
   ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
