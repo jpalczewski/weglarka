@@ -1,6 +1,6 @@
 //! Forgejo adapter behind the `WebhookSource` trait: HMAC-SHA256 (`X-Forgejo-Signature`, hex,
 //! constant time) and normalization of `package` events (`action == "created"`) to `{image_ref}`.
-//! The registry host comes from `[webhook.forgejo]`, never from the payload (docs/decisions/0024).
+//! The registry host comes from `[webhook.forgejo]`, never from the payload (docs/decisions/0025).
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
@@ -163,7 +163,7 @@ mod tests {
         }
     }
 
-    // Shape follows the Gitea/Forgejo `PackagePayload`; replace with a captured delivery (ADR 0024).
+    // Shape follows the Gitea/Forgejo `PackagePayload`; replace with a captured delivery (ADR 0025).
     const CREATED: &str = r#"{"action":"created","package":{"id":7,"owner":{"login":"Acme"},"type":"container","name":"Shop","version":"main"},"sender":{"login":"ci"}}"#;
 
     #[test]

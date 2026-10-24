@@ -148,7 +148,7 @@ pub struct WebhookConfig {
 
 /// Forgejo's `package` payload names the owner and the package but not the registry host, and
 /// a host taken from a payload would let a signed event point a pull at another registry — so the
-/// host comes from here (docs/decisions/0024).
+/// host comes from here (docs/decisions/0025).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgejoWebhookConfig {

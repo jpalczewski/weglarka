@@ -337,7 +337,7 @@ pushu (0004) — pierwsza dostawa jest też testem.
 
 ### Webhook Forgejo (prywatne obrazy)
 
-Adapter Forgejo (ADR 0024) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
+Adapter Forgejo (ADR 0025) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
 Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyżej (`webhook-hmac`, per apka).
 
 1. **Rejestr z konfiguracji.** Payload nie zawiera hosta rejestru, więc podaj go w `weglarka.toml`:
@@ -352,7 +352,7 @@ Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyże
 2. **Obraz apki** to `<registry>/<org>/<nazwa>:<tag>` (małe litery), np. `git.example.eu/acme/shop:main`.
 3. **Webhook w Forgejo** (repo lub organizacja → Settings → Webhooks → Forgejo): URL jak wyżej, content type
    `application/json`, Secret = wartość `webhook-hmac`, zdarzenie **Package**.
-4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0024). Zaloguj
+4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0025). Zaloguj
    się raz jako użytkownik uruchamiający Podmana, kontem serwisowym z tokenem tylko do odczytu pakietów:
 
    ```sh

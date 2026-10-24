@@ -1,4 +1,4 @@
-# 0024 — Forgejo webhooks: `package` event, registry host from config, pulls via `auth.json` (issue #44)
+# 0025 — Forgejo webhooks: `package` event, registry host from config, pulls via `auth.json` (issue #44)
 
 Status: accepted (2026-10-24, issue #44). **Payload shape and moving-tag behaviour to be confirmed on a real push.**
 
