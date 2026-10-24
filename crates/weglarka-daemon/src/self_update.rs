@@ -288,11 +288,11 @@ where
 }
 
 /// The state schema the files are at: `schema_version` in `state.toml` (a file without the marker is
-/// the implicit v1). A state this binary cannot read (written by a newer daemon) is an error — the
+/// the implicit v1, which is also what a missing file counts as). A state this binary cannot read (written by a newer daemon) is an error — the
 /// switcher must not replace the image while it cannot tell what that state needs.
 fn state_schema(settings: &Settings) -> Result<u32, Error> {
     let state = state_files::load_state(&settings.paths.state.state)?;
-    Ok(state.schema_version.unwrap_or(state_files::SCHEMA_VERSION))
+    Ok(state.schema_version.unwrap_or(state::IMPLICIT_SCHEMA))
 }
 
 /// `repo@sha256:…` — the service definition says exactly what runs, so a moving tag cannot change it.
