@@ -157,8 +157,8 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
 - **Configi z hosta (ADR 0023):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
   demona w `platform install` — po upgrade trzeba go przeinstalować), `configs = [{ source, target }]` w spec
-  apki (source względny do rootu, walidacja składniowa w `validate_app`, a canonicalize/containment przy starcie,
-  zapisie, reconcile i przed startem kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
+  apki (source względny do rootu, walidacja składniowa w `validate_app`; start i zapis sprawdzają tylko sam
+  `config_root`, a canonicalize/containment źródła — reconcile i moment tworzenia kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
   **lista `configs` jest w hashu**; `reload_signal` poza hashem. Zmianę treści aplikuje `apps reload` (sygnał albo
   restart), a single-file bind mount po write-and-rename wymaga `--recreate`. Oba pliki TOML mają
   `deny_unknown_fields` → przed downgradem usunąć `config_root`, `configs`, `reload_signal`. Pliki runtime usera

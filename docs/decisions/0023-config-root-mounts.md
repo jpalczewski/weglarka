@@ -55,14 +55,16 @@ store.
 syntactic rules: `source` non-empty, relative, no `.`/`..` segments, no control characters; `target`
 valid and unique across volumes, shared volumes and configs.
 
-The filesystem rules run wherever `config_root` is known: daemon startup, `apps add/update`, the
-reconcile pass, `launch` (before the old container is touched) and `apps reload`. They canonicalize the
-root and the source, reject anything that does not stay inside the root, and require a regular file or a
-directory. The **canonical** path is what gets mounted, so a symlink swapped between the check and the
-mount cannot redirect the bind.
+The filesystem side is split by who can act on it. At startup and on `apps add/update` Węglarka checks
+only the **root**: it must be configured and be a usable directory. A source the operator has not created
+yet must not keep the daemon from booting or block adding the app (the natural workflow is "add the app,
+then write its config"). Per-source resolution — canonicalize the root and the source, require the result
+to stay inside the root and to be a regular file or a directory — runs in the reconcile pass, in `launch`
+(before the old container is touched) and in `apps reload`. An unresolvable source blocks that instance
+instead of failing a deploy and its rollback, and `doctor` reports it. The **canonical** path is what gets
+mounted, so a symlink swapped between the check and the mount cannot redirect the bind.
 
-An app that declares `configs` while `config_root` is unset is an error at write time and at startup,
-and blocks the instance in reconcile rather than failing a deploy and its rollback.
+An app that declares `configs` while `config_root` is unset is an error at write time and at startup.
 
 ### What the hash covers
 

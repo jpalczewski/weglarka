@@ -1002,8 +1002,8 @@ przykład: [`docs/examples/configs.toml`](examples/configs.toml).
 Katalog należy do użytkownika runtime'u (zwykle trzyma się go jako repo git: commituj zmiany, `git checkout` to
 rollback). Demon montuje ten katalog do **swojego** kontenera read-only (potrzebuje go do `apps show` i
 `doctor`), a kontenery apek dostają własne bind-mounty read-only z libpoda. Bez `config_root` funkcja jest
-wyłączona; apka z `configs` przy pustym `config_root` jest odrzucana przy zapisie, a config spoza katalogu
-zatrzymuje demona przy starcie.
+wyłączona; apka z `configs` przy pustym `config_root` jest odrzucana przy zapisie. Sam `config_root`, jeśli
+jest ustawiony, musi istnieć i być katalogiem — inaczej demon nie wystartuje.
 
 Po aktualizacji Węglarki **uruchom ponownie `weglarka platform install`** (quadlet dostaje nowy mount) — bez tego
 demon nie widzi katalogu i `doctor` to zgłosi.
@@ -1026,8 +1026,10 @@ Przez flagi CLI: `weglarka apps update prometheus --config prometheus/prometheus
 
 Bezpieczeństwo: `source` musi być względny, bez `.`/`..`, po rozwiązaniu symlinków musi zostać wewnątrz
 `config_root`, a `target` podlega regułom wolumenów. Sekretów nie trzymaj w `config_root` — apka powinna czytać je
-przez `*_FILE`/env. Kolejność walidacji jest dwuwarstwowa: reguły składniowe przy każdym `apps.toml`, a reguły
-systemu plików przy zapisie specu, starcie demona, w reconcile i przed startem kontenera.
+przez `*_FILE`/env. Walidacja jest dwuwarstwowa: reguły składniowe (`source` względny, bez `..`, unikalny `target`) przy
+każdym `apps.toml`, a reguły systemu plików (symlinki, containment, plik/katalog) w reconcile, przed startem
+kontenera i przy `apps reload`. Brakujący plik nie blokuje więc dodania apki ani startu demona — blokuje samą
+apkę (`weglarka doctor` to pokaże).
 
 **3. Zmiana i reload.** Treść plików nie jest częścią `spec-hash`, więc pętla reconcile niczego nie odtwarza.
 Aplikuj zmianę jawnie:

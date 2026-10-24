@@ -187,8 +187,11 @@ pub fn describe(root: Option<&Path>, spec: &AppSpec) -> Vec<MountView> {
         .collect()
 }
 
-/// Validates the filesystem side of every app's `configs` against the host config: the root is set
-/// when an app declares configs, it is a directory, and every source resolves inside it.
+/// Validates the **host** side of `configs`: when any app declares a config mount, `config_root` must
+/// be set and usable (an existing directory). Individual sources are deliberately **not** resolved
+/// here: a file the operator has not created yet must not keep the daemon from starting. An
+/// unresolvable source blocks only the app (reconcile), is refused when the container is about to be
+/// created (`launch`) and is reported by `doctor`.
 pub fn validate_host(host: &HostConfig, apps: &AppsFile) -> Result<(), ConfigError> {
     let Some((first, _)) = apps.apps.iter().find(|(_, spec)| !spec.configs.is_empty()) else {
         return Ok(());
@@ -199,12 +202,7 @@ pub fn validate_host(host: &HostConfig, apps: &AppsFile) -> Result<(), ConfigErr
         .ok_or_else(|| ConfigError::NoRootFor {
             instance: first.clone(),
         })?;
-    let root = canonical_root(root)?;
-    for spec in apps.apps.values().filter(|spec| !spec.configs.is_empty()) {
-        for mount in &spec.configs {
-            canonical_source(&root, &mount.source)?;
-        }
-    }
+    canonical_root(root)?;
     Ok(())
 }
 
@@ -631,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_host_needs_a_root_and_resolves_every_source() {
+    fn validate_host_checks_the_root_but_not_the_sources() {
         const HOST: &str = r#"
 [ingress]
 mode = "behind"
@@ -672,12 +670,19 @@ domain = "weglarka.example.eu"
             &apps("configs = [{ source = \"app.yml\", target = \"/app.yml\" }]"),
         )
         .unwrap();
-        // ... unless a source is missing or escapes.
-        let err = validate_host(
+        // A source that does not exist yet is not a host error: the app is blocked in reconcile and
+        // `doctor` reports it (`launch` refuses it when a container is about to be created).
+        validate_host(
             &host(Some(root.path())),
             &apps("configs = [{ source = \"missing.yml\", target = \"/app.yml\" }]"),
         )
+        .unwrap();
+        // A configured root that is not a directory is a host error.
+        let err = validate_host(
+            &host(Some(&root.path().join("missing-dir"))),
+            &apps("configs = [{ source = \"app.yml\", target = \"/app.yml\" }]"),
+        )
         .unwrap_err();
-        assert!(matches!(err, ConfigError::NotFound { .. }), "{err}");
+        assert!(matches!(err, ConfigError::RootUnavailable { .. }), "{err}");
     }
 }
