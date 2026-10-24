@@ -1,0 +1,6 @@
+# Static site: no volumes, no secrets. Add it with
+#   weglarka apps add <name> --spec docs/examples/static-site.toml
+# Fields not listed keep their defaults (auto_update = true, start = true, no limits/hardening).
+image = "ghcr.io/example/static-site:1.0"
+domains = ["app.example.com"]
+port = 8080

@@ -5,6 +5,15 @@ CLI `weglarka` zostaje poza kontenerem — na hoście albo na laptopie przez tun
 Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z Coolify). Decyzje:
 [0005](decisions/0005-ingress-i-platforma.md), [0006](decisions/0006-pakowanie-obrazy-i-release.md).
 
+**Spis treści:** [1. Wymagania hosta](#1-wymagania-hosta) · [2. Konfiguracja hosta](#2-konfiguracja-hosta) ·
+[3. Binarki na hoście](#3-binarki-na-hoście-platform-install) · [4. Quadlet i start](#4-quadlet-i-start) ·
+[5. CLI z laptopa](#5-cli-z-laptopa-macos-przez-tunel-ssh) · [Odbiór](#odbiór-na-hoście-scriptsacceptancesh) ·
+[6. Pierwsza apka](#6-pierwsza-apka-ntfyzig) ·
+[6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2) ·
+[6b. `start = false`](#6b-zatrzymywanie-apek-start--false) · [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
+
+Gotowe specy apek (kopiuj-wklej): [`docs/examples/`](examples/).
+
 ## 1. Wymagania hosta
 
 Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie instaluje:
@@ -302,7 +311,8 @@ pushu (0004) — pierwsza dostawa jest też testem.
 
 ## 6a. Wolumeny, zakresy UID i import z Coolify (iteracja 2)
 
-Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md).
+Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md). Import danych przed pierwszym startem apki
+(provisioning z `start = false`) i zatrzymywanie apek: [6b](#6b-zatrzymywanie-apek-start--false).
 
 **Każdy kontener Węglarki dostaje własny zakres UID** z puli subuid użytkownika runtime'u (`userns: private` +
 jawne `UIDMap`/`GIDMap`): apka — 65 536 UID, nginx ingressu — 4 096. Zakres jest przydzielany raz (w `state.toml`:

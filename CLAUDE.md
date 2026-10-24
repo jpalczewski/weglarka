@@ -30,6 +30,19 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
   Nowy i zmieniany kod piszesz od razu po angielsku; istniejące polskie komentarze w plikach, których nie dotykasz,
   tłumaczy osobne zadanie (nie mieszaj tłumaczeń z niezwiązanymi zmianami w PR).
 
+## Przed PR-em (checklista)
+
+1. `git fetch origin && git rebase origin/main` — PR musi być na bieżącym `main`; inaczej GitHub pokaże konflikt
+   i nie uruchomi CI.
+2. `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
+3. Snapshoty: `INSTA_UPDATE=always cargo test`, przejrzyj diff `.snap` i commituj `.snap` (`.snap.new` jest ignorowany).
+4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
+   w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Opisz też kompatybilność wstecz
+   (`deny_unknown_fields` a rollback) w PR i w `docs/install.md`.
+5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md);
+   indeks wszystkich decyzji: [`docs/decisions/README.md`](docs/decisions/README.md).
+6. Tytuł, commity i PR po angielsku, `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `integration-podman`).
+
 ## Mapa crate'ów
 
 Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → api, core`; `daemon → wszystko`.
@@ -46,6 +59,22 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → ap
 Przy pracy równoległej kilku agentów: jeden crate/obszar na agenta, a zmiany w kontrakcie (`app.rs`, `podman.rs`,
 `weglarka-api`) tylko addytywne i zawsze z aktualizacją `FakePodman`.
 Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo.toml` i odwołaj się przez `.workspace = true`.
+
+### Gdzie co leży (najczęstsze punkty wejścia)
+
+| Obszar | Pliki |
+|---|---|
+| model i walidacja apki | `core/src/app.rs`, `core/src/state.rs` (`AppSpec`, `AppsFile`, `validate_app`) |
+| pętla reconcile | `core/src/reconcile.rs` — czyste `plan()` (`Target`/`Action`) + `execute()` (jedyny pisarz stanu) |
+| deploy | `core/src/deploy.rs` — `deploy_locked`: pull → stop → create+start → bramka → rollback; `provision_locked` |
+| spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
+| wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009) |
+| sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
+| kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
+| ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
+| CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |
+| testy silnika | `core/src/engine_tests.rs` (scenariusze na `FakePodman`), testy modułu w `core/src/volumes.rs` |
+| testy daemon/API | `daemon/tests/*.rs` (prawdziwy unix socket + `FakePodman`) |
 
 ## Wnioski z wdrożeń (obowiązują)
 
@@ -64,6 +93,8 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 ## Testy
 
 - `cargo test --workspace` — jednostkowe + snapshoty, bez Podmana.
+- Środowiska z sandboxem (agent / CI w kontenerze): jeśli cargo nie może pisać do globalnego `target-dir`
+  (`Operation not permitted`), ustaw `CARGO_TARGET_DIR=$PWD/target` — katalog `target/` jest w `.gitignore`.
 - Fake: `weglarka-core` z `features = ["testing"]` → `weglarka_core::testing::FakePodman`
   (skryptowalne digesty pulla, błędy w środku pulla, kolejka wyników healthchecka, log wywołań).
 - Integracyjne z prawdziwym Podmanem 6.1 (`weglarka-podman/tests/`): wymagają `WEGLARKA_PODMAN_SOCKET`

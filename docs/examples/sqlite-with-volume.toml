@@ -1,0 +1,10 @@
+# SQLite app with one named volume. The Podman volume is called `<instance>.data` and survives
+# `apps remove` (only `--purge-volumes` deletes it). Add it with
+#   weglarka apps add <name> --spec docs/examples/sqlite-with-volume.toml
+image = "ghcr.io/example/app:latest"
+domains = ["app.example.com"]
+port = 8080
+volumes = [{ name = "data", target = "/data" }]
+
+# Optional resource limits (memory takes bytes or "256m"/"1g", cpus are fractional):
+# resources = { memory = "256m", cpus = 0.5 }

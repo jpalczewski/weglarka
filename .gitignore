@@ -2,3 +2,5 @@
 *.snap.new
 .env
 /bin
+# Local agent/tool state (Serena project config and caches are per-machine).
+.serena/
