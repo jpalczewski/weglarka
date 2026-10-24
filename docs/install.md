@@ -337,6 +337,38 @@ weglarka apps show ntfy                                         # deploy rusza s
 `secrets set` tylko nadpisuje wartość — sekret usuwa się przez `secrets remove`, a cały zakres apki
 sprząta `apps remove --purge-secrets` ([6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce)).
 
+### Zamontowany sekret: tryb i właściciel (`mode`, `uid`, `gid`)
+
+`--secret-mount` montuje plik z domyślnym trybem `0444` (czytelny dla każdego w kontenerze) i właścicielem
+`0:0` — rootem kontenera. Obraz, który uruchamia się jako konkretny nieuprzywilejowany użytkownik i wymaga
+strictejszego trybu (np. `0400` tylko dla niego), dostaje oba ustawienia przez `--spec`/`apps.toml`:
+
+```toml
+# apps.toml
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+secrets = [
+  { secret = "config", kind = "mount", path = "/config.json", mode = 0o400, uid = 1000, gid = 1000 },
+]
+```
+
+- **`mode`, `uid`, `gid` są opcjonalne.** Bez nich zostaje `0o444` i `0/0` (jak w `podman run --secret`).
+- **Identyfikatory są liczbowe i „kontenerowe”** — w tej samej przestrzeni, w której mówi `USER` obrazu
+  (np. `1000`). Podman mapuje je przez zakres UID instancji (ADR 0009), więc `stat` **wewnątrz kontenera**
+  pokazuje `1000`, a na hoście offset `zakres.start + 1000`. **Nie podawaj UID-ów hosta ani nazw
+  użytkowników** — nazwa to błąd parsowania, a hostowy UID trafiłby w innego właściciela.
+- **Zakres `0..=65535`** (`0` = root w kontenerze); większa wartość odrzuca `apps.toml`/`--spec` przy wczytaniu.
+- **Tylko przez `--spec`:** nie ma flagi CLI dla `uid`/`gid`. `apps update --secret-mount SECRET=PATH` wiąże
+  sekret **od nowa**, więc resetuje `mode`/`uid`/`gid` tej pozycji do domyślnych — ustaw je ponownie w specu.
+- **W `spec-hash`:** nieustawione pola nic nie zmieniają (aktualizacja Węglarki nie odtwarza kontenera),
+  a ustawione lub zmienione odtwarzają kontener przy następnym reconcile — właściciel jest nadawany przy
+  tworzeniu kontenera. Decyzja i odrzucone alternatywy: [0037](decisions/0037-secret-mount-ownership.md).
+
+**Rollback:** to zmiana schematu plików stanu (wersja 7) — `apps.toml` i `state.toml` dostają
+`schema_version = 7` przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `uid`/`gid` z zamontowanych
+sekretów (albo przywróć pliki **z kopii sprzed aktualizacji**,
+[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
+
 ### Wartość sekretu: `< plik`, nie `/dev/stdin`
 
 **Prywatne obrazy (rejestr z uwierzytelnianiem).** Poświadczenia do pulla to zwykły sekret apki o zarezerwowanej
@@ -1689,7 +1721,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   weglarka-self-update.timer weglarka-watchdog.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
   ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
   ([6n](#6n-ścieżki-na-jednej-domenie-paths)) oraz `ingress.max_body_size`
-  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)). W trybie `edge` przed downgradem ustaw
+  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)) oraz `uid`/`gid` z zamontowanych sekretów
+  ([6](#6-pierwsza-apka-ntfyzig)). W trybie `edge` przed downgradem ustaw
   `mode = "behind"`, usuń `https_bind` i przywróć `traefik_dynamic_file`
   ([6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu)). Inaczej daemon nie wystartuje z błędem parsowania.
 
@@ -1699,10 +1732,10 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
 [0023](decisions/0023-state-schema-version.md)). Zasady:
 
 - **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
-  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 5**
+  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 7**
   (v2: configi z hosta, issue #118, [0028](decisions/0028-config-root-mounts.md); v3: grupy wolumenów
-  współdzielonych, issue #129): plik v1 wczytuje się bez zmian, a pierwszy zwykły zapis dopisuje
-  `schema_version = 3`.
+  współdzielonych, issue #129, [0029](decisions/0029-shared-volume-groups.md); dalsze wersje — niżej):
+  plik v1 wczytuje się bez zmian, a pierwszy zwykły zapis dopisuje `schema_version = 7`.
 - Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
   `apps.toml`/`state.toml`); taka wersja uruchamia migrację przy odczycie, a pierwszy zwykły zapis
   dopisuje nowy numer. **Wersja 3** (issue #129, [0029](decisions/0029-shared-volume-groups.md)) dodaje opcjonalne
@@ -1712,6 +1745,11 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   `shared_networks` w specu apki ([6m](#6m-wspólna-sieć-między-apkami-shared_networks)); te same zasady rollbacku.
   **Wersja 5** (issue #130, [0031](decisions/0031-path-prefix-routing.md)) dodaje `paths` i `ingress.strip_prefix`
   ([6n](#6n-ścieżki-na-jednej-domenie-paths)); te same zasady rollbacku.
+  **Wersja 6** ([0033](decisions/0033-ingress-max-body-size.md)) dodaje opcjonalny `ingress.max_body_size`
+  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)); **wersja 7** (issue #55, [0037](decisions/0037-secret-mount-ownership.md))
+  dodaje opcjonalne `uid`/`gid` w zamontowanym sekrecie ([6](#6-pierwsza-apka-ntfyzig)) — plik v1 wczytuje się
+  bez zmian, a rollback do wydania sprzed danej wersji wymaga usunięcia tych pól albo kopii plików sprzed
+  aktualizacji.
 - **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
 
   ```text

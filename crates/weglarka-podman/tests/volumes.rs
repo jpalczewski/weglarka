@@ -575,7 +575,7 @@ async fn engine_ranges_volumes_secrets_import_migration_and_purge() {
 image = "docker.io/library/nginx:1-alpine"
 health = {{ attempts = 1, window_secs = 2 }}
 volumes = [{{ name = "data", target = "/data" }}]
-secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 0o444 }}]
+secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 0o444, uid = 1000, gid = 1000 }}]
 "#
         ),
     )
@@ -631,6 +631,14 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
         sh("su -s /bin/sh daemon -c 'grep -q s3cret /run/secrets/tok'").await,
         0,
         "non-root"
+    );
+    // Issue #55: `uid`/`gid` are container-space ids, so libpod maps them through the instance's
+    // range and the file is owned by 1000:1000 *inside* the container (the mode stays 0444, so both
+    // readability checks above still pass).
+    assert_eq!(
+        sh("test \"$(stat -c '%u:%g' /run/secrets/tok)\" = 1000:1000").await,
+        0,
+        "secret mount ownership is mapped into the container's id space"
     );
 
     // Data survives a forced redeploy (new container, same range).

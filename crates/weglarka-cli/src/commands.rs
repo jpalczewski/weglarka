@@ -176,6 +176,8 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
             target: SecretTarget::Mount {
                 path: path.clone(),
                 mode: None,
+                uid: None,
+                gid: None,
             },
         });
     }

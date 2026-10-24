@@ -112,6 +112,18 @@ pub enum SecretTarget {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
+        /// Owner of the mounted file as a numeric uid **in the container** (`0` is root there): the
+        /// same id space the image's `USER` refers to, not a host uid. Podman maps it through the
+        /// instance's uid range (ADR 0009), so `1000` becomes range offset `1000`. Defaults to `0`
+        /// (root in the container), like `podman run --secret`; valid `0..=65535` (the whole range),
+        /// user names are not accepted. Set only through `--spec` (no CLI flag).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uid: Option<u32>,
+        /// Owner group of the mounted file as a numeric gid in the container (`0` is root there),
+        /// mapped by Podman through the instance's gid range (ADR 0009). Defaults to `0`; valid
+        /// `0..=65535`; user names are not accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gid: Option<u32>,
     },
 }
 
@@ -1207,6 +1219,71 @@ secrets = [{ secret = "config", kind = "mount", path = "/config.json" }]
 
         let bad = "[apps.x]\nimage = \"a\"\nbogus = 1\n";
         assert!(toml::from_str::<AppsFile>(bad).is_err());
+    }
+
+    /// Issue #55: a mounted secret can name its owner next to `mode`, as a numeric id in the
+    /// container's space (Podman maps it through the instance's uid range, ADR 0009).
+    #[test]
+    fn secret_mount_ownership_parses_roundtrips_and_stays_out_when_unset() {
+        let toml_src = r#"
+[apps.app]
+image = "i"
+secrets = [
+  { secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 0o400, uid = 1000, gid = 1000 },
+]
+"#;
+        let parsed: AppsFile = toml::from_str(toml_src).unwrap();
+        let spec = &parsed.apps[&InstanceName::new("app").unwrap()];
+        assert_eq!(
+            spec.secrets[0].target,
+            SecretTarget::Mount {
+                path: "/run/secrets/tok".into(),
+                mode: Some(0o400),
+                uid: Some(1000),
+                gid: Some(1000),
+            }
+        );
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(
+            text.contains("mode = 256")
+                && text.contains("uid = 1000")
+                && text.contains("gid = 1000"),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<AppsFile>(&text).unwrap(), parsed);
+
+        // Unset ownership stays out of the file, so existing specs keep their shape.
+        let plain: AppsFile = toml::from_str(
+            "[apps.a]\nimage = \"i\"\nsecrets = [{ secret = \"s\", kind = \"mount\", path = \"/f\" }]\n",
+        )
+        .unwrap();
+        let plain_spec = &plain.apps[&InstanceName::new("a").unwrap()];
+        assert_eq!(
+            plain_spec.secrets[0].target,
+            SecretTarget::Mount {
+                path: "/f".into(),
+                mode: None,
+                uid: None,
+                gid: None,
+            }
+        );
+        let text = toml::to_string(&plain).unwrap();
+        assert!(
+            !text.contains("mode") && !text.contains("uid") && !text.contains("gid"),
+            "{text}"
+        );
+
+        // Numeric ids only: a user name is a parse error, not a delayed validation error.
+        let bad = "[apps.a]\nimage = \"i\"\n\
+                   secrets = [{ secret = \"s\", kind = \"mount\", path = \"/f\", uid = \"1000\" }]\n";
+        assert!(toml::from_str::<AppsFile>(bad).is_err());
+        let bad_gid = "[apps.a]\nimage = \"i\"\n\
+                       secrets = [{ secret = \"s\", kind = \"mount\", path = \"/f\", gid = \"daemon\" }]\n";
+        assert!(toml::from_str::<AppsFile>(bad_gid).is_err());
+        // Ownership only exists on a mount; `deny_unknown_fields` rejects it on `kind = "env"`.
+        let bad_env = "[apps.a]\nimage = \"i\"\n\
+                       secrets = [{ secret = \"s\", kind = \"env\", var = \"V\", uid = 1000 }]\n";
+        assert!(toml::from_str::<AppsFile>(bad_env).is_err());
     }
 
     #[test]

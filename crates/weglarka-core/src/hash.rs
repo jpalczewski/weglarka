@@ -564,4 +564,61 @@ env = { B = "2", A = "1" }
         s.reload_signal = Some("SIGHUP".into());
         assert_eq!(base, spec_hash(&s, &digest('a')));
     }
+
+    fn mounting(uid: Option<u32>, gid: Option<u32>) -> AppSpec {
+        let mut s = spec();
+        s.secrets = vec![SecretBinding {
+            secret: "cfg".into(),
+            target: SecretTarget::Mount {
+                path: "/config.json".into(),
+                mode: Some(0o400),
+                uid,
+                gid,
+            },
+        }];
+        s
+    }
+
+    /// Issue #55: `uid`/`gid` are new optional fields of a mount binding. While unset they are
+    /// skipped, so the binding enters the hash exactly as before the feature (`HASH_FORMAT` stays
+    /// v1) and upgrading Węglarka recreates no container. `LegacyInput` mirrors the pre-feature
+    /// `HashInput` for a spec whose other optional fields are all unset (like `spec()`).
+    #[test]
+    fn unset_secret_mount_ownership_does_not_change_the_hash() {
+        #[derive(Serialize)]
+        struct LegacyInput<'a> {
+            format: &'static str,
+            image_digest: &'a Digest,
+            port: Option<u16>,
+            env: &'a BTreeMap<String, String>,
+            secrets: Vec<&'a SecretBinding>,
+        }
+        let s = mounting(None, None);
+        let d = digest('a');
+        let legacy = LegacyInput {
+            format: HASH_FORMAT,
+            image_digest: &d,
+            port: s.port,
+            env: &s.env,
+            secrets: s.secrets.iter().collect(),
+        };
+        let expected = hex::encode(Sha256::digest(serde_json::to_vec(&legacy).unwrap()));
+        assert_eq!(spec_hash(&s, &d).as_str(), expected);
+    }
+
+    /// Ownership is applied when the container is created (`MountSecret.UID`/`GID` in libpod), so
+    /// setting it — or changing it — must recreate the container.
+    #[test]
+    fn secret_mount_ownership_changes_the_hash_only_when_set() {
+        let hash = |uid, gid| spec_hash(&mounting(uid, gid), &digest('a'));
+        let base = hash(None, None);
+        assert_eq!(base, hash(None, None));
+        assert_ne!(base, hash(Some(1000), None), "uid");
+        assert_ne!(base, hash(None, Some(1000)), "gid");
+        assert_ne!(
+            hash(Some(1000), Some(1000)),
+            hash(Some(1001), Some(1000)),
+            "the owner id is part of the container"
+        );
+    }
 }

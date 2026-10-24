@@ -259,6 +259,8 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
             return Err(missing("secret binding", s));
         }
     }
+    // Re-binding replaces the whole binding, so it also resets the mount options (`mode`, `uid`,
+    // `gid`) to their defaults — same as before this flag existed, there is no flag for them.
     let bindings = a
         .secret_env
         .iter()
@@ -269,6 +271,8 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
                 SecretTarget::Mount {
                     path: path.clone(),
                     mode: None,
+                    uid: None,
+                    gid: None,
                 },
             )
         }));

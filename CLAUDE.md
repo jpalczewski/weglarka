@@ -221,6 +221,12 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   schematu, a starszy demon go ignoruje. Odczyt jest tolerancyjny (brak = pusty zbiór, uszkodzony = warn +
   pusty i przepisany przy następnej dostawie), a błąd zapisu tylko ostrzega — księgowość nie może wywalić
   webhooka ani startu demona.
+- **Właściciel zamontowanego sekretu (ADR 0037, #55):** `mode`/`uid`/`gid` w wiązaniu `kind = "mount"` są
+  **kontenerowe** (ta sama przestrzeń co `USER` obrazu; Podman mapuje je przez zakres instancji, ADR 0009),
+  `uid`/`gid` to liczby w `0..=65535` (nazwy użytkowników odrzuca parsowanie). Nieustawione pola nie wchodzą
+  do `spec_hash` (aktualizacja nic nie odtwarza), ustawione/zmienione odtwarzają kontener, a `--secret-mount`
+  wiąże od nowa i resetuje te opcje do domyślnych. Nowe pola `apps.toml` → `schema_version = 7` (no-op krok),
+  więc przed downgradem usuń `uid`/`gid` z zamontowanych sekretów albo przywróć pliki stanu z kopii.
 
 ## Testy
 
