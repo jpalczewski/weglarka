@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use weglarka_core::podman::{
     ContainerFilter, ContainerState, EventFilter, HealthStatus, NetworkSpec, PodmanClient,
-    PodmanError, PullEvent,
+    PodmanError, PullEvent, RegistryAuth,
 };
 use weglarka_podman::LibpodClient;
 
@@ -85,9 +85,15 @@ fn serve(routes: Vec<Route>) -> Mock {
                 }
                 let request_line = head.lines().next().unwrap().to_owned();
                 let body = String::from_utf8_lossy(&buf[body_start..body_start + len]);
+                // Only the registry-auth header is of interest to the tests; absent → the entry is unchanged.
+                let auth = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("x-registry-auth: "))
+                    .map(|v| format!(" [x-registry-auth: {v}]"))
+                    .unwrap_or_default();
                 log.lock()
                     .unwrap()
-                    .push(format!("{request_line} {body}").trim_end().to_owned());
+                    .push(format!("{request_line} {body}{auth}").trim_end().to_owned());
                 let target = request_line.rsplit_once(' ').unwrap().0;
                 let (status, payload) = routes
                     .iter()
@@ -264,6 +270,86 @@ async fn pull_error_in_stream_body_is_err_item_then_ends() {
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], Ok(PullEvent::Progress { .. })));
     assert!(matches!(&events[1], Err(PodmanError::Pull(m)) if m.contains("unauthorized")));
+}
+
+/// `image_pull_with` sends `X-Registry-Auth` (base64url JSON); a plain `image_pull` sends none.
+#[tokio::test]
+async fn pull_with_credentials_sends_registry_auth_header_and_plain_pull_does_not() {
+    let routes = || {
+        vec![
+            (
+                "POST /v6.0.0/libpod/images/pull",
+                200,
+                fixture!("pull_ok.ndjson"),
+            ),
+            (
+                "GET /v6.0.0/libpod/images/",
+                200,
+                fixture!("inspect_image.json"),
+            ),
+        ]
+    };
+    let image = "ghcr.io/jpalczewski/ntfy.zig:latest";
+
+    let mock = serve(routes());
+    let auth = RegistryAuth::new("ci", "s3cr3t:with-colon");
+    let events: Vec<_> = LibpodClient::new(&mock.socket)
+        .image_pull_with(image, Some(&auth))
+        .collect()
+        .await;
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let pull = mock.requests().remove(0);
+    // {"username":"ci","password":"s3cr3t:with-colon","serveraddress":"ghcr.io"}
+    assert!(
+        pull.ends_with(
+            " [x-registry-auth: eyJ1c2VybmFtZSI6ImNpIiwicGFzc3dvcmQiOiJzM2NyM3Q6d2l0aC1jb2xvbiIsInNlcnZlcmFkZHJlc3MiOiJnaGNyLmlvIn0=]"
+        ),
+        "{pull}"
+    );
+    assert!(
+        !format!("{auth:?}").contains("s3cr3t"),
+        "Debug redacts the password"
+    );
+
+    let mock = serve(routes());
+    LibpodClient::new(&mock.socket)
+        .image_pull(image)
+        .collect::<Vec<_>>()
+        .await;
+    assert!(!mock.requests()[0].contains("x-registry-auth"));
+}
+
+/// 401/403 from libpod (before the stream starts) and the `unauthorized` error inside the stream
+/// are both registry-auth failures.
+#[tokio::test]
+async fn pull_auth_failures_are_recognized_in_status_and_in_stream() {
+    let mock = serve(vec![(
+        "POST /v6.0.0/libpod/images/pull",
+        401,
+        r#"{"message":"denied"}"#,
+    )]);
+    let events: Vec<_> = LibpodClient::new(&mock.socket)
+        .image_pull("ghcr.io/x/priv:latest")
+        .collect()
+        .await;
+    assert!(
+        matches!(events.as_slice(), [Err(e)] if e.is_registry_auth_failure()),
+        "{events:?}"
+    );
+
+    let mock = serve(vec![(
+        "POST /v6.0.0/libpod/images/pull",
+        200,
+        fixture!("pull_error.ndjson"),
+    )]);
+    let events: Vec<_> = LibpodClient::new(&mock.socket)
+        .image_pull("ghcr.io/x/bad:latest")
+        .collect()
+        .await;
+    assert!(matches!(&events[1], Err(e) if e.is_registry_auth_failure()));
 }
 
 #[tokio::test]

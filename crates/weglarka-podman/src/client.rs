@@ -8,9 +8,10 @@ use hyper::Method;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
     NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent,
-    Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
+use crate::registry_auth;
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
@@ -179,10 +180,15 @@ impl PodmanClient for LibpodClient {
         Ok(containers)
     }
 
-    fn image_pull(&self, reference: &str) -> impl Stream<Item = Result<PullEvent>> + Send {
+    fn image_pull_with(
+        &self,
+        reference: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> impl Stream<Item = Result<PullEvent>> + Send {
         let state = PullState {
             client: self.clone(),
             reference: reference.to_owned(),
+            auth: auth.cloned(),
             lines: None,
             image_id: None,
             finished: false,
@@ -407,6 +413,8 @@ impl PodmanClient for LibpodClient {
 struct PullState {
     client: LibpodClient,
     reference: String,
+    /// Sent as `X-Registry-Auth`; never logged (`RegistryAuth`'s `Debug` redacts the password).
+    auth: Option<RegistryAuth>,
     lines: Option<Lines>,
     image_id: Option<String>,
     finished: bool,
@@ -431,7 +439,17 @@ impl PullState {
                 "/images/pull?reference={}",
                 encode_component(&self.reference)
             );
-            self.lines = Some(self.client.transport.lines(Method::POST, &path).await?);
+            let header = self
+                .auth
+                .as_ref()
+                .map(|auth| registry_auth::header(&self.reference, auth))
+                .transpose()?;
+            self.lines = Some(
+                self.client
+                    .transport
+                    .lines(Method::POST, &path, header)
+                    .await?,
+            );
         }
         let lines = self.lines.as_mut().expect("opened above");
         loop {
@@ -481,7 +499,7 @@ impl EventsState {
 
     async fn next_event(&mut self) -> Result<Option<PodmanEvent>> {
         if self.lines.is_none() {
-            self.lines = Some(self.transport.lines(Method::GET, &self.path).await?);
+            self.lines = Some(self.transport.lines(Method::GET, &self.path, None).await?);
         }
         let lines = self.lines.as_mut().expect("opened above");
         match lines.next_line().await? {

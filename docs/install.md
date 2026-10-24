@@ -288,6 +288,19 @@ sprząta `apps remove --purge-secrets` ([6j](#6j-sekrety-usuwanie-i-sprzątanie-
 
 ### Wartość sekretu: `< plik`, nie `/dev/stdin`
 
+**Prywatne obrazy (rejestr z uwierzytelnianiem).** Poświadczenia do pulla to zwykły sekret apki o zarezerwowanej
+nazwie `registry-auth`, w formacie `<użytkownik>:<hasło-lub-token>` (ADR
+[0026](decisions/0026-registry-credentials.md)):
+
+```
+weglarka secrets set moja-apka registry-auth < creds.txt   # np. "ci-bot:ghp_xxx"
+```
+
+Demon wysyła je jako `X-Registry-Auth` przy każdym pullu tej apki; bez sekretu pull jest anonimowy (jak dotąd —
+działa też `auth.json` użytkownika Podmana). Odrzucone dane daje błąd `409` z nazwą sekretu do poprawienia;
+sekretu `registry-auth` nie wolno podpiąć do kontenera (`secrets = [...]`). Kompatybilność wstecz: brak zmian
+w plikach stanu — starszy demon po prostu ignoruje ten sekret.
+
 Przekaż wartość **przekierowaniem** (`secrets set <app> <nazwa> < plik`) albo potokiem
 (`pbpaste | weglarka secrets set …`) — CLI czyta wtedy standardowe wejście. Nie używaj
 `--from-file /dev/stdin` przez `sudo -u`/`ssh` na innego użytkownika: `/dev/stdin` to dowiązanie do
@@ -337,7 +350,7 @@ pushu (0004) — pierwsza dostawa jest też testem.
 
 ### Webhook Forgejo (prywatne obrazy)
 
-Adapter Forgejo (ADR 0025) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
+Adapter Forgejo (ADR 0026) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
 Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyżej (`webhook-hmac`, per apka).
 
 1. **Rejestr z konfiguracji.** Payload nie zawiera hosta rejestru, więc podaj go w `weglarka.toml`:
@@ -352,7 +365,7 @@ Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyże
 2. **Obraz apki** to `<registry>/<org>/<nazwa>:<tag>` (małe litery), np. `git.example.eu/acme/shop:main`.
 3. **Webhook w Forgejo** (repo lub organizacja → Settings → Webhooks → Forgejo): URL jak wyżej, content type
    `application/json`, Secret = wartość `webhook-hmac`, zdarzenie **Package**.
-4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0025). Zaloguj
+4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0026). Zaloguj
    się raz jako użytkownik uruchamiający Podmana, kontem serwisowym z tokenem tylko do odczytu pakietów:
 
    ```sh

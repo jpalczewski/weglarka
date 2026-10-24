@@ -236,6 +236,12 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         return Err(format!("{name}: health attempts and window must be > 0"));
     }
     for b in &spec.secrets {
+        if b.secret == crate::secret_store::REGISTRY_AUTH_SECRET {
+            return Err(format!(
+                "{name}: secret {:?} is reserved for registry credentials and cannot be bound to the container",
+                b.secret
+            ));
+        }
         if !crate::secret_store::valid_secret_name(&b.secret) {
             return Err(format!("{name}: invalid secret name {:?}", b.secret));
         }
