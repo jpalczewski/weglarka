@@ -29,7 +29,8 @@ pub enum DependsOnFlag {
     Clear,
 }
 
-/// Limits, volumes, hardening and host ports; flattened into `AddArgs` and `UpdateArgs`.
+/// Limits, volumes, hardening, host ports and start dependencies; flattened into `AddArgs` and
+/// `UpdateArgs`.
 #[derive(Debug, Default, Args)]
 pub struct SpecFlags {
     /// Memory limit, e.g. 128m or 1g (`none` removes it). Default: no limit.

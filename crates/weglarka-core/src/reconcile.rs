@@ -100,8 +100,8 @@ pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
     /// Time allowed for gracefully stopping the old container.
     pub stop_timeout_secs: u32,
-    /// How long a start waits for the apps in `depends_on` (issue #35). `0` means a single check,
-    /// which is what tests use; the default stays below the admin API's mutation timeout.
+    /// How long a start waits for the apps in `depends_on` (issue #35). `0` means a single check
+    /// (no waiting); the default stays below the admin API's mutation timeout.
     pub dependency_wait_secs: u32,
 }
 
