@@ -59,12 +59,26 @@ async fn nginx_lifecycle() {
         ApplyReport::Changed { nginx, .. } => Some(nginx),
         ApplyReport::Unchanged => None,
     };
+    // The one container facing outside traffic is hardened (docs/decisions/0014).
+    let assert_hardened = |f: &FakePodman| {
+        let spec = f.container_spec("weglarka-nginx").expect("nginx container");
+        assert!(spec.security.read_only, "rootfs must be read-only");
+        assert_eq!(spec.security.cap_drop, ["ALL"]);
+        assert_eq!(
+            spec.security.cap_add,
+            ["CHOWN", "SETGID", "SETUID"],
+            "worker-uid drop and temp-dir chown, nothing more"
+        );
+        assert!(spec.security.no_new_privileges);
+        assert!(spec.security.tmpfs.is_empty(), "libpod's /tmp suffices");
+    };
 
     // Empty app set: nginx is created anyway (webhooks).
     assert_eq!(
         nginx_action(manager.apply().await),
         Some(NginxAction::Created)
     );
+    assert_hardened(&fake);
     assert!(
         std::fs::read_to_string(&traefik)
             .unwrap()
@@ -177,6 +191,8 @@ async fn nginx_lifecycle() {
         fake.container_inspect("weglarka-nginx").await.unwrap().id,
         id_before
     );
+    // ...and the recreated container is hardened as well.
+    assert_hardened(&fake);
 
     // Container died → start (without touching the config).
     fake.crash_container("weglarka-nginx", 1);

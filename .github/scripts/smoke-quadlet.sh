@@ -75,6 +75,17 @@ done
 [ "$(podman inspect -f '{{.HostConfig.ReadonlyRootfs}}' weglarka)" = true ] || { echo "rootfs not read-only"; exit 1; }
 [ "$(podman inspect -f '{{.HostConfig.Memory}}' weglarka)" -gt 0 ] || { echo "no memory limit"; exit 1; }
 [ "$(podman inspect -f '{{.State.Running}}' weglarka)" = true ] || { echo "weglarka not running"; exit 1; }
+# The ingress nginx is hardened too (docs/decisions/0014) — same checks as in smoke-image.sh.
+[ "$(podman inspect -f '{{.HostConfig.ReadonlyRootfs}}' weglarka-nginx)" = true ] \
+  || { echo "weglarka-nginx rootfs is not read-only"; exit 1; }
+podman inspect -f '{{.HostConfig.SecurityOpt}}' weglarka-nginx | grep -q 'no-new-privileges' \
+  || { echo "weglarka-nginx runs without no-new-privileges"; exit 1; }
+caps=$(podman inspect -f '{{json .EffectiveCaps}}' weglarka-nginx)
+[ "$(printf '%s' "$caps" | grep -o 'CAP_[A-Z_]*' | sort -u | tr '\n' ' ' || true)" = "CAP_CHOWN CAP_SETGID CAP_SETUID " ] \
+  || { echo "weglarka-nginx capabilities are not exactly CHOWN+SETGID+SETUID: $caps"; exit 1; }
+podman exec weglarka-nginx nginx -t -c /etc/nginx/nginx.conf \
+  || { echo "nginx -t fails inside the hardened container"; exit 1; }
+echo "weglarka-nginx is hardened: read-only root, no-new-privileges, CHOWN+SETGID+SETUID only"
 [ -s "$dir/traefik.yml" ] || { echo "traefik file not written"; exit 1; }
 [ -s "$dir/nginx/nginx.conf" ] || { echo "nginx.conf not written"; exit 1; }
 echo "OK"

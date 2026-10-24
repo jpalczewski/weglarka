@@ -56,6 +56,33 @@ fn output_is_deterministic() {
     );
 }
 
+/// Hardening assumption (docs/decisions/0014): the nginx container has a read-only root, and the only
+/// writable filesystem it gets is libpod's tmpfs on `/tmp` (`/var/tmp`, `/run`). Every path nginx writes
+/// at startup — its pid and the request-body/proxy temp directories — therefore has to live under `/tmp`;
+/// a directive writing elsewhere would break the hardened container, not just this test.
+#[test]
+fn writable_nginx_paths_stay_under_tmp() {
+    for (name, apps) in layouts() {
+        let conf = nginx::generate(&host(), &apps, &opts()).unwrap();
+        let mut checked = 0;
+        for line in conf.lines() {
+            let Some((directive, value)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            if directive != "pid" && !directive.ends_with("_temp_path") {
+                continue;
+            }
+            let path = value.trim_end_matches(';');
+            assert!(
+                path.starts_with("/tmp/"),
+                "{name}: {directive} points outside the writable tmpfs: {path}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "{name}: pid plus five *_temp_path directives");
+    }
+}
+
 #[test]
 fn traefik_without_cert_resolver() {
     let o = TraefikOptions {

@@ -90,6 +90,8 @@ bind = "172.17.0.1:8088"                                   # docker0; 8080 zajmu
 traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # root-owy path-unit waliduje i publikuje do dynamic/
 # nginx przypięty po digeście (0006); podbijaj świadomie — zmiana odtwarza kontener nginx:
 nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421428ce13bd1eaa412404953859cf7a5b6512c25e67a60"
+# Kontener nginx jest zawsze osłoniony (0014): read-only root, cap_drop ALL (+ CHOWN/SETGID/SETUID),
+# no-new-privileges. Własny obraz musi to tolerować (nie może pisać po swoim rootfs przy starcie).
 # Opcjonalnie: peery, którym nginx ufa w sprawie X-Forwarded-* (0007). Domyślnie podsieć `net-weglarka`
 # (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE domyślną. Zwykle zostaw nieustawione.
 # trusted_proxies = ["10.89.1.2"]
@@ -376,6 +378,25 @@ zapisywalnych katalogów poza wolumenami i `--cap-add NAZWA`, jeśli apka czego�
   nie odtwarza).
 - Sprawdź po deployu: `podman inspect <kontener> --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'`.
 
+### Kontener ingressu (`weglarka-nginx`)
+
+Kontener nginx jest osłoniony **zawsze** (0014): to jedyny kontener wystawiony na zewnątrz, a jego profil wybiera
+Węglarka, nie spec apki. `read_only`, `no_new_privileges`, `cap_drop = ["ALL"]` i tylko trzy capability z powrotem
+(`CHOWN`, `SETGID`, `SETUID` — nginx zmienia właściciela swoich katalogów tymczasowych na użytkownika workera z obrazu
+i do niego zrzuca uprawnienia; bez nich nie wystartuje). Wszystko, co nginx zapisuje w runtime (pid i katalogi
+`*_temp_path`), leży w `/tmp`, który Podman przy `read_only` montuje jako zapisywalny tmpfs (razem z `/var/tmp`
+i `/run`) — dlatego profil nie potrzebuje własnego wpisu `tmpfs`.
+
+- Profil jest częścią `weglarka.ingress-hash`, więc **aktualizacja Węglarki odtwarza nginx jednorazowo** (krótka
+  przerwa ruchu; obraz jest już na hoście, jeśli `nginx_image` się nie zmienił). Powrót do starszej Węglarki też go
+  odtworzy — wtedy bez osłonienia. Żadne pole w TOML-ach się nie zmieniło, więc `deny_unknown_fields` nie
+  przeszkadza w rollbacku w żadną stronę.
+- Własny `ingress.nginx_image` musi działać z read-only rootem i z dokładnie tymi capability (oficjalny
+  `nginx:*-alpine` działa).
+- Sprawdź: `podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'` (oczekiwane
+  `true` i `[CAP_CHOWN CAP_SETGID CAP_SETUID]`) oraz
+  `podman exec weglarka-nginx nginx -t -c /etc/nginx/nginx.conf`.
+
 ### Import danych z Coolify (np. szklana.pogoda)
 
 Importuj tar z Coolify trybem domyślnym (**obcy** tar): libpod nadaje wypakowanym plikom właściciela z konfiguracji
@@ -577,6 +598,7 @@ błędem parsowania.
 weglarka status && weglarka apps show ntfy      # digest, generacja, ostatni deploy
 curl -fsS https://nz.descriptortable.eu/        # z zewnątrz, przez Traefika
 podman logs weglarka-nginx                      # access log JSON z polem app
+podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'  # true [] (0014)
 ```
 
 - **Automatyczny rollback:** deploy, który nie przejdzie bramki zdrowia, wraca do poprzedniego digestu
