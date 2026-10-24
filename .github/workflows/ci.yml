@@ -110,6 +110,14 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/trusted.conf"
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 192.0.2.0/24 > "$RUNNER_TEMP/untrusted.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf"
+      # Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream
+      # reaches the client immediately and an idle stream survives the 60 s default read timeout; the same
+      # upstream without the option is held back by nginx (the negative control in the script).
+      - name: Streaming through nginx
+        run: |
+          set -euo pipefail
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/streaming.conf"
+          .github/scripts/test-streaming.sh "$RUNNER_TEMP/streaming.conf"
 
   # Static (musl) daemon + CLI — built once and used three ways: build check, image content, and the
   # binaries run by the smoke test. PRs build the cheap `ci` profile, main the full `release` profile
