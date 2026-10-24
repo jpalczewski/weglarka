@@ -243,6 +243,48 @@ pub enum Trigger {
     Changed,
 }
 
+/// What the engine is doing to an instance right now (in-memory only; see [`InFlight`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Pull, create/start and the health gate of a deploy (manual, webhook or the first reconcile).
+    Deploy,
+    /// Recreate the container from the pinned digest (spec drift, missing container, secret change).
+    Recreate,
+    /// `start = false`: pin the digest and prepare the network, uid range and volumes; no container.
+    Provision,
+}
+
+impl ActivityKind {
+    /// Short label for user-facing output (`doctor`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Recreate => "recreate",
+            Self::Provision => "provision",
+        }
+    }
+}
+
+/// The instance being mutated right now, exposed by [`Reconciler::in_flight`] so that `doctor` can
+/// tell a **transient** mismatch between `state.toml` and the container from real drift: a deploy
+/// writes `state.toml` only after the new container passes the health gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    pub instance: InstanceName,
+    pub kind: ActivityKind,
+}
+
+/// Clears [`Reconciler::in_flight`] when the mutating operation ends (RAII: early returns included).
+pub(crate) struct ActivityGuard<'a> {
+    slot: &'a std::sync::Mutex<Option<InFlight>>,
+}
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Engine: reconcile + deploy. One per daemon process; all mutating operations
 /// are serialized by `lock` (the sole state writer).
 pub struct Reconciler<P: PodmanClient> {
@@ -254,6 +296,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) http_prober: Option<Arc<dyn crate::limits::HttpProber>>,
     pub(crate) lock: tokio::sync::Mutex<()>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
+    /// The instance being mutated right now (`None` when the engine is idle). See [`InFlight`].
+    pub(crate) activity: std::sync::Mutex<Option<InFlight>>,
 }
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -272,6 +316,7 @@ impl<P: PodmanClient> Reconciler<P> {
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             dedup: std::sync::Mutex::new(DeliveryDedup::new(256)),
+            activity: std::sync::Mutex::new(None),
         }
     }
 
@@ -292,6 +337,33 @@ impl<P: PodmanClient> Reconciler<P> {
 
     pub fn podman(&self) -> &P {
         &self.podman
+    }
+
+    /// The instance the engine is mutating right now (deploy/recreate/provision), if any.
+    ///
+    /// In-memory only: after a daemon restart the answer is `None` and `doctor` sees the ordinary
+    /// state — correct, because the startup reconcile then really converges the instance.
+    pub fn in_flight(&self) -> Option<InFlight> {
+        self.activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Marks `instance` as in flight until the returned guard is dropped (also on early `?` returns
+    /// and panics). Callers hold `lock`, so at most one instance is in flight at a time.
+    pub(crate) fn begin_activity(
+        &self,
+        instance: &InstanceName,
+        kind: ActivityKind,
+    ) -> ActivityGuard<'_> {
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(InFlight {
+            instance: instance.clone(),
+            kind,
+        });
+        ActivityGuard {
+            slot: &self.activity,
+        }
     }
 
     // Desired-state changes (API → daemon). Send [`Trigger::Changed`] after them.

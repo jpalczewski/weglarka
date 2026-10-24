@@ -28,4 +28,4 @@ expression: render(&r)
 [WARN] state.secrets_file       /etc/weglarka/secrets.toml not found
                                 hint: to normalne przed pierwszym `secrets set`; inna lokalizacja: --secrets-file / WEGLARKA_SECRETS_FILE
 
-1 ok, 7 warn, 5 fail
+1 ok, 0 info, 7 warn, 5 fail

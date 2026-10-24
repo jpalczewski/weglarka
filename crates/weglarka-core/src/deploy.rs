@@ -15,7 +15,7 @@ use crate::podman::{
     ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError, PullEvent,
     RestartPolicy,
 };
-use crate::reconcile::{EngineError, Reconciler, RecreateReason, SecretChangePolicy};
+use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
 use crate::secrets::{binding_fingerprints, materialize};
 use crate::state::{self, AppState, FailedDeploy, StateFile};
 use crate::webhook::WebhookEvent;
@@ -399,6 +399,9 @@ impl<P: PodmanClient> Reconciler<P> {
         if !spec.start {
             return self.provision_locked(instance, &spec).await;
         }
+        // `state.toml` is written only after the health gate, so until then the instance is
+        // "in flight": `doctor` must not read the lagging state as drift.
+        let _activity = self.begin_activity(instance, ActivityKind::Deploy);
         self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st: StateFile = state::load_state(&self.paths.state)?;
         self.secrets_gate(instance, &spec, &mut st).await?;
@@ -546,6 +549,7 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<DeployOutcome, EngineError> {
+        let _activity = self.begin_activity(instance, ActivityKind::Provision);
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
         self.assign_uid_range(instance).await?;
@@ -621,6 +625,7 @@ impl<P: PodmanClient> Reconciler<P> {
         reason: RecreateReason,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        let _activity = self.begin_activity(instance, ActivityKind::Recreate);
         self.assign_uid_range(instance).await?; // before `st` is loaded: it writes state.toml
         let mut st = state::load_state(&self.paths.state)?;
         let cur = st.apps.get(instance).cloned().unwrap_or_default();

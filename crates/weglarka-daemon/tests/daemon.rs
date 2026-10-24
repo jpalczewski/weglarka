@@ -370,6 +370,80 @@ async fn admin_lifecycle_add_deploy_status_remove() {
     h.running.stop().await;
 }
 
+/// Issue #30: `state.toml` is written after the health gate, so a recreate is briefly visible as a
+/// state/container mismatch. `doctor` must report it as `state.deploying` (`info`), not as drift.
+#[tokio::test]
+async fn doctor_reports_a_recreate_in_progress_instead_of_state_drift() {
+    let h = harness().await;
+    // A 2 s gate widens the window in which the instance counts as in flight.
+    let health = json!({ "attempts": 1, "window_secs": 2 });
+    let mut body = app_body("ntfy", "nz.example.eu");
+    body["spec"]["health"] = health.clone();
+    let (s, v) = admin(&h, "POST", "/v1/apps", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    eventually("first deploy", || async {
+        current_digest(&h, "ntfy").await.is_some()
+    })
+    .await;
+
+    // `env` is part of the spec hash: reconcile recreates the container from the pinned digest.
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy",
+        Some(json!({
+            "spec": {
+                "image": IMAGE,
+                "domains": ["nz.example.eu"],
+                "port": 8085,
+                "env": { "CHANGED": "1" },
+                "health": health
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let checks = |v: &Value, id: &str| -> Option<Value> {
+        v["checks"]
+            .as_array()?
+            .iter()
+            .find(|c| c["id"] == id)
+            .cloned()
+    };
+    let mut saw_deploying = false;
+    for _ in 0..200 {
+        let (s, v) = admin(&h, "GET", "/v1/doctor", None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        if let Some(check) = checks(&v, "state.deploying") {
+            assert_eq!(check["status"], "info", "{check}");
+            let message = check["message"].as_str().unwrap_or_default();
+            assert!(message.contains("ntfy"), "{message}");
+            assert!(
+                message.contains("recreate"),
+                "the kind of operation is reported: {message}"
+            );
+            let drift = checks(&v, "state.drift").expect("state.drift is always reported");
+            assert_eq!(
+                drift["status"], "ok",
+                "no drift warning mid-deploy: {drift}"
+            );
+            saw_deploying = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_deploying, "doctor never reported state.deploying");
+
+    // Once the deploy is done the transient check disappears and the state is consistent.
+    eventually("deploy finished", || async {
+        let (_, v) = admin(&h, "GET", "/v1/doctor", None).await;
+        checks(&v, "state.deploying").is_none()
+            && checks(&v, "state.drift").unwrap()["status"].as_str() == Some("ok")
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn provision_only_add_creates_no_container_and_deploy_provisions() {
     let h = harness().await;

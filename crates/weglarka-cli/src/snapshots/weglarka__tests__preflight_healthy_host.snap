@@ -20,4 +20,4 @@ expression: render(&r)
 [ OK ] ingress.traefik_sync     no /etc/weglarka/traefik-policy.json — Traefik sync not in use
 [ OK ] state.secrets_file       /etc/weglarka/secrets.toml has mode 0600
 
-17 ok, 0 warn, 0 fail
+17 ok, 0 info, 0 warn, 0 fail

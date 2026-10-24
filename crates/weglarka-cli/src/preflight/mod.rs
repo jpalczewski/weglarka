@@ -182,6 +182,7 @@ pub fn render(report: &DoctorReport) -> String {
     for c in &report.checks {
         let tag = match c.status {
             CheckStatus::Ok => " OK ",
+            CheckStatus::Info => "INFO",
             CheckStatus::Warn => "WARN",
             CheckStatus::Fail => "FAIL",
         };
@@ -190,14 +191,17 @@ pub fn render(report: &DoctorReport) -> String {
             out.push_str(&format!("       {:<width$}  hint: {h}\n", ""));
         }
     }
-    let (mut ok_n, mut warn_n, mut fail_n) = (0, 0, 0);
+    let (mut ok_n, mut info_n, mut warn_n, mut fail_n) = (0, 0, 0, 0);
     for c in &report.checks {
         match c.status {
             CheckStatus::Ok => ok_n += 1,
+            CheckStatus::Info => info_n += 1,
             CheckStatus::Warn => warn_n += 1,
             CheckStatus::Fail => fail_n += 1,
         }
     }
-    out.push_str(&format!("\n{ok_n} ok, {warn_n} warn, {fail_n} fail\n"));
+    out.push_str(&format!(
+        "\n{ok_n} ok, {info_n} info, {warn_n} warn, {fail_n} fail\n"
+    ));
     out
 }

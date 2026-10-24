@@ -28,4 +28,4 @@ expression: render(&r)
 [FAIL] state.secrets_file       /etc/weglarka/secrets.toml has mode 0644 (expected 0600)
                                 hint: `chmod 0600 /etc/weglarka/secrets.toml`
 
-9 ok, 1 warn, 7 fail
+9 ok, 0 info, 1 warn, 7 fail

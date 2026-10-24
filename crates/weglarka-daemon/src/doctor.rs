@@ -115,8 +115,18 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         Ok(c) => c,
         Err(_) => return, // missing Podman already reported above
     };
+    // A deploy writes `state.toml` only after the new container passes the health gate; until then
+    // the instance is reported as in progress, not as drift (issue #30).
+    let in_flight = d.engine.in_flight();
     let mut problems = Vec::new();
+    let mut active = Vec::new();
     for name in apps.apps.keys() {
+        if let Some(a) = in_flight.as_ref()
+            && &a.instance == name
+        {
+            active.push(format!("{name} ({})", a.kind.label()));
+            continue;
+        }
         let app_state = st.apps.get(name);
         let container = containers
             .iter()
@@ -149,6 +159,17 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
         {
             problems.push(format!("{}: sierota (brak w apps.toml)", c.name));
         }
+    }
+    if !active.is_empty() {
+        out.push(check(
+            "state.deploying",
+            CheckStatus::Info,
+            format!(
+                "deploy w toku: {} — pominięto w ocenie dryfu",
+                active.join(", ")
+            ),
+            None,
+        ));
     }
     out.push(if problems.is_empty() {
         ok("state.drift", "stan faktyczny zgodny z pożądanym")

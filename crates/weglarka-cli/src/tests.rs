@@ -12,8 +12,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use weglarka_api::{
-    ApiError, DeployOutcome, DeployResponse, DoctorReport, ErrorCode, RuntimeState,
-    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
+    ApiError, CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, DoctorReport, ErrorCode,
+    RuntimeState, SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
@@ -361,6 +361,22 @@ fn preflight_json_uses_api_types() {
     assert_eq!(v["checks"][0]["status"], "ok");
     let back: DoctorReport = serde_json::from_value(v).unwrap();
     assert_eq!(back, r);
+}
+
+#[test]
+fn render_reports_info_checks_without_alarming() {
+    let report = DoctorReport {
+        checks: vec![DoctorCheck {
+            id: "state.deploying".into(),
+            status: CheckStatus::Info,
+            message: "deploy w toku: ntfy (recreate)".into(),
+            hint: None,
+        }],
+    };
+    let text = render(&report);
+    assert!(text.contains("[INFO] state.deploying"), "{text}");
+    assert!(text.contains("0 ok, 1 info, 0 warn, 0 fail"), "{text}");
+    assert_eq!(report.exit_code(), 0);
 }
 
 #[test]
