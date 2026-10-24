@@ -1,8 +1,9 @@
 //! `recreate` deploy: pull → stop old → new container → health gate → digest shift
 //! or rollback to the previous digest (retention 1). Plus webhook fan-out
-//! (image → all instances tracking that image/tag) with dedup by `delivery_id`.
+//! (image → all instances tracking that image/tag) with dedup by `delivery_id`
+//! (persisted across restarts, see [`crate::delivery`] / ADR 0035).
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -81,38 +82,6 @@ pub fn instances_tracking(apps: &AppsFile, image_ref: &str) -> Vec<InstanceName>
         .filter(|(_, s)| s.auto_update && s.start && normalize_image(&s.image) == wanted)
         .map(|(n, _)| n.clone())
         .collect()
-}
-
-/// Bounded memory of recently seen `delivery_id`s.
-pub struct DeliveryDedup {
-    cap: usize,
-    order: VecDeque<String>,
-    seen: HashSet<String>,
-}
-
-impl DeliveryDedup {
-    pub fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            order: VecDeque::new(),
-            seen: HashSet::new(),
-        }
-    }
-
-    /// `true` if the identifier was already seen; otherwise remembers it.
-    pub fn check_and_insert(&mut self, id: &str) -> bool {
-        if self.seen.contains(id) {
-            return true;
-        }
-        if self.order.len() == self.cap
-            && let Some(old) = self.order.pop_front()
-        {
-            self.seen.remove(&old);
-        }
-        self.order.push_back(id.to_owned());
-        self.seen.insert(id.to_owned());
-        false
-    }
 }
 
 #[derive(Debug)]
@@ -848,16 +817,6 @@ mod tests {
             normalize_image("ghcr.io/a/b:v1@sha256:x"),
             ("ghcr.io/a/b".into(), "v1".into())
         );
-    }
-
-    #[test]
-    fn dedup_is_bounded() {
-        let mut d = DeliveryDedup::new(2);
-        assert!(!d.check_and_insert("a"));
-        assert!(d.check_and_insert("a"));
-        assert!(!d.check_and_insert("b"));
-        assert!(!d.check_and_insert("c")); // evicts "a"
-        assert!(!d.check_and_insert("a"));
     }
 
     /// `start = false` apps never receive webhook-driven deploys: nothing is pulled for an app that

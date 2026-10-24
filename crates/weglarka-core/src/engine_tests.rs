@@ -1212,6 +1212,51 @@ health = { attempts = 1, window_secs = 1 }
     );
 }
 
+/// Issue #41: handled delivery ids survive a restart — a fresh engine over the same state directory
+/// answers a redelivery as a duplicate and does not pull (self-update makes restarts routine).
+#[tokio::test(start_paused = true)]
+async fn webhook_dedup_survives_daemon_restart() {
+    let h = Harness::new(
+        r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+health = { attempts = 1, window_secs = 1 }
+"#,
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    let event = WebhookEvent {
+        delivery_id: Some("restart-1".into()),
+        image_ref: IMAGE.into(),
+    };
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    assert!(!h.rec.handle_webhook(&event).await.unwrap().duplicate);
+
+    // "Restart": a new engine (empty in-memory set) over the same state directory.
+    let restarted = Reconciler::new(
+        h.fake.clone(),
+        h.store.clone(),
+        h.rec.paths().clone(),
+        ReconcilerOptions::default(),
+    )
+    .with_events(h.sink.clone())
+    .with_monitor(crash::Policy::disabled());
+    let calls = h.fake.calls().len();
+    let dup = restarted.handle_webhook(&event).await.unwrap();
+    assert!(dup.duplicate && dup.results.is_empty());
+    assert_eq!(
+        h.fake.calls().len(),
+        calls,
+        "a redelivery after a restart must not pull"
+    );
+    assert!(
+        h.sink
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::WebhookDuplicate { .. }))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn health_gate_polls_healthcheck_until_healthy() {
     let h = Harness::new(
