@@ -1,19 +1,19 @@
-# Decyzje implementacyjne (ADR)
+# Implementation decisions (ADR)
 
-Każda decyzja opisuje problem, wybór, konsekwencje i odrzucone alternatywy. Nowe wpisy numerujemy kolejno
-(po `0011` następny jest `0012`); szkielet: [`0000-template.md`](0000-template.md).
+Each decision describes the problem, the choice, the consequences and the rejected alternatives. New entries are
+numbered consecutively (after `0012` comes `0013`); the skeleton is [`0000-template.md`](0000-template.md).
 
-| # | Temat |
+| # | Topic |
 |---|---|
-| [0001](0001-async-traits.md) | Async w traitach: natywne `async fn` + generyki, bez `async-trait` |
-| [0002](0002-podman-in-ci.md) | Podman 6.1 w testach integracyjnych: instalacja z OBS, job `integration-podman` |
-| [0003](0003-state-toml.md) | Stan runtime w osobnym `state.toml` (atomowy zapis, walidacja) |
-| [0004](0004-webhook-github.md) | Webhooki GitHub: zdarzenia, HMAC per apka, `202` od razu, dedup dostarczeń |
-| [0005](0005-ingress-i-platforma.md) | Ingress w demonie: przeładowanie nginxa, plik Traefika, quadlet |
-| [0006](0006-pakowanie-obrazy-i-release.md) | Pakowanie: obraz na `scratch`, oficjalny nginx, release na GHCR |
-| [0007](0007-zaufane-proxy-i-reload-nginx.md) | Trusted proxies za rootless Podmanem, reload zamiast recreate |
-| [0008](0008-ci-speed-prebuilt-binaries.md) | CI speed: prebuilt binarki, profil `ci`, bez stosu regex |
-| [0009](0009-volume-ownership.md) | Własność plików w wolumenach: zakresy UID per instancja |
-| [0010](0010-health-http-probe.md) | `health.http` przez nginx, limity zasobów, `health.command` |
-| [0011](0011-start-false-provisioning.md) | `start = false`: provisioning bez startu, import przed pierwszym startem |
-| [0012](0012-doctor-in-flight.md) | `doctor` a operacja w toku: status `info` (`state.deploying`) zamiast fałszywego dryfu |
+| [0001](0001-async-traits.md) | Async in traits: native `async fn` + generics |
+| [0002](0002-podman-in-ci.md) | Podman 6.1 in integration tests: install from OBS on the runner |
+| [0003](0003-state-toml.md) | Runtime state in a separate `state.toml` |
+| [0004](0004-webhook-github.md) | GitHub webhooks: events, per-app secret, 202 immediately |
+| [0005](0005-ingress-i-platforma.md) | Ingress in the daemon: nginx reload, Traefik file, quadlet |
+| [0006](0006-pakowanie-obrazy-i-release.md) | Packaging: the Węglarka image on `scratch`, official nginx, release on GHCR |
+| [0007](0007-zaufane-proxy-i-reload-nginx.md) | Trusted proxies behind rootless Podman, reload instead of recreate |
+| [0008](0008-ci-speed-prebuilt-binaries.md) | CI speed: prebuilt binaries, `ci` profile, no regex stack |
+| [0009](0009-volume-ownership.md) | File ownership of named volumes under rootless Podman |
+| [0010](0010-health-http-probe.md) | `health.http`: probe through nginx, resource limits, `health.command` |
+| [0011](0011-start-false-provisioning.md) | `start = false`: provision without starting (issue #29) |
+| [0012](0012-doctor-in-flight.md) | `doctor` and an operation in progress: `info` status instead of false drift |
