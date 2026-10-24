@@ -13,13 +13,15 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
 - `--json`: exactly one document on stdout — a type from `weglarka-api` (`ListAppsResponse`,
   `ShowAppResponse`, `DeployResponse`, `StatusResponse`, `ListSecretsResponse`, `SecretInfo`,
   `ListVolumesResponse`, `ListSharedVolumesResponse`, `DoctorReport`). CLI exceptions: `apps remove` →
-  `{"removed","existed"}`, `volumes add` → `{"declared"}`, `volumes remove` → `{"removed","purged"}`,
-  a no-op of `apps update`/`start`/`stop` → `{"changed":false,"app"}`, `--dry-run` →
-  `{"dry_run":true,"method","path","body"}`.
+  `{"removed","existed"}`, `secrets remove` → `{"removed"}` (the removed `<app>.<name>`), `volumes add` →
+  `{"declared"}`, `volumes remove` → `{"removed","purged"}`, a no-op of `apps update`/`start`/`stop` →
+  `{"changed":false,"app"}`, `--dry-run` → `{"dry_run":true,"method","path","body"}`.
 - Errors go to stderr; with `--json`: `{"error":{"code","message","hint","exit_code"}}`.
-- `--dry-run` (`apps add/remove/update/start/stop`, `deploy`, `secrets set`, `volumes add/remove`):
-  nothing is sent that would change state; `remove`/`deploy`/`start`/`stop` only check that the app
-  exists (GET). The secret value is masked.
+- `--dry-run` (`apps add/remove/update/start/stop`, `deploy`, `secrets set/remove`, `volumes add/remove`):
+  nothing is sent that would change state; `apps remove`/`deploy`/`start`/`stop` only check that the app
+  exists (GET), while `secrets remove --dry-run` sends nothing at all (the app need not exist). The
+  purge flags are part of the printed path (`?purge_volumes=true&purge_secrets=true`). The secret value
+  is masked.
 - `apps update <name>`: read-modify-write of the whole spec (`GET`, apply flags, `PUT`); `--dry-run` shows the
   diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
   Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
@@ -60,8 +62,14 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   (`not_started` in JSON). `start = true` is the default and is omitted from the `AppSpec` TOML/JSON, so a spec
   without `start` means the app runs.
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
-- Secret: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
-  is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes).
+- Secrets: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
+  is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes). `secrets remove
+  <app> <name>` refuses (409) while the app's spec still binds the secret — drop the binding with
+  `apps update <app> --unbind-secret <name>`, or pass `--force` (the app then waits for the secret; a
+  running container keeps the old value). The app need not exist, so the leftovers of a removed or
+  renamed app can still be removed (`doctor` names them, `secrets list` needs a live app). `apps
+  remove` keeps the stored secrets by default (a new app under the same name inherits them); `apps
+  remove --purge-secrets` deletes them together with the app and is independent of `--purge-volumes`.
 
 ## Volumes
 

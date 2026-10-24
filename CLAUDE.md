@@ -165,6 +165,14 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
   ustala baseline), pod mutexem silnika, a granicą baseline'u jest etykieta `weglarka.generation`. Progi w
   `[monitor]` (nowa sekcja → kolejny caveat downgrade'u), zdarzenia idą tym samym `EventSink`-iem co deploye.
+- **Sekrety są w zakresie per instancja (ADR 0024, `<apka>.<nazwa>` w `secrets.toml`)** — `apps remove`
+  domyślnie **zachowuje** je (dane i poświadczenia to osobne decyzje), więc nowa apka pod starą nazwą
+  dziedziczy stare wartości. Sprzątanie przy usuwaniu: `apps remove --purge-secrets` (cały zakres
+  `<apka>.*`, także `webhook-hmac`, niezależnie od `--purge-volumes`, przed zapisem `apps.toml`).
+  `secrets remove` działa **także po usunięciu apki** (sprząta pozostałości po zmianie nazwy instancji),
+  a `doctor` ostrzega checkiem `state.orphan_secrets`. Szczegóły:
+  [`docs/decisions/0024-secret-removal-and-purge.md`](docs/decisions/0024-secret-removal-and-purge.md) i
+  [`docs/install.md` 6j](docs/install.md#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 

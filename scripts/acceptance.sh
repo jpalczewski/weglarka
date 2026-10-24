@@ -509,6 +509,23 @@ step_webhook_protocol() {
   note "202 / 401 / 204 / 204 jak w 0004"
 }
 
+# Secret removal (issue #80): a throwaway secret set on the canary must disappear from `secrets list`
+# again. The canary spec binds no secret under `wg-probe`, so no `--force` is needed and the app is
+# untouched; the secret is removed also so the canary cleanup leaves no orphan behind.
+step_secrets() {
+  local out
+  set_secret "$CANARY" wg-probe "wg-accept-$$"
+  out=$(wg --json secrets list "$CANARY")
+  printf '%s' "$out" | jq -e '.secrets | any(.name == "wg-probe")' >/dev/null \
+    || die "secrets list nie zawiera wg-probe po secrets set: $out"
+  wg secrets remove "$CANARY" wg-probe >/dev/null || die "secrets remove $CANARY wg-probe nie powiodło się"
+  out=$(wg --json secrets list "$CANARY")
+  printf '%s' "$out" | jq -e '.secrets | any(.name == "wg-probe") | not' >/dev/null \
+    || die "secrets list nadal zawiera wg-probe po secrets remove: $out"
+  log "secrets set → list → remove → list: wg-probe zniknął"
+  note "usuwanie sekretu: wg-probe set → list → remove → list"
+}
+
 # A webhook that really deploys: the app tracks a tag in the local registry; we move the tag and poke it.
 step_webhook_deploy() {
   local secret spec f ref gen0 cur0 cur1 cur2 gen1 code i
@@ -695,19 +712,28 @@ EOF
 }
 
 step_cleanup() {
-  local app
+  local app out
   for app in "$WEBHOOK_APP" "$ROLLBACK_APP"; do
     wg apps remove --ignore-missing "$app" >/dev/null
   done
   podman rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
-  wg apps remove "$CANARY" >/dev/null || die "apps remove $CANARY nie powiodło się"
+  # --purge-secrets (issue #80): the canary's webhook-hmac and any probe secret go with the app.
+  wg apps remove --purge-secrets "$CANARY" >/dev/null || die "apps remove --purge-secrets $CANARY nie powiodło się"
   wg --json apps list | jq -e --arg n "$CANARY" '[.apps[].name] | index($n) | not' >/dev/null \
     || die "kanarek nadal na liście apek"
+  # No orphaned canary secrets may remain: doctor warns about every secret scope whose instance is
+  # gone, so the check must not mention $CANARY. `doctor` exits 1 on warnings and that is fine here.
+  out=$(wg --json doctor) || true
+  printf '%s' "$out" | jq -e '.checks' >/dev/null 2>&1 \
+    || die "doctor po sprzątaniu nie zwrócił raportu: $out"
+  printf '%s' "$out" | jq -e --arg n "$CANARY" \
+    '[.checks[] | select(.id == "state.orphan_secrets" and (((.message // "") + " " + (.hint // "")) | contains($n)))] | length == 0' >/dev/null \
+    || die "doctor nadal zgłasza osierocone sekrety kanarka ($CANARY) po --purge-secrets"
   if [ -n "$TRAEFIK_FILE" ] && [ -r "$TRAEFIK_FILE" ]; then
     wait_for "zniknięcie routera" 30 router_gone || die "domena kanarka nadal w $TRAEFIK_FILE"
-    note "kanarek i pomocnicze usunięte, router zniknął z pliku Traefika"
+    note "kanarek usunięty z sekretami (bez osieroconych wpisów), router zniknął z pliku Traefika"
   else
-    note "kanarek i pomocnicze usunięte (plik Traefika niedostępny — routera nie sprawdzono)"
+    note "kanarek usunięty z sekretami (plik Traefika niedostępny — routera nie sprawdzono)"
   fi
 }
 
@@ -733,6 +759,7 @@ fi
 run_step streaming "ingress: streaming = reload nginx bez odtworzenia kontenera" step_streaming canary traffic
 run_step http_redirect "http → 301 na https (bez -L)" step_http_redirect canary traffic
 run_step webhook_protocol "webhook: 202 / 401 / 204" step_webhook_protocol canary
+run_step secrets "sekrety: set → list → remove → list" step_secrets webhook_protocol
 if [ "$LOCAL_REGISTRY" = 1 ]; then
   run_step registry "lokalny rejestr testowy" step_registry doctor
   run_step webhook_deploy "webhook: deploy, duplikat dostarczenia" step_webhook_deploy registry

@@ -19,7 +19,7 @@ use weglarka_core::images::human_bytes;
 
 use crate::cli::{
     AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,
-    PruneImagesArgs, RemoveArgs, SecretSetArgs, SecretsCommand,
+    PruneImagesArgs, RemoveArgs, SecretRemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, append_query, request_path};
 use crate::error::{CliError, Kind, exit};
@@ -51,6 +51,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Secrets(SecretsCommand::List { app }) => {
             secrets_list(json, &overrides, &app).await
         }
+        Command::Secrets(SecretsCommand::Remove(a)) => secrets_remove(json, &overrides, a).await,
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
@@ -225,20 +226,35 @@ struct Removed {
     existed: bool,
 }
 
-/// Query of the `apps remove` request: `--purge-volumes` is the only flag that travels as a query
-/// parameter, so the dry run and the real call take it from the same place.
-fn remove_query(purge_volumes: bool) -> &'static str {
-    if purge_volumes {
-        "purge_volumes=true"
-    } else {
-        ""
+/// Query of `DELETE /v1/apps/{name}`: the purge flags are independent and only sent when set.
+pub(crate) fn remove_query(a: &RemoveArgs) -> String {
+    let mut query = String::new();
+    if a.purge_volumes {
+        query.push_str("purge_volumes=true");
+    }
+    if a.purge_secrets {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str("purge_secrets=true");
+    }
+    query
+}
+
+/// What `apps remove` reports it also deleted (nothing without the purge flags).
+pub(crate) fn remove_suffix(a: &RemoveArgs) -> &'static str {
+    match (a.purge_volumes, a.purge_secrets) {
+        (true, true) => " (with its data and secrets)",
+        (true, false) => " (with its data)",
+        (false, true) => " (with its secrets)",
+        (false, false) => "",
     }
 }
 
-/// The request `apps remove --dry-run` shows; its endpoint, params and query match the real call.
-pub(crate) fn remove_dry_run(name: &str, purge_volumes: bool) -> DryRun {
-    let params = [("name", name)];
-    DryRun::new(endpoints::APPS_REMOVE, &params, None).with_query(remove_query(purge_volumes))
+/// The request `apps remove --dry-run` shows; the purge flags are query parameters, so they are part
+/// of the printed path.
+pub(crate) fn remove_dry_run(name: &str, a: &RemoveArgs) -> DryRun {
+    DryRun::new(endpoints::APPS_REMOVE, &[("name", name)], None).with_query(&remove_query(a))
 }
 
 pub(crate) async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, CliError> {
@@ -254,16 +270,17 @@ pub(crate) async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Res
             Err(e) if e.kind == Kind::NotFound && a.ignore_missing => {}
             Err(e) => return Err(e),
         }
-        remove_dry_run(name.as_str(), a.purge_volumes).print(json);
+        remove_dry_run(name.as_str(), &a).print(json);
         return Ok(exit::OK);
     }
-    let removal = client
-        .call_empty_query(
-            endpoints::APPS_REMOVE,
-            &params,
-            remove_query(a.purge_volumes),
-        )
-        .await;
+    let query = remove_query(&a);
+    let removal = if query.is_empty() {
+        client.call_empty(endpoints::APPS_REMOVE, &params).await
+    } else {
+        client
+            .call_empty_query(endpoints::APPS_REMOVE, &params, &query)
+            .await
+    };
     let existed = match removal {
         Ok(()) => true,
         Err(e) if e.kind == Kind::NotFound && a.ignore_missing => false,
@@ -275,7 +292,7 @@ pub(crate) async fn apps_remove(json: bool, o: &Overrides, a: RemoveArgs) -> Res
     };
     emit(json, &out, || {
         if existed {
-            format!("removed {}\n", out.removed)
+            format!("removed {}{}\n", out.removed, remove_suffix(&a))
         } else {
             format!("{} did not exist (nothing to do)\n", out.removed)
         }
@@ -517,6 +534,74 @@ async fn secrets_list(json: bool, o: &Overrides, app: &str) -> Result<i32, CliEr
             .map(|s| vec![s.name.clone(), s.fingerprint.clone(), s.updated_at.clone()])
             .collect::<Vec<_>>();
         table(&["NAME", "FINGERPRINT", "UPDATED"], &rows)
+    });
+    Ok(exit::OK)
+}
+
+/// `secrets remove` output: which secret was removed (`<app>.<name>`).
+#[derive(Debug, Serialize)]
+struct SecretRemoved {
+    removed: String,
+}
+
+/// The request `secrets remove --dry-run` shows; `--force` is a query parameter, so it is part of
+/// the printed path.
+pub(crate) fn secret_remove_dry_run(app: &str, name: &str, force: bool) -> DryRun {
+    let dry = DryRun::new(
+        endpoints::SECRETS_REMOVE,
+        &[("name", app), ("secret", name)],
+        None,
+    );
+    dry.with_query(if force { "force=true" } else { "" })
+}
+
+/// Hints for the two expected refusals; the daemon message names the binding / the stored secret.
+fn secret_remove_error(e: CliError, app: &str, name: &str) -> CliError {
+    match e.kind {
+        Kind::Conflict => e.with_hint(format!(
+            "the app's spec still binds it: `weglarka apps update {app} --unbind-secret {name}`, or \
+             --force (the app then waits for the secret; a running container keeps the old value)"
+        )),
+        Kind::NotFound => e.with_hint(format!(
+            "check the stored secrets: `weglarka secrets list {app}`"
+        )),
+        _ => e,
+    }
+}
+
+pub(crate) async fn secrets_remove(
+    json: bool,
+    o: &Overrides,
+    a: SecretRemoveArgs,
+) -> Result<i32, CliError> {
+    let app = instance(&a.app)?;
+    let name = secret_name(&a.name)?;
+    if a.dry_run {
+        secret_remove_dry_run(app.as_str(), name, a.force).print(json);
+        return Ok(exit::OK);
+    }
+    let params = [("name", app.as_str()), ("secret", name)];
+    let client = client(o)?;
+    let removal = if a.force {
+        client
+            .call_empty_query(endpoints::SECRETS_REMOVE, &params, "force=true")
+            .await
+    } else {
+        client.call_empty(endpoints::SECRETS_REMOVE, &params).await
+    };
+    removal.map_err(|e| secret_remove_error(e, app.as_str(), name))?;
+    let out = SecretRemoved {
+        removed: format!("{app}.{name}"),
+    };
+    emit(json, &out, || {
+        let mut s = format!("removed secret {}\n", out.removed);
+        if a.force {
+            s.push_str(
+                "the app's spec still binds it: the app now waits for the secret (a running \
+                 container keeps the old value)\n",
+            );
+        }
+        s
     });
     Ok(exit::OK)
 }

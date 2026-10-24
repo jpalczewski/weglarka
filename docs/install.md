@@ -19,6 +19,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
 [6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
 [6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
+[6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -261,8 +262,9 @@ opcjonalne (`--with-local-registry`) — wymagają tymczasowego rejestru na `127
 usługi Podmana (czyta go przy starcie). Skrypt sam niczego nie konfiguruje; bez wpisu deploy kończy się FAIL
 z podpowiedzią. Na produkcji nie zalecane.
 
-Uwaga: `secrets.toml` zachowuje sekret `webhook-hmac` kanarka po jego usunięciu (jednorazowa wartość testowa,
-nadpisywana przy kolejnym uruchomieniu).
+Uwaga: `apps remove` domyślnie **zachowuje** sekrety kanarka w `secrets.toml` (`webhook-hmac`); skrypt
+sprząta je w kroku „sprzątanie” przez `--purge-secrets`, więc po przebiegu nie zostają osierocone wpisy
+(i `doctor` nie zgłasza ich w `state.orphan_secrets`). Sprzątanie po fakcie — [6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
 
 ## 6. Pierwsza apka: ntfy.zig
 
@@ -280,6 +282,9 @@ weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:latest \
 weglarka secrets set ntfy config < ./config.json                # plik trafia pod /config.json
 weglarka apps show ntfy                                         # deploy rusza sam: pull, bramka zdrowia
 ```
+
+`secrets set` tylko nadpisuje wartość — sekret usuwa się przez `secrets remove`, a cały zakres apki
+sprząta `apps remove --purge-secrets` ([6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce)).
 
 ### Wartość sekretu: `< plik`, nie `/dev/stdin`
 
@@ -1045,6 +1050,61 @@ unhealthy_observations = 2     # ile kolejnych obserwacji z failing healthcheck 
   (sekcja 6h) nadal zbiorą ewentualne podsumowanie, gdy apka migocze między awarią a powrotem.
 - **Rollback:** `[monitor]` to nowa sekcja w `weglarka.toml`, więc starszy demon jej nie odczyta — przed
   downgradem usuń ją razem z `[notify]` (patrz [7](#7-weryfikacja-i-rollback)).
+## 6j. Sekrety: usuwanie i sprzątanie po apce
+
+Sekrety trzyma się per instancja, w zakresie `<apka>.<nazwa>` w `secrets.toml` (0600). Do tej pory nic
+ich nie usuwało: `apps remove` kasowało apkę, a jej sekrety — w tym `webhook-hmac` — zostawały. Plik
+rósł, a **nowa apka pod starą nazwą dziedziczyła stare wartości** (np. stary `webhook-hmac`, który nie
+zgadza się już z webhookiem w GitHubie). Decyzja i odrzucone alternatywy: [0024](decisions/0024-secret-removal-and-purge.md).
+
+**Pojedynczy sekret: `secrets remove`.**
+
+```sh
+weglarka secrets list ntfy                     # nazwy, fingerprint, data — bez wartości
+weglarka secrets remove ntfy config            # 409, gdy spec apki nadal wiąże ten sekret
+weglarka secrets remove ntfy config --force    # usuwa mimo wiązania; apka czeka na sekret
+weglarka secrets remove ntfy config --dry-run  # pokazuje, co by usunął
+```
+
+- **409 domyślnie:** dopóki spec apki wiąże sekret (`--secret-env`/`--secret-mount`), usunięcie jest
+  odrzucane — apka bez wartości nigdy nie wstanie. Najpierw odwiąż go
+  (`weglarka apps update ntfy --unbind-secret config`) albo użyj `--force`.
+- **`--force`:** wartość znika, a apka przy kolejnym reconcile przechodzi w stan „czeka na sekret”
+  ([6](#6-pierwsza-apka-ntfyzig)) — to nie błąd, deploy czeka na `secrets set`. Działający kontener
+  zachowuje zmaterializowaną wartość do najbliższego odtworzenia; samo usunięcie **nie** wywołuje
+  deployu.
+- **404**, gdy takiego sekretu nie ma; **400** przy niepoprawnej nazwie apki/sekretu.
+- **Apka nie musi istnieć w `apps.toml`** — właśnie po to jest ten endpoint: sprząta pozostałości po
+  usuniętej apecie i **po zmianie nazwy instancji** (stary zakres `<stara-nazwa>.*` zostaje w pliku,
+  dopóki go nie usuniesz).
+
+**Cały zakres apki: `apps remove --purge-secrets`.**
+
+```sh
+weglarka apps remove ntfy --purge-secrets                  # apka + wszystkie jej sekrety
+weglarka apps remove ntfy --purge-secrets --purge-volumes  # + wolumeny (dane)
+```
+
+- Usuwa **cały** zakres `<apka>.*`, w tym `webhook-hmac`. `--purge-secrets` i `--purge-volumes` są
+  niezależne: dane domyślnie przeżywają `remove` + `add`, a poświadczenia nie muszą być trzymane tylko
+  dlatego, że dane zostają.
+- Purge dzieje się **przed** zapisem `apps.toml`: jeśli się nie uda, apka zostaje zarejestrowana
+  i można spróbować ponownie.
+- Działa tylko dla apki obecnej w `apps.toml`; po fakcie użyj `secrets remove` (wyżej).
+- Nie rusza **zmaterializowanych sekretów Podmana** — te powstają z magazynu przy każdym deployu
+  i pozostają po usuniętej apecie do czasu osobnego sprzątania (znana luka, opisana w 0024).
+
+**Pozostałości po apecie: ostrzeżenie w `doctor`.** Check `state.orphan_secrets` zgłasza `warn` z listą
+sekretów, których instancji nie ma już w `apps.toml`, z podpowiedzią (`weglarka secrets remove <apka>
+<nazwa>`; przy kolejnym usuwaniu — `apps remove --purge-secrets`). Gdy wszystko jest czyste, checka nie
+ma. Ostrzeżenie niczego nie blokuje — zostawione sekrety nie psują działania, są problemem higieny
+i bezpieczeństwa.
+
+**Czego to nie zmienia:** format `secrets.toml`/`apps.toml`/`state.toml` zostaje ten sam, więc upgrade
+i rollback demona są bezpieczne, a usunięcie sekretu nie zmienia specu ani `spec_hash` (zmienia się
+tylko wartość, nie wiązanie). Plik nadal jest zapisywany atomowo z prawami 0600. Nowe CLI wobec
+**starego demona** po cichu zignoruje `--purge-secrets` (usunie apkę, sekrety zostaną) i dostanie 404
+na `secrets remove` — najpierw zaktualizuj demona.
 
 ## 7. Weryfikacja i rollback
 

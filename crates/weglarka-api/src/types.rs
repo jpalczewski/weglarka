@@ -102,12 +102,23 @@ pub struct UpdateAppResponse {
     pub deploy: Option<DeployResponse>,
 }
 
-/// Query of `DELETE /v1/apps/{name}`: `?purge_volumes=true` also deletes the instance's named volumes.
-/// Without it volumes are kept (data survives `remove` + `add`). Owner: session 1.
+/// Query of `DELETE /v1/apps/{name}`: `?purge_volumes=true` also deletes the instance's named volumes,
+/// `?purge_secrets=true` its secrets. Without them volumes and secrets are kept (data survives
+/// `remove` + `add`, which also means a new app under the same name inherits the old secrets).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoveAppQuery {
     #[serde(default)]
     pub purge_volumes: bool,
+    #[serde(default)]
+    pub purge_secrets: bool,
+}
+
+/// Query of `DELETE /v1/apps/{name}/secrets/{secret}` (issue #80): `?force=true` removes a secret the
+/// app's spec still binds. Without it such a removal is refused with 409.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveSecretQuery {
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// A volume declared in the app's spec, with what Podman knows about it.

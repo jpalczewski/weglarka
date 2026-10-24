@@ -12,6 +12,7 @@ expression: list
   "Post /v1/apps/{name}/deploy",
   "Get /v1/apps/{name}/secrets",
   "Put /v1/apps/{name}/secrets/{secret}",
+  "Delete /v1/apps/{name}/secrets/{secret}",
   "Get /v1/apps/{name}/volumes",
   "Get /v1/apps/{name}/volumes/{volume}/export",
   "Put /v1/apps/{name}/volumes/{volume}/import",
