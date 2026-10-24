@@ -654,8 +654,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(load(&fs::read_to_string(&p).unwrap()).unwrap(), apps);
 
         // Mounting an undeclared shared volume is a typo, not a new volume.
-        let err = load("[apps.a]\nimage = \"x:1\"\nshared_volumes = [{ name = \"d\", target = \"/d\" }]\n")
-            .unwrap_err();
+        let err = load(
+            "[apps.a]\nimage = \"x:1\"\nshared_volumes = [{ name = \"d\", target = \"/d\" }]\n",
+        )
+        .unwrap_err();
         assert!(matches!(err, StateError::Invalid { .. }), "{err:?}");
         // At most one shared volume per app (a shared volume is a uid-range boundary).
         assert!(matches!(

@@ -68,12 +68,17 @@ pub async fn update_app<P: PodmanClient + 'static>(
             .apps
             .insert(name.clone(), req.spec.clone())
             .ok_or_else(|| Fail(ErrorCode::NotFound, format!("unknown app: {name}")))?;
+        // Shared volumes (issue #33): a mount of an undeclared volume is rejected here with the
+        // `weglarka volumes add` hint, and a uid-range change with existing volume data is refused
+        // before anything is persisted — the old container and its files stay untouched.
+        weglarka_core::shared_volumes::validate(&apps).map_err(invalid)?;
         // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
         // by another app), as in `add`. Both see the candidate app set.
         weglarka_core::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
         // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
         weglarka_core::depends::validate(&apps).map_err(invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;
+        d.engine.check_range_change(&name, &req.spec).await?;
         match tokio::time::timeout(
             MUTATION_TIMEOUT,
             d.engine.upsert_app(name.clone(), req.spec.clone()),
