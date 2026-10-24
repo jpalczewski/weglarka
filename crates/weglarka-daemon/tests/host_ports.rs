@@ -2,118 +2,32 @@
 //! (privileged ports, two apps on one socket, the ingress bind) are enforced wherever the daemon
 //! reads or writes `apps.toml` (`docs/decisions/0013-host-ports.md`).
 
-use std::path::{Path, PathBuf};
+mod common;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use common::*;
+use std::path::PathBuf;
+
+use hyper::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
-use weglarka_core::config::HostConfig;
 use weglarka_core::testing::FakePodman;
-use weglarka_daemon::{Running, Settings, start};
+use weglarka_daemon::start;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    running: Running<FakePodman>,
+/// The `[runtime]` section that toggles `allow_privileged_host_ports`.
+fn allow_privileged(allow: bool) -> String {
+    format!("\n[runtime]\nallow_privileged_host_ports = {allow}\n")
 }
 
-/// `weglarka.toml` for a test daemon; `allow_privileged` toggles
-/// `[runtime] allow_privileged_host_ports`.
-fn host_toml(root: &Path, allow_privileged: bool) -> String {
-    format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-
-[runtime]
-allow_privileged_host_ports = {allow_privileged}
-"#,
-        root = root.display()
-    )
-}
-
-/// Short path: `sun_path` is limited to ~104 characters.
-fn tempdir() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    (dir, root)
-}
-
-async fn harness_with(allow_privileged: bool) -> Harness {
-    let (dir, root) = tempdir();
-    let host = HostConfig::from_toml_str(&host_toml(&root, allow_privileged)).unwrap();
-    let running = start(
-        Settings::from_host(host, root.join("weglarka.toml")),
-        FakePodman::new(),
-    )
-    .await
-    .unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        running,
-    }
+async fn harness_with(allow: bool) -> Harness {
+    Builder::new()
+        .sections(&allow_privileged(allow))
+        .build()
+        .await
 }
 
 async fn harness() -> Harness {
     harness_with(false).await
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// A valid spec for `domain`; `start = false` keeps the test free of background deploys.
@@ -302,13 +216,12 @@ start = false
 host_ports = [{ host = 222, container = 22 }]
 "#;
 
-    let start_err = |apps: &'static str, allow_privileged: bool| async move {
-        let (_dir, root) = tempdir();
+    let start_err = |apps: &'static str, allow: bool| async move {
+        let (_dir, root) = tempdir("wg");
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::write(root.join("state/apps.toml"), apps).unwrap();
-        let host = HostConfig::from_toml_str(&host_toml(&root, allow_privileged)).unwrap();
         start(
-            Settings::from_host(host, root.join("weglarka.toml")),
+            settings(&root, "", &allow_privileged(allow)),
             FakePodman::new(),
         )
         .await
@@ -324,12 +237,11 @@ host_ports = [{ host = 222, container = 22 }]
     assert!(message.contains("below 1024"), "{message}");
 
     // The opt-in makes the same file valid and the daemon starts.
-    let (_dir, root) = tempdir();
+    let (_dir, root) = tempdir("wg");
     std::fs::create_dir_all(root.join("state")).unwrap();
     std::fs::write(root.join("state/apps.toml"), privileged).unwrap();
-    let host = HostConfig::from_toml_str(&host_toml(&root, true)).unwrap();
     let running = start(
-        Settings::from_host(host, root.join("weglarka.toml")),
+        settings(&root, "", &allow_privileged(true)),
         FakePodman::new(),
     )
     .await

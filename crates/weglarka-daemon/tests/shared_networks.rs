@@ -2,118 +2,23 @@
 //! the real admin socket: declarations (`/v1/networks`), membership through the app spec, the
 //! in-use guard on removal and the doctor check.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+mod common;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use common::*;
+use std::collections::BTreeMap;
+
+use hyper::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
 use weglarka_core::app::{AppsFile, SharedNetworkName};
-use weglarka_core::config::HostConfig;
 use weglarka_core::labels;
 use weglarka_core::podman::{NetworkSpec, PodmanClient};
 use weglarka_core::state;
-use weglarka_core::testing::FakePodman;
-use weglarka_daemon::{Running, Settings, start};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 /// Declared name of the group used by the tests.
 const GROUP: &str = "kajet";
 /// Its Podman network name ([`labels::shared_network_name`]).
 const PODMAN_GROUP: &str = "net-shared-kajet";
-
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-async fn harness() -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root: PathBuf = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let host = HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-"#,
-        root = root.display()
-    ))
-    .unwrap();
-    let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        fake,
-        running,
-    }
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
-
-/// Raw admin call: returns the status and the body bytes (tars, error messages).
-async fn raw(h: &Harness, method: &str, path: &str, body: Vec<u8>) -> (StatusCode, Bytes) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    send(stream, req).await
-}
 
 fn apps_file(h: &Harness) -> AppsFile {
     state::load_apps(&h.root.join("state/apps.toml")).unwrap()
@@ -130,16 +35,6 @@ fn member_spec(network: &str, aliases: &[&str]) -> Value {
 async fn declare(h: &Harness, name: &str) {
     let (status, _) = admin(h, "PUT", &format!("/v1/networks/{name}"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "declare {name}");
-}
-
-async fn add(h: &Harness, name: &str, spec: Value) -> (StatusCode, Value) {
-    admin(
-        h,
-        "POST",
-        "/v1/apps",
-        Some(json!({ "name": name, "spec": spec })),
-    )
-    .await
 }
 
 fn doctor_check(report: &Value) -> &Value {
@@ -184,10 +79,17 @@ async fn declare_is_idempotent_and_listed_without_members() {
 async fn adding_a_member_creates_the_network_lazily_and_lists_it() {
     let h = harness().await;
     declare(&h, GROUP).await;
-    let (status, body) = add(&h, "kajet-api", member_spec(GROUP, &[])).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = add(&h, "kajet-proxy", member_spec(GROUP, &["gateway"])).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    add(&h, "kajet-api", member_spec(GROUP, &[])).await;
+    add(&h, "kajet-proxy", member_spec(GROUP, &["gateway"])).await;
+
+    // The adds only write the spec: the group network and the containers appear in a background
+    // reconcile pass, so wait for them instead of racing it (issue #147).
+    eventually("both members deployed", || async {
+        h.fake.container_spec("kajet-api").is_some()
+            && h.fake.container_spec("kajet-proxy").is_some()
+            && h.fake.networks().contains(&PODMAN_GROUP.to_owned())
+    })
+    .await;
 
     assert!(h.fake.networks().contains(&PODMAN_GROUP.to_owned()));
     let spec = h.fake.network_spec(PODMAN_GROUP).unwrap();
@@ -210,7 +112,7 @@ async fn adding_a_member_creates_the_network_lazily_and_lists_it() {
 #[tokio::test]
 async fn an_undeclared_network_is_rejected_and_nothing_is_written() {
     let h = harness().await;
-    let (status, body) = add(&h, "kajet-api", member_spec("nope", &[])).await;
+    let (status, body) = post_app(&h, "kajet-api", member_spec("nope", &[])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
         body["message"]
@@ -223,9 +125,8 @@ async fn an_undeclared_network_is_rejected_and_nothing_is_written() {
 
     // An alias that another member already answers to is refused as well.
     declare(&h, GROUP).await;
-    let (status, _) = add(&h, "a", member_spec(GROUP, &["web"])).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = add(&h, "b", member_spec(GROUP, &["web"])).await;
+    add(&h, "a", member_spec(GROUP, &["web"])).await;
+    let (status, body) = post_app(&h, "b", member_spec(GROUP, &["web"])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     h.running.stop().await;
 }
@@ -234,8 +135,7 @@ async fn an_undeclared_network_is_rejected_and_nothing_is_written() {
 async fn removal_is_refused_while_members_exist() {
     let h = harness().await;
     declare(&h, GROUP).await;
-    let (status, _) = add(&h, "kajet-api", member_spec(GROUP, &[])).await;
-    assert_eq!(status, StatusCode::OK);
+    add(&h, "kajet-api", member_spec(GROUP, &[])).await;
 
     let (status, body) = raw(&h, "DELETE", &format!("/v1/networks/{GROUP}"), vec![]).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -291,8 +191,7 @@ async fn doctor_reports_an_undeclared_group_network_and_an_empty_group() {
 async fn doctor_is_quiet_for_a_consistent_group() {
     let h = harness().await;
     declare(&h, GROUP).await;
-    let (status, _) = add(&h, "kajet-api", member_spec(GROUP, &[])).await;
-    assert_eq!(status, StatusCode::OK);
+    add(&h, "kajet-api", member_spec(GROUP, &[])).await;
     let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
     let check = doctor_check(&report);
     assert_eq!(check["status"], "ok", "{check}");

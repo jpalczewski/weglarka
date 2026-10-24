@@ -2,17 +2,18 @@
 //! the digest a switch requested and the `self_update` doctor check (off, applied, pending, stale
 //! timer).
 
+mod common;
+
+use common::*;
 use std::path::PathBuf;
 
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::UnixStream;
 use weglarka_core::app::Digest;
-use weglarka_core::config::HostConfig;
 use weglarka_core::podman::PodmanClient;
 use weglarka_core::self_update::{self, SelfUpdateState};
 use weglarka_core::testing::FakePodman;
@@ -33,35 +34,8 @@ struct Env {
 
 impl Env {
     fn new(extra: &str) -> Self {
-        // Short path: `sun_path` is limited to ~104 characters.
-        let dir = tempfile::Builder::new()
-            .prefix("wg")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let root = dir.path().to_owned();
-        std::fs::write(root.join("traefik.yml"), "").unwrap();
-        let host = HostConfig::from_toml_str(&format!(
-            r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18081"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-{extra}
-"#,
-            root = root.display()
-        ))
-        .unwrap();
-        let settings = Settings::from_host(host, root.join("weglarka.toml"));
+        let (dir, root) = tempdir("wg");
+        let settings = settings(&root, "", extra);
         std::fs::create_dir_all(&settings.paths.state_dir).unwrap();
         Env {
             _dir: dir,
@@ -99,19 +73,6 @@ dir = "{root}/state"
 
 fn digest(c: char) -> Digest {
     Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
 }
 
 async fn doctor(running: &Running<FakePodman>) -> Value {

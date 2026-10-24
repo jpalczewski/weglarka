@@ -2,118 +2,25 @@
 //! real admin socket: declarations (`/v1/volumes`), member mounts, the purge/range-change guards and
 //! import/export through the app's volume endpoints.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+mod common;
 
-use http_body_util::{BodyExt, Full};
+use common::*;
+use std::collections::BTreeMap;
+
+use hyper::StatusCode;
 use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
 use weglarka_core::app::{AppsFile, InstanceName, SharedVolumeName};
-use weglarka_core::config::HostConfig;
 use weglarka_core::labels;
 use weglarka_core::podman::{ContainerState, PodmanClient, VolumeSpec};
 use weglarka_core::state::{self, StateFile};
-use weglarka_core::testing::{Call, FakePodman};
-use weglarka_daemon::{Running, Settings, start};
+use weglarka_core::testing::Call;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 /// Declared name of the group used by the tests.
 const GROUP: &str = "kajet-data";
 /// Its Podman volume name ([`labels::shared_volume_name`]).
 const PODMAN_GROUP: &str = "wg-shared-kajet-data";
-
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-async fn harness() -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root: PathBuf = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let host = HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-"#,
-        root = root.display()
-    ))
-    .unwrap();
-    let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        fake,
-        running,
-    }
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
-
-/// Raw admin call: returns the status and the body bytes (tars, error messages).
-async fn raw(h: &Harness, method: &str, path: &str, body: Vec<u8>) -> (StatusCode, Bytes) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    send(stream, req).await
-}
 
 fn instance(s: &str) -> InstanceName {
     InstanceName::new(s).unwrap()
@@ -144,17 +51,6 @@ fn member_spec(volume: &str, start: bool) -> Value {
 async fn declare(h: &Harness, name: &str) {
     let (status, _) = admin(h, "PUT", &format!("/v1/volumes/{name}"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "declare {name}");
-}
-
-async fn add(h: &Harness, name: &str, spec: Value) {
-    let (status, body) = admin(
-        h,
-        "POST",
-        "/v1/apps",
-        Some(json!({ "name": name, "spec": spec })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "add {name}: {body}");
 }
 
 async fn deploy(h: &Harness, name: &str) {

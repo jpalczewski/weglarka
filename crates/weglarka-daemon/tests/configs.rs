@@ -1,59 +1,26 @@
 //! Host config mounts and `apps reload` (issue #118, ADR 0022) over the admin API: startup
 //! validation, reload/show/doctor on `FakePodman` with a real `config_root` in the temp dir.
-//!
-//! The harness is a copy of the one in `tests/daemon.rs` (the pattern is per file): a real unix
-//! socket and `FakePodman`.
 
+mod common;
+
+use common::*;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
-use weglarka_core::config::HostConfig;
 use weglarka_core::testing::{Call, FakePodman};
-use weglarka_daemon::{Running, Settings, StartError, start};
+use weglarka_daemon::{Running, StartError, start};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/prometheus:latest";
 const CONFIG_SOURCE: &str = "prometheus/prometheus.yml";
 const CONFIG_TARGET: &str = "/etc/prometheus/prometheus.yml";
 
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    config_root: PathBuf,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-fn host_toml(root: &Path, config_root: Option<&Path>) -> HostConfig {
-    let extra = config_root
+/// The `config_root` line of `weglarka.toml` when the test asks for one.
+fn config_root_line(config_root: Option<&Path>) -> String {
+    config_root
         .map(|root| format!("config_root = {:?}\n", root.display().to_string()))
-        .unwrap_or_default();
-    HostConfig::from_toml_str(&format!(
-        r#"{extra}
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-"#,
-        root = root.display()
-    ))
-    .unwrap()
+        .unwrap_or_default()
 }
 
 /// A `config_root` with one real config file, and a daemon that mounts it when `with_config_root`.
@@ -64,35 +31,21 @@ async fn harness(with_config_root: bool) -> Harness {
 /// [`harness`] with `apps.toml` written **before** startup: the per-source tolerance is only
 /// observable when the broken mount is already declared when the daemon starts.
 async fn harness_with_apps(with_config_root: bool, apps: &str) -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let config_root = root.join("config");
+    let mut builder = Builder::new();
+    let config_root = builder.root().join("config");
     std::fs::create_dir_all(config_root.join("prometheus")).unwrap();
     std::fs::write(
         config_root.join(CONFIG_SOURCE),
         "global:\n  scrape_interval: 30s\n",
     )
     .unwrap();
+    builder = builder.top_level(&config_root_line(
+        with_config_root.then_some(config_root.as_path()),
+    ));
     if !apps.is_empty() {
-        std::fs::create_dir_all(root.join("state")).unwrap();
-        std::fs::write(root.join("state/apps.toml"), apps).unwrap();
+        builder = builder.apps(apps);
     }
-    let host = host_toml(&root, with_config_root.then_some(config_root.as_path()));
-    let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        config_root,
-        fake,
-        running,
-    }
+    builder.build().await
 }
 
 /// Daemon startup for the rejection tests: `apps.toml` already written, `start` decides.
@@ -104,7 +57,7 @@ async fn start_result(
     std::fs::create_dir_all(root.join("state")).unwrap();
     std::fs::write(root.join("state/apps.toml"), apps_toml).unwrap();
     std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let settings = Settings::from_host(host_toml(root, config_root), root.join("weglarka.toml"));
+    let settings = settings(root, &config_root_line(config_root), "");
     start(settings, FakePodman::new()).await
 }
 
@@ -117,38 +70,6 @@ fn startup_dir() -> tempfile::TempDir {
         .prefix("wgs")
         .tempdir_in("/tmp")
         .unwrap()
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
 }
 
 fn app_body(name: &str, domain: &str, extra: Value) -> Value {
@@ -169,16 +90,6 @@ fn app_body(name: &str, domain: &str, extra: Value) -> Value {
 
 fn configs_field() -> Value {
     json!([{ "source": CONFIG_SOURCE, "target": CONFIG_TARGET }])
-}
-
-async fn eventually<F: Fn() -> Fut, Fut: Future<Output = bool>>(what: &str, f: F) {
-    for _ in 0..100 {
-        if f().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for: {what}");
 }
 
 async fn current_digest(h: &Harness, name: &str) -> Option<String> {

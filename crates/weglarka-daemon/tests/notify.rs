@@ -1,21 +1,17 @@
 //! Notifications (issue #38) on `FakePodman`: engine events reach a mock ntfy server through the
 //! durable outbox, and `notify test`/`notify status` answer over the admin API.
 
+mod common;
+
+use common::*;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
-use weglarka_core::config::HostConfig;
-use weglarka_core::testing::FakePodman;
-use weglarka_daemon::{Running, Settings, start};
+use tokio::net::{TcpListener, TcpStream};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 
@@ -121,22 +117,9 @@ fn request_complete(buf: &[u8]) -> bool {
 
 // ── Daemon harness ───────────────────────────────────────────────────────────
 
-struct Harness {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-/// Starts the daemon; `ntfy` configures `[notify.ntfy]` (without it notifications stay off).
+/// Starts the daemon; `ntfy` adds `[notify.ntfy]` (without it notifications stay off). The
+/// reconcile interval is short because the crash-loop test waits for a periodic pass.
 async fn harness(ntfy: Option<&Ntfy>) -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wgn")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
     let notify = match ntfy {
         Some(ntfy) => format!(
             "[notify.ntfy]\nurl = \"{}\"\ntopic = \"weglarka\"\n",
@@ -144,72 +127,12 @@ async fn harness(ntfy: Option<&Ntfy>) -> Harness {
         ),
         None => String::new(),
     };
-    let host = HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-
-[runtime]
-# The crash-loop test waits for a periodic pass; one second keeps it short.
-reconcile_interval_secs = 1
-
-{notify}"#,
-        root = root.display(),
-    ))
-    .unwrap();
-    let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        root,
-        fake,
-        running,
-    }
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+    Builder::new()
+        .sections(&format!(
+            "[runtime]\nreconcile_interval_secs = 1\n\n{notify}"
+        ))
+        .build()
         .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
 }
 
 fn app_body(name: &str, domain: &str) -> Value {
@@ -222,16 +145,6 @@ fn app_body(name: &str, domain: &str) -> Value {
             "health": { "attempts": 1, "window_secs": 1 }
         }
     })
-}
-
-async fn eventually<F: Fn() -> Fut, Fut: Future<Output = bool>>(what: &str, f: F) {
-    for _ in 0..100 {
-        if f().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for: {what}");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

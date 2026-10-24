@@ -1,111 +1,21 @@
 //! Image retention through the admin API (issue #40): `POST /v1/images/prune` and the `doctor`
 //! warning. Real unix socket, `FakePodman`.
 
-use std::time::Duration;
+mod common;
+
+use common::*;
 
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
 use weglarka_core::app::Digest;
-use weglarka_core::config::HostConfig;
 use weglarka_core::podman::PodmanClient;
-use weglarka_core::testing::{DEFAULT_IMAGE_SIZE_BYTES, FakePodman};
-use weglarka_daemon::{Running, Settings, start};
+use weglarka_core::testing::DEFAULT_IMAGE_SIZE_BYTES;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 
-struct Harness {
-    _dir: tempfile::TempDir,
-    fake: FakePodman,
-    running: Running<FakePodman>,
-}
-
-async fn harness() -> Harness {
-    // Short path: `sun_path` is limited to ~104 characters.
-    let dir = tempfile::Builder::new()
-        .prefix("wg")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let root = dir.path().to_owned();
-    std::fs::write(root.join("traefik.yml"), "").unwrap();
-    let host = HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "behind"
-bind = "127.0.0.1:18080"
-traefik_dynamic_file = "{root}/traefik.yml"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.eu"
-
-[state]
-dir = "{root}/state"
-"#,
-        root = root.display()
-    ))
-    .unwrap();
-    let fake = FakePodman::new();
-    let settings = Settings::from_host(host, root.join("weglarka.toml"));
-    let running = start(settings, fake.clone()).await.unwrap();
-    Harness {
-        _dir: dir,
-        fake,
-        running,
-    }
-}
-
 fn digest(c: char) -> Digest {
     Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-}
-
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> (StatusCode, Bytes)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status();
-    (status, resp.into_body().collect().await.unwrap().to_bytes())
-}
-
-async fn admin(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let stream = UnixStream::connect(&h.running.admin_socket).await.unwrap();
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "weglarka")
-        .body(Full::new(Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let (status, bytes) = send(stream, req).await;
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
-
-async fn eventually<F: Fn() -> Fut, Fut: Future<Output = bool>>(what: &str, f: F) {
-    for _ in 0..100 {
-        if f().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for: {what}");
 }
 
 /// The `runtime.images` check of a `GET /v1/doctor`.
