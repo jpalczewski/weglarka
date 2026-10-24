@@ -2,8 +2,6 @@
 source: crates/weglarka-core/src/state.rs
 expression: "fs::read_to_string(&paths.state).unwrap()"
 ---
-schema_version = 2
-
 [apps.ntfy]
 generation = 3
 current = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
