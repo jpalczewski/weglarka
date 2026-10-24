@@ -37,3 +37,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0028](0028-config-root-mounts.md) | Host config mounts (`config_root`) and app reload |
 | [0029](0029-shared-volume-groups.md) | Shared volume groups: several shared volumes per app, one uid range per group (issue #129) |
 | [0030](0030-shared-networks.md) | Shared networks: opt-in connectivity for a group of instances (issue #128) |
+| [0031](0031-path-prefix-routing.md) | Path-prefix routing (several instances behind one domain) |
