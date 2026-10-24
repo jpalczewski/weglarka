@@ -348,6 +348,11 @@ się nie zmienia).
 Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi właścicielami (czas i miejsce w
 `~/.local/share/containers` przy pierwszym starcie obrazu w nowym zakresie).
 
+`state.toml` trzyma też `effective_uid_range` — ostatni zakres, w którym przygotowano kontener i wolumeny apki (jej
+własny albo zakres wolumenu współdzielonego). To z niego korzysta guard zmiany zakresu, gdy kontenera nie ma
+(apka provisionowana `start = false` albo po `apps stop`), więc dane w wolumenach prywatnych nie zmieniają
+właściciela po cichu ([#75](https://github.com/jpalczewski/weglarka/issues/75)).
+
 ### Wolumeny w spec apki
 
 ```toml
@@ -403,6 +408,12 @@ go równolegle z działającym CLI.
   (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
 - `start = false` członka provisionuje zakres i wolumen **bez kontenera** ([6b](#6b-zatrzymywanie-apek-start--false)),
   więc dane można zaimportować przed pierwszym startem.
+- **Zmiana zakresu UID przy danych jest odrzucana także bez kontenera:** dołączenie apki z prywatnymi wolumenami do
+  grupy (albo wystąpienie z niej) kończy się `409` (`PUT /v1/apps/<nazwa>`) albo błędem akcji reconcile — również
+  wtedy, gdy apka jest tylko provisionowana lub zatrzymana, bo guard czyta ostatni zakres z `state.toml`
+  (`effective_uid_range`). Provisioning i deploy mają wspólny prolog, więc ręczna edycja `apps.toml` przy
+  zatrzymanym demonie też nie przejdzie. Zmiana zakresu jest bezpieczna dopiero po usunięciu danych
+  (`apps remove --purge-volumes` albo ręcznie skasowane wolumeny).
 - **`doctor`:** `state.shared_volumes` raportuje dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
   --purge`), zadeklarowany a jeszcze nieutworzony wolumen, rozjazd etykiety `weglarka.uid-range` i przypomnienie,
   że wszystkie obrazy grupy muszą działać jako ten sam `USER` — porównania użytkowników `doctor` nie robi za Ciebie.
@@ -629,6 +640,20 @@ Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być
 3. Kontenery członków działają w zakresie grupy, dopóki stary demon ich nie odtworzy — a odtworzy je we własnych
    zakresach i dane w wolumenie staną się nieczytelne. Przed downgradem zrób `volumes export` i zatrzymaj apki
    (`apps stop`).
+
+### Rollback do Węglarki bez pola `effective_uid_range` (issue #75)
+
+`effective_uid_range` w `state.toml` to nowe pole `AppState`, a `state.toml` ma `deny_unknown_fields` — **starszy
+demon nie odczyta pliku**. Wartość jest pochodna (kopia `uid_range` apki albo `shared_volumes.<nazwa>.uid_range`),
+więc przed downgradem wystarczy:
+
+1. Zatrzymaj apki (`apps stop`) i zrób kopię `state.toml` — nowszy demon odtworzy pole przy najbliższym
+   provision/deploy.
+2. Usuń z `state.toml` linie `effective_uid_range` (albo przywróć kopię sprzed wdrożenia) i uruchom starszego demona.
+   Bez tego daemon odmówi startu z błędem parsowania stanu.
+3. **Aktualizuj CLI razem z demonem:** starsze CLI nie odczyta odpowiedzi `apps show`, `apps add`, `apps update`
+   oraz `apps start`/`apps stop`, bo `AppState` w API też ma `deny_unknown_fields`. Nowe CLI czyta starszy demon bez
+   zmian.
 
 ## 6b. Zatrzymywanie apek: `start = false`
 

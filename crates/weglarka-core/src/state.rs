@@ -67,6 +67,15 @@ pub struct AppState {
     /// `None` = the instance runs with `--userns=auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid_range: Option<UidRange>,
+    /// Last **effective** uid/gid range the instance's container and volumes were prepared with:
+    /// its own [`Self::uid_range`] or the range of the shared volume it mounts
+    /// (docs/decisions/0017). Written by `prepare_container` right before a container is created,
+    /// so the range-change guard still knows the owner of the private volume data when there is no
+    /// container to read the `weglarka.uid-range` label from (issue #75). It mirrors a range that
+    /// is also stored here or in [`SharedVolumeState::uid_range`], so it is not part of the
+    /// disjoint-ranges validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_uid_range: Option<UidRange>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +588,10 @@ mod tests {
                 }),
                 waiting_for_secrets: vec![],
                 uid_range: Some(UidRange {
+                    start: 1,
+                    size: 65_536,
+                }),
+                effective_uid_range: Some(UidRange {
                     start: 1,
                     size: 65_536,
                 }),

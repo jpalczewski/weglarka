@@ -18,6 +18,7 @@ use crate::podman::{
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
 use crate::secrets::{binding_fingerprints, materialize};
 use crate::state::{self, AppState, FailedDeploy, StateFile};
+use crate::uid_range::UidRange;
 use crate::webhook::WebhookEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,9 +112,11 @@ pub struct WebhookOutcome {
     pub results: Vec<(InstanceName, Result<DeployOutcome, EngineError>)>,
 }
 
-/// Result of starting a container: the hash it was started with, and the gate verdict.
+/// Result of starting a container: the hash it was started with, the uid range its volumes were
+/// prepared in (recorded in the state as the data owner, issue #75) and the gate verdict.
 struct Launched {
     hash: SpecHash,
+    range: UidRange,
     health: Result<(), String>,
 }
 
@@ -247,28 +250,22 @@ impl<P: PodmanClient> Reconciler<P> {
             .filter(|id| !id.is_empty())
     }
 
-    /// Prepare (image, network, secrets) → remove the old one → create+start → gate.
-    /// `Err` means failure *before* touching the old container; later errors end up
-    /// in `Launched::health`.
-    async fn launch(
+    /// The part of a launch that runs before anything is created or removed: the network, the
+    /// uid-range guard, the volumes (uid range + attachments) and only then the old container.
+    /// `launch` and `provision_locked` share it, so neither of them can skip the guard again
+    /// (issue #75). `Err` = the old container is untouched and nothing new exists yet.
+    async fn begin_instance(
         &self,
         instance: &InstanceName,
         spec: &AppSpec,
-        digest: &Digest,
-        generation: u64,
-        local_id: Option<&str>,
-    ) -> Result<Launched, EngineError> {
-        let image = self.ensure_image(spec, digest, local_id).await?;
-        let network = labels::network_name(instance);
+    ) -> Result<crate::volumes::Prepared, EngineError> {
         self.podman
             .network_create(&NetworkSpec {
-                name: network.clone(),
+                name: labels::network_name(instance),
                 internal: false,
                 labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
             })
             .await?;
-        let hash = self.desired_hash(instance, spec, digest).await?;
-        let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // A changed uid range would make the instance's existing files unreadable
         // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
         // old container. The range was assigned by the caller, so `state.toml` already has it.
@@ -294,6 +291,26 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(()) | Err(PodmanError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
+        Ok(prepared)
+    }
+
+    /// Prepare (image, network, secrets, uid range) → remove the old one → create+start → gate.
+    /// `Err` means failure *before* touching the old container; later errors end up
+    /// in `Launched::health`.
+    async fn launch(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+        generation: u64,
+        local_id: Option<&str>,
+    ) -> Result<Launched, EngineError> {
+        let image = self.ensure_image(spec, digest, local_id).await?;
+        let hash = self.desired_hash(instance, spec, digest).await?;
+        let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
+        let prepared = self.begin_instance(instance, spec).await?;
+        let name = labels::container_name(instance);
+        let network = labels::network_name(instance);
 
         let mut container = ContainerSpec {
             name: name.clone(),
@@ -322,6 +339,7 @@ impl<P: PodmanClient> Reconciler<P> {
             id_mapping: None,
             security: spec.security.clone(),
         };
+        let range = prepared.range;
         prepared.apply(&mut container);
         let started = async {
             self.podman.container_create(&container).await?;
@@ -332,7 +350,11 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(()) => self.health_gate(&name, spec).await,
             Err(e) => Err(format!("cannot start container: {e}")),
         };
-        Ok(Launched { hash, health })
+        Ok(Launched {
+            hash,
+            range,
+            health,
+        })
     }
 
     /// Health gate: `attempts` tries within `window_secs`. The container must keep running throughout.
@@ -461,6 +483,9 @@ impl<P: PodmanClient> Reconciler<P> {
 
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.generation = generation;
+        // The volumes were just prepared in this range; remember the data owner in the state even
+        // if the app never gets a container or the deploy fails below (issue #75).
+        entry.effective_uid_range = Some(launched.range);
         let reason = match launched.health {
             Ok(()) => {
                 if cur.current.as_ref() != Some(&digest) {
@@ -513,10 +538,14 @@ impl<P: PodmanClient> Reconciler<P> {
             )
             .await;
         let entry = st.apps.entry(instance.clone()).or_default();
+        if let Ok(l) = &restore {
+            entry.effective_uid_range = Some(l.range);
+        }
         match restore {
             Ok(Launched {
                 hash,
                 health: Ok(()),
+                ..
             }) => {
                 entry.generation = generation + 1;
                 entry.spec_hash = Some(hash);
@@ -582,33 +611,15 @@ impl<P: PodmanClient> Reconciler<P> {
                 return Err(e);
             }
         };
-        self.podman
-            .network_create(&NetworkSpec {
-                name: labels::network_name(instance),
-                internal: false,
-                labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
-            })
-            .await?;
-        let _prepared = self.prepare_container(instance, spec).await?; // uid range + volumes
-
-        let name = labels::container_name(instance);
-        match self
-            .podman
-            .container_stop(&name, self.options.stop_timeout_secs)
-            .await
-        {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        match self.podman.container_remove(&name, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
+        // Same prologue as `launch`: network, the uid-range guard, the volumes, and only then the
+        // old container — provisioning must not bypass the guard either (issue #75).
+        let prepared = self.begin_instance(instance, spec).await?;
 
         let mut st = state::load_state(&self.paths.state)?;
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.current = Some(digest.clone());
         entry.failed = None;
+        entry.effective_uid_range = Some(prepared.range);
         state::save_state(&self.paths.state, &st)?;
         self.events.emit(Event::Provisioned {
             instance: instance.clone(),
@@ -665,6 +676,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.generation = generation;
         entry.spec_hash = Some(launched.hash);
+        entry.effective_uid_range = Some(launched.range);
         state::save_state(&self.paths.state, &st)?;
         match launched.health {
             Ok(()) => {
