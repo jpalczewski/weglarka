@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::events::Severity;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -17,6 +19,9 @@ pub struct HostConfig {
     pub platform: PlatformConfig,
     #[serde(default)]
     pub state: StateConfig,
+    /// Notifications; absent = off (the events only reach the daemon log).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyConfig>,
 }
 
 impl HostConfig {
@@ -135,6 +140,61 @@ pub struct WebhookConfig {
     pub domain: String,
 }
 
+/// `[notify]`: where the daemon sends engine events (deploy ok/fail, rollback, …).
+///
+/// Delivery is at-least-once: a notification is written to a durable outbox before it is sent and
+/// retried until ntfy accepts it or the attempts/time limits run out. Absent section = off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// Repeated events of one app/kind are coalesced inside this window (seconds): the first one is
+    /// sent immediately, the rest become a single summary when the window closes. `0` disables it.
+    #[serde(default = "NotifyConfig::default_dedup_window_secs")]
+    pub dedup_window_secs: u64,
+    /// ntfy channel; `[notify]` without it is treated as disabled (warned about at startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntfy: Option<NtfyConfig>,
+}
+
+impl NotifyConfig {
+    fn default_dedup_window_secs() -> u64 {
+        300
+    }
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            dedup_window_secs: Self::default_dedup_window_secs(),
+            ntfy: None,
+        }
+    }
+}
+
+/// ntfy channel: the daemon publishes a JSON message to `<url>/`.
+///
+/// The token is **not** part of this file: `token_file` points at a 0600 file that the daemon reads
+/// once at startup, so `weglarka.toml` (typically 0644) never holds a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NtfyConfig {
+    /// Base URL: `http://` or `https://`, `scheme://host[:port][/base]` (no userinfo/query/fragment).
+    pub url: String,
+    /// `Host` header and TLS server name when they differ from the URL's host — e.g. a self-hosted
+    /// ntfy reached through the ingress container (`url = "http://weglarka-nginx:8080"`,
+    /// `host = "ntfy.example.com"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// ntfy topic (`[A-Za-z0-9_-]{1,64}`).
+    pub topic: String,
+    /// File with an ntfy access token (mode 0600); read once at startup and never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
+    /// Lowest severity published to this channel; lower ones are dropped before dedup.
+    #[serde(default)]
+    pub min_severity: Severity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
@@ -246,6 +306,65 @@ kind = "systemd"
     #[test]
     fn rejects_unknown_fields() {
         let bad = SAMPLE.replace("[platform]", "[platform]\nbogus = true");
+        assert!(HostConfig::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn notifications_are_off_by_default_and_stay_out_of_the_serialized_config() {
+        let cfg = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(cfg.notify.is_none());
+        assert!(!toml::to_string(&cfg).unwrap().contains("notify"));
+    }
+
+    #[test]
+    fn the_notification_example_parses() {
+        // `docs/examples/notify.toml` is a `weglarka.toml` excerpt: keep it valid.
+        let example = include_str!("../../../docs/examples/notify.toml");
+        let notify = HostConfig::from_toml_str(&format!("{SAMPLE}\n{example}"))
+            .unwrap()
+            .notify
+            .unwrap();
+        let ntfy = notify.ntfy.unwrap();
+        assert_eq!(notify.dedup_window_secs, 300);
+        assert_eq!(ntfy.topic, "weglarka");
+        assert_eq!(ntfy.min_severity, Severity::Info);
+        assert_eq!(ntfy.host, None, "the public URL is the documented default");
+    }
+
+    #[test]
+    fn notify_section_parses_with_defaults() {
+        let src = format!(
+            "{SAMPLE}\n[notify.ntfy]\nurl = \"https://ntfy.example.com\"\ntopic = \"weglarka\"\n"
+        );
+        let notify = HostConfig::from_toml_str(&src).unwrap().notify.unwrap();
+        assert_eq!(notify.dedup_window_secs, 300);
+        let ntfy = notify.ntfy.unwrap();
+        assert_eq!(ntfy.min_severity, Severity::Info);
+        assert_eq!(ntfy.host, None);
+        assert_eq!(ntfy.token_file, None);
+    }
+
+    #[test]
+    fn notify_section_honours_all_options_and_rejects_unknown_fields() {
+        let src = format!(
+            "{SAMPLE}\n[notify]\ndedup_window_secs = 0\n\
+             [notify.ntfy]\nurl = \"http://weglarka-nginx:8080\"\n\
+             host = \"ntfy.example.com\"\ntopic = \"wg\"\n\
+             token_file = \"/etc/weglarka/ntfy-token\"\nmin_severity = \"warning\"\n"
+        );
+        let ntfy = HostConfig::from_toml_str(&src)
+            .unwrap()
+            .notify
+            .unwrap()
+            .ntfy
+            .unwrap();
+        assert_eq!(ntfy.min_severity, Severity::Warning);
+        assert_eq!(ntfy.host.as_deref(), Some("ntfy.example.com"));
+        assert_eq!(
+            ntfy.token_file.as_deref(),
+            Some(std::path::Path::new("/etc/weglarka/ntfy-token"))
+        );
+        let bad = format!("{src}\nbogus = true\n");
         assert!(HostConfig::from_toml_str(&bad).is_err());
     }
 }

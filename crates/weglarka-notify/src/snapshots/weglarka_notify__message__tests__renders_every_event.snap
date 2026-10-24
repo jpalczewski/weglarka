@@ -1,0 +1,126 @@
+---
+source: crates/weglarka-notify/src/message.rs
+expression: rendered
+---
+[
+  {
+    "severity": "info",
+    "key": "deploy:ntfy",
+    "title": "deployed ntfy",
+    "body": "aaaaaaaaaaaa · generation 7",
+    "priority": 3,
+    "tags": [
+      "white_check_mark"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "info",
+    "key": "provision:ntfy",
+    "title": "provisioned ntfy",
+    "body": "bbbbbbbbbbbb · ready for `apps start`",
+    "priority": 3,
+    "tags": [
+      "package"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "warning",
+    "key": "deploy-failed:ntfy",
+    "title": "deploy failed: ntfy",
+    "body": "health gate failed after 10 attempts: connection refused\nimage cccccccccccc",
+    "priority": 4,
+    "tags": [
+      "warning"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "warning",
+    "key": "deploy-failed:ntfy",
+    "title": "deploy failed: ntfy",
+    "body": "pull failed: unauthorized",
+    "priority": 4,
+    "tags": [
+      "warning"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "warning",
+    "key": "rollback:ntfy",
+    "title": "rolled back ntfy",
+    "body": "failed: cccccccccccc\nrestored: aaaaaaaaaaaa\nhealth gate failed after 10 attempts",
+    "priority": 4,
+    "tags": [
+      "rewind",
+      "warning"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "critical",
+    "key": "rollback-failed:ntfy",
+    "title": "ROLLBACK FAILED: ntfy",
+    "body": "cannot start container: image not found",
+    "priority": 5,
+    "tags": [
+      "rotating_light"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "info",
+    "key": "recreate:ntfy",
+    "title": "recreated ntfy",
+    "body": "SpecDrift",
+    "priority": 3,
+    "tags": [
+      "arrows_counterclockwise"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "debug",
+    "key": "pruned:gone",
+    "title": "removed container gone",
+    "body": "gone is not in apps.toml",
+    "priority": 2,
+    "tags": [
+      "wastebasket"
+    ]
+  },
+  {
+    "severity": "info",
+    "key": "secret:ntfy",
+    "title": "waiting for secrets: ntfy",
+    "body": "missing: config, token",
+    "priority": 3,
+    "tags": [
+      "key"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "debug",
+    "key": "dependency:ntfy",
+    "title": "waiting for dependencies: ntfy",
+    "body": "not running yet: db",
+    "priority": 2,
+    "tags": [
+      "hourglass"
+    ],
+    "click": "https://nz.example.com"
+  },
+  {
+    "severity": "debug",
+    "key": "webhook-dup:abc-123",
+    "title": "duplicate webhook abc-123",
+    "body": "already handled (deduplicated by delivery id)",
+    "priority": 2,
+    "tags": [
+      "recycle"
+    ]
+  }
+]

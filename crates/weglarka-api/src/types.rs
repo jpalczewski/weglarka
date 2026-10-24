@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedVolumeName};
+use weglarka_core::events::Severity;
 use weglarka_core::state::AppState;
 use weglarka_core::uid_range::UidRange;
 
@@ -243,6 +244,46 @@ pub struct SecretInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSecretsResponse {
     pub secrets: Vec<SecretInfo>,
+}
+
+/// One configured notification channel (`GET /v1/notifications`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyChannelSummary {
+    /// Channel name as stored in the outbox (`ntfy`).
+    pub name: String,
+    /// Lowest severity this channel publishes.
+    pub min_severity: Severity,
+    /// Notifications queued for this channel.
+    pub pending: u32,
+}
+
+/// `GET /v1/notifications`: notification status (issue #38). `enabled = false` when `weglarka.toml`
+/// has no `[notify]` channel — then every other field is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyStatusResponse {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<NotifyChannelSummary>,
+    /// Notifications waiting for delivery (durable outbox).
+    pub pending: u32,
+    /// Notifications dropped since the outbox was created (queue cap, age, permanent errors).
+    pub dropped: u64,
+    /// Error of the last failed delivery attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// RFC 3339 of the last successful delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivered_at: Option<String>,
+}
+
+/// `POST /v1/notifications/test`: delivery of a test notification, bypassing the outbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyTestResponse {
+    /// `true` when the channel accepted the notification right now.
+    pub delivered: bool,
+    /// The channel's verdict when `delivered` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

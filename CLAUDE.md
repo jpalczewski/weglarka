@@ -5,7 +5,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0020).
+funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` (0001–0021).
 Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
@@ -87,15 +87,17 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → core`; `podman → core`; `ingress → core`; `cli → api, core`; `daemon → wszystko`.
+Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `cli → api, core`;
+`daemon → wszystko`.
 
 | Crate | Zawartość |
 |---|---|
 | `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), sekrety, traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
 | `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
 | `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
+| `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
-| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet) |
+| `weglarka-daemon` | demon: admin API (unix socket), webhooki, zapis ingressu, `Platform` systemd (quadlet), worker powiadomień |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
 
 Przy pracy równoległej kilku agentów: jeden crate/obszar na agenta, a zmiany w kontrakcie (`app.rs`, `podman.rs`,
@@ -115,6 +117,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
 | ingress | `ingress/src/plan.rs` (`Plan::build` waliduje) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs` |
+| powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
 | CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |
 | testy silnika | `core/src/engine_tests.rs` (scenariusze na `FakePodman`), testy modułu w `core/src/volumes.rs` |
 | testy daemon/API | `daemon/tests/*.rs` (prawdziwy unix socket + `FakePodman`) |
@@ -139,6 +142,10 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   --purge-volumes` członka przy innych członkach = 409 (nic nie usuwane), import wymaga zatrzymanych
   członków, a zmiana zakresu przy istniejących prywatnych danych jest odrzucana (`RangeChangeWithData`).
   Szczegóły: `docs/decisions/0017-shared-volumes.md` i `docs/install.md` §6a.
+- **Powiadomienia (ADR 0021):** `EventSink::emit` jest wołane pod mutexem silnika, więc sink **tylko kolejkuje**
+  (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
+  `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
+  rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 

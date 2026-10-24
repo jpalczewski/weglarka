@@ -19,5 +19,7 @@ expression: list
   "Put /v1/volumes/{volume}",
   "Delete /v1/volumes/{volume}",
   "Get /v1/doctor",
-  "Post /v1/images/prune"
+  "Post /v1/images/prune",
+  "Get /v1/notifications",
+  "Post /v1/notifications/test"
 ]

@@ -1,7 +1,9 @@
 # Węglarka
 
 A lightweight deploy tool in Rust that manages **rootless Podman 6**: declarative state in TOML,
-a reconcile loop, nginx in a container, auto-update on a GitHub webhook (GHCR), and a health gate with rollback.
+a reconcile loop, nginx in a container, auto-update on a GitHub webhook (GHCR), a health gate with rollback,
+and push notifications (ntfy) for deploys, rollbacks and failures — through a durable outbox, so a
+notification survives the notification server being redeployed.
 An alternative to Coolify for a small VPS (priorities: security, extensible code, low RAM).
 
 Status: **MVP** — the daemon, CLI, Podman client, ingress and packaging are ready; deployment on the host is in progress.
@@ -10,6 +12,7 @@ Status: **MVP** — the daemon, CLI, Podman client, ingress and packaging are re
 
 `weglarka-core` (domain, traits, reconcile) · `weglarka-api` (admin API contract) ·
 `weglarka-podman` (libpod v6 client) · `weglarka-ingress` (nginx/Traefik) ·
+`weglarka-notify` (events → severity → dedup → durable outbox → ntfy) ·
 `weglarka-daemon` (daemon) · `weglarka-cli` (the `weglarka` binary).
 
 ```sh

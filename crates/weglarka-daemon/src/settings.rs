@@ -24,6 +24,8 @@ pub struct Paths {
     pub secrets: PathBuf,
     /// Host directory with `nginx.conf` (mounted into the nginx container).
     pub nginx_conf_dir: PathBuf,
+    /// Durable queue of notifications that have not been delivered yet (issue #38).
+    pub notifications: PathBuf,
 }
 
 impl Paths {
@@ -41,6 +43,7 @@ impl Paths {
                 .nginx_conf_dir
                 .clone()
                 .unwrap_or_else(|| state_dir.join("nginx")),
+            notifications: state_dir.join("notifications.toml"),
             state_dir,
         }
     }

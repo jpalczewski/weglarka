@@ -38,3 +38,7 @@ git_tag_name = "{{ package }}-v{{ version }}"
 [[package]]
 name = "weglarka-ingress"
 git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-notify"
+git_tag_name = "{{ package }}-v{{ version }}"

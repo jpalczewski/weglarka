@@ -1,5 +1,7 @@
-# Węglarka image: static binaries (musl) on `scratch` — no shell, no libc, no CA
-# (the daemon talks only to the Podman socket; Podman pulls the images). Decisions: docs/decisions/0006.
+# Węglarka image: static binaries (musl) on `scratch` — no shell, no libc, no system CA store
+# (the daemon talks only to the Podman socket; Podman pulls the images). The one outbound HTTPS
+# client — notifications to ntfy — trusts the roots bundled by `webpki-roots`, not `/etc/ssl`.
+# Decisions: docs/decisions/0006 (packaging), docs/decisions/0021 (notifications).
 #
 #   podman build -t weglarka -f Containerfile .                                  # from source (local)
 #   podman build -t weglarka -f Containerfile --build-arg BIN_SOURCE=prebuilt .  # CI/release: bin/{weglarka-daemon,weglarka}

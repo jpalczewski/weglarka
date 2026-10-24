@@ -8,8 +8,9 @@ use serde::Serialize;
 use weglarka_api::endpoints;
 use weglarka_api::{
     AddAppRequest, AppSummary, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
-    ListAppsResponse, ListSecretsResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage,
-    SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
+    ListAppsResponse, ListSecretsResponse, NotifyStatusResponse, NotifyTestResponse,
+    PruneImagesRequest, PruneImagesResponse, PrunedImage, SecretInfo, SetSecretRequest,
+    ShowAppResponse, StatusResponse,
 };
 use weglarka_core::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
@@ -17,8 +18,8 @@ use weglarka_core::app::{
 use weglarka_core::images::human_bytes;
 
 use crate::cli::{
-    AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, PruneImagesArgs,
-    RemoveArgs, SecretSetArgs, SecretsCommand,
+    AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,
+    PruneImagesArgs, RemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, expand_path};
 use crate::error::{CliError, Kind, exit};
@@ -53,6 +54,8 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
+        Command::Notify(NotifyCommand::Status) => notify_status(json, &overrides).await,
+        Command::Notify(NotifyCommand::Test) => notify_test(json, &overrides).await,
     }
 }
 
@@ -332,6 +335,68 @@ async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {
         )
     });
     Ok(exit::OK)
+}
+
+// ---------- notifications ----------
+
+pub(crate) async fn notify_status(json: bool, o: &Overrides) -> Result<i32, CliError> {
+    let resp: NotifyStatusResponse = client(o)?
+        .call(endpoints::NOTIFICATIONS_STATUS, &[], None::<&()>)
+        .await?;
+    emit(json, &resp, || render_notify_status(&resp));
+    Ok(exit::OK)
+}
+
+pub(crate) async fn notify_test(json: bool, o: &Overrides) -> Result<i32, CliError> {
+    let resp: NotifyTestResponse = client(o)?
+        .call(endpoints::NOTIFICATIONS_TEST, &[], None::<&()>)
+        .await?;
+    emit(json, &resp, || {
+        if resp.delivered {
+            "test notification delivered\n".to_owned()
+        } else {
+            format!(
+                "test notification failed: {}\n",
+                resp.error
+                    .as_deref()
+                    .unwrap_or("no answer from the channel")
+            )
+        }
+    });
+    Ok(if resp.delivered {
+        exit::OK
+    } else {
+        exit::NOTIFY_FAILED
+    })
+}
+
+pub(crate) fn render_notify_status(resp: &NotifyStatusResponse) -> String {
+    if !resp.enabled {
+        return "notifications: off (no [notify.ntfy] section in weglarka.toml)\n".to_owned();
+    }
+    let mut out = String::new();
+    for channel in &resp.channels {
+        let queued = match channel.pending {
+            0 => String::new(),
+            1 => " (1 notification queued)".to_owned(),
+            n => format!(" ({n} notifications queued)"),
+        };
+        out.push_str(&format!(
+            "{}: min severity {}{queued}\n",
+            channel.name, channel.min_severity
+        ));
+    }
+    out.push_str(&format!(
+        "outbox: {} pending, {} dropped\n",
+        resp.pending, resp.dropped
+    ));
+    if let Some(last) = &resp.last_delivered_at {
+        out.push_str(&format!("last delivered: {last}\n"));
+    }
+    if let Some(error) = &resp.last_error {
+        out.push_str(&format!("last error: {error}\n"));
+    }
+    out
 }
 
 // ---------- secrets ----------

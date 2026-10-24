@@ -108,6 +108,18 @@ pub const IMAGES_PRUNE: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/images/prune",
 };
+/// `GET` → [`NotifyStatusResponse`](crate::NotifyStatusResponse): configured channels, the pending
+/// outbox and the last delivery error (issue #38).
+pub const NOTIFICATIONS_STATUS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/notifications",
+};
+/// `POST` with no body → [`NotifyTestResponse`](crate::NotifyTestResponse). Delivers a test
+/// notification now, bypassing the outbox (issue #38).
+pub const NOTIFICATIONS_TEST: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/notifications/test",
+};
 
 pub const ENDPOINTS: &[Endpoint] = &[
     STATUS,
@@ -127,4 +139,6 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SHARED_VOLUMES_REMOVE,
     DOCTOR,
     IMAGES_PRUNE,
+    NOTIFICATIONS_STATUS,
+    NOTIFICATIONS_TEST,
 ];

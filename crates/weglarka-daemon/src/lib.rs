@@ -51,6 +51,10 @@ pub enum StartError {
     /// (issue #33).
     #[error("invalid shared volumes in apps.toml: {0}")]
     SharedVolumes(String),
+    /// The `[notify]` section is invalid (bad URL/topic, unreadable token file…). Notifications are
+    /// opt-in, but once configured they must work — a silent no-op would hide a broken deployment.
+    #[error("notifications: {0}")]
+    Notify(#[from] weglarka_notify::NotifySettingsError),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -76,6 +80,8 @@ pub struct Running<P: PodmanClient + 'static> {
     webhook: JoinHandle<()>,
     ingress: JoinHandle<()>,
     reconcile: JoinHandle<()>,
+    /// Notification worker; `None` when notifications are not configured.
+    notify: Option<JoinHandle<()>>,
 }
 
 fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
@@ -137,15 +143,26 @@ pub async fn start<P: PodmanClient + 'static>(
     // it; kept here next to the host rules so a broken `apps.toml` is rejected at startup loudly.
     weglarka_core::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
 
-    let engine = Arc::new(
-        Reconciler::new(
-            podman,
-            secrets.clone() as Arc<dyn SecretStore>,
-            paths.state.clone(),
-            ReconcilerOptions::default(),
-        )
-        .with_http_prober(Arc::new(health_probe::NginxProber::default_target())),
-    );
+    // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
+    // stops the daemon instead of failing silently at the first deploy.
+    let notifier = weglarka_notify::Notifier::build(
+        host.notify.as_ref(),
+        paths.state.apps.clone(),
+        paths.notifications.clone(),
+    )?;
+    let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
+    let mut reconciler = Reconciler::new(
+        podman,
+        secrets.clone() as Arc<dyn SecretStore>,
+        paths.state.clone(),
+        ReconcilerOptions::default(),
+    )
+    .with_http_prober(Arc::new(health_probe::NginxProber::default_target()));
+    if let Some(notifier) = &notifier {
+        // The engine emits into the durable pipeline instead of only into the log.
+        reconciler = reconciler.with_events(notifier.sink());
+    }
+    let engine = Arc::new(reconciler);
     let ingress = Arc::new(IngressManager::new(
         engine.clone(),
         host.clone(),
@@ -159,6 +176,7 @@ pub async fn start<P: PodmanClient + 'static>(
         secrets,
         ingress: ingress.clone(),
         github: Box::new(github::GitHub),
+        notify: notify.clone(),
         desired_lock: tokio::sync::Mutex::new(()),
         triggers: trigger_tx,
         webhook_addr: OnceLock::new(),
@@ -213,6 +231,10 @@ pub async fn start<P: PodmanClient + 'static>(
         let engine = engine.clone();
         async move { engine.run(trigger_rx, period).await }
     });
+    let notify_task = notifier.map(|notifier| {
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move { notifier.run(rx).await })
+    });
 
     tracing::info!(
         admin = %host.admin.socket.display(),
@@ -228,6 +250,7 @@ pub async fn start<P: PodmanClient + 'static>(
         webhook,
         ingress: ingress_task,
         reconcile,
+        notify: notify_task,
     })
 }
 
@@ -242,6 +265,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             webhook,
             ingress,
             reconcile,
+            notify,
             admin_socket,
             ..
         } = self;
@@ -253,6 +277,13 @@ impl<P: PodmanClient + 'static> Running<P> {
             {
                 tracing::warn!(task = name, "did not stop in time");
             }
+        }
+        if let Some(handle) = notify
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("notification worker did not stop in time");
         }
 
         let mut tasks =

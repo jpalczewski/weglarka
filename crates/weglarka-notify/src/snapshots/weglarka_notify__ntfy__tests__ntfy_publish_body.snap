@@ -1,0 +1,14 @@
+---
+source: crates/weglarka-notify/src/ntfy.rs
+expression: body_of(&request)
+---
+{
+  "click": "https://nz.example.com",
+  "message": "health gate failed after 10 attempts",
+  "priority": 4,
+  "tags": [
+    "warning"
+  ],
+  "title": "deploy failed: ntfy",
+  "topic": "weglarka"
+}

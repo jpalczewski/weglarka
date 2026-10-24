@@ -14,7 +14,10 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
 [6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
 [6d. Zależności między apkami](#6d-zależności-między-apkami-depends_on) ·
+[6e. Streaming](#6e-streaming-sse-long-polling) ·
 [6f. Komenda i argumenty](#6f-komenda-i-argumenty-kontenera-command) ·
+[6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
+[6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -913,6 +916,68 @@ zostało po starszych deployach.
   `weglarka images prune`. W trakcie deployu check jest informacyjny (`info`): świeżo przyciągnięty obraz
   nie jest jeszcze w `state.toml`, więc wyglądałby na nieużywany.
 - Brak zmian w `apps.toml`/`state.toml`, więc upgrade i rollback demona są bezpieczne.
+
+## 6h. Powiadomienia (ntfy)
+
+Nieudany deploy, rollback i zdarzenia z pętli reconcile trafiają do telefonu przez ntfy — wysyłanego przez
+Węglarkę samą (apka `ntfy`), więc powiadomienia muszą przetrwać deploy ntfy. Decyzja i odrzucone alternatywy:
+[0021](decisions/0021-notifications.md). Wycinek konfiguracji: [`docs/examples/notify.toml`](examples/notify.toml).
+
+Co przychodzi: `deploy ok`, `deploy failed`, `rolled back`, `ROLLBACK FAILED` (krytyczne),
+`provisioned`, `recreated`, `waiting for secrets` (info) oraz — gdy podniesiesz `min_severity` do `debug` —
+`sprzątanie kontenera`, `oczekiwanie na zależności` i `duplikat webhooka`. Wykrywanie zapętlających się
+kontenerów to osobne zadanie (#112), a fallback mailowy — #113.
+
+**1. Temat i token w ntfy.** Utwórz temat (np. `weglarka`) i — jeśli serwer nie jest publiczny — token dostępu
+w panelu ntfy. Token trzymaj w pliku 0600 obok konfiguracji; **nie wpisuj go do `weglarka.toml`**:
+
+```sh
+umask 077 && printf '%s\n' 'tk_…' | sudo -u weglarka tee /var/lib/weglarka/ntfy-token >/dev/null
+sudo -u weglarka chmod 600 /var/lib/weglarka/ntfy-token
+```
+
+**2. Sekcja w `weglarka.toml`** (plik konfiguracyjny hosta, nie `apps.toml`):
+
+```toml
+[notify]
+dedup_window_secs = 300          # okno łączenia powtórzeń; 0 = bez łączenia
+
+[notify.ntfy]
+url = "https://nz.example.com"   # musi być osiągalny Z KONTENERA Węglarki (patrz niżej)
+topic = "weglarka"
+token_file = "/var/lib/weglarka/ntfy-token"   # opcjonalny; bez niego temat jest publiczny
+min_severity = "info"            # debug | info | warning | critical
+```
+
+- **Adres:** jeśli kontener Węglarki nie potrafi wyjść na publiczną domenę hosta (hairpin NAT / DNS w
+  kontenerze), użyj trasy wewnętrznej przez ingress: `url = "http://weglarka-nginx:8080"` oraz
+  `host = "nz.example.com"` (nagłówek `Host` i nazwa SNI; nginx routuje po `Host`, tak samo jak
+  `health.http`). Wewnętrzna trasa jest po HTTP w sieci Podmana — token nie opuszcza hosta.
+- **Walidacja przy starcie:** zły URL, temat albo nieczytelny/rozluźniony plik tokenu **zatrzymuje demona**
+  (`notifications: …` w logu) — raz włączone powiadomienia nie mogą po cichu nie działać.
+- **Test:** po restarcie `systemctl --user restart weglarka`:
+
+```sh
+weglarka notify test      # „test notification delivered” = URL, DNS, ingress i token działają
+weglarka notify status    # kanały, kolejka, licznik odrzuconych, ostatni błąd i czas dostarczenia
+```
+
+`notify test` idzie **poza kolejką** (natychmiast, bez dedup), a przy odmowie kanału kończy się kodem 7.
+
+**3. Co się dzieje, gdy ntfy nie odpowiada.** Każde powiadomienie najpierw trafia do trwałej kolejki
+`/var/lib/weglarka/notifications.toml` (0600), a dopiero potem jest wysyłane. Nieudana próba zostaje w kolejce
+i jest powtarzana z backoffem 30 s → 1 min → … → 30 min, maksymalnie 12 razy (≈3,5 h); kolejkę ograniczają też
+200 pozycji i 7 dni (najstarsze wypadają, licznik `dropped` widać w `notify status`). Dzięki temu deploy ntfy —
+czyli chwila, w której powiadomienia są najbardziej potrzebne — nie gubi powiadomień. Kolejka przeżywa restart
+demona; okna dedup (poniżej) są tylko w pamięci.
+
+**4. Powtórzenia (flapping).** Pierwsze zdarzenie danego rodzaju dla danej apki idzie od razu; kolejne w oknie
+`dedup_window_secs` są liczone i po jego zamknięciu przychodzi jedno podsumowanie („3 more: deploy failed: ntfy”).
+Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, nadal daje jedno zgłoszenie na okno.
+
+**5. Rollback.** `weglarka.toml` ma `deny_unknown_fields`, więc **starszy demon nie wystartuje** z sekcją
+`[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
+nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
 
 ## 7. Weryfikacja i rollback
 
