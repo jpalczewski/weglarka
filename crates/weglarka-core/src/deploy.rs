@@ -195,7 +195,17 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut stream = std::pin::pin!(self.podman.image_pull(reference));
         let mut digest = None;
         while let Some(ev) = stream.next().await {
-            if let PullEvent::Complete { digest: d, .. } = ev? {
+            let ev = ev.map_err(|e| {
+                if e.is_registry_auth_failure() {
+                    EngineError::RegistryAuth {
+                        reference: reference.to_owned(),
+                        message: e.to_string(),
+                    }
+                } else {
+                    EngineError::Podman(e)
+                }
+            })?;
+            if let PullEvent::Complete { digest: d, .. } = ev {
                 digest = d;
             }
         }

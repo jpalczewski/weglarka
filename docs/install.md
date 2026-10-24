@@ -335,6 +335,37 @@ Po pierwszym pushu sprawdź *Recent Deliveries*: `latest` → **202**, `sha-…`
 zły sekret, 204 dla `latest` = niezgodna nazwa obrazu. Nazwy pól payloadu są jeszcze niepotwierdzone na prawdziwym
 pushu (0004) — pierwsza dostawa jest też testem.
 
+### Webhook Forgejo (prywatne obrazy)
+
+Adapter Forgejo (ADR 0025) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
+Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyżej (`webhook-hmac`, per apka).
+
+1. **Rejestr z konfiguracji.** Payload nie zawiera hosta rejestru, więc podaj go w `weglarka.toml`:
+
+   ```toml
+   [webhook.forgejo]
+   registry = "git.example.eu"   # sam host[:port], bez schematu i ścieżki
+   ```
+
+   Bez tej sekcji trasa odpowiada 404. Starszy demon nie wystartuje z tą sekcją (`deny_unknown_fields`) —
+   przed downgradem usuń ją, tak samo jak `[notify]`.
+2. **Obraz apki** to `<registry>/<org>/<nazwa>:<tag>` (małe litery), np. `git.example.eu/acme/shop:main`.
+3. **Webhook w Forgejo** (repo lub organizacja → Settings → Webhooks → Forgejo): URL jak wyżej, content type
+   `application/json`, Secret = wartość `webhook-hmac`, zdarzenie **Package**.
+4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0025). Zaloguj
+   się raz jako użytkownik uruchamiający Podmana, kontem serwisowym z tokenem tylko do odczytu pakietów:
+
+   ```sh
+   podman login git.example.eu     # login konta serwisowego + token read:package
+   ```
+
+   Token leży w `auth.json` na hoście, poza magazynem sekretów Węglarki. Gdy rejestr odrzuci pull (401/403),
+   deploy kończy się błędem „registry rejected the pull of …; check the podman user's credentials”, a nie
+   „image not found”.
+5. **Dostawy:** push `main` + `sha-<commit>` daje 202 dla `main` i 204 dla `sha-…` (apka śledzi `:main`).
+   Nazwy pól payloadu i to, czy ponowny push ruchomego tagu wysyła `package.created`, są jeszcze niepotwierdzone
+   na prawdziwej instancji — jeśli nie wysyła, potrzebne jest #83.
+
 ## 6a. Wolumeny, zakresy UID i import z Coolify (iteracja 2)
 
 Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md). Import danych przed pierwszym startem apki

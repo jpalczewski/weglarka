@@ -31,3 +31,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0022](0022-crash-loop-detection.md) | Crash-loop and unhealthy detection |
 | [0023](0023-state-schema-version.md) | State schema version and a startup compatibility check (issue #98) |
 | [0024](0024-secret-removal-and-purge.md) | Removing secrets and purging them with the app (issue #80) |
+| [0025](0025-webhook-forgejo.md) | Forgejo webhooks: `package` event, registry host from config, pulls via `auth.json` (issue #44) |

@@ -141,6 +141,42 @@ pub struct WebhookConfig {
     pub listen: SocketAddr,
     /// Public domain; only the webhook paths are exposed.
     pub domain: String,
+    /// `[webhook.forgejo]`: enables `/webhook/forgejo/{instance}`. Absent = the route answers 404.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forgejo: Option<ForgejoWebhookConfig>,
+}
+
+/// Forgejo's `package` payload names the owner and the package but not the registry host, and
+/// a host taken from a payload would let a signed event point a pull at another registry — so the
+/// host comes from here (docs/decisions/0025).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgejoWebhookConfig {
+    /// Registry host (optionally `host:port`) the images are pulled from, e.g. `git.example.eu`.
+    pub registry: String,
+}
+
+impl ForgejoWebhookConfig {
+    /// The registry as a lower-case `host[:port]`; rejects schemes, paths and other surprises.
+    pub fn registry_host(&self) -> Result<String, String> {
+        let host = self.registry.trim().to_ascii_lowercase();
+        let ok = !host.is_empty()
+            && host.len() <= 253
+            && !host.starts_with(['.', '-', ':'])
+            && !host.ends_with(['.', '-', ':'])
+            && host.matches(':').count() <= 1
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
+        if ok {
+            Ok(host)
+        } else {
+            Err(format!(
+                "invalid [webhook.forgejo] registry {:?}: expected a bare host[:port]",
+                self.registry
+            ))
+        }
+    }
 }
 
 /// `[notify]`: where the daemon sends engine events (deploy ok/fail, rollback, …).
@@ -313,6 +349,34 @@ kind = "systemd"
     #[test]
     fn parses_sample_from_mvp_note() {
         insta::assert_json_snapshot!(HostConfig::from_toml_str(SAMPLE).unwrap());
+    }
+
+    #[test]
+    fn forgejo_registry_is_optional_and_must_be_a_bare_host() {
+        assert!(
+            HostConfig::from_toml_str(SAMPLE)
+                .unwrap()
+                .webhook
+                .forgejo
+                .is_none()
+        );
+        let cfg = format!("{SAMPLE}\n[webhook.forgejo]\nregistry = \"Git.Example.eu:3000\"\n");
+        let parsed = HostConfig::from_toml_str(&cfg).unwrap();
+        let forgejo = parsed.webhook.forgejo.unwrap();
+        assert_eq!(forgejo.registry_host().unwrap(), "git.example.eu:3000");
+        for bad in [
+            "",
+            "https://git.example.eu",
+            "git.example.eu/org",
+            "a b",
+            "x:1:2",
+            "-x",
+        ] {
+            let c = ForgejoWebhookConfig {
+                registry: bad.into(),
+            };
+            assert!(c.registry_host().is_err(), "{bad:?}");
+        }
     }
 
     #[test]
