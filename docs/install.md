@@ -491,6 +491,9 @@ weglarka apps update stara-apka --start      # to samo co `apps start`
 - Uwaga przy rollbacku: `start` to nowe pole w `apps.toml` z `deny_unknown_fields`, więc **starszy** demon/CLI
   nie odczyta specu zatrzymanej apki (`start = false`). Wracając do poprzedniej wersji Węglarki usuń `start = false`
   z `apps.toml` (albo najpierw `weglarka apps start`) — inaczej daemon odmówi startu z błędem parsowania.
+- Uwaga przy łączeniu wersji: `doctor` raportuje trwającą operację statusem `info` (`state.deploying`). Starsze CLI
+  nie zna tego wariantu i gdy w chwili `weglarka doctor` trwa deploy/recreate, nie sparsuje odpowiedzi — aktualizuj
+  CLI razem z demonem (nowe CLI czyta starszy demon bez zmian).
 
 ## 7. Weryfikacja i rollback
 

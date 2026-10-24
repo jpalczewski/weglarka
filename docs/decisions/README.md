@@ -16,3 +16,4 @@ Każda decyzja opisuje problem, wybór, konsekwencje i odrzucone alternatywy. No
 | [0009](0009-volume-ownership.md) | Własność plików w wolumenach: zakresy UID per instancja |
 | [0010](0010-health-http-probe.md) | `health.http` przez nginx, limity zasobów, `health.command` |
 | [0011](0011-start-false-provisioning.md) | `start = false`: provisioning bez startu, import przed pierwszym startem |
+| [0012](0012-doctor-in-flight.md) | `doctor` a operacja w toku: status `info` (`state.deploying`) zamiast fałszywego dryfu |
