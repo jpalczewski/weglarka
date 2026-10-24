@@ -16,7 +16,8 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::app::{AppSpec, AppsFile, Digest, InstanceName};
 use crate::crash;
-use crate::deploy::{DeliveryDedup, DeployOutcome};
+use crate::delivery::{self, DeliveryDedup};
+use crate::deploy::DeployOutcome;
 use crate::events::{Event, EventSink, TracingSink};
 use crate::hash::SpecHash;
 use crate::labels;
@@ -467,6 +468,9 @@ impl<P: PodmanClient> Reconciler<P> {
         paths: StatePaths,
         options: ReconcilerOptions,
     ) -> Self {
+        // Handled webhook delivery ids survive a restart (issue #41, ADR 0035). A missing file is an
+        // empty set; a broken one only costs a warning — bookkeeping never stops the daemon.
+        let dedup = DeliveryDedup::load(paths.deliveries.clone(), delivery::DEFAULT_CAP);
         Self {
             podman,
             secrets,
@@ -475,7 +479,7 @@ impl<P: PodmanClient> Reconciler<P> {
             events: Arc::new(TracingSink),
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
-            dedup: std::sync::Mutex::new(DeliveryDedup::new(256)),
+            dedup: std::sync::Mutex::new(dedup),
             activity: std::sync::Mutex::new(None),
             monitor: crash::Policy::default(),
             watch: std::sync::Mutex::new(crash::Watcher::default()),

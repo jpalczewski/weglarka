@@ -204,6 +204,13 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   w quadlecie i restartuje, a demon po starcie emituje `SelfUpdateFellBack` i zostawia zepsuty digest
   w `error` (bez ponownego pinu, dopóki tag się nie ruszy). Jedna próba: wyczerpany budżet to raport
   (`doctor`, journal, unit watchdoga „failed”), nie pętla restartów.
+- **Dedup webhooków przeżywa restart (ADR 0035, #41):** identyfikatory dostaw trzyma
+  `<katalog stanu>/webhook-deliveries.toml` (`core/src/delivery.rs`; 0600, 256 wpisów, najstarsze wypadają),
+  zapisywany atomowo przez `state::write_atomic` pod mutexem dedup, tylko na nowy id i **przed** fan-outem.
+  Plik jest celowo poza `state.toml` (nowe pole łamie rollback przez `deny_unknown_fields`), nie ma znacznika
+  schematu, a starszy demon go ignoruje. Odczyt jest tolerancyjny (brak = pusty zbiór, uszkodzony = warn +
+  pusty i przepisany przy następnej dostawie), a błąd zapisu tylko ostrzega — księgowość nie może wywalić
+  webhooka ani startu demona.
 
 ## Testy
 

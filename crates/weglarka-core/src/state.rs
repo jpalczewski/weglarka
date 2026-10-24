@@ -201,6 +201,8 @@ pub struct SharedVolumeState {
 pub struct StatePaths {
     pub apps: PathBuf,
     pub state: PathBuf,
+    /// Handled webhook delivery ids (issue #41, ADR 0035): bookkeeping, deliberately not versioned.
+    pub deliveries: PathBuf,
 }
 
 impl StatePaths {
@@ -209,6 +211,7 @@ impl StatePaths {
         Self {
             apps: dir.join("apps.toml"),
             state: dir.join("state.toml"),
+            deliveries: dir.join(crate::delivery::FILE_NAME),
         }
     }
 }

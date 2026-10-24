@@ -373,6 +373,12 @@ Po pierwszym pushu sprawdź *Recent Deliveries*: `latest` → **202**, `sha-…`
 zły sekret, 204 dla `latest` = niezgodna nazwa obrazu. Nazwy pól payloadu są jeszcze niepotwierdzone na prawdziwym
 pushu (0004) — pierwsza dostawa jest też testem.
 
+**Powtórki po restarcie.** Identyfikatory dostaw (`X-GitHub-Delivery`, a dla Forgejo `X-Forgejo-Delivery`) są
+zapisywane w `<katalog stanu>/webhook-deliveries.toml` (0600, maks. 256 wpisów, najstarsze wypadają), więc powtórka
+tego samego zdarzenia po restarcie, samoaktualizacji albo reboocie hosta kończy się **202** i nie robi pulla ani
+deployu. Plik to tylko księgowość: można go bezpiecznie usunąć (dedup zacznie się od zera), nie jest wersjonowany,
+a starszy demon go ignoruje — rollback nie wymaga migracji (ADR 0035).
+
 ### Webhook Forgejo (prywatne obrazy)
 
 Adapter Forgejo (ADR 0026) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów

@@ -593,6 +593,83 @@ async fn webhook_flow() {
     h.running.stop().await;
 }
 
+/// Issue #41: handled delivery ids survive a daemon restart. The same `X-GitHub-Delivery` sent to a
+/// fresh daemon over the same state directory is a duplicate — 202, no pull, no redeploy.
+#[tokio::test]
+async fn webhook_dedup_survives_daemon_restart() {
+    let h = harness().await;
+    let addr = h.running.webhook_addr;
+    admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(app_body("ntfy", "nz.example.eu")),
+    )
+    .await;
+    eventually("first deploy", || async {
+        current_digest(&h, "ntfy").await.is_some()
+    })
+    .await;
+    let (s, _) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy/secrets/webhook-hmac",
+        Some(json!({"value": SECRET})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let body = published("latest");
+    let good = Some(sign(SECRET.as_bytes(), &body));
+    let before = pulls(&h.fake);
+    assert_eq!(
+        hook(
+            addr,
+            "ntfy",
+            "registry_package",
+            "restart-1",
+            &body,
+            good.clone()
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    eventually("webhook deploy pulled", || async {
+        pulls(&h.fake) > before
+    })
+    .await;
+
+    // Stop and start again on the same state directory (what self-update / a reboot does).
+    let Harness {
+        _dir,
+        root,
+        fake,
+        running,
+    } = h;
+    running.stop().await;
+    assert!(
+        root.join("state/webhook-deliveries.toml").is_file(),
+        "the handled delivery is persisted"
+    );
+    let running = start(settings(&root), fake.clone()).await.unwrap();
+    let addr = running.webhook_addr;
+    // Let the startup reconcile settle before sampling the pull counter.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_restart = pulls(&fake);
+
+    assert_eq!(
+        hook(addr, "ntfy", "registry_package", "restart-1", &body, good).await,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        pulls(&fake),
+        after_restart,
+        "a redelivery after a restart must not pull"
+    );
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn refuses_loose_secrets_permissions() {
     let dir = tempfile::Builder::new()
