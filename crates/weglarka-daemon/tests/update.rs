@@ -481,3 +481,83 @@ async fn missing_secret_is_a_waiting_state_not_a_failure() {
     assert!(v["state"].get("waiting_for_secrets").is_none(), "{v}");
     h.running.stop().await;
 }
+
+#[tokio::test]
+async fn paths_share_a_domain_reload_nginx_and_never_touch_containers() {
+    let h = harness().await;
+    let with_paths = |paths: Value| {
+        let mut s = spec("app.example.eu");
+        s["paths"] = paths;
+        s
+    };
+    add(&h, "api", with_paths(json!(["/api"]))).await;
+    deployed(&h, "api").await;
+    let conf = || read(&h.root.join("state/nginx/nginx.conf"));
+    eventually("nginx config for the first path", || async {
+        conf().contains("location ^~ /api/ {")
+    })
+    .await;
+
+    // A second instance on the same domain with a disjoint prefix is accepted and routed.
+    add(&h, "mcp", with_paths(json!(["/mcp"]))).await;
+    deployed(&h, "mcp").await;
+    eventually("both paths in one server", || async {
+        let c = conf();
+        c.contains("location ^~ /mcp/ {") && c.contains("http://api:8085")
+    })
+    .await;
+
+    // An overlapping prefix is refused with a message naming the conflict, and nothing is saved.
+    for clash in [json!(["/api"]), json!(["/api/v2"])] {
+        let (s, v) = admin(
+            &h,
+            "PUT",
+            "/v1/apps/mcp",
+            Some(json!({ "spec": with_paths(clash) })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("overlap"),
+            "{v}"
+        );
+    }
+    // The catch-all coexists with prefixes; a second one is the old "domain taken" refusal.
+    add(&h, "spa", spec("app.example.eu")).await;
+    let (s, _) = admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(json!({"name": "spa2", "spec": spec("app.example.eu")})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(show(&h, "mcp").await["spec"]["paths"], json!(["/mcp"]));
+
+    // Changing paths re-renders nginx only: same generation, same container.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = show(&h, "mcp").await;
+    let creates = creates_of(&h.fake, "mcp");
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/mcp",
+        Some(json!({ "spec": with_paths(json!(["/mcp", "/.well-known"])) })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["deploy"].is_null(), "{v}");
+    eventually("the added prefix in nginx", || async {
+        conf().contains("location ^~ /.well-known/ {")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = show(&h, "mcp").await;
+    assert_eq!(after["state"]["generation"], before["state"]["generation"]);
+    assert_eq!(after["state"]["spec_hash"], before["state"]["spec_hash"]);
+    assert_eq!(creates_of(&h.fake, "mcp"), creates);
+    h.running.stop().await;
+}

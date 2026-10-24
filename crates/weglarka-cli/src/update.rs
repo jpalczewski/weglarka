@@ -40,6 +40,19 @@ pub struct UpdateArgs {
     /// Remove a domain (repeatable).
     #[arg(long = "remove-domain", value_name = "DOMAIN", conflicts_with = "spec")]
     pub remove_domains: Vec<String>,
+    /// Add a path prefix of the app's domains (repeatable), e.g. `/api`. Ingress-only: nginx reload,
+    /// the container is not recreated.
+    #[arg(long = "path", value_name = "PREFIX", conflicts_with = "spec")]
+    pub paths: Vec<String>,
+    /// Remove a path prefix (repeatable); with none left the app serves `/` again.
+    #[arg(long = "remove-path", value_name = "PREFIX", conflicts_with = "spec")]
+    pub remove_paths: Vec<String>,
+    /// Strip the path prefix before proxying.
+    #[arg(long, conflicts_with_all = ["spec", "no_strip_prefix"])]
+    pub strip_prefix: bool,
+    /// Stop stripping the path prefix.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_strip_prefix: bool,
     /// HTTP port in the container.
     #[arg(long, conflicts_with_all = ["spec", "unset_port"])]
     pub port: Option<u16>,
@@ -50,7 +63,7 @@ pub struct UpdateArgs {
     /// timeout. Ingress-only: nginx reload, the container is not recreated.
     #[arg(long, conflicts_with_all = ["spec", "no_streaming"])]
     pub streaming: bool,
-    /// Stop streaming: clears the whole `ingress` block, a custom `stream_timeout_secs` included.
+    /// Stop streaming: resets the streaming settings, a custom `stream_timeout_secs` included.
     #[arg(long, conflicts_with = "spec")]
     pub no_streaming: bool,
     /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
@@ -98,6 +111,10 @@ impl UpdateArgs {
         self.image.is_some()
             || !self.domains.is_empty()
             || !self.remove_domains.is_empty()
+            || !self.paths.is_empty()
+            || !self.remove_paths.is_empty()
+            || self.strip_prefix
+            || self.no_strip_prefix
             || self.port.is_some()
             || self.unset_port
             || self.streaming
@@ -143,18 +160,40 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
             spec.domains.push(d.clone());
         }
     }
+    for p in &a.remove_paths {
+        let before = spec.paths.len();
+        spec.paths.retain(|x| x != p);
+        if spec.paths.len() == before {
+            return Err(missing("path", p));
+        }
+    }
+    for p in &a.paths {
+        if !spec.paths.contains(p) {
+            spec.paths.push(p.clone());
+        }
+    }
     if a.unset_port {
         spec.port = None;
     }
     if a.port.is_some() {
         spec.port = a.port;
     }
-    // Ingress-only (issue #64): `--no-streaming` drops the whole block, a custom timeout included.
+    // Ingress-only (issue #64): `--no-streaming` resets the streaming settings, a custom timeout
+    // included, and leaves `strip_prefix` (issue #130) alone.
     if a.streaming {
         spec.ingress.streaming = true;
     }
     if a.no_streaming {
-        spec.ingress = AppIngress::default();
+        spec.ingress = AppIngress {
+            strip_prefix: spec.ingress.strip_prefix,
+            ..AppIngress::default()
+        };
+    }
+    if a.strip_prefix {
+        spec.ingress.strip_prefix = true;
+    }
+    if a.no_strip_prefix {
+        spec.ingress.strip_prefix = false;
     }
     for k in &a.unset_env {
         if spec.env.remove(k).is_none() {
@@ -738,6 +777,35 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn path_flags_edit_prefixes_and_strip_without_touching_streaming() {
+        let s = apply_flags(
+            spec(),
+            &args(&[
+                "--path",
+                "/api",
+                "--path",
+                "/mcp",
+                "--path",
+                "/api",
+                "--strip-prefix",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(s.paths, ["/api", "/mcp"]);
+        assert!(s.ingress.strip_prefix);
+        let s = apply_flags(s, &args(&["--remove-path", "/mcp", "--streaming"])).unwrap();
+        assert_eq!(s.paths, ["/api"]);
+        // `--no-streaming` resets streaming only; the prefix handling survives.
+        let s = apply_flags(s, &args(&["--no-streaming"])).unwrap();
+        assert!(!s.ingress.streaming && s.ingress.strip_prefix);
+        let s = apply_flags(s, &args(&["--no-strip-prefix"])).unwrap();
+        assert!(s.ingress.is_default());
+        assert!(args(&["--path", "/a"]).has_edits());
+        assert!(args(&["--strip-prefix"]).has_edits());
+        assert!(apply_flags(spec(), &args(&["--remove-path", "/nope"])).is_err());
+    }
+
+    #[test]
     fn command_flag_replaces_and_none_clears() {
         let mut before = spec();
         before.command = vec!["serve".into()];
@@ -773,6 +841,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         // A custom timeout survives a read-modify-write that names only the flag.
         let mut custom = spec();
         custom.ingress = AppIngress {
+            strip_prefix: false,
             streaming: true,
             stream_timeout_secs: 600,
         };

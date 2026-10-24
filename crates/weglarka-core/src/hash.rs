@@ -27,7 +27,7 @@ impl fmt::Display for SpecHash {
     }
 }
 
-/// Only fields that affect the container. `domains`, the per-app ingress options
+/// Only fields that affect the container. `domains`, `paths` (issue #130), the per-app ingress options
 /// (`streaming`/`stream_timeout_secs`, issue #64) and the gate's timing/HTTP probe are deliberately
 /// omitted — changing routing or the gate does not require recreating the container. `start` (run vs
 /// provision-only intent) is omitted as well: it controls whether a container exists, not what it is
@@ -377,11 +377,13 @@ env = { B = "2", A = "1" }
         s.ingress = crate::app::AppIngress {
             streaming: true,
             stream_timeout_secs: 600,
+            strip_prefix: true,
         };
+        s.paths = vec!["/api".into()];
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options (issue #64) only re-render nginx"
+            "ingress options and paths (issues #64, #130) only re-render nginx"
         );
     }
 

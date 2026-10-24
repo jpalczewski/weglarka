@@ -1281,6 +1281,7 @@ use std::sync::Mutex;
 struct ScriptedProber {
     script: Mutex<std::collections::VecDeque<Result<(), String>>>,
     hosts: Mutex<Vec<String>>,
+    paths: Mutex<Vec<String>>,
 }
 
 impl ScriptedProber {
@@ -1288,13 +1289,15 @@ impl ScriptedProber {
         Arc::new(Self {
             script: Mutex::new(results.into_iter().collect()),
             hosts: Mutex::default(),
+            paths: Mutex::default(),
         })
     }
 }
 
 impl HttpProber for ScriptedProber {
-    fn probe<'a>(&'a self, host: &'a str, _probe: &'a HttpProbe) -> ProbeFuture<'a> {
+    fn probe<'a>(&'a self, host: &'a str, probe: &'a HttpProbe) -> ProbeFuture<'a> {
         self.hosts.lock().unwrap().push(host.to_owned());
+        self.paths.lock().unwrap().push(probe.path.clone());
         let mut script = self.script.lock().unwrap();
         let r = if script.len() > 1 {
             script.pop_front().unwrap()
@@ -1336,6 +1339,26 @@ async fn spec_limits_and_healthcheck_reach_the_container_and_both_probes_must_pa
     assert_eq!(spec.resources.memory.unwrap().bytes(), 256 << 20);
     assert_eq!(spec.resources.cpus.unwrap().millis(), 500);
     assert_eq!(spec.healthcheck.unwrap().command, ["/app", "-health"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_probe_requests_the_apps_path_prefix() {
+    let apps = r#"
+[apps.who]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 80
+domains = ["who.example.com"]
+paths = ["/api", "/healthz"]
+health = { attempts = 1, window_secs = 2, http = { path = "/up" } }
+"#;
+    let mut h = Harness::new(apps);
+    let prober = ScriptedProber::new([Ok(())]);
+    with_prober(&mut h, prober.clone());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+    // Through nginx a shared domain is routed by prefix: the probe must carry the app's own.
+    assert_eq!(*prober.paths.lock().unwrap(), ["/api/up"]);
 }
 
 #[tokio::test(start_paused = true)]

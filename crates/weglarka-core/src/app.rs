@@ -666,6 +666,10 @@ pub struct AppIngress {
         skip_serializing_if = "AppIngress::is_default_stream_timeout"
     )]
     pub stream_timeout_secs: u64,
+    /// Strip the matching `paths` prefix before proxying (`/p/x` → `/x`, `/p` → `/`; issue #130).
+    /// Off by default: the app is expected to serve under its prefix. Requires a prefix other than `/`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strip_prefix: bool,
 }
 
 impl Default for AppIngress {
@@ -673,6 +677,7 @@ impl Default for AppIngress {
         Self {
             streaming: false,
             stream_timeout_secs: Self::DEFAULT_STREAM_TIMEOUT_SECS,
+            strip_prefix: false,
         }
     }
 }
@@ -692,6 +697,36 @@ impl AppIngress {
     pub fn is_default_stream_timeout(value: &u64) -> bool {
         *value == Self::DEFAULT_STREAM_TIMEOUT_SECS
     }
+}
+
+/// Syntax of a `paths` entry (ADR 0031): `/` or `/seg[/seg…]` of `[A-Za-z0-9_.-]`, no trailing slash,
+/// no empty or dot segments, at most 128 bytes. It lands in `nginx.conf`, so the check lives next to
+/// the type and is shared by spec validation and the ingress generator.
+pub fn check_path_prefix(path: &str) -> Result<(), &'static str> {
+    if path.len() > 128 {
+        return Err("longer than 128 bytes");
+    }
+    if path == "/" {
+        return Ok(());
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err("must start with '/'");
+    };
+    for seg in rest.split('/') {
+        if seg.is_empty() {
+            return Err("must not contain empty segments or end with '/'");
+        }
+        if seg == "." || seg == ".." {
+            return Err("must not contain '.' or '..' segments");
+        }
+        if !seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err("only [A-Za-z0-9_.-] allowed in segments");
+        }
+    }
+    Ok(())
 }
 
 fn default_stream_timeout_secs() -> u64 {
@@ -716,6 +751,10 @@ pub struct AppSpec {
     /// Domains routed to the app (ingress generators).
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Path prefixes of `domains` served by this app (issue #130, ADR 0031); empty means `["/"]`.
+    /// Ingress-only: outside the spec hash, a change re-renders nginx and never recreates the container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// HTTP port in the container that ingress proxies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,

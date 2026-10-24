@@ -183,9 +183,11 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         image,
         command: Vec::new(),
         domains: a.domains.clone(),
+        paths: a.paths.clone(),
         port: a.port,
         ingress: AppIngress {
             streaming: a.streaming,
+            strip_prefix: a.strip_prefix,
             ..Default::default()
         },
         env: a.env.iter().cloned().collect(),

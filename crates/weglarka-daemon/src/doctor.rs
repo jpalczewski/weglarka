@@ -882,6 +882,53 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
     ));
 }
 
+/// The effective route table (issue #130, ADR 0031): every `(domain, path)` and where it goes, built
+/// from the same plan the generators use, so what is listed is what nginx is given.
+fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let plan = match weglarka_ingress::Plan::build(&d.host, &apps.apps) {
+        Ok(plan) => plan,
+        Err(e) => {
+            out.push(check(
+                "ingress.routes",
+                CheckStatus::Fail,
+                e.to_string(),
+                Some("fix domains/paths in apps.toml; overlapping paths on a shared domain are refused"),
+            ));
+            return;
+        }
+    };
+    let rows = plan.route_table();
+    if rows.is_empty() {
+        out.push(ok("ingress.routes", "no app is routed by ingress"));
+        return;
+    }
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let mut line = format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.port);
+            if r.strip_prefix && !r.path.is_root() {
+                line.push_str(" (strip prefix)");
+            }
+            if r.streaming {
+                line.push_str(" (streaming)");
+            }
+            if !r.active {
+                line.push_str(" (not started)");
+            }
+            line
+        })
+        .collect();
+    out.push(check(
+        "ingress.routes",
+        CheckStatus::Info,
+        lines.join("; "),
+        None,
+    ));
+}
+
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     out.push(match d.secrets.check_permissions() {
         Ok(()) => ok(
@@ -990,6 +1037,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some("it is created on the first ingress recompute"),
         ));
     }
+    ingress_routes(d, out);
     // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {
         let mode = m.permissions().mode() & 0o777;

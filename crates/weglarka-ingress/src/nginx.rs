@@ -15,7 +15,7 @@ use std::net::IpAddr;
 use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
 use weglarka_core::config::{HostConfig, IngressMode};
 
-use crate::plan::{Cidr, Domain, IngressError, Plan, WEBHOOK_UPSTREAM_HOST};
+use crate::plan::{AppRoute, Cidr, Domain, IngressError, PathPrefix, Plan, WEBHOOK_UPSTREAM_HOST};
 use std::collections::BTreeMap;
 
 /// Generator settings that belong to neither `HostConfig` nor `AppSpec`.
@@ -104,13 +104,57 @@ enum Backend<'a> {
 }
 
 impl Backend<'_> {
-    fn write_location(&self, c: &mut Conf, ingress: &AppIngress) {
+    /// Renders the `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any
+    /// other prefix `/p` becomes `location = /p` plus `location ^~ /p/` — a bare `location /p` would
+    /// also match `/pxyz` (ADR 0031). `set_app` names the app for the access log when the server
+    /// hosts several apps and the server-level `$app` is therefore unknown.
+    fn write_locations(
+        &self,
+        c: &mut Conf,
+        ingress: &AppIngress,
+        path: &PathPrefix,
+        set_app: Option<&str>,
+    ) {
+        if path.is_root() {
+            self.write_location(c, "location /", ingress, None, set_app);
+            return;
+        }
+        let p = path.as_str();
+        // `Some((regex, replacement))` of the rewrite that removes the prefix (`.` is the only regex
+        // metacharacter the path alphabet allows).
+        let escaped = p.replace('.', "\\.");
+        let exact = ingress
+            .strip_prefix
+            .then(|| ("^".to_owned(), "/".to_owned()));
+        let below = ingress
+            .strip_prefix
+            .then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
+        self.write_location(c, &format!("location = {p}"), ingress, exact, set_app);
+        self.write_location(c, &format!("location ^~ {p}/"), ingress, below, set_app);
+    }
+
+    fn write_location(
+        &self,
+        c: &mut Conf,
+        header: &str,
+        ingress: &AppIngress,
+        strip: Option<(String, String)>,
+        set_app: Option<&str>,
+    ) {
         match self {
             Backend::Container { host, port } => {
                 // A variable in `proxy_pass` forces runtime resolution (via `resolver`): a missing
                 // container yields 502 instead of a startup error; a new IP after recreate is picked up after the TTL.
-                c.block("location /", |c| {
+                c.block(header, |c| {
+                    if let Some(app) = set_app {
+                        c.line(&format!("set $app \"{app}\";"));
+                    }
                     c.line(&format!("set $upstream \"http://{host}:{port}\";"));
+                    // `strip_prefix`: with a variable `proxy_pass` carries no URI of its own, so the
+                    // rewritten one is what the upstream sees (query string is kept by `rewrite`).
+                    if let Some((regex, replacement)) = strip {
+                        c.line(&format!("rewrite {regex} {replacement} break;"));
+                    }
                     c.line("proxy_pass $upstream;");
                     // Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the
                     // right default everywhere else. Both timeouts change together — nginx would
@@ -339,19 +383,56 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
 
         // Apps with `start = false` are provisioned only: they reserve their domains (see plan), but
         // have no container, so there is nothing to proxy to and no `server` block for them.
+        // Domains whose set of serving apps is identical share one `server`: an app whose domains
+        // are not shared with anyone renders exactly as before path routing existed (ADR 0031).
+        let mut by_domain: BTreeMap<&Domain, Vec<&AppRoute<'_>>> = BTreeMap::new();
         for app in plan.apps.iter().filter(|app| app.active) {
+            for domain in &app.domains {
+                by_domain.entry(domain).or_default().push(app);
+            }
+        }
+        let mut groups: BTreeMap<Vec<&InstanceName>, (Vec<Domain>, Vec<&AppRoute<'_>>)> =
+            BTreeMap::new();
+        for (domain, apps) in by_domain {
+            let key: Vec<&InstanceName> = apps.iter().map(|a| a.instance).collect();
+            let group = groups.entry(key).or_insert_with(|| (Vec::new(), apps));
+            group.0.push(domain.clone());
+        }
+        for (domains, apps) in groups.values() {
             c.blank();
             c.block("server", |c| {
                 mode.listen(c, false);
-                c.line(&format!("server_name {};", join_domains(&app.domains)));
-                c.line(&format!("set $app \"{}\";", app.instance));
+                c.line(&format!("server_name {};", join_domains(domains)));
+                // One app: known up front, so the redirect is attributed too. Several: each
+                // `location` sets its own and the redirect logs `-`.
+                let shared = apps.len() > 1;
+                c.line(&format!(
+                    "set $app \"{}\";",
+                    if shared {
+                        "-"
+                    } else {
+                        apps[0].instance.as_str()
+                    }
+                ));
                 mode.https_redirect(c);
                 c.line(&format!("client_max_body_size {};", o.app_max_body_bytes));
-                Backend::Container {
-                    host: app.instance.as_str(),
-                    port: app.port,
+                let mut locations: Vec<(&PathPrefix, &AppRoute<'_>)> = apps
+                    .iter()
+                    .flat_map(|app| app.paths.iter().map(move |p| (p, *app)))
+                    .collect();
+                locations.sort_by(|a, b| a.0.cmp(b.0));
+                for (path, app) in locations {
+                    Backend::Container {
+                        host: app.instance.as_str(),
+                        port: app.port,
+                    }
+                    .write_locations(
+                        c,
+                        &app.ingress,
+                        path,
+                        shared.then(|| app.instance.as_str()),
+                    );
                 }
-                .write_location(c, &app.ingress);
             });
         }
     });

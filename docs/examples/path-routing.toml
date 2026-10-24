@@ -1,0 +1,22 @@
+# Two instances behind one public domain, split by path (issue #130, ADR 0031).
+[apps.api]
+image = "ghcr.io/example/api:latest"
+domains = ["app.example.com"]
+paths = ["/api", "/healthz"]
+port = 3000
+
+[apps.mcp]
+image = "ghcr.io/example/mcp:latest"
+domains = ["app.example.com"]
+paths = ["/mcp", "/.well-known"]
+port = 3001
+
+[apps.mcp.ingress]
+streaming = true      # per instance, so it applies to /mcp and /.well-known only
+strip_prefix = true   # /mcp/x reaches the app as /x
+
+# The SPA is the catch-all (`paths` omitted = ["/"]).
+[apps.spa]
+image = "ghcr.io/example/spa:latest"
+domains = ["app.example.com"]
+port = 3002

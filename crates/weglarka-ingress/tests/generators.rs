@@ -551,3 +551,175 @@ fn traefik_router_names_never_collide() {
     let unique: std::collections::BTreeSet<_> = names.iter().collect();
     assert_eq!(names.len(), unique.len(), "{yml}");
 }
+
+/// Two instances split one domain by path (ADR 0031), a third owns its own domain and a fourth keeps
+/// a catch-all next to a prefix.
+const PATH_APPS: &str = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+domains = ["app.example.eu"]
+paths = ["/api", "/healthz"]
+port = 3000
+
+[apps.mcp]
+image = "ghcr.io/x/mcp:latest"
+domains = ["app.example.eu"]
+paths = ["/mcp", "/.well-known"]
+port = 3001
+
+[apps.mcp.ingress]
+streaming = true
+strip_prefix = true
+
+[apps.spa]
+image = "ghcr.io/x/spa:latest"
+domains = ["app.example.eu"]
+port = 3002
+
+[apps.solo]
+image = "ghcr.io/x/solo:latest"
+domains = ["solo.example.eu"]
+port = 3003
+"#;
+
+#[test]
+fn path_routes_share_one_server_and_render_per_prefix() {
+    let a = apps(PATH_APPS);
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_paths", conf);
+    insta::assert_snapshot!(
+        "traefik_paths",
+        traefik::generate(&host(), &a, &TraefikOptions::default()).unwrap()
+    );
+
+    let shared = server_block(&conf, "app.example.eu");
+    assert!(shared.contains("location = /api {"), "{shared}");
+    assert!(shared.contains("location ^~ /api/ {"), "{shared}");
+    assert!(shared.contains("location / {"), "{shared}");
+    // The app name for the log comes from the location, not the (shared) server.
+    assert!(shared.contains("set $app \"api\";"), "{shared}");
+    // Streaming and strip are per instance: they must not leak into the neighbour.
+    assert!(
+        shared.contains("rewrite ^/mcp/(.*)$ /$1 break;"),
+        "{shared}"
+    );
+    assert!(
+        shared.contains(r"rewrite ^/\.well-known/(.*)$ /$1 break;"),
+        "{shared}"
+    );
+    assert_eq!(
+        shared.matches("proxy_buffering off;").count(),
+        4,
+        "{shared}"
+    );
+    assert_eq!(shared.matches("rewrite ").count(), 4, "{shared}");
+    // An unshared domain keeps its single-app server.
+    let solo = server_block(&conf, "solo.example.eu");
+    assert!(
+        solo.contains("set $app \"solo\";") && solo.contains("location / {"),
+        "{solo}"
+    );
+    assert!(!solo.contains("location ^~"), "{solo}");
+}
+
+#[test]
+fn path_route_table_lists_every_domain_and_prefix() {
+    let a = apps(PATH_APPS);
+    let h = host();
+    let plan = Plan::build(&h, &a).unwrap();
+    let rows: Vec<String> = plan
+        .route_table()
+        .iter()
+        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.port))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "app.example.eu/ -> spa:3002",
+            "app.example.eu/.well-known -> mcp:3001",
+            "app.example.eu/api -> api:3000",
+            "app.example.eu/healthz -> api:3000",
+            "app.example.eu/mcp -> mcp:3001",
+            "solo.example.eu/ -> solo:3003",
+        ]
+    );
+}
+
+#[test]
+fn overlapping_paths_on_a_shared_domain_are_rejected() {
+    let build = |a_paths: &str, b_paths: &str| {
+        let a = apps(&format!(
+            r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+port = 80
+{a_paths}
+
+[apps.b]
+image = "ghcr.io/x/b:latest"
+domains = ["app.example.eu"]
+port = 81
+{b_paths}
+"#
+        ));
+        Plan::build(&host(), &a).map(|_| ())
+    };
+    assert_eq!(build("paths = [\"/a\"]", "paths = [\"/b\"]"), Ok(()));
+    // A prefix on a segment boundary only: `/api` and `/apiary` are different routes.
+    assert_eq!(build("paths = [\"/api\"]", "paths = [\"/apiary\"]"), Ok(()));
+    // `/` is the catch-all and coexists with prefixes.
+    assert_eq!(build("", "paths = [\"/b\"]"), Ok(()));
+    for (a, b) in [
+        ("paths = [\"/a\"]", "paths = [\"/a\"]"),
+        ("paths = [\"/a\"]", "paths = [\"/a/b\"]"),
+        ("paths = [\"/a/b\"]", "paths = [\"/a\"]"),
+    ] {
+        let err = build(a, b).unwrap_err();
+        assert!(matches!(err, IngressError::PathConflict { .. }), "{err:?}");
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+    // Two catch-alls are the old "domain already taken" error.
+    assert!(matches!(
+        build("", ""),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    assert!(matches!(
+        build("paths = [\"/\"]", ""),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+}
+
+#[test]
+fn the_webhook_domain_stays_exclusive_even_with_paths() {
+    let a = apps(
+        r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["weglarka.example.eu"]
+paths = ["/a"]
+port = 80
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&host(), &a),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+}
+
+#[test]
+fn invalid_paths_never_reach_the_generator() {
+    let a = apps(
+        r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+paths = ["/a;b"]
+port = 80
+"#,
+    );
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::InvalidPath { .. })
+    ));
+}

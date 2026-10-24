@@ -23,6 +23,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6k. Samoaktualizacja](#6k-samoaktualizacja-węglarki-self_update) ·
 [6l. Configi z hosta](#6l-configi-z-hosta-config_root-i-apps-reload) ·
 [6m. Wspólna sieć między apkami](#6m-wspólna-sieć-między-apkami-shared_networks) ·
+[6n. Ścieżki na jednej domenie](#6n-ścieżki-na-jednej-domenie-paths) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -937,7 +938,7 @@ Gotowy plik: [`docs/examples/streaming.toml`](examples/streaming.toml).
 - **Tylko ingress:** zmiana renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP — tak samo jak `--domain`.
   Kontener apki, jego digest i `spec-hash` zostają nietknięte, nie ma deployu ani przerwy w ruchu do apki. Zmiana
   działa na nowe połączenia; nginx domyka stare workery, więc otwarty strumień kończy się na starym.
-- `--no-streaming` czyści **cały** blok `ingress` (razem z własnym timeoutem) i nic nie wysyła, gdy apka i tak nie
+- `--no-streaming` zeruje ustawienia streamingu (razem z własnym timeoutem; `strip_prefix` zostaje) i nic nie wysyła, gdy apka i tak nie
   streamuje. Flagi, jak `--domain`, wykluczają się z `--spec`.
 - **Uwaga operacyjna:** `proxy_buffering off` to cel, ale ma koszt — wolny klient trzyma połączenie workera nginxa
   przez cały czas trwania strumienia (`worker_processes 1`, `worker_connections 1024`), a
@@ -1397,6 +1398,45 @@ przy pierwszym zapisie po aktualizacji, niezależnie od tego, czy używasz sieci
 z komunikatem o wersji schematu; wracając do poprzedniej wersji przywróć `apps.toml` i `state.toml` **z kopii sprzed
 aktualizacji** ([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
 
+## 6n. Ścieżki na jednej domenie (`paths`)
+
+Domyślnie domena należy do jednej instancji. Gdy jedna publiczna nazwa ma obsługiwać kilka usług (REST pod
+`/api`, osobny serwis pod `/mcp`, SPA jako reszta), podaj każdej instancji prefiksy ścieżek — bez dodatkowego
+reverse proxy w stacku. Decyzja i odrzucone alternatywy: [0031](decisions/0031-path-prefix-routing.md). Gotowy
+fragment: [`docs/examples/path-routing.toml`](examples/path-routing.toml).
+
+```toml
+[apps.api]
+domains = ["app.example.com"]
+paths = ["/api", "/healthz"]     # domyślnie ["/"] (dotychczasowe zachowanie)
+[apps.mcp]
+domains = ["app.example.com"]
+paths = ["/mcp", "/.well-known"]
+```
+
+CLI: `weglarka apps add … --path /api --path /healthz [--strip-prefix]`, `apps update <app> --path /x`,
+`--remove-path /x`, `--strip-prefix` / `--no-strip-prefix`. Flagi wykluczają się z `--spec`.
+
+- **Składnia:** `/` albo `/seg[/seg…]`, bez końcowego `/`, bez `//` i segmentów `.`/`..`, znaki `[A-Za-z0-9_.-]`,
+  do 128 bajtów. `paths` wymaga `domains`.
+- **Dopasowanie:** dla `/p` nginx dostaje `location = /p` i `location ^~ /p/` (więc `/pxyz` nie pasuje), `/` jest
+  catch-allem; wygrywa najdłuższy prefiks.
+- **Rozłączność:** dwie instancje mogą dzielić domenę tylko z rozłącznymi prefiksami. Identyczny prefiks i
+  zagnieżdżony (`/api` vs `/api/v2`) są odrzucane (400) z komunikatem `overlap`; `/` współistnieje z innymi
+  prefiksami. Dwa `/` na jednej domenie to dotychczasowy błąd „domena zajęta”. Domena webhooka pozostaje wyłączna.
+- **`strip_prefix`** (`[apps.X.ingress]`, domyślnie `false`): `/p/x?q=1` trafia do apki jako `/x?q=1`, a `/p` jako `/`.
+  Wymaga prefiksu innego niż `/`.
+- **`streaming`** działa per instancja, czyli per ścieżki tej instancji. **`health.http`** idzie przez nginx, więc
+  żądanie ma pierwszy prefiks apki przed `health.http.path` (dla `/api` i `path = "/up"` sonda pyta `/api/up`).
+- **Tylko ingress:** zmiana `paths`/`strip_prefix` renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP;
+  kontener, digest i `spec-hash` zostają nietknięte. Plik Traefika się nie zmienia (jeden router na apkę).
+- **`weglarka doctor`:** check `ingress.routes` wypisuje efektywną tabelę tras (`domena/ścieżka -> instancja:port`).
+
+**Rollback:** to zmiana schematu plików stanu (wersja 5) — `apps.toml` i `state.toml` dostają `schema_version = 5`
+przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `paths` i `ingress.strip_prefix` z apek (albo
+przywróć pliki **z kopii sprzed aktualizacji**,
+[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -1431,7 +1471,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy))
   i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
   weglarka-self-update.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
-  ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)). Inaczej daemon nie wystartuje z błędem parsowania.
+  ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
+  ([6n](#6n-ścieżki-na-jednej-domenie-paths)). Inaczej daemon nie wystartuje z błędem parsowania.
 
 ### Wersja schematu plików stanu (rollback między wersjami)
 
@@ -1439,7 +1480,7 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
 [0023](decisions/0023-state-schema-version.md)). Zasady:
 
 - **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
-  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 3**
+  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 5**
   (v2: configi z hosta, issue #118, [0028](decisions/0028-config-root-mounts.md); v3: grupy wolumenów
   współdzielonych, issue #129): plik v1 wczytuje się bez zmian, a pierwszy zwykły zapis dopisuje
   `schema_version = 3`.
@@ -1450,6 +1491,8 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   zapisie, także gdy nie używasz grup, a rollback do wcześniejszego wydania wymaga kopii plików sprzed aktualizacji.
   **Wersja 4** (issue #128, [0030](decisions/0030-shared-networks.md)) dodaje `[shared_networks.<nazwa>]` i
   `shared_networks` w specu apki ([6m](#6m-wspólna-sieć-między-apkami-shared_networks)); te same zasady rollbacku.
+  **Wersja 5** (issue #130, [0031](decisions/0031-path-prefix-routing.md)) dodaje `paths` i `ingress.strip_prefix`
+  ([6n](#6n-ścieżki-na-jednej-domenie-paths)); te same zasady rollbacku.
 - **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
 
   ```text

@@ -49,10 +49,14 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   chunked, long polling — with no nginx response/request buffering and a long idle timeout (issue #64).
   Ingress-only: a change re-renders nginx.conf and reloads nginx (no deploy, no traffic gap), the container is
   untouched and `spec_hash` does not change. `apps add --streaming` sets it, `apps update --streaming` turns it
-  on; `apps update --no-streaming` clears the whole `ingress` block, a custom timeout included, and sends
+  on; `apps update --no-streaming` resets the streaming settings, a custom timeout included (`strip_prefix` is kept), and sends
   nothing (a no-op) when the app is not streaming. `stream_timeout_secs` — default 180, allowed 1..=3600 — has
   no flag in v1: set it through `apps update --spec` (validation rejects it unless `streaming = true`).
   Conflicts with `--spec`.
+- `--path PREFIX` (repeatable; `paths` in `--spec`) and `--strip-prefix` (`[ingress] strip_prefix`): serve only a
+  path prefix of the app's domains, so several instances can share one domain (issue #130, ADR 0031). Prefixes
+  must be disjoint between instances (`/` is the catch-all). `apps update` also has `--remove-path` and
+  `--no-strip-prefix`. Ingress-only like `--domain`: nginx reload, no recreate. Conflicts with `--spec`.
 - Lifecycle: `start` is a spec field (default `true`), not a one-shot flag. `apps add --no-start` provisions
   only — the image digest is pinned, the network, uid range and volumes are created, **no container**;
   `apps start` / `apps stop` flip the flag with the same read-modify-write as `apps update`

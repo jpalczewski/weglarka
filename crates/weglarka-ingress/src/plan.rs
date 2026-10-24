@@ -1,11 +1,11 @@
 //! Shared, validated route model — the only place where app data becomes "safe".
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
+use weglarka_core::app::{AppIngress, AppSpec, InstanceName, check_path_prefix};
 use weglarka_core::config::{HostConfig, IngressMode};
 
 /// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
@@ -18,6 +18,18 @@ pub enum IngressError {
     InvalidDomain { value: String, reason: &'static str },
     #[error("domain {0:?} is used more than once")]
     DuplicateDomain(String),
+    #[error("invalid path {value:?}: {reason}")]
+    InvalidPath { value: String, reason: &'static str },
+    #[error(
+        "path conflict on {domain}: {path_a:?} of {a} and {path_b:?} of {b} overlap (paths of instances sharing a domain must be disjoint)"
+    )]
+    PathConflict {
+        domain: String,
+        a: InstanceName,
+        path_a: String,
+        b: InstanceName,
+        path_b: String,
+    },
     #[error("app {0} has domains but no port")]
     MissingPort(InstanceName),
     #[error("app {0} has invalid port 0")]
@@ -86,6 +98,59 @@ impl fmt::Display for Domain {
     }
 }
 
+/// Path prefix of a route (ADR 0031): `/` or `/seg[/seg…]`, validated by
+/// [`weglarka_core::app::check_path_prefix`] because it lands in `nginx.conf`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathPrefix(String);
+
+impl PathPrefix {
+    pub fn new(value: impl Into<String>) -> Result<Self, IngressError> {
+        let value = value.into();
+        match check_path_prefix(&value) {
+            Ok(()) => Ok(Self(value)),
+            Err(reason) => Err(IngressError::InvalidPath { value, reason }),
+        }
+    }
+
+    /// The catch-all prefix, i.e. the default of an app without `paths`.
+    pub fn root() -> Self {
+        Self("/".to_owned())
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.0 == "/"
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Two prefixes overlap when equal or when one is a segment-wise ancestor of the other
+    /// (`/api` vs `/api/v2`, but not `/api` vs `/apiary`). The root is the designed catch-all and
+    /// never counts as a conflict with a longer prefix.
+    fn overlaps(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        if self.is_root() || other.is_root() {
+            return false;
+        }
+        let (short, long) = if self.0.len() <= other.0.len() {
+            (&self.0, &other.0)
+        } else {
+            (&other.0, &self.0)
+        };
+        long.strip_prefix(short.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+impl fmt::Display for PathPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// IP network in CIDR notation (e.g. trusted Docker networks for `set_real_ip_from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
@@ -130,19 +195,34 @@ impl fmt::Display for Cidr {
     }
 }
 
-/// Route of a single app: all its domains → `instance:port` on the app network.
+/// Route of a single app: all its domains × paths → `instance:port` on the app network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRoute<'a> {
     pub instance: &'a InstanceName,
     pub port: u16,
     /// Sorted, without duplicates.
     pub domains: Vec<Domain>,
+    /// Path prefixes served on every domain; sorted, without duplicates, `["/"]` when the spec sets none.
+    pub paths: Vec<PathPrefix>,
     /// `spec.start`: `false` means the app is provisioned only (no container), so it is validated
     /// and reserves its domains like any other app, but the generators render no route for it.
     pub active: bool,
     /// Per-app ingress behaviour (issue #64). Copied from the spec as-is: an app without a domain is
     /// not rendered at all, so the options never matter there.
     pub ingress: AppIngress,
+}
+
+/// One line of the effective route table (`doctor`, ADR 0031): a `(domain, path)` and where it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRow {
+    pub domain: Domain,
+    pub path: PathPrefix,
+    pub instance: InstanceName,
+    pub port: u16,
+    pub strip_prefix: bool,
+    pub streaming: bool,
+    /// `false` for `start = false` apps: they reserve the route but nginx renders nothing for it.
+    pub active: bool,
 }
 
 /// Webhook route: public domain → Węglarka's container.
@@ -162,6 +242,29 @@ pub struct Plan<'a> {
 }
 
 impl<'a> Plan<'a> {
+    /// Every `(domain, path)` of every app, sorted by domain then path.
+    pub fn route_table(&self) -> Vec<RouteRow> {
+        let mut rows: Vec<RouteRow> = self
+            .apps
+            .iter()
+            .flat_map(|app| {
+                app.domains.iter().flat_map(move |domain| {
+                    app.paths.iter().map(move |path| RouteRow {
+                        domain: domain.clone(),
+                        path: path.clone(),
+                        instance: app.instance.clone(),
+                        port: app.port,
+                        strip_prefix: app.ingress.strip_prefix,
+                        streaming: app.ingress.streaming,
+                        active: app.active,
+                    })
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.domain, &a.path).cmp(&(&b.domain, &b.path)));
+        rows
+    }
+
     /// Apps without domains are skipped (nothing to route). A domain must not repeat
     /// within an app, between apps, or with the webhook domain. Apps with `start = false` are
     /// validated exactly like running ones and keep their domains reserved (a later start must not
@@ -171,7 +274,8 @@ impl<'a> Plan<'a> {
         apps: &'a BTreeMap<InstanceName, AppSpec>,
     ) -> Result<Self, IngressError> {
         let webhook_domain = Domain::new(host.webhook.domain.clone())?;
-        let mut seen = BTreeSet::from([webhook_domain.clone()]);
+        // Who claimed which prefix on a domain; the webhook domain is exclusive (no entry to share).
+        let mut claimed: BTreeMap<Domain, Vec<(&InstanceName, PathPrefix)>> = BTreeMap::new();
         let mut routes = Vec::new();
 
         for (instance, spec) in apps {
@@ -186,12 +290,45 @@ impl<'a> Plan<'a> {
                 Some(0) => return Err(IngressError::InvalidPort(instance.clone())),
                 Some(p) => p,
             };
+            let mut paths = spec
+                .paths
+                .iter()
+                .map(PathPrefix::new)
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.is_empty() {
+                paths.push(PathPrefix::root());
+            }
+            paths.sort();
+            if let Some(w) = paths.windows(2).find(|w| w[0] == w[1]) {
+                return Err(IngressError::InvalidPath {
+                    value: w[0].to_string(),
+                    reason: "listed more than once",
+                });
+            }
             let mut domains = Vec::with_capacity(spec.domains.len());
             for raw in &spec.domains {
                 let domain = Domain::new(raw.clone())?;
-                if !seen.insert(domain.clone()) {
+                if domain == webhook_domain || domains.contains(&domain) {
                     return Err(IngressError::DuplicateDomain(raw.clone()));
                 }
+                let others = claimed.entry(domain.clone()).or_default();
+                for path in &paths {
+                    if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
+                    {
+                        // Two catch-alls are the pre-#130 "domain already taken" case.
+                        if path.is_root() && other_path.is_root() {
+                            return Err(IngressError::DuplicateDomain(raw.clone()));
+                        }
+                        return Err(IngressError::PathConflict {
+                            domain: raw.clone(),
+                            a: (*other).clone(),
+                            path_a: other_path.to_string(),
+                            b: instance.clone(),
+                            path_b: path.to_string(),
+                        });
+                    }
+                }
+                others.extend(paths.iter().map(|p| (instance, p.clone())));
                 domains.push(domain);
             }
             domains.sort();
@@ -199,6 +336,7 @@ impl<'a> Plan<'a> {
                 instance,
                 port,
                 domains,
+                paths,
                 active: spec.start,
                 ingress: spec.ingress.clone(),
             });
