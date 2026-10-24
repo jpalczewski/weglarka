@@ -3,6 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    # A docs-only push to `main` builds nothing (no code changed): the whole workflow is skipped,
+    # same rule as for a docs-only PR below. Tags are not affected (this workflow has none).
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".gitignore"
   pull_request:
 
 env:

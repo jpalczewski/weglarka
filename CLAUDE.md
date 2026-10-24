@@ -120,4 +120,6 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `.github/scripts/smoke-image.sh` i `smoke-quadlet.sh` (argumenty z `platform install`).
 - CI na PR buduje profilem `ci` (thin LTO), `main` i tagi — pełnym `release` (`docs/decisions/0008`).
   PR zmieniający wyłącznie dokumentację (`docs/**`, `*.md`, `.gitignore`) nie uruchamia buildów — job
-  `changes` pomija `check`/`musl`/`integration-podman`; `changes` i `pr-title` biegną zawsze.
+  `changes` pomija `check`/`musl`/`integration-podman`; `changes` i `pr-title` biegną zawsze. Push na
+  `main` z samą dokumentacją nie uruchamia CI ani Release (`paths-ignore`) — obraz nie jest wtedy
+  przebudowywany; tagi `v*` budują zawsze.

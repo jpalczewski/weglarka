@@ -6,6 +6,13 @@ name: Release
 on:
   push:
     branches: [main]
+    # A docs-only push to `main` must not rebuild/republish the image: it would be identical except
+    # for the revision label. Tag pushes are not affected (path filters are not evaluated for tags).
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".gitignore"
     tags: ["v*"]
 
 env:
