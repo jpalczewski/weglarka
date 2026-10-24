@@ -1,5 +1,5 @@
 //! Admin endpoints for volumes shared between instances (issue #33,
-//! [`docs/decisions/0014-shared-volumes.md`](../../../docs/decisions/0014-shared-volumes.md)):
+//! [`docs/decisions/0015-shared-volumes.md`](../../../docs/decisions/0015-shared-volumes.md)):
 //! `GET /v1/volumes` lists the declarations, `PUT /v1/volumes/{volume}` declares one (idempotent,
 //! no body) and `DELETE /v1/volumes/{volume}?purge=true` drops the declaration — with `purge` also
 //! its data.

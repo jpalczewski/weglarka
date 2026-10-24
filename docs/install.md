@@ -365,7 +365,7 @@ sam przy najbliższym przebiegu reconcile po `apps remove` (gdy nic już z niej 
 ### Wolumeny współdzielone (grupa UID, iteracja 2)
 
 Kilka apek (kontenerów) może pracować na **jednym** wolumenie — typowy przypadek to SQLite i procesy obok niego
-(api, mcp, worker). Decyzja i odrzucone alternatywy: [0014](decisions/0014-shared-volumes.md). Wolumen deklaruje się
+(api, mcp, worker). Decyzja i odrzucone alternatywy: [0014](decisions/0015-shared-volumes.md). Wolumen deklaruje się
 **raz**, w sekcji najwyższego poziomu `apps.toml`, a apka montuje go po nazwie:
 
 ```toml

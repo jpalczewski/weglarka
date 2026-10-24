@@ -1,4 +1,4 @@
-//! Shared volumes between instances (issue #33, `docs/decisions/0014-shared-volumes.md`) — the pure
+//! Shared volumes between instances (issue #33, `docs/decisions/0015-shared-volumes.md`) — the pure
 //! desired-state checks and lookups.
 //!
 //! A shared volume is declared once in `[shared_volumes.<name>]` and mounted by apps through

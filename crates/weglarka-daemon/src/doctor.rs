@@ -289,7 +289,7 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
     let mut hints = Vec::new();
 
     // (a) Data without a declaration: nothing will ever create, purge or reclaim that volume, so the
-    // operator has to decide (the engine deliberately keeps the range reserved, ADR 0014).
+    // operator has to decide (the engine deliberately keeps the range reserved, ADR 0015).
     for volume in &volumes {
         let Some(shared) = volume.labels.get(labels::SHARED_VOLUME) else {
             continue;
@@ -325,7 +325,7 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
         }
         // (d) The shared range aligns host owners only when every member process uses the same
         // container uid; Węglarka does not override the image's USER, so this is a documented
-        // requirement (ADR 0014) and the comparison itself is a follow-up.
+        // requirement (ADR 0015) and the comparison itself is a follow-up.
         let members = shared_volumes::members(&apps, name);
         if members.len() > 1 {
             notes.push(format!(

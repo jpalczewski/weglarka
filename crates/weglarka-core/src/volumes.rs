@@ -1,5 +1,5 @@
 //! Volumes and file ownership of the deploy engine (iteration 2, docs/decisions/0009-volume-ownership.md;
-//! shared volumes: issue #33, docs/decisions/0014-shared-volumes.md).
+//! shared volumes: issue #33, docs/decisions/0015-shared-volumes.md).
 //!
 //! Every container Węglarka creates runs in its own user namespace with an explicit uid/gid range
 //! (`userns: private` + `UIDMap`/`GIDMap`); plain `userns: auto` is a no-op under rootless Podman.
@@ -55,7 +55,7 @@ pub fn id_mapping(range: UidRange) -> IdMapping {
 }
 
 /// The uid/gid range a container of `instance` runs in: the shared volume's range when the spec
-/// mounts one (all members share it, docs/decisions/0014), otherwise the instance's own range.
+/// mounts one (all members share it, docs/decisions/0015), otherwise the instance's own range.
 pub fn effective_range(
     st: &StateFile,
     instance: &InstanceName,
@@ -491,7 +491,7 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Refuses a uid-range change when the instance already has private volume data: the files are
     /// owned by the old range and a recreate with a new map would make them unreadable
-    /// (docs/decisions/0014). `None` as the old label means "no label yet" (pre-range container) and
+    /// (docs/decisions/0015). `None` as the old label means "no label yet" (pre-range container) and
     /// is always allowed.
     pub(crate) async fn range_change_guard_locked(
         &self,
@@ -1382,7 +1382,7 @@ volumes = [{ name = "data", target = "/data" }]
         );
     }
 
-    // ── Shared volumes (issue #33, docs/decisions/0014-shared-volumes.md) ──────────────────────
+    // ── Shared volumes (issue #33, docs/decisions/0015-shared-volumes.md) ──────────────────────
 
     const SHARED_APPS: &str = r#"
 [shared_volumes.kajet-data]

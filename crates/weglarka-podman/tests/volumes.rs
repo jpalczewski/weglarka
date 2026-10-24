@@ -178,7 +178,7 @@ impl Env {
             .unwrap();
     }
 
-    /// Shared volume exactly as the engine creates it (ADR 0014): `wg-shared-<name>` labelled
+    /// Shared volume exactly as the engine creates it (ADR 0015): `wg-shared-<name>` labelled
     /// `weglarka.shared-volume=<name>` and deliberately **without** the `weglarka.instance` label.
     async fn shared_volume(&mut self, name: &SharedVolumeName) -> String {
         let volume = labels::shared_volume_name(name);
@@ -736,7 +736,7 @@ fn host_uid(path: &str) -> u32 {
     fs::metadata(path).unwrap().uid()
 }
 
-/// A member container as the engine creates one (ADR 0014): the shared volume's explicit uid range
+/// A member container as the engine creates one (ADR 0015): the shared volume's explicit uid range
 /// (`userns: private` + one `IdMapping`, `userns_auto = false`), the `weglarka.uid-range` label and
 /// the shared Podman volume mounted read-write. `ContainerSpec` has no command, so the member image
 /// has to keep running by itself (nginx does) and commands run through `container_exec`.
@@ -764,7 +764,7 @@ fn member_spec(name: &str, shared_volume: &str, range: UidRange) -> ContainerSpe
     }
 }
 
-/// Issue #33 data plane (ADR 0014): two containers of one shared volume run in the **same** explicit
+/// Issue #33 data plane (ADR 0015): two containers of one shared volume run in the **same** explicit
 /// uid range and read/overwrite the same file with one stable owner across recreation, while a
 /// container with a disjoint range cannot touch the volume.
 #[tokio::test]
