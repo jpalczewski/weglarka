@@ -13,8 +13,8 @@ use crate::events::{Event, VecSink};
 use crate::labels;
 use crate::podman::{ContainerState, HealthStatus, NetworkSpec, PodmanClient};
 use crate::reconcile::{
-    Action, ActionOutcome, EngineError, ReconcileReport, Reconciler, ReconcilerOptions,
-    RecreateReason, SecretChangePolicy, Trigger,
+    Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
+    ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
 };
 use crate::secret_store::{SecretStore, SecretValue};
 use crate::secrets::FileSecretStore;
@@ -165,6 +165,48 @@ async fn fresh_deploy_then_converged() {
 
     // Second pass: nothing to do.
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+}
+
+/// `doctor` reads the engine to tell a deploy from drift (issue #30): while a deploy runs, the
+/// instance is reported as in flight; the guard clears it on every exit path.
+#[tokio::test(start_paused = true)]
+async fn in_flight_is_visible_during_a_deploy() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let rec = h.rec.clone();
+    let instance = name("ntfy");
+    let deploy = tokio::spawn({
+        let instance = instance.clone();
+        async move { rec.deploy(&instance, false).await }
+    });
+
+    // Let the deploy reach the health gate (a real await) and look at the engine from the outside.
+    let mut seen = None;
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+        if let Some(activity) = h.rec.in_flight() {
+            seen = Some(activity);
+            break;
+        }
+    }
+    let activity = seen.expect("a running deploy must be visible as in flight");
+    assert_eq!(activity.instance, instance);
+    assert_eq!(activity.kind, ActivityKind::Deploy);
+
+    let outcome = deploy.await.unwrap().unwrap();
+    assert!(matches!(outcome, DeployOutcome::Deployed { .. }));
+    assert!(h.rec.in_flight().is_none(), "cleared after the deploy");
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_flight_is_cleared_when_the_deploy_fails() {
+    let h = Harness::new(NTFY);
+    h.fake.fail_pull(IMAGE, "registry down");
+    assert!(h.rec.deploy(&name("ntfy"), false).await.is_err());
+    assert!(
+        h.rec.in_flight().is_none(),
+        "a failed deploy must not leave the instance in flight"
+    );
 }
 
 #[tokio::test(start_paused = true)]
