@@ -4,8 +4,8 @@
 //! The daemon shares `net-weglarka` with `weglarka-nginx`, so it reaches nginx by container name and
 //! never joins an app network. nginx routes by `Host`, hence the app's first domain
 //! (`state::validate_app` requires one when `health.http` is set). The request deliberately carries
-//! no `X-Forwarded-*`: the daemon's address is inside the subnet nginx trusts by default
-//! (docs/decisions/0007), and a probe must not exercise — or abuse — that trust.
+//! no `X-Forwarded-*`: whether nginx trusts the daemon's address depends on `[ingress] trusted_proxies`
+//! (by default it does not, docs/decisions/0032), and a probe must not exercise — or abuse — that trust.
 //! See docs/decisions/0010-health-http-probe.md.
 
 use std::time::Duration;

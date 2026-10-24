@@ -2,16 +2,23 @@
 # Forwarded headers through the generated nginx.conf (docs/decisions/0007), with plain Docker on a CI runner:
 # a trusted peer's X-Forwarded-{Proto,For,Host} reach the app, an untrusted peer's are overwritten.
 #
-#   test-forwarded-headers.sh <nginx-conf-trusted> <nginx-conf-untrusted>
+#   test-forwarded-headers.sh <nginx-conf-trusted> <nginx-conf-untrusted> <conf-trusting-peer> <conf-trusting-neighbor>
 #
 # Both configs come from `cargo run -p weglarka-ingress --example dump -- nginx 127.0.0.11 <trusted>`:
 # the first trusts Docker's bridge (the source address of a published-port request), the second does not.
+# The last two configs trust a single address (a /32, as the daemon generates from nginx's own addresses,
+# docs/decisions/0032): `$PEER_IP`, the address a probe container connects from, and 172.29.77.201, another
+# address of the same subnet — the stand-in for an app container that shares a network with nginx.
 # The sample config has the app `blog` on port 3000 and the domain blog.example.eu.
 set -euo pipefail
 
 trusted_conf=$1
 untrusted_conf=$2
+peer_conf=$3
+neighbor_conf=$4
 net=wg-fwd-test
+subnet=172.29.77.0/24
+PEER_IP=172.29.77.200
 fail=0
 
 # shellcheck disable=SC2329,SC2317 # invoked by the EXIT trap
@@ -29,7 +36,7 @@ trap cleanup EXIT
 docker rm -f wg-fwd-blog wg-fwd-nginx >/dev/null 2>&1 || true
 docker network rm "$net" >/dev/null 2>&1 || true
 
-docker network create "$net" >/dev/null
+docker network create --subnet "$subnet" "$net" >/dev/null
 docker run -d --name wg-fwd-blog --network "$net" --network-alias blog docker.io/traefik/whoami:v1.10.4 --port 3000 >/dev/null
 
 # Status + redirect target for a request carrying the given extra curl args (HTTPS redirect, docs/decisions/0005).
@@ -83,6 +90,33 @@ expect untrusted "$body" 'X-Forwarded-Host: blog.example.eu'
 
 expect_status 'untrusted + http (header ignored)' "$(status_of -H 'X-Forwarded-Proto: http')" '200 '
 
-echo "--- nginx access log (untrusted run)"
+# A trust entry is one address, not its network: the same request from the one trusted address keeps its
+# forwarded headers, while a neighbour in the same subnet cannot forge them (an app container on a shared network).
+peer_request() { # conf -> whoami body of a request sent from $PEER_IP
+  docker rm -f wg-fwd-nginx >/dev/null 2>&1 || true
+  docker run -d --name wg-fwd-nginx --network "$net" -v "$1:/etc/nginx/nginx.conf:ro" \
+    docker.io/library/nginx:1-alpine >/dev/null
+  for _ in $(seq 30); do
+    docker run --rm --network "$net" --ip "$PEER_IP" docker.io/library/nginx:1-alpine \
+      wget -q -O /dev/null --header 'Host: blog.example.eu' http://wg-fwd-nginx:8080/ 2>/dev/null && break
+    sleep 1
+  done
+  docker run --rm --network "$net" --ip "$PEER_IP" docker.io/library/nginx:1-alpine \
+    wget -q -O - --header 'Host: blog.example.eu' --header 'X-Forwarded-Proto: https' \
+    --header 'X-Forwarded-For: 203.0.113.9' --header 'X-Forwarded-Host: forged.example' http://wg-fwd-nginx:8080/ | tr -d '\r'
+}
+
+body=$(peer_request "$peer_conf")
+expect 'exact peer' "$body" 'X-Forwarded-Proto: https'
+expect 'exact peer' "$body" 'X-Forwarded-For: 203.0.113.9'
+expect 'exact peer' "$body" 'X-Forwarded-Host: forged.example'
+
+body=$(peer_request "$neighbor_conf")
+expect 'neighbour of the trusted address' "$body" 'X-Forwarded-Proto: http'
+reject 'neighbour of the trusted address' "$body" 'X-Forwarded-Proto: https'
+reject 'neighbour of the trusted address' "$body" '203.0.113.9'
+reject 'neighbour of the trusted address' "$body" 'forged.example'
+
+echo "--- nginx access log (last run)"
 docker logs wg-fwd-nginx 2>&1 | tail -3
 exit "$fail"

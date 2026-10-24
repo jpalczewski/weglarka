@@ -327,6 +327,7 @@ mod tests {
             health: None,
             restarts: 0,
             networks: Vec::new(),
+            addresses: Vec::new(),
         }
     }
 

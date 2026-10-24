@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::IpAddr;
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -275,6 +276,10 @@ pub struct ContainerInfo {
     pub restarts: u32,
     /// Names of the networks the container is currently attached to (sorted).
     pub networks: Vec<String>,
+    /// The container's own addresses on those networks (sorted, deduplicated); empty when it is not
+    /// running. Ingress trusts the nginx container's own addresses as the port forwarder's source
+    /// (`docs/decisions/0032`).
+    pub addresses: Vec<IpAddr>,
 }
 
 /// Repository from an image reference — without tag and digest but **with** the registry port:

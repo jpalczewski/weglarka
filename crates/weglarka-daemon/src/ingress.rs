@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -199,15 +200,6 @@ impl<P: PodmanClient> IngressManager<P> {
             }
         }
 
-        // Default trust: only `net-weglarka`, the primary network of the nginx container, where the port
-        // forwarder connects from. App networks are never trusted (docs/decisions/0007).
-        let trusted = if self.host.ingress.trusted_proxies.is_empty() {
-            forwarder_subnets
-        } else {
-            self.host.ingress.trusted_proxies.clone()
-        };
-        let options = nginx::NginxOptions::new(resolvers).with_trusted_proxies(&trusted)?;
-        let conf = nginx::generate(&self.host, &apps, &options)?;
         let traefik_yaml = match (
             &self.host.ingress.traefik_dynamic_file,
             self.host.ingress.mode,
@@ -220,25 +212,34 @@ impl<P: PodmanClient> IngressManager<P> {
             _ => None,
         };
 
-        let previous = fs::read(self.conf_path()).ok();
-        let conf_written = self.write_conf(&conf)?;
-        // Traefik is updated only once nginx accepted the config (no route to a server that is not there).
-        let nginx = match self
-            .ensure_nginx(&networks, options.listen_port, conf_written)
-            .await
-        {
-            Ok(action) => action,
-            Err(e) => {
-                // Roll back so the next `apply` sees the difference again and retries.
-                if let (true, Some(old)) = (conf_written, &previous) {
-                    let path = self.conf_path();
-                    if let Err(re) = write_atomic(&path, old, 0o644) {
-                        tracing::error!(error = %re, "cannot restore previous nginx.conf");
-                    }
-                }
-                return Err(e);
-            }
+        // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
+        let pinned = !self.host.ingress.trusted_proxies.is_empty();
+        let render = Render {
+            apps: &apps,
+            resolvers: &resolvers,
+            forwarder_subnets: &forwarder_subnets,
+            networks: &networks,
         };
+        let mut own_addresses = self.nginx_addresses().await?;
+        let (mut conf_written, mut nginx) = self.apply_nginx(&render, &own_addresses).await?;
+        // The addresses the config trusts were read before nginx was (re)created or joined a new network, so
+        // they may be stale (or the bootstrap fallback): never leave that config in place. Re-read and, if
+        // they moved, regenerate and reload within this pass. If the re-read fails, retry shortly.
+        if !pinned {
+            let current = self.nginx_addresses().await.inspect_err(|_| {
+                self.retry_soon.store(true, Ordering::Relaxed);
+            })?;
+            if current != own_addresses {
+                tracing::info!("nginx addresses changed, regenerating the trusted peers");
+                own_addresses = current;
+                let (written, action) = self.apply_nginx(&render, &own_addresses).await?;
+                conf_written |= written;
+                if matches!(nginx, NginxAction::None | NginxAction::NetworksSynced) {
+                    nginx = action;
+                }
+            }
+        }
+        // Traefik is updated only once nginx accepted the config (no route to a server that is not there).
         let traefik_written = match (&self.host.ingress.traefik_dynamic_file, &traefik_yaml) {
             (Some(path), Some(yaml)) => write_in_place(path, yaml.as_bytes())?,
             _ => false,
@@ -253,6 +254,57 @@ impl<P: PodmanClient> IngressManager<P> {
                 nginx,
             })
         }
+    }
+
+    /// Generates `nginx.conf` for the given own addresses, writes it and brings the container in line
+    /// (create/reload); a rejected config is rolled back on disk. Returns `(conf_written, action)`.
+    async fn apply_nginx(
+        &self,
+        r: &Render<'_>,
+        own_addresses: &[IpAddr],
+    ) -> Result<(bool, NginxAction), IngressApplyError> {
+        let trusted = if self.host.ingress.trusted_proxies.is_empty() {
+            default_trusted(own_addresses, r.forwarder_subnets)
+        } else {
+            self.host.ingress.trusted_proxies.clone()
+        };
+        let options =
+            nginx::NginxOptions::new(r.resolvers.to_vec()).with_trusted_proxies(&trusted)?;
+        let conf = nginx::generate(&self.host, r.apps, &options)?;
+
+        let previous = fs::read(self.conf_path()).ok();
+        let conf_written = self.write_conf(&conf)?;
+        match self
+            .ensure_nginx(r.networks, options.listen_port, conf_written)
+            .await
+        {
+            Ok(action) => Ok((conf_written, action)),
+            Err(e) => {
+                // Roll back so the next `apply` sees the difference again and retries.
+                if let (true, Some(old)) = (conf_written, &previous) {
+                    let path = self.conf_path();
+                    if let Err(re) = write_atomic(&path, old, 0o644) {
+                        tracing::error!(error = %re, "cannot restore previous nginx.conf");
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The running nginx container's own addresses on all its networks (sorted); empty when it does not
+    /// exist yet or is not running.
+    async fn nginx_addresses(&self) -> Result<Vec<IpAddr>, IngressApplyError> {
+        let containers = self
+            .engine
+            .podman()
+            .container_list(&ContainerFilter::default())
+            .await?;
+        Ok(containers
+            .into_iter()
+            .find(|c| c.name == NGINX_CONTAINER && c.state == ContainerState::Running)
+            .map(|c| c.addresses)
+            .unwrap_or_default())
     }
 
     /// `nginx.conf` atomically (the directory is mounted, so the `rename` is visible in the container).
@@ -444,6 +496,30 @@ const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v2";
 /// `setgid(101) failed`. `NET_BIND_SERVICE` is not needed (8080), and `pid` plus every `*_temp_path`
 /// already live under `/tmp` (`weglarka-ingress/src/nginx.rs`), the one writable place this profile
 /// leaves — the generator test keeps that invariant.
+/// Inputs of one `nginx.conf` rendering that do not depend on nginx's addresses.
+struct Render<'a> {
+    apps: &'a BTreeMap<InstanceName, AppSpec>,
+    resolvers: &'a [IpAddr],
+    forwarder_subnets: &'a [String],
+    networks: &'a [String],
+}
+
+/// Peers whose `X-Forwarded-*` nginx trusts by default (docs/decisions/0032): nginx's **own**
+/// addresses. With rootless Podman the published port is served by a forwarder that dials from inside
+/// nginx's network namespace, so its source address is one of nginx's own interface addresses — on
+/// whichever attached network it picked, not necessarily `net-weglarka`. An app container reaching
+/// nginx over its network has a different address and stays untrusted.
+///
+/// Before the container runs (first `apply`) there are no addresses yet; the `net-weglarka` subnet
+/// bootstraps the config until the next pass replaces it.
+fn default_trusted(own_addresses: &[IpAddr], bootstrap_subnets: &[String]) -> Vec<String> {
+    if own_addresses.is_empty() {
+        bootstrap_subnets.to_vec()
+    } else {
+        own_addresses.iter().map(ToString::to_string).collect()
+    }
+}
+
 fn nginx_security() -> Security {
     Security {
         read_only: true,
@@ -520,6 +596,18 @@ pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_trust_is_nginx_own_addresses_with_a_bootstrap_fallback() {
+        let own: Vec<IpAddr> = ["10.89.0.2", "10.89.2.6"]
+            .map(|a| a.parse().unwrap())
+            .into();
+        let subnets = ["10.89.0.0/24".to_owned()];
+        // Single hosts, never the networks they sit in.
+        assert_eq!(default_trusted(&own, &subnets), ["10.89.0.2", "10.89.2.6"]);
+        // No running container yet: the webhook network keeps the first config valid.
+        assert_eq!(default_trusted(&[], &subnets), ["10.89.0.0/24"]);
+    }
 
     #[test]
     fn write_in_place_keeps_inode_and_skips_identical() {

@@ -2,6 +2,7 @@
 //! Conversions to the `weglarka_core::podman` domain types.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{Digest, Resources, SecretTarget};
@@ -448,8 +449,17 @@ pub(crate) struct InspectContainer {
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "PascalCase")]
 struct InspectNetworkSettings {
-    /// Only the keys (network names) matter.
-    networks: Option<BTreeMap<String, serde::de::IgnoredAny>>,
+    /// Keys are network names; the per-network addresses feed the ingress trust list.
+    networks: Option<BTreeMap<String, InspectAttachment>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct InspectAttachment {
+    #[serde(rename = "IPAddress")]
+    ip_address: String,
+    #[serde(rename = "GlobalIPv6Address")]
+    global_ipv6_address: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -496,6 +506,13 @@ pub(crate) fn health_status(status: &str) -> Option<HealthStatus> {
 impl InspectContainer {
     pub(crate) fn into_domain(self) -> ContainerInfo {
         let state = container_state(&self.state.status);
+        let networks = self.network_settings.networks.unwrap_or_default();
+        // Empty strings (not connected, no IPv6) and anything unparsable are skipped.
+        let addresses: std::collections::BTreeSet<IpAddr> = networks
+            .values()
+            .flat_map(|n| [&n.ip_address, &n.global_ipv6_address])
+            .filter_map(|a| a.parse().ok())
+            .collect();
         ContainerInfo {
             id: self.id,
             name: self.name.trim_start_matches('/').to_owned(),
@@ -507,12 +524,8 @@ impl InspectContainer {
             state,
             health: self.state.health.and_then(|h| health_status(&h.status)),
             restarts: self.restart_count,
-            networks: self
-                .network_settings
-                .networks
-                .unwrap_or_default()
-                .into_keys()
-                .collect(),
+            networks: networks.keys().cloned().collect(),
+            addresses: addresses.into_iter().collect(),
         }
     }
 }
@@ -888,6 +901,26 @@ mod tests {
             info.restarts, 3,
             "libpod `RestartCount` maps to `ContainerInfo::restarts`"
         );
+    }
+
+    #[test]
+    fn inspect_collects_the_addresses_on_every_network() {
+        let json = br#"{"Id":"1","Name":"n","NetworkSettings":{"Networks":{
+            "net-a":{"IPAddress":"10.89.0.5","GlobalIPv6Address":""},
+            "net-b":{"IPAddress":"10.89.2.6","GlobalIPv6Address":"fd00::6"},
+            "net-c":{"IPAddress":"","GlobalIPv6Address":""}}}}"#;
+        let info = decode::<InspectContainer>(json).unwrap().into_domain();
+        assert_eq!(info.networks, ["net-a", "net-b", "net-c"]);
+        let expected: Vec<IpAddr> = ["10.89.0.5", "10.89.2.6", "fd00::6"]
+            .map(|a| a.parse().unwrap())
+            .into();
+        assert_eq!(info.addresses, expected);
+
+        // No `NetworkSettings` (a stopped container, the fixtures above): no addresses.
+        let info = decode::<InspectContainer>(fixture!("inspect_container_exited.json"))
+            .unwrap()
+            .into_domain();
+        assert!(info.addresses.is_empty());
     }
 
     #[test]

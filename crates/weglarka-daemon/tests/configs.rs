@@ -383,7 +383,7 @@ async fn reload_without_a_signal_restarts_the_container() {
     assert!(
         !calls
             .iter()
-            .any(|call| matches!(call, Call::ContainerKill { .. })),
+            .any(|call| matches!(call, Call::ContainerKill { name, .. } if name == "prometheus")),
         "no signal without `reload_signal`: {calls:?}"
     );
     h.running.stop().await;

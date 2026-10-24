@@ -1,6 +1,6 @@
 # 0007 — Trusted proxies behind rootless Podman, reload instead of recreate
 
-Status: accepted (2026-10-23).
+Status: accepted (2026-10-23). Section 1's default trust (the `net-weglarka` subnet) is superseded by 0032.
 
 ## 1. Who nginx sees as the peer
 

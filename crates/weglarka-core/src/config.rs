@@ -124,8 +124,8 @@ pub struct IngressConfig {
     /// Host directory with `nginx.conf` (mounted into the nginx container); defaults to `<state dir>/nginx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nginx_conf_dir: Option<PathBuf>,
-    /// Peers (IPs/CIDRs) whose `X-Forwarded-*` nginx trusts. Empty = the generator's default
-    /// (rootless Podman's port-forwarder networks, see `docs/decisions/0007`).
+    /// Peers (IPs/CIDRs) whose `X-Forwarded-*` nginx trusts. Empty = the daemon's default
+    /// (nginx's own addresses, where the rootless port forwarder connects from, see `docs/decisions/0032`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_proxies: Vec<String>,
 }
