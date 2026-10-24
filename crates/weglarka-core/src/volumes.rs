@@ -841,6 +841,13 @@ image = "ghcr.io/x/szklana:latest"
 start = false
 volumes = [{ name = "data", target = "/data" }]
 "#;
+    /// The same app as [`APP`], but provisioned only: the container is removed, the data stays.
+    const STOPPED_WITH_VOLUMES: &str = r#"
+[apps.szklana]
+image = "ghcr.io/x/szklana:latest"
+start = false
+volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cache", read_only = true }]
+"#;
 
     struct Env {
         _dir: tempfile::TempDir,
@@ -1655,6 +1662,103 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(e.mapping("szklana"), old_map);
         assert_eq!(e.range("szklana"), Some(old_range));
         assert_eq!(e.fake.volumes().len(), 2, "private volumes keep their data");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joining_a_group_after_provisioning_is_refused() {
+        let e = env(APP); // szklana owns private volumes with data
+        e.rec.reconcile().await.unwrap();
+        let old_range = e.range("szklana").unwrap();
+
+        // `apps stop` removes the container but keeps the data and the range (issue #75).
+        e.set_apps(STOPPED_WITH_VOLUMES);
+        e.rec.reconcile().await.unwrap();
+        assert!(e.fake.containers().is_empty(), "provisioning removes the container");
+        assert_eq!(e.fake.volumes().len(), 2, "the private volumes survive");
+
+        // The early check of `PUT /v1/apps/{name}` must still see the data owner.
+        let new_spec: AppSpec = toml::from_str(&format!(
+            "image = \"{IMAGE}\"\nport = 8080\nshared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ))
+        .unwrap();
+        let err = e
+            .rec
+            .check_range_change(&name("szklana"), &new_spec)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::RangeChangeWithData { .. }),
+            "{err:?}"
+        );
+
+        // The reconcile path (a hand-edited apps.toml) must refuse too: nothing may start in the
+        // group's range while the files belong to the old one.
+        e.set_apps(&format!(
+            "[shared_volumes.kajet-data]\n\n[apps.szklana]\nimage = \"{IMAGE}\"\nport = 8080\n\
+             shared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ));
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(
+            report.actions.iter().any(|a| a.result.is_err()),
+            "{report:?}"
+        );
+        assert!(
+            e.fake.containers().is_empty(),
+            "no container in the shared range over files of the old range"
+        );
+        assert_eq!(e.range("szklana"), Some(old_range));
+        assert_eq!(e.fake.volumes().len(), 2, "nothing new was created");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_with_private_data_cannot_join_a_group() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        let old_range = e.range("szklana").unwrap();
+        let old_map = e.mapping("szklana");
+
+        // One edit (e.g. apps.toml written while the daemon was stopped): stop and join a group.
+        e.set_apps(&format!(
+            "[shared_volumes.kajet-data]\n\n[apps.szklana]\nimage = \"{IMAGE}\"\nport = 8080\n\
+             start = false\n\
+             volumes = [{{ name = \"data\", target = \"/data\" }}, \
+             {{ name = \"cache\", target = \"/cache\", read_only = true }}]\n\
+             shared_volumes = [{{ name = \"kajet-data\", target = \"/group\" }}]\n"
+        ));
+        let report = e.rec.reconcile().await.unwrap();
+        assert!(
+            report.actions.iter().any(|a| a.result.is_err()),
+            "provisioning must refuse the range change before removing the container: {report:?}"
+        );
+        assert_eq!(e.mapping("szklana"), old_map, "the old container is untouched");
+        assert_eq!(e.range("szklana"), Some(old_range));
+        assert_eq!(e.fake.volumes().len(), 2, "nothing new was created");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn re_adding_a_removed_app_cannot_join_a_group_over_its_data() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        e.rec
+            .remove_app_with_volumes(&name("szklana"), false)
+            .await
+            .unwrap();
+        e.rec.reconcile().await.unwrap();
+        assert_eq!(e.fake.volumes().len(), 2, "the data survives apps remove");
+
+        let joining: AppSpec = toml::from_str(&format!(
+            "image = \"{IMAGE}\"\nport = 8080\nshared_volumes = [{{ name = \"kajet-data\", target = \"/data\" }}]\n"
+        ))
+        .unwrap();
+        let err = e
+            .rec
+            .check_range_change(&name("szklana"), &joining)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::RangeChangeWithData { .. }),
+            "the removed app's data owner is still known: {err:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
