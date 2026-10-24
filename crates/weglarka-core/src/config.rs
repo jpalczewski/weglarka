@@ -19,6 +19,12 @@ pub struct HostConfig {
     pub platform: PlatformConfig,
     #[serde(default)]
     pub state: StateConfig,
+    /// Host directory with the app config files/directories that `apps.toml`'s `configs` mount
+    /// (issue #118, `docs/decisions/0028-config-root-mounts.md`). Absolute, or relative to the
+    /// directory of `weglarka.toml` (the caller resolves it, like `[state] dir`). Unset = the
+    /// feature is off: an app that declares `configs` is then an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_root: Option<PathBuf>,
     /// Notifications; absent = off (the events only reach the daemon log).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<NotifyConfig>,
@@ -497,6 +503,21 @@ kind = "systemd"
     fn rejects_unknown_fields() {
         let bad = SAMPLE.replace("[platform]", "[platform]\nbogus = true");
         assert!(HostConfig::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn config_root_is_optional_and_stays_out_of_the_serialized_config() {
+        let plain = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(plain.config_root.is_none());
+        assert!(!toml::to_string(&plain).unwrap().contains("config_root"));
+
+        // Both an absolute path and one relative to `weglarka.toml` are accepted verbatim; the
+        // caller decides what a relative one is relative to.
+        for path in ["/srv/weglarka/configs", "configs"] {
+            let src = format!("config_root = {path:?}\n{SAMPLE}");
+            let cfg = HostConfig::from_toml_str(&src).unwrap();
+            assert_eq!(cfg.config_root.as_deref(), Some(std::path::Path::new(path)));
+        }
     }
 
     #[test]

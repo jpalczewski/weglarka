@@ -1,11 +1,11 @@
 //! Spec flags shared by `apps add` and `apps update`: the container command, resource limits,
-//! volumes, hardening, ports published directly on the host and start dependencies. Before these
-//! existed, they could only be set through `--spec <file.toml>`.
+//! volumes, host config mounts, hardening, ports published directly on the host and start
+//! dependencies. Before these existed, they could only be set through `--spec <file.toml>`.
 
 use clap::Args;
 use weglarka_core::app::{
-    AppSpec, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedVolumeName, SharedVolumeRef,
-    VolumeMount, valid_volume_name,
+    AppSpec, ConfigMount, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedVolumeName,
+    SharedVolumeRef, VolumeMount, normalize_signal, valid_config_source, valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -27,6 +27,22 @@ pub enum HostPortFlag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependsOnFlag {
     Set(InstanceName),
+    Clear,
+}
+
+/// Value of [`SpecFlags::configs`]: a host config mount, or `none` to clear the list (the same
+/// convention as the other list flags).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFlag {
+    Set(ConfigMount),
+    Clear,
+}
+
+/// Value of [`SpecFlags::reload_signal`]: a signal name (normalized, without the `SIG` prefix), or
+/// `none` to remove it and go back to a restart-based reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadSignalFlag {
+    Set(String),
     Clear,
 }
 
@@ -55,6 +71,16 @@ pub struct SpecFlags {
     /// volume must be declared first (`weglarka volumes add NAME`); v1 allows at most one per app.
     #[arg(long = "shared-volume", value_name = "NAME=/PATH[:ro]", value_parser = parse_shared_volume, conflicts_with = "spec")]
     pub shared_volumes: Vec<SharedVolumeRef>,
+    /// Read-only host config mount from `config_root` (ADR 0028): SOURCE:TARGET, with `source`
+    /// relative to `config_root` and `target` absolute in the container (repeatable; replaces a
+    /// mount with the same `source`; `none` clears the list). Independent of the global
+    /// `--config FILE`; it conflicts with no other flag except `--spec`.
+    #[arg(long = "config-mount", value_name = "SOURCE:TARGET|none", value_parser = parse_config, conflicts_with = "spec")]
+    pub configs: Vec<ConfigFlag>,
+    /// Signal `apps reload` sends to the container, e.g. SIGHUP (`none` removes it). Without it
+    /// `apps reload` restarts the container instead. Not part of the spec hash.
+    #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
+    pub reload_signal: Option<ReloadSignalFlag>,
     /// Hardening preset: read-only root, all capabilities dropped, no-new-privileges. Combine with
     /// --tmpfs for writable paths and --cap-add for what the app really needs.
     #[arg(long, conflicts_with = "spec")]
@@ -91,6 +117,8 @@ impl SpecFlags {
             && self.cpus.is_none()
             && self.volumes.is_empty()
             && self.shared_volumes.is_empty()
+            && self.configs.is_empty()
+            && self.reload_signal.is_none()
             && !self.hardened
             && self.read_only.is_none()
             && self.tmpfs.is_empty()
@@ -124,6 +152,12 @@ impl SpecFlags {
         for v in &self.shared_volumes {
             spec.shared_volumes.retain(|x| x.name != v.name);
             spec.shared_volumes.push(v.clone());
+        }
+        apply_configs(&mut spec.configs, &self.configs);
+        match &self.reload_signal {
+            Some(ReloadSignalFlag::Set(signal)) => spec.reload_signal = Some(signal.clone()),
+            Some(ReloadSignalFlag::Clear) => spec.reload_signal = None,
+            None => {}
         }
         let sec = &mut spec.security;
         if self.hardened {
@@ -205,6 +239,60 @@ fn apply_depends_on(spec: &mut Vec<InstanceName>, flags: &[DependsOnFlag]) {
             }
         }
     }
+}
+
+/// `none` clears the list; entries replace a mount with the same `source` and are appended otherwise.
+/// Source and target are validated here too (the daemon repeats it, and the filesystem rules live
+/// there), so an obvious typo fails before anything is sent.
+fn apply_configs(spec: &mut Vec<ConfigMount>, flags: &[ConfigFlag]) {
+    for flag in flags {
+        match flag {
+            ConfigFlag::Clear => spec.clear(),
+            ConfigFlag::Set(mount) => {
+                spec.retain(|m| m.source != mount.source);
+                spec.push(mount.clone());
+            }
+        }
+    }
+}
+
+/// `SOURCE:TARGET`, or `none` to clear the list. `source` is a relative path under `config_root`
+/// (the filesystem rules — symlinks, containment — are checked by the daemon), `target` must be an
+/// absolute path in the container.
+fn parse_config(s: &str) -> Result<ConfigFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(ConfigFlag::Clear);
+    }
+    let syntax = || format!("expected SOURCE:TARGET, got {s:?}");
+    let (source, target) = s.split_once(':').ok_or_else(syntax)?;
+    if !valid_config_source(source) {
+        return Err(format!(
+            "invalid config source {source:?}: a relative path under config_root, without '.'/'..' \
+             segments"
+        ));
+    }
+    if !target.starts_with('/') {
+        return Err(format!(
+            "config target must be an absolute path in the container, got {target:?}"
+        ));
+    }
+    Ok(ConfigFlag::Set(ConfigMount {
+        source: source.to_owned(),
+        target: target.to_owned(),
+    }))
+}
+
+/// A signal name like `SIGHUP` (stored normalized, without the `SIG` prefix), or `none` to remove it.
+fn parse_reload_signal(s: &str) -> Result<ReloadSignalFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(ReloadSignalFlag::Clear);
+    }
+    normalize_signal(s).map(ReloadSignalFlag::Set).ok_or_else(|| {
+        format!(
+            "invalid signal {s:?}: expected a name like SIGHUP, SIGUSR1 or HUP (2–10 characters of \
+             [A-Z][A-Z0-9]*)"
+        )
+    })
 }
 
 /// A known app name, or `none` to clear the list.
@@ -536,6 +624,144 @@ resources = { memory = "64m", pids_limit = 10 }
         assert_eq!(spec.resources.pids_limit, None);
         assert_eq!(spec.volumes.len(), 1);
         assert_eq!(spec.volumes[0].target, "/data");
+    }
+
+    #[test]
+    fn parses_config_mounts() {
+        let mount = match parse_config("prometheus/prometheus.yml:/etc/prometheus/prometheus.yml")
+            .unwrap()
+        {
+            ConfigFlag::Set(m) => m,
+            ConfigFlag::Clear => panic!("expected a mount"),
+        };
+        assert_eq!(
+            (mount.source.as_str(), mount.target.as_str()),
+            (
+                "prometheus/prometheus.yml",
+                "/etc/prometheus/prometheus.yml"
+            )
+        );
+        // A directory mount is a config mount too.
+        assert!(matches!(
+            parse_config("prometheus/rules:/etc/prometheus/rules").unwrap(),
+            ConfigFlag::Set(m) if m.source == "prometheus/rules"
+        ));
+        assert_eq!(parse_config("none").unwrap(), ConfigFlag::Clear);
+        assert_eq!(parse_config("NONE").unwrap(), ConfigFlag::Clear);
+        // Missing separator, a non-relative source (and `.`/`..` segments) and a relative target.
+        assert!(parse_config("prometheus/prometheus.yml").is_err());
+        assert!(parse_config("/etc/shadow:/etc/shadow").is_err());
+        assert!(parse_config("../outside:/etc/x").is_err());
+        assert!(parse_config("a/../b:/etc/x").is_err());
+        assert!(parse_config("prometheus/prometheus.yml:etc/prometheus").is_err());
+        assert!(parse_config(":/etc/x").is_err());
+    }
+
+    #[test]
+    fn apply_replaces_a_config_mount_of_the_same_source_and_none_clears() {
+        let mut spec: AppSpec = toml::from_str(
+            "image = \"i\"\nconfigs = [{ source = \"app/config.yml\", target = \"/old\" }]\n\
+             reload_signal = \"SIGHUP\"\n",
+        )
+        .unwrap();
+        let flags = SpecFlags {
+            configs: vec![
+                parse_config("app/config.yml:/new").unwrap(),
+                parse_config("app/rules:/etc/rules").unwrap(),
+            ],
+            reload_signal: Some(parse_reload_signal("sigUSR1").unwrap()),
+            ..SpecFlags::default()
+        };
+        assert!(!flags.is_empty(), "the flags count as an edit");
+        flags.apply(&mut spec);
+        assert_eq!(spec.configs.len(), 2, "the same source was replaced");
+        assert_eq!(spec.configs[0].target, "/new");
+        assert_eq!(spec.configs[1].source, "app/rules");
+        assert_eq!(
+            spec.reload_signal.as_deref(),
+            Some("USR1"),
+            "stored without the SIG prefix, upper case"
+        );
+
+        SpecFlags {
+            configs: vec![parse_config("none").unwrap()],
+            reload_signal: Some(parse_reload_signal("none").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert!(spec.configs.is_empty());
+        assert_eq!(spec.reload_signal, None);
+
+        // Not giving the flags keeps the spec untouched.
+        SpecFlags::default().apply(&mut spec);
+        assert!(spec.configs.is_empty());
+        assert_eq!(spec.reload_signal, None);
+    }
+
+    #[test]
+    fn parses_and_normalizes_reload_signals() {
+        for (raw, expected) in [
+            ("SIGHUP", "HUP"),
+            ("sighup", "HUP"),
+            ("HUP", "HUP"),
+            ("sigusr1", "USR1"),
+            ("SIGTERM", "TERM"),
+        ] {
+            assert_eq!(
+                parse_reload_signal(raw).unwrap(),
+                ReloadSignalFlag::Set(expected.to_owned()),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            parse_reload_signal("none").unwrap(),
+            ReloadSignalFlag::Clear
+        );
+        for bad in [
+            "",
+            "SIG",
+            "H",
+            "HU P",
+            "SIGKILL!",
+            "-HUP",
+            "TOOOOOOOOOOOLONG",
+        ] {
+            assert!(parse_reload_signal(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn config_flags_conflict_with_spec() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Add {
+            #[command(flatten)]
+            _a: crate::cli::AddArgs,
+        }
+        assert!(
+            Add::try_parse_from([
+                "add",
+                "ntfy",
+                "img",
+                "--config-mount",
+                "app/config.yml:/etc/config.yml",
+                "--spec",
+                "f",
+            ])
+            .is_err()
+        );
+        assert!(
+            Add::try_parse_from([
+                "add",
+                "ntfy",
+                "img",
+                "--reload-signal",
+                "SIGHUP",
+                "--spec",
+                "f"
+            ])
+            .is_err()
+        );
     }
 }
 

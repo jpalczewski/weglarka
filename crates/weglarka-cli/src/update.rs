@@ -589,6 +589,155 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn config_and_reload_signal_flags_flow_through_read_modify_write() {
+        let a = args(&[
+            "--config-mount",
+            "prometheus/prometheus.yml:/etc/prometheus/prometheus.yml",
+            "--config-mount",
+            "prometheus/rules:/etc/prometheus/rules",
+            "--reload-signal",
+            "SIGHUP",
+        ]);
+        assert!(a.has_edits(), "the flags count as an edit");
+        let s = apply_flags(spec(), &a).unwrap();
+        assert_eq!(s.configs.len(), 2);
+        assert_eq!(s.configs[0].source, "prometheus/prometheus.yml");
+        assert_eq!(
+            s.reload_signal.as_deref(),
+            Some("HUP"),
+            "stored normalized, without the SIG prefix"
+        );
+        // A second pass naming one source replaces that mount only.
+        let s = apply_flags(
+            s,
+            &args(&["--config-mount", "prometheus/prometheus.yml:/etc/prom.yml"]),
+        )
+        .unwrap();
+        assert_eq!(s.configs.len(), 2);
+        assert_eq!(
+            s.configs
+                .iter()
+                .find(|m| m.source == "prometheus/prometheus.yml")
+                .unwrap()
+                .target,
+            "/etc/prom.yml",
+            "the named source was replaced"
+        );
+        assert_eq!(
+            s.configs
+                .iter()
+                .find(|m| m.source == "prometheus/rules")
+                .unwrap()
+                .target,
+            "/etc/prometheus/rules",
+            "the other mount is untouched"
+        );
+        // `none` clears both, restoring a spec that looks like the input one.
+        let s = apply_flags(
+            s,
+            &args(&["--config-mount", "none", "--reload-signal", "none"]),
+        )
+        .unwrap();
+        assert!(s.configs.is_empty());
+        assert_eq!(s.reload_signal, None);
+        assert_eq!(s, spec(), "everything else stays untouched");
+
+        // `--dry-run` shows the new lines (the whole spec travels, so the diff is the request).
+        let new = apply_flags(
+            spec(),
+            &args(&["--config-mount", "app/config.yml:/etc/app.yml"]),
+        )
+        .unwrap();
+        let diff = spec_diff(&spec(), &new);
+        assert!(diff.contains("app/config.yml"), "{diff}");
+        assert!(diff.contains("configs"), "{diff}");
+
+        // Without a flag the fields are not touched, and they conflict with `--spec`.
+        let untouched = apply_flags(spec(), &args(&["--domain", "x.example.eu"])).unwrap();
+        assert!(untouched.configs.is_empty() && untouched.reload_signal.is_none());
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        assert!(
+            W::try_parse_from([
+                "w",
+                "ntfy",
+                "--config-mount",
+                "app/config.yml:/etc/app.yml",
+                "--spec",
+                "f"
+            ])
+            .is_err()
+        );
+        assert!(
+            W::try_parse_from(["w", "ntfy", "--reload-signal", "SIGHUP", "--spec", "f"]).is_err()
+        );
+    }
+
+    #[test]
+    fn host_config_flag_stays_global_and_the_mount_flag_is_separate() {
+        use crate::cli::{AppsCommand, Cli, Command};
+        // `--config FILE` is the global host configuration flag (also after the subcommand), while
+        // `--config-mount SOURCE:TARGET` edits the app's config mounts, so both work side by side.
+        let cli = Cli::try_parse_from([
+            "weglarka",
+            "apps",
+            "update",
+            "prometheus",
+            "--config",
+            "/etc/weglarka/weglarka.toml",
+            "--config-mount",
+            "prometheus/prometheus.yml:/etc/prometheus/prometheus.yml",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new("/etc/weglarka/weglarka.toml"))
+        );
+        match cli.command {
+            Command::Apps(AppsCommand::Update(a)) => {
+                assert_eq!(a.spec_flags.configs.len(), 1);
+            }
+            other => panic!("expected apps update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_config_flag_is_global_for_every_subcommand() {
+        use crate::cli::{Cli, Command};
+        // `global = true` again: `status --config FILE` and the documented
+        // `doctor --preflight --config FILE` (docs/install.md) both set the host configuration file.
+        let cli = Cli::try_parse_from([
+            "weglarka",
+            "status",
+            "--config",
+            "/etc/weglarka/weglarka.toml",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new("/etc/weglarka/weglarka.toml"))
+        );
+        assert!(matches!(cli.command, Command::Status));
+
+        let cli = Cli::try_parse_from([
+            "weglarka",
+            "doctor",
+            "--preflight",
+            "--config",
+            "/etc/weglarka/weglarka.toml",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new("/etc/weglarka/weglarka.toml"))
+        );
+        assert!(matches!(cli.command, Command::Doctor(_)));
+    }
+
+    #[test]
     fn command_flag_replaces_and_none_clears() {
         let mut before = spec();
         before.command = vec!["serve".into()];
@@ -736,6 +885,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             spec: spec(),
             state: Default::default(),
             runtime: RuntimeState::Running,
+            configs: None,
         })
         .unwrap()
     }

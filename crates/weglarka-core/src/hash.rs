@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::app::{AppSpec, Digest, Resources, SecretBinding, Security, VolumeMount};
+use crate::app::{AppSpec, ConfigMount, Digest, Resources, SecretBinding, Security, VolumeMount};
 
 /// Version of the hash input format; bump when fields change (forces recreate of all instances).
 const HASH_FORMAT: &str = "weglarka.spec-hash/v1";
@@ -38,6 +38,10 @@ impl fmt::Display for SpecHash {
 /// so a spec that does not use them hashes exactly as before (`HASH_FORMAT` stays v1 and existing
 /// instances are not recreated by upgrading Węglarka). `command` (issue #79) is appended for the same
 /// reason: an app that does not set it keeps its hash, a change to it recreates the container.
+/// `configs` (issue #118, `docs/decisions/0028-config-root-mounts.md`) is appended last the same way:
+/// the **list** of host config mounts is a container setting, while the file content is deliberately
+/// outside the hash — editing a config must not recreate the container. `reload_signal` is omitted
+/// entirely: it only affects `apps reload`, never what the container is made of.
 #[derive(Serialize)]
 struct HashInput<'a> {
     format: &'static str,
@@ -69,6 +73,12 @@ struct HashInput<'a> {
     /// an app without a command hashes exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     command: &'a Vec<String>,
+    /// Host config mounts (issue #118): the list — source and target — is a container setting, so a
+    /// change recreates the container; the content is deliberately outside the hash. Sorted (the
+    /// order in the spec is not meaningful) and skipped while empty, so an app without configs hashes
+    /// exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    configs: Vec<&'a ConfigMount>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -124,6 +134,8 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         .collect();
     shared_volumes
         .sort_by(|a, b| (&a.name, &a.target, a.read_only).cmp(&(&b.name, &b.target, b.read_only)));
+    let mut configs: Vec<&ConfigMount> = spec.configs.iter().collect();
+    configs.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
     let input = HashInput {
         format: HASH_FORMAT,
         image_digest,
@@ -137,6 +149,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         host_ports,
         shared_volumes,
         command: &spec.command,
+        configs,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -445,5 +458,47 @@ env = { B = "2", A = "1" }
         let h1 = spec_hash_with_secrets(&spec(), &digest('a'), &one);
         assert_ne!(base, h1);
         assert_ne!(h1, spec_hash_with_secrets(&spec(), &digest('a'), &two));
+    }
+
+    /// `configs` (issue #118): the list of mounts is a container setting, the content and
+    /// `reload_signal` are not. An app without configs keeps its hash (the golden value above).
+    #[test]
+    fn configs_are_container_settings_but_reload_signal_is_not() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        let mount = |source: &str, target: &str| ConfigMount {
+            source: source.into(),
+            target: target.into(),
+        };
+        assert_eq!(base, hash(&|_| {}), "no configs hashes as before");
+        assert_ne!(base, hash(&|s| s.configs.push(mount("a.yml", "/a.yml"))));
+        assert_ne!(
+            hash(&|s| s.configs.push(mount("a.yml", "/a.yml"))),
+            hash(&|s| s.configs.push(mount("b.yml", "/a.yml"))),
+            "the source is part of the mount"
+        );
+        assert_ne!(
+            hash(&|s| s.configs.push(mount("a.yml", "/a.yml"))),
+            hash(&|s| s.configs.push(mount("a.yml", "/etc/a.yml"))),
+            "the container target is part of the mount"
+        );
+        // The order in the spec is not meaningful.
+        let a = hash(&|s| {
+            s.configs.push(mount("a.yml", "/a.yml"));
+            s.configs.push(mount("dir", "/dir"));
+        });
+        let b = hash(&|s| {
+            s.configs.push(mount("dir", "/dir"));
+            s.configs.push(mount("a.yml", "/a.yml"));
+        });
+        assert_eq!(a, b);
+        // `reload_signal` only affects `apps reload`, so it must not recreate the container.
+        let mut s = spec();
+        s.reload_signal = Some("SIGHUP".into());
+        assert_eq!(base, spec_hash(&s, &digest('a')));
     }
 }

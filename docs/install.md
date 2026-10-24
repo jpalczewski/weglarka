@@ -21,6 +21,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
 [6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
 [6k. Samoaktualizacja](#6k-samoaktualizacja-węglarki-self_update) ·
+[6l. Configi z hosta](#6l-configi-z-hosta-config_root-i-apps-reload) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -114,6 +115,10 @@ domain = "weglarka.descriptortable.eu"                     # wystawiane są tylk
 
 [state]
 dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
+
+# Katalog z plikami konfiguracyjnymi apek (sekcja 6i). Montowany read-only do kontenera Węglarki.
+# Absolutny albo względny do katalogu weglarka.toml. Nieustawione = funkcja wyłączona.
+# config_root = "/var/lib/weglarka/config"
 
 [platform]
 kind = "systemd"
@@ -1061,6 +1066,91 @@ Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, 
 `[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
 nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
 
+## 6l. Configi z hosta (`config_root`) i `apps reload`
+
+Infra-apki (Authelia #88, Prometheus, Grafana, Loki) potrzebują plików konfiguracyjnych. Zamiast wrzucać je do
+obrazu, do sekretów albo importować do wolumenu, Węglarka montuje je **read-only** z jednego katalogu na hoście i
+pozwala wskazać, jak apka ma je przeładować. Decyzja: [0028](decisions/0028-config-root-mounts.md); gotowy
+przykład: [`docs/examples/configs.toml`](examples/configs.toml).
+
+**1. Katalog.** W `weglarka.toml` dodaj `config_root` — absolutny albo względny do katalogu tego pliku:
+
+```toml
+# config_root = "/var/lib/weglarka/config"
+```
+
+Katalog należy do użytkownika runtime'u (zwykle trzyma się go jako repo git: commituj zmiany, `git checkout` to
+rollback). Demon montuje ten katalog do **swojego** kontenera read-only (potrzebuje go do `apps show` i
+`doctor`), a kontenery apek dostają własne bind-mounty read-only z libpoda. Bez `config_root` funkcja jest
+wyłączona; apka z `configs` przy pustym `config_root` jest odrzucana przy zapisie. Sam `config_root`, jeśli
+jest ustawiony, musi istnieć i być katalogiem — inaczej demon nie wystartuje.
+
+Po aktualizacji Węglarki **uruchom ponownie `weglarka platform install`** (quadlet dostaje nowy mount) — bez tego
+demon nie widzi katalogu i `doctor` to zgłosi.
+
+**2. Spec apki.** `source` jest zawsze względny do `config_root`, `target` to ścieżka w kontenerze. Mount jest
+zawsze read-only (nie ma flagi rw). Lista `configs` jest częścią `spec-hash` — zmiana **co** jest montowane
+odtwarza kontener; zmiana **treści** plików już nie.
+
+```toml
+# apps.toml / --spec
+configs = [
+  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
+  { source = "prometheus/rules", target = "/etc/prometheus/rules" },   # katalog
+]
+reload_signal = "SIGHUP"   # opcjonalnie: bez niego `apps reload` restartuje kontener
+```
+
+Przez flagi CLI: `weglarka apps update prometheus --config-mount prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+--reload-signal SIGHUP` (flaga zastępuje wpis o tym samym `source`; `--config-mount none` czyści listę). To flaga
+specu apki — globalne `--config plik.toml` (plik konfiguracji hosta) jej nie koliduje i dalej działa jak dotąd.
+
+Bezpieczeństwo: `source` musi być względny, bez `.`/`..`, po rozwiązaniu symlinków musi zostać wewnątrz
+`config_root`, a `target` podlega regułom wolumenów. Sekretów nie trzymaj w `config_root` — apka powinna czytać je
+przez `*_FILE`/env. Walidacja jest dwuwarstwowa: reguły składniowe (`source` względny, bez `..`, unikalny `target`) przy
+każdym `apps.toml`, a reguły systemu plików (symlinki, containment, plik/katalog) w reconcile, przed startem
+kontenera i przy `apps reload`. Brakujący plik nie blokuje więc dodania apki ani startu demona — blokuje samą
+apkę (`weglarka doctor` to pokaże).
+
+**3. Zmiana i reload.** Treść plików nie jest częścią `spec-hash`, więc pętla reconcile niczego nie odtwarza.
+Aplikuj zmianę jawnie:
+
+```sh
+vim /var/lib/weglarka/config/prometheus/prometheus.yml
+weglarka apps reload prometheus        # SIGHUP (spec ma reload_signal) albo restart kontenera
+git -C /var/lib/weglarka/config commit -am "scrape nowy cel"
+```
+
+`apps reload` bierze mutex silnika (serializuje się z deployem), nie zmienia `apps.toml`/`state.toml` i odmawia
+(409), gdy kontener nie działa — wtedy `weglarka apps start`. Rollback configu to `git checkout` + `apps reload`;
+rollback obrazu przywraca digest, nie pliki.
+
+**4. Edytor, inode i `--recreate`.** Edytory zapisujące przez write-and-rename zostawiają single-file bind mount
+na starym inodzie — apka nadal widzi poprzednią treść, mimo poprawnego `git status`. Rozwiązania: mountować
+**katalog** (`source = "prometheus"`, `target = "/etc/prometheus"`) albo po takim zapisie:
+
+```sh
+weglarka apps reload prometheus --recreate   # odtworzenie kontenera z przypiętego digestu (bez pullu)
+```
+
+**5. Uprawnienia i widoczność.** Pliki użytkownika runtime'u są w zakresie UID apki widoczne jako `nobody`
+([0009](decisions/0009-volume-ownership.md)), więc wystarczą `0644` dla plików i `0755` dla katalogów:
+
+```sh
+chmod -R u=rwX,go=rX /var/lib/weglarka/config
+```
+
+`weglarka apps show prometheus` wypisuje każdy mount z aktualnym fingerprintem treści, a `weglarka doctor`
+ostrzega o brakującym źródle, ucieczce poza katalog, zbyt luźnych uprawnieniach oraz o tym, że sam katalog jest
+group/world-writable.
+
+**6. Rollback Węglarki.** `weglarka.toml` i `apps.toml` mają `deny_unknown_fields`, a `apps.toml` niesie teraz
+`schema_version = 2` ([0023](decisions/0023-state-schema-version.md), powód: `configs`/`reload_signal` z #118):
+starszy demon odmówi startu z komunikatem o wersji schematu. Przed downgradem (1) usuń `config_root` z
+`weglarka.toml`, (2) usuń `configs`/`reload_signal` z apek, (3) usuń linię `schema_version` z `apps.toml` i
+`state.toml` — albo prościej: przywróć oba pliki z kopii sprzed aktualizacji (patrz
+[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Configi zostają na dysku, po prostu
+nie są montowane.
 ## 6i. Wykrywanie awarii apek (crash loop, unhealthy)
 
 Apka, która w kółko pada, nie jest dziś widoczna: każdy kontener chodzi z `restart = always`, więc Podman
@@ -1262,19 +1352,21 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
   ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy))
   i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
-  weglarka-self-update.timer`). Inaczej daemon nie wystartuje z błędem parsowania.
+  weglarka-self-update.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
+  ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)). Inaczej daemon nie wystartuje z błędem parsowania.
 
 ### Wersja schematu plików stanu (rollback między wersjami)
 
 `apps.toml` i `state.toml` mogą nieść pole `schema_version` (decyzja:
 [0023](decisions/0023-state-schema-version.md)). Zasady:
 
-- **Plik bez `schema_version` to wersja 1** — dzisiejszy kształt. Demon celowo **nie** dopisuje
-  `schema_version = 1`, więc pliki pozostają bez zmian, a rollback do Węglarki sprzed wersjonowania
-  nadal działa.
+- **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
+  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 2**
+  (configi z hosta, issue #118, [0026](decisions/0028-config-root-mounts.md)): plik v1 wczytuje się
+  bez zmian, a pierwszy zwykły zapis dopisuje `schema_version = 2`.
 - Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
-  `apps.toml`/`state.toml`); przy pierwszym starcie taka wersja uruchamia migrację i zapisuje nowy
-  numer.
+  `apps.toml`/`state.toml`); taka wersja uruchamia migrację przy odczycie, a pierwszy zwykły zapis
+  dopisuje nowy numer.
 - **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
 
   ```text
@@ -1292,7 +1384,6 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   nowszy demon migruje pliki, a starszy ich potem nie odczyta.
 - Po przywróceniu starszej kopii `state.toml` reconcile uzupełni zakresy UID z etykiet kontenerów, ale
   apki bez przypiętego `current` mogą zostać wdrożone od nowa (pull + bramka zdrowia).
-
 ### `apps update`: co się dzieje po zmianie
 
 Gdy demon jest zajęty innym deployem (bramka zdrowia trwa do kilkudziesięciu sekund), CLI nie zwraca od razu
@@ -1313,6 +1404,7 @@ diff i niczego nie wysyła.
 | `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
 | `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
 | `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
+| `--config-mount` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6l-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
   ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
   ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
   ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`

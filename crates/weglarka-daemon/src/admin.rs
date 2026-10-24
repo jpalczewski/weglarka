@@ -12,13 +12,16 @@ use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weglarka_api::{
-    AddAppRequest, ApiError, AppSummary, DeployOutcome, DeployRequest, DeployResponse, ErrorCode,
-    ListAppsResponse, ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse,
-    NotifyTestResponse, RuntimeState, SecretInfo, SetSecretRequest, ShowAppResponse,
-    StatusResponse, endpoints,
+    AddAppRequest, ApiError, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome,
+    DeployRequest, DeployResponse, ErrorCode, ListAppsResponse, ListSecretsResponse,
+    NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse, ReloadAction, ReloadRequest,
+    ReloadResponse, RuntimeState, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
+    endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::config_mounts::{self, MountStatus, MountView};
 use weglarka_core::deploy::DeployOutcome as CoreOutcome;
+use weglarka_core::deploy::ReloadOutcome;
 use weglarka_core::labels;
 use weglarka_core::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, PodmanClient,
@@ -109,6 +112,11 @@ impl From<EngineError> for Fail {
             | EngineError::SharedVolumeHasData { .. }
             | EngineError::SharedVolumeBusy { .. }
             | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
+            // Config mounts (issue #118): a spec/source problem is the request's fault (400).
+            EngineError::Configs(message) => Fail::invalid(message),
+            // `apps reload` of an app whose container is not running: nothing to signal or restart.
+            // The engine message already points at `apps start`.
+            e @ EngineError::ReloadNotRunning(_) => Fail(ErrorCode::Conflict, e.to_string()),
             other => Fail::internal(other),
         }
     }
@@ -151,6 +159,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
                 .delete(remove_app::<P>),
         )
         .route(endpoints::APPS_DEPLOY.path, post(deploy_app::<P>))
+        .route(endpoints::APPS_RELOAD.path, post(reload_app::<P>))
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
         .route(endpoints::SECRETS_REMOVE.path, delete(remove_secret::<P>))
@@ -328,6 +337,7 @@ async fn show_app<P: PodmanClient + 'static>(
             runtime_state_for(&spec, app_state, container.as_ref()),
             app_state,
         ),
+        configs: config_views(&d, &spec),
         name,
         spec,
     }))
@@ -341,6 +351,54 @@ fn load_spec<P: PodmanClient>(d: &Daemon<P>, name: &InstanceName) -> ApiResult<A
         .ok_or_else(|| Fail::not_found(format!("unknown app: {name}")))
 }
 
+/// Contract view of one declared mount (issue #118): what `apps show`/`apps reload` report.
+fn mount_view(view: MountView) -> ConfigMountView {
+    ConfigMountView {
+        source: view.source,
+        target: view.target,
+        status: match view.status {
+            MountStatus::Ok => ConfigMountStatus::Ok,
+            MountStatus::Missing => ConfigMountStatus::Missing,
+            MountStatus::NoRoot => ConfigMountStatus::NoRoot,
+            MountStatus::OutsideRoot => ConfigMountStatus::OutsideRoot,
+            MountStatus::NotFileOrDir => ConfigMountStatus::NotFileOrDir,
+            MountStatus::Unreadable => ConfigMountStatus::Unreadable,
+        },
+        fingerprint: view.fingerprint,
+        detail: view.detail,
+    }
+}
+
+/// Resolved config mounts of `spec` (issue #118); `None` when the app declares none, so the field
+/// stays out of the response and apps without configs keep their shape. `describe` never fails: a
+/// broken mount is a status the caller reports.
+fn config_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<ConfigMountView>> {
+    (!spec.configs.is_empty()).then(|| {
+        config_mounts::describe(d.paths.config_root.as_deref(), spec)
+            .into_iter()
+            .map(mount_view)
+            .collect()
+    })
+}
+
+/// `apps add`/`apps update`: an app with `configs` needs `config_root` in `weglarka.toml`. The
+/// sources themselves are not checked here — a file that does not exist yet must not block adding
+/// the app; reconcile blocks the instance and `doctor` warns until the source appears. The lexical
+/// rules (`relative`, no `..`, unique `target`) are already enforced by `state::validate_app`.
+pub(crate) fn validate_config_mounts<P: PodmanClient>(
+    d: &Daemon<P>,
+    spec: &AppSpec,
+) -> ApiResult<()> {
+    if spec.configs.is_empty() || d.paths.config_root.is_some() {
+        return Ok(());
+    }
+    Err(Fail::invalid(
+        "the app declares `configs`, but weglarka.toml sets no `config_root`; set it to the host \
+         directory with the config files, then re-run `weglarka platform install` so the daemon \
+         container mounts it read-only",
+    ))
+}
+
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 async fn add_app<P: PodmanClient + 'static>(
@@ -349,6 +407,7 @@ async fn add_app<P: PodmanClient + 'static>(
 ) -> ApiResult<Response> {
     let req: AddAppRequest = parse_json(&body)?;
     state::validate_app(&req.name, &req.spec).map_err(Fail::invalid)?;
+    validate_config_mounts(&d, &req.spec)?;
     {
         let _g = d.desired_lock.lock().await;
         let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
@@ -393,6 +452,8 @@ async fn add_app<P: PodmanClient + 'static>(
             app_state,
         ),
         state: app_state.cloned().unwrap_or_default(),
+        // Only `GET /v1/apps/{name}` resolves the mounts: add/update never touch `config_root`.
+        configs: None,
         name: req.name,
         spec: req.spec,
     }))
@@ -477,8 +538,58 @@ async fn deploy_app<P: PodmanClient + 'static>(
     Ok(json(resp))
 }
 
-// ── Secrets ──────────────────────────────────────────────────────────────────
+// ── Reload (issue #118) ─────────────────────────────────────────────────────
 
+/// `POST /v1/apps/{name}/reload`: send `reload_signal` to the running container, restart it when the
+/// spec sets none, or recreate it from the pinned digest with `{"recreate": true}` (the escape hatch
+/// for editors that save by write-and-rename — a single-file bind mount keeps the old inode).
+/// Changes no desired state; the response reports the mount views the app now sees.
+async fn reload_app<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(raw): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let name = parse_name(&raw)?;
+    let req: ReloadRequest = if body.is_empty() {
+        ReloadRequest::default()
+    } else {
+        parse_json(&body)?
+    };
+    let spec = load_spec(&d, &name)?;
+    let (action, signal) = if req.recreate {
+        // Recreating still needs a container to replace: a provisioned (`start = false`) or stopped
+        // app gets the same conflict as a plain reload, with the `apps start` hint.
+        let running = matches!(
+            d.engine
+                .podman()
+                .container_inspect(&labels::container_name(&name))
+                .await,
+            Ok(info) if info.state == ContainerState::Running
+        );
+        if !running {
+            return Err(Fail::from(EngineError::ReloadNotRunning(name)));
+        }
+        // A forced deploy goes through the existing recreate path (`launch`): ADR 0022 prescribes it
+        // for editors that save with write-and-rename. Like a deploy, it holds the engine mutex
+        // through the health gate, so it is not wrapped in `mutating()`.
+        d.engine.deploy(&name, true).await?;
+        (ReloadAction::Recreated, None)
+    } else {
+        match mutating(d.engine.reload(&name)).await? {
+            ReloadOutcome::Signalled { signal } => (ReloadAction::Signalled, Some(signal)),
+            ReloadOutcome::Restarted => (ReloadAction::Restarted, None),
+        }
+    };
+    d.changed();
+    Ok(json(ReloadResponse {
+        name,
+        action,
+        signal,
+        configs: config_views(&d, &spec),
+    }))
+}
+
+// ── Secrets ──────────────────────────────────────────────────────────────────
 fn secret_infos<P: PodmanClient>(
     d: &Daemon<P>,
     instance: &InstanceName,

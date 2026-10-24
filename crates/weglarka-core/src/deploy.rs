@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use crate::app::{AppSpec, AppsFile, Digest, InstanceName};
+use crate::app::{AppSpec, AppsFile, Digest, InstanceName, normalize_signal};
 use crate::events::Event;
 use crate::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use crate::labels;
 use crate::podman::{
-    ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
+    BindMount, ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
     PortMapping, PullEvent, RestartPolicy, image_repo,
 };
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
@@ -40,6 +40,16 @@ pub enum DeployOutcome {
     /// `start = false`: nothing was started. The image digest is pinned and the network, uid range
     /// and volumes are ready; `apps start` deploys the app later.
     Provisioned { digest: Digest },
+}
+
+/// Outcome of `apps reload` (issue #118): the running app picked up its config without being
+/// recreated. Desired state is not touched either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// `reload_signal` was sent to the running container (name without the `SIG` prefix, e.g. `HUP`).
+    Signalled { signal: String },
+    /// No signal is configured: the same container was stopped and started again.
+    Restarted,
 }
 
 // ── Helpers (pure) ──────────────────────────────────────────────────────
@@ -129,6 +139,42 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<DeployOutcome, EngineError> {
         let _g = self.lock.lock().await;
         self.deploy_locked(instance, force).await
+    }
+
+    /// `apps reload` (issue #118): make a **running** app re-read its config without recreating the
+    /// container. Sends `reload_signal` when the spec sets one, otherwise restarts the same container
+    /// (stop + start). Takes the engine lock, writes neither `apps.toml` nor `state.toml` and emits no
+    /// event; a container that is not running is refused with [`EngineError::ReloadNotRunning`].
+    pub async fn reload(&self, instance: &InstanceName) -> Result<ReloadOutcome, EngineError> {
+        let _g = self.lock.lock().await;
+        let spec = self.load_spec(instance)?;
+        // Same precondition as a deploy: a config that cannot be mounted is not reloadable either.
+        crate::config_mounts::resolve_all(self.options.config_root.as_deref(), &spec)
+            .map_err(|e| EngineError::Configs(e.to_string()))?;
+        let name = labels::container_name(instance);
+        let info = match self.podman.container_inspect(&name).await {
+            Ok(info) => info,
+            Err(PodmanError::NotFound(_)) => {
+                return Err(EngineError::ReloadNotRunning(instance.clone()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if info.state != ContainerState::Running {
+            return Err(EngineError::ReloadNotRunning(instance.clone()));
+        }
+        if let Some(raw) = &spec.reload_signal {
+            let signal = normalize_signal(raw)
+                .ok_or_else(|| EngineError::Configs(format!("invalid reload_signal {raw:?}")))?;
+            self.podman.container_kill(&name, &signal).await?;
+            tracing::info!(%instance, %signal, "sent the reload signal to the container");
+            return Ok(ReloadOutcome::Signalled { signal });
+        }
+        self.podman
+            .container_stop(&name, self.options.stop_timeout_secs)
+            .await?;
+        self.podman.container_start(&name).await?;
+        tracing::info!(%instance, "restarted the container to reload its config");
+        Ok(ReloadOutcome::Restarted)
     }
 
     /// "New image" webhook: dedup by `delivery_id`, fan-out to instances with `auto_update`.
@@ -279,7 +325,18 @@ impl<P: PodmanClient> Reconciler<P> {
         &self,
         instance: &InstanceName,
         spec: &AppSpec,
-    ) -> Result<crate::volumes::Prepared, EngineError> {
+    ) -> Result<
+        (
+            crate::volumes::Prepared,
+            Vec<crate::config_mounts::Resolved>,
+        ),
+        EngineError,
+    > {
+        // A config mount that cannot be resolved fails the deploy **before** the old container is
+        // touched (no stop/remove, and no rollback that would only restore the same broken spec,
+        // ADR 0028). The resolved canonical paths are what `launch` mounts.
+        let configs = crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
+            .map_err(|e| EngineError::Configs(e.to_string()))?;
         self.podman
             .network_create(&NetworkSpec {
                 name: labels::network_name(instance),
@@ -312,7 +369,7 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(()) | Err(PodmanError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        Ok(prepared)
+        Ok((prepared, configs))
     }
 
     /// Prepare (image, network, secrets, uid range) → remove the old one → create+start → gate.
@@ -329,7 +386,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let image = self.ensure_image(instance, spec, digest, local_id).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
-        let prepared = self.begin_instance(instance, spec).await?;
+        let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
         let network = labels::network_name(instance);
 
@@ -353,7 +410,16 @@ impl<P: PodmanClient> Reconciler<P> {
                 .collect(),
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
+            // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
+            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
+            mounts: configs
+                .iter()
+                .map(|c| BindMount {
+                    source: c.source.display().to_string(),
+                    target: c.target.clone(),
+                    read_only: true,
+                })
+                .collect(),
             volumes: vec![],
             resources: spec.resources.clone(),
             healthcheck: crate::limits::container_healthcheck(&spec.health),
@@ -617,6 +683,9 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<DeployOutcome, EngineError> {
+        // Config mounts are validated before anything is pinned or touched, exactly like a deploy.
+        crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
+            .map_err(|e| EngineError::Configs(e.to_string()))?;
         let _activity = self.begin_activity(instance, ActivityKind::Provision);
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
@@ -634,7 +703,7 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         // Same prologue as `launch`: network, the uid-range guard, the volumes, and only then the
         // old container — provisioning must not bypass the guard either (issue #75).
-        let prepared = self.begin_instance(instance, spec).await?;
+        let (prepared, _configs) = self.begin_instance(instance, spec).await?;
 
         let mut st = state::load_state(&self.paths.state)?;
         let entry = st.apps.entry(instance.clone()).or_default();

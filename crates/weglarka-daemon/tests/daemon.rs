@@ -631,14 +631,19 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
     std::fs::write(root.join("traefik.yml"), "").unwrap();
 
     // `state.toml` written by a newer schema stops the daemon before it binds anything.
-    std::fs::write(root.join("state/state.toml"), "schema_version = 2\n").unwrap();
+    let newer = weglarka_core::state::SCHEMA_VERSION + 1;
+    std::fs::write(
+        root.join("state/state.toml"),
+        format!("schema_version = {newer}\n"),
+    )
+    .unwrap();
     let err = match start(settings(root), FakePodman::new()).await {
         Ok(_) => panic!("a newer state schema must refuse to start"),
         Err(e) => e,
     };
     let message = err.to_string();
     assert!(
-        message.contains("state.toml") && message.contains("schema version 2"),
+        message.contains("state.toml") && message.contains(&format!("schema version {newer}")),
         "{message}"
     );
 
@@ -646,7 +651,7 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
     std::fs::write(root.join("state/state.toml"), "").unwrap();
     std::fs::write(
         root.join("state/apps.toml"),
-        "schema_version = 2\n[apps.a]\nimage = \"x:1\"\n",
+        format!("schema_version = {newer}\n[apps.a]\nimage = \"x:1\"\n"),
     )
     .unwrap();
     let err = match start(settings(root), FakePodman::new()).await {

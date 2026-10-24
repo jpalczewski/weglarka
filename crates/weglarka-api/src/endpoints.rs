@@ -52,6 +52,13 @@ pub const APPS_DEPLOY: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/deploy",
 };
+/// `POST` [`ReloadRequest`](crate::ReloadRequest) → [`ReloadResponse`](crate::ReloadResponse).
+/// Sends the app's `reload_signal`, restarts the container when the spec sets none, or recreates it
+/// when `recreate = true` (issue #118). Changes no desired state.
+pub const APPS_RELOAD: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/apps/{name}/reload",
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -139,6 +146,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_UPDATE,
     APPS_REMOVE,
     APPS_DEPLOY,
+    APPS_RELOAD,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

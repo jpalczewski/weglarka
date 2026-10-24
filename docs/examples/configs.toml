@@ -1,0 +1,68 @@
+# Read-only host config mounts (issue #118): `config_root` in weglarka.toml holds the files, the app spec
+# names them relative to that root, and the mount is always read-only. Files are edited in place (keep
+# config_root as a git repo — `git checkout` is the rollback), and the app picks a change up through
+# `weglarka apps reload`, without recreating the container:
+#
+#   # weglarka.toml
+#   # config_root = "/var/lib/weglarka/config"
+#
+#   # /var/lib/weglarka/config/prometheus/prometheus.yml, .../rules/*.yml
+#   weglarka apps add prometheus docker.io/prom/prometheus:latest --spec docs/examples/configs.toml
+#   weglarka apps reload prometheus
+#
+# This file is a `--spec` file (one app; `apps add --spec`, `apps update --spec`). In apps.toml the same
+# fields are inside the app table:
+#   [apps.prometheus]
+#   image = "docker.io/prom/prometheus:latest"
+#   configs = [{ source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" }]
+#   reload_signal = "SIGHUP"
+#
+# Flags added for apps where a whole TOML file is overkill:
+#   weglarka apps update prometheus \
+#     --config-mount prometheus/prometheus.yml:/etc/prometheus/prometheus.yml \
+#     --config-mount prometheus/rules:/etc/prometheus/rules \
+#     --reload-signal SIGHUP
+#   weglarka apps update prometheus --config-mount none      # clear the list
+#
+# What recreates the container and what does not:
+# - the `configs` list (source/target) is part of the spec hash, so adding/removing/retargeting a mount
+#   recreates the container from the pinned digest, without a pull;
+# - the content of the files is NOT part of the hash: editing a mounted file never recreates anything,
+#   apply it with `weglarka apps reload`;
+# - `reload_signal` is outside the hash: it only changes how reload behaves.
+#
+# A signal-based reload trusts the app to handle it (Prometheus reloads on SIGHUP; an app that does not
+# handle the signal may terminate). Without `reload_signal`, `apps reload` stops and starts the container.
+#
+# Editors that save with write-and-rename leave a single-file bind mount pointing at the old inode — the
+# app keeps the previous content. Prefer mounting a directory, or recreate the container explicitly:
+#   weglarka apps reload prometheus --recreate
+#
+# Symlinks are resolved and must stay inside config_root; `source` is relative and may not contain `..`.
+# Secrets do not belong here — keep them in the secret store and reference them from the config through
+# `*_FILE`/environment variables, never by copying the value into config_root.
+#
+# Ownership: files owned by the runtime user appear as `nobody` inside the app's uid range (ADR 0009), so
+# mode 0644 for files and 0755 for directories is what the app needs:
+#   chmod -R u=rwX,go=rX /var/lib/weglarka/config
+#
+# `weglarka apps show prometheus` lists every mount with a fingerprint of the current content and
+# `weglarka doctor` warns about missing sources and loose permissions.
+#
+# `weglarka.toml` and `apps.toml` have `deny_unknown_fields`: before downgrading Węglarka, remove
+# `config_root` and the apps' `configs`/`reload_signal` — see docs/install.md section 6l and ADR 0028.
+image = "docker.io/prom/prometheus:latest"
+domains = ["prometheus.example.com"]
+port = 9090
+# Prometheus reloads its configuration and rule files on SIGHUP: `apps reload` sends it instead of
+# restarting the container.
+reload_signal = "SIGHUP"
+configs = [
+  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
+  # A directory mount is preferred for files edited by editors that replace the file instead of rewriting
+  # it: the bind mount follows the directory, so a renamed file inside is visible after a reload.
+  { source = "prometheus/rules", target = "/etc/prometheus/rules" },
+]
+# Prometheus keeps its TSDB in a private volume (never in config_root).
+volumes = [{ name = "data", target = "/prometheus" }]
+health = { http = { path = "/-/healthy" } }

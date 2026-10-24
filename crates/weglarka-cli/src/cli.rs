@@ -34,7 +34,7 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Manage apps (add/update/remove/list/show).
+    /// Manage apps (add/update/start/stop/reload/remove/list/show).
     #[command(subcommand)]
     Apps(AppsCommand),
     /// Force an app deploy (pull, container swap, health gate, rollback if needed).
@@ -91,6 +91,9 @@ pub enum AppsCommand {
     /// Stop the app: sets `start = false` and removes the container; volumes, the uid range and the
     /// pinned image digest stay.
     Stop(StartStopArgs),
+    /// Reload the app's configs without recreating the container: sends the spec's `reload_signal`,
+    /// or restarts the container when the spec sets none. Changes no desired state.
+    Reload(ReloadArgs),
     /// Remove an app instance.
     Remove(RemoveArgs),
     /// List apps.
@@ -151,6 +154,20 @@ pub struct StartStopArgs {
     /// Send nothing; show the request that would be sent.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Flags of `apps reload`: a signal-based reload, or an explicit recreate for editors that save with
+/// write-and-rename (a single-file bind mount keeps pointing at the old inode).
+#[derive(Debug, Args)]
+pub struct ReloadArgs {
+    /// Instance name.
+    pub name: String,
+    /// Recreate the container from the pinned digest instead of reloading in place (no pull). Needed
+    /// when a single-file config mount still points at the old file: an editor saved a new inode.
+    /// The `configs` list is part of the spec hash, the file content is not, so a plain reload cannot
+    /// publish a renamed file.
+    #[arg(long)]
+    pub recreate: bool,
 }
 
 #[derive(Debug, Args)]

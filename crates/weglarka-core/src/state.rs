@@ -18,8 +18,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
-    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, valid_mount_target,
-    valid_volume_name,
+    AppSpec, AppsFile, Digest, HostPort, InstanceName, SharedVolumeName, normalize_signal,
+    valid_config_source, valid_mount_target, valid_volume_name,
 };
 use crate::hash::SpecHash;
 use crate::uid_range::UidRange;
@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -42,10 +42,18 @@ const IMPLICIT_SCHEMA_VERSION: u32 = 1;
 /// One schema migration: rewrites a parsed document in place, returning a reason on failure.
 type SchemaStep = fn(&mut toml::Table) -> Result<(), String>;
 
+/// v1 → v2: host config mounts (issue #118, ADR 0028). `AppSpec::configs` and
+/// `AppSpec::reload_signal` are optional fields with defaults, so a v1 document needs no data
+/// transformation — the version marker alone records that the file may carry them. The step is a
+/// no-op on purpose: it must also accept a hand-edited v1 file that already has the new fields.
+fn host_config_mounts_v2(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
-const SCHEMA_STEPS: &[SchemaStep] = &[];
+const SCHEMA_STEPS: &[SchemaStep] = &[host_config_mounts_v2];
 
 const _: () = assert!(
     SCHEMA_STEPS.len() as u32 == SCHEMA_VERSION - IMPLICIT_SCHEMA_VERSION,
@@ -356,6 +364,36 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         if !seen_targets.insert(v.target.trim_end_matches('/')) {
             return Err(format!("{name}: duplicate volume target {:?}", v.target));
         }
+    }
+    // Host config mounts (issue #118): lexical rules only. Whether the root is set and the sources
+    // really stay inside it is a filesystem question answered by `crate::config_mounts::validate_host`
+    // (and by `launch`/reconcile/reload, which do have the host config).
+    for mount in &spec.configs {
+        if !valid_config_source(&mount.source) {
+            return Err(format!(
+                "{name}: config source {:?} must be a relative path inside config_root (no '..')",
+                mount.source
+            ));
+        }
+        if !valid_mount_target(&mount.target) {
+            return Err(format!(
+                "{name}: config mount target {:?} must be an absolute path (no '..', ':' or ',')",
+                mount.target
+            ));
+        }
+        if !seen_targets.insert(mount.target.trim_end_matches('/')) {
+            return Err(format!(
+                "{name}: duplicate config target {:?}",
+                mount.target
+            ));
+        }
+    }
+    if let Some(signal) = &spec.reload_signal
+        && normalize_signal(signal).is_none()
+    {
+        return Err(format!(
+            "{name}: invalid reload_signal {signal:?} (expected a signal name like HUP or SIGHUP)"
+        ));
     }
     validate_security(name, &spec.security)?;
     if spec.resources.pids_limit == Some(0) {
@@ -735,7 +773,17 @@ mod tests {
             },
         );
         save_state(&paths.state, &st).unwrap();
-        assert_eq!(load_state(&paths.state).unwrap(), st);
+        let loaded = load_state(&paths.state).unwrap();
+        // The saved file has no marker (v1), so reading it runs the migration chain: the payload is
+        // unchanged, only the in-memory marker is the current version (ADR 0023).
+        assert_eq!(loaded.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(
+            StateFile {
+                schema_version: None,
+                ..loaded
+            },
+            st
+        );
         insta::assert_snapshot!(fs::read_to_string(&paths.state).unwrap());
     }
 
@@ -930,6 +978,59 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
     }
 
     #[test]
+    fn config_mounts_and_reload_signal_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("apps.toml");
+        let load = |src: &str| {
+            fs::write(&p, src).unwrap();
+            load_apps(&p)
+        };
+        let app = |extra: &str| format!("[apps.a]\nimage = \"x:1\"\n{extra}\n");
+
+        // A file and a directory mount, plus a signal spelled any way: all valid. These are lexical
+        // rules only — whether `config_root` is set is a host question answered by config_mounts.
+        assert!(
+            load(&app("configs = [\
+                 { source = \"app/config.yml\", target = \"/etc/app/config.yml\" }, \
+                 { source = \"app/conf.d\", target = \"/etc/app/conf.d\" }]\n\
+                 reload_signal = \"sighup\""))
+            .is_ok()
+        );
+
+        for bad in [
+            "configs = [{ source = \"\", target = \"/a\" }]",
+            "configs = [{ source = \"/etc/shadow\", target = \"/a\" }]",
+            "configs = [{ source = \"a/../b\", target = \"/a\" }]",
+            "configs = [{ source = \"a/./b\", target = \"/a\" }]",
+            "configs = [{ source = \"a\", target = \"relative\" }]",
+            "configs = [{ source = \"a\", target = \"/a:ro\" }]",
+            "configs = [{ source = \"a\", target = \"/a/../b\" }]",
+            "configs = [{ source = \"a\", target = \"/a\" }, { source = \"b\", target = \"/a/\" }]",
+            "volumes = [{ name = \"d\", target = \"/data\" }]\n\
+             configs = [{ source = \"a\", target = \"/data/\" }]",
+            "reload_signal = \"SIG\"",
+            "reload_signal = \"\"",
+            "reload_signal = \"HU P\"",
+            "reload_signal = \"H\"",
+        ] {
+            assert!(
+                matches!(load(&app(bad)), Err(StateError::Invalid { .. })),
+                "{bad}"
+            );
+        }
+
+        // Config targets share the uniqueness namespace with shared-volume mounts.
+        assert!(matches!(
+            load(
+                "[shared_volumes.d]\n[apps.a]\nimage = \"x:1\"\n\
+                 shared_volumes = [{ name = \"d\", target = \"/data\" }]\n\
+                 configs = [{ source = \"a\", target = \"/data/\" }]\n"
+            ),
+            Err(StateError::Invalid { .. })
+        ));
+    }
+
+    #[test]
     fn apps_validation() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("apps.toml");
@@ -944,31 +1045,48 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
     }
 
     #[test]
-    fn files_without_a_version_are_v1_and_stay_unmarked() {
+    fn files_without_a_version_are_v1_and_get_stamped_by_the_first_save() {
+        // A file without the marker is v1 (ADR 0023). From the first real schema bump on, loading it
+        // runs the migration chain and the next ordinary save writes the marker — that is what
+        // turns a silent `deny_unknown_fields` parse error into a clear downgrade message.
         let dir = tempfile::tempdir().unwrap();
         let apps_path = dir.path().join("apps.toml");
         fs::write(&apps_path, "[apps.a]\nimage = \"x:1\"\n").unwrap();
         let apps = load_apps(&apps_path).unwrap();
-        assert_eq!(apps.schema_version, None);
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
         save_apps(&apps_path, &apps).unwrap();
-        // v1 files keep their exact shape: stamping a marker would break a downgrade to a daemon
-        // that predates versioning (ADR 0023).
         assert!(
-            !fs::read_to_string(&apps_path)
+            fs::read_to_string(&apps_path)
                 .unwrap()
-                .contains("schema_version")
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
         );
 
         let state_path = dir.path().join("state.toml");
         fs::write(&state_path, "[apps.a]\ngeneration = 3\n").unwrap();
         let st = load_state(&state_path).unwrap();
-        assert_eq!(st.schema_version, None);
+        assert_eq!(st.schema_version, Some(SCHEMA_VERSION));
         save_state(&state_path, &st).unwrap();
         assert!(
-            !fs::read_to_string(&state_path)
+            fs::read_to_string(&state_path)
                 .unwrap()
-                .contains("schema_version")
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
         );
+    }
+
+    #[test]
+    fn a_v1_file_that_already_carries_the_new_app_fields_migrates_cleanly() {
+        // The v1 → v2 step is a no-op and must accept a hand-edited/rollback-restored file that
+        // already contains `configs`/`reload_signal` (issue #118).
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "[apps.a]\nimage = \"x:1\"\nconfigs = [{ source = \"a.yml\", target = \"/a.yml\" }]\nreload_signal = \"HUP\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(apps.apps[&name("a")].configs.len(), 1);
     }
 
     #[test]
@@ -997,9 +1115,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let apps_path = dir.path().join("apps.toml");
         // Under `deny_unknown_fields` the `bogus` field would win; the version must be reported
         // first — that is the whole point of issue #98.
+        let newer = SCHEMA_VERSION + 1;
         fs::write(
             &apps_path,
-            "schema_version = 2\n[apps.a]\nimage = \"x:1\"\nbogus = 1\n",
+            format!("schema_version = {newer}\n[apps.a]\nimage = \"x:1\"\nbogus = 1\n"),
         )
         .unwrap();
         let err = load_apps(&apps_path).unwrap_err();
@@ -1007,16 +1126,16 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             matches!(
                 err,
                 StateError::SchemaTooNew {
-                    found: 2,
+                    found,
                     supported: SCHEMA_VERSION,
                     ..
-                }
+                } if found == newer
             ),
             "{err}"
         );
         let message = err.to_string();
         assert!(
-            message.contains("apps.toml") && message.contains("schema version 2"),
+            message.contains("apps.toml") && message.contains(&format!("schema version {newer}")),
             "{message}"
         );
 
@@ -1057,14 +1176,15 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         fs::write(&p, "").unwrap();
         assert_eq!(load_state(&p).unwrap(), StateFile::default());
         fs::write(&p, "# nothing yet\n").unwrap();
-        assert_eq!(load_state(&p).unwrap(), StateFile::default());
+        let loaded = load_state(&p).unwrap();
+        assert_eq!(loaded.schema_version, Some(SCHEMA_VERSION));
+        assert!(loaded.apps.is_empty());
     }
 
     #[test]
     fn migrating_stamps_the_schema_version() {
-        // There is no step yet (`SCHEMA_VERSION == IMPLICIT_SCHEMA_VERSION`), so exercise the
-        // machinery directly: the first bump adds a step to `SCHEMA_STEPS` and this test keeps
-        // proving that the migrated document carries the current version.
+        // Exercise the chain directly through the implicit version: the migrated document must
+        // carry the current version (the v1 → v2 step is a no-op, ADR 0023/0026).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         let st: StateFile =

@@ -34,3 +34,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0025](0025-webhook-forgejo.md) | Forgejo webhooks: `package` event, registry host from config, pulls via `auth.json` (issue #44) |
 | [0026](0026-registry-credentials.md) | Per-app registry credentials for private image pulls (issue #44, option (b)) |
 | [0027](0027-self-update.md) | Self-update: a host-side switcher, a pinned cosign key and a schema gate |
+| [0028](0028-config-root-mounts.md) | Host config mounts (`config_root`) and app reload |

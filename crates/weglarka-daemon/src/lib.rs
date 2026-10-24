@@ -33,6 +33,7 @@ use weglarka_core::webhook::WebhookSource;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use weglarka_core::config_mounts::ConfigError;
 use weglarka_core::podman::PodmanClient;
 use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
 use weglarka_core::secret_store::SecretStore;
@@ -57,6 +58,12 @@ pub enum StartError {
     /// (issue #33).
     #[error("invalid shared volumes in apps.toml: {0}")]
     SharedVolumes(String),
+    /// The startup preconditions of host config mounts are not met: `config_root` is configured but
+    /// unusable, or an app declares `configs` while it is unset (issue #118,
+    /// `docs/decisions/0028-config-root-mounts.md`). A single missing/escaping source is *not* a
+    /// startup error — the engine refuses to mount it and `doctor` reports it.
+    #[error("config mounts: {0}")]
+    Configs(#[from] ConfigError),
     /// The `[notify]` section is invalid (bad URL/topic, unreadable token file…). Notifications are
     /// opt-in, but once configured they must work — a silent no-op would hide a broken deployment.
     #[error("notifications: {0}")]
@@ -79,6 +86,18 @@ fn io(what: impl Into<String>) -> impl FnOnce(std::io::Error) -> StartError {
     move |source| StartError::Io { what, source }
 }
 
+/// Startup preconditions of host config mounts (issue #118), deliberately tolerant about the single
+/// sources: an operator may add an app with `configs` before creating the files, and a symlink target
+/// may move. The daemon refuses to start only when:
+///
+/// * `config_root` is configured but is not a usable directory (a typo would otherwise hide every
+///   config and only surface as blocked instances), or
+/// * an app declares `configs` while `config_root` is unset (the feature is off).
+///
+/// Per-source resolution stays strict where a bind mount is actually created and where a failure can
+/// still be recovered from: the engine's `launch`/reconcile/`reload` refuse a missing or escaping
+/// source, and `doctor` reports each mount's status. `config_root` here is the path already resolved
+/// against the config directory by [`Paths::resolve`].
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -161,6 +180,10 @@ pub async fn start<P: PodmanClient + 'static>(
     // Shared-volume mounts must resolve to a declaration (issue #33). `load_apps` already enforces
     // it; kept here next to the host rules so a broken `apps.toml` is rejected at startup loudly.
     weglarka_core::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
+    // Host config mounts (issue #118): only the root's own preconditions stop the daemon — a single
+    // missing/escaping source is refused by the engine at launch and reported by `doctor`, so that an
+    // app added before its files exist does not keep the daemon from starting.
+    weglarka_core::config_mounts::validate_host(&host, &apps)?;
 
     // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
     // stops the daemon instead of failing silently at the first deploy.
@@ -179,11 +202,17 @@ pub async fn start<P: PodmanClient + 'static>(
         };
         self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     }
+    // The engine resolves and mounts an app's `configs` against the same root the API and doctor
+    // read (issue #118); `None` keeps the feature off.
+    let options = ReconcilerOptions {
+        config_root: paths.config_root.clone(),
+        ..ReconcilerOptions::default()
+    };
     let mut reconciler = Reconciler::new(
         podman,
         secrets.clone() as Arc<dyn SecretStore>,
         paths.state.clone(),
-        ReconcilerOptions::default(),
+        options,
     )
     .with_http_prober(Arc::new(health_probe::NginxProber::default_target()))
     // Crash-loop / unhealthy thresholds (`[monitor]`): the reconcile pass observes them and emits

@@ -100,7 +100,7 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `notify →
 
 | Crate | Zawartość |
 |---|---|
-| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), sekrety, wykrywanie awarii (`crash.rs`), stan samoaktualizacji (`self_update.rs`: plik stanu + czyste `decide()`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
+| `weglarka-core` | typy domenowe (`AppSpec`, `HostConfig`, stan), reconcile, deploy (bramka zdrowia, rollback), wolumeny i zakresy UID (w tym wolumeny współdzielone), configi z hosta (`config_root`, `config_mounts.rs`), sekrety, wykrywanie awarii (`crash.rs`), stan samoaktualizacji (`self_update.rs`: plik stanu + czyste `decide()`), traity (`PodmanClient`, `Platform`, `WebhookSource`, `SecretStore`) + `FakePodman` (feature `testing`) |
 | `weglarka-podman` | klient libpod v6 (hyper, unix socket) + testy integracyjne |
 | `weglarka-ingress` | czyste generatory `nginx.conf` i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
@@ -123,6 +123,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | spec-hash | `core/src/hash.rs` — co odtwarza kontener (`HashInput`) |
 | wolumeny i UID | `core/src/volumes.rs`, `core/src/uid_range.rs` (ADR 0009), wolumeny współdzielone: `core/src/shared_volumes.rs` + `core/src/volumes.rs` (ADR 0017) |
 | sekrety | `core/src/secrets.rs`, `core/src/secret_store.rs` |
+| configi z hosta i reload | `core/src/config_mounts.rs` (resolve/fingerprint/walidacja hosta), `core/src/deploy.rs` (`launch` montuje `BindMount` ro, `reload_locked`/`reload`), pola `configs`/`reload_signal` w `core/src/app.rs`, hash w `core/src/hash.rs`, `daemon/src/settings.rs` (`Paths.config_root`) + mount w `daemon/src/main.rs` (`service_spec`), trasa `api/src/endpoints.rs` → `daemon/src/admin.rs`, check `configs.*` w `daemon/src/doctor.rs`, CLI `cli/src/commands.rs`/`spec_flags.rs` (ADR 0028) |
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timer, `install_user_units`, `restart_service`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
@@ -162,6 +163,18 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
   rollback do starszego demona (`deny_unknown_fields`). Nowy kanał = `Channel` + jego nazwa w outboxie.
+- **Configi z hosta (ADR 0028):** jedno `config_root` w `weglarka.toml` (mountowane **read-only** do kontenera
+  demona w `platform install` — po upgrade trzeba go przeinstalować), `configs = [{ source, target }]` w spec
+  apki (source względny do rootu, walidacja składniowa w `validate_app`; start i zapis sprawdzają tylko sam
+  `config_root`, a canonicalize/containment źródła — reconcile i moment tworzenia kontenera). **Treść plików jest poza `spec_hash`** (edycja nic nie odtwarza),
+  **lista `configs` jest w hashu**; `reload_signal` poza hashem. Zmianę treści aplikuje `apps reload` (sygnał albo
+  restart), a single-file bind mount po write-and-rename wymaga `--recreate`. Oba pliki TOML mają
+  `deny_unknown_fields`, a `apps.toml` dostaje `schema_version = 2` (`state::SCHEMA_VERSION` + no-op
+  `SCHEMA_STEPS`, ADR 0023) → przed downgradem usunąć `config_root`, `configs`, `reload_signal` i marker
+  `schema_version` (albo przywrócić pliki z kopii). Pliki runtime usera
+  widoczne w zakresie UID apki jako `nobody` → 0644/0755. Szczegóły:
+  [`docs/decisions/0028-config-root-mounts.md`](docs/decisions/0028-config-root-mounts.md) i
+  [`docs/install.md` 6l](docs/install.md#6l-configi-z-hosta-config_root-i-apps-reload).
 - **Detekcja awarii (ADR 0022):** watcher crash loopów działa w przejściu reconcile — `container_list` już
   robi inspect każdego kontenera, więc licznik restartów (`RestartCount` → `ContainerInfo.restarts`) nie
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko

@@ -615,10 +615,15 @@ dir = "{root}/state"
             std::fs::write(root.join("traefik.yml"), "").unwrap();
             let settings = Settings::from_host(host, root.join("weglarka.toml"));
             std::fs::create_dir_all(&settings.paths.state_dir).unwrap();
+            // A current image publishes the schema it writes; without the label the gate assumes the
+            // pre-versioning schema and refuses it against a newer state (ADR 0023).
+            let podman = FakePodman::new();
+            let schema = weglarka_core::state::SCHEMA_VERSION.to_string();
+            podman.set_pull_labels(IMAGE, &[(SCHEMA_LABEL, schema.as_str())]);
             Self {
                 _dir: dir,
                 settings,
-                podman: FakePodman::new(),
+                podman,
                 signer,
                 registry: FakeRegistry::new(),
                 platform: FakePlatform::default(),
@@ -826,7 +831,10 @@ dir = "{root}/state"
         match ctx.run(Options::default()).await {
             Report::Refused { reason } => {
                 assert!(reason.contains("schema 0"), "{reason}");
-                assert!(reason.contains("schema 1"), "{reason}");
+                assert!(
+                    reason.contains(&format!("schema {}", weglarka_core::state::SCHEMA_VERSION)),
+                    "{reason}"
+                );
                 assert!(reason.contains("--force"), "{reason}");
             }
             other => panic!("expected a refusal, got {other:?}"),
