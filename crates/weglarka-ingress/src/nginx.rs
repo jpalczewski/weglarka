@@ -317,7 +317,9 @@ fn render(plan: &Plan<'_>, o: &NginxOptions, mode: &dyn ModeProfile) -> String {
             c.block("location /", |c| c.line("return 404;"));
         });
 
-        for app in &plan.apps {
+        // Apps with `start = false` are provisioned only: they reserve their domains (see plan), but
+        // have no container, so there is nothing to proxy to and no `server` block for them.
+        for app in plan.apps.iter().filter(|app| app.active) {
             c.blank();
             c.block("server", |c| {
                 mode.listen(c, false);

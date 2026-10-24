@@ -411,10 +411,21 @@ pub struct AppSpec {
     /// `false` — webhook/reconcile does not swap the image on its own.
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    /// `false` — the instance is only **provisioned** (image digest pinned, network, uid range and
+    /// volumes ready) and no container exists; `apps start` (or `start = true`) brings it up.
+    /// Not part of the spec hash: flipping it neither recreates nor pulls anything by itself.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub start: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Serde helper: omits `start` while it is `true` (the default), so existing `apps.toml` files and
+/// snapshots keep their shape.
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// Contents of `apps.toml`.
@@ -515,5 +526,21 @@ secrets = [{ secret = "config", kind = "mount", path = "/config.json" }]
 
         let bad = "[apps.x]\nimage = \"a\"\nbogus = 1\n";
         assert!(toml::from_str::<AppsFile>(bad).is_err());
+    }
+
+    #[test]
+    fn start_defaults_to_true_is_omitted_and_false_roundtrips() {
+        let plain: AppsFile = toml::from_str("[apps.a]\nimage = \"img\"\n").unwrap();
+        assert!(plain.apps[&InstanceName::new("a").unwrap()].start);
+        assert!(
+            !toml::to_string(&plain).unwrap().contains("start"),
+            "`start = true` (the default) must not be serialized"
+        );
+
+        let stopped: AppSpec = toml::from_str("image = \"img\"\nstart = false\n").unwrap();
+        assert!(!stopped.start);
+        let rendered = toml::to_string(&stopped).unwrap();
+        assert!(rendered.contains("start = false"), "{rendered}");
+        assert_eq!(toml::from_str::<AppSpec>(&rendered).unwrap(), stopped);
     }
 }

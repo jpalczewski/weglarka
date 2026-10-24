@@ -1,5 +1,5 @@
-//! `weglarka apps update <name>` (API: `APPS_UPDATE`, full spec replacement) and rendering of the
-//! "waiting for secret" state. **Owner: session 3 (iteration 2).**
+//! `weglarka apps update/start/stop <name>` (API: `APPS_UPDATE`, full spec replacement) and
+//! rendering of the "waiting for secret" state. **Owner: session 3 (iteration 2).**
 //!
 //! Read-modify-write: `GET` the current spec, apply the flags (or take a whole spec from `--spec`),
 //! `PUT` the result. The daemon replaces the spec as a whole; the diff in `--dry-run` is therefore
@@ -17,7 +17,7 @@ use weglarka_api::{
 use weglarka_core::app::{AppSpec, SecretBinding, SecretTarget};
 use weglarka_core::state::AppState;
 
-use crate::cli::parse_pair;
+use crate::cli::{StartStopArgs, parse_pair};
 use crate::client::expand_path;
 use crate::commands::{client, instance, render_show};
 use crate::error::{CliError, exit};
@@ -67,6 +67,12 @@ pub struct UpdateArgs {
     /// Disable auto-update.
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,
+    /// Set `start = true` and deploy the app now (a provisioned app gets its container).
+    #[arg(long, conflicts_with_all = ["spec", "no_start"])]
+    pub start: bool,
+    /// Set `start = false`: remove the container; volumes, the uid range and the pinned image digest stay.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_start: bool,
     #[command(flatten)]
     pub spec_flags: crate::spec_flags::SpecFlags,
     /// Replace the whole spec with an AppSpec TOML file (instead of the flags above); `-` = stdin.
@@ -91,6 +97,8 @@ impl UpdateArgs {
             || !self.unbind_secrets.is_empty()
             || self.auto_update
             || self.no_auto_update
+            || self.start
+            || self.no_start
             || !self.spec_flags.is_empty()
     }
 }
@@ -163,6 +171,12 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
         spec.auto_update = false;
     }
     a.spec_flags.apply(&mut spec);
+    if a.start {
+        spec.start = true;
+    }
+    if a.no_start {
+        spec.start = false;
+    }
     Ok(spec)
 }
 
@@ -233,6 +247,28 @@ struct NoChange {
     app: ShowAppResponse,
 }
 
+/// Prints the `PUT /v1/apps/{name}` a real run would send (`--dry-run` of update/start/stop).
+fn emit_update_dry_run(json: bool, params: &[(&str, &str)], diff: String, req: UpdateAppRequest) {
+    let out = UpdateDryRun {
+        dry_run: true,
+        method: "PUT",
+        path: expand_path(endpoints::APPS_UPDATE, params),
+        changed: !diff.is_empty(),
+        diff,
+        body: req,
+    };
+    emit(json, &out, || {
+        let mut s = format!("dry-run: {} {}\n", out.method, out.path);
+        s.push_str(&if out.changed {
+            format!("spec changes:\n{}", out.diff)
+        } else {
+            "no changes to the spec\n".to_owned()
+        });
+        s.push_str("nothing was sent\n");
+        s
+    });
+}
+
 pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32, CliError> {
     if a.spec.is_none() && !a.has_edits() {
         return Err(CliError::usage("nothing to change").with_hint(
@@ -253,24 +289,7 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
     let req = UpdateAppRequest { spec: new_spec };
 
     if a.dry_run {
-        let out = UpdateDryRun {
-            dry_run: true,
-            method: "PUT",
-            path: expand_path(endpoints::APPS_UPDATE, &params),
-            changed: !diff.is_empty(),
-            diff,
-            body: req,
-        };
-        emit(json, &out, || {
-            let mut s = format!("dry-run: {} {}\n", out.method, out.path);
-            s.push_str(&if out.changed {
-                format!("spec changes:\n{}", out.diff)
-            } else {
-                "no changes to the spec\n".to_owned()
-            });
-            s.push_str("nothing was sent\n");
-            s
-        });
+        emit_update_dry_run(json, &params, diff, req);
         return Ok(exit::OK);
     }
     if diff.is_empty() {
@@ -293,28 +312,129 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
 }
 
 fn render_update(r: &UpdateAppResponse, diff: &str) -> String {
-    let mut s = format!("updated {}\n{diff}", r.app.name);
+    render_change(
+        "updated",
+        r,
+        diff,
+        "container changes (env, port, secrets, volumes, limits) are applied by the daemon's next \
+         reconcile; domains only reload ingress\n",
+    )
+}
+
+/// Human output of a successful `PUT`: the diff, the deploy outcome and the fresh app view.
+pub(crate) fn render_change(
+    verb: &str,
+    r: &UpdateAppResponse,
+    diff: &str,
+    no_deploy: &str,
+) -> String {
+    let mut s = format!("{verb} {}\n{diff}", r.app.name);
     match &r.deploy {
+        Some(d) if d.outcome == DeployOutcome::Provisioned => s.push_str(&format!(
+            "deploy: provisioned (start = false): no container started (generation {})\n",
+            d.generation
+        )),
         Some(d) => s.push_str(&format!(
             "deploy: {:?} (generation {})\n",
             d.outcome, d.generation
         )),
-        None => s.push_str(
-            "container changes (env, port, secrets, volumes, limits) are applied by the daemon's \
-             next reconcile; domains only reload ingress\n",
-        ),
+        None => s.push_str(no_deploy),
     }
     s.push('\n');
     s.push_str(&render_show(&r.app));
     s
 }
 
+// ---------- apps start / apps stop ----------
+
+/// Shared body of `apps start` / `apps stop`: read the spec, flip `start`, `PUT` it back.
+///
+/// The flip is a spec change like any other (that is why `start` is a field, not a one-shot flag),
+/// so `--json` reuses the `apps update` shapes: `UpdateDryRun`, `UpdateAppResponse`, and
+/// `{"changed":false,"app":…}` when there is nothing to do (the flag already has the target value).
+async fn set_start(
+    json: bool,
+    o: &Overrides,
+    a: StartStopArgs,
+    start: bool,
+    verb: &str,
+    noop: &str,
+) -> Result<i32, CliError> {
+    let name = instance(&a.name)?;
+    let params = [("name", name.as_str())];
+    let client = client(o)?;
+    let current: ShowAppResponse = client
+        .call(endpoints::APPS_SHOW, &params, None::<&()>)
+        .await?;
+    if current.spec.start == start {
+        let out = NoChange {
+            changed: false,
+            app: current,
+        };
+        emit(json, &out, || format!("{name}: {noop}\n"));
+        return Ok(exit::OK);
+    }
+    let mut new_spec = current.spec.clone();
+    new_spec.start = start;
+    let diff = spec_diff(&current.spec, &new_spec);
+    let req = UpdateAppRequest { spec: new_spec };
+    if a.dry_run {
+        emit_update_dry_run(json, &params, diff, req);
+        return Ok(exit::OK);
+    }
+    let resp: UpdateAppResponse = client
+        .call(endpoints::APPS_UPDATE, &params, Some(&req))
+        .await?;
+    emit(json, &resp, || {
+        render_change(
+            verb,
+            &resp,
+            &diff,
+            "deploy: none (the flag is saved; the daemon deploys on its next reconcile, e.g. once \
+             the missing secrets are set)\n",
+        )
+    });
+    Ok(match &resp.deploy {
+        Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
+        _ => exit::OK,
+    })
+}
+
+/// `apps start`: `start = true` and a deploy (a provisioned app gets its container).
+pub async fn apps_start(json: bool, o: &Overrides, a: StartStopArgs) -> Result<i32, CliError> {
+    set_start(
+        json,
+        o,
+        a,
+        true,
+        "started",
+        "already running (start = true)",
+    )
+    .await
+}
+
+/// `apps stop`: `start = false` — the container goes away, volumes, the uid range and the pinned
+/// image digest stay (`apps start` brings the app back).
+pub async fn apps_stop(json: bool, o: &Overrides, a: StartStopArgs) -> Result<i32, CliError> {
+    set_start(
+        json,
+        o,
+        a,
+        false,
+        "stopped",
+        "already stopped (start = false)",
+    )
+    .await
+}
+
 // ---------- "waiting for secret" rendering ----------
 
-/// Runtime label for tables and `show` (`WaitingForSecret` → `waiting-for-secret`).
+/// Runtime label for tables and `show` (`WaitingForSecret` → `waiting-for-secret`,
+/// `NotStarted` → `not-started`).
 pub fn runtime_label(r: RuntimeState) -> String {
     match r {
         RuntimeState::WaitingForSecret => "waiting-for-secret".to_owned(),
+        RuntimeState::NotStarted => "not-started".to_owned(),
         other => format!("{other:?}").to_lowercase(),
     }
 }

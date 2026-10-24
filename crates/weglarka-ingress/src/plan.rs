@@ -137,6 +137,9 @@ pub struct AppRoute<'a> {
     pub port: u16,
     /// Sorted, without duplicates.
     pub domains: Vec<Domain>,
+    /// `spec.start`: `false` means the app is provisioned only (no container), so it is validated
+    /// and reserves its domains like any other app, but the generators render no route for it.
+    pub active: bool,
 }
 
 /// Webhook route: public domain → Węglarka's container.
@@ -157,7 +160,9 @@ pub struct Plan<'a> {
 
 impl<'a> Plan<'a> {
     /// Apps without domains are skipped (nothing to route). A domain must not repeat
-    /// within an app, between apps, or with the webhook domain.
+    /// within an app, between apps, or with the webhook domain. Apps with `start = false` are
+    /// validated exactly like running ones and keep their domains reserved (a later start must not
+    /// collide with, say, Coolify); only rendering skips them ([`AppRoute::active`]).
     pub fn build(
         host: &HostConfig,
         apps: &'a BTreeMap<InstanceName, AppSpec>,
@@ -191,6 +196,7 @@ impl<'a> Plan<'a> {
                 instance,
                 port,
                 domains,
+                active: spec.start,
             });
         }
 

@@ -93,6 +93,8 @@ pub struct Target {
     /// Expected `weglarka.uid-range` label (`Some` iff `pinned`, `None` = not checked). A mismatch —
     /// notably a container created before ranges existed — recreates the container once.
     pub uid_range: Option<String>,
+    /// `spec.start`: `false` means provision-only — no container may exist (one is removed).
+    pub start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,9 @@ pub enum Action {
     },
     /// The container exists but is not running (e.g. after a host restart without linger).
     Start { instance: InstanceName },
+    /// `start = false`: pin the image, create the network, the uid range and the volumes; no
+    /// container (one left over from before the flag flip is stopped and removed).
+    Provision { instance: InstanceName },
     /// Orphan or duplicate carrying the `weglarka.instance` label.
     Remove { container: String },
 }
@@ -149,6 +154,15 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
             });
         }
         if t.blocked {
+            continue;
+        }
+        if !t.start {
+            // `start = false`: provision once, and remove a container left over from before the flip.
+            if main.is_some() || t.pinned.is_none() {
+                actions.push(Action::Provision {
+                    instance: t.instance.clone(),
+                });
+            }
             continue;
         }
         let (Some(_), Some(expected)) = (&t.pinned, &t.expected_hash) else {
@@ -197,6 +211,7 @@ pub enum ActionOutcome {
     Deployed(DeployOutcome),
     Recreated(DeployOutcome),
     Started,
+    Provisioned(DeployOutcome),
     Removed,
 }
 
@@ -315,7 +330,12 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut targets = Vec::with_capacity(apps.apps.len());
         let mut waiting_changed = false;
         for (name, spec) in &apps.apps {
-            let missing = missing_secrets(&self.secrets, name, spec).await?;
+            // `start = false` needs no secrets: nothing is deployed until `apps start`.
+            let missing = if spec.start {
+                missing_secrets(&self.secrets, name, spec).await?
+            } else {
+                Vec::new()
+            };
             if apply_waiting(&mut st, name, &missing) {
                 waiting_changed = true;
                 if !missing.is_empty() {
@@ -361,6 +381,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 expected_hash,
                 blocked,
                 uid_range,
+                start: spec.start,
             });
         }
 
@@ -437,6 +458,15 @@ impl<P: PodmanClient> Reconciler<P> {
                     .await?;
                 Ok(ActionOutcome::Started)
             }
+            Action::Provision { instance } => {
+                let spec = apps
+                    .apps
+                    .get(&instance)
+                    .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
+                Ok(ActionOutcome::Provisioned(
+                    self.provision_locked(&instance, spec).await?,
+                ))
+            }
             Action::Remove { container } => {
                 self.podman.container_remove(&container, true).await?;
                 self.events.emit(Event::Pruned { container });
@@ -506,6 +536,7 @@ mod tests {
                 expected_hash: pinned.map(|_| h.clone()),
                 blocked: false,
                 uid_range: None,
+                start: true,
             },
             h,
         )
@@ -552,6 +583,33 @@ mod tests {
         assert_eq!(
             plan(&[t], &[stopped]),
             vec![Action::Start {
+                instance: name("a")
+            }]
+        );
+    }
+
+    #[test]
+    fn start_false_plans_provision_or_removal() {
+        let (mut fresh, _) = target("a", None);
+        fresh.start = false;
+        // Never deployed: provision (network, uid range, volumes, pinned digest), no container.
+        assert_eq!(
+            plan(std::slice::from_ref(&fresh), &[]),
+            vec![Action::Provision {
+                instance: name("a")
+            }]
+        );
+        // Already provisioned (pinned digest, no container): nothing to do.
+        let (mut provisioned, _) = target("b", Some('a'));
+        provisioned.start = false;
+        assert!(plan(std::slice::from_ref(&provisioned), &[]).is_empty());
+        // The flag was flipped while it ran: provision stops and removes the container.
+        let (mut running, h) = target("a", Some('a'));
+        running.start = false;
+        let c = container("a", "a", &h, ContainerState::Running);
+        assert_eq!(
+            plan(&[running], &[c]),
+            vec![Action::Provision {
                 instance: name("a")
             }]
         );

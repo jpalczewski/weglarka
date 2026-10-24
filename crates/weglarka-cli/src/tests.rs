@@ -5,22 +5,28 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use clap::Parser as _;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use weglarka_api::{
-    ApiError, DeployOutcome, DeployResponse, DoctorReport, ErrorCode, SetSecretRequest, endpoints,
+    ApiError, DeployOutcome, DeployResponse, DoctorReport, ErrorCode, RuntimeState,
+    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
 };
+use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config::HostConfig;
 
+use crate::cli::{AddArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
-use crate::commands::read_secret_value;
+use crate::commands::{build_spec, read_secret_value};
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
 use crate::preflight::testing::FakeHost;
 use crate::preflight::{Context, all_checks, render, run_checks};
+use crate::settings::Overrides;
+use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_label};
 
 // ---------- mock server on a unix socket ----------
 
@@ -498,4 +504,286 @@ fn traefik_sync_only_for_behind_on_systemd() {
     let openrc = CONFIG.replace("\n[webhook]", "\n[platform]\nkind = \"openrc\"\n[webhook]");
     let r = report(&sync_host("active\n", None), Some(&openrc));
     assert!(r.checks.iter().all(|c| c.id != "ingress.traefik_sync"));
+}
+
+// ---------- apps lifecycle: `start = false`, `apps start` / `apps stop` ----------
+
+/// `apps add` flags as parsed from the command line.
+fn add_args(extra: &[&str]) -> AddArgs {
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        a: AddArgs,
+    }
+    let mut argv = vec!["add", "ntfy", "ghcr.io/x/ntfy:latest"];
+    argv.extend_from_slice(extra);
+    Add::try_parse_from(argv).unwrap().a
+}
+
+/// `apps update` flags as parsed from the command line.
+fn update_args(extra: &[&str]) -> crate::update::UpdateArgs {
+    #[derive(clap::Parser)]
+    struct Up {
+        #[command(flatten)]
+        a: crate::update::UpdateArgs,
+    }
+    let mut argv = vec!["up", "ntfy"];
+    argv.extend_from_slice(extra);
+    Up::try_parse_from(argv).unwrap().a
+}
+
+fn app_spec(start: bool) -> AppSpec {
+    let mut spec: AppSpec = toml::from_str(
+        r#"
+image = "ghcr.io/x/ntfy:latest"
+domains = ["ntfy.example.eu"]
+port = 8085
+volumes = [{ name = "data", target = "/var/lib/ntfy" }]
+"#,
+    )
+    .unwrap();
+    spec.start = start;
+    spec
+}
+
+fn show_app(start: bool) -> ShowAppResponse {
+    ShowAppResponse {
+        name: InstanceName::new("ntfy").unwrap(),
+        spec: app_spec(start),
+        state: Default::default(),
+        runtime: if start {
+            RuntimeState::Running
+        } else {
+            RuntimeState::NotStarted
+        },
+    }
+}
+
+fn update_response(start: bool, outcome: DeployOutcome) -> String {
+    serde_json::to_string(&UpdateAppResponse {
+        app: show_app(start),
+        deploy: Some(DeployResponse {
+            outcome,
+            generation: 2,
+            digest: None,
+        }),
+    })
+    .unwrap()
+}
+
+fn overrides(m: &Mock) -> Overrides {
+    Overrides {
+        config: None,
+        socket: Some(m.socket.clone()),
+    }
+}
+
+#[test]
+fn add_no_start_builds_a_provision_only_spec() {
+    let spec = build_spec(&add_args(&["--no-start"])).unwrap();
+    assert!(!spec.start);
+    let body = serde_json::to_value(weglarka_api::AddAppRequest {
+        name: InstanceName::new("ntfy").unwrap(),
+        spec,
+    })
+    .unwrap();
+    assert_eq!(body["spec"]["start"], serde_json::json!(false));
+
+    // Without the flag the app runs; the default `start = true` is not serialized.
+    let running = build_spec(&add_args(&[])).unwrap();
+    assert!(running.start);
+    let body = serde_json::to_value(running).unwrap();
+    assert!(body.get("start").is_none(), "{body}");
+}
+
+#[test]
+fn update_flags_flip_start() {
+    assert!(
+        !apply_flags(app_spec(true), &update_args(&["--no-start"]))
+            .unwrap()
+            .start
+    );
+    assert!(
+        apply_flags(app_spec(false), &update_args(&["--start"]))
+            .unwrap()
+            .start
+    );
+
+    #[derive(clap::Parser)]
+    struct Up {
+        #[command(flatten)]
+        _a: crate::update::UpdateArgs,
+    }
+    assert!(Up::try_parse_from(["up", "ntfy", "--start", "--no-start"]).is_err());
+    assert!(Up::try_parse_from(["up", "ntfy", "--start", "--spec", "f"]).is_err());
+    assert!(Up::try_parse_from(["up", "ntfy", "--no-start", "--spec", "f"]).is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_start_puts_start_true_and_renders_the_deploy() {
+    let get = serde_json::to_string(&show_app(false)).unwrap();
+    let put = update_response(true, DeployOutcome::Deployed);
+    let m = mock(move |method, _| match method {
+        "GET" => (200, get.clone()),
+        _ => (200, put.clone()),
+    })
+    .await;
+    let code = apps_start(
+        true,
+        &overrides(&m),
+        StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("GET", "/v1/apps/ntfy")
+        );
+        assert_eq!(
+            (seen[1].method.as_str(), seen[1].path.as_str()),
+            ("PUT", "/v1/apps/ntfy")
+        );
+        // The whole spec travels (read-modify-write); only `start` flips.
+        let req: weglarka_api::UpdateAppRequest = serde_json::from_str(&seen[1].body).unwrap();
+        assert!(req.spec.start, "PUT must set start = true");
+        assert_eq!(req.spec.domains, ["ntfy.example.eu"]);
+        assert_eq!(req.spec.volumes, app_spec(false).volumes);
+    }
+
+    let rendered = render_change(
+        "started",
+        &UpdateAppResponse {
+            app: show_app(true),
+            deploy: Some(DeployResponse {
+                outcome: DeployOutcome::Deployed,
+                generation: 2,
+                digest: None,
+            }),
+        },
+        &crate::update::spec_diff(&app_spec(false), &app_spec(true)),
+        "deploy: none\n",
+    );
+    assert!(rendered.starts_with("started ntfy\n"), "{rendered}");
+    assert!(
+        rendered.contains("deploy: Deployed (generation 2)"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_stop_puts_start_false_and_renders_provisioning() {
+    let get = serde_json::to_string(&show_app(true)).unwrap();
+    let put = update_response(false, DeployOutcome::Provisioned);
+    let m = mock(move |method, _| match method {
+        "GET" => (200, get.clone()),
+        _ => (200, put.clone()),
+    })
+    .await;
+    let code = apps_stop(
+        true,
+        &overrides(&m),
+        StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].method, "PUT");
+        let body: serde_json::Value = serde_json::from_str(&seen[1].body).unwrap();
+        assert_eq!(body["spec"]["start"], serde_json::json!(false));
+    }
+
+    let rendered = render_change(
+        "stopped",
+        &UpdateAppResponse {
+            app: show_app(false),
+            deploy: Some(DeployResponse {
+                outcome: DeployOutcome::Provisioned,
+                generation: 3,
+                digest: None,
+            }),
+        },
+        &crate::update::spec_diff(&app_spec(true), &app_spec(false)),
+        "deploy: none\n",
+    );
+    assert!(rendered.starts_with("stopped ntfy\n"), "{rendered}");
+    assert!(
+        rendered
+            .contains("deploy: provisioned (start = false): no container started (generation 3)"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_stop_noop_sends_nothing() {
+    let get = serde_json::to_string(&show_app(true)).unwrap();
+    let m = mock(move |_, _| (200, get.clone())).await;
+    let code = apps_start(
+        true,
+        &overrides(&m),
+        StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+
+    let get = serde_json::to_string(&show_app(false)).unwrap();
+    let m = mock(move |_, _| (200, get.clone())).await;
+    let code = apps_stop(
+        true,
+        &overrides(&m),
+        StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_dry_run_sends_nothing() {
+    let get = serde_json::to_string(&show_app(false)).unwrap();
+    let m = mock(move |_, _| (200, get.clone())).await;
+    let code = apps_start(
+        true,
+        &overrides(&m),
+        StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+}
+
+#[test]
+fn runtime_labels_cover_the_lifecycle() {
+    assert_eq!(runtime_label(RuntimeState::NotStarted), "not-started");
+    assert_eq!(runtime_label(RuntimeState::Running), "running");
+    assert_eq!(runtime_label(RuntimeState::Stopped), "stopped");
+    assert_eq!(
+        runtime_label(RuntimeState::WaitingForSecret),
+        "waiting-for-secret"
+    );
 }

@@ -108,6 +108,30 @@ port = 8085
 health = { attempts = 3, window_secs = 6 }
 "#;
 
+/// `start = false`: provisioned only, no container is created/started.
+const PROVISION_ONLY: &str = r#"
+[apps.gate]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+start = false
+volumes = [{ name = "data", target = "/data" }]
+"#;
+
+/// `start = false` binds a secret that is not set: that must not block provisioning.
+const STOPPED_WITH_SECRET: &str = r#"
+[apps.gate]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+start = false
+secrets = [{ secret = "token", kind = "env", var = "TOKEN" }]
+"#;
+
+/// Running app with a volume, used to check that flipping `start` off keeps the data.
+const RUNNING_WITH_VOLUME: &str = r#"
+[apps.gate]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+volumes = [{ name = "data", target = "/data" }]
+"#;
+
 #[tokio::test(start_paused = true)]
 async fn fresh_deploy_then_converged() {
     let h = Harness::new(NTFY);
@@ -141,6 +165,101 @@ async fn fresh_deploy_then_converged() {
 
     // Second pass: nothing to do.
     assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_false_provisions_without_a_container() {
+    let h = Harness::new(PROVISION_ONLY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(matches!(
+        single(&report),
+        ActionOutcome::Provisioned(DeployOutcome::Provisioned { .. })
+    ));
+    assert!(
+        h.fake.containers().is_empty(),
+        "start = false means no container"
+    );
+    let gate = name("gate");
+    assert_eq!(h.fake.networks(), vec![labels::network_name(&gate)]);
+    let volumes: Vec<String> = h.fake.volumes().into_iter().map(|v| v.name).collect();
+    assert_eq!(volumes, vec![labels::volume_name(&gate, "data")]);
+    let st = h.state("gate");
+    assert_eq!(st.current, Some(digest('a')));
+    assert!(st.uid_range.is_some());
+
+    // Idempotent: the next pass has nothing to do and does not pull again.
+    let pulls = |h: &Harness| {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ImagePull(_)))
+            .count()
+    };
+    let before = pulls(&h);
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.actions.is_empty(), "{:?}", report.actions);
+    assert!(report.is_clean());
+    assert_eq!(pulls(&h), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deploy_honours_start_false_and_needs_no_secrets() {
+    let h = Harness::new(STOPPED_WITH_SECRET);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let outcome = h.rec.deploy(&name("gate"), false).await.unwrap();
+    assert!(matches!(outcome, DeployOutcome::Provisioned { .. }));
+    assert!(h.fake.containers().is_empty());
+    assert_eq!(h.state("gate").current, Some(digest('a')));
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_false_with_unset_secrets_does_not_wait() {
+    let h = Harness::new(STOPPED_WITH_SECRET);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean());
+    assert!(report.waiting.is_empty(), "{:?}", report.waiting);
+    assert!(h.state("gate").waiting_for_secrets.is_empty());
+    assert!(matches!(single(&report), ActionOutcome::Provisioned(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_after_provision_starts_from_the_pinned_digest() {
+    let h = Harness::new(PROVISION_ONLY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap(); // provision only
+    h.set_apps(&PROVISION_ONLY.replace("start = false", "start = true"));
+
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(matches!(
+        single(&report),
+        ActionOutcome::Recreated(DeployOutcome::Deployed { .. })
+    ));
+    let containers = h.fake.containers();
+    assert_eq!(containers.len(), 1);
+    assert_eq!(containers[0].state, ContainerState::Running);
+    assert!(h.state("gate").generation > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flipping_start_off_removes_the_container_and_keeps_the_data() {
+    let h = Harness::new(RUNNING_WITH_VOLUME);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap(); // deploy
+    assert_eq!(h.fake.containers().len(), 1);
+
+    h.set_apps(&RUNNING_WITH_VOLUME.replace("port = 8085", "port = 8085\nstart = false"));
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(matches!(single(&report), ActionOutcome::Provisioned(_)));
+    assert!(h.fake.containers().is_empty());
+    let st = h.state("gate");
+    assert_eq!(st.current, Some(digest('a')));
+    assert!(st.uid_range.is_some());
+    assert_eq!(h.fake.volumes().len(), 1, "the volume and its data stay");
 }
 
 #[tokio::test(start_paused = true)]

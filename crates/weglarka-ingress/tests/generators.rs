@@ -7,12 +7,20 @@ use common::*;
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_ingress::nginx::{self, NginxOptions};
 use weglarka_ingress::traefik::{self, TraefikOptions};
-use weglarka_ingress::{Cidr, IngressError};
+use weglarka_ingress::{Cidr, Domain, IngressError, Plan};
 
 fn opts() -> NginxOptions {
     NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
         .with_trusted_proxies(&["10.89.0.0/24".into()])
         .unwrap()
+}
+
+/// The `start = false` (provision-only) form of [`app_with`].
+fn stopped(mut apps: BTreeMap<InstanceName, AppSpec>) -> BTreeMap<InstanceName, AppSpec> {
+    for spec in apps.values_mut() {
+        spec.start = false;
+    }
+    apps
 }
 
 fn layouts() -> Vec<(&'static str, BTreeMap<InstanceName, AppSpec>)> {
@@ -133,6 +141,94 @@ fn rejects_port_problems_and_duplicates() {
     assert!(matches!(
         nginx::generate(&h, &app_with(&["weglarka.example.eu"], Some(80)), &opts()),
         Err(IngressError::DuplicateDomain(_))
+    ));
+}
+
+#[test]
+fn start_false_apps_are_validated_and_reserve_domains_but_are_not_rendered() {
+    let h = host();
+    let a = stopped(app_with(&["off.example.eu"], Some(80)));
+
+    // The plan still carries the route: the domain is reserved even though the app does not run.
+    let plan = Plan::build(&h, &a).unwrap();
+    assert_eq!(plan.apps.len(), 1);
+    assert!(
+        !plan.apps[0].active,
+        "start = false must map to active = false"
+    );
+    assert_eq!(
+        plan.apps[0]
+            .domains
+            .iter()
+            .map(Domain::as_str)
+            .collect::<Vec<_>>(),
+        ["off.example.eu"]
+    );
+
+    // No route may reach a container that does not exist.
+    let conf = nginx::generate(&h, &a, &opts()).unwrap();
+    assert!(
+        !conf.contains("off.example.eu"),
+        "nginx rendered a server block for a start = false app"
+    );
+    assert!(
+        !conf.contains("set $app \"app\";"),
+        "nginx rendered the app access-log name"
+    );
+    assert!(conf.contains("server_name _;"), "default server must stay");
+
+    let yml = traefik::generate(&h, &a, &TraefikOptions::default()).unwrap();
+    assert!(
+        !yml.contains("off.example.eu"),
+        "traefik rendered a router for a start = false app"
+    );
+    assert!(!yml.contains("weglarka-app-app"), "app router name leaked");
+    assert!(
+        yml.contains("weglarka-webhooks"),
+        "webhook router must stay"
+    );
+}
+
+#[test]
+fn start_false_apps_still_take_part_in_validation() {
+    let h = host();
+    // A duplicate domain of an inactive app is still a duplicate: starting it later would hijack
+    // the other app's traffic.
+    let dup = apps(
+        r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["dup.example.eu"]
+port = 80
+
+[apps.b]
+image = "ghcr.io/x/b:latest"
+domains = ["dup.example.eu"]
+port = 80
+start = false
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &dup),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    assert!(matches!(
+        nginx::generate(&h, &dup, &opts()),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+
+    // Domains and ports are validated exactly like for a running app.
+    assert!(matches!(
+        Plan::build(&h, &stopped(app_with(&["a.com; return 200"], Some(80)))),
+        Err(IngressError::InvalidDomain { .. })
+    ));
+    assert!(matches!(
+        Plan::build(&h, &stopped(app_with(&["off.example.eu"], None))),
+        Err(IngressError::MissingPort(_))
+    ));
+    assert!(matches!(
+        Plan::build(&h, &stopped(app_with(&["off.example.eu"], Some(0)))),
+        Err(IngressError::InvalidPort(_))
     ));
 }
 
