@@ -28,7 +28,9 @@ So a `set_real_ip_from` limited to Docker's ranges never matched: no `X-Forwarde
 
 **Security reasoning.** In `behind` the published port is reachable only from Traefik (UFW: only the `coolify`
 network → 8088), so trusting the forwarder = trusting Traefik. Because only `net-weglarka` is trusted, apps cannot
-impersonate it. In `edge` mode (future) direct clients must never be trusted.
+impersonate it. In `edge` mode direct clients must never be trusted — implemented in
+[0036](0036-edge-mode.md): no `real_ip`, no trust map, the forwarded headers are rebuilt from
+`$remote_addr`/`$scheme`/`$host`.
 
 **Alternative considered: pasta for the nginx container** (`--network pasta` preserves the source address) — it
 cannot be combined with user networks (aardvark DNS, per-app networks `proxy_pass` relies on). Rejected.

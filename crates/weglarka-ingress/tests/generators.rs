@@ -5,6 +5,7 @@ use std::net::IpAddr;
 
 use common::*;
 use weglarka_core::app::{AppSpec, InstanceName};
+use weglarka_core::config::IngressMode;
 use weglarka_ingress::nginx::{self, NginxOptions};
 use weglarka_ingress::traefik::{self, TraefikOptions};
 use weglarka_ingress::{Cidr, Domain, IngressError, Plan};
@@ -59,11 +60,27 @@ fn output_is_deterministic() {
 /// Hardening assumption (docs/decisions/0014): the nginx container has a read-only root, and the only
 /// writable filesystem it gets is libpod's tmpfs on `/tmp` (`/var/tmp`, `/run`). Every path nginx writes
 /// at startup — its pid and the request-body/proxy temp directories — therefore has to live under `/tmp`;
-/// a directive writing elsewhere would break the hardened container, not just this test.
+/// a directive writing elsewhere would break the hardened container, not just this test. Holds for both
+/// ingress modes (issue #95).
 #[test]
 fn writable_nginx_paths_stay_under_tmp() {
+    let mut cases: Vec<(String, String)> = Vec::new();
     for (name, apps) in layouts() {
-        let conf = nginx::generate(&host(), &apps, &opts()).unwrap();
+        cases.push((
+            format!("behind_{name}"),
+            nginx::generate(&host(), &apps, &opts()).unwrap(),
+        ));
+        cases.push((
+            format!("edge_{name}"),
+            nginx::generate(
+                &edge_host(),
+                &apps,
+                &edge_opts(&["nz.example.eu", "blog.example.eu", "weglarka.example.eu"]),
+            )
+            .unwrap(),
+        ));
+    }
+    for (name, conf) in cases {
         let mut checked = 0;
         for line in conf.lines() {
             let Some((directive, value)) = line.trim().split_once(' ') else {
@@ -511,17 +528,234 @@ fn rejects_bad_options() {
 }
 
 #[test]
-fn edge_mode_is_not_supported_yet() {
-    let mut h = host();
-    h.ingress.mode = weglarka_core::config::IngressMode::Edge;
+fn edge_mode_renders_without_traefik_and_rejects_it() {
+    // Traefik has no part in `edge`: the generator refuses that mode, so a stale
+    // `traefik_dynamic_file` cannot publish a second, unmanaged entrypoint.
     assert!(matches!(
-        nginx::generate(&h, &BTreeMap::new(), &opts()),
-        Err(IngressError::UnsupportedMode(_))
+        traefik::generate(&edge_host(), &BTreeMap::new(), &TraefikOptions::default()),
+        Err(IngressError::UnsupportedMode(IngressMode::Edge))
     ));
+}
+
+/// `edge` options: no trusted peer, one fixed TLS fingerprint, the given domains have certificates.
+fn edge_opts(certificates: &[&str]) -> NginxOptions {
+    let mut o = NginxOptions::new(vec!["10.89.0.1".parse().unwrap()]);
+    o.certificates = certificates
+        .iter()
+        .map(|d| Domain::new(*d).unwrap())
+        .collect();
+    o.tls_fingerprint = Some("1a2b3c4d".to_owned());
+    o
+}
+
+#[test]
+fn nginx_edge_snapshots() {
+    let h = edge_host();
+    for (name, apps) in layouts() {
+        // The webhook domain always has a certificate; the many-app layout leaves some app domains
+        // without one on purpose, so both the TLS and the plain-HTTP-only branches are pinned.
+        let certs: &[&str] = match name {
+            "no_apps" => &["weglarka.example.eu"],
+            "one_app" => &["nz.example.eu", "weglarka.example.eu"],
+            _ => &["blog.example.eu", "example.eu", "weglarka.example.eu"],
+        };
+        let conf = nginx::generate(&h, &apps, &edge_opts(certs)).unwrap();
+        insta::assert_snapshot!(format!("nginx_edge_{name}"), conf);
+    }
+}
+
+#[test]
+fn nginx_edge_paths_snapshot() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(PATH_APPS),
+        &edge_opts(&["app.example.eu", "weglarka.example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_paths", conf);
+}
+
+/// The `server { … }` block of `domain` that listens on TLS.
+fn tls_server(conf: &str, domain: &str) -> String {
+    let block = conf
+        .split("    server {\n")
+        .skip(1)
+        .find(|b| {
+            b.contains(" ssl;")
+                && b.lines()
+                    .any(|l| l.trim_start().starts_with("server_name ") && l.contains(domain))
+        })
+        .unwrap_or_else(|| panic!("no TLS server block for {domain} in\n{conf}"));
+    block.split("\n    }").next().unwrap_or(block).to_owned()
+}
+
+#[test]
+fn edge_plain_http_serves_acme_and_redirects_everything_else() {
+    let conf =
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&["nz.example.eu"])).unwrap();
+    let plain = server_block(&conf, "nz.example.eu");
+    assert!(plain.contains("listen 8080;"), "{plain}");
+    assert!(
+        plain.contains("return 301 https://$host$request_uri;"),
+        "{plain}"
+    );
+    assert!(
+        !plain.contains("proxy_pass"),
+        "plain HTTP must not proxy the app: {plain}"
+    );
+    // The ACME prefix is served from the webroot, before the catch-all redirect.
+    assert!(
+        plain.contains("location ^~ /.well-known/acme-challenge/ {"),
+        "{plain}"
+    );
+    assert!(plain.contains("alias /etc/nginx/acme/;"), "{plain}");
+    assert!(plain.contains("limit_except GET"), "{plain}");
+    assert!(
+        plain.find("acme-challenge").unwrap() < plain.find("location / {").unwrap(),
+        "the ACME location must win over the redirect: {plain}"
+    );
+    // The TLS server of the same domain proxies it.
+    let tls = tls_server(&conf, "nz.example.eu");
+    assert!(
+        tls.contains("ssl_certificate /etc/nginx/tls/nz.example.eu.crt;"),
+        "{tls}"
+    );
+    assert!(
+        tls.contains("ssl_certificate_key /etc/nginx/tls/nz.example.eu.key;"),
+        "{tls}"
+    );
+    assert!(tls.contains("http2 on;"), "{tls}");
+    assert!(tls.contains("proxy_pass $upstream;"), "{tls}");
+}
+
+#[test]
+fn edge_serves_tls_only_for_domains_with_a_certificate() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(MANY_APPS),
+        &edge_opts(&["blog.example.eu"]),
+    )
+    .unwrap();
+    assert!(
+        tls_server(&conf, "blog.example.eu").contains("proxy_pass"),
+        "a certified domain is served over TLS"
+    );
+    // Every other routed domain (app or webhook) keeps the redirect but has no certificate.
+    for domain in [
+        "www.blog.example.eu",
+        "example.eu",
+        "nz.example.eu",
+        "weglarka.example.eu",
+    ] {
+        assert!(
+            !conf.contains(&format!("ssl_certificate /etc/nginx/tls/{domain}.crt")),
+            "{domain} must not have a TLS server"
+        );
+        assert!(
+            server_block(&conf, domain).contains("return 301 https://$host$request_uri;"),
+            "{domain}: plain HTTP must still redirect"
+        );
+    }
+    // Nothing silently proxies over plain HTTP.
+    for block in conf.split("    server {\n").skip(1) {
+        let block = block.split("\n    }").next().unwrap_or(block);
+        if !block.contains(" ssl;") && !block.contains("ssl_reject_handshake") {
+            assert!(
+                !block.contains("proxy_pass"),
+                "plain-HTTP server proxies: {block}"
+            );
+        }
+    }
+}
+
+#[test]
+fn edge_rejects_an_unknown_sni_without_a_certificate() {
+    let conf =
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&["nz.example.eu"])).unwrap();
+    assert!(conf.contains("listen 8443 ssl default_server;"), "{conf}");
+    assert!(conf.contains("ssl_reject_handshake on;"), "{conf}");
+    // The default TLS server must not borrow any app certificate.
+    let default = conf
+        .split("    server {\n")
+        .skip(1)
+        .find(|b| b.contains("ssl_reject_handshake"))
+        .expect("default TLS server");
+    assert!(!default.contains("ssl_certificate"), "{default}");
+}
+
+#[test]
+fn edge_never_trusts_forwarded_headers() {
+    let conf =
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&["nz.example.eu"])).unwrap();
+    assert!(!conf.contains("set_real_ip_from"), "{conf}");
+    assert!(!conf.contains("$weglarka_trusted"), "{conf}");
+    assert!(!conf.contains("$http_x_forwarded_proto"), "{conf}");
+    // The headers are nginx's own: a direct client cannot choose them.
+    assert!(
+        conf.contains("proxy_set_header X-Forwarded-For $remote_addr;"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("proxy_set_header X-Forwarded-Host $host;"),
+        "{conf}"
+    );
+}
+
+#[test]
+fn edge_options_reject_behind_settings_and_bad_paths() {
+    let h = edge_host();
+    let a = apps(ONE_APP);
+    let mut o = edge_opts(&["nz.example.eu"]);
+    o.trusted_proxies = vec!["10.89.0.0/24".parse().unwrap()];
     assert!(matches!(
-        traefik::generate(&h, &BTreeMap::new(), &TraefikOptions::default()),
-        Err(IngressError::UnsupportedMode(_))
+        nginx::generate(&h, &a, &o),
+        Err(IngressError::InvalidOption {
+            name: "trusted_proxies",
+            ..
+        })
     ));
+
+    let mut o = edge_opts(&["nz.example.eu"]);
+    o.tls_fingerprint = None;
+    assert!(matches!(
+        nginx::generate(&h, &a, &o),
+        Err(IngressError::InvalidOption {
+            name: "tls_fingerprint",
+            ..
+        })
+    ));
+    let mut o = edge_opts(&["nz.example.eu"]);
+    o.tls_fingerprint = Some("../../etc".to_owned());
+    assert!(nginx::generate(&h, &a, &o).is_err());
+
+    // The certificate and webroot paths land verbatim in the config: only safe container paths.
+    for bad in [
+        "relative/tls",
+        "/etc/nginx/tls/",
+        "/etc/nginx/../x",
+        "/etc/nginx/t ls",
+    ] {
+        let mut o = edge_opts(&["nz.example.eu"]);
+        o.cert_dir = bad.into();
+        assert!(nginx::generate(&h, &a, &o).is_err(), "accepted {bad:?}");
+    }
+}
+
+#[test]
+fn edge_output_is_independent_of_the_certificate_order() {
+    let h = edge_host();
+    let a = apps(MANY_APPS);
+    let first = nginx::generate(&h, &a, &edge_opts(&["blog.example.eu", "nz.example.eu"])).unwrap();
+    let second =
+        nginx::generate(&h, &a, &edge_opts(&["nz.example.eu", "blog.example.eu"])).unwrap();
+    assert_eq!(
+        first, second,
+        "the certificate list must not drive ordering"
+    );
 }
 
 #[test]

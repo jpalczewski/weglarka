@@ -121,6 +121,20 @@ pub fn apt_installed_from(policy: &str, needle: &str) -> Option<bool> {
 }
 
 /// Whether a process with `uid`/`gids` could write the file (classic mode bits; ACLs ignored).
+/// Whether `uid`/`gids` may read the file (the same mode arithmetic as [`can_write`]).
+pub fn can_read(stat: &FileStat, uid: u32, gids: &[u32]) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    if stat.uid == uid {
+        stat.mode & 0o400 != 0
+    } else if gids.contains(&stat.gid) {
+        stat.mode & 0o040 != 0
+    } else {
+        stat.mode & 0o004 != 0
+    }
+}
+
 pub fn can_write(stat: &FileStat, uid: u32, gids: &[u32]) -> bool {
     if uid == 0 {
         return true;

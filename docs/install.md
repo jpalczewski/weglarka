@@ -25,6 +25,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6m. Wspólna sieć między apkami](#6m-wspólna-sieć-między-apkami-shared_networks) ·
 [6n. Ścieżki na jednej domenie](#6n-ścieżki-na-jednej-domenie-paths) ·
 [6o. Limit rozmiaru żądania](#6o-limit-rozmiaru-żądania-ingressmax_body_size) ·
+[6p. Tryb `edge`](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -65,7 +66,16 @@ Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie i
   wpuszczać** — reguły dodaje rola `weglarka_host` w Ansible, Węglarka firewalla nie zmienia. Porty < 1024
   wymagają `net.ipv4.ip_unprivileged_port_start=0` na hoście **i** `[runtime] allow_privileged_host_ports = true`
   w `weglarka.toml`; bez sysctla sam start kontenera się nie powiedzie;
-- DNS: rekord domeny webhooków (`[webhook] domain`) i domen apek wskazuje na host (Traefik terminuje TLS).
+- (tryb `edge`) **porty 80/443 na hoście**: nginx Węglarki publikuje je bezpośrednio (w kontenerze nadal
+  nasłuchuje na 8080/8443), więc rootless Podman potrzebuje `net.ipv4.ip_unprivileged_port_start=0` **i**
+  `[runtime] allow_privileged_host_ports = true` w `weglarka.toml` (ta sama flaga co przy `host_ports`,
+  [6c](#6c-porty-publikowane-na-hoście-host_ports)); bez niej walidacja odmawia startu, a bez sysctla nie
+  powiedzie się publikacja portu. UFW musi wpuszczać 80 i 443. TLS i certyfikaty leżą w katalogu stanu
+  (`<state>/nginx/tls`, katalog `0700`, klucz `0600`), webroot ACME w `<state>/nginx/acme` (`0755`, pliki
+  `0644`) — [6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu). Porty inne niż 80/443 (np. 18080/18443)
+  pozwalają uruchomić `edge` bez sysctla — tak robi CI;
+- DNS: rekord domeny webhooków (`[webhook] domain`) i domen apek wskazuje na host (w `behind` TLS terminuje
+  Traefik, w `edge` — nginx Węglarki).
 
 Sprawdzenie (jako użytkownik runtime'u, po zapisaniu `weglarka.toml`):
 
@@ -79,7 +89,13 @@ Każde `warn`/`fail` ma podpowiedź naprawy (`runtime.subuid`, `runtime.linger`,
 Wybrane sprawdzenia hosta:
 `runtime.subuid`/`subgid` (warn < 1 000 000 id, fail < 65 536), `runtime.apparmor_userns` (Ubuntu 24.04:
 profil `podman` załadowany, gdy `apparmor_restrict_unprivileged_userns=1`; pełny wynik tylko jako root),
-`ingress.bind_free` (port `bind` nie zajęty przez cudzy proces, np. Traefika), `ingress.traefik_sync`
+`ingress.config` (klucze `[ingress]` pasują do trybu: `edge` wymaga `https_bind`, a odrzuca
+`traefik_dynamic_file`/`trusted_proxies` oraz porty < 1024 bez `allow_privileged_host_ports`),
+`ingress.bind`/`ingress.bind_free` (adresy i porty publikacji — w `edge` **oba**, HTTP i TLS — nie zajęte
+przez cudzy proces, np. Traefika), `ingress.tls` (tylko `edge`: każda routowana domena ma parę
+`<domena>.crt`/`<domena>.key` w `<nginx_conf_dir>/tls`; brak to `warn`, bo #96 zrobi to automatycznie),
+`ingress.privileged_ports` (tylko `edge` z portem < 1024: czy `net.ipv4.ip_unprivileged_port_start` na to
+pozwala), `ingress.traefik_sync`
 (tryb `behind`: aktywny `weglarka-traefik-sync.path`, gdy istnieje `/etc/weglarka/traefik-policy.json`;
 domeny z `apps.toml` na allowliście polityki, klucz `allowed_domains`), `apps.host_ports_free` (porty z
 `apps.toml` nie zajęte przez cudzy proces — `/proc/net/tcp*`, jak `ingress.bind_free` — oraz porty < 1024 bez
@@ -109,6 +125,12 @@ nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421
 # kontenera nginx we wszystkich jego sieciach (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE
 # domyślną i jest statyczna (adresy kontenera mogą się zmienić). Zwykle zostaw nieustawione.
 # trusted_proxies = ["10.89.1.2"]
+# Tryb `edge` (issue #95, 0036): nginx sam terminuje TLS i publikuje DWA porty — `bind` (HTTP: tylko
+# przekierowanie na HTTPS i ACME) oraz `https_bind` (TLS). `traefik_dynamic_file` i `trusted_proxies` są
+# wtedy odrzucane przez walidację, a certyfikaty kładziesz w <state>/nginx/tls (6p).
+# mode = "edge"
+# bind = "0.0.0.0:80"
+# https_bind = "0.0.0.0:443"
 
 [admin]
 socket = "/var/lib/weglarka/run/admin.sock"
@@ -259,7 +281,11 @@ weglarka doctor            # autodiagnoza przez API (--json dla maszyn)
 ## Odbiór na hoście (`scripts/acceptance.sh`)
 
 Test łańcucha na prawdziwym hoście: preflight i `doctor`, kanarek `traefik/whoami` na domenie testowej
-(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204) i sprzątanie. Uruchamiaj **po instalacji**
+(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204) i sprzątanie. **W trybie `edge`** skrypt
+wykrywa tryb z `weglarka.toml` (albo `--edge`), sam składa certyfikat testowy dla domeny kanarka w
+`<nginx_conf_dir>/tls`, czeka na przeładowanie nginx i sprawdza ruch po `https` na porcie z `[ingress]
+https_bind`, przekierowanie na porcie HTTP oraz webroot ACME (`/.well-known/acme-challenge/`); `--direct`
+jest wtedy odrzucane. Uruchamiaj **po instalacji**
 i **po każdej aktualizacji Węglarki** (zanim ruszysz prawdziwą apkę), jako użytkownik runtime'u:
 
 ```sh
@@ -965,8 +991,9 @@ Gotowy plik: [`docs/examples/streaming.toml`](examples/streaming.toml).
 - Apka, która ma WebSocket i włączy streaming, dostaje przy okazji dłuższy idle timeout (180 s zamiast 60 s) —
   zwykle dokładnie to, czego chce, ale to zmiana zachowania, nie efekt uboczny.
 - **Traefik (`behind`) się nie zmienia:** przekazuje odpowiedź na bieżąco i jej nie buforuje, a jego `idleTimeout`
-  dotyczy bezczynności między żądaniami keep-alive, nie trwającego strumienia. (Tryb `edge` nie jest
-  zaimplementowany; zanim powstanie, musi to sprawdzić osobno — [0005](decisions/0005-ingress-i-platforma.md).)
+  dotyczy bezczynności między żądaniami keep-alive, nie trwającego strumienia. (W trybie `edge` ruch idzie
+  prosto do nginx Węglarki, który terminuje TLS — buforowanie i timeouty działają identycznie,
+  [6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu).)
 - **Bezpieczeństwo configu:** gdy nginx odrzuci wygenerowany config, `nginx -t` w demonie kończy się błędem,
   a poprzedni, działający config zostaje przywrócony — zły wpis nie zostawia ingressu bez ruchu.
 - Rollback: `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta bloku `[apps.X.ingress]`.
@@ -1527,6 +1554,91 @@ przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `ingress.max_body
 (`weglarka apps update <apka> --unset-max-body-size`) albo przywróć pliki **z kopii sprzed aktualizacji**
 ([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
 
+## 6p. Tryb `edge` (nginx na 80/443, TLS z katalogu stanu)
+
+W trybie `edge` Węglarka nie stoi już za Traefikiem: jej nginx **sam terminuje TLS** i publikuje na hoście dwa
+porty — `bind` (HTTP) i `https_bind` (TLS); w kontenerze nadal nasłuchuje na 8080/8443. Decyzja i odrzucone
+alternatywy: [0036](decisions/0036-edge-mode.md). Tryb `behind` niczego się nie zmienia.
+
+```toml
+[ingress]
+mode = "edge"
+bind = "0.0.0.0:80"          # HTTP: tylko 301 → https (z wyjątkiem ACME) i serwer domyślny 444
+https_bind = "0.0.0.0:443"   # TLS: jeden serwer na domenę, certyfikat z <state>/nginx/tls
+# traefik_dynamic_file i trusted_proxies są w edge zabronione — walidacja zatrzyma demona
+```
+
+- **Przekierowanie:** każda routowana domena (apki i webhook) na porcie HTTP odpowiada
+  `301 https://$host$request_uri`; wyjątkiem jest prefiks `/.well-known/acme-challenge/`, obsługiwany
+  z webroota. Nieznany `Host` zamyka połączenie (`444`).
+- **TLS tylko z certyfikatem:** serwer TLS powstaje **tylko** dla domeny, która ma parę plików
+  (`<domena>.crt` i `<domena>.key`). Domena bez pary dalej przekierowuje na HTTPS, ale nie ma serwera TLS —
+  handshake jest odrzucany (`ssl_reject_handshake`), więc **nic nie idzie plaintextem** do apki. Dlatego do
+  czasu #96 certyfikaty kładziesz sam (w testach wystarczy self-signed).
+
+### Certyfikaty i webroot ACME (kontrakt dla #96)
+
+| ścieżka | tryb | rola |
+|---|---|---|
+| `<nginx_conf_dir>/tls/<domena>.crt` | `0644` | łańcuch PEM, liść pierwszy; czytany przez master nginx |
+| `<nginx_conf_dir>/tls/<domena>.key` | `0600` | klucz PEM; czytany **tylko** przez master nginx |
+| `<nginx_conf_dir>/tls/` (katalog) | `0700` | tworzony przez demona przy pierwszym `apply` |
+| `<nginx_conf_dir>/acme/<token>` | `0644` | token HTTP-01, serwowany jako `/.well-known/acme-challenge/<token>` |
+| `<nginx_conf_dir>/acme/` (katalog) | `0755` | tworzony przez demona; pliki czyta worker nginx |
+
+`<nginx_conf_dir>` to `[ingress] nginx_conf_dir` albo `<state dir>/nginx`. Webroot ACME przyjmuje tylko
+`GET`/`HEAD`; token jest **publiczny**, więc `0644` to nie wyciek — klucze prywatne nigdy nie trafiają do
+webroota. Prywatny klucz jest czytany przez master nginx, który od 0036 działa jako użytkownik runtime'u
+(dwuipisowa mapa uid kontenera ingressu); dlatego pliki mogą zostać `0600` i **nie** są czytelne dla
+użytkowników hosta.
+
+Testowy certyfikat (do pierwszego wdrożenia albo dla `scripts/acceptance.sh`):
+
+```sh
+install -d -m 0700 /var/lib/weglarka/nginx/tls
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
+  -keyout /var/lib/weglarka/nginx/tls/nz.example.eu.key \
+  -out    /var/lib/weglarka/nginx/tls/nz.example.eu.crt \
+  -subj "/CN=nz.example.eu" -addext "subjectAltName=DNS:nz.example.eu"
+chmod 0600 /var/lib/weglarka/nginx/tls/nz.example.eu.key
+```
+
+Dopisanie lub odnowienie certyfikatu **nie wymaga restartu ani odtworzenia nginx**: demon skanuje katalog
+`tls/` przy każdym przejściu, a jego odcisk (nazwy, rozmiary, mtime) trafia do `nginx.conf`, więc zmiana
+przechodzi zwykłą ścieżkę `nginx -t` + SIGHUP (a odrzucony config wraca na dysk z komunikatem w `doctor`).
+Sprawdzenie:
+
+```sh
+podman exec weglarka-nginx grep -F 'ssl_certificate /etc/nginx/tls/' /etc/nginx/nginx.conf
+head -2 /var/lib/weglarka/nginx/nginx.conf        # "# tls material: fingerprint …" zmienia się po odnowieniu
+curl -k --resolve nz.example.eu:443:127.0.0.1 https://nz.example.eu/   # -k tylko dla self-signed
+```
+
+### Wymagania i bezpieczeństwo
+
+- Porty < 1024 wymagają sysctla i `[runtime] allow_privileged_host_ports = true`; `doctor --preflight` ma na to
+  check `ingress.privileged_ports`, a `ingress.tls` ostrzega o domenach bez pary certyfikatów. Porty wysokie
+  (np. 18080/18443) nie wymagają niczego — tak `edge` uruchamia CI i lokalny odbiór.
+- **Brak zaufania do nagłówków:** nginx terminuje TLS, więc `X-Forwarded-For/Proto/Host` buduje z
+  `$remote_addr`/`$scheme`/`$host`; podszyte wartości klienta są nadpisywane (ADR 0007). `trusted_proxies`
+  w `edge` jest błędem walidacji.
+- **Kontener ingressu:** profil osłonienia (0014) się nie zmienia (te same trzy capability, read-only root);
+  zmienia się mapa uid — root kontenera to użytkownik runtime'u, worker zostaje w zakresie ingressu
+  ([0036](decisions/0036-edge-mode.md), [0009](decisions/0009-volume-ownership.md)). Konsekwencja: **do
+  kontenera nginx nie wolno montować niczego poza `<nginx_conf_dir>`** (żadnego katalogu stanu, `config_root`
+  ani pliku Traefika).
+- Własny `ingress.nginx_image` musi mieć nginx ≥ 1.25.1 (`http2 on`, `ssl_reject_handshake`); oficjalny
+  `nginx:1-alpine` i digest z sekcji 2 to spełniają, starszy obraz obleje `nginx -t`.
+- **Odbiór:** `scripts/acceptance.sh` sam wykrywa tryb i sprawdza przekierowanie, ruch po TLS, nagłówki i ACME
+  (patrz [Odbiór](#odbiór-na-hoście-scriptsacceptancesh)). Po instalacji: `weglarka doctor` (check
+  `ingress.apply`, `ingress.tls`, `ingress.nginx`).
+
+**Rollback:** przełączenie na `behind` to powrót do konfiguracji sprzed 0036: ustaw `mode = "behind"`, usuń
+`https_bind`, przywróć `traefik_dynamic_file`, zrestartuj demona. Jednorazowo odtworzy się kontener nginx
+(inny `weglarka.ingress-hash`). `apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu), a
+pliki w `tls/`/`acme/` możesz zostawić — `behind` ich nie czyta. Przed downgradem do wydania sprzed 0036
+usuń `https_bind` z `weglarka.toml` (starszy demon nie zna tego klucza).
+
 ## 7. Weryfikacja i rollback
 
 ```sh
@@ -1563,7 +1675,9 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
   weglarka-self-update.timer weglarka-watchdog.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
   ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
   ([6n](#6n-ścieżki-na-jednej-domenie-paths)) oraz `ingress.max_body_size`
-  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)). Inaczej daemon nie wystartuje z błędem parsowania.
+  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)). W trybie `edge` przed downgradem ustaw
+  `mode = "behind"`, usuń `https_bind` i przywróć `traefik_dynamic_file`
+  ([6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu)). Inaczej daemon nie wystartuje z błędem parsowania.
 
 ### Wersja schematu plików stanu (rollback między wersjami)
 

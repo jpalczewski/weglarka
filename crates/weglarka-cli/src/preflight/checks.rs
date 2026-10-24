@@ -9,7 +9,8 @@ use weglarka_core::config::{IngressMode, PlatformKind};
 
 use super::host::{CmdOutput, FileKind, Host};
 use super::parse::{
-    apt_installed_from, can_write, gids_of, parse_major_minor, parse_proc_net_tcp, subid_total,
+    apt_installed_from, can_read, can_write, gids_of, parse_major_minor, parse_proc_net_tcp,
+    subid_total,
 };
 use super::{Check, Context, RuntimeUser, fail, ok, warn};
 
@@ -620,16 +621,218 @@ impl Check for TraefikFile {
     }
 }
 
-pub struct BindAddress;
-impl Check for BindAddress {
+/// The `[ingress]` shape for the selected mode (issue #95): the same validation the daemon runs at
+/// startup, so a mode/key mismatch or a privileged publish port without the opt-in is reported before
+/// the first `apply` instead of failing there.
+pub struct IngressConfigCheck;
+impl Check for IngressConfigCheck {
     fn id(&self) -> &'static str {
-        "ingress.bind"
+        "ingress.config"
     }
     fn applies(&self, cx: &Context<'_>) -> bool {
         cx.config.is_some()
     }
     fn run(&self, cx: &Context<'_>) -> DoctorCheck {
-        let bind = cx.config.as_ref().expect("applies").ingress.bind;
+        match cx.config.as_ref().expect("applies").validate() {
+            Ok(()) => {
+                let ingress = &cx.config.as_ref().expect("applies").ingress;
+                ok(
+                    self.id(),
+                    format!(
+                        "[ingress] mode is consistent ({:?}, publishes {})",
+                        ingress.mode,
+                        describe_sockets(ingress.publish_sockets()),
+                    ),
+                )
+            }
+            Err(e) => fail(
+                self.id(),
+                e.clone(),
+                "fix [ingress] in weglarka.toml (mode-specific keys are listed in docs/install.md)",
+            ),
+        }
+    }
+}
+
+/// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS directory,
+/// otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A warning, not a
+/// failure: ACME issuance (issue #96) will fill this directory automatically.
+pub struct IngressTls;
+impl Check for IngressTls {
+    fn id(&self) -> &'static str {
+        "ingress.tls"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.config
+            .as_ref()
+            .is_some_and(|c| c.ingress.mode == IngressMode::Edge)
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        let host = cx.config.as_ref().expect("applies");
+        let tls = cx.nginx_conf_dir().join("tls");
+        let mut domains = vec![host.webhook.domain.clone()];
+        match cx.host.read_to_string(&cx.apps_path) {
+            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
+                Ok(apps) => {
+                    for spec in apps.apps.values() {
+                        domains.extend(spec.domains.iter().cloned());
+                    }
+                }
+                Err(e) => {
+                    // `apps.host_ports_free` reports the parse error; do not duplicate it.
+                    return warn(
+                        self.id(),
+                        format!("cannot read the app domains from apps.toml: {e}"),
+                        "fix apps.toml first",
+                    );
+                }
+            },
+            // No `apps.toml` yet (a fresh host): only the webhook domain needs a certificate.
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return warn(
+                    self.id(),
+                    format!("cannot read {}: {e}", cx.apps_path.display()),
+                    "run the preflight as the runtime user",
+                );
+            }
+        }
+        domains.sort();
+        domains.dedup();
+        let Ok(user) = runtime_user(cx, self.id()) else {
+            return warn(
+                self.id(),
+                "skipped: the runtime user is unknown",
+                "fix `runtime.user` first",
+            );
+        };
+        let gids = gids_of(cx.host, user);
+        let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
+        for domain in &domains {
+            let mut ok_pair = true;
+            for suffix in ["crt", "key"] {
+                let path = tls.join(format!("{domain}.{suffix}"));
+                match cx.host.stat(&path) {
+                    Ok(st) if st.kind == FileKind::File && can_read(&st, user.uid, &gids) => {
+                        // readable by the daemon's user: good
+                    }
+                    Ok(st) if st.kind == FileKind::File => {
+                        unreadable.push(format!("{} (mode {:04o})", path.display(), st.mode));
+                        ok_pair = false;
+                    }
+                    Ok(_) => {
+                        unreadable.push(format!("{} (not a regular file)", path.display()));
+                        ok_pair = false;
+                    }
+                    Err(_) => {
+                        ok_pair = false;
+                    }
+                }
+            }
+            if !ok_pair && !unreadable.iter().any(|u| u.contains(domain)) {
+                missing.push(domain.clone());
+            }
+        }
+        if !missing.is_empty() {
+            return warn(
+                self.id(),
+                format!(
+                    "no certificate pair for: {} (in {})",
+                    missing.join(", "),
+                    tls.display()
+                ),
+                "put <domain>.crt (PEM chain) and <domain>.key (0600) there; ACME issuance will automate it (issue #96)",
+            );
+        }
+        if !unreadable.is_empty() {
+            return warn(
+                self.id(),
+                format!(
+                    "TLS material not readable by {}: {}",
+                    user.name,
+                    unreadable.join(", ")
+                ),
+                "make the files readable by the runtime user (`chown`/`chmod 0600`)",
+            );
+        }
+        ok(
+            self.id(),
+            format!(
+                "every routed domain has a certificate pair in {}",
+                tls.display()
+            ),
+        )
+    }
+}
+
+/// `edge` with a privileged public port (80/443 by default): rootless Podman can only bind it with
+/// `net.ipv4.ip_unprivileged_port_start=0`, and `[ingress]` must opt in with
+/// `[runtime] allow_privileged_host_ports = true` (validated by `ingress.config`).
+pub struct IngressPrivilegedPorts;
+impl IngressPrivilegedPorts {
+    const SYSCTL: &'static str = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
+}
+impl Check for IngressPrivilegedPorts {
+    fn id(&self) -> &'static str {
+        "ingress.privileged_ports"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.config.as_ref().is_some_and(|c| {
+            c.ingress.mode == IngressMode::Edge
+                && c.ingress.publish_sockets().iter().any(|s| s.port() < 1024)
+        })
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        let sockets = cx
+            .config
+            .as_ref()
+            .expect("applies")
+            .ingress
+            .publish_sockets();
+        let Some(port) = sockets.iter().map(|s| s.port()).find(|p| *p < 1024) else {
+            return ok(self.id(), "no privileged ingress port");
+        };
+        let hint = "`sysctl -w net.ipv4.ip_unprivileged_port_start=0` (persist it, e.g. in /etc/sysctl.d) and keep [runtime] allow_privileged_host_ports = true; allow 80/443 through the firewall";
+        match cx.host.read_to_string(Path::new(Self::SYSCTL)) {
+            Err(e) => warn(
+                self.id(),
+                format!("cannot read {}: {e}", Self::SYSCTL),
+                hint,
+            ),
+            Ok(v) => match v.trim().parse::<u16>() {
+                Ok(start) if start <= port => ok(
+                    self.id(),
+                    format!("port {port} is allowed (net.ipv4.ip_unprivileged_port_start={start})"),
+                ),
+                Ok(start) => fail(
+                    self.id(),
+                    format!(
+                        "port {port} is below 1024 but net.ipv4.ip_unprivileged_port_start={start}"
+                    ),
+                    hint,
+                ),
+                Err(_) => warn(
+                    self.id(),
+                    format!("cannot parse {}: {:?}", Self::SYSCTL, v.trim()),
+                    hint,
+                ),
+            },
+        }
+    }
+}
+
+fn describe_sockets(sockets: Vec<std::net::SocketAddr>) -> String {
+    sockets
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub struct BindAddress;
+impl BindAddress {
+    fn check_socket(&self, cx: &Context<'_>, bind: std::net::SocketAddr) -> DoctorCheck {
         let ip = bind.ip();
         if ip.is_unspecified() {
             return ok(self.id(), format!("{bind} listens on all interfaces"));
@@ -661,19 +864,39 @@ impl Check for BindAddress {
     }
 }
 
-/// The port from `ingress.bind` must not be held by someone else's process. We read the socket
-/// owner from `/proc/net/tcp*` (uid column): the runtime user's socket is Węglarka's nginx
-/// (pasta/rootlessport).
-pub struct BindFree;
-impl Check for BindFree {
+impl Check for BindAddress {
     fn id(&self) -> &'static str {
-        "ingress.bind_free"
+        "ingress.bind"
     }
     fn applies(&self, cx: &Context<'_>) -> bool {
         cx.config.is_some()
     }
     fn run(&self, cx: &Context<'_>) -> DoctorCheck {
-        let bind = cx.config.as_ref().expect("applies").ingress.bind;
+        // `edge` publishes two sockets (HTTP and TLS), `behind` one; both addresses must be local.
+        let mut notes = Vec::new();
+        for bind in cx
+            .config
+            .as_ref()
+            .expect("applies")
+            .ingress
+            .publish_sockets()
+        {
+            let check = self.check_socket(cx, bind);
+            if check.status != weglarka_api::CheckStatus::Ok {
+                return check;
+            }
+            notes.push(check.message);
+        }
+        ok(self.id(), notes.join("; "))
+    }
+}
+
+/// The port from `ingress.bind` must not be held by someone else's process. We read the socket
+/// owner from `/proc/net/tcp*` (uid column): the runtime user's socket is Węglarka's nginx
+/// (pasta/rootlessport).
+pub struct BindFree;
+impl BindFree {
+    fn check_socket(&self, cx: &Context<'_>, bind: std::net::SocketAddr) -> DoctorCheck {
         let IpAddr::V4(ip) = bind.ip() else {
             return ok(self.id(), format!("{bind}: IPv6 bind, port check skipped"));
         };
@@ -718,8 +941,35 @@ impl Check for BindFree {
                 bind.port(),
                 other.uid
             ),
-            "pick a free port in [ingress] bind (e.g. 8088; on niechybnie 8080 is taken by Traefik from Coolify) — check `ss -ltnp`",
+            "pick a free port in [ingress] bind/[ingress] https_bind — check `ss -ltnp`",
         )
+    }
+}
+
+impl Check for BindFree {
+    fn id(&self) -> &'static str {
+        "ingress.bind_free"
+    }
+    fn applies(&self, cx: &Context<'_>) -> bool {
+        cx.config.is_some()
+    }
+    fn run(&self, cx: &Context<'_>) -> DoctorCheck {
+        // Both `edge` publishes are checked; `behind` has one.
+        let mut notes = Vec::new();
+        for bind in cx
+            .config
+            .as_ref()
+            .expect("applies")
+            .ingress
+            .publish_sockets()
+        {
+            let check = self.check_socket(cx, bind);
+            if check.status != weglarka_api::CheckStatus::Ok {
+                return check;
+            }
+            notes.push(check.message);
+        }
+        ok(self.id(), notes.join("; "))
     }
 }
 

@@ -21,6 +21,7 @@ expression: render(&r)
 [ OK ] runtime.apparmor_userns  apparmor_restrict_unprivileged_userns=1 and profile podman is loaded
 [FAIL] ingress.traefik_file     /data/traefik/weglarka.yml is not writable by weglarka (mode 0644, uid 0)
                                 hint: `chown weglarka /data/traefik/weglarka.yml` and `chmod 0644 /data/traefik/weglarka.yml`
+[ OK ] ingress.config           [ingress] mode is consistent (Behind, publishes 172.17.0.1:8080)
 [FAIL] ingress.bind             172.17.0.1 is not assigned to any host interface
                                 hint: the address must belong to a host interface (for Traefik from Coolify: the docker0 gateway, e.g. 172.17.0.1)
 [ OK ] ingress.bind_free        port 8080 is free on 172.17.0.1
@@ -29,4 +30,4 @@ expression: render(&r)
 [FAIL] state.secrets_file       /etc/weglarka/secrets.toml has mode 0644 (expected 0600)
                                 hint: `chmod 0600 /etc/weglarka/secrets.toml`
 
-10 ok, 0 info, 1 warn, 7 fail
+11 ok, 0 info, 1 warn, 7 fail

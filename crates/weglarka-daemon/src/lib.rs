@@ -78,6 +78,10 @@ pub enum StartError {
     /// `[self_update]` cannot work (a digest instead of a tag, an interval that is too short…).
     #[error("[self_update] {0}")]
     SelfUpdateConfig(String),
+    /// `[ingress]` cannot work in the selected mode (an `edge` host without `https_bind`, a
+    /// `behind`-only key in `edge`, a privileged publish port without the opt-in — issue #95).
+    #[error("{0}")]
+    Ingress(String),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -178,6 +182,9 @@ pub async fn start<P: PodmanClient + 'static>(
             .validate()
             .map_err(StartError::SelfUpdateConfig)?;
     }
+    // The `[ingress]` shape for the selected mode (issue #95): a mode/key mismatch or a privileged
+    // publish port without the opt-in stops the daemon instead of failing at the first `apply`.
+    host.validate().map_err(StartError::Ingress)?;
     // Host-wide `host_ports` rules (privileged ports, two apps on one socket, the ingress bind)
     // stop the daemon instead of failing at container start (`docs/decisions/0013-host-ports.md`).
     weglarka_core::host_ports::validate(&host, &apps)?;

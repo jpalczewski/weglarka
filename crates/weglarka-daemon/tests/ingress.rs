@@ -362,3 +362,130 @@ async fn trusts_nginx_own_addresses_on_app_networks_but_not_app_containers() {
     );
     assert!(!conf.contains("/24"), "whole network trusted: {conf}");
 }
+
+/// `edge` (issue #95): two publishes on the host (8080/8443 inside), the ingress uid map that lets the
+/// TLS master read the daemon's `0600` keys, certificates rescanned on every pass and a renewal that
+/// only reloads nginx.
+#[tokio::test]
+async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\nhttps_bind=\"127.0.0.1:18443\"\n[admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+        root.display()
+    ))
+    .unwrap();
+    // The same validation the daemon runs at startup.
+    host.validate().unwrap();
+    let paths = StatePaths::in_dir(root);
+    let fake = FakePodman::new();
+    let engine = Arc::new(Reconciler::new(
+        fake.clone(),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        paths.clone(),
+        ReconcilerOptions::default(),
+    ));
+    let manager = IngressManager::new(engine, host, root.join("nginx"));
+    let action = |r: Result<ApplyReport, _>| match r.unwrap() {
+        ApplyReport::Changed { nginx, .. } => Some(nginx),
+        ApplyReport::Unchanged => None,
+    };
+    let id = |f: &FakePodman| f.container_spec("weglarka-nginx").unwrap();
+
+    // Webhook only: nginx still publishes both ports and starts with a TLS listener that refuses
+    // every SNI, because no certificate exists yet.
+    assert_eq!(action(manager.apply().await), Some(NginxAction::Created));
+    let spec = id(&fake);
+    let publishes: Vec<(u16, u16)> = spec
+        .publish
+        .iter()
+        .map(|p| (p.host_port, p.container_port))
+        .collect();
+    assert_eq!(publishes, [(18080, 8080), (18443, 8443)]);
+    let map = spec.id_mapping.as_ref().expect("explicit ingress map");
+    assert_eq!(map.uid_map[0].container_id, 0);
+    assert_eq!(map.uid_map[0].host_id, 0, "container root is the host user");
+    assert_eq!(map.uid_map[1].container_id, 1);
+    assert!(
+        map.uid_map[1].host_id > 0,
+        "worker stays in the ingress range"
+    );
+    // No Traefik file in edge, and the certificate directories exist with the documented modes.
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    assert!(conf.contains("listen 8443 ssl default_server;"), "{conf}");
+    assert!(conf.contains("ssl_reject_handshake on;"), "{conf}");
+    assert!(!conf.contains("ssl_certificate "), "{conf}");
+    assert!(!conf.contains("set_real_ip_from"), "{conf}");
+    let tls = manager.tls_dir();
+    let acme = manager.acme_dir();
+    assert_eq!(
+        std::fs::metadata(&tls).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&acme).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    // A certificate for the webhook domain: the config gains its TLS server and nginx reloads
+    // (`nginx -t` + SIGHUP), the container is not recreated.
+    let nginx_id = fake.container_inspect("weglarka-nginx").await.unwrap().id;
+    let write_pair = |domain: &str, body: &str| {
+        std::fs::write(tls.join(format!("{domain}.crt")), body).unwrap();
+        std::fs::write(tls.join(format!("{domain}.key")), body).unwrap();
+        for suffix in ["crt", "key"] {
+            std::fs::set_permissions(
+                tls.join(format!("{domain}.{suffix}")),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    };
+    write_pair("h.example.eu", "cert-1\n");
+    assert_eq!(action(manager.apply().await), Some(NginxAction::Reloaded));
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    assert!(
+        conf.contains("ssl_certificate /etc/nginx/tls/h.example.eu.crt;"),
+        "{conf}"
+    );
+    assert_eq!(
+        fake.container_inspect("weglarka-nginx").await.unwrap().id,
+        nginx_id
+    );
+
+    // Renewal changes the material only: the fingerprint comment makes the config differ, so the same
+    // reload path runs (no recreate, no manual step for #96).
+    let old = conf
+        .lines()
+        .find(|l| l.starts_with("# tls material: fingerprint "))
+        .expect("fingerprint comment")
+        .to_owned();
+    write_pair("h.example.eu", "cert-2-renewed\n");
+    assert_eq!(action(manager.apply().await), Some(NginxAction::Reloaded));
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    let new = conf
+        .lines()
+        .find(|l| l.starts_with("# tls material: fingerprint "))
+        .expect("fingerprint comment")
+        .to_owned();
+    assert_ne!(old, new, "a renewed certificate must re-render the config");
+    assert_eq!(
+        fake.container_inspect("weglarka-nginx").await.unwrap().id,
+        nginx_id
+    );
+
+    // A certificate without its key is ignored; the domain keeps its redirect and loses TLS.
+    std::fs::remove_file(tls.join("h.example.eu.key")).unwrap();
+    assert_eq!(action(manager.apply().await), Some(NginxAction::Reloaded));
+    let conf = std::fs::read_to_string(manager.conf_path()).unwrap();
+    assert!(!conf.contains("ssl_certificate "), "{conf}");
+    assert!(
+        conf.contains("return 301 https://$host$request_uri;"),
+        "{conf}"
+    );
+    // Removing the stray file is not a change.
+    std::fs::remove_file(tls.join("h.example.eu.crt")).unwrap();
+    assert_eq!(action(manager.apply().await), None);
+}

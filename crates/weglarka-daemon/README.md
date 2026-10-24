@@ -17,6 +17,11 @@ mode = "behind"
 bind = "172.17.0.1:8080"
 traefik_dynamic_file = "/data/coolify/proxy/dynamic/weglarka.yml"   # the file must exist
 # nginx_image = "docker.io/library/nginx:1-alpine"
+# edge (docs/decisions/0036): nginx terminates TLS itself; two publishes, no Traefik file, certificates
+# under <state>/nginx/tls (0600 keys) and the ACME webroot under <state>/nginx/acme.
+# mode = "edge"
+# bind = "0.0.0.0:80"
+# https_bind = "0.0.0.0:443"
 
 [admin]
 socket = "/run/user/1001/weglarka/admin.sock"
@@ -116,3 +121,5 @@ Operator runbook: `docs/install.md` section 6k.
 - No concurrency limit/rate limit on the webhook listener (nginx with a body-size limit sits in front of it).
 - `deploy` with `image_ref` → 400; `Failed` without rollback → 500.
 - Changing `[ingress]`/`[webhook]` in `weglarka.toml` requires a daemon restart (config is read once).
+- `edge` certificates are operator-provided until ACME issuance (#96) lands; a routed domain without a
+  certificate pair gets no TLS server (fail closed) and `doctor` reports it as `ingress.tls`.

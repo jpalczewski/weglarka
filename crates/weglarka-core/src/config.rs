@@ -40,6 +40,31 @@ impl HostConfig {
     pub fn from_toml_str(src: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(src)
     }
+
+    /// Rejects a configuration that cannot work on this host. Called at startup (the daemon refuses
+    /// to run with it) and by `doctor --preflight`, so a mode/key mismatch or a privileged ingress
+    /// port fails loudly instead of at the first `apply` or at container start.
+    pub fn validate(&self) -> Result<(), String> {
+        self.ingress.validate()?;
+        // Public ingress ports below 1024 are rootless Podman's privileged-port problem
+        // (`docs/decisions/0013`): the host needs `net.ipv4.ip_unprivileged_port_start=0`, and the
+        // explicit opt-in is the operator's promise that it is there. Apps' `host_ports` follow the
+        // same rule (`host_ports::validate`); the sysctl itself is checked by `doctor --preflight`.
+        if !self.runtime.allow_privileged_host_ports
+            && let Some(port) = self
+                .ingress
+                .publish_sockets()
+                .iter()
+                .map(|socket| socket.port())
+                .find(|port| *port < 1024)
+        {
+            return Err(format!(
+                "[ingress] port {port} is below 1024; rootless Podman can only publish it with \
+                 net.ipv4.ip_unprivileged_port_start=0 and [runtime] allow_privileged_host_ports = true"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Location of the state files: `apps.toml`, `state.toml`, `secrets.toml` (and the nginx directory).
@@ -103,7 +128,10 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngressMode {
-    /// Węglarka's nginx holds 80/443 (ACME is out of the MVP).
+    /// Węglarka's nginx terminates TLS itself and publishes the two public web ports: `bind` (plain
+    /// HTTP, redirects to HTTPS except ACME) and `https_bind` (TLS). Certificates come from
+    /// `<nginx_conf_dir>/tls`, ACME HTTP-01 tokens from `<nginx_conf_dir>/acme`
+    /// (`docs/decisions/0036`).
     Edge,
     /// nginx na wysokim porcie za Traefikiem z Coolify.
     Behind,
@@ -113,8 +141,14 @@ pub enum IngressMode {
 #[serde(deny_unknown_fields)]
 pub struct IngressConfig {
     pub mode: IngressMode,
-    /// nginx publish address on the host, e.g. `172.17.0.1:8080`.
+    /// nginx publish address on the host, e.g. `172.17.0.1:8080`. Always the **plain-HTTP** publish:
+    /// in `behind` it is the only one, in `edge` it sits next to [`Self::https_bind`].
     pub bind: SocketAddr,
+    /// `edge` only: the TLS publish address on the host, e.g. `0.0.0.0:443`. nginx listens on 8443
+    /// inside the container; this is the host-side socket. Required in `edge`, rejected in `behind`
+    /// ([`HostConfig::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_bind: Option<SocketAddr>,
     /// Plik dynamicznej konfiguracji Traefika (tryb `behind`), nadpisywany w miejscu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traefik_dynamic_file: Option<PathBuf>,
@@ -122,10 +156,13 @@ pub struct IngressConfig {
     #[serde(default = "IngressConfig::default_nginx_image")]
     pub nginx_image: String,
     /// Host directory with `nginx.conf` (mounted into the nginx container); defaults to `<state dir>/nginx`.
+    /// In `edge` its `tls/` and `acme/` subdirectories hold the certificates and the ACME HTTP-01
+    /// webroot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nginx_conf_dir: Option<PathBuf>,
     /// Peers (IPs/CIDRs) whose `X-Forwarded-*` nginx trusts. Empty = the daemon's default
     /// (nginx's own addresses, where the rootless port forwarder connects from, see `docs/decisions/0032`).
+    /// `behind` only: in `edge` nginx terminates TLS and no direct client is trusted (`docs/decisions/0007`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_proxies: Vec<String>,
 }
@@ -133,6 +170,68 @@ pub struct IngressConfig {
 impl IngressConfig {
     pub fn default_nginx_image() -> String {
         "docker.io/library/nginx:1-alpine".to_owned()
+    }
+
+    /// Sockets nginx publishes on the host, in mode order: `bind` (plain HTTP) first, then
+    /// `https_bind` (`edge` only). `https_bind` is `None` when the mode does not need it or the
+    /// configuration is invalid — [`HostConfig::validate`] reports that, callers that reserve host
+    /// ports just take the sockets that are there.
+    pub fn publish_sockets(&self) -> Vec<SocketAddr> {
+        let mut sockets = vec![self.bind];
+        sockets.extend(self.https_bind);
+        sockets
+    }
+
+    /// Rejects a configuration that cannot work in the selected mode (issue #95). Mostly "a key of
+    /// the other mode is set": silently ignoring it would leave the operator with a false sense of
+    /// what nginx does.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.bind.port() == 0 {
+            return Err("[ingress] bind has port 0".to_owned());
+        }
+        match self.mode {
+            IngressMode::Behind => {
+                if let Some(https) = self.https_bind {
+                    return Err(format!(
+                        "[ingress] https_bind ({https}) is an `edge`-mode option; `behind` publishes a \
+                         single port (bind) and Traefik terminates TLS"
+                    ));
+                }
+            }
+            IngressMode::Edge => {
+                let Some(https) = self.https_bind else {
+                    return Err(
+                        "[ingress] mode = \"edge\" requires https_bind (the TLS publish address, \
+                         e.g. \"0.0.0.0:443\")"
+                            .to_owned(),
+                    );
+                };
+                if https.port() == 0 {
+                    return Err("[ingress] https_bind has port 0".to_owned());
+                }
+                if https == self.bind {
+                    return Err(format!(
+                        "[ingress] bind and https_bind are the same socket ({https}); `edge` needs a \
+                         plain-HTTP and a TLS publish"
+                    ));
+                }
+                if self.traefik_dynamic_file.is_some() {
+                    return Err(
+                        "[ingress] traefik_dynamic_file is a `behind`-mode option; `edge` terminates \
+                         TLS in Węglarka's nginx — remove it"
+                            .to_owned(),
+                    );
+                }
+                if !self.trusted_proxies.is_empty() {
+                    return Err(
+                        "[ingress] trusted_proxies is a `behind`-mode option; in `edge` direct clients \
+                         are never trusted and the forwarded headers are nginx's own (docs/decisions/0007)"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -737,5 +836,117 @@ kind = "systemd"
             .unwrap();
         assert!(su.enabled);
         su.validate().unwrap();
+    }
+
+    /// An `edge` host: two public sockets, no Traefik, high ports so the default
+    /// `allow_privileged_host_ports = false` is enough.
+    const EDGE: &str = r#"
+[runtime]
+user = "weglarka"
+
+[ingress]
+mode = "edge"
+bind = "0.0.0.0:8080"
+https_bind = "0.0.0.0:8443"
+
+[admin]
+socket = "/run/user/1001/weglarka/admin.sock"
+
+[webhook]
+listen = "0.0.0.0:9180"
+domain = "weglarka.descriptortable.eu"
+"#;
+
+    fn ingress(src: &str) -> Result<(), String> {
+        HostConfig::from_toml_str(src).unwrap().ingress.validate()
+    }
+
+    #[test]
+    fn edge_publishes_the_plain_http_socket_then_the_tls_one() {
+        let cfg = HostConfig::from_toml_str(EDGE).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.ingress.publish_sockets(),
+            [
+                "0.0.0.0:8080".parse().unwrap(),
+                "0.0.0.0:8443".parse().unwrap()
+            ]
+        );
+        // `behind` keeps its single socket and never serializes the edge key.
+        let behind = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert_eq!(
+            behind.ingress.publish_sockets(),
+            ["172.17.0.1:8080".parse().unwrap()]
+        );
+        assert!(!toml::to_string(&behind).unwrap().contains("https_bind"));
+        assert!(
+            !toml::to_string(&HostConfig::from_toml_str(EDGE).unwrap())
+                .unwrap()
+                .contains("traefik_dynamic_file")
+        );
+    }
+
+    #[test]
+    fn edge_requires_https_bind() {
+        let src = EDGE.replace("https_bind = \"0.0.0.0:8443\"\n", "");
+        let err = ingress(&src).unwrap_err();
+        assert!(err.contains("requires https_bind"), "{err}");
+    }
+
+    #[test]
+    fn edge_rejects_one_socket_for_both_roles() {
+        let src = EDGE.replace(
+            "https_bind = \"0.0.0.0:8443\"",
+            "https_bind = \"0.0.0.0:8080\"",
+        );
+        let err = ingress(&src).unwrap_err();
+        assert!(err.contains("same socket"), "{err}");
+    }
+
+    #[test]
+    fn edge_rejects_behind_only_options() {
+        // A Traefik file would be silently ignored, and trusted proxies would trust direct clients.
+        for (needle, extra) in [
+            (
+                "traefik_dynamic_file",
+                "traefik_dynamic_file = \"/tmp/weglarka.yml\"\n",
+            ),
+            ("trusted_proxies", "trusted_proxies = [\"10.89.0.0/16\"]\n"),
+        ] {
+            let src = EDGE.replace("[admin]", &format!("{extra}\n[admin]"));
+            let err = ingress(&src).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn behind_rejects_https_bind() {
+        let src = SAMPLE.replace("[ingress]", "[ingress]\nhttps_bind = \"0.0.0.0:8443\"");
+        let err = ingress(&src).unwrap_err();
+        assert!(err.contains("https_bind"), "{err}");
+    }
+
+    #[test]
+    fn privileged_edge_ports_need_the_explicit_opt_in() {
+        let src = EDGE
+            .replace("bind = \"0.0.0.0:8080\"", "bind = \"0.0.0.0:80\"")
+            .replace(
+                "https_bind = \"0.0.0.0:8443\"",
+                "https_bind = \"0.0.0.0:443\"",
+            );
+        let err = HostConfig::from_toml_str(&src)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("allow_privileged_host_ports"), "{err}");
+
+        let allowed = src.replace(
+            "[ingress]",
+            "allow_privileged_host_ports = true\n\n[ingress]",
+        );
+        HostConfig::from_toml_str(&allowed)
+            .unwrap()
+            .validate()
+            .unwrap();
     }
 }

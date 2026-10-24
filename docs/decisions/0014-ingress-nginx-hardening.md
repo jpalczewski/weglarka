@@ -40,7 +40,9 @@ Security {
 - **`no_new_privileges`.** setuid binaries and file capabilities cannot raise privileges, even if a future image
   ships them.
 - **Root in a private user namespace** maps to the instance's own subuid range (ADR 0009); the hardening is a
-  layer on top of that isolation, not a replacement for it.
+  layer on top of that isolation, not a replacement for it. Since [0036](0036-edge-mode.md) the *ingress*
+  container's uid 0 maps to the runtime user instead (the TLS master must read `0600` keys); the worker keeps
+  the ingress range and the capability set is unchanged.
 
 **The profile is part of the container identity.** `weglarka.ingress-hash` now hashes the image, the publishing
 (bind address + listen port), the uid range **and the security profile** (format bumped to

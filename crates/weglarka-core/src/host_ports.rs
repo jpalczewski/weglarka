@@ -2,8 +2,9 @@
 //!
 //! `state::validate_app` covers the rules an app can break on its own (zero ports, an IP that is not
 //! an IP, two entries of one app on the same socket). The rules that need the host — privileged
-//! ports, two apps on the same socket, a collision with the ingress bind — live here and are checked
-//! wherever the daemon writes or loads `apps.toml` (`docs/decisions/0013-host-ports.md`).
+//! ports, two apps on the same socket, a collision with the ingress publishes — live here and are
+//! checked wherever the daemon writes or loads `apps.toml` (`docs/decisions/0013-host-ports.md`). In
+//! `edge` mode the ingress publishes two sockets, so both are reserved (issue #95).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -49,7 +50,9 @@ pub fn bind_overlaps(a: IpAddr, b: IpAddr) -> bool {
 /// `apps.toml` is a `BTreeMap`, so the report of the first conflict is deterministic.
 pub fn validate(host: &HostConfig, apps: &AppsFile) -> Result<(), HostPortError> {
     let allow_privileged = host.runtime.allow_privileged_host_ports;
-    let ingress = host.ingress.bind;
+    // Both `edge` publishes (plain HTTP and TLS) and the single `behind` one; `https_bind` missing in
+    // `edge` is `HostConfig::validate`'s error, not this module's.
+    let ingress = host.ingress.publish_sockets();
     let mut published: Vec<(&str, u16, IpAddr)> = Vec::new();
     for (name, spec) in &apps.apps {
         let name = name.as_str();
@@ -67,12 +70,16 @@ pub fn validate(host: &HostConfig, apps: &AppsFile) -> Result<(), HostPortError>
                     port: entry.host,
                 });
             }
-            if entry.host == ingress.port() && bind_overlaps(ip, ingress.ip()) {
+            if let Some(socket) = ingress
+                .iter()
+                .copied()
+                .find(|socket| entry.host == socket.port() && bind_overlaps(ip, socket.ip()))
+            {
                 return Err(HostPortError::Ingress {
                     app: name.to_owned(),
                     port: entry.host,
                     ip: entry.bind_ip().to_owned(),
-                    ingress,
+                    ingress: socket,
                 });
             }
             if let Some((other, _, _)) = published
@@ -222,6 +229,54 @@ host_ports = [{ host = 8080, container = 80, ip = "10.0.0.5" }]
 "#,
         );
         validate(&host(), &parsed).unwrap();
+    }
+
+    #[test]
+    fn the_edge_tls_bind_is_reserved_too() {
+        let edge = r#"
+[ingress]
+mode = "edge"
+bind = "0.0.0.0:8080"
+https_bind = "0.0.0.0:8443"
+
+[admin]
+socket = "/run/user/1001/weglarka/admin.sock"
+
+[webhook]
+listen = "0.0.0.0:9180"
+domain = "weglarka.example.eu"
+"#;
+        let parsed = apps(
+            r#"
+[apps.a]
+image = "i"
+host_ports = [{ host = 8443, container = 443, ip = "0.0.0.0" }]
+"#,
+        );
+        let err = validate(&HostConfig::from_toml_str(edge).unwrap(), &parsed).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HostPortError::Ingress {
+                    port: 8443,
+                    ref ingress,
+                    ..
+                } if ingress.port() == 8443
+            ),
+            "{err}"
+        );
+        // And the plain-HTTP one, exactly as in `behind`.
+        let parsed = apps(
+            r#"
+[apps.a]
+image = "i"
+host_ports = [{ host = 8080, container = 80, ip = "0.0.0.0" }]
+"#,
+        );
+        assert!(matches!(
+            validate(&HostConfig::from_toml_str(edge).unwrap(), &parsed),
+            Err(HostPortError::Ingress { port: 8080, .. })
+        ));
     }
 
     #[test]

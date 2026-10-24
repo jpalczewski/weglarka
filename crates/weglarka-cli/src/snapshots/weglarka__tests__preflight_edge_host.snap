@@ -1,0 +1,24 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: render(&r)
+---
+[ OK ] config.file              /etc/weglarka/weglarka.toml parses
+[ OK ] runtime.user             user weglarka exists (uid 1001)
+[ OK ] runtime.subuid           2000000 ids for weglarka in /etc/subuid
+[ OK ] runtime.subgid           2000000 ids for weglarka in /etc/subgid
+[ OK ] runtime.cgroups          cgroups v2
+[ OK ] runtime.linger           linger enabled for weglarka
+[ OK ] runtime.socket           podman socket /run/user/1001/podman/podman.sock responds
+[ OK ] runtime.podman_version   libpod API 6.1
+[ OK ] runtime.podman_source    podman installed from alvistack
+[ OK ] runtime.netavark         netavark 2.0.1, firewall driver nftables (NETAVARK_FW)
+[ OK ] runtime.pasta            pasta available (pasta: pasta 2025_01_21)
+[ OK ] runtime.apparmor_userns  apparmor_restrict_unprivileged_userns=1 and profile podman is loaded
+[ OK ] ingress.config           [ingress] mode is consistent (Edge, publishes 0.0.0.0:18080, 0.0.0.0:18443)
+[ OK ] ingress.tls              every routed domain has a certificate pair in /etc/weglarka/nginx/tls
+[ OK ] ingress.bind             0.0.0.0:18080 listens on all interfaces; 0.0.0.0:18443 listens on all interfaces
+[ OK ] ingress.bind_free        port 18080 is free on 0.0.0.0; port 18443 is free on 0.0.0.0
+[ OK ] apps.host_ports_free     /etc/weglarka/apps.toml does not exist — no host ports published
+[ OK ] state.secrets_file       /etc/weglarka/secrets.toml has mode 0600
+
+18 ok, 0 info, 0 warn, 0 fail

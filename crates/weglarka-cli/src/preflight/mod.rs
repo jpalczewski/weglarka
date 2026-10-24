@@ -40,6 +40,8 @@ pub struct Context<'a> {
     pub user: Option<RuntimeUser>,
     pub secrets_path: PathBuf,
     pub apps_path: PathBuf,
+    /// `[state] dir` or the directory of `weglarka.toml` (the same rule the daemon applies).
+    pub state_dir: PathBuf,
 }
 
 impl<'a> Context<'a> {
@@ -79,7 +81,19 @@ impl<'a> Context<'a> {
             user,
             secrets_path,
             apps_path,
+            state_dir,
         }
+    }
+
+    /// Host directory with `nginx.conf` and, in `edge`, its `tls/` and `acme/` subdirectories:
+    /// `[ingress] nginx_conf_dir` verbatim or `<state dir>/nginx` — the same rule as the daemon
+    /// (`daemon/src/settings.rs`). A relative value is used verbatim; `nginx_conf_dir` is documented
+    /// as absolute.
+    pub fn nginx_conf_dir(&self) -> PathBuf {
+        self.config
+            .as_ref()
+            .and_then(|c| c.ingress.nginx_conf_dir.clone())
+            .unwrap_or_else(|| self.state_dir.join("nginx"))
     }
 
     /// libpod socket: `runtime.socket` or the systemd default
@@ -121,6 +135,9 @@ pub fn all_checks() -> Vec<Box<dyn Check>> {
         Box::new(Pasta),
         Box::new(AppArmorUserns),
         Box::new(TraefikFile),
+        Box::new(IngressConfigCheck),
+        Box::new(IngressTls),
+        Box::new(IngressPrivilegedPorts),
         Box::new(BindAddress),
         Box::new(BindFree),
         Box::new(TraefikSync),

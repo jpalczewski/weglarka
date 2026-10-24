@@ -962,6 +962,51 @@ fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     ));
 }
 
+/// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS
+/// directory, otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A
+/// warning, not a failure: until ACME issuance exists (issue #96) the operator places the files, and
+/// a host without any app domain legitimately has an empty directory.
+fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let tls = d.ingress.tls_dir();
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let mut domains: Vec<String> = vec![d.host.webhook.domain.clone()];
+    for spec in apps.apps.values() {
+        domains.extend(spec.domains.iter().cloned());
+    }
+    domains.sort();
+    domains.dedup();
+    let missing: Vec<&str> = domains
+        .iter()
+        .filter(|domain| {
+            !(tls.join(format!("{domain}.crt")).is_file()
+                && tls.join(format!("{domain}.key")).is_file())
+        })
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        out.push(ok(
+            "ingress.tls",
+            format!("every routed domain has a certificate in {}", tls.display()),
+        ));
+    } else {
+        out.push(check(
+            "ingress.tls",
+            CheckStatus::Warn,
+            format!(
+                "no certificate pair for: {} (in {})",
+                missing.join(", "),
+                tls.display()
+            ),
+            Some(
+                "put <domain>.crt (PEM chain) and <domain>.key (0600) there; ACME issuance will \
+                 automate it (issue #96)",
+            ),
+        ));
+    }
+}
+
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     out.push(match d.secrets.check_permissions() {
         Ok(()) => ok(
@@ -1071,6 +1116,9 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ));
     }
     ingress_routes(d, out);
+    if d.host.ingress.mode == IngressMode::Edge {
+        ingress_tls(d, out);
+    }
     // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {
         let mode = m.permissions().mode() & 0o777;

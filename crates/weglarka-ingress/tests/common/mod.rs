@@ -22,6 +22,25 @@ pub fn host() -> HostConfig {
     HostConfig::from_toml_str(HOST).unwrap()
 }
 
+/// `edge` (issue #95): two publishes, no Traefik, no trusted peers.
+pub const EDGE_HOST: &str = r#"
+[ingress]
+mode = "edge"
+bind = "0.0.0.0:8080"
+https_bind = "0.0.0.0:8443"
+
+[admin]
+socket = "/run/user/1001/weglarka/admin.sock"
+
+[webhook]
+listen = "0.0.0.0:9180"
+domain = "weglarka.example.eu"
+"#;
+
+pub fn edge_host() -> HostConfig {
+    HostConfig::from_toml_str(EDGE_HOST).unwrap()
+}
+
 pub fn apps(toml_src: &str) -> BTreeMap<InstanceName, AppSpec> {
     toml::from_str::<AppsFile>(toml_src).unwrap().apps
 }
