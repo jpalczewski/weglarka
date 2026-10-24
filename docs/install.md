@@ -882,6 +882,37 @@ najwyższego poziomu (jak `image`). Gotowy plik: [`docs/examples/command.toml`](
 - **Downgrade:** `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta `command`. Przed
   powrotem do starszej Węglarki usuń pole z apek (`apps update <apka> --command none` albo ręcznie) — patrz
   [7](#7-weryfikacja-i-rollback).
+## 6g. Retencja obrazów i jednorazowe sprzątanie
+
+Do tej pory każdy deploy zostawiał poprzedni obraz na zawsze (issue #40), więc dysk się zapełniał
+(`niechybnie`: ~83 %). Teraz Węglarka sama pilnuje porządku i daje jednorazowe sprzątanie tego, co
+zostało po starszych deployach.
+
+- **Co zostaje:** po udanym deployu (także po rollbacku i przy `start = false`) trzymane są dwa obrazy
+  repozytorium apki — bieżący (`current`) i poprzedni (`previous`, cel rollbacku). Starsze obrazy tego
+  samego repozytorium są usuwane. Obraz, którego używa **jakikolwiek** kontener (także zatrzymany), obraz
+  przypięty w `state.toml` dowolnej apki i obraz, którego tag nadal występuje w `apps.toml`, nigdy nie
+  zostanie usunięty; `image remove` nie jest wołane z `force`, więc Podman odmawia usunięcia obrazu
+  w użyciu. Deploy nie pada przez sprzątanie — problem z retencją jest tylko logowany.
+- **Czego Węglarka nie rusza:** obrazów spoza repozytoriów wymienionych w `apps.toml` (ingress nginx,
+  ręczne `podman pull`, warstwy pośrednie) oraz obrazów repozytorium, którego żadna apka już nie
+  wymienia (usunięta apka albo zmieniony `image`) — te nie są przypisywalne, patrz
+  [0020](decisions/0020-image-retention.md).
+- **Jednorazowo po aktualizacji** (obrazy zostawione przez wcześniejsze deploye):
+
+  ```sh
+  weglarka images prune --dry-run   # lista: ID, tag/digest, rozmiar; nic nie usuwa
+  weglarka images prune             # usuwa i podaje, ile miejsca zwolniono (górna granica)
+  ```
+
+  Sprzątanie jest **jawne**, nie automatyczne przy starcie demona: masowe kasowanie obrazów należy do
+  decyzji operatora. Demon serializuje je z deployami (w trakcie deployu odpowiada `busy`, podobnie jak
+  pozostałe mutacje).
+- **Ostrzeżenie w `doctor`:** check `runtime.images` zgłasza `warn` z liczbą nieużywanych obrazów
+  i rozmiarem („at most” — warstwy wspólne liczone są per obraz), a `hint` wskazuje
+  `weglarka images prune`. W trakcie deployu check jest informacyjny (`info`): świeżo przyciągnięty obraz
+  nie jest jeszcze w `state.toml`, więc wyglądałby na nieużywany.
+- Brak zmian w `apps.toml`/`state.toml`, więc upgrade i rollback demona są bezpieczne.
 
 ## 7. Weryfikacja i rollback
 

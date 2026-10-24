@@ -204,6 +204,23 @@ async fn list_filters_by_label_and_inspects_each() {
 }
 
 #[tokio::test]
+async fn image_list_reads_the_collection_and_keeps_names() {
+    let mock = serve(vec![(
+        "GET /v6.0.0/libpod/images/json",
+        200,
+        fixture!("list_images.json"),
+    )]);
+    let images = LibpodClient::new(&mock.socket).image_list().await.unwrap();
+    assert_eq!(images.len(), 2);
+    assert_eq!(
+        images[0].repo_tags,
+        ["ghcr.io/jpalczewski/ntfy.zig:latest".to_owned()]
+    );
+    assert_eq!(images[0].size_bytes, 41_943_040);
+    assert!(mock.requests()[0].contains("/images/json"));
+}
+
+#[tokio::test]
 async fn pull_streams_progress_then_complete_with_digest() {
     let mock = serve(vec![
         (

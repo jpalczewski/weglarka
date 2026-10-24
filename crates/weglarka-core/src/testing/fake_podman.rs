@@ -92,6 +92,9 @@ struct State {
 /// Production-sized subuid pool (`niechybnie`: `1000000:2000000`).
 pub const DEFAULT_SUBUID_POOL: u64 = 2_000_000;
 
+/// Size every pulled image reports (10 MiB), so retention/`doctor` sizes are predictable in tests.
+pub const DEFAULT_IMAGE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Cloning yields a handle to the same state (`Arc`).
 #[derive(Clone, Default)]
 pub struct FakePodman {
@@ -166,6 +169,24 @@ impl FakePodman {
             .insert(container.to_owned(), code);
     }
 
+    /// Hides one *name* of an image (models an untag, or a repository that no longer resolves this
+    /// reference) without removing the image: `image_remove` drops the image with all its names.
+    pub fn forget_image_reference(&self, reference: &str) {
+        let mut s = self.lock();
+        let Some(removed) = s.images.remove(reference) else {
+            return;
+        };
+        for alias in s.images.values_mut().filter(|i| i.id == removed.id) {
+            alias.repo_tags.retain(|name| name != reference);
+            alias.repo_digests.retain(|name| name != reference);
+        }
+    }
+
+    /// Images currently in the fake store, one entry per image id (what `image_list` returns).
+    pub fn images(&self) -> Vec<ImageInfo> {
+        self.lock().unique_images()
+    }
+
     pub fn calls(&self) -> Vec<Call> {
         self.lock().calls.clone()
     }
@@ -220,6 +241,25 @@ impl State {
         self.containers
             .get_mut(name)
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))
+    }
+
+    /// Id of the image behind a reference (one of its names or the id itself).
+    fn image_id(&self, reference: &str) -> Option<String> {
+        self.images
+            .get(reference)
+            .or_else(|| self.images.values().find(|i| i.id == reference))
+            .map(|i| i.id.clone())
+    }
+
+    /// One entry per image, the way `image_list` reports them.
+    fn unique_images(&self) -> Vec<ImageInfo> {
+        let mut by_id: BTreeMap<String, ImageInfo> = BTreeMap::new();
+        for image in self.images.values() {
+            by_id
+                .entry(image.id.clone())
+                .or_insert_with(|| image.clone());
+        }
+        by_id.into_values().collect()
     }
 
     /// Container snapshot with `networks` filled in from network membership.
@@ -442,18 +482,43 @@ impl PodmanClient for FakePodman {
                 .cloned()
                 .unwrap_or_else(|| Self::default_digest(reference));
             let id = digest.as_str().trim_start_matches("sha256:").to_owned();
-            // The same image is available under the reference and under `repo@digest`.
-            let repo = reference
-                .rsplit_once(':')
-                .map_or(reference, |(r, _)| r)
-                .to_owned();
+            // A tag pull names the image `repo:tag`; a digest pull only gets `repo@digest`.
+            let (repo_tags, repo_digests, aliases) = if reference.contains('@') {
+                (
+                    Vec::new(),
+                    vec![reference.to_owned()],
+                    vec![reference.to_owned()],
+                )
+            } else {
+                let repo = reference
+                    .rsplit_once(':')
+                    .map_or(reference, |(r, _)| r)
+                    .to_owned();
+                let digest_name = format!("{repo}@{digest}");
+                (
+                    vec![reference.to_owned()],
+                    vec![digest_name.clone()],
+                    vec![reference.to_owned(), digest_name],
+                )
+            };
             let image = ImageInfo {
                 id: id.clone(),
                 digest: Some(digest.clone()),
-                repo_tags: vec![reference.to_owned()],
+                repo_tags,
+                repo_digests,
+                size_bytes: DEFAULT_IMAGE_SIZE_BYTES,
             };
-            s.images.insert(reference.to_owned(), image.clone());
-            s.images.insert(format!("{repo}@{digest}"), image.clone());
+            if !reference.contains('@') {
+                // A tag moves to the freshly pulled build: the previous holder loses that name and
+                // becomes an untagged image that only its repository digest still identifies.
+                s.images.remove(reference);
+                for existing in s.images.values_mut() {
+                    existing.repo_tags.retain(|tag| tag != reference);
+                }
+            }
+            for alias in aliases {
+                s.images.insert(alias, image.clone());
+            }
             // Image stays addressable by ID even after its names are gone (as in Podman).
             s.images.insert(id.clone(), image);
             items.push(Ok(PullEvent::Complete {
@@ -474,6 +539,10 @@ impl PodmanClient for FakePodman {
             .ok_or_else(|| PodmanError::NotFound(reference.to_owned()))
     }
 
+    async fn image_list(&self) -> Result<Vec<ImageInfo>> {
+        Ok(self.lock().unique_images())
+    }
+
     async fn image_tag(&self, id: &str, repo: &str, tag: &str) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::ImageTag {
@@ -481,23 +550,38 @@ impl PodmanClient for FakePodman {
             repo: repo.into(),
             tag: tag.into(),
         });
-        let image = s
+        let mut image = s
             .images
             .values()
             .find(|i| i.id == id)
             .cloned()
             .ok_or_else(|| PodmanError::NotFound(format!("image {id}")))?;
-        s.images.insert(format!("{repo}:{tag}"), image);
+        let name = format!("{repo}:{tag}");
+        image.repo_tags.push(name.clone());
+        // Every alias of the image reports the new tag too.
+        for existing in s.images.values_mut().filter(|i| i.id == id) {
+            *existing = image.clone();
+        }
+        s.images.insert(name, image);
         Ok(())
     }
 
     async fn image_remove(&self, reference: &str) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::ImageRemove(reference.to_owned()));
-        s.images
-            .remove(reference)
-            .map(|_| ())
-            .ok_or_else(|| PodmanError::NotFound(reference.to_owned()))
+        let id = s
+            .image_id(reference)
+            .ok_or_else(|| PodmanError::NotFound(reference.to_owned()))?;
+        // Podman refuses an image a container uses — and this client never forces (docs/decisions/0020).
+        if let Some(container) = s.containers.values().find(|c| c.image_id == id) {
+            return Err(PodmanError::Conflict(format!(
+                "image {id} is in use by container {}",
+                container.name
+            )));
+        }
+        // Removing an image drops every one of its names, as `podman rmi <id>` does.
+        s.images.retain(|_, image| image.id != id);
+        Ok(())
     }
 
     async fn network_create(&self, spec: &NetworkSpec) -> Result<()> {

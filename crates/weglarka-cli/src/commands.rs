@@ -8,16 +8,17 @@ use serde::Serialize;
 use weglarka_api::endpoints;
 use weglarka_api::{
     AddAppRequest, AppSummary, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
-    ListAppsResponse, ListSecretsResponse, SecretInfo, SetSecretRequest, ShowAppResponse,
-    StatusResponse,
+    ListAppsResponse, ListSecretsResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage,
+    SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
 };
 use weglarka_core::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
 };
+use weglarka_core::images::human_bytes;
 
 use crate::cli::{
-    AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, RemoveArgs, SecretSetArgs,
-    SecretsCommand,
+    AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, PruneImagesArgs,
+    RemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, expand_path};
 use crate::error::{CliError, Kind, exit};
@@ -51,6 +52,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         }
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
+        Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
     }
 }
 
@@ -443,7 +445,89 @@ async fn doctor(json: bool, o: &Overrides, a: DoctorArgs) -> Result<i32, CliErro
     Ok(report.exit_code())
 }
 
+/// `images prune`: the daemon plans and (unless `--dry-run`) removes. Images Podman refused are
+/// reported and turn the exit code into [`exit::INTERNAL`] — the operator should look at them.
+pub(crate) async fn images_prune(
+    json: bool,
+    o: &Overrides,
+    a: PruneImagesArgs,
+) -> Result<i32, CliError> {
+    let request = PruneImagesRequest { dry_run: a.dry_run };
+    let response: PruneImagesResponse = client(o)?
+        .call(endpoints::IMAGES_PRUNE, &[], Some(&request))
+        .await?;
+    emit(json, &response, || render_prune(&response));
+    Ok(if response.failed.is_empty() {
+        exit::OK
+    } else {
+        exit::INTERNAL
+    })
+}
+
 // ---------- render ----------
+
+/// `images prune` output: one row per image, then a summary; failures go to stderr.
+pub(crate) fn render_prune(r: &PruneImagesResponse) -> String {
+    let rows = r
+        .removed
+        .iter()
+        .map(|i| {
+            vec![
+                short_image_id(&i.id),
+                image_names(i),
+                human_bytes(i.size_bytes),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut out = if rows.is_empty() {
+        String::new()
+    } else {
+        table(&["ID", "IMAGE", "SIZE"], &rows)
+    };
+    let what = if r.dry_run { "would remove" } else { "removed" };
+    let space = if r.dry_run {
+        format!("{} at most", human_bytes(r.reclaimed_bytes))
+    } else {
+        format!("{} reclaimed", human_bytes(r.reclaimed_bytes))
+    };
+    out.push_str(&format!("{what} {} image(s), {space}\n", r.removed.len()));
+    for failure in &r.failed {
+        eprintln!("warning: could not remove {failure}");
+    }
+    out
+}
+
+/// The first 12 hex characters — enough to tell images apart, short enough for a table.
+fn short_image_id(id: &str) -> String {
+    id.get(..12).unwrap_or(id).to_owned()
+}
+
+/// Tags if the image has any, otherwise its repository digests (an untagged leftover keeps those).
+fn image_names(image: &PrunedImage) -> String {
+    let names: Vec<String> = if image.tags.is_empty() {
+        image.digests.iter().map(|d| short_digest_name(d)).collect()
+    } else {
+        image.tags.clone()
+    };
+    if names.is_empty() {
+        "-".to_owned()
+    } else {
+        names.join(",")
+    }
+}
+
+/// `repo@sha256:<64 hex>` → `repo@sha256:<12 hex>…`.
+fn short_digest_name(name: &str) -> String {
+    match name.split_once('@') {
+        Some((repo, digest)) => match digest.strip_prefix("sha256:") {
+            Some(hex) if hex.len() > 12 => {
+                format!("{repo}@sha256:{}…", hex.get(..12).unwrap_or(hex))
+            }
+            _ => name.to_owned(),
+        },
+        None => name.to_owned(),
+    }
+}
 
 fn render_apps(apps: &[AppSummary]) -> String {
     let rows = apps

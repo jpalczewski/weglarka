@@ -9,6 +9,7 @@ pub mod app;
 pub mod doctor;
 pub mod github;
 pub mod health_probe;
+pub mod images;
 pub mod ingress;
 pub mod platform;
 pub mod settings;
