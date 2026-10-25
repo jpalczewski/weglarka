@@ -180,8 +180,14 @@ if [ "${#ups[@]}" -eq 0 ]; then
 fi
 echo "--- upstreams: ${ups[*]}"
 
+# The forwarder's socket directory (`dump` with WEGLARKA_DUMP_PROXY_SOCKET_DIR=/run/wg-ingress); unused
+# when the config has no such listener.
+sock_dir=$work/run
+mkdir -p "$sock_dir"
+chmod 777 "$sock_dir"
 docker run -d --name wg-edge-nginx --network "$net" \
   -p "127.0.0.1:$http_port:8080" -p "127.0.0.1:$https_port:8443" \
+  -v "$sock_dir:/run/wg-ingress" \
   -v "$conf:/etc/nginx/nginx.conf:ro" -v "$tls_dir:/etc/nginx/tls:ro" \
   -v "$acme_dir:/etc/nginx/acme:ro" docker.io/library/nginx:1-alpine >/dev/null
 
@@ -305,8 +311,43 @@ case $out in
   *) echo "FAIL unknown Host on plain HTTP: got '$out', expected 444 or a dropped connection"; fail=1 ;;
 esac
 
-# Requests that reach no app server (the 444 above, the rejected handshakes) must not make nginx warn
-# about an uninitialized `$app` (issue #182).
+# ── Requests nginx rejects before it processes them (issue #182) ─────────────
+# A malformed request line is answered with 400 before the rewrite and `realip` phases, so `set $app`
+# never ran and `$remote_addr` was still `unix:`. Speak PROXY protocol to the forwarder's plain socket
+# (what the port forwarder does) and check that the log line has the announced client and `app` "-".
+
+if grep -qF 'http.sock' "$conf"; then
+  python3 - "$sock_dir/http.sock" <<'PY' || true
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall(b"PROXY TCP4 203.0.113.7 192.0.2.1 54321 80\r\nGET /.env\x01 HTTP/1.1\r\nHost: x\r\n\r\n")
+try:
+    while s.recv(4096):
+        pass
+except OSError:
+    pass
+PY
+  sleep 1
+  line=$(docker logs wg-edge-nginx 2>&1 | grep -F '"status":400' | grep -F '"remote_addr":"203.0.113.7"' | tail -1 || true)
+  if [ -n "$line" ]; then
+    echo "ok   malformed request: logged with the announced client 203.0.113.7"
+    case $line in
+      *'"app":"-"'*) echo 'ok   malformed request: app is "-"' ;;
+      *) echo "FAIL malformed request: app is not \"-\": $line"; fail=1 ;;
+    esac
+  else
+    echo "FAIL malformed request: no 400 log line with remote_addr 203.0.113.7 (unix: before #182)"
+    docker logs wg-edge-nginx 2>&1 | grep -F '"status":400' | tail -3 || true
+    fail=1
+  fi
+else
+  echo "skip malformed request: the config has no forwarder socket (WEGLARKA_DUMP_PROXY_SOCKET_DIR)"
+fi
+
+# Requests that reach no app server (the 444 above, the malformed one, the rejected handshakes) must not
+# make nginx warn about an uninitialized `$app`.
 if docker logs wg-edge-nginx 2>&1 | grep -qF 'uninitialized "app" variable'; then
   echo 'FAIL catch-all: nginx warned about an uninitialized "app" variable'; fail=1
 else
