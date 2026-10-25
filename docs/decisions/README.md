@@ -54,4 +54,5 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0045](0045-host-mounts.md) | Allowlisted read-only host mounts and groups for apps |
 | [0046](0046-blue-green-deploy.md) | Blue-green deploys for stateless apps (issue #39) |
 | [0047](0047-ingress-streaming-paths.md) | Per-path streaming locations (issue #180) |
+| [0048](0048-edge-recreate-gap.md) | Edge mode: no refused connections while nginx or the forwarder is replaced |
 | [0049](0049-static-sites.md) | Static sites (`kind = "static"`) |

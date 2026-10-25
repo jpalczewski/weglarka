@@ -33,7 +33,15 @@ against a forged header), prefixed with a PROXY protocol v2 header; nginx listen
 OpenRC too. Decision and measurements: [ADR 0043](../decisions/0043-edge-client-address.md).
 
 - Hostnames behind Cloudflare's proxy: see [edge behind a CDN](edge-cdn.md).
-- A daemon self-update recreates the forwarder (a short gap on 80/443); `doctor` reports `ingress.client_ip`.
+- A daemon self-update does **not** recreate the forwarder (its identity is a revision constant, not the image id),
+  so the public ports stay open. It is recreated — with the ports closed for about a second — only when `bind` or
+  `https_bind` change or a release bumps its revision; `doctor` reports `ingress.client_ip`.
+- nginx is **reloaded** (no downtime) for config, certificate and app-network changes. It is **recreated** when
+  its identity changes: `[ingress] nginx_image`, `bind`/`https_bind`, the hardening profile, the ingress uid range
+  or a release that changes the identity format. During a recreate the forwarder holds new connections for up to
+  20 s until nginx listens again, so clients see a slow request rather than a refusal. Each recreate is logged as
+  `nginx recreated (not reloaded)` with `reason` (the changed inputs) and the measured `gap_ms`
+  ([ADR 0048](../decisions/0048-edge-recreate-gap.md)).
 - Downgrading to an older daemon leaves the container behind: `podman rm -f weglarka-forwarder`.
 - Check the address from **another host**: `scripts/acceptance.sh --expect-client-ip <ip>`.
 

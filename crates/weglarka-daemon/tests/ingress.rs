@@ -685,3 +685,65 @@ async fn seed_own_container(fake: &FakePodman) {
     }
     fake.add_foreign_container("weglarka", "ghcr.io/jpalczewski/weglarka:test");
 }
+
+/// Issue #183: a daemon self-update changes the image the forwarder could run from, but the forwarder
+/// owns the public ports, so it must not be recreated for that; a real identity change (here the
+/// published address) still recreates it and records the spec it was built from.
+#[tokio::test]
+async fn edge_self_update_keeps_the_forwarder_and_a_changed_publish_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let host_for = |https: &str| {
+        let host = HostConfig::from_toml_str(&format!(
+            "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\nhttps_bind=\"{https}\"\n[admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+            root.display()
+        ))
+        .unwrap();
+        host.validate().unwrap();
+        host
+    };
+    let fake = FakePodman::new();
+    seed_own_container(&fake).await;
+    let manager_for = |host: HostConfig| {
+        let engine = Arc::new(Reconciler::new(
+            fake.clone(),
+            Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+            StatePaths::in_dir(root),
+            ReconcilerOptions::default(),
+        ));
+        IngressManager::new(engine, host, root.join("nginx"))
+    };
+    let manager = manager_for(host_for("127.0.0.1:18443"));
+    manager.apply().await.unwrap();
+    let forwarder = fake.container_inspect("weglarka-forwarder").await.unwrap();
+    let spec = fake.container_spec("weglarka-forwarder").unwrap();
+    assert!(spec.labels.contains_key("weglarka.ingress-spec"));
+
+    // Self-update: the daemon's own container now runs another image.
+    fake.container_remove("weglarka", true).await.unwrap();
+    let mut pull = std::pin::pin!(fake.image_pull("ghcr.io/jpalczewski/weglarka:next"));
+    while let Some(event) = futures_util::StreamExt::next(&mut pull).await {
+        event.unwrap();
+    }
+    fake.add_foreign_container("weglarka", "ghcr.io/jpalczewski/weglarka:next");
+    manager.apply().await.unwrap();
+    assert_eq!(
+        fake.container_inspect("weglarka-forwarder")
+            .await
+            .unwrap()
+            .id,
+        forwarder.id,
+        "a self-update must not close the public ports"
+    );
+
+    // A changed publish is a real identity change.
+    let manager = manager_for(host_for("127.0.0.1:18444"));
+    manager.apply().await.unwrap();
+    assert_ne!(
+        fake.container_inspect("weglarka-forwarder")
+            .await
+            .unwrap()
+            .id,
+        forwarder.id
+    );
+}
