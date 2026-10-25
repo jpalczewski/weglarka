@@ -125,8 +125,18 @@ async fn accept_loop(listener: TcpListener, socket: PathBuf) {
             Ok((client, peer)) => {
                 let socket = socket.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = relay(client, peer, &socket).await {
-                        tracing::debug!(%peer, error = %e, "connection ended with an error");
+                    match relay(client, peer, &socket).await {
+                        Ok(()) => {}
+                        // nginx not answering is an operator problem; a client that resets is routine.
+                        Err(Relay::Upstream(e)) => tracing::warn!(
+                            %peer,
+                            socket = %socket.display(),
+                            error = %e,
+                            "cannot reach nginx"
+                        ),
+                        Err(Relay::Io(e)) => {
+                            tracing::debug!(%peer, error = %e, "connection ended with an error");
+                        }
                     }
                     drop(permit);
                 });
@@ -140,18 +150,35 @@ async fn accept_loop(listener: TcpListener, socket: PathBuf) {
     }
 }
 
+/// Why a relay ended early: the nginx side could not be reached, or an I/O error on an open connection.
+enum Relay {
+    Upstream(std::io::Error),
+    Io(std::io::Error),
+}
+
 async fn relay(
     mut client: TcpStream,
     peer: SocketAddr,
     socket: &std::path::Path,
-) -> std::io::Result<()> {
-    let local = client.local_addr()?;
-    client.set_nodelay(true)?;
+) -> Result<(), Relay> {
+    let local = client.local_addr().map_err(Relay::Io)?;
+    client.set_nodelay(true).map_err(Relay::Io)?;
     let mut upstream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(socket))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "nginx socket timeout"))??;
-    upstream.write_all(&proxy_v2_header(peer, local)).await?;
-    copy_bidirectional(&mut client, &mut upstream).await?;
+        .map_err(|_| {
+            Relay::Upstream(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "nginx socket timeout",
+            ))
+        })?
+        .map_err(Relay::Upstream)?;
+    upstream
+        .write_all(&proxy_v2_header(peer, local))
+        .await
+        .map_err(Relay::Upstream)?;
+    copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map_err(Relay::Io)?;
     Ok(())
 }
 
