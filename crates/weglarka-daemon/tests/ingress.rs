@@ -601,6 +601,82 @@ async fn edge_serves_covered_domains_with_a_wildcard_pair() {
     assert!(!conf().contains("ssl_certificate "), "{}", conf());
 }
 
+/// `edge` behind a CDN (issue #159): the refreshed range list is rendered with its etag, a new etag
+/// takes the reload path and never recreates nginx, and a rejected refresh leaves the config alone.
+#[tokio::test]
+async fn edge_cdn_ranges_refresh_reloads_and_never_recreates() {
+    use weglarka_daemon::cdn::{CdnRanges, Fetched, RangeFetcher};
+
+    struct Scripted(std::sync::Mutex<Vec<Result<Fetched, String>>>);
+    impl RangeFetcher for Scripted {
+        async fn fetch(&self) -> Result<Fetched, String> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+    let list = |extra: &str| -> Vec<String> {
+        weglarka_ingress::CLOUDFLARE_RANGES
+            .iter()
+            .map(|r| (*r).to_owned())
+            .chain(std::iter::once(extra.to_owned()))
+            .collect()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\nhttps_bind=\"127.0.0.1:18443\"\n\
+         [ingress.cdn]\nprovider=\"cloudflare\"\n\
+         [admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+        root.display()
+    ))
+    .unwrap();
+    host.validate().unwrap();
+    let fake = FakePodman::new();
+    seed_own_container(&fake).await;
+    let engine = Arc::new(Reconciler::new(
+        fake.clone(),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        StatePaths::in_dir(root),
+        ReconcilerOptions::default(),
+    ));
+    let manager = IngressManager::new(engine, host, root.join("nginx"));
+    let ranges = Arc::new(CdnRanges::load(
+        weglarka_core::config::CdnProvider::Cloudflare,
+        root.join("cdn-ranges.toml"),
+    ));
+    manager.set_cdn_ranges(ranges.clone());
+    let conf = || std::fs::read_to_string(manager.conf_path()).unwrap();
+
+    manager.apply().await.unwrap();
+    assert!(conf().contains("# CDN peers (bundled etag "), "{}", conf());
+    let nginx_id = fake.container_inspect("weglarka-nginx").await.unwrap().id;
+
+    let fetcher = Scripted(std::sync::Mutex::new(vec![
+        Ok(("new1".into(), list("198.51.100.0/24"))),
+        Ok(("bad".into(), vec!["198.51.100.0/24".into()])),
+    ]));
+    assert_eq!(ranges.refresh(&fetcher).await, Ok(true));
+    assert!(matches!(
+        manager.apply().await.unwrap(),
+        ApplyReport::Changed {
+            nginx: NginxAction::Reloaded,
+            ..
+        }
+    ));
+    let c = conf();
+    assert!(c.contains("# CDN peers (refreshed etag new1)"), "{c}");
+    assert!(c.contains("198.51.100.0/24 1;"), "{c}");
+    assert_eq!(
+        fake.container_inspect("weglarka-nginx").await.unwrap().id,
+        nginx_id,
+        "a new list never recreates the container"
+    );
+
+    // An implausible list is refused: the config stays as it is.
+    assert!(ranges.refresh(&fetcher).await.is_err());
+    assert_eq!(manager.apply().await.unwrap(), ApplyReport::Unchanged);
+}
+
 /// The daemon's own container: the `edge` forwarder runs from its image (issue #162).
 async fn seed_own_container(fake: &FakePodman) {
     let mut pull = std::pin::pin!(fake.image_pull("ghcr.io/jpalczewski/weglarka:test"));

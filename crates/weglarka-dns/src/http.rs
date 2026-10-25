@@ -119,6 +119,7 @@ pub(crate) struct Client {
     tls: TlsConnector,
     base: Base,
     timeout: Duration,
+    max_body: usize,
 }
 
 impl Client {
@@ -138,7 +139,14 @@ impl Client {
             tls: TlsConnector::from(Arc::new(config)),
             base,
             timeout,
+            max_body: MAX_BODY,
         })
+    }
+
+    /// Lowers the response cap (a public list is far smaller than a zone listing).
+    pub(crate) fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body.min(MAX_BODY);
+        self
     }
 
     /// `path` is relative to the base path and starts with `/` (it may carry a query).
@@ -146,10 +154,10 @@ impl Client {
         &self,
         method: &'static str,
         path: &str,
-        bearer: &str,
+        bearer: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<Response, HttpError> {
-        if bearer.is_empty() || !bearer.bytes().all(|b| b.is_ascii_graphic()) {
+        if bearer.is_some_and(|b| b.is_empty() || !b.bytes().all(|b| b.is_ascii_graphic())) {
             return Err(HttpError::Token);
         }
         let addr = format!("{}:{}", self.base.host, self.base.port);
@@ -177,9 +185,9 @@ impl Client {
                 .connect(name, tcp)
                 .await
                 .map_err(|e| HttpError::Tls(e.to_string()))?;
-            round_trip(stream, request, MAX_BODY).await
+            round_trip(stream, request, self.max_body).await
         } else {
-            round_trip(tcp, request, MAX_BODY).await
+            round_trip(tcp, request, self.max_body).await
         }
     }
 }
@@ -188,15 +196,19 @@ fn build_request(
     base: &Base,
     method: &str,
     path: &str,
-    bearer: &str,
+    bearer: Option<&str>,
     body: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut head = format!(
         "{method} {base_path}{path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\n\
-         Accept: application/json\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n",
+         Accept: application/json\r\n",
         base_path = base.path,
         host = base.host,
     );
+    if let Some(bearer) = bearer {
+        head.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    }
+    head.push_str("Connection: close\r\n");
     if let Some(body) = body {
         head.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n",
@@ -443,13 +455,14 @@ mod tests {
     #[test]
     fn request_carries_the_token_and_the_body_length() {
         let base = Base::parse("https://api.example.eu/v4").unwrap();
-        let request = build_request(&base, "POST", "/zones/x", "tok", Some(b"{}"));
+        let request = build_request(&base, "POST", "/zones/x", Some("tok"), Some(b"{}"));
         let text = String::from_utf8(request).unwrap();
         assert!(text.starts_with("POST /v4/zones/x HTTP/1.1\r\nHost: api.example.eu\r\n"));
         assert!(text.contains("Authorization: Bearer tok\r\n"));
         assert!(text.contains("Content-Length: 2\r\n"));
         assert!(text.ends_with("\r\n\r\n{}"));
-        let get = String::from_utf8(build_request(&base, "GET", "/zones", "tok", None)).unwrap();
+        let get =
+            String::from_utf8(build_request(&base, "GET", "/zones", Some("tok"), None)).unwrap();
         assert!(!get.contains("Content-Length"));
     }
 

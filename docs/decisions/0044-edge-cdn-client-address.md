@@ -31,8 +31,15 @@ address, so the trust has to be tied to the peer.
   the client itself.
 * The option needs the forwarder path (`proxy_socket_dir`): without a real peer address the ranges would be
   compared with nginx's own address, so the generator rejects the combination (an invariant, `edge` always sets it).
-* This PR ships the bundled snapshot of Cloudflare's prefixes (`GET /client/v4/ips`, 15 IPv4 + 7 IPv6) and the
-  pin; the daily refresh from the API is a follow-up (issue #159, second PR).
+* **Range source.** The binary bundles a snapshot of Cloudflare's prefixes (`GET /client/v4/ips`, 15 IPv4 + 7
+  IPv6, with its `etag`). Unless `ranges` pins a list, the daemon refreshes it daily (with jitter) from that API:
+  no token, HTTPS with the bundled webpki roots, host pinned, response capped at 64 KiB, at most 256 entries, every
+  entry a valid CIDR. Because the list's authority rests on that TLS channel alone, it must also still cover every
+  bundled prefix; an empty list, or one that drops a prefix, is rejected. A good list is saved in
+  `<state dir>/cdn-ranges.toml` (tolerant serde, `0644`: public data) and rendered into `nginx.conf` with its
+  `etag` in a comment, so a change takes the `nginx -t` + SIGHUP path. A failed or rejected refresh keeps the last
+  good list (saved, else bundled) and is reported by `doctor`; a corrupted file falls back to the bundled list with
+  a warning. `ranges = [...]` disables the refresh and the bundled list.
 
 ## Consequences
 
@@ -41,9 +48,13 @@ address, so the trust has to be tied to the peer.
   (nginx reloads). Every existing snapshot is unchanged.
 * The Cloudflare zone must use **Full (strict)**; with Flexible, Cloudflare reaches the plain listener and loops
   on the 301.
-* `doctor`: `ingress.cdn` reports the range source in use.
+* `doctor`: `ingress.cdn` reports the range source in use (`bundled etag …` / `refreshed <age> ago, etag …` /
+  `pinned, N ranges`) and warns when the last refresh failed or the last success is older than 7 days.
+* `cdn-ranges.toml` is a new file in the state directory; an older daemon never reads it, so it needs no cleanup.
 * Tests: generator snapshot `nginx_edge_cdn`, header/trust assertions, rejection in `behind` and without the
-  forwarder, config validation.
+  forwarder, config validation; the refresh on a fake fetcher (a new etag re-renders and reloads and never
+  recreates, a failed or implausible fetch keeps the list, a corrupted file falls back to bundled) and the
+  anonymous, size-capped `GET /ips` against a loopback mock.
 
 ## Rejected alternatives
 
