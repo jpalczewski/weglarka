@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use weglarka_core::app::{AppIngress, AppSpec, InstanceName, check_path_prefix};
+use weglarka_core::app::{AppIngress, AppKind, AppSpec, InstanceName, check_path_prefix};
 use weglarka_core::config::{HostConfig, IngressMode};
 
 /// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
@@ -214,11 +214,52 @@ impl fmt::Display for Cidr {
     }
 }
 
-/// Route of a single app: all its domains × paths → `instance:port` on the app network.
+/// Directory inside the nginx container under which the daemon keeps one directory per static site
+/// (`<nginx_conf_dir>/sites`, with `<nginx_conf_dir>` mounted at `/etc/nginx`, ADR 0036/0049).
+pub const SITES_CONTAINER_DIR: &str = "/etc/nginx/sites";
+
+/// Where the traffic of a route ends up (ADR 0049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteBackend {
+    /// A container: `instance:port` on the app network.
+    Upstream { port: u16 },
+    /// A static site: files below `root` inside the nginx container. It is the `current` symlink the
+    /// daemon switches atomically, never a path taken from app data.
+    Directory { root: String },
+}
+
+impl RouteBackend {
+    /// Served root of the static site `instance`: `/etc/nginx/sites/<instance>/current`.
+    pub fn site_root(instance: &InstanceName) -> String {
+        format!("{SITES_CONTAINER_DIR}/{instance}/current")
+    }
+
+    /// The upstream port, `None` for a directory.
+    pub fn port(&self) -> Option<u16> {
+        match self {
+            Self::Upstream { port } => Some(*port),
+            Self::Directory { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for RouteBackend {
+    /// `doctor`'s notation: `<port>` is rendered by the caller next to the instance; a directory
+    /// shows as `static:<root>`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upstream { port } => write!(f, "{port}"),
+            Self::Directory { root } => write!(f, "static:{root}"),
+        }
+    }
+}
+
+/// Route of a single app: all its domains × paths → a container (`instance:port` on the app network)
+/// or, for a static site, a directory served by nginx itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRoute<'a> {
     pub instance: &'a InstanceName,
-    pub port: u16,
+    pub backend: RouteBackend,
     /// Sorted, without duplicates.
     pub domains: Vec<Domain>,
     /// Path prefixes served on every domain; sorted, without duplicates, `["/"]` when the spec sets none.
@@ -237,7 +278,7 @@ pub struct RouteRow {
     pub domain: Domain,
     pub path: PathPrefix,
     pub instance: InstanceName,
-    pub port: u16,
+    pub backend: RouteBackend,
     pub strip_prefix: bool,
     pub streaming: bool,
     /// `false` for `start = false` apps: they reserve the route but nginx renders nothing for it.
@@ -272,7 +313,7 @@ impl<'a> Plan<'a> {
                         domain: domain.clone(),
                         path: path.clone(),
                         instance: app.instance.clone(),
-                        port: app.port,
+                        backend: app.backend.clone(),
                         strip_prefix: app.ingress.strip_prefix,
                         streaming: app.ingress.streaming,
                         active: app.active,
@@ -304,10 +345,18 @@ impl<'a> Plan<'a> {
             if instance.as_str() == WEBHOOK_UPSTREAM_HOST {
                 return Err(IngressError::ReservedName(instance.clone()));
             }
-            let port = match spec.port {
-                None => return Err(IngressError::MissingPort(instance.clone())),
-                Some(0) => return Err(IngressError::InvalidPort(instance.clone())),
-                Some(p) => p,
+            // A static site has no container and therefore no port (whatever the spec carries).
+            let backend = match spec.kind {
+                AppKind::Static => RouteBackend::Directory {
+                    root: RouteBackend::site_root(instance),
+                },
+                AppKind::Container => RouteBackend::Upstream {
+                    port: match spec.port {
+                        None => return Err(IngressError::MissingPort(instance.clone())),
+                        Some(0) => return Err(IngressError::InvalidPort(instance.clone())),
+                        Some(p) => p,
+                    },
+                },
             };
             let mut paths = spec
                 .paths
@@ -366,7 +415,7 @@ impl<'a> Plan<'a> {
             domains.sort();
             routes.push(AppRoute {
                 instance,
-                port,
+                backend,
                 domains,
                 paths,
                 active: spec.start,

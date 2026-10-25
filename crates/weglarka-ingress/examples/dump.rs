@@ -8,6 +8,8 @@
 //! buffered defaults, so `.github/scripts/test-streaming.sh` can use it as the negative control.
 //! `upload` (streamed, 256 MiB) and `capped` (not streamed, 8 MiB) carry `ingress.max_body_size`
 //! (ADR 0033) for `.github/scripts/test-body-size.sh`; `blog` is again the default-limit control.
+//! `landing` (the whole `landing.example.eu`) and `docs` (`blog.example.eu/docs`, next to the `blog` container
+//! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`.
 
 use std::collections::BTreeMap;
 
@@ -82,6 +84,17 @@ port = 3000
 
 [apps.capped.ingress]
 max_body_size = "8m"
+
+[apps.landing]
+kind = "static"
+image = "registry.example.com/x/landing:latest"
+domains = ["landing.example.eu"]
+
+[apps.docs]
+kind = "static"
+image = "registry.example.com/x/docs:latest"
+domains = ["blog.example.eu"]
+paths = ["/docs"]
 "#;
 
 fn main() {

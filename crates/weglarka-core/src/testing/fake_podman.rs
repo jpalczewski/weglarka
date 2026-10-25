@@ -34,6 +34,8 @@ pub enum Call {
     ImageLoad {
         bytes: usize,
     },
+    /// `image_save`: the reference that was exported.
+    ImageSave(String),
     ImageTag {
         id: String,
         repo: String,
@@ -104,6 +106,8 @@ struct State {
     load_names: VecDeque<Vec<String>>,
     /// The next `image_load` fails with this message (a broken archive).
     load_failures: VecDeque<String>,
+    /// Archive that `image_save` returns for an image, keyed by the image's digest.
+    image_archives: BTreeMap<Digest, Bytes>,
     pull_digests: BTreeMap<String, Digest>,
     pull_failures: BTreeMap<String, String>,
     /// References that only pull with exactly these credentials (a private registry).
@@ -293,6 +297,14 @@ impl FakePodman {
         self.lock()
             .load_names
             .push_back(names.iter().map(|n| (*n).to_owned()).collect());
+    }
+
+    /// `image_save` of an image with `digest` returns `archive` (an `oci-archive` tar, see
+    /// `crate::sites`); without a script the export fails with `NotFound`.
+    pub fn script_image_archive(&self, digest: &Digest, archive: Vec<u8>) {
+        self.lock()
+            .image_archives
+            .insert(digest.clone(), Bytes::from(archive));
     }
 
     /// The next `image_load` fails with `message` (a corrupt or unsupported archive).
@@ -1121,6 +1133,23 @@ impl PodmanClient for FakePodman {
             .ok_or_else(|| PodmanError::NotFound(format!("volume {name}")))?;
         *stored = data;
         Ok(())
+    }
+
+    async fn image_save(&self, reference: &str) -> Result<TarStream> {
+        let mut s = self.lock();
+        s.calls.push(Call::ImageSave(reference.to_owned()));
+        let archive = reference
+            .rsplit_once('@')
+            .and_then(|(_, d)| Digest::new(d).ok())
+            .and_then(|d| s.image_archives.get(&d).cloned())
+            .ok_or_else(|| PodmanError::NotFound(format!("image {reference}")))?;
+        // Two chunks, so consumers are exercised with a real stream.
+        let (head, tail) = archive.split_at(archive.len() / 2);
+        let chunks = vec![
+            Ok(Bytes::copy_from_slice(head)),
+            Ok(Bytes::copy_from_slice(tail)),
+        ];
+        Ok(stream::iter(chunks).boxed())
     }
 
     async fn volume_export(&self, name: &str) -> Result<TarStream> {

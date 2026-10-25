@@ -3358,3 +3358,130 @@ health = { attempts = 3, window_secs = 6 }
         );
     }
 }
+
+/// Static sites (ADR 0049): a pinned image is unpacked into a release and `current` is switched.
+mod static_sites {
+    use super::*;
+
+    const SITE: &str = r#"
+[apps.blog]
+kind = "static"
+image = "registry.example.com/me/blog:latest"
+domains = ["blog.example.com"]
+"#;
+    const SITE_IMAGE: &str = "registry.example.com/me/blog:latest";
+
+    /// A `docker-archive` whose single layer holds `files`.
+    fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut b = tar::Builder::new(Vec::new());
+            for (path, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, *data).unwrap();
+            }
+            b.into_inner().unwrap()
+        }
+        tar_of(&[
+            (
+                "manifest.json",
+                br#"[{"Config":"c.json","Layers":["l/layer.tar"]}]"#,
+            ),
+            ("l/layer.tar", &tar_of(files)),
+        ])
+    }
+
+    fn harness() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let h = Harness::build(
+            SITE,
+            ReconcilerOptions {
+                sites_root: Some(sites),
+                ..Default::default()
+            },
+            crash::Policy::disabled(),
+        );
+        drop(dir);
+        h
+    }
+
+    fn sites(h: &Harness) -> std::path::PathBuf {
+        h.rec.options.sites_root.clone().unwrap()
+    }
+
+    fn publish(h: &Harness, d: char, files: &[(&str, &[u8])]) -> Digest {
+        h.fake.set_pull_digest(SITE_IMAGE, digest(d));
+        h.fake.script_image_archive(&digest(d), archive(files));
+        digest(d)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_unpacks_the_site_and_creates_no_container() {
+        let h = harness();
+        let d = publish(&h, 'a', &[("index.html", b"<h1>hi</h1>")]);
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(matches!(
+            single(&report),
+            ActionOutcome::Deployed(DeployOutcome::Deployed { .. })
+        ));
+        let site = sites(&h).join("blog");
+        assert_eq!(
+            std::fs::read(site.join("current/index.html")).unwrap(),
+            b"<h1>hi</h1>"
+        );
+        assert_eq!(h.state("blog").current, Some(d));
+        assert!(h.fake.containers().is_empty());
+        // Converged: the next pass does nothing.
+        assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_digest_switches_current_and_keeps_only_two_releases() {
+        let h = harness();
+        for (i, c) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let body = format!("v{i}");
+            publish(&h, c, &[("index.html", body.as_bytes())]);
+            h.rec.deploy(&name("blog"), false).await.unwrap();
+            let served =
+                std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
+            assert_eq!(served, body);
+        }
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('c')));
+        assert_eq!(st.previous, Some(digest('b')));
+        let releases = std::fs::read_dir(sites(&h).join("blog/releases"))
+            .unwrap()
+            .count();
+        assert_eq!(releases, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_site_never_replaces_the_one_being_served() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"good")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        // No index.html: the release is rejected and `current` stays.
+        publish(&h, 'b', &[("about.html", b"oops")]);
+        let outcome = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(
+            matches!(outcome, DeployOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let served = std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
+        assert_eq!(served, "good");
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_sites_directory_the_deploy_is_refused() {
+        let h = Harness::new(SITE);
+        h.fake.set_pull_digest(SITE_IMAGE, digest('a'));
+        let err = h.rec.deploy(&name("blog"), false).await.unwrap_err();
+        assert!(matches!(err, EngineError::Site(_)), "{err:?}");
+    }
+}

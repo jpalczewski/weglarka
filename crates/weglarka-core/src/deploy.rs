@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use crate::app::{AppSpec, AppsFile, Digest, InstanceName, normalize_signal};
+use crate::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName, normalize_signal};
 use crate::events::Event;
 use crate::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use crate::labels;
@@ -359,7 +359,7 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    async fn digest_from(
+    pub(crate) async fn digest_from(
         &self,
         instance: &InstanceName,
         spec: &AppSpec,
@@ -818,6 +818,11 @@ impl<P: PodmanClient> Reconciler<P> {
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
+        if spec.kind == AppKind::Static {
+            return self
+                .deploy_static_from(instance, &spec, force, source)
+                .await;
+        }
         // `start = false` — provision only (no container, no secrets, no health gate).
         if !spec.start {
             return self.provision_from(instance, &spec, source).await;

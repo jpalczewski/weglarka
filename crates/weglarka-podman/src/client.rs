@@ -462,6 +462,11 @@ impl PodmanClient for LibpodClient {
         Ok(())
     }
 
+    async fn image_save(&self, reference: &str) -> Result<TarStream> {
+        let path = format!("/images/{}/get?format=oci-archive", path_name(reference)?);
+        self.transport.bytes_stream(Method::GET, &path).await
+    }
+
     async fn volume_export(&self, name: &str) -> Result<TarStream> {
         let path = format!("/volumes/{}/export", path_name(name)?);
         self.transport.bytes_stream(Method::GET, &path).await

@@ -5,11 +5,18 @@ use weglarka_core::app::AppIngress;
 use super::NginxOptions;
 use super::common::set_app;
 use super::conf::Conf;
-use crate::plan::{AppRoute, PathPrefix};
+use crate::plan::{AppRoute, PathPrefix, RouteBackend};
 
-/// Where nginx forwards traffic. Today only a container; static sites will come as another variant.
+/// Where nginx sends traffic: a container (`proxy_pass`) or a static site's directory (ADR 0049).
 enum Backend<'a> {
-    Container { host: &'a str, port: u16 },
+    Container {
+        host: &'a str,
+        port: u16,
+    },
+    /// Files below `root`; never a `proxy_pass`, so none of the proxy headers apply.
+    Directory {
+        root: &'a str,
+    },
 }
 
 /// One `location` block of an app, before its directives are rendered. Extra locations of an app
@@ -33,6 +40,7 @@ fn path_locations<'a>(
     ingress: &AppIngress,
     path: &PathPrefix,
     app: Option<&'a str>,
+    directory: bool,
 ) -> Vec<Location<'a>> {
     if path.is_root() {
         return vec![Location {
@@ -49,12 +57,16 @@ fn path_locations<'a>(
     // The rewrite that removes the prefix (`.` is the only regex metacharacter the path alphabet
     // allows).
     let escaped = p.replace('.', "\\.");
-    let exact = ingress
-        .strip_prefix
-        .then(|| ("^".to_owned(), "/".to_owned()));
-    let below = ingress
-        .strip_prefix
-        .then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
+    // The files of a site live at its root, so its prefix is always removed; `/p` itself is the
+    // site's index.
+    let strip = ingress.strip_prefix || directory;
+    let exact = strip.then(|| {
+        (
+            "^".to_owned(),
+            if directory { "/index.html" } else { "/" }.to_owned(),
+        )
+    });
+    let below = strip.then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
     vec![
         Location {
             header: format!("location = {p}"),
@@ -107,6 +119,10 @@ impl Backend<'_> {
             if let Some(app) = location.app {
                 set_app(c, app);
             }
+            if let Backend::Directory { root } = self {
+                write_directory(c, root, location.strip.as_ref());
+                return;
+            }
             self.write_upstream(c, location.strip.as_ref());
             write_body_limit(c, ingress);
             write_streaming(c, ingress);
@@ -127,8 +143,23 @@ impl Backend<'_> {
                 }
                 c.line("proxy_pass $upstream;");
             }
+            Backend::Directory { .. } => unreachable!("a directory is rendered by write_directory"),
         }
     }
+}
+
+/// A static site's `location` body. `rewrite ... break` runs before `try_files`, which then sees the URI
+/// relative to the site root; nginx has normalized `$uri` (no `..`) before this point. Only GET and HEAD
+/// are allowed, and nothing is listed.
+fn write_directory(c: &mut Conf, root: &str, strip: Option<&(String, String)>) {
+    if let Some((regex, replacement)) = strip {
+        c.line(&format!("rewrite {regex} {replacement} break;"));
+    }
+    c.line(&format!("root {root};"));
+    c.line("index index.html;");
+    c.line("autoindex off;");
+    c.line("try_files $uri $uri/index.html =404;");
+    c.block("limit_except GET HEAD", |c| c.line("deny all;"));
 }
 
 /// Per-app body limit (ADR 0033). It is a *location* directive so that apps sharing a `server`
@@ -179,12 +210,16 @@ pub(super) fn write_app_locations(
         .collect();
     locations.sort_by(|a, b| a.0.cmp(b.0));
     for (path, app) in locations {
-        let backend = Backend::Container {
-            host: app.instance.as_str(),
-            port: app.port,
+        let backend = match &app.backend {
+            RouteBackend::Upstream { port } => Backend::Container {
+                host: app.instance.as_str(),
+                port: *port,
+            },
+            RouteBackend::Directory { root } => Backend::Directory { root },
         };
+        let directory = matches!(backend, Backend::Directory { .. });
         let name = shared.then(|| app.instance.as_str());
-        for location in path_locations(&app.ingress, path, name) {
+        for location in path_locations(&app.ingress, path, name, directory) {
             backend.write_location(c, &location, &app.ingress);
         }
     }

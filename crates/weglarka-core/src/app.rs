@@ -881,10 +881,32 @@ fn default_stream_timeout_secs() -> u64 {
     AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
 }
 
+/// What an instance runs (ADR 0049). The default is a container; a `static` instance has no container
+/// at all — its image is an artifact that the daemon unpacks into a release directory served by the
+/// ingress nginx.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppKind {
+    #[default]
+    Container,
+    Static,
+}
+
+impl AppKind {
+    /// Serde helper: omits `kind` while it is the default, so existing `apps.toml` files keep their shape.
+    pub fn is_container(&self) -> bool {
+        *self == Self::Container
+    }
+}
+
 /// Desired state of a single instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSpec {
+    /// `container` (default) or `static` (ADR 0049). Not part of the spec hash: a static instance has no
+    /// container whose hash could drift, and an unset kind must leave every running app untouched.
+    #[serde(default, skip_serializing_if = "AppKind::is_container")]
+    pub kind: AppKind,
     /// Image reference (floating tag, e.g. `ghcr.io/jpalczewski/ntfy.zig:latest`).
     /// State pins the resolved digest; see [`crate::state::AppState`].
     pub image: String,

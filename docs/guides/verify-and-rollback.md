@@ -54,6 +54,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `configs` and `reload_signal` | [host configs](host-configs.md) |
 | `apps.toml`, apps | `host_mounts`, `group_add` | [host mounts](host-mounts.md) |
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
+| `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |

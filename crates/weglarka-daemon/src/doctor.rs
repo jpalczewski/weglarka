@@ -996,7 +996,7 @@ fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let lines: Vec<String> = rows
         .iter()
         .map(|r| {
-            let mut line = format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.port);
+            let mut line = format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.backend);
             if r.strip_prefix && !r.path.is_root() {
                 line.push_str(" (strip prefix)");
             }

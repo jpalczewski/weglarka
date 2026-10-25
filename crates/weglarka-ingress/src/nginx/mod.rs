@@ -21,8 +21,8 @@
 //!   `$host`. A domain without a certificate gets no TLS server and its TLS handshake is rejected —
 //!   fail closed.
 //!
-//! Extension points: [`Backend`] (today only a proxy to a container; static sites would be another
-//! variant) and the two renderers, which share the location/log/scaffolding helpers, so a third mode
+//! Extension points: [`Backend`] (a proxy to a container or a directory served by nginx itself, ADR 0049)
+//! and the two renderers, which share the location/log/scaffolding helpers, so a third mode
 //! only has to write its own `server` blocks.
 
 mod behind;
