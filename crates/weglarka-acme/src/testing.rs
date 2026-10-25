@@ -97,6 +97,9 @@ impl AcmeClient for FakeAcme {
                 break;
             }
         }
+        if result.is_ok() {
+            solver.settle().await;
+        }
         for challenge in &challenges {
             if let Err(e) = solver.cleanup(challenge).await {
                 tracing::warn!(error = %e, "challenge cleanup failed");

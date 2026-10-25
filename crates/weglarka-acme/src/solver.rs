@@ -80,6 +80,12 @@ pub trait ChallengeSolver: Send + Sync {
     fn present(&self, challenge: &Challenge) -> impl Future<Output = Result<(), AcmeError>> + Send;
 
     fn cleanup(&self, challenge: &Challenge) -> impl Future<Output = Result<(), AcmeError>> + Send;
+
+    /// Called once after every challenge of an order is presented and before the CA is asked to
+    /// validate. DNS-01 waits here for the TXT records to become visible; HTTP-01 has nothing to wait for.
+    fn settle(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// HTTP-01: writes the key authorization to `<webroot>/<token>` (`0644`), which the ingress serves

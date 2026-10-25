@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use weglarka_dns::{DnsProvider, RecordHandle};
 
@@ -17,13 +18,17 @@ use crate::solver::{Challenge, ChallengeKind, ChallengeSolver};
 pub struct DnsSolver<P> {
     provider: P,
     records: Mutex<HashMap<(String, String), RecordHandle>>,
+    propagation: Duration,
 }
 
 impl<P: DnsProvider> DnsSolver<P> {
-    pub fn new(provider: P) -> Self {
+    /// `propagation` is how long [`ChallengeSolver::settle`] waits after publishing, so the CA's
+    /// resolvers can see the records (the provider API answers before its name servers do).
+    pub fn new(provider: P, propagation: Duration) -> Self {
         Self {
             provider,
             records: Mutex::default(),
+            propagation,
         }
     }
 
@@ -54,6 +59,12 @@ fn failed(challenge: &Challenge, e: weglarka_dns::DnsError) -> AcmeError {
 impl<P: DnsProvider> ChallengeSolver for DnsSolver<P> {
     fn kind(&self) -> ChallengeKind {
         ChallengeKind::Dns01
+    }
+
+    async fn settle(&self) {
+        if !self.propagation.is_zero() {
+            tokio::time::sleep(self.propagation).await;
+        }
     }
 
     async fn present(&self, challenge: &Challenge) -> Result<(), AcmeError> {
@@ -127,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_the_dns01_value_at_the_acme_challenge_name() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let c = challenge("example.eu", "tok");
         solver.present(&c).await.unwrap();
         assert_eq!(
@@ -139,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn present_and_cleanup_are_idempotent() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let c = challenge("example.eu", "tok");
         solver.present(&c).await.unwrap();
         solver.present(&c).await.unwrap();
@@ -158,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_challenges_on_one_name_are_two_records_removed_independently() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let (a, b) = (
             challenge("example.eu", "one"),
             challenge("example.eu", "two"),
@@ -177,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_delete_is_reported_and_can_be_retried() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let c = challenge("example.eu", "tok");
         solver.present(&c).await.unwrap();
         solver.provider().fail_next_remove("API down");
@@ -194,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_publish_is_a_challenge_error_and_leaves_nothing_behind() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let c = challenge("example.eu", "tok");
         solver.provider().fail_next_set("quota");
         let err = solver.present(&c).await.unwrap_err();
@@ -205,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_the_provider_rejects_is_a_challenge_error() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let err = solver
             .present(&challenge("Bad Name", "tok"))
             .await
@@ -215,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_order_still_cleans_the_dns_records() {
-        let solver = DnsSolver::new(FakeDns::new());
+        let solver = DnsSolver::new(FakeDns::new(), Duration::ZERO);
         let fake = FakeAcme::new(UNIX_EPOCH + 90 * DAY);
         fake.fail_next("CA said no");
         let spec = CertSpec::single("example.eu").unwrap();
@@ -232,7 +243,7 @@ mod tests {
         let dns = Arc::new(FakeDns::new());
         let manager = Manager::new(
             FakeAcme::new(now + 90 * DAY),
-            DnsSolver::new(Shared(dns.clone())),
+            DnsSolver::new(Shared(dns.clone()), Duration::ZERO),
             store.clone(),
             30 * DAY,
         );
