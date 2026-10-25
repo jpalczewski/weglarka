@@ -36,6 +36,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hmac = "0.13"
 http-body-util = "0.1"
+# ACME client (docs/decisions/0038): `ring` provider only — the default `aws-lc-rs` needs a C toolchain.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "x509-parser"] }
+# TLS connector for the ACME client: `ring` + our own bundled roots (the image has no CA store).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 insta = { version = "1", features = ["json"] }
@@ -56,6 +60,8 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 webpki-roots = "1"
+# Reads `notAfter` from issued chains (no verification features, so no extra crypto).
+x509-parser = "0.18"
 
 [profile.release]
 lto = true
