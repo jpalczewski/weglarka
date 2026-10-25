@@ -1,7 +1,7 @@
 # 0039 — ACME DNS-01 through a DNS-provider adapter (wildcard certificates)
 
-Status: proposed (2026-10-25, issue #97). The adapter crate is implemented; the solver, configuration and
-ingress mapping follow once the ACME crate of #96 is on `main` (see “Rollout”).
+Status: proposed (2026-10-25, issue #97). The adapter crate and the `DnsSolver` are implemented; the
+configuration, wildcard handling in the manager and the ingress mapping follow (see “Rollout”).
 
 ## Problem
 
@@ -76,15 +76,20 @@ convention `tls/_wildcard.<apex>.crt|key`.
 
 ## Rollout
 
-1. **This change:** the ADR and `weglarka-dns` (trait, `FakeDns`, Cloudflare adapter, tests). Nothing is
+1. **First step (done):** the ADR and `weglarka-dns` (trait, `FakeDns`, Cloudflare adapter, tests). Nothing is
    wired into the daemon yet, so there is no behavioural change.
-2. After the ACME crate of #96 lands: the `[acme]` additions (`challenge`, `[acme.dns]` with the provider
-   and the *name* of the token secret), a `DnsSolver` (`kind() == Dns01`: TXT value from the challenge's
-   key authorization, cleanup also after errors), wildcard handling in the manager and the store.
-3. A separate change for ingress: map a routed domain to its certificate (exact `<domain>.crt` first, then
+2. **`DnsSolver`** in `weglarka-acme` (done, on the #96 skeleton): `kind() == Dns01`, publishes
+   `_acme-challenge.<name>` = `Challenge::dns01_txt_value()` and remembers one handle per `(name, value)`, so
+   a wildcard order's two challenges on the same name are two records removed independently. `present` and
+   `cleanup` are idempotent, a failed delete keeps its handle for a retry, and the provider's error text is
+   the only thing that reaches `AcmeError::Challenge`.
+3. After the `instant-acme` client and `[acme]` of #96 land: the additions `challenge` and `[acme.dns]` (the
+   provider and the *name* of the token secret), building the solver from them, and the wildcard
+   `CertSpec` (`_wildcard.<apex>`: `*.<apex>` + `<apex>`) in the daemon's certificate list.
+4. A separate change for ingress: map a routed domain to its certificate (exact `<domain>.crt` first, then
    a one-label wildcard `*.<apex>`; the apex itself is not covered), which touches the certificate scan in
    the daemon and the `edge` generator and its snapshots; `behind` stays byte-for-byte unchanged.
-4. Doctor checks (`acme.dns.*`, CAA), `docs/install.md` and the operator documentation.
+5. Doctor checks (`acme.dns.*`, CAA), `docs/install.md` and the operator documentation.
 
 ## Consequences
 

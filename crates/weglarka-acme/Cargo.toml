@@ -28,8 +28,10 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 webpki-roots.workspace = true
 weglarka-core.workspace = true
+weglarka-dns.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+weglarka-dns = { workspace = true, features = ["testing"] }
 tokio.workspace = true

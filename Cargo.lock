@@ -1689,6 +1689,7 @@ dependencies = [
  "tracing",
  "webpki-roots",
  "weglarka-core",
+ "weglarka-dns",
  "x509-parser",
 ]
 
