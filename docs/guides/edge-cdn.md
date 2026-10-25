@@ -32,6 +32,7 @@ provider = "cloudflare"            # the only provider for now
   `pinned, N ranges`) and warns when a refresh failed or the last success is older than 7 days. If the daemon
   cannot reach `api.cloudflare.com`, the list simply stays as it is; an edge address that is not on it is treated
   as a plain client, never trusted.
+- **Certificates:** see [ACME behind a CDN](acme-behind-cdn.md) (wildcards preferred, zone rule for HTTP-01).
 - **Zone setting:** use SSL/TLS mode **Full (strict)**. With Flexible, Cloudflare connects to the plain listener
   and loops on the redirect to HTTPS.
 
