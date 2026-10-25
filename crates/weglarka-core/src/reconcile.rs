@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
-use crate::app::{AppSpec, AppsFile, Digest, InstanceName};
+use crate::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName};
 use crate::crash;
 use crate::delivery::{self, DeliveryDedup};
 use crate::deploy::DeployOutcome;
@@ -64,6 +64,9 @@ pub enum EngineError {
     /// issue #118, `docs/decisions/0028-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
+    /// A static site cannot be deployed or served (ADR 0049).
+    #[error("static site: {0}")]
+    Site(String),
     /// `weglarka run` of an app that has never been deployed: there is no pinned image to run.
     #[error("app {0} has no deployed image yet; run `weglarka apps deploy {0}` first")]
     RunNotDeployed(InstanceName),
@@ -242,6 +245,9 @@ pub struct ReconcilerOptions {
     /// network: at least the ingress resolver's cache lifetime, so no request still resolves to a
     /// container that is about to stop (ADR 0046).
     pub switch_drain: Duration,
+    /// Directory the static sites' releases are unpacked into (`<nginx_conf_dir>/sites`, ADR 0049).
+    /// `None` = the daemon serves no static sites: deploying one fails with a clear error.
+    pub sites_root: Option<PathBuf>,
 }
 
 impl Default for ReconcilerOptions {
@@ -254,6 +260,7 @@ impl Default for ReconcilerOptions {
             host_mounts: Vec::new(),
             group_add: Vec::new(),
             switch_drain: Duration::from_secs(3),
+            sites_root: None,
         }
     }
 }
@@ -279,6 +286,9 @@ pub struct Target {
     /// Apps that must be running before this one starts (`spec.depends_on`, issue #35). Used by
     /// [`plan`] for the start order and by the executor's dependency gate.
     pub depends_on: Vec<InstanceName>,
+    /// `kind = "static"` (ADR 0049): the instance has no container, so [`plan`] only deploys it once and
+    /// removes any container that carries its label.
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +366,20 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
             actions.push(Action::Remove {
                 container: c.name.clone(),
             });
+        }
+        if t.is_static {
+            // A kind flip leaves a container behind; a site has none.
+            if let Some(c) = main {
+                actions.push(Action::Remove {
+                    container: c.name.clone(),
+                });
+            }
+            if !t.blocked && t.pinned.is_none() {
+                actions.push(Action::Deploy {
+                    instance: t.instance.clone(),
+                });
+            }
+            continue;
         }
         if t.blocked {
             continue;
@@ -679,6 +703,29 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut targets = Vec::with_capacity(apps.apps.len());
         let mut waiting_changed = false;
         for (name, spec) in &apps.apps {
+            if spec.kind == AppKind::Static {
+                let app_state = st.apps.get(name);
+                let pinned = app_state.and_then(|s| s.current.clone());
+                // A failed first deploy waits for `deploy`, as for containers.
+                let blocked = pinned.is_none() && app_state.is_some_and(|s| s.failed.is_some());
+                if blocked {
+                    report.blocked.push((
+                        name.clone(),
+                        "first deploy failed; run deploy manually".into(),
+                    ));
+                }
+                targets.push(Target {
+                    instance: name.clone(),
+                    pinned,
+                    expected_hash: None,
+                    blocked,
+                    uid_range: None,
+                    start: true,
+                    depends_on: Vec::new(),
+                    is_static: true,
+                });
+                continue;
+            }
             // `start = false` needs no secrets: nothing is deployed until `apps start`.
             let missing = if spec.start {
                 missing_secrets(&self.secrets, name, spec).await?
@@ -736,6 +783,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 uid_range,
                 start: spec.start,
                 depends_on: spec.depends_on.clone(),
+                is_static: false,
             });
         }
 
@@ -934,6 +982,7 @@ mod tests {
                 uid_range: None,
                 start: true,
                 depends_on: vec![],
+                is_static: false,
             },
             h,
         )

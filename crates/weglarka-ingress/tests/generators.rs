@@ -1137,7 +1137,7 @@ fn path_route_table_lists_every_domain_and_prefix() {
     let rows: Vec<String> = plan
         .route_table()
         .iter()
-        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.port))
+        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.backend))
         .collect();
     assert_eq!(
         rows,
@@ -1413,4 +1413,177 @@ port = 3001
         nginx::generate(&host(), &a, &opts()),
         Err(IngressError::PathConflict { .. })
     ));
+}
+
+// --- Static sites (ADR 0049): a directory backend instead of an upstream ---------------------------
+
+/// A root site, a prefixed site and a container app on one domain (disjoint paths), plus a lone
+/// root site. None of the sites has a port.
+const SITE_APPS: &str = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+domains = ["app.example.eu"]
+paths = ["/api"]
+port = 3000
+
+[apps.docs]
+kind = "static"
+image = "ghcr.io/x/docs:latest"
+domains = ["app.example.eu"]
+paths = ["/docs.v2"]
+
+[apps.landing]
+kind = "static"
+image = "ghcr.io/x/landing:latest"
+domains = ["www.example.eu"]
+"#;
+
+#[test]
+fn static_site_needs_no_port_and_has_a_directory_backend() {
+    let a = apps(SITE_APPS);
+    let h = host();
+    let plan = Plan::build(&h, &a).unwrap();
+    let rows: Vec<String> = plan
+        .route_table()
+        .iter()
+        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.backend))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "app.example.eu/api -> api:3000",
+            "app.example.eu/docs.v2 -> docs:static:/etc/nginx/sites/docs/current",
+            "www.example.eu/ -> landing:static:/etc/nginx/sites/landing/current",
+        ]
+    );
+}
+
+#[test]
+fn static_site_shares_the_domain_rules_of_apps() {
+    let h = host();
+    let site = |paths: &str| {
+        format!(
+            r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+port = 80
+paths = ["/api"]
+
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["app.example.eu"]
+{paths}
+"#
+        )
+    };
+    // Disjoint prefix next to a container app, and the catch-all next to a prefixed app: accepted.
+    assert!(Plan::build(&h, &apps(&site("paths = [\"/docs\"]"))).is_ok());
+    assert!(Plan::build(&h, &apps(&site(""))).is_ok());
+    // Overlap and an identical prefix are refused like for two containers.
+    assert!(matches!(
+        Plan::build(&h, &apps(&site("paths = [\"/api/v2\"]"))),
+        Err(IngressError::PathConflict { .. })
+    ));
+    assert!(matches!(
+        Plan::build(&h, &apps(&site("paths = [\"/api\"]"))),
+        Err(IngressError::PathConflict { .. })
+    ));
+    // Two catch-alls, one of them a site.
+    let both = apps(
+        r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+port = 80
+
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["app.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &both),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    // The webhook domain stays exclusive; the reserved instance name too.
+    let webhook = apps(
+        r#"
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["weglarka.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &webhook),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    let reserved = apps(
+        r#"
+[apps.weglarka]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["s.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &reserved),
+        Err(IngressError::ReservedName(_))
+    ));
+}
+
+#[test]
+fn nginx_static_site_snapshots() {
+    let a = apps(SITE_APPS);
+    let behind = nginx::generate(&host(), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_sites", behind);
+    let edge = nginx::generate(
+        &edge_host(),
+        &a,
+        &edge_opts(&["app.example.eu", "www.example.eu", "weglarka.example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_sites", edge);
+
+    for conf in [&behind, &edge] {
+        // Only the container location proxies; the sites never do.
+        assert_eq!(conf.matches("proxy_pass $upstream;").count(), 3, "{conf}"); // api (exact + below) + webhook
+        let www = server_block(conf, "www.example.eu");
+        assert!(
+            !www.contains("proxy_pass") && !www.contains("$upstream"),
+            "{www}"
+        );
+        // (`edge` has a plain-HTTP and a TLS server per domain; `server_block` finds the first.)
+        assert!(
+            conf.contains("root /etc/nginx/sites/landing/current;"),
+            "{conf}"
+        );
+        // The prefix is stripped before `try_files` (`/docs.v2/x` -> `<root>/x`), `.` escaped.
+        assert!(
+            conf.contains("rewrite ^/docs\\.v2/(.*)$ /$1 break;"),
+            "{conf}"
+        );
+        assert!(conf.contains("rewrite ^ /index.html break;"), "{conf}");
+        assert!(conf.contains("try_files $uri $uri/index.html =404;"));
+        assert!(conf.contains("limit_except GET HEAD {"));
+    }
+}
+
+#[test]
+fn stopped_static_site_reserves_its_domain_but_renders_nothing() {
+    let a = stopped(apps(SITE_APPS));
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    assert!(!conf.contains("/etc/nginx/sites"), "{conf}");
+    let yml = traefik::generate(&host(), &a, &TraefikOptions::default()).unwrap();
+    assert!(!yml.contains("weglarka-app-"), "{yml}");
+}
+
+#[test]
+fn traefik_routes_a_static_site_to_the_nginx_like_any_app() {
+    let yml = traefik::generate(&host(), &apps(SITE_APPS), &TraefikOptions::default()).unwrap();
+    insta::assert_snapshot!("traefik_sites", yml);
+    assert!(yml.contains("Host(`www.example.eu`)"));
 }

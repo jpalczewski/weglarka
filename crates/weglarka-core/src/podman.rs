@@ -506,6 +506,9 @@ pub trait PodmanClient: Send + Sync {
     /// Loads an image archive (`oci-archive` or `docker-archive`) from a streamed tar and reports the
     /// image it created (`weglarka push`, docs/decisions/0042). Nothing is buffered by the client.
     fn image_load(&self, tar: TarStream) -> impl Future<Output = Result<LoadedImage>> + Send;
+    /// Exports an image as an `oci-archive` stream (`GET /libpod/images/{name}/get`), which the static
+    /// site extractor unpacks (docs/decisions/0049). `NotFound` if the image is missing.
+    fn image_save(&self, reference: &str) -> impl Future<Output = Result<TarStream>> + Send;
 
     // Networks
     /// Idempotent: an existing network with that name → `Ok`.
