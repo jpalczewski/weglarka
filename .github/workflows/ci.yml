@@ -143,8 +143,13 @@ jobs:
             -keyout "$RUNNER_TEMP/edge-certs/$domain.key" -out "$RUNNER_TEMP/edge-certs/$domain.crt" \
             -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain"
           chmod 600 "$RUNNER_TEMP/edge-certs/$domain.key"
-          cargo run -q -p weglarka-ingress --example dump -- nginx-edge "$domain" > "$RUNNER_TEMP/edge.conf"
-          docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" docker.io/library/nginx:1-alpine \
+          WEGLARKA_DUMP_PROXY_SOCKET_DIR=/run/wg-ingress \
+            cargo run -q -p weglarka-ingress --example dump -- nginx-edge "$domain" > "$RUNNER_TEMP/edge.conf"
+          # `nginx -t` binds the forwarder's unix sockets, so their directory has to exist.
+          mkdir -p "$RUNNER_TEMP/edge-run"
+          chmod 777 "$RUNNER_TEMP/edge-run"
+          docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-run:/run/wg-ingress" \
+            docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge.conf"
           .github/scripts/test-edge.sh "$RUNNER_TEMP/edge.conf" "$RUNNER_TEMP/edge-certs"
       # Wildcard certificates (issue #97): a pair named `_wildcard.<apex>` serves the apex and one label below it.

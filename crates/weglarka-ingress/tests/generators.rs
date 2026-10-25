@@ -1273,7 +1273,8 @@ fn nginx_edge_cdn_snapshot() {
 fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
     let o = edge_cdn_opts(&["203.0.113.0/24"]);
     let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
-    assert!(conf.contains("geo $remote_addr $weglarka_cdn {"));
+    // Trust is decided on the PROXY-header address, which is also set on requests rejected early.
+    assert!(conf.contains("geo $weglarka_peer $weglarka_cdn {"));
     assert!(conf.contains("203.0.113.0/24 1;"));
     assert!(
         !conf.contains("173.245.48.0/20"),
@@ -1283,9 +1284,12 @@ fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
     assert!(conf.contains("proxy_set_header X-Real-IP $weglarka_client;"));
     assert!(conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"));
     assert!(!conf.contains("$http_x_forwarded_for"));
-    assert!(conf.contains("\"peer\":\"$remote_addr\""));
-    // A fallback to `$remote_addr` for a CDN peer without a usable header.
-    assert!(conf.contains("default $remote_addr;"));
+    assert!(conf.contains("\"peer\":\"$weglarka_peer\""));
+    // A fallback to the peer for a CDN peer without a usable header, and for any non-CDN peer: a
+    // spoofed `CF-Connecting-IP` is never read (the `geo` default is 0).
+    assert!(conf.contains("default 0;"));
+    assert!(conf.contains("default $weglarka_peer;"));
+    assert!(!conf.contains("default $remote_addr;\n        \"~^1:"));
 }
 
 #[test]
@@ -1309,6 +1313,31 @@ fn the_cdn_option_needs_the_forwarder_and_edge_mode() {
         .unwrap();
     b.cdn = edge_cdn_opts(&[]).cdn;
     assert!(nginx::generate(&host(), &BTreeMap::new(), &b).is_err());
+}
+
+#[test]
+fn every_mode_defaults_app_for_requests_that_reach_no_app_server() {
+    let mut edge = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    edge.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    for conf in [
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge).unwrap(),
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap(),
+    ] {
+        assert!(conf.contains("map \"\" $app {\n"), "{conf}");
+        assert!(conf.contains("default \"-\";"));
+    }
+}
+
+#[test]
+fn edge_logs_the_proxy_protocol_address_for_requests_rejected_before_realip() {
+    let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("\"unix:\" $proxy_protocol_addr;"));
+    assert!(conf.contains("\"remote_addr\":\"$weglarka_peer\""));
+    // Without the forwarder socket there is nothing to fall back to.
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();
+    assert!(!conf.contains("weglarka_peer"));
 }
 
 /// Issue #180: `streaming_paths` carve long-lived locations out of the catch-all; the rest of the app

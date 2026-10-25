@@ -113,25 +113,62 @@ fn write_log_skip_maps(c: &mut Conf, plan: &Plan<'_>) -> bool {
     true
 }
 
+/// `$app` for requests that never reach a `set $app` (catch-all servers, and requests nginx rejects
+/// with 400 before the rewrite phase). A `map` variable is changeable, so the `set $app` in the
+/// `server`/`location` blocks still wins where it runs.
+fn write_app_default(c: &mut Conf) {
+    c.block("map \"\" $app", |c| {
+        c.line(&format!("default \"{NO_APP}\";"));
+    });
+}
+
 /// Where the access log takes the client address from.
 #[derive(Clone, Copy)]
 pub(super) enum ClientAddr {
-    /// `$remote_addr` is the client (`behind`, `edge` without a CDN).
+    /// `$remote_addr` is the client (`behind`, `edge` without a CDN or the forwarder).
     Direct,
-    /// `edge` behind a CDN: `$weglarka_client` is the visitor, `$remote_addr` the CDN's address.
-    BehindCdn,
+    /// `edge` behind the forwarder: `$weglarka_peer` is the client (see [`write_peer_address`]).
+    Proxied,
+    /// `edge` behind a CDN: `$weglarka_client` is the visitor, the peer is the CDN's address.
+    BehindCdn { proxied: bool },
+}
+
+impl ClientAddr {
+    /// The variable holding the TCP peer's address.
+    pub(super) fn peer(self) -> &'static str {
+        match self {
+            Self::Direct | Self::BehindCdn { proxied: false } => "$remote_addr",
+            Self::Proxied | Self::BehindCdn { proxied: true } => "$weglarka_peer",
+        }
+    }
+}
+
+/// The connection's peer address in `edge` behind the forwarder. `$remote_addr` is replaced from the
+/// PROXY header only when the request is processed (`realip` runs after the headers are parsed), so a
+/// request nginx rejects earlier still has `unix:`; the PROXY header itself is available from the start.
+pub(super) fn write_peer_address(c: &mut Conf) {
+    c.block("map $remote_addr $weglarka_peer", |c| {
+        c.line("\"unix:\" $proxy_protocol_addr;");
+        c.line("default $remote_addr;");
+    });
 }
 
 pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
-    c.line("# App name for the access log; set in each `server`.");
+    c.line("# App name for the access log; `-` unless a `server`/`location` sets it.");
+    write_app_default(c);
     c.line("log_format weglarka escape=json");
     // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
     let format = match client {
-        ClientAddr::BehindCdn => LOG_FORMAT.replace(
+        ClientAddr::BehindCdn { .. } => LOG_FORMAT.replace(
             "\"remote_addr\":\"$remote_addr\"",
-            "\"remote_addr\":\"$weglarka_client\",\"peer\":\"$remote_addr\"",
+            &format!(
+                "\"remote_addr\":\"$weglarka_client\",\"peer\":\"{}\"",
+                client.peer()
+            ),
         ),
-        ClientAddr::Direct => LOG_FORMAT.to_owned(),
+        ClientAddr::Direct | ClientAddr::Proxied => {
+            LOG_FORMAT.replace("$remote_addr", client.peer())
+        }
     };
     c.line(&format!("    '{format}';"));
     if write_log_skip_maps(c, plan) {

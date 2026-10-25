@@ -27,22 +27,22 @@ pub(super) const EDGE_CDN_FORWARDED: Forwarded = Forwarded {
 };
 
 /// The visitor's address behind a CDN (issue #159): the CDN header for a peer inside the ranges,
-/// `$remote_addr` for everyone else, and also for a CDN peer whose header is missing or not an IP
+/// the connection's peer address for everyone else, and also for a CDN peer whose header is missing or not an IP
 /// literal (the edge address, never empty). `X-Forwarded-For` is never read: a CDN appends to it,
 /// so its prefix is client-controlled. The regex runs only for CDN peers.
-fn write_cdn_client(c: &mut Conf, cdn: &CdnTrust) {
+fn write_cdn_client(c: &mut Conf, cdn: &CdnTrust, peer: &str) {
     c.line(&format!(
         "# CDN peers ({}): only they may announce the visitor.",
         cdn.source_label()
     ));
-    write_trusted_peers(c, "$remote_addr", "$weglarka_cdn", &cdn.ranges);
+    write_trusted_peers(c, peer, "$weglarka_cdn", &cdn.ranges);
     c.block(
         &format!(
             "map \"$weglarka_cdn:{}\" $weglarka_client",
             cdn.header_variable
         ),
         |c| {
-            c.line("default $remote_addr;");
+            c.line(&format!("default {peer};"));
             c.line("\"~^1:(?<ip>[0-9A-Fa-f.:]{3,45})$\" $ip;");
         },
     );
@@ -67,15 +67,16 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(
-            c,
-            if o.cdn.is_some() {
-                ClientAddr::BehindCdn
-            } else {
-                ClientAddr::Direct
-            },
-            plan,
-        );
+        let proxied = o.proxy_socket_dir.is_some();
+        let client = match (o.cdn.is_some(), proxied) {
+            (true, proxied) => ClientAddr::BehindCdn { proxied },
+            (false, true) => ClientAddr::Proxied,
+            (false, false) => ClientAddr::Direct,
+        };
+        if proxied {
+            write_peer_address(c);
+        }
+        write_log(c, client, plan);
         c.blank();
         // No `real_ip` and no trust maps: a direct client is never trusted for `X-Forwarded-*`
         // (ADR 0007). The headers are rebuilt from nginx's own `$remote_addr`/`$scheme`/`$host`.
@@ -86,7 +87,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.blank();
         }
         let forwarded = if let Some(cdn) = &o.cdn {
-            write_cdn_client(c, cdn);
+            write_cdn_client(c, cdn, client.peer());
             c.blank();
             &EDGE_CDN_FORWARDED
         } else {
