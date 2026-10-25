@@ -795,6 +795,13 @@ pub struct AppIngress {
     /// errors on these paths are still logged. Empty (default) logs everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_skip_paths: Vec<String>,
+    /// Paths (public URL space, same syntax as `paths`) that get their own `location` with a long
+    /// `proxy_read_timeout` ([`AppIngress::STREAMING_PATH_TIMEOUT_SECS`]) and buffering off, while the
+    /// rest of the app keeps the default timeout (issue #180: SSE endpoints such as `/user/events`).
+    /// Each entry matches itself and everything below it. Only for apps routed at `/`; redundant with
+    /// `streaming = true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_paths: Vec<String>,
 }
 
 impl Default for AppIngress {
@@ -805,11 +812,14 @@ impl Default for AppIngress {
             strip_prefix: false,
             max_body_size: None,
             access_log_skip_paths: Vec::new(),
+            streaming_paths: Vec::new(),
         }
     }
 }
 
 impl AppIngress {
+    /// Idle timeout of a `streaming_paths` location: an hour, the same ceiling as `stream_timeout_secs`.
+    pub const STREAMING_PATH_TIMEOUT_SECS: u64 = 3600;
     /// Default idle timeout of a streaming app (nginx's own default of 60 s is too short for SSE).
     pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 180;
     /// Upper bound: a stream idle for longer than an hour is a bug, not a slow producer.

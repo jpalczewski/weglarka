@@ -24,12 +24,28 @@ A ready-made file: [`docs/examples/streaming.toml`](../examples/streaming.toml).
 - `streaming = true` adds four directives to `location /` of **that one app**: `proxy_buffering off;`, `proxy_request_buffering off;`, `proxy_read_timeout <n>s;` and `proxy_send_timeout <n>s;`. Other apps, webhook blocks and the default server stay unchanged: an app without `ingress` gets exactly the `nginx.conf` it gets today.
 - `stream_timeout_secs` is idle time in both directions: **default 180**, allowed **1-3600**. `streaming = true` alone is enough (the default timeout is not written out). Setting a timeout with `streaming = false` is rejected by validation with the message "requires ingress.streaming = true": a timeout that never reaches the config is a typo, not an option. In v1 there is **no CLI flag** for the timeout: set it in `apps.toml` or through `apps update --spec`.
 - **Ingress only:** the change renders `nginx.conf`, checks it with `nginx -t` and sends SIGHUP, the same as `--domain`. The app's container, its digest and its `spec-hash` stay untouched: no deploy and no interruption of traffic to the app. The change applies to new connections; nginx closes the old workers gracefully, so an open stream ends on the old configuration.
-- `--no-streaming` resets the streaming settings (together with a custom timeout; `strip_prefix` stays) and sends nothing when the app does not stream anyway. The flags, like `--domain`, are mutually exclusive with `--spec`.
+- `--no-streaming` resets the streaming settings (together with a custom timeout; `strip_prefix`, `max_body_size` and `streaming_paths` stay) and sends nothing when the app does not stream anyway. The flags, like `--domain`, are mutually exclusive with `--spec`.
 - **Operational note:** `proxy_buffering off` is the point, but it has a cost: a slow client holds an nginx worker connection for the whole duration of the stream (`worker_processes 1`, `worker_connections 1024`), and `proxy_request_buffering off` extends the same to a slowly uploaded request body. Enable streaming for apps that really stream, not for everything "just in case".
 - An app that has WebSocket and enables streaming also gets a longer idle timeout (180 s instead of 60 s). That is usually exactly what you want, but it is a behaviour change, not a side effect.
 - **Traefik (`behind`) does not change:** it forwards the response as it arrives and does not buffer it, and its `idleTimeout` concerns idleness between keep-alive requests, not an ongoing stream. (In `edge` mode traffic goes straight to Węglarka's nginx, which terminates TLS; buffering and timeouts work identically, see [edge mode](edge-mode.md).)
 - **Config safety:** when nginx rejects the generated config, `nginx -t` in the daemon fails and the previous, working config is restored, so a bad entry does not leave the ingress without traffic.
 
+## Streaming only on some paths
+
+Switching a whole app to `streaming = true` is too broad when only one endpoint is long-lived (for example Forgejo's `/user/events`, which sits idle until something happens and otherwise ends in a 504 after the default 180 s). List the endpoint instead:
+
+```toml
+[apps.forge.ingress]
+streaming_paths = ["/user/events"]
+```
+
+or `weglarka apps update forge --streaming-path /user/events` (repeatable; replaces the list; `--no-streaming-paths` clears it; `apps add` takes the same flag).
+
+- Each entry gets its own `location = <path>` and `location ^~ <path>/` next to the app's `location /`, with buffering off and `proxy_read_timeout`/`proxy_send_timeout` of **3600 s**. The rest of the app keeps the default timeouts, and an empty list leaves `nginx.conf` unchanged. A per-app `max_body_size` is inherited. Works in both `behind` and `edge` mode.
+- Entries use the syntax of `paths` (`/seg[/seg…]`). `/` is rejected (use `streaming = true`), as are duplicates, a list combined with `streaming = true` (redundant), and a list on an app that routes under `paths` prefixes (see [path routing](path-routing.md)).
+- A streaming path must not fall under a prefix another app owns on the same domain: the ingress plan rejects it as a path conflict.
+- Ingress only, like `streaming`: nginx reload, no container recreation, no `spec-hash` change.
+
 ## Rollback
 
-`apps.toml` has `deny_unknown_fields`, so an **older daemon** cannot read an `[apps.X.ingress]` block. Remove it before a downgrade (`apps update --no-streaming` or by hand); see [verify and rollback](verify-and-rollback.md).
+`apps.toml` has `deny_unknown_fields`, so an **older daemon** cannot read an `[apps.X.ingress]` block. Remove it before a downgrade (`apps update --no-streaming` or by hand; `--no-streaming-paths` for `streaming_paths`) and the `schema_version` marker; see [verify and rollback](verify-and-rollback.md).

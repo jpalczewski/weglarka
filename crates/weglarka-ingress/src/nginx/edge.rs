@@ -67,13 +67,16 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        let peer = if o.proxy_socket_dir.is_some() {
-            write_peer_address(c);
-            "$weglarka_peer"
-        } else {
-            "$remote_addr"
+        let proxied = o.proxy_socket_dir.is_some();
+        let client = match (o.cdn.is_some(), proxied) {
+            (true, proxied) => ClientAddr::BehindCdn { proxied },
+            (false, true) => ClientAddr::Proxied,
+            (false, false) => ClientAddr::Direct,
         };
-        write_log(c, o.cdn.is_some(), peer, plan);
+        if proxied {
+            write_peer_address(c);
+        }
+        write_log(c, client, plan);
         c.blank();
         // No `real_ip` and no trust maps: a direct client is never trusted for `X-Forwarded-*`
         // (ADR 0007). The headers are rebuilt from nginx's own `$remote_addr`/`$scheme`/`$host`.
@@ -84,7 +87,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.blank();
         }
         let forwarded = if let Some(cdn) = &o.cdn {
-            write_cdn_client(c, cdn, peer);
+            write_cdn_client(c, cdn, client.peer());
             c.blank();
             &EDGE_CDN_FORWARDED
         } else {
@@ -109,7 +112,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.block("server", |c| {
             listen_edge_plain(c, o, false);
             c.line(&format!("server_name {};", plan.webhook.domain));
-            c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
+            set_app(c, WEBHOOK_UPSTREAM_HOST);
             write_plain_http_body(c, o);
         });
         if let Some(stem) = o.certificate_stem(&plan.webhook.domain) {
@@ -117,7 +120,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.block("server", |c| {
                 write_tls_listener(c, o, &stem);
                 c.line(&format!("server_name {};", plan.webhook.domain));
-                c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
+                set_app(c, WEBHOOK_UPSTREAM_HOST);
                 write_webhook_body(c, plan, o);
             });
         }
@@ -133,7 +136,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         for (domain, apps) in by_domain {
             let shared = apps.len() > 1;
             let app_name = if shared {
-                "-"
+                NO_APP
             } else {
                 apps[0].instance.as_str()
             };
@@ -141,7 +144,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.block("server", |c| {
                 listen_edge_plain(c, o, false);
                 c.line(&format!("server_name {domain};"));
-                c.line(&format!("set $app \"{app_name}\";"));
+                set_app(c, app_name);
                 write_plain_http_body(c, o);
             });
             let Some(stem) = o.certificate_stem(domain) else {
@@ -151,7 +154,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.block("server", |c| {
                 write_tls_listener(c, o, &stem);
                 c.line(&format!("server_name {domain};"));
-                c.line(&format!("set $app \"{app_name}\";"));
+                set_app(c, app_name);
                 write_app_locations(c, o, &apps, shared);
             });
         }

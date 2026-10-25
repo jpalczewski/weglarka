@@ -3,6 +3,7 @@
 use weglarka_core::app::AppIngress;
 
 use super::NginxOptions;
+use super::common::set_app;
 use super::conf::Conf;
 use crate::plan::{AppRoute, PathPrefix};
 
@@ -21,6 +22,8 @@ struct Location<'a> {
     /// App name set for the access log when the server hosts several apps and the server-level
     /// `$app` is therefore unknown.
     app: Option<&'a str>,
+    /// A `streaming_paths` entry (issue #180): rendered with the long-lived stream directives.
+    long_lived: bool,
 }
 
 /// The `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any other prefix
@@ -36,7 +39,11 @@ fn path_locations<'a>(
             header: "location /".to_owned(),
             strip: None,
             app,
-        }];
+            long_lived: false,
+        }]
+        .into_iter()
+        .chain(streaming_locations(ingress, app))
+        .collect();
     }
     let p = path.as_str();
     // The rewrite that removes the prefix (`.` is the only regex metacharacter the path alphabet
@@ -53,20 +60,52 @@ fn path_locations<'a>(
             header: format!("location = {p}"),
             strip: exact,
             app,
+            long_lived: false,
         },
         Location {
             header: format!("location ^~ {p}/"),
             strip: below,
             app,
+            long_lived: false,
         },
     ]
 }
 
+/// Issue #180: the long-lived endpoints carved out of the catch-all, each matching itself and
+/// everything below it. Validation only allows them on apps routed at `/`.
+fn streaming_locations<'a>(
+    ingress: &AppIngress,
+    app: Option<&'a str>,
+) -> impl Iterator<Item = Location<'a>> {
+    ingress.streaming_paths.iter().flat_map(move |p| {
+        [format!("location = {p}"), format!("location ^~ {p}/")]
+            .into_iter()
+            .map(move |header| Location {
+                header,
+                strip: None,
+                app,
+                long_lived: true,
+            })
+    })
+}
+
 impl Backend<'_> {
     fn write_location(&self, c: &mut Conf, location: &Location<'_>, ingress: &AppIngress) {
+        // Issue #180: a streaming-path location is the app's own settings with the long-lived
+        // stream directives on (long timeout, buffering off); the body limit is inherited.
+        let long_lived = AppIngress {
+            streaming: true,
+            stream_timeout_secs: AppIngress::STREAMING_PATH_TIMEOUT_SECS,
+            ..ingress.clone()
+        };
+        let ingress = if location.long_lived {
+            &long_lived
+        } else {
+            ingress
+        };
         c.block(&location.header, |c| {
             if let Some(app) = location.app {
-                c.line(&format!("set $app \"{app}\";"));
+                set_app(c, app);
             }
             self.write_upstream(c, location.strip.as_ref());
             write_body_limit(c, ingress);

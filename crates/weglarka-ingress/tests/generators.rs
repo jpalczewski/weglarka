@@ -1339,3 +1339,78 @@ fn edge_logs_the_proxy_protocol_address_for_requests_rejected_before_realip() {
     let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();
     assert!(!conf.contains("weglarka_peer"));
 }
+
+/// Issue #180: `streaming_paths` carve long-lived locations out of the catch-all; the rest of the app
+/// keeps nginx's default timeout, and an app without the list renders exactly as before.
+const STREAMING_PATHS_APPS: &str = r#"
+[apps.forge]
+image = "ghcr.io/x/forge:latest"
+domains = ["git.example.eu"]
+port = 3000
+
+[apps.forge.ingress]
+streaming_paths = ["/user/events"]
+max_body_size = "4g"
+
+[apps.plain]
+image = "ghcr.io/x/plain:latest"
+domains = ["plain.example.eu"]
+port = 3001
+"#;
+
+#[test]
+fn streaming_paths_get_their_own_long_timeout_location() {
+    let conf = nginx::generate(&host(), &apps(STREAMING_PATHS_APPS), &opts()).unwrap();
+    insta::assert_snapshot!("nginx_streaming_paths", conf);
+
+    let forge = server_block(&conf, "git.example.eu");
+    assert!(forge.contains("location = /user/events {"), "{forge}");
+    assert!(forge.contains("location ^~ /user/events/ {"), "{forge}");
+    assert_eq!(
+        forge.matches("proxy_read_timeout 3600s;").count(),
+        2,
+        "{forge}"
+    );
+    // The catch-all keeps the default: its block ends before the first streaming location.
+    let root =
+        &forge[forge.find("location / {").unwrap()..forge.find("location = /user/events").unwrap()];
+    assert!(!root.contains("proxy_read_timeout"), "{root}");
+    assert!(!conf.contains("proxy_read_timeout 180s"), "{conf}");
+    let plain = server_block(&conf, "plain.example.eu");
+    assert!(!plain.contains("proxy_read_timeout"), "{plain}");
+}
+
+#[test]
+fn streaming_paths_render_in_edge_mode_too() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(STREAMING_PATHS_APPS),
+        &edge_opts(&["git.example.eu"]),
+    )
+    .unwrap();
+    assert!(conf.contains("location = /user/events {"), "{conf}");
+    assert!(conf.contains("proxy_read_timeout 3600s;"), "{conf}");
+}
+
+#[test]
+fn streaming_paths_must_not_shadow_another_apps_prefix() {
+    let a = apps(
+        r#"
+[apps.forge]
+image = "i"
+domains = ["git.example.eu"]
+port = 3000
+ingress = { streaming_paths = ["/user/events"] }
+
+[apps.other]
+image = "i"
+domains = ["git.example.eu"]
+paths = ["/user"]
+port = 3001
+"#,
+    );
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::PathConflict { .. })
+    ));
+}
