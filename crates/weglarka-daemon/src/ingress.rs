@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, watch};
-use weglarka_core::app::{AppSpec, InstanceName, Security};
+use weglarka_core::app::{AppKind, AppSpec, InstanceName, Security};
 use weglarka_core::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
 use weglarka_core::labels;
 use weglarka_core::podman::{
@@ -214,9 +214,10 @@ impl<P: PodmanClient> IngressManager<P> {
 
     async fn apply_locked(&self) -> Result<ApplyReport, IngressApplyError> {
         let apps: BTreeMap<InstanceName, AppSpec> = state::load_apps(&self.apps_path)?.apps;
+        // A static site (ADR 0049) has no container, hence no network for nginx to join.
         let routed: Vec<&InstanceName> = apps
             .iter()
-            .filter(|(_, s)| !s.domains.is_empty())
+            .filter(|(_, s)| !s.domains.is_empty() && s.kind == AppKind::Container)
             .map(|(n, _)| n)
             .collect();
 

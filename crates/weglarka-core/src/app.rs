@@ -795,6 +795,13 @@ pub struct AppIngress {
     /// errors on these paths are still logged. Empty (default) logs everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_skip_paths: Vec<String>,
+    /// Paths (public URL space, same syntax as `paths`) that get their own `location` with a long
+    /// `proxy_read_timeout` ([`AppIngress::STREAMING_PATH_TIMEOUT_SECS`]) and buffering off, while the
+    /// rest of the app keeps the default timeout (issue #180: SSE endpoints such as `/user/events`).
+    /// Each entry matches itself and everything below it. Only for apps routed at `/`; redundant with
+    /// `streaming = true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_paths: Vec<String>,
 }
 
 impl Default for AppIngress {
@@ -805,11 +812,14 @@ impl Default for AppIngress {
             strip_prefix: false,
             max_body_size: None,
             access_log_skip_paths: Vec::new(),
+            streaming_paths: Vec::new(),
         }
     }
 }
 
 impl AppIngress {
+    /// Idle timeout of a `streaming_paths` location: an hour, the same ceiling as `stream_timeout_secs`.
+    pub const STREAMING_PATH_TIMEOUT_SECS: u64 = 3600;
     /// Default idle timeout of a streaming app (nginx's own default of 60 s is too short for SSE).
     pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 180;
     /// Upper bound: a stream idle for longer than an hour is a bug, not a slow producer.
@@ -871,10 +881,32 @@ fn default_stream_timeout_secs() -> u64 {
     AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
 }
 
+/// What an instance runs (ADR 0049). The default is a container; a `static` instance has no container
+/// at all — its image is an artifact that the daemon unpacks into a release directory served by the
+/// ingress nginx.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppKind {
+    #[default]
+    Container,
+    Static,
+}
+
+impl AppKind {
+    /// Serde helper: omits `kind` while it is the default, so existing `apps.toml` files keep their shape.
+    pub fn is_container(&self) -> bool {
+        *self == Self::Container
+    }
+}
+
 /// Desired state of a single instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSpec {
+    /// `container` (default) or `static` (ADR 0049). Not part of the spec hash: a static instance has no
+    /// container whose hash could drift, and an unset kind must leave every running app untouched.
+    #[serde(default, skip_serializing_if = "AppKind::is_container")]
+    pub kind: AppKind,
     /// Image reference (floating tag, e.g. `ghcr.io/jpalczewski/ntfy.zig:latest`).
     /// State pins the resolved digest; see [`crate::state::AppState`].
     pub image: String,

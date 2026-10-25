@@ -37,6 +37,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [One-off commands](one-off-commands.md) | `weglarka run` |
 | [Port forward](port-forward.md) | `weglarka forward`, `cli.toml` (`ssh_host`) |
 | [Deploying a local image](push-local-images.md) | `weglarka push`: an image archive or another tag of the repository |
+| [Static sites](static-sites.md) | `kind = "static"`: a built site (Astro, Hugo…) served by the ingress nginx, releases and `current` |
 | [apps update](apps-update.md) | What each change does to a running app |
 
 ## Networking and ingress

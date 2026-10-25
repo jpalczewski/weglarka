@@ -1137,7 +1137,7 @@ fn path_route_table_lists_every_domain_and_prefix() {
     let rows: Vec<String> = plan
         .route_table()
         .iter()
-        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.port))
+        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.backend))
         .collect();
     assert_eq!(
         rows,
@@ -1273,7 +1273,8 @@ fn nginx_edge_cdn_snapshot() {
 fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
     let o = edge_cdn_opts(&["203.0.113.0/24"]);
     let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
-    assert!(conf.contains("geo $remote_addr $weglarka_cdn {"));
+    // Trust is decided on the PROXY-header address, which is also set on requests rejected early.
+    assert!(conf.contains("geo $weglarka_peer $weglarka_cdn {"));
     assert!(conf.contains("203.0.113.0/24 1;"));
     assert!(
         !conf.contains("173.245.48.0/20"),
@@ -1283,9 +1284,12 @@ fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
     assert!(conf.contains("proxy_set_header X-Real-IP $weglarka_client;"));
     assert!(conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"));
     assert!(!conf.contains("$http_x_forwarded_for"));
-    assert!(conf.contains("\"peer\":\"$remote_addr\""));
-    // A fallback to `$remote_addr` for a CDN peer without a usable header.
-    assert!(conf.contains("default $remote_addr;"));
+    assert!(conf.contains("\"peer\":\"$weglarka_peer\""));
+    // A fallback to the peer for a CDN peer without a usable header, and for any non-CDN peer: a
+    // spoofed `CF-Connecting-IP` is never read (the `geo` default is 0).
+    assert!(conf.contains("default 0;"));
+    assert!(conf.contains("default $weglarka_peer;"));
+    assert!(!conf.contains("default $remote_addr;\n        \"~^1:"));
 }
 
 #[test]
@@ -1309,4 +1313,277 @@ fn the_cdn_option_needs_the_forwarder_and_edge_mode() {
         .unwrap();
     b.cdn = edge_cdn_opts(&[]).cdn;
     assert!(nginx::generate(&host(), &BTreeMap::new(), &b).is_err());
+}
+
+#[test]
+fn every_mode_defaults_app_for_requests_that_reach_no_app_server() {
+    let mut edge = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    edge.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    for conf in [
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge).unwrap(),
+        nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap(),
+    ] {
+        assert!(conf.contains("map \"\" $app {\n"), "{conf}");
+        assert!(conf.contains("default \"-\";"));
+    }
+}
+
+#[test]
+fn edge_logs_the_proxy_protocol_address_for_requests_rejected_before_realip() {
+    let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("\"unix:\" $proxy_protocol_addr;"));
+    assert!(conf.contains("\"remote_addr\":\"$weglarka_peer\""));
+    // Without the forwarder socket there is nothing to fall back to.
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();
+    assert!(!conf.contains("weglarka_peer"));
+}
+
+/// Issue #180: `streaming_paths` carve long-lived locations out of the catch-all; the rest of the app
+/// keeps nginx's default timeout, and an app without the list renders exactly as before.
+const STREAMING_PATHS_APPS: &str = r#"
+[apps.forge]
+image = "ghcr.io/x/forge:latest"
+domains = ["git.example.eu"]
+port = 3000
+
+[apps.forge.ingress]
+streaming_paths = ["/user/events"]
+max_body_size = "4g"
+
+[apps.plain]
+image = "ghcr.io/x/plain:latest"
+domains = ["plain.example.eu"]
+port = 3001
+"#;
+
+#[test]
+fn streaming_paths_get_their_own_long_timeout_location() {
+    let conf = nginx::generate(&host(), &apps(STREAMING_PATHS_APPS), &opts()).unwrap();
+    insta::assert_snapshot!("nginx_streaming_paths", conf);
+
+    let forge = server_block(&conf, "git.example.eu");
+    assert!(forge.contains("location = /user/events {"), "{forge}");
+    assert!(forge.contains("location ^~ /user/events/ {"), "{forge}");
+    assert_eq!(
+        forge.matches("proxy_read_timeout 3600s;").count(),
+        2,
+        "{forge}"
+    );
+    // The catch-all keeps the default: its block ends before the first streaming location.
+    let root =
+        &forge[forge.find("location / {").unwrap()..forge.find("location = /user/events").unwrap()];
+    assert!(!root.contains("proxy_read_timeout"), "{root}");
+    assert!(!conf.contains("proxy_read_timeout 180s"), "{conf}");
+    let plain = server_block(&conf, "plain.example.eu");
+    assert!(!plain.contains("proxy_read_timeout"), "{plain}");
+}
+
+#[test]
+fn streaming_paths_render_in_edge_mode_too() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(STREAMING_PATHS_APPS),
+        &edge_opts(&["git.example.eu"]),
+    )
+    .unwrap();
+    assert!(conf.contains("location = /user/events {"), "{conf}");
+    assert!(conf.contains("proxy_read_timeout 3600s;"), "{conf}");
+}
+
+#[test]
+fn streaming_paths_must_not_shadow_another_apps_prefix() {
+    let a = apps(
+        r#"
+[apps.forge]
+image = "i"
+domains = ["git.example.eu"]
+port = 3000
+ingress = { streaming_paths = ["/user/events"] }
+
+[apps.other]
+image = "i"
+domains = ["git.example.eu"]
+paths = ["/user"]
+port = 3001
+"#,
+    );
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::PathConflict { .. })
+    ));
+}
+
+// --- Static sites (ADR 0049): a directory backend instead of an upstream ---------------------------
+
+/// A root site, a prefixed site and a container app on one domain (disjoint paths), plus a lone
+/// root site. None of the sites has a port.
+const SITE_APPS: &str = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+domains = ["app.example.eu"]
+paths = ["/api"]
+port = 3000
+
+[apps.docs]
+kind = "static"
+image = "ghcr.io/x/docs:latest"
+domains = ["app.example.eu"]
+paths = ["/docs.v2"]
+
+[apps.landing]
+kind = "static"
+image = "ghcr.io/x/landing:latest"
+domains = ["www.example.eu"]
+"#;
+
+#[test]
+fn static_site_needs_no_port_and_has_a_directory_backend() {
+    let a = apps(SITE_APPS);
+    let h = host();
+    let plan = Plan::build(&h, &a).unwrap();
+    let rows: Vec<String> = plan
+        .route_table()
+        .iter()
+        .map(|r| format!("{}{} -> {}:{}", r.domain, r.path, r.instance, r.backend))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "app.example.eu/api -> api:3000",
+            "app.example.eu/docs.v2 -> docs:static:/etc/nginx/sites/docs/current",
+            "www.example.eu/ -> landing:static:/etc/nginx/sites/landing/current",
+        ]
+    );
+}
+
+#[test]
+fn static_site_shares_the_domain_rules_of_apps() {
+    let h = host();
+    let site = |paths: &str| {
+        format!(
+            r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+port = 80
+paths = ["/api"]
+
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["app.example.eu"]
+{paths}
+"#
+        )
+    };
+    // Disjoint prefix next to a container app, and the catch-all next to a prefixed app: accepted.
+    assert!(Plan::build(&h, &apps(&site("paths = [\"/docs\"]"))).is_ok());
+    assert!(Plan::build(&h, &apps(&site(""))).is_ok());
+    // Overlap and an identical prefix are refused like for two containers.
+    assert!(matches!(
+        Plan::build(&h, &apps(&site("paths = [\"/api/v2\"]"))),
+        Err(IngressError::PathConflict { .. })
+    ));
+    assert!(matches!(
+        Plan::build(&h, &apps(&site("paths = [\"/api\"]"))),
+        Err(IngressError::PathConflict { .. })
+    ));
+    // Two catch-alls, one of them a site.
+    let both = apps(
+        r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["app.example.eu"]
+port = 80
+
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["app.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &both),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    // The webhook domain stays exclusive; the reserved instance name too.
+    let webhook = apps(
+        r#"
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["weglarka.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &webhook),
+        Err(IngressError::DuplicateDomain(_))
+    ));
+    let reserved = apps(
+        r#"
+[apps.weglarka]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["s.example.eu"]
+"#,
+    );
+    assert!(matches!(
+        Plan::build(&h, &reserved),
+        Err(IngressError::ReservedName(_))
+    ));
+}
+
+#[test]
+fn nginx_static_site_snapshots() {
+    let a = apps(SITE_APPS);
+    let behind = nginx::generate(&host(), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_sites", behind);
+    let edge = nginx::generate(
+        &edge_host(),
+        &a,
+        &edge_opts(&["app.example.eu", "www.example.eu", "weglarka.example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_sites", edge);
+
+    for conf in [&behind, &edge] {
+        // Only the container location proxies; the sites never do.
+        assert_eq!(conf.matches("proxy_pass $upstream;").count(), 3, "{conf}"); // api (exact + below) + webhook
+        let www = server_block(conf, "www.example.eu");
+        assert!(
+            !www.contains("proxy_pass") && !www.contains("$upstream"),
+            "{www}"
+        );
+        // (`edge` has a plain-HTTP and a TLS server per domain; `server_block` finds the first.)
+        assert!(
+            conf.contains("root /etc/nginx/sites/landing/current;"),
+            "{conf}"
+        );
+        // The prefix is stripped before `try_files` (`/docs.v2/x` -> `<root>/x`), `.` escaped.
+        assert!(
+            conf.contains("rewrite ^/docs\\.v2/(.*)$ /$1 break;"),
+            "{conf}"
+        );
+        assert!(conf.contains("rewrite ^ /index.html break;"), "{conf}");
+        assert!(conf.contains("try_files $uri $uri/index.html =404;"));
+        assert!(conf.contains("limit_except GET HEAD {"));
+    }
+}
+
+#[test]
+fn stopped_static_site_reserves_its_domain_but_renders_nothing() {
+    let a = stopped(apps(SITE_APPS));
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    assert!(!conf.contains("/etc/nginx/sites"), "{conf}");
+    let yml = traefik::generate(&host(), &a, &TraefikOptions::default()).unwrap();
+    assert!(!yml.contains("weglarka-app-"), "{yml}");
+}
+
+#[test]
+fn traefik_routes_a_static_site_to_the_nginx_like_any_app() {
+    let yml = traefik::generate(&host(), &apps(SITE_APPS), &TraefikOptions::default()).unwrap();
+    insta::assert_snapshot!("traefik_sites", yml);
+    assert!(yml.contains("Host(`www.example.eu`)"));
 }

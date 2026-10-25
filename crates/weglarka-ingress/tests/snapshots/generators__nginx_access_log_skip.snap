@@ -55,7 +55,10 @@ http {
         '' close;
     }
 
-    # App name for the access log; set in each `server`.
+    # App name for the access log; `-` unless a `server`/`location` sets it.
+    map "" $app {
+        default "-";
+    }
     log_format weglarka escape=json
         '{"time":"$time_iso8601","app":"$app","host":"$host","remote_addr":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_response_time":"$upstream_response_time","request_id":"$request_id","user_agent":"$http_user_agent"}';
     # Paths an app asked to keep out of the access log (while they succeed).

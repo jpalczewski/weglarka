@@ -231,6 +231,8 @@ pub async fn start<P: PodmanClient + 'static>(
         config_root: paths.config_root.clone(),
         host_mounts: host.runtime.host_mounts.clone(),
         group_add: host.runtime.group_add.clone(),
+        // Static sites live in the one directory nginx mounts (ADR 0049, ADR 0036).
+        sites_root: Some(paths.nginx_conf_dir.join("sites")),
         dependency_wait_secs: host
             .runtime
             .dependency_wait_secs

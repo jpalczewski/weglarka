@@ -91,6 +91,9 @@ curl -k --resolve ntfy.example.com:443:127.0.0.1 https://ntfy.example.com/   # -
 - **No trust in headers:** nginx terminates TLS, so it builds `X-Forwarded-For/Proto/Host` from
   `$remote_addr`/`$scheme`/`$host`; spoofed client values are overwritten ([ADR 0007](../decisions/0007-zaufane-proxy-i-reload-nginx.md)).
   `trusted_proxies` in `edge` is a validation error.
+- **Access log for requests that reach no app:** `app` is `-` unless a server or location names an app, and
+  `remote_addr` is the client address from the forwarder's PROXY header even for requests nginx rejects with
+  400 before it processes them (scanner garbage), which would otherwise be logged as `unix:`.
 - **Ingress container:** the hardening profile ([ADR 0014](../decisions/0014-ingress-nginx-hardening.md), see
   [container hardening](container-hardening.md)) does not change (the same three capabilities, read-only root);
   the uid map does — the container root is the runtime user, the worker stays in the ingress range

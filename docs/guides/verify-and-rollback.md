@@ -47,13 +47,14 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `strategy` (`weglarka apps update <app> --strategy recreate`, then remove the key) | [blue-green deploys](blue-green.md) |
 | `apps.toml`, apps | `command` | [container command](container-command.md) |
 | `apps.toml`, apps | `host_ports` | [host ports](host-ports.md) |
-| `apps.toml`, apps | `[apps.X.ingress]` blocks — `streaming` | [streaming](streaming.md) |
+| `apps.toml`, apps | `[apps.X.ingress]` blocks — `streaming`, `streaming_paths` (`weglarka apps update <app> --no-streaming-paths`) | [streaming](streaming.md) |
 | `apps.toml`, apps | `paths` and `ingress.strip_prefix` | [path routing](path-routing.md) |
 | `apps.toml`, apps | `ingress.max_body_size` (`weglarka apps update <app> --unset-max-body-size`) | [max body size](max-body-size.md) |
 | `apps.toml`, apps | `ingress.access_log_skip_paths` (`weglarka apps update <app> --remove-access-log-skip-path <path>`) | [access log](access-log.md) |
 | `apps.toml`, apps | `configs` and `reload_signal` | [host configs](host-configs.md) |
 | `apps.toml`, apps | `host_mounts`, `group_add` | [host mounts](host-mounts.md) |
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
+| `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |

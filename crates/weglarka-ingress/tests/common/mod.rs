@@ -47,6 +47,7 @@ pub fn apps(toml_src: &str) -> BTreeMap<InstanceName, AppSpec> {
 
 pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, AppSpec> {
     let mut spec = AppSpec {
+        kind: Default::default(),
         image: "ghcr.io/x/y:latest".into(),
         command: vec![],
         domains: domains.iter().map(|d| (*d).to_owned()).collect(),

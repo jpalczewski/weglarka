@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
-    AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget, SharedVolumeName,
+    AppKind, AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget, SharedVolumeName,
     normalize_signal, valid_config_source, valid_mount_target, valid_volume_name,
 };
 use crate::hash::SpecHash;
@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -110,6 +110,20 @@ fn access_log_skip_paths_v10(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v10 → v11: streaming paths (issue #180). `AppIngress::streaming_paths` is optional and defaults to
+/// empty, so a v10 document needs no data transformation — the marker records that the file may carry
+/// it. A no-op that must accept a hand-edited file which already has it.
+fn ingress_streaming_paths_v11(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
+/// v11 → v12: static sites (issue #48, ADR 0049). `AppSpec::kind` is optional and defaults to
+/// `container`, so a v11 document needs no data transformation — the marker records that the file may
+/// carry `kind = "static"`. A no-op that must accept a hand-edited file which already has it.
+fn static_sites_v12(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -123,6 +137,8 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     host_mounts_v8,
     deploy_strategy_v9,
     access_log_skip_paths_v10,
+    ingress_streaming_paths_v11,
+    static_sites_v12,
 ];
 
 const _: () = assert!(
@@ -348,7 +364,44 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_depends_on(name, spec)?;
     validate_ingress(name, spec)?;
     validate_strategy(name, spec)?;
-    validate_iteration2(name, spec)
+    validate_iteration2(name, spec)?;
+    validate_static(name, spec)
+}
+
+/// A static site (ADR 0049) has no process: every field that configures one is a typo or a mistaken
+/// `kind`, and silently ignoring it would hide that.
+fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    if spec.kind != AppKind::Static {
+        return Ok(());
+    }
+    let defaults: AppSpec = toml::from_str("image = \"i\"").expect("minimal spec parses");
+    let rejected = [
+        ("port", spec.port.is_some()),
+        ("command", !spec.command.is_empty()),
+        ("env", !spec.env.is_empty()),
+        ("secrets", !spec.secrets.is_empty()),
+        ("health", spec.health != defaults.health),
+        ("volumes", !spec.volumes.is_empty()),
+        ("shared_volumes", !spec.shared_volumes.is_empty()),
+        ("shared_networks", !spec.shared_networks.is_empty()),
+        ("host_ports", !spec.host_ports.is_empty()),
+        ("depends_on", !spec.depends_on.is_empty()),
+        ("resources", spec.resources != defaults.resources),
+        ("security", spec.security != defaults.security),
+        ("configs", !spec.configs.is_empty()),
+        ("reload_signal", spec.reload_signal.is_some()),
+        ("ingress", spec.ingress != defaults.ingress),
+        ("start", !spec.start),
+        ("host_mounts", !spec.host_mounts.is_empty()),
+        ("group_add", !spec.group_add.is_empty()),
+        ("strategy", spec.strategy != defaults.strategy),
+    ];
+    if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
+        return Err(format!(
+            "{name}: `{field}` does not apply to kind = \"static\" (a static site has no container)"
+        ));
+    }
+    Ok(())
 }
 
 /// `blue_green` runs two containers of the app at once, so it is only for stateless apps (ADR 0046):
@@ -437,6 +490,31 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         return Err(format!(
             "{name}: ingress.access_log_skip_paths requires at least one domain"
         ));
+    }
+    if !ingress.streaming_paths.is_empty() {
+        if ingress.streaming {
+            return Err(format!(
+                "{name}: ingress.streaming_paths is redundant with ingress.streaming = true"
+            ));
+        }
+        if spec.paths.iter().any(|p| p != "/") {
+            return Err(format!(
+                "{name}: ingress.streaming_paths cannot be combined with path prefixes in `paths`"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for path in &ingress.streaming_paths {
+            crate::app::check_path_prefix(path)
+                .map_err(|reason| format!("{name}: invalid streaming path {path:?}: {reason}"))?;
+            if path == "/" {
+                return Err(format!(
+                    "{name}: use ingress.streaming = true instead of streaming path \"/\""
+                ));
+            }
+            if !seen.insert(path) {
+                return Err(format!("{name}: duplicate streaming path {path:?}"));
+            }
+        }
     }
     Ok(())
 }
@@ -933,6 +1011,43 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("requires ingress.streaming = true"), "{err}");
+    }
+
+    #[test]
+    fn streaming_paths_are_validated() {
+        let ok = |extra: &str| -> Result<(), String> {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(ok("ingress = { streaming_paths = [\"/user/events\", \"/a/b\"] }").is_ok());
+        for (extra, needle) in [
+            (
+                "ingress = { streaming_paths = [\"/\"] }",
+                "instead of streaming path",
+            ),
+            (
+                "ingress = { streaming_paths = [\"x\"] }",
+                "invalid streaming path",
+            ),
+            (
+                "ingress = { streaming_paths = [\"/a\", \"/a\"] }",
+                "duplicate",
+            ),
+            (
+                "ingress = { streaming = true, streaming_paths = [\"/a\"] }",
+                "redundant",
+            ),
+            (
+                "paths = [\"/p\"]\ningress = { streaming_paths = [\"/a\"] }",
+                "cannot be combined",
+            ),
+        ] {
+            let err = ok(extra).unwrap_err();
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
     }
 
     #[test]
