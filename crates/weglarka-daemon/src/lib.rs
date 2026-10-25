@@ -223,9 +223,14 @@ pub async fn start<P: PodmanClient + 'static>(
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
+    let defaults = ReconcilerOptions::default();
     let options = ReconcilerOptions {
         config_root: paths.config_root.clone(),
-        ..ReconcilerOptions::default()
+        dependency_wait_secs: host
+            .runtime
+            .dependency_wait_secs
+            .unwrap_or(defaults.dependency_wait_secs),
+        ..defaults
     };
     let mut reconciler = Reconciler::new(
         podman,
