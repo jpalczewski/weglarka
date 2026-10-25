@@ -13,9 +13,9 @@ use sha2::{Digest as _, Sha256};
 use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent,
-    PullEvent, RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
-    image_repo,
+    ImageInfo, LogChunk, LogSource, LogStream, NetworkInfo, NetworkSpec, NetworkSummary,
+    PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream,
+    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -50,6 +50,11 @@ pub enum Call {
         name: String,
         cmd: Vec<String>,
     },
+    ContainerLogs {
+        name: String,
+        follow: bool,
+    },
+    ContainerWait(String),
     SecretCreate(String),
     SecretRemove(String),
     HealthcheckRun(String),
@@ -63,8 +68,22 @@ pub enum Call {
     },
 }
 
+/// What a one-off container prints and how it ends; scripted with
+/// [`FakePodman::script_next_run`] and picked up by the next `container_start`.
+#[derive(Debug, Clone, Default)]
+pub struct RunScript {
+    pub output: Vec<(LogSource, Vec<u8>)>,
+    pub exit_code: i32,
+    /// The process never exits: `container_wait` stays pending (timeouts, cancellation, limits).
+    pub hang: bool,
+}
+
 #[derive(Default)]
 struct State {
+    /// Scripts waiting for a container to start.
+    run_queue: VecDeque<RunScript>,
+    /// Script of each started container.
+    run_scripts: BTreeMap<String, RunScript>,
     containers: BTreeMap<String, ContainerInfo>,
     /// reference → image
     images: BTreeMap<String, ImageInfo>,
@@ -235,6 +254,12 @@ impl FakePodman {
         if let Some(c) = self.lock().containers.get_mut(name) {
             c.health = health;
         }
+    }
+
+    /// The next container that starts prints `script.output` and exits with `script.exit_code`
+    /// (reported by `container_wait`); without a script it exits 0 silently.
+    pub fn script_next_run(&self, script: RunScript) {
+        self.lock().run_queue.push_back(script);
     }
 
     /// Exit code returned by subsequent `container_exec`s in this container.
@@ -482,6 +507,8 @@ impl PodmanClient for FakePodman {
         let mut s = self.lock();
         s.calls.push(Call::ContainerStart(name.to_owned()));
         s.container_mut(name)?.state = ContainerState::Running;
+        let script = s.run_queue.pop_front().unwrap_or_default();
+        s.run_scripts.insert(name.to_owned(), script);
         Ok(())
     }
 
@@ -543,6 +570,49 @@ impl PodmanClient for FakePodman {
             )));
         }
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
+    }
+
+    async fn container_logs(&self, name: &str, follow: bool) -> Result<LogStream> {
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerLogs {
+            name: name.to_owned(),
+            follow,
+        });
+        s.container_mut(name)?;
+        let chunks: Vec<Result<LogChunk>> = s
+            .run_scripts
+            .get(name)
+            .map(|script| {
+                script
+                    .output
+                    .iter()
+                    .map(|(source, data)| {
+                        Ok(LogChunk {
+                            source: *source,
+                            data: Bytes::from(data.clone()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(stream::iter(chunks).boxed())
+    }
+
+    async fn container_wait(&self, name: &str) -> Result<i32> {
+        let hang = {
+            let mut s = self.lock();
+            s.calls.push(Call::ContainerWait(name.to_owned()));
+            s.run_scripts.get(name).is_some_and(|script| script.hang)
+        };
+        if hang {
+            return std::future::pending().await;
+        }
+        let mut s = self.lock();
+        let code = s.run_scripts.get(name).map_or(0, |script| script.exit_code);
+        let container = s.container_mut(name)?;
+        container.state = ContainerState::Stopped;
+        container.exit_code = Some(code);
+        Ok(code)
     }
 
     async fn container_archive_put(

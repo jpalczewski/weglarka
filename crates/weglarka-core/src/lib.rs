@@ -29,6 +29,7 @@ pub mod deploy;
 pub mod images;
 pub mod limits;
 pub mod reconcile;
+pub mod run;
 pub mod secrets;
 pub mod volumes;
 pub mod waiting;

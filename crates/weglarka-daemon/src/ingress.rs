@@ -581,6 +581,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 image: image.clone(),
                 // The image's own CMD starts nginx; nothing to add.
                 command: vec![],
+                entrypoint: None,
                 // No `weglarka.instance` — reconcile would treat the container as an orphan.
                 labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
                 env: BTreeMap::new(),

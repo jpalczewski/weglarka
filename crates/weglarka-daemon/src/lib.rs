@@ -235,6 +235,14 @@ pub async fn start<P: PodmanClient + 'static>(
         reconciler = reconciler.with_events(notifier.sink());
     }
     let engine = Arc::new(reconciler);
+    // A daemon that died in the middle of `weglarka run` left its one-off container behind; this
+    // process has no run yet, so every one found is stale (issue #106). Podman being down is not a
+    // reason to refuse to start: the reconcile loop reports it.
+    match engine.remove_stale_runs().await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed stale one-off containers"),
+        Err(error) => tracing::warn!(%error, "cannot look for stale one-off containers"),
+    }
     let ingress = Arc::new(IngressManager::new(
         engine.clone(),
         host.clone(),

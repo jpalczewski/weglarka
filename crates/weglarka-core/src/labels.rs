@@ -15,6 +15,13 @@ pub const UID_RANGE: &str = "weglarka.uid-range";
 /// Deliberately not [`INSTANCE`], so reconcile never mistakes it for a duplicate of the app.
 pub const IMPORT_FOR: &str = "weglarka.import-for";
 
+/// Marks a one-off `weglarka run` container (the value is always `"true"`, so a label filter can find
+/// every one of them). Deliberately not [`INSTANCE`]: reconcile, the crash watcher and ingress must
+/// never mistake it for the app's container.
+pub const RUN: &str = "weglarka.run";
+/// The instance a one-off container was started for.
+pub const RUN_FOR: &str = "weglarka.run-for";
+
 /// Set of labels that reconcile applies to an instance's container.
 pub fn container_labels(
     instance: &InstanceName,
@@ -85,4 +92,11 @@ pub fn uid_range_label(range: crate::uid_range::UidRange) -> String {
 /// collides with — and force-removing it never touches — another instance's container.
 pub fn import_container_name(instance: &InstanceName) -> String {
     format!("wg-import.{instance}")
+}
+
+/// Name of one `weglarka run` container. `.` cannot occur in an instance name, so — like
+/// [`import_container_name`] — it never collides with, and removing it never touches, an app's
+/// container; `token` keeps concurrent runs of one app apart.
+pub fn run_container_name(instance: &InstanceName, token: &str) -> String {
+    format!("wg-run.{instance}.{token}")
 }

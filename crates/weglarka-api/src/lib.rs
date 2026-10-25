@@ -6,10 +6,14 @@
 
 pub mod doctor;
 pub mod endpoints;
+pub mod run;
 pub mod types;
 
 pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
 pub use endpoints::{ENDPOINTS, Endpoint, Method};
+pub use run::{
+    FrameError, MAX_FRAME_PAYLOAD, RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest,
+};
 pub use types::*;
 
 /// Contract version; path prefix (`/v1/...`). A breaking change means a new prefix.

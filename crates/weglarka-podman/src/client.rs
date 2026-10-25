@@ -6,7 +6,7 @@ use futures_core::Stream;
 use futures_util::stream;
 use hyper::Method;
 use weglarka_core::podman::{
-    ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
+    ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo, LogStream,
     NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent,
     RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
@@ -16,8 +16,9 @@ use crate::transport::{Lines, Transport, encode_component, name_conflict, path_n
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
-    InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, NetworkRmReport,
-    PullLine, PullReport, StartExec, Version, WireEvent, WireVolume, decode, health_status,
+    InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, LogDemux,
+    NetworkRmReport, PullLine, PullReport, StartExec, Version, WireEvent, WireVolume, decode,
+    health_status, parse_wait,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -141,6 +142,47 @@ impl PodmanClient for LibpodClient {
         Err(PodmanError::Protocol(format!(
             "exec in {name} did not finish in time"
         )))
+    }
+
+    async fn container_logs(&self, name: &str, follow: bool) -> Result<LogStream> {
+        let path = format!(
+            "/containers/{}/logs?stdout=true&stderr=true&follow={follow}",
+            path_name(name)?
+        );
+        let raw = self.transport.bytes_stream(Method::GET, &path).await?;
+        let state = (raw, LogDemux::default(), std::collections::VecDeque::new());
+        Ok(Box::pin(stream::unfold(
+            state,
+            |(mut raw, mut demux, mut ready)| async move {
+                loop {
+                    if let Some(chunk) = ready.pop_front() {
+                        return Some((Ok(chunk), (raw, demux, ready)));
+                    }
+                    match futures_util::StreamExt::next(&mut raw).await {
+                        None if demux.is_clean() => return None,
+                        None => {
+                            let error = PodmanError::Protocol("log stream ended mid-frame".into());
+                            // Leave an empty demux behind so the next poll ends the stream.
+                            return Some((Err(error), (raw, LogDemux::default(), ready)));
+                        }
+                        Some(Err(e)) => return Some((Err(e), (raw, demux, ready))),
+                        Some(Ok(data)) => match demux.push(&data) {
+                            Ok(chunks) => ready.extend(chunks),
+                            Err(e) => return Some((Err(e), (raw, LogDemux::default(), ready))),
+                        },
+                    }
+                }
+            },
+        )))
+    }
+
+    async fn container_wait(&self, name: &str) -> Result<i32> {
+        let path = format!(
+            "/containers/{}/wait?condition=stopped&condition=exited",
+            path_name(name)?
+        );
+        let body = self.transport.call(Method::POST, &path, None).await?;
+        parse_wait(&body)
     }
 
     async fn container_archive_put(&self, name: &str, path: &str, tar: TarStream) -> Result<()> {

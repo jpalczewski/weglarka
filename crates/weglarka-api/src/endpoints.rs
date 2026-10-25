@@ -66,6 +66,14 @@ pub const APPS_RELOAD: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/reload",
 };
+/// `POST` [`RunRequest`](crate::RunRequest) → a stream of [`RunFrame`](crate::RunFrame)s
+/// (`application/vnd.weglarka.run-stream`). Runs a command once in a fresh container of the app
+/// (its image, env, secrets, volumes, configs and networks; never its `host_ports` or ingress
+/// routing) and removes the container afterwards. Closing the connection kills the run (issue #106).
+pub const APPS_RUN: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/apps/{name}/run",
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -174,6 +182,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_REMOVE,
     APPS_DEPLOY,
     APPS_RELOAD,
+    APPS_RUN,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

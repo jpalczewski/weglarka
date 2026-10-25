@@ -55,6 +55,38 @@ pub enum ReloadOutcome {
 
 // ── Helpers (pure) ──────────────────────────────────────────────────────
 
+/// The networks an instance's container joins and the extra DNS aliases on them. The instance's own
+/// network stays first (the primary one: egress, ingress); the group network is added next to it,
+/// with the declared aliases on top of the container name.
+pub(crate) fn instance_networks(
+    instance: &InstanceName,
+    spec: &AppSpec,
+) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut networks = vec![labels::network_name(instance)];
+    let mut aliases = BTreeMap::new();
+    if let Some(net) = crate::shared_networks::membership(spec) {
+        let shared = labels::shared_network_name(&net.name);
+        if !net.aliases.is_empty() {
+            aliases.insert(shared.clone(), net.aliases.clone());
+        }
+        networks.push(shared);
+    }
+    (networks, aliases)
+}
+
+/// Host config mounts: always read-only, and the **canonical** path is what mounts, so a symlink
+/// swapped between the check and the mount cannot redirect the bind (ADR 0028).
+pub(crate) fn config_binds(configs: &[crate::config_mounts::Resolved]) -> Vec<BindMount> {
+    configs
+        .iter()
+        .map(|c| BindMount {
+            source: c.source.display().to_string(),
+            target: c.target.clone(),
+            read_only: true,
+        })
+        .collect()
+}
+
 /// Reference pinning a digest: `repo@sha256:…`.
 pub fn pinned_ref(image: &str, digest: &Digest) -> String {
     format!("{}@{digest}", image_repo(image))
@@ -252,7 +284,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Returns the image reference to create the container from. Order: the pinned `repo@digest`
     /// if present locally, then `local_id` (the image of the previous container, kept locally so
     /// that a rollback does not depend on the registry), and only then a pull.
-    async fn ensure_image(
+    pub(crate) async fn ensure_image(
         &self,
         instance: &InstanceName,
         spec: &AppSpec,
@@ -276,7 +308,7 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// ID of the image the app's container currently runs (retention 1: the rollback target).
-    async fn running_image_id(&self, instance: &InstanceName) -> Option<String> {
+    pub(crate) async fn running_image_id(&self, instance: &InstanceName) -> Option<String> {
         let name = labels::container_name(instance);
         self.podman
             .container_inspect(&name)
@@ -291,6 +323,37 @@ impl<P: PodmanClient> Reconciler<P> {
     /// `launch` and `provision_locked` share it, so neither of them can skip the guard again
     /// (issue #75). `Err` = the old container is untouched and nothing new exists yet.
     async fn begin_instance(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+    ) -> Result<
+        (
+            crate::volumes::Prepared,
+            Vec<crate::config_mounts::Resolved>,
+        ),
+        EngineError,
+    > {
+        let prepared = self.prepare_instance(instance, spec).await?;
+        let name = labels::container_name(instance);
+        match self
+            .podman
+            .container_stop(&name, self.options.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match self.podman.container_remove(&name, true).await {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(prepared)
+    }
+
+    /// Everything a container of `instance` needs before it can be created, without touching the
+    /// app's own container: resolved config mounts, the networks, the uid-range guard, the volumes.
+    /// A one-off `weglarka run` container goes through exactly this, so it cannot skip a guard either.
+    pub(crate) async fn prepare_instance(
         &self,
         instance: &InstanceName,
         spec: &AppSpec,
@@ -339,20 +402,6 @@ impl<P: PodmanClient> Reconciler<P> {
         self.range_change_guard_locked(instance, new_label.as_deref())
             .await?;
         let prepared = self.prepare_container(instance, spec).await?; // uid range + volumes
-
-        let name = labels::container_name(instance);
-        match self
-            .podman
-            .container_stop(&name, self.options.stop_timeout_secs)
-            .await
-        {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        match self.podman.container_remove(&name, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
         Ok((prepared, configs))
     }
 
@@ -372,23 +421,13 @@ impl<P: PodmanClient> Reconciler<P> {
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
-        let network = labels::network_name(instance);
-        // The instance's own network stays first (the primary one: egress, ingress); the group
-        // network is added next to it, with the declared aliases on top of the container name.
-        let mut networks = vec![network];
-        let mut network_aliases = BTreeMap::new();
-        if let Some(net) = crate::shared_networks::membership(spec) {
-            let shared = labels::shared_network_name(&net.name);
-            if !net.aliases.is_empty() {
-                network_aliases.insert(shared.clone(), net.aliases.clone());
-            }
-            networks.push(shared);
-        }
+        let (networks, network_aliases) = instance_networks(instance, spec);
 
         let mut container = ContainerSpec {
             name: name.clone(),
             image,
             command: spec.command.clone(),
+            entrypoint: None,
             labels: labels::container_labels(instance, generation, &hash),
             env: spec.env.clone(),
             networks,
@@ -408,14 +447,7 @@ impl<P: PodmanClient> Reconciler<P> {
             userns_auto: true,
             // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
             // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
-            mounts: configs
-                .iter()
-                .map(|c| BindMount {
-                    source: c.source.display().to_string(),
-                    target: c.target.clone(),
-                    read_only: true,
-                })
-                .collect(),
+            mounts: config_binds(&configs),
             volumes: vec![],
             resources: spec.resources.clone(),
             healthcheck: crate::limits::container_healthcheck(&spec.health),

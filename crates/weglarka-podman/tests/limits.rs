@@ -75,6 +75,7 @@ fn spec(name: &str) -> ContainerSpec {
         name: name.into(),
         image: IMAGE.into(),
         command: vec![],
+        entrypoint: None,
         labels: BTreeMap::new(),
         env: BTreeMap::new(),
         networks: vec![],

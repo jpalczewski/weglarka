@@ -27,6 +27,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6o. Limit rozmiaru żądania](#6o-limit-rozmiaru-żądania-ingressmax_body_size) ·
 [6p. Tryb `edge`](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu) ·
 [6q. Certyfikaty ACME](#6q-certyfikaty-acme-http-01-acme) ·
+[6r. Jednorazowe polecenia](#6r-jednorazowe-polecenia-weglarka-run) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -1732,6 +1733,41 @@ email = "ops@example.eu"             # opcjonalnie: adres kontaktowy CA (powiado
 startu**, dopóki jej nie usuniesz. Usuń sekcję (albo ustaw `enabled = false` przed rollbackiem do wydania, które
 ją zna) i zrestartuj; wystawione certyfikaty w `tls/` zostają i dalej są serwowane, tylko nie będą odnawiane.
 `apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu).
+
+## 6r. Jednorazowe polecenia (`weglarka run`)
+
+`weglarka run <apka> -- <polecenie>` uruchamia **jeden raz** nowy kontener z obrazem, env, sekretami,
+wolumenami, configami i sieciami apki — np. migrację bazy albo komendę administracyjną — drukuje jego wyjście
+na bieżąco i usuwa kontener po zakończeniu. Decyzja: [0040](decisions/0040-one-off-containers.md).
+
+```sh
+weglarka run gitea -- gitea admin user list
+weglarka run ntfy --env LOG_LEVEL=debug --timeout 10m -- ntfy user list
+weglarka run gitea --entrypoint /bin/sh -- -c 'ls -l /data'
+```
+
+- **Co dostaje kontener:** przypięty digest obrazu apki (nigdy nowszy z tagu), jej `env` (flaga `--env`/`-e`
+  dokłada i nadpisuje na ten jeden raz), sekrety, wolumeny (prywatne i współdzielone, do zapisu), configi
+  z hosta (tylko do odczytu), sieć apki i sieć wspólną. Limity zasobów i hardening jak w apce.
+- **Czego nie dostaje:** `host_ports`, routingu ingressu ani aliasów DNS apki — nie odpowiada pod jej nazwą.
+  Reconcile i `doctor` go nie widzą (etykieta `weglarka.run`, bez `weglarka.instance`).
+- **Argumenty:** wszystko po `--` to argumenty entrypointu obrazu (jak `command`, [6f](#6f-komenda-i-argumenty-kontenera-command)),
+  chyba że podasz `--entrypoint ŚCIEŻKA` — wtedy to jego argumenty. Bez polecenia i bez entrypointu: błąd.
+- **Wyjście i kod:** stdout i stderr idą na odpowiednie strumienie CLI; kod wyjścia CLI to kod polecenia.
+  Uwaga: dzieli on przestrzeń z kodami samego CLI (3 = nie ma apki, 4 = konflikt…); błędy sprzed startu
+  polecenia są wypisane na stderr, a `--json` drukuje po jednym obiekcie JSON na linię (`stream`/`data`,
+  na końcu `exit_code`). `--timeout` (domyślnie i maksymalnie 24 h) kończy polecenie przez `SIGKILL`; kod 124.
+- **Ctrl-C / zerwane połączenie** zabija polecenie i usuwa kontener. Demon, który padł w trakcie runu, zostawia
+  kontener z etykietą `weglarka.run=true` — kolejny start demona usuwa takie sieroty.
+- **Limity:** najwyżej 4 jednoczesne runy (409 powyżej); apka musi mieć przypięty obraz (po `deploy` albo po
+  `apps add` z `start = false`, który go pobiera) — nie musi działać, więc migrację można zrobić **przed**
+  pierwszym startem.
+- **Uwaga na dane:** wolumeny są wspólne z działającą apką. Migracja na żywej bazie (np. SQLite w trybie WAL)
+  może pisać po tych samych plikach — zatrzymaj apkę (`apps stop`) przed migracją, która tego wymaga.
+- **Nie ma (jeszcze):** stdin ani TTY (interaktywna konsola) — osobne zadanie pod #49.
+
+**Rollback:** nic nie trzeba robić — `run` nie zapisuje stanu (`apps.toml`/`state.toml` bez zmian, bez bumu
+wersji schematu). Starszy demon nie ma trasy `/v1/apps/{name}/run`, starszy CLI nie ma komendy.
 
 ## 7. Weryfikacja i rollback
 

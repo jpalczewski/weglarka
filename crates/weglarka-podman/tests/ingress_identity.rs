@@ -121,6 +121,7 @@ impl Env {
                 name: name.to_owned(),
                 image: ALPINE.to_owned(),
                 command: vec!["sleep".into(), "300".into()],
+                entrypoint: None,
                 labels: BTreeMap::new(),
                 env: BTreeMap::new(),
                 networks: vec![],

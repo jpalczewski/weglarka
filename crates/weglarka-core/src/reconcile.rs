@@ -64,6 +64,15 @@ pub enum EngineError {
     /// issue #118, `docs/decisions/0028-config-root-mounts.md`).
     #[error("invalid config mounts: {0}")]
     Configs(String),
+    /// `weglarka run` of an app that has never been deployed: there is no pinned image to run.
+    #[error("app {0} has no deployed image yet; run `weglarka apps deploy {0}` first")]
+    RunNotDeployed(InstanceName),
+    /// `weglarka run` while the maximum number of one-off containers is already running.
+    #[error("too many one-off containers running (at most {0}); retry when one has finished")]
+    RunLimit(usize),
+    /// `weglarka run` request that cannot start a process.
+    #[error("{0}")]
+    RunInvalid(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
     #[error("app {0} has no running container; use `weglarka apps start {0}`")]
     ReloadNotRunning(InstanceName),
@@ -452,6 +461,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) events: Arc<dyn EventSink>,
     pub(crate) http_prober: Option<Arc<dyn crate::limits::HttpProber>>,
     pub(crate) lock: tokio::sync::Mutex<()>,
+    /// Free slots for one-off containers ([`crate::run::MAX_CONCURRENT_RUNS`]).
+    pub(crate) runs: Arc<tokio::sync::Semaphore>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
     /// The instance being mutated right now (`None` when the engine is idle). See [`InFlight`].
     pub(crate) activity: std::sync::Mutex<Option<InFlight>>,
@@ -479,6 +490,7 @@ impl<P: PodmanClient> Reconciler<P> {
             events: Arc::new(TracingSink),
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
+            runs: Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
             dedup: std::sync::Mutex::new(dedup),
             activity: std::sync::Mutex::new(None),
             monitor: crash::Policy::default(),

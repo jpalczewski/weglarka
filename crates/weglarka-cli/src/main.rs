@@ -7,6 +7,7 @@ mod error;
 mod networks;
 mod output;
 mod preflight;
+mod run;
 mod settings;
 mod spec_flags;
 mod update;

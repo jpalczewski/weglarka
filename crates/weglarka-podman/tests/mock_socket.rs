@@ -155,6 +155,7 @@ async fn not_found_and_name_conflict() {
         name: "x".into(),
         image: "i".into(),
         command: vec![],
+        entrypoint: None,
         labels: Default::default(),
         env: Default::default(),
         networks: vec![],
@@ -523,4 +524,59 @@ async fn volume_calls_use_libpod_paths_and_map_results() {
     client.volume_remove("app.data", true).await.unwrap();
     assert!(client.volume_export("../x").await.is_err());
     assert!(mock.requests()[0].contains(r#""Name":"app.data""#));
+}
+
+/// One-off containers (issue #106): the log stream is demultiplexed into stdout/stderr and `wait`
+/// returns the exit code, whichever of libpod's two shapes it answers in.
+#[tokio::test]
+async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
+    use weglarka_core::podman::LogSource;
+    let mock = serve(vec![
+        (
+            "GET /v6.0.0/libpod/containers/job/logs",
+            200,
+            "\x01\0\0\0\0\0\0\x06hello\n\x02\0\0\0\0\0\0\x04bad\n",
+        ),
+        ("POST /v6.0.0/libpod/containers/job/wait", 200, "7"),
+        (
+            "POST /v6.0.0/libpod/containers/gone/wait",
+            404,
+            r#"{"message":"no such container gone"}"#,
+        ),
+    ]);
+    let client = LibpodClient::new(&mock.socket);
+    let mut logs = client.container_logs("job", true).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = logs.next().await {
+        let chunk = chunk.unwrap();
+        got.push((
+            chunk.source,
+            String::from_utf8(chunk.data.to_vec()).unwrap(),
+        ));
+    }
+    assert_eq!(
+        got,
+        [
+            (LogSource::Stdout, "hello\n".to_owned()),
+            (LogSource::Stderr, "bad\n".to_owned())
+        ]
+    );
+    assert_eq!(client.container_wait("job").await.unwrap(), 7);
+    assert!(matches!(
+        client.container_wait("gone").await,
+        Err(PodmanError::NotFound(_))
+    ));
+    let requests = mock.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.contains("logs?stdout=true&stderr=true&follow=true")),
+        "{requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.contains("wait?condition=stopped&condition=exited")),
+        "{requests:?}"
+    );
 }

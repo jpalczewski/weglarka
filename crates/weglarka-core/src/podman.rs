@@ -187,6 +187,9 @@ pub struct ContainerSpec {
     /// Arguments to the image's entrypoint (`Cmd`); empty keeps the image's own `CMD` and this never
     /// overrides the entrypoint (issue #79).
     pub command: Vec<String>,
+    /// Replaces the image's `ENTRYPOINT` when set (`weglarka run --entrypoint`); `None` keeps it. Apps
+    /// never set it: only one-off containers may swap the entrypoint (ADR 0040).
+    pub entrypoint: Option<Vec<String>>,
     pub labels: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     /// Networks the container joins on creation (first = primary).
@@ -241,6 +244,22 @@ pub struct VolumeFilter {
 
 /// Tar bytes in transit (volume import/export): streamed so a large volume never sits in RAM.
 pub type TarStream = BoxStream<'static, Result<Bytes>>;
+
+/// Which output stream a [`LogChunk`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    Stdout,
+    Stderr,
+}
+
+/// A piece of a container's output (arbitrary bytes, not necessarily whole lines or valid UTF-8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    pub source: LogSource,
+    pub data: Bytes,
+}
+
+pub type LogStream = BoxStream<'static, Result<LogChunk>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
@@ -407,6 +426,16 @@ pub trait PodmanClient: Send + Sync {
         name: &str,
         cmd: &[String],
     ) -> impl Future<Output = Result<i32>> + Send;
+    /// The container's output from the beginning; with `follow` the stream stays open until the
+    /// container exits (one-off `weglarka run`). Containers here have no TTY, so stdout and stderr
+    /// arrive separated.
+    fn container_logs(
+        &self,
+        name: &str,
+        follow: bool,
+    ) -> impl Future<Output = Result<LogStream>> + Send;
+    /// Blocks until the container has stopped and returns its exit code. `NotFound` if missing.
+    fn container_wait(&self, name: &str) -> impl Future<Output = Result<i32>> + Send;
     /// Extracts a tar archive into `path` of a container (`PUT /containers/{name}/archive`; works on
     /// created, not started containers). Unlike `volume_import`, libpod maps the archive's ids through
     /// the *container's* user namespace, so a foreign tar owned by uid 1000 becomes container uid 1000
@@ -562,6 +591,7 @@ mod fake_tests {
             name: name.into(),
             image: image.into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],

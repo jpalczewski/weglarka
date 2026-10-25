@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -11,12 +12,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::mpsc;
 use weglarka_api::{
     AddAppRequest, ApiError, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome,
     DeployRequest, DeployResponse, ErrorCode, HealthResponse, ListAppsResponse,
     ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse,
-    ReloadAction, ReloadRequest, ReloadResponse, RuntimeState, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse, endpoints,
+    ReloadAction, ReloadRequest, ReloadResponse, RunFrame, RunRequest, RuntimeState, SecretInfo,
+    SetSecretRequest, ShowAppResponse, StatusResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config_mounts::{self, MountStatus, MountView};
@@ -24,9 +26,10 @@ use weglarka_core::deploy::DeployOutcome as CoreOutcome;
 use weglarka_core::deploy::ReloadOutcome;
 use weglarka_core::labels;
 use weglarka_core::podman::{
-    ContainerFilter, ContainerInfo, ContainerState, HealthStatus, PodmanClient,
+    ContainerFilter, ContainerInfo, ContainerState, HealthStatus, LogChunk, LogSource, PodmanClient,
 };
 use weglarka_core::reconcile::EngineError;
+use weglarka_core::run::{RunOptions, RunOutcome};
 use weglarka_core::secret_store::{
     SecretError, SecretStore, SecretValue, fingerprint, scoped_name, valid_secret_name,
 };
@@ -123,6 +126,11 @@ impl From<EngineError> for Fail {
             // `apps reload` of an app whose container is not running: nothing to signal or restart.
             // The engine message already points at `apps start`.
             e @ EngineError::ReloadNotRunning(_) => Fail(ErrorCode::Conflict, e.to_string()),
+            // `weglarka run` (issue #106): nothing was created for any of these.
+            e @ (EngineError::RunNotDeployed(_) | EngineError::RunLimit(_)) => {
+                Fail(ErrorCode::Conflict, e.to_string())
+            }
+            EngineError::RunInvalid(message) => Fail::invalid(message),
             other => Fail::internal(other),
         }
     }
@@ -167,6 +175,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         )
         .route(endpoints::APPS_DEPLOY.path, post(deploy_app::<P>))
         .route(endpoints::APPS_RELOAD.path, post(reload_app::<P>))
+        .route(endpoints::APPS_RUN.path, post(run_app::<P>))
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
         .route(endpoints::SECRETS_REMOVE.path, delete(remove_secret::<P>))
@@ -611,6 +620,84 @@ async fn reload_app<P: PodmanClient + 'static>(
         signal,
         configs: config_views(&d, &spec),
     }))
+}
+
+// ── One-off containers (issue #106) ─────────────────────────────────────────
+
+/// `POST /v1/apps/{name}/run`: run a command once in a fresh container of the app and stream its
+/// output as [`RunFrame`]s. Everything that can be refused is refused with an ordinary JSON error
+/// *before* the stream starts; after that the last frame says how the run ended. Closing the
+/// connection kills the run and removes the container. Changes no desired state.
+async fn run_app<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(raw): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let name = parse_name(&raw)?;
+    let req: RunRequest = if body.is_empty() {
+        RunRequest::default()
+    } else {
+        parse_json(&body)?
+    };
+    let options = RunOptions {
+        command: req.command,
+        entrypoint: req.entrypoint,
+        env: req.env,
+        timeout: req.timeout_secs.map(|s| Duration::from_secs(s.into())),
+    };
+    let pending = mutating(d.engine.prepare_run(&name, &options)).await?;
+
+    let (chunks_tx, mut chunks_rx) = mpsc::channel::<LogChunk>(16);
+    let (frames_tx, frames_rx) = mpsc::channel::<Bytes>(16);
+    // The run lives in its own task, so it ends the same way whether the client reads on or hangs up:
+    // a dropped response body closes `frames_tx`, the pump stops and drops `chunks_rx`, and the
+    // engine sees its output channel close and kills the container.
+    tokio::spawn(async move {
+        let pump = {
+            let frames_tx = frames_tx.clone();
+            async move {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            let Some(chunk) = chunk else { break };
+                            let frame = match chunk.source {
+                                LogSource::Stdout => RunFrame::Stdout(chunk.data.to_vec()),
+                                LogSource::Stderr => RunFrame::Stderr(chunk.data.to_vec()),
+                            };
+                            if frames_tx.send(Bytes::from(frame.encode())).await.is_err() {
+                                break;
+                            }
+                        }
+                        () = frames_tx.closed() => break,
+                    }
+                }
+            }
+        };
+        let (outcome, ()) = tokio::join!(pending.drive(chunks_tx), pump);
+        let last = match outcome {
+            Ok(RunOutcome::Exited(code)) => Some(RunFrame::Exit(code)),
+            Ok(RunOutcome::TimedOut) => Some(RunFrame::TimedOut),
+            Ok(RunOutcome::Cancelled) => None,
+            Err(e) => Some(RunFrame::Error(e.to_string())),
+        };
+        if let Some(frame) = last {
+            let _ = frames_tx.send(Bytes::from(frame.encode())).await;
+        }
+    });
+
+    let stream = futures_util::stream::unfold(frames_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|frame| (Ok::<_, std::convert::Infallible>(frame), rx))
+    });
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            weglarka_api::RUN_STREAM_CONTENT_TYPE,
+        )],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
