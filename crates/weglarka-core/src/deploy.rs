@@ -134,12 +134,62 @@ pub struct WebhookOutcome {
     pub results: Vec<(InstanceName, Result<DeployOutcome, EngineError>)>,
 }
 
+/// The libpod spec of an app container: what `launch` and the blue-green challenger share. The caller
+/// decides the name, the networks and the labels; volumes are added by `Prepared::apply`.
+#[allow(clippy::too_many_arguments)]
+fn container_spec(
+    name: String,
+    image: String,
+    labels: BTreeMap<String, String>,
+    spec: &AppSpec,
+    networks: Vec<String>,
+    network_aliases: BTreeMap<String, Vec<String>>,
+    secrets: Vec<crate::podman::SecretAttachment>,
+    configs: &[crate::config_mounts::Resolved],
+) -> ContainerSpec {
+    ContainerSpec {
+        name,
+        image,
+        command: spec.command.clone(),
+        entrypoint: None,
+        labels,
+        env: spec.env.clone(),
+        networks,
+        network_aliases,
+        secrets,
+        publish: spec
+            .host_ports
+            .iter()
+            .map(|p| PortMapping {
+                // Validated earlier; the loopback default keeps publishing opt-in.
+                host_ip: Some(p.bind_ip().to_owned()),
+                host_port: p.host,
+                container_port: p.container,
+            })
+            .collect(),
+        restart: RestartPolicy::Always,
+        userns_auto: true,
+        // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
+        // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
+        mounts: config_binds(configs),
+        keep_groups: !spec.group_add.is_empty(),
+        volumes: vec![],
+        resources: spec.resources.clone(),
+        healthcheck: crate::limits::container_healthcheck(&spec.health),
+        id_mapping: None,
+        security: spec.security.clone(),
+    }
+}
+
 /// Result of starting a container: the hash it was started with, the uid range its volumes were
 /// prepared in (recorded in the state as the data owner, issue #75) and the gate verdict.
 struct Launched {
     hash: SpecHash,
     range: UidRange,
     health: Result<(), String>,
+    /// A blue-green deploy that failed before the switch: the old container was never touched and
+    /// still serves, so there is nothing to roll back to (ADR 0046). Always `false` for `launch`.
+    old_intact: bool,
 }
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -462,39 +512,16 @@ impl<P: PodmanClient> Reconciler<P> {
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
         let (networks, network_aliases) = instance_networks(instance, spec);
-
-        let mut container = ContainerSpec {
-            name: name.clone(),
+        let mut container = container_spec(
+            name.clone(),
             image,
-            command: spec.command.clone(),
-            entrypoint: None,
-            labels: labels::container_labels(instance, generation, &hash),
-            env: spec.env.clone(),
+            labels::container_labels(instance, generation, &hash),
+            spec,
             networks,
             network_aliases,
             secrets,
-            publish: spec
-                .host_ports
-                .iter()
-                .map(|p| PortMapping {
-                    // Validated earlier; the loopback default keeps publishing opt-in.
-                    host_ip: Some(p.bind_ip().to_owned()),
-                    host_port: p.host,
-                    container_port: p.container,
-                })
-                .collect(),
-            restart: RestartPolicy::Always,
-            userns_auto: true,
-            // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
-            // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
-            mounts: config_binds(&configs),
-            keep_groups: !spec.group_add.is_empty(),
-            volumes: vec![],
-            resources: spec.resources.clone(),
-            healthcheck: crate::limits::container_healthcheck(&spec.health),
-            id_mapping: None,
-            security: spec.security.clone(),
-        };
+            &configs,
+        );
         let range = prepared.range;
         prepared.apply(&mut container);
         let started = async {
@@ -510,7 +537,199 @@ impl<P: PodmanClient> Reconciler<P> {
             hash,
             range,
             health,
+            old_intact: false,
         })
+    }
+
+    /// Whether a deploy of `spec` swaps blue-green: the app opted in **and** a container is serving now
+    /// (a first deploy has nothing to run next to, so it takes the plain path).
+    async fn blue_green_applies(&self, instance: &InstanceName, spec: &AppSpec) -> bool {
+        spec.strategy == crate::app::Strategy::BlueGreen
+            && self
+                .podman
+                .container_inspect(&labels::container_name(instance))
+                .await
+                .is_ok_and(|c| c.state == ContainerState::Running)
+    }
+
+    /// `launch` or, for a blue-green app with a serving container, [`Self::launch_blue_green`].
+    async fn launch_with_strategy(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+        generation: u64,
+    ) -> Result<Launched, EngineError> {
+        if self.blue_green_applies(instance, spec).await {
+            self.launch_blue_green(instance, spec, digest, generation)
+                .await
+        } else {
+            self.launch(instance, spec, digest, generation, None).await
+        }
+    }
+
+    /// Blue-green swap (ADR 0046): the new container starts and passes its gate on a staging network
+    /// while the old one keeps serving; only then does it join the app network with the instance
+    /// alias, the names are swapped and the old container is stopped after a drain.
+    ///
+    /// `Err` = failure before anything was created (the old container is untouched). A challenger that
+    /// fails its gate is removed and reported as `Launched { old_intact: true, health: Err }`.
+    async fn launch_blue_green(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+        generation: u64,
+    ) -> Result<Launched, EngineError> {
+        let image = self.ensure_image(instance, spec, digest, None).await?;
+        let hash = self.desired_hash(instance, spec, digest).await?;
+        let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
+        // Everything `launch` prepares, **without** touching the serving container.
+        let (prepared, configs) = self.prepare_instance(instance, spec).await?;
+        let range = prepared.range;
+
+        let serving = labels::container_name(instance);
+        let next = labels::challenger_name(instance);
+        let retiring = labels::retiring_name(instance);
+        let app_net = labels::network_name(instance);
+        let staging = labels::staging_network_name(instance);
+
+        // A leftover of a crashed deploy would hold the names.
+        self.remove_transient(&next, &retiring).await;
+        self.podman
+            .network_create(&NetworkSpec {
+                name: staging.clone(),
+                internal: false,
+                labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
+            })
+            .await?;
+
+        // The app network is the one nginx is on and the one that carries the alias: the challenger
+        // joins it only after its gate. Shared networks (and their aliases) are joined up front, since
+        // libpod cannot add an alias to a network the container is already on.
+        let (mut networks, network_aliases) = instance_networks(instance, spec);
+        networks[0] = staging.clone();
+        let mut container = container_spec(
+            next.clone(),
+            image,
+            labels::container_labels(instance, generation, &hash),
+            spec,
+            networks,
+            network_aliases,
+            secrets,
+            &configs,
+        );
+        prepared.apply(&mut container);
+
+        let failed = |reason: String| Launched {
+            hash: hash.clone(),
+            range,
+            health: Err(reason),
+            old_intact: true,
+        };
+        let started = async {
+            self.podman.container_create(&container).await?;
+            self.podman.container_start(&next).await
+        }
+        .await;
+        if let Err(e) = started {
+            self.abandon_challenger(&next, &staging).await;
+            return Ok(failed(format!("cannot start container: {e}")));
+        }
+        if let Err(reason) = self.challenger_gate(&next, spec).await {
+            self.abandon_challenger(&next, &staging).await;
+            return Ok(failed(reason));
+        }
+
+        // Switch. From here the challenger answers to the instance name next to the old container.
+        let alias = [instance.to_string()];
+        if let Err(e) = self
+            .podman
+            .network_connect_aliased(&app_net, &next, &alias)
+            .await
+        {
+            self.abandon_challenger(&next, &staging).await;
+            return Ok(failed(format!("cannot join the app network: {e}")));
+        }
+        // Names are bookkeeping (libpod keeps the old DNS entry of a renamed container): the old one
+        // makes room first, so a container called `<instance>` exists throughout.
+        if let Err(e) = self.podman.container_rename(&serving, &retiring).await {
+            self.back_out_switch(&app_net, &next, &staging).await;
+            return Ok(failed(format!("cannot rename the old container: {e}")));
+        }
+        if let Err(e) = self.podman.container_rename(&next, &serving).await {
+            let _ = self.podman.container_rename(&retiring, &serving).await;
+            self.back_out_switch(&app_net, &next, &staging).await;
+            return Ok(failed(format!("cannot rename the new container: {e}")));
+        }
+
+        // The old container keeps serving through DNS caches until it stops: wait out the resolver TTL.
+        tokio::time::sleep(self.options.switch_drain).await;
+        match self
+            .podman
+            .container_stop(&retiring, self.options.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => tracing::warn!(%instance, error = %e, "cannot stop the retired container"),
+        }
+        match self.podman.container_remove(&retiring, true).await {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => tracing::warn!(%instance, error = %e, "cannot remove the retired container"),
+        }
+        let _ = self.podman.network_disconnect(&staging, &serving).await;
+        let _ = self.podman.network_remove(&staging).await;
+
+        // `health.http` goes through nginx by `Host`, so it only means something once traffic moved.
+        let health = match &spec.health.http {
+            Some(probe) => self.http_probe(spec, probe).await,
+            None => Ok(()),
+        };
+        Ok(Launched {
+            hash,
+            range,
+            health,
+            old_intact: false,
+        })
+    }
+
+    /// The challenger's gate. It runs on the staging network, so only a check **inside** the container
+    /// can speak for it (`health.http` would reach the old container): without one the swap is refused.
+    async fn challenger_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
+        let info = self
+            .podman
+            .container_inspect(name)
+            .await
+            .map_err(|e| format!("inspect failed: {e}"))?;
+        if spec.health.command.is_none() && info.health.is_none() {
+            return Err("strategy \"blue_green\" needs a container healthcheck (health.command or a \
+                        HEALTHCHECK in the image): health.http probes through the ingress, which still \
+                        reaches the old container"
+                .to_owned());
+        }
+        let mut inside = spec.clone();
+        inside.health.http = None;
+        self.health_gate(name, &inside).await
+    }
+
+    /// Removes a challenger that did not make it, with its staging network. Best effort.
+    async fn abandon_challenger(&self, next: &str, staging: &str) {
+        let _ = self.podman.container_stop(next, 1).await;
+        let _ = self.podman.container_remove(next, true).await;
+        let _ = self.podman.network_remove(staging).await;
+    }
+
+    /// Takes the challenger back out of the app network after a failed rename, then removes it.
+    async fn back_out_switch(&self, app_net: &str, next: &str, staging: &str) {
+        let _ = self.podman.network_disconnect(app_net, next).await;
+        self.abandon_challenger(next, staging).await;
+    }
+
+    async fn remove_transient(&self, next: &str, retiring: &str) {
+        for name in [next, retiring] {
+            let _ = self.podman.container_stop(name, 1).await;
+            let _ = self.podman.container_remove(name, true).await;
+        }
     }
 
     /// Health gate: `attempts` tries within `window_secs`. The container must keep running throughout.
@@ -640,7 +859,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let generation = cur.generation + 1;
         let prev_image_id = self.running_image_id(instance).await;
         let launched = self
-            .launch(instance, &spec, &digest, generation, None)
+            .launch_with_strategy(instance, &spec, &digest, generation)
             .await;
         let launched = match launched {
             Ok(l) => l,
@@ -659,6 +878,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // The volumes were just prepared in this range; remember the data owner in the state even
         // if the app never gets a container or the deploy fails below (issue #75).
         entry.effective_uid_range = Some(launched.range);
+        let old_intact = launched.old_intact;
         let reason = match launched.health {
             Ok(()) => {
                 if cur.current.as_ref() != Some(&digest) {
@@ -685,6 +905,17 @@ impl<P: PodmanClient> Reconciler<P> {
             digest: digest.clone(),
             reason: reason.clone(),
         });
+        // A blue-green challenger that failed its gate: the old container never stopped serving, so
+        // there is nothing to roll back (ADR 0046) — only the failure to record.
+        if old_intact {
+            state::save_state(&self.paths.state, &st)?;
+            self.events.emit(Event::DeployFailed {
+                instance: instance.clone(),
+                digest: Some(digest.clone()),
+                reason: reason.clone(),
+            });
+            return Ok(DeployOutcome::Failed { digest, reason });
+        }
         let name = labels::container_name(instance);
         // Nothing to return to when nothing is pinned or it is the same digest (e.g. an env change).
         let rollback_to = cur.current.clone().filter(|c| *c != digest);
@@ -855,12 +1086,16 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         let generation = cur.generation + 1;
         let launched = self
-            .launch(instance, &spec, &digest, generation, None)
+            .launch_with_strategy(instance, &spec, &digest, generation)
             .await?;
 
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.generation = generation;
-        entry.spec_hash = Some(launched.hash);
+        // A blue-green challenger that failed its gate left the old container serving with its old
+        // hash, so the recorded hash must stay (the next pass retries the swap).
+        if !launched.old_intact {
+            entry.spec_hash = Some(launched.hash);
+        }
         entry.effective_uid_range = Some(launched.range);
         state::save_state(&self.paths.state, &st)?;
         match launched.health {

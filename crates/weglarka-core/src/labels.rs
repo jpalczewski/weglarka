@@ -46,7 +46,26 @@ pub fn container_name(instance: &InstanceName) -> String {
     instance.to_string()
 }
 
-/// Network of Węglarka itself (daemon + ingress nginx). Shaped like an app network, so network
+/// Name of the challenger container of a blue-green deploy (ADR 0046). `.` cannot occur in an instance
+/// name, so — like [`import_container_name`] — it never collides with another instance's container.
+/// It carries the instance's labels, so reconcile must not mistake it for a duplicate of the app.
+pub fn challenger_name(instance: &InstanceName) -> String {
+    format!("{instance}.next")
+}
+
+/// Name the previous container gets while it drains after a blue-green switch.
+pub fn retiring_name(instance: &InstanceName) -> String {
+    format!("{instance}.prev")
+}
+
+/// Network the challenger starts on, apart from the app network, so that it can join the app network
+/// with the instance alias once its health gate has passed (libpod cannot add an alias to a network the
+/// container is already on). Carries the instance label like the app network.
+pub fn staging_network_name(instance: &InstanceName) -> String {
+    format!("net-{instance}.next")
+}
+
+/// Network of Węglarka (daemon + ingress nginx). Shaped like an app network, so network
 /// cleanup must never treat it as an orphan.
 pub const INGRESS_NETWORK: &str = "net-weglarka";
 

@@ -3135,3 +3135,226 @@ mod push {
         assert_eq!(h.fake.calls().len(), before);
     }
 }
+
+/// Blue-green deploys (issue #39, `docs/decisions/0046-blue-green-deploy.md`).
+mod blue_green {
+    use super::*;
+
+    const BG: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+strategy = "blue_green"
+health = { attempts = 3, window_secs = 6, command = ["true"] }
+"#;
+
+    /// `BG` deployed once (digest `a`), the way a first deploy goes: nothing to swap with yet.
+    async fn deployed_bg(apps: &str) -> Harness {
+        let h = Harness::new(apps);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    /// Index of the **last** `c`: the sweep of leftovers at the start also calls stop/remove on the
+    /// transient names, and it is the real stop at the end that matters for the order.
+    fn pos(calls: &[Call], c: &Call) -> usize {
+        calls
+            .iter()
+            .rposition(|x| x == c)
+            .unwrap_or_else(|| panic!("{c:?} not in {calls:?}"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_deploy_has_nothing_to_swap_with() {
+        let h = deployed_bg(BG).await;
+        let calls = h.fake.calls();
+        assert!(calls.contains(&Call::ContainerCreate("ntfy".into())));
+        assert!(!calls.contains(&Call::ContainerCreate("ntfy.next".into())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_new_container_takes_over_before_the_old_one_stops() {
+        let h = deployed_bg(BG).await;
+        let ntfy = name("ntfy");
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("ntfy.next", [HealthStatus::Healthy]);
+        let before = h.fake.calls().len();
+
+        assert_eq!(
+            h.rec.deploy(&ntfy, false).await.unwrap(),
+            DeployOutcome::Deployed {
+                digest: digest('b'),
+                generation: 2
+            }
+        );
+        let calls = h.fake.calls()[before..].to_vec();
+        let app_net = labels::network_name(&ntfy);
+        // The serving container is never stopped under its own name: it is renamed out of the way,
+        // keeps serving through the drain, and only then stops.
+        assert!(!calls.contains(&Call::ContainerStop("ntfy".into())));
+        let order = [
+            Call::ContainerCreate("ntfy.next".into()),
+            Call::ContainerStart("ntfy.next".into()),
+            Call::HealthcheckRun("ntfy.next".into()),
+            Call::NetworkConnectAliased {
+                network: app_net,
+                container: "ntfy.next".into(),
+                aliases: vec!["ntfy".into()],
+            },
+            Call::ContainerRename {
+                from: "ntfy".into(),
+                to: "ntfy.prev".into(),
+            },
+            Call::ContainerRename {
+                from: "ntfy.next".into(),
+                to: "ntfy".into(),
+            },
+            Call::ContainerStop("ntfy.prev".into()),
+            Call::ContainerRemove("ntfy.prev".into()),
+        ];
+        let positions: Vec<usize> = order.iter().map(|c| pos(&calls, c)).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+
+        // One container, under the plain name, on the new digest; the staging network is gone.
+        let containers = h.fake.containers();
+        assert_eq!(containers.len(), 1, "{containers:?}");
+        assert_eq!(containers[0].name, "ntfy");
+        assert!(
+            h.container_digest_ref("ntfy")
+                .ends_with(digest('b').as_str())
+        );
+        assert!(
+            !h.fake
+                .networks()
+                .contains(&labels::staging_network_name(&ntfy))
+        );
+        let st = h.state("ntfy");
+        assert_eq!(
+            (st.current, st.previous),
+            (Some(digest('b')), Some(digest('a')))
+        );
+        // The new container is what the spec hash describes.
+        assert_eq!(
+            containers[0]
+                .labels
+                .get(labels::INSTANCE)
+                .map(String::as_str),
+            Some("ntfy")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_challenger_that_fails_its_gate_leaves_the_old_container_serving() {
+        let h = deployed_bg(BG).await;
+        let ntfy = name("ntfy");
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("ntfy.next", [HealthStatus::Unhealthy]);
+        let before = h.fake.calls().len();
+
+        let out = h.rec.deploy(&ntfy, false).await.unwrap();
+        assert!(
+            matches!(&out, DeployOutcome::Failed { digest: d, .. } if *d == digest('b')),
+            "{out:?}"
+        );
+        let calls = h.fake.calls()[before..].to_vec();
+        // Not a single call touched the serving container: no outage on a bad deploy.
+        assert!(!calls.iter().any(|c| matches!(
+            c,
+            Call::ContainerStop(n) | Call::ContainerRemove(n) if n == "ntfy"
+        )));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::ContainerRename { .. }))
+        );
+
+        let containers = h.fake.containers();
+        assert_eq!(containers.len(), 1, "{containers:?}");
+        assert_eq!(containers[0].state, ContainerState::Running);
+        assert!(
+            h.container_digest_ref("ntfy")
+                .ends_with(digest('a').as_str())
+        );
+        assert!(
+            !h.fake
+                .networks()
+                .contains(&labels::staging_network_name(&ntfy))
+        );
+
+        let st = h.state("ntfy");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.failed.as_ref().unwrap().digest, digest('b'));
+        let events = h.sink.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DeployFailed { .. }))
+        );
+        assert!(!events.iter().any(|e| matches!(e, Event::RolledBack { .. })));
+        // The bad digest is not retried by the webhook.
+        assert_eq!(
+            h.rec.deploy(&ntfy, false).await.unwrap(),
+            DeployOutcome::KnownBad {
+                digest: digest('b')
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_container_healthcheck_the_swap_is_refused() {
+        let h = deployed_bg(BG).await;
+        // The check inside the container goes away (and the image declares none): `health.http` alone
+        // would probe the old container through the ingress, so nothing can vouch for the new one.
+        h.set_apps(
+            r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+strategy = "blue_green"
+health = { attempts = 3, window_secs = 6 }
+"#,
+        );
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        let out = h.rec.deploy(&name("ntfy"), false).await.unwrap();
+        let DeployOutcome::Failed { reason, .. } = out else {
+            panic!("{out:?}");
+        };
+        assert!(reason.contains("container healthcheck"), "{reason}");
+        let calls = h.fake.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::ContainerRename { .. }))
+        );
+        // The old container still serves, and the challenger is gone.
+        let containers = h.fake.containers();
+        assert_eq!(containers.len(), 1, "{containers:?}");
+        assert_eq!(containers[0].name, "ntfy");
+        assert_eq!(containers[0].state, ContainerState::Running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_does_not_remove_the_transient_containers() {
+        let h = deployed_bg(BG).await;
+        // A challenger and a retiring container exist only inside a deploy, which holds the engine lock;
+        // a pass that sees them must leave them to that deploy.
+        for transient in ["ntfy.next", "ntfy.prev"] {
+            h.fake.add_foreign_container(transient, IMAGE);
+            h.fake.set_container_labels(
+                transient,
+                BTreeMap::from([(labels::INSTANCE.to_owned(), "ntfy".to_owned())]),
+            );
+        }
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(&a.action, Action::Remove { .. })),
+            "{:?}",
+            report.actions
+        );
+    }
+}
