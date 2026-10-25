@@ -651,6 +651,7 @@ impl<P: PodmanClient> Reconciler<P> {
     pub async fn upsert_app(&self, name: InstanceName, spec: AppSpec) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
+        crate::promote::ensure_unmanaged(&apps, &name)?;
         apps.apps.insert(name, spec);
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }

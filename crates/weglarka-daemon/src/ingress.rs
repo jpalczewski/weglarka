@@ -7,7 +7,7 @@
 //! App networks are *not* part of it: they are connected/disconnected on the running container, and
 //! a config change is validated with `nginx -t` (rolled back on failure) and applied with `SIGHUP`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -329,6 +329,19 @@ impl<P: PodmanClient> IngressManager<P> {
         }
     }
 
+    /// Static sites that have no release yet; their routes answer 503 (issue #205). A state file
+    /// that cannot be read leaves the set empty: the previous behaviour, never a broken config.
+    fn unreleased_sites(&self, apps: &BTreeMap<InstanceName, AppSpec>) -> BTreeSet<InstanceName> {
+        let state = state::load_state(&self.engine.paths().state).unwrap_or_default();
+        apps.iter()
+            .filter(|(name, spec)| {
+                spec.kind == AppKind::Static
+                    && state.apps.get(*name).is_none_or(|s| s.current.is_none())
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Generates `nginx.conf` for the given own addresses, writes it and brings the container in line
     /// (create/reload); a rejected config is rolled back on disk. Returns `(conf_written, action)`.
     async fn apply_nginx(
@@ -351,6 +364,7 @@ impl<P: PodmanClient> IngressManager<P> {
             options.proxy_socket_dir = Some(SOCKET_CONTAINER_DIR.to_owned());
             options.cdn = cdn_trust(&self.host, self.cdn_ranges.get().map(|r| &**r))?;
         }
+        options.unreleased = self.unreleased_sites(r.apps);
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
         let previous = fs::read(self.conf_path()).ok();

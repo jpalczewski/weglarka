@@ -43,6 +43,7 @@ use crate::images;
 use crate::push;
 use crate::shared_networks;
 use crate::shared_volumes;
+use crate::sites;
 use crate::update;
 use crate::volumes;
 
@@ -56,7 +57,7 @@ type ApiResult<T> = Result<T, Fail>;
 pub struct Fail(pub ErrorCode, pub String);
 
 impl Fail {
-    fn invalid(msg: impl Into<String>) -> Self {
+    pub(crate) fn invalid(msg: impl Into<String>) -> Self {
         Self(ErrorCode::InvalidRequest, msg.into())
     }
     fn not_found(msg: impl Into<String>) -> Self {
@@ -138,6 +139,12 @@ impl From<EngineError> for Fail {
                 Fail(ErrorCode::Conflict, e.to_string())
             }
             EngineError::ForwardInvalid(message) => Fail::invalid(message),
+            // Sites with environments (issue #205): nothing was changed for any of these.
+            e @ (EngineError::PromoteOnly(_)
+            | EngineError::PromoteRefused(_)
+            | EngineError::ManagedBySite { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
+            e @ EngineError::UnknownSite(_) => Fail::not_found(e.to_string()),
+            EngineError::PromoteInvalid(message) => Fail::invalid(message),
             // `weglarka push` (issue #109): nothing was deployed for any of these.
             e @ EngineError::PushBusy => Fail(ErrorCode::Conflict, e.to_string()),
             e @ (EngineError::PushLoad(_) | EngineError::PushInvalid(_)) => {
@@ -206,6 +213,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap
         .merge(shared_volumes::routes())
         .merge(shared_networks::routes())
+        .merge(sites::routes())
         .merge(images::routes())
         .merge(push::routes()) // a streamed archive, like the volume tars
         .with_state(daemon)
@@ -596,6 +604,15 @@ pub(crate) fn deploy_response<P: PodmanClient + 'static>(
     name: &InstanceName,
     outcome: CoreOutcome,
 ) -> ApiResult<Response> {
+    deploy_result(d, name, outcome).map(json)
+}
+
+/// The typed body of [`deploy_response`].
+pub(crate) fn deploy_result<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    name: &InstanceName,
+    outcome: CoreOutcome,
+) -> ApiResult<DeployResponse> {
     d.changed();
     let generation = state::load_state(&d.paths.state.state)
         .map(|s| s.apps.get(name).map_or(0, |a| a.generation))
@@ -628,7 +645,7 @@ pub(crate) fn deploy_response<P: PodmanClient + 'static>(
             return Err(Fail::internal("deploy refused: known bad digest"));
         }
     };
-    Ok(json(resp))
+    Ok(resp)
 }
 
 // ── Reload (issue #118) ─────────────────────────────────────────────────────

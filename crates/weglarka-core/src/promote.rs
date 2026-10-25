@@ -6,9 +6,11 @@
 //! built from the image that is already in the local store (no second pull) and `current` /
 //! `previous` / `failed` behave as for any deploy.
 
-use crate::app::{Digest, InstanceName};
+use std::collections::BTreeMap;
+
+use crate::app::{AppsFile, Digest, InstanceName};
 use crate::deploy::{DeployOutcome, DigestSource};
-use crate::environments::{EnvName, SiteName, instance_name};
+use crate::environments::{EnvName, SiteName, SiteSpec, instance_name};
 use crate::podman::PodmanClient;
 use crate::reconcile::{EngineError, Reconciler};
 use crate::state;
@@ -140,5 +142,78 @@ impl<P: PodmanClient> Reconciler<P> {
             plan,
             outcome: Some(outcome),
         })
+    }
+}
+
+/// Refuses to edit an instance that a site owns: the edit would be lost, because expanded instances
+/// are never written back to `apps.toml`.
+pub(crate) fn ensure_unmanaged(apps: &AppsFile, name: &InstanceName) -> Result<(), EngineError> {
+    match apps.origin(name) {
+        Some(o) => Err(EngineError::ManagedBySite {
+            instance: name.clone(),
+            site: o.site.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+impl<P: PodmanClient> Reconciler<P> {
+    /// Declares or replaces `site` (`PUT /v1/sites/{site}`). Environments that disappear from a
+    /// replaced site are dropped from the desired state like a removed app (their releases and state
+    /// entries stay until pruned, as for `apps remove`).
+    pub async fn declare_site(&self, site: SiteName, spec: SiteSpec) -> Result<(), EngineError> {
+        let _g = self.lock.lock().await;
+        let mut apps = state::load_apps(&self.paths.apps)?;
+        let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
+        sites.insert(site, spec);
+        apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
+        for (name, spec) in &apps.apps {
+            state::validate_app(name, spec).map_err(EngineError::PromoteInvalid)?;
+        }
+        crate::depends::validate(&apps).map_err(EngineError::PromoteInvalid)?;
+        Ok(state::save_apps(&self.paths.apps, &apps)?)
+    }
+
+    /// Removes `site` (`DELETE /v1/sites/{site}`). Refused while any of its environments has a release
+    /// unless `purge`, which also forgets their state entries.
+    pub async fn remove_site(&self, site: &SiteName, purge: bool) -> Result<(), EngineError> {
+        let _g = self.lock.lock().await;
+        let mut apps = state::load_apps(&self.paths.apps)?;
+        if !apps.sites.contains_key(site) {
+            return Err(EngineError::UnknownSite(site.to_string()));
+        }
+        let members: Vec<InstanceName> = apps
+            .origins
+            .iter()
+            .filter(|(_, o)| &o.site == site)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let mut st = state::load_state(&self.paths.state)?;
+        let pinned: Vec<String> = members
+            .iter()
+            .filter(|n| st.apps.get(*n).is_some_and(|s| s.current.is_some()))
+            .map(ToString::to_string)
+            .collect();
+        if !pinned.is_empty() && !purge {
+            return Err(EngineError::PromoteRefused(format!(
+                "site {site} still serves releases in {}; remove it with --purge to drop them",
+                pinned.join(", ")
+            )));
+        }
+        let mut sites = apps.sites.clone();
+        sites.remove(site);
+        apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
+        crate::depends::validate(&apps).map_err(EngineError::PromoteInvalid)?;
+        state::save_apps(&self.paths.apps, &apps)?;
+        if purge {
+            let mut changed = false;
+            for n in &members {
+                changed |= st.apps.remove(n).is_some();
+            }
+            if changed {
+                state::save_state(&self.paths.state, &st)?;
+            }
+        }
+        Ok(())
     }
 }
