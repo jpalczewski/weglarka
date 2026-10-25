@@ -1,0 +1,27 @@
+[package]
+name = "weglarka-acme"
+description = "Węglarka: ACME certificate issuance and renewal for the edge ingress (challenge solvers, cert store, renewal policy)"
+version = "0.0.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# In-memory `AcmeClient`/`CertInspector` for engine and daemon tests — no network, no CA.
+testing = []
+
+[dependencies]
+base64.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+weglarka-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
