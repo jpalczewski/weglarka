@@ -26,6 +26,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6n. Ścieżki na jednej domenie](#6n-ścieżki-na-jednej-domenie-paths) ·
 [6o. Limit rozmiaru żądania](#6o-limit-rozmiaru-żądania-ingressmax_body_size) ·
 [6p. Tryb `edge`](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu) ·
+[6q. Certyfikaty ACME](#6q-certyfikaty-acme-http-01-acme) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -93,7 +94,7 @@ profil `podman` załadowany, gdy `apparmor_restrict_unprivileged_userns=1`; peł
 `traefik_dynamic_file`/`trusted_proxies` oraz porty < 1024 bez `allow_privileged_host_ports`),
 `ingress.bind`/`ingress.bind_free` (adresy i porty publikacji — w `edge` **oba**, HTTP i TLS — nie zajęte
 przez cudzy proces, np. Traefika), `ingress.tls` (tylko `edge`: każda routowana domena ma parę
-`<domena>.crt`/`<domena>.key` w `<nginx_conf_dir>/tls`; brak to `warn`, bo #96 zrobi to automatycznie),
+`<domena>.crt`/`<domena>.key` w `<nginx_conf_dir>/tls`; brak to `warn`; `[acme]` — sekcja 6q — wystawia je automatycznie),
 `ingress.privileged_ports` (tylko `edge` z portem < 1024: czy `net.ipv4.ip_unprivileged_port_start` na to
 pozwala), `ingress.traefik_sync`
 (tryb `behind`: aktywny `weglarka-traefik-sync.path`, gdy istnieje `/etc/weglarka/traefik-policy.json`;
@@ -1619,10 +1620,11 @@ https_bind = "0.0.0.0:443"   # TLS: jeden serwer na domenę, certyfikat z <state
   z webroota. Nieznany `Host` zamyka połączenie (`444`).
 - **TLS tylko z certyfikatem:** serwer TLS powstaje **tylko** dla domeny, która ma parę plików
   (`<domena>.crt` i `<domena>.key`). Domena bez pary dalej przekierowuje na HTTPS, ale nie ma serwera TLS —
-  handshake jest odrzucany (`ssl_reject_handshake`), więc **nic nie idzie plaintextem** do apki. Dlatego do
-  czasu #96 certyfikaty kładziesz sam (w testach wystarczy self-signed).
+  handshake jest odrzucany (`ssl_reject_handshake`), więc **nic nie idzie plaintextem** do apki. Certyfikaty
+  wystawia `[acme]` ([6q](#6q-certyfikaty-acme-http-01-acme)) albo kładziesz je sam (w testach wystarczy
+  self-signed).
 
-### Certyfikaty i webroot ACME (kontrakt dla #96)
+### Certyfikaty i webroot ACME
 
 | ścieżka | tryb | rola |
 |---|---|---|
@@ -1684,6 +1686,52 @@ curl -k --resolve nz.example.eu:443:127.0.0.1 https://nz.example.eu/   # -k tylk
 (inny `weglarka.ingress-hash`). `apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu), a
 pliki w `tls/`/`acme/` możesz zostawić — `behind` ich nie czyta. Przed downgradem do wydania sprzed 0036
 usuń `https_bind` z `weglarka.toml` (starszy demon nie zna tego klucza).
+
+## 6q. Certyfikaty ACME (HTTP-01, `[acme]`)
+
+W trybie `edge` ([6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu)) demon sam wystawia i odnawia
+certyfikaty: dla każdej routowanej domeny (apki i webhook) zamawia osobny certyfikat przez HTTP-01 i zapisuje go
+do `tls/`; nginx przeładowuje się bez odtwarzania kontenera. Decyzja: [0038](decisions/0038-acme-engine-seams.md).
+
+```toml
+[acme]
+accept_terms = true                  # wymagane: zgoda na regulamin CA, bez niej konto nie powstanie
+email = "ops@example.eu"             # opcjonalnie: adres kontaktowy CA (powiadomienia o wygasaniu)
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"   # staging na próbę
+# renew_before_days = 30             # odnawiaj, gdy zostało tyle dni lub mniej (1..=60)
+# check_interval_secs = 21600        # przejście co 6 h (minimum 600)
+# enabled = false                    # wstrzymanie bez usuwania sekcji
+```
+
+- **Wymagania:** `mode = "edge"`, port HTTP (`bind`) osiągalny z internetu jako **port 80** i DNS domeny
+  wskazujący na ten host — CA wchodzi na `http://<domena>/.well-known/acme-challenge/<token>`. Walidacja
+  odrzuca `[acme]` w trybie `behind` (chyba że `enabled = false`).
+- **Przebieg:** pierwsze przejście startuje 30 s po demonie (nginx musi już nasłuchiwać). Domena bez certyfikatu
+  dostaje go od razu; istniejący jest odnawiany, gdy zostało `renew_before_days` dni lub mniej. Po błędzie
+  następne przejście jest za 30 minut (limit CA to 5 nieudanych walidacji na godzinę dla jednej nazwy),
+  a poprzedni certyfikat jest nadal serwowany.
+- **Pliki:** konto CA to `<state dir>/acme/account.key` (`0600`, JSON z kluczem prywatnym konta; poza webrootem
+  i `tls/`; demon odmawia pliku czytelnego dla grupy/innych), klucz domeny to `tls/<domena>.key` (`0600`),
+  łańcuch `tls/<domena>.crt` (`0644`). Zapis jest atomowy, **klucz przed certyfikatem**. Klucze nie trafiają
+  do logów, zdarzeń ani komunikatów błędów.
+- **Powiadomienia:** `CertificateIssued` (info) po wystawieniu/odnowieniu; `CertificateRenewalFailed` (warning,
+  critical gdy zostało mniej niż 7 dni albo certyfikatu nie ma) — przez zwykły kanał `[notify]`.
+- **`doctor`:** `acme.config` (ostrzega przy stagingu), `acme.account` (tryb pliku konta), `acme.certs`
+  (nieistniejące/wygasłe/do odnowienia i ostatni błąd). Domena bez certyfikatu nadal daje `ingress.tls` = warn,
+  z podpowiedzią, że worker zamówi go w następnym przejściu.
+- **Staging:** na próbę ustaw `directory_url` na staging Let's Encrypt; certyfikaty nie są zaufane przez
+  przeglądarki. Przejście na produkcję: usuń `directory_url` i pliki `tls/<domena>.*` oraz
+  `<state dir>/acme/account.key` (konto stagingu nie istnieje na produkcji), zrestartuj demona.
+- **Test na stagingu (opt-in):** `WEGLARKA_ACME_STAGING_DOMAIN=<domena> WEGLARKA_ACME_STAGING_WEBROOT=<katalog>
+  cargo test -p weglarka-acme --test staging -- --nocapture` — wymaga publicznego portu 80, który serwuje
+  `<katalog>` pod `/.well-known/acme-challenge/` (w CI pomijany).
+- **Nie obsługiwane (jeszcze):** certyfikaty wildcard (DNS-01, #97), kilka nazw w jednym certyfikacie,
+  własne CA poza `directory_url`.
+
+**Rollback:** `[acme]` jest nową sekcją `weglarka.toml` z `deny_unknown_fields`, więc **starszy demon odmówi
+startu**, dopóki jej nie usuniesz. Usuń sekcję (albo ustaw `enabled = false` przed rollbackiem do wydania, które
+ją zna) i zrestartuj; wystawione certyfikaty w `tls/` zostają i dalej są serwowane, tylko nie będą odnawiane.
+`apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu).
 
 ## 7. Weryfikacja i rollback
 

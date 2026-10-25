@@ -34,6 +34,10 @@ pub struct HostConfig {
     /// Automatic update of Węglarka's own image; absent = off (issue #99, `docs/decisions/0027`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update: Option<SelfUpdateConfig>,
+    /// ACME certificate issuance and renewal for `edge` ingress; absent = off, the operator
+    /// provides `tls/<domain>.crt|key` (issue #96, `docs/decisions/0038`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<AcmeConfig>,
 }
 
 impl HostConfig {
@@ -62,6 +66,15 @@ impl HostConfig {
                 "[ingress] port {port} is below 1024; rootless Podman can only publish it with \
                  net.ipv4.ip_unprivileged_port_start=0 and [runtime] allow_privileged_host_ports = true"
             ));
+        }
+        if let Some(acme) = &self.acme {
+            acme.validate()?;
+            if acme.enabled && self.ingress.mode != IngressMode::Edge {
+                return Err(
+                    "[acme] needs `edge` ingress: HTTP-01 is answered by Węglarka's own nginx"
+                        .to_owned(),
+                );
+            }
         }
         Ok(())
     }
@@ -372,6 +385,95 @@ impl MonitorConfig {
 
     fn default_unhealthy_observations() -> u32 {
         2
+    }
+}
+
+/// `[acme]`: Let's Encrypt (or any ACME CA) certificates for `edge` ingress (issue #96,
+/// `docs/decisions/0038`). The daemon orders one certificate per domain (the webhook domain and
+/// every app domain) over HTTP-01 and renews it before it expires; nginx reloads without a
+/// container recreate. Needs the plain-HTTP port reachable from the internet as port 80.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// The operator accepts the CA's terms of service. Must be `true`: an account is never created
+    /// on the operator's behalf without it.
+    pub accept_terms: bool,
+    /// Contact address for expiry notices from the CA (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// ACME directory; use the staging URL while trying the setup out.
+    #[serde(default = "AcmeConfig::default_directory_url")]
+    pub directory_url: String,
+    /// `false` pauses issuance and renewal without removing the section.
+    #[serde(default = "AcmeConfig::default_enabled")]
+    pub enabled: bool,
+    /// Renew when this many days or fewer are left.
+    #[serde(default = "AcmeConfig::default_renew_before_days")]
+    pub renew_before_days: u64,
+    /// Time between two passes over the certificates (seconds).
+    #[serde(default = "AcmeConfig::default_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+impl AcmeConfig {
+    pub const LETS_ENCRYPT_PRODUCTION: &'static str =
+        "https://acme-v02.api.letsencrypt.org/directory";
+    pub const LETS_ENCRYPT_STAGING: &'static str =
+        "https://acme-staging-v02.api.letsencrypt.org/directory";
+    pub const MIN_CHECK_INTERVAL_SECS: u64 = 600;
+    pub const MAX_RENEW_BEFORE_DAYS: u64 = 60;
+
+    fn default_directory_url() -> String {
+        Self::LETS_ENCRYPT_PRODUCTION.to_owned()
+    }
+
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_renew_before_days() -> u64 {
+        30
+    }
+
+    fn default_check_interval_secs() -> u64 {
+        6 * 3600
+    }
+
+    /// Rejects a configuration that cannot work. Called at startup and by `doctor --preflight`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.accept_terms {
+            return Err(
+                "[acme] accept_terms must be true: the CA's terms of service have to be accepted \
+                 explicitly"
+                    .to_owned(),
+            );
+        }
+        if !self.directory_url.starts_with("https://") {
+            return Err(format!(
+                "[acme] directory_url {:?} must be an https:// URL",
+                self.directory_url
+            ));
+        }
+        if let Some(email) = &self.email
+            && (!email.contains('@') || email.chars().any(|c| c.is_whitespace() || c == ','))
+        {
+            return Err(format!("[acme] email {email:?} is not a single address"));
+        }
+        if !(1..=Self::MAX_RENEW_BEFORE_DAYS).contains(&self.renew_before_days) {
+            return Err(format!(
+                "[acme] renew_before_days must be 1..={} (got {})",
+                Self::MAX_RENEW_BEFORE_DAYS,
+                self.renew_before_days
+            ));
+        }
+        if self.check_interval_secs < Self::MIN_CHECK_INTERVAL_SECS {
+            return Err(format!(
+                "[acme] check_interval_secs must be at least {} (got {})",
+                Self::MIN_CHECK_INTERVAL_SECS,
+                self.check_interval_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -945,6 +1047,63 @@ domain = "weglarka.descriptortable.eu"
             "allow_privileged_host_ports = true\n\n[ingress]",
         );
         HostConfig::from_toml_str(&allowed)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn acme_section_is_off_by_default_and_parses_with_defaults() {
+        let cfg = HostConfig::from_toml_str(EDGE).unwrap();
+        assert!(cfg.acme.is_none());
+        assert!(!toml::to_string(&cfg).unwrap().contains("acme"));
+
+        let src = format!("{EDGE}\n[acme]\naccept_terms = true\n");
+        let acme = HostConfig::from_toml_str(&src).unwrap().acme.unwrap();
+        assert!(acme.enabled && acme.email.is_none());
+        assert_eq!(acme.directory_url, AcmeConfig::LETS_ENCRYPT_PRODUCTION);
+        assert_eq!(acme.renew_before_days, 30);
+        assert_eq!(acme.check_interval_secs, 6 * 3600);
+        acme.validate().unwrap();
+        HostConfig::from_toml_str(&src).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn acme_requires_explicit_terms_and_sane_values() {
+        let acme = |extra: &str| {
+            let src = format!("{EDGE}\n[acme]\naccept_terms = true\n{extra}");
+            HostConfig::from_toml_str(&src).unwrap().acme.unwrap()
+        };
+        // `accept_terms` has no default: omitting it is a parse error, `false` a validation error.
+        assert!(HostConfig::from_toml_str(&format!("{EDGE}\n[acme]\n")).is_err());
+        let mut declined = acme("");
+        declined.accept_terms = false;
+        assert!(declined.validate().unwrap_err().contains("accept_terms"));
+        for bad in [
+            "directory_url = \"http://ca.example/dir\"",
+            "email = \"nobody\"",
+            "email = \"a@b.eu, c@d.eu\"",
+            "renew_before_days = 0",
+            "renew_before_days = 61",
+            "check_interval_secs = 599",
+        ] {
+            assert!(acme(bad).validate().is_err(), "{bad}");
+        }
+        acme("email = \"ops@example.eu\"\nrenew_before_days = 60\ncheck_interval_secs = 600")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn acme_needs_edge_unless_disabled() {
+        let behind = format!("{SAMPLE}\n[acme]\naccept_terms = true\n");
+        let err = HostConfig::from_toml_str(&behind)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("edge"), "{err}");
+        let paused = format!("{SAMPLE}\n[acme]\naccept_terms = true\nenabled = false\n");
+        HostConfig::from_toml_str(&paused)
             .unwrap()
             .validate()
             .unwrap();

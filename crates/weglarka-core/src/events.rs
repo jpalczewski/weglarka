@@ -79,6 +79,20 @@ pub enum Event {
     /// The watchdog restored the previous digest because the switched daemon did not answer the admin
     /// API within its deadline (issue #100, `docs/decisions/0034`). `from` is the digest that failed.
     SelfUpdateFellBack { from: Digest, to: Digest },
+    /// A certificate was ordered and stored (issue #96, `docs/decisions/0038`). `renewed` tells a
+    /// first issuance from a renewal; nginx picks the files up on the next ingress apply.
+    CertificateIssued {
+        cert: String,
+        renewed: bool,
+        expires_in_days: u64,
+    },
+    /// Issuing or renewing a certificate failed. `expires_in_days` is the remaining validity of the
+    /// certificate still on disk (`None` when there is none, `Some(0)` once it has expired).
+    CertificateRenewalFailed {
+        cert: String,
+        reason: String,
+        expires_in_days: Option<u64>,
+    },
 }
 
 /// How serious an event is. Notification channels route on it (`min_severity`) and the daemon uses it
@@ -116,9 +130,17 @@ impl std::fmt::Display for Severity {
 
 impl Event {
     /// Severity used for notification routing and for the `tracing` level.
+    /// A failed renewal with fewer days than this left on the current certificate is critical.
+    pub const CERT_CRITICAL_DAYS: u64 = 7;
+
     pub fn severity(&self) -> Severity {
         match self {
             Self::RollbackFailed { .. } | Self::CrashLooping { .. } => Severity::Critical,
+            // Nothing valid is being served (or soon won't be): wake somebody up.
+            Self::CertificateRenewalFailed {
+                expires_in_days, ..
+            } if expires_in_days.is_none_or(|d| d < Self::CERT_CRITICAL_DAYS) => Severity::Critical,
+            Self::CertificateRenewalFailed { .. } => Severity::Warning,
             Self::DeployFailed { .. }
             | Self::RolledBack { .. }
             | Self::Unhealthy { .. }
@@ -132,7 +154,8 @@ impl Event {
             | Self::Recreated { .. }
             | Self::WaitingForSecret { .. }
             | Self::Recovered { .. }
-            | Self::SelfUpdated { .. } => Severity::Info,
+            | Self::SelfUpdated { .. }
+            | Self::CertificateIssued { .. } => Severity::Info,
         }
     }
 }
@@ -270,6 +293,38 @@ mod tests {
                     instance: name("a"),
                 },
                 Severity::Warning,
+            ),
+            (
+                Event::CertificateIssued {
+                    cert: "a.example.eu".into(),
+                    renewed: true,
+                    expires_in_days: 90,
+                },
+                Severity::Info,
+            ),
+            (
+                Event::CertificateRenewalFailed {
+                    cert: "a.example.eu".into(),
+                    reason: "x".into(),
+                    expires_in_days: Some(7),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::CertificateRenewalFailed {
+                    cert: "a.example.eu".into(),
+                    reason: "x".into(),
+                    expires_in_days: Some(6),
+                },
+                Severity::Critical,
+            ),
+            (
+                Event::CertificateRenewalFailed {
+                    cert: "a.example.eu".into(),
+                    reason: "x".into(),
+                    expires_in_days: None,
+                },
+                Severity::Critical,
             ),
             (
                 Event::Recovered {

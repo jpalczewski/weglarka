@@ -64,7 +64,9 @@ fn instance_of(event: &Event) -> Option<&InstanceName> {
         | Event::WebhookDuplicate { .. }
         | Event::SelfUpdated { .. }
         | Event::SelfUpdatePending { .. }
-        | Event::SelfUpdateFellBack { .. } => None,
+        | Event::SelfUpdateFellBack { .. }
+        | Event::CertificateIssued { .. }
+        | Event::CertificateRenewalFailed { .. } => None,
     }
 }
 
@@ -227,6 +229,34 @@ pub fn build(event: &Event) -> Message {
                 short(from),
                 short(to)
             ),
+            tag("warning"),
+        ),
+        // Issue #96: certificates belong to the host, not to an app.
+        Event::CertificateIssued {
+            cert,
+            renewed,
+            expires_in_days,
+        } => (
+            format!("acme:{cert}"),
+            format!(
+                "certificate {}: {cert}",
+                if *renewed { "renewed" } else { "issued" }
+            ),
+            format!("valid for {expires_in_days} more days"),
+            tag("lock"),
+        ),
+        Event::CertificateRenewalFailed {
+            cert,
+            reason,
+            expires_in_days,
+        } => (
+            format!("acme:{cert}"),
+            format!("certificate renewal failed: {cert}"),
+            match expires_in_days {
+                Some(0) => format!("{reason}; the current certificate has expired"),
+                Some(days) => format!("{reason}; the current certificate has {days} days left"),
+                None => format!("{reason}; there is no certificate for this domain yet"),
+            },
             tag("warning"),
         ),
     };
@@ -421,6 +451,30 @@ image = "ghcr.io/x/worker:1"
                 },
                 Severity::Warning,
             ),
+            (
+                Event::CertificateIssued {
+                    cert: "app.example.eu".into(),
+                    renewed: false,
+                    expires_in_days: 89,
+                },
+                Severity::Info,
+            ),
+            (
+                Event::CertificateRenewalFailed {
+                    cert: "app.example.eu".into(),
+                    reason: "rate limited".into(),
+                    expires_in_days: Some(12),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::CertificateRenewalFailed {
+                    cert: "app.example.eu".into(),
+                    reason: "challenge failed".into(),
+                    expires_in_days: None,
+                },
+                Severity::Critical,
+            ),
         ]
     }
 
@@ -445,7 +499,8 @@ image = "ghcr.io/x/worker:1"
             assert_eq!(message.priority, priority(severity), "{message:?}");
             let has_instance = !message.key.starts_with("pruned:")
                 && !message.key.starts_with("webhook-dup:")
-                && !message.key.starts_with("self-update:");
+                && !message.key.starts_with("self-update:")
+                && !message.key.starts_with("acme:");
             if has_instance {
                 assert_eq!(
                     message.click.as_deref(),

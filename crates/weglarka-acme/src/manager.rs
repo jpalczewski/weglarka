@@ -78,6 +78,13 @@ where
         report
     }
 
+    /// `notAfter` of the certificate currently on disk; `None` when there is none or it cannot be
+    /// read (the caller reports the remaining validity of what is still being served).
+    pub fn current_not_after(&self, id: &CertId) -> Option<SystemTime> {
+        let chain = self.store.read_chain(id).ok().flatten()?;
+        self.client.not_after(&chain).ok()
+    }
+
     async fn one(&self, now: SystemTime, spec: &CertSpec) -> Result<Outcome, AcmeError> {
         let existing = match self.store.read_chain(spec.id())? {
             Some(chain) => {

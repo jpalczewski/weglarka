@@ -642,6 +642,10 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
 
 /// An `edge` daemon (issue #95): two public ports, no Traefik, certificates under `<state>/nginx/tls`.
 fn edge_settings(root: &Path) -> Settings {
+    edge_settings_with(root, "")
+}
+
+fn edge_settings_with(root: &Path, extra: &str) -> Settings {
     let host = HostConfig::from_toml_str(&format!(
         r#"
 [ingress]
@@ -658,6 +662,7 @@ domain = "hooks.example.eu"
 
 [state]
 dir = "{root}/state"
+{extra}
 "#,
         root = root.display()
     ))
@@ -739,5 +744,70 @@ async fn edge_ingress_owns_two_ports_and_doctor_reports_tls() {
             .contains("hooks.example.eu"),
         "{tls}"
     );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_reports_acme_and_the_daemon_stops_with_the_worker_waiting() {
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().to_owned();
+    let fake = FakePodman::new();
+    let settings = edge_settings_with(
+        &root,
+        "[acme]\naccept_terms = true\ndirectory_url = \"https://acme.invalid/directory\"\n",
+    );
+    let running = start(settings, fake.clone()).await.unwrap();
+    assert!(running.daemon.acme.is_some());
+
+    let (status, v) = admin_running(&running, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let find = |id: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} check in {v}"))
+            .clone()
+    };
+    assert_eq!(find("acme.config")["status"], "ok");
+    assert_eq!(find("acme.account")["status"], "info");
+    let certs = find("acme.certs");
+    assert_eq!(certs["status"], "warn", "{certs}");
+    assert!(
+        certs["message"]
+            .as_str()
+            .unwrap()
+            .contains("hooks.example.eu")
+    );
+    assert!(
+        find("ingress.tls")["hint"]
+            .as_str()
+            .unwrap()
+            .contains("ACME worker")
+    );
+
+    // The worker is still in its startup delay: stopping must not wait for it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), running.stop())
+        .await
+        .expect("the daemon stops promptly with the ACME worker waiting");
+}
+
+#[tokio::test]
+async fn a_paused_acme_section_starts_no_worker() {
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = start(
+        edge_settings_with(dir.path(), "[acme]\naccept_terms = true\nenabled = false\n"),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+    assert!(running.daemon.acme.is_none());
     running.stop().await;
 }

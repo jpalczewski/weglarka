@@ -26,6 +26,8 @@ pub struct Paths {
     pub nginx_conf_dir: PathBuf,
     /// Durable queue of notifications that have not been delivered yet (issue #38).
     pub notifications: PathBuf,
+    /// ACME account credentials (`[acme]`, issue #96): `0600`, outside the webroot and `tls/`.
+    pub acme_account_key: PathBuf,
     /// Host directory with the apps' config files/directories (issue #118), resolved from
     /// `weglarka.toml`'s `config_root`. `None` = config mounts are off.
     pub config_root: Option<PathBuf>,
@@ -56,6 +58,7 @@ impl Paths {
                 .clone()
                 .unwrap_or_else(|| state_dir.join("nginx")),
             notifications: state_dir.join("notifications.toml"),
+            acme_account_key: state_dir.join("acme").join("account.key"),
             config_root,
             state_dir,
         }

@@ -121,5 +121,6 @@ Operator runbook: `docs/install.md` section 6k.
 - No concurrency limit/rate limit on the webhook listener (nginx with a body-size limit sits in front of it).
 - `deploy` with `image_ref` → 400; `Failed` without rollback → 500.
 - Changing `[ingress]`/`[webhook]` in `weglarka.toml` requires a daemon restart (config is read once).
-- `edge` certificates are operator-provided until ACME issuance (#96) lands; a routed domain without a
-  certificate pair gets no TLS server (fail closed) and `doctor` reports it as `ingress.tls`.
+- `edge` certificates come from the `[acme]` worker (`src/acme.rs`, HTTP-01, docs/install.md 6q) or are
+  operator-provided; a routed domain without a certificate pair gets no TLS server (fail closed) and
+  `doctor` reports it as `ingress.tls` (and `acme.certs` when `[acme]` is on).
