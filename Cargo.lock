@@ -1775,6 +1775,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "weglarka-dns"
+version = "0.0.2"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
+ "weglarka-core",
+]
+
+[[package]]
 name = "weglarka-ingress"
 version = "0.0.2"
 dependencies = [

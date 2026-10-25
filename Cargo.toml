@@ -20,6 +20,7 @@ all = { level = "warn", priority = -1 }
 weglarka-acme = { path = "crates/weglarka-acme", version = "0.0.2" }
 weglarka-api = { path = "crates/weglarka-api", version = "0.0.2" }
 weglarka-core = { path = "crates/weglarka-core", version = "0.0.2" }
+weglarka-dns = { path = "crates/weglarka-dns", version = "0.0.2" }
 weglarka-podman = { path = "crates/weglarka-podman", version = "0.0.2" }
 weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0.2" }
 weglarka-notify = { path = "crates/weglarka-notify", version = "0.0.2" }

@@ -95,7 +95,7 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `registry → core`; `acme → core`;
+Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `registry → core`; `acme → core`; `dns → core`;
 `cli → api, core`; `daemon → wszystko`.
 
 | Crate | Zawartość |
@@ -106,6 +106,7 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `notify →
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
 | `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); własny minimalny klient HTTP/TLS, `FakeRegistry`/`TestSigner` (feature `testing`) |
 | `weglarka-acme` | silnik ACME dla trybu `edge` (#96, ADR 0038): `CertSpec`/`CertId` (certyfikat = lista nazw, plik z id), trait `ChallengeSolver` (`Http01Solver`; DNS-01 = #97), `AcmeClient`/`CertInspector`, `CertStore` (klucz 0600 przed certem 0644, atomowo), czyste `renewal::decide`, `Manager::pass`; `InstantAcme` (klient na `instant-acme`, `ring`, `webpki-roots`), `FakeAcme` (feature `testing`); test na staging Let's Encrypt jest opt-in (`WEGLARKA_ACME_STAGING_DOMAIN`/`_WEBROOT`); worker w demonie (`daemon/src/acme.rs`, `[acme]`, zdarzenia, `doctor acme.*`) |
+| `weglarka-dns` | adaptery DNS dla ACME DNS-01: trait `DnsProvider` (`set_txt`/`remove_txt`, handle usuwa dokładnie swój rekord), adapter Cloudflare (API v4, własny minimalny klient HTTP/TLS, token jako `SecretValue`), `FakeDns` (feature `testing`); ADR 0039 |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
 | `weglarka-daemon` | demon: admin API (unix socket, w tym `GET /v1/health`), webhooki, zapis ingressu, `Platform` systemd (quadlet + timery samoaktualizacji i watchdoga), worker powiadomień, host-side `self-update` i `supervise` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
