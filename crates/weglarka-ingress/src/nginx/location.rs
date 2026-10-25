@@ -11,89 +11,116 @@ enum Backend<'a> {
     Container { host: &'a str, port: u16 },
 }
 
+/// One `location` block of an app, before its directives are rendered. Extra locations of an app
+/// (several paths, a streaming sub-path) are more entries of the list [`path_locations`] builds.
+struct Location<'a> {
+    /// The whole header, e.g. `location ^~ /p/`.
+    header: String,
+    /// `(regex, replacement)` of the `rewrite` that removes the path prefix.
+    strip: Option<(String, String)>,
+    /// App name set for the access log when the server hosts several apps and the server-level
+    /// `$app` is therefore unknown.
+    app: Option<&'a str>,
+}
+
+/// The `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any other prefix
+/// `/p` becomes `location = /p` plus `location ^~ /p/` — a bare `location /p` would also match
+/// `/pxyz` (ADR 0031).
+fn path_locations<'a>(
+    ingress: &AppIngress,
+    path: &PathPrefix,
+    app: Option<&'a str>,
+) -> Vec<Location<'a>> {
+    if path.is_root() {
+        return vec![Location {
+            header: "location /".to_owned(),
+            strip: None,
+            app,
+        }];
+    }
+    let p = path.as_str();
+    // The rewrite that removes the prefix (`.` is the only regex metacharacter the path alphabet
+    // allows).
+    let escaped = p.replace('.', "\\.");
+    let exact = ingress
+        .strip_prefix
+        .then(|| ("^".to_owned(), "/".to_owned()));
+    let below = ingress
+        .strip_prefix
+        .then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
+    vec![
+        Location {
+            header: format!("location = {p}"),
+            strip: exact,
+            app,
+        },
+        Location {
+            header: format!("location ^~ {p}/"),
+            strip: below,
+            app,
+        },
+    ]
+}
+
 impl Backend<'_> {
-    /// Renders the `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any
-    /// other prefix `/p` becomes `location = /p` plus `location ^~ /p/` — a bare `location /p` would
-    /// also match `/pxyz` (ADR 0031). `set_app` names the app for the access log when the server
-    /// hosts several apps and the server-level `$app` is therefore unknown.
-    fn write_locations(
-        &self,
-        c: &mut Conf,
-        ingress: &AppIngress,
-        path: &PathPrefix,
-        set_app: Option<&str>,
-    ) {
-        if path.is_root() {
-            self.write_location(c, "location /", ingress, None, set_app);
-            return;
-        }
-        let p = path.as_str();
-        // `Some((regex, replacement))` of the rewrite that removes the prefix (`.` is the only regex
-        // metacharacter the path alphabet allows).
-        let escaped = p.replace('.', "\\.");
-        let exact = ingress
-            .strip_prefix
-            .then(|| ("^".to_owned(), "/".to_owned()));
-        let below = ingress
-            .strip_prefix
-            .then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
-        self.write_location(c, &format!("location = {p}"), ingress, exact, set_app);
-        self.write_location(c, &format!("location ^~ {p}/"), ingress, below, set_app);
+    fn write_location(&self, c: &mut Conf, location: &Location<'_>, ingress: &AppIngress) {
+        c.block(&location.header, |c| {
+            if let Some(app) = location.app {
+                c.line(&format!("set $app \"{app}\";"));
+            }
+            self.write_upstream(c, location.strip.as_ref());
+            write_body_limit(c, ingress);
+            write_streaming(c, ingress);
+        });
     }
 
-    fn write_location(
-        &self,
-        c: &mut Conf,
-        header: &str,
-        ingress: &AppIngress,
-        strip: Option<(String, String)>,
-        set_app: Option<&str>,
-    ) {
+    /// `set $upstream` + optional prefix rewrite + `proxy_pass`.
+    fn write_upstream(&self, c: &mut Conf, strip: Option<&(String, String)>) {
         match self {
             Backend::Container { host, port } => {
                 // A variable in `proxy_pass` forces runtime resolution (via `resolver`): a missing
                 // container yields 502 instead of a startup error; a new IP after recreate is picked up after the TTL.
-                c.block(header, |c| {
-                    if let Some(app) = set_app {
-                        c.line(&format!("set $app \"{app}\";"));
-                    }
-                    c.line(&format!("set $upstream \"http://{host}:{port}\";"));
-                    // `strip_prefix`: with a variable `proxy_pass` carries no URI of its own, so the
-                    // rewritten one is what the upstream sees (query string is kept by `rewrite`).
-                    if let Some((regex, replacement)) = strip {
-                        c.line(&format!("rewrite {regex} {replacement} break;"));
-                    }
-                    c.line("proxy_pass $upstream;");
-                    // Per-app body limit (ADR 0033). It is a *location* directive so that apps
-                    // sharing a `server` (path routing) keep their own limits, and the server-level
-                    // default stays for everyone else. nginx would otherwise buffer the body in
-                    // `client_body_temp_path` — on the read-only root's small tmpfs, i.e. in RAM —
-                    // before the upstream sees the first byte; `streaming` below already says this.
-                    if let Some(limit) = ingress.max_body_size {
-                        c.line(&format!("client_max_body_size {};", limit.bytes()));
-                        if !ingress.streaming {
-                            c.line("proxy_request_buffering off;");
-                        }
-                    }
-                    // Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the
-                    // right default everywhere else. Both timeouts change together — nginx would
-                    // otherwise cut an idle stream at its 60 s default. The `Connection`/`Upgrade`
-                    // headers stay global on purpose: a streaming app may still use WebSocket.
-                    if ingress.streaming {
-                        c.line("proxy_buffering off;");
-                        c.line("proxy_request_buffering off;");
-                        c.line(&format!(
-                            "proxy_read_timeout {}s;",
-                            ingress.stream_timeout_secs
-                        ));
-                        c.line(&format!(
-                            "proxy_send_timeout {}s;",
-                            ingress.stream_timeout_secs
-                        ));
-                    }
-                });
+                c.line(&format!("set $upstream \"http://{host}:{port}\";"));
+                // `strip_prefix`: with a variable `proxy_pass` carries no URI of its own, so the
+                // rewritten one is what the upstream sees (query string is kept by `rewrite`).
+                if let Some((regex, replacement)) = strip {
+                    c.line(&format!("rewrite {regex} {replacement} break;"));
+                }
+                c.line("proxy_pass $upstream;");
             }
         }
+    }
+}
+
+/// Per-app body limit (ADR 0033). It is a *location* directive so that apps sharing a `server`
+/// (path routing) keep their own limits, and the server-level default stays for everyone else.
+/// nginx would otherwise buffer the body in `client_body_temp_path` — on the read-only root's small
+/// tmpfs, i.e. in RAM — before the upstream sees the first byte; `streaming` already says this.
+fn write_body_limit(c: &mut Conf, ingress: &AppIngress) {
+    if let Some(limit) = ingress.max_body_size {
+        c.line(&format!("client_max_body_size {};", limit.bytes()));
+        if !ingress.streaming {
+            c.line("proxy_request_buffering off;");
+        }
+    }
+}
+
+/// Streaming is opt-in per app (issue #64, docs/decisions/0018): buffering is the right default
+/// everywhere else. Both timeouts change together — nginx would otherwise cut an idle stream at its
+/// 60 s default. The `Connection`/`Upgrade` headers stay global on purpose: a streaming app may
+/// still use WebSocket.
+fn write_streaming(c: &mut Conf, ingress: &AppIngress) {
+    if ingress.streaming {
+        c.line("proxy_buffering off;");
+        c.line("proxy_request_buffering off;");
+        c.line(&format!(
+            "proxy_read_timeout {}s;",
+            ingress.stream_timeout_secs
+        ));
+        c.line(&format!(
+            "proxy_send_timeout {}s;",
+            ingress.stream_timeout_secs
+        ));
     }
 }
 
@@ -113,10 +140,13 @@ pub(super) fn write_app_locations(
         .collect();
     locations.sort_by(|a, b| a.0.cmp(b.0));
     for (path, app) in locations {
-        Backend::Container {
+        let backend = Backend::Container {
             host: app.instance.as_str(),
             port: app.port,
+        };
+        let name = shared.then(|| app.instance.as_str());
+        for location in path_locations(&app.ingress, path, name) {
+            backend.write_location(c, &location, &app.ingress);
         }
-        .write_locations(c, &app.ingress, path, shared.then(|| app.instance.as_str()));
     }
 }
