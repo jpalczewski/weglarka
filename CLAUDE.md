@@ -78,7 +78,7 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
    jeśli rebase ujawni kolizję, przenumeruj jedną komendą: `scripts/adr.sh renumber OLD NEW`.
    Przed PR-em uruchom też `scripts/adr.sh lint` (to samo robi job `docs-lint`).
 6. Tytuł, commity i PR w Conventional Commits (`<type>(<scope>): <summary>`, patrz wyżej), po angielsku;
-   `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `podman-tests`, `smoke`; zmiana tylko w
+   `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `nginx-e2e`, `podman-tests`, `smoke-behind`, `smoke-edge`; zmiana tylko w
    `docs/`/`*.md`/`.gitignore` nie buduje — job `changes`).
 
 ## Worktrees (praca równoległa)
@@ -273,6 +273,6 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `.github/scripts/smoke-image.sh` i `smoke-quadlet.sh` (argumenty z `platform install`).
 - CI na PR buduje profilem `ci` (thin LTO), `main` i tagi — pełnym `release` (`docs/decisions/0008`).
   PR zmieniający wyłącznie dokumentację (`docs/**`, `*.md`, `.gitignore`) nie uruchamia buildów — job
-  `changes` pomija `check`/`musl`/`podman-tests`/`smoke`; `changes` i `pr-title` biegną zawsze. Push na
+  `changes` pomija `check`/`nginx-e2e`/`musl`/`podman-tests`/`smoke-behind`/`smoke-edge`; `changes` i `pr-title` biegną zawsze. Push na
   `main` z samą dokumentacją nie uruchamia CI ani Release (`paths-ignore`) — obraz nie jest wtedy
   przebudowywany; tagi `v*` budują zawsze.

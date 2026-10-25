@@ -87,8 +87,8 @@ jobs:
       - name: ADR numbering, generated index and internal links
         run: scripts/adr.sh lint
 
-  # fmt → clippy → test → nginx -t in ONE job: the toolchain is installed once and the debug `target/`
-  # is shared, instead of four runners each paying for toolchain setup and a cold cache.
+  # fmt → clippy → test in ONE job: the toolchain is installed once and the debug `target/`
+  # is shared, instead of three runners each paying for toolchain setup and a cold cache.
   # The cache is written only on main (`save-if`); PRs restore main's cache read-only.
   check:
     needs: changes
@@ -105,6 +105,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-core +
+  # weglarka-ingress) and Docker. The debug cache is `check`'s, restored read-only; the example is built once up
+  # front so the steps below (which call `cargo run`) only reuse it.
+  nginx-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          save-if: false
+      - run: cargo build -q -p weglarka-ingress --example dump
       # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
       # (IngressConfig::default_nginx_image; docs/decisions/0006).
       - name: nginx -t
@@ -264,8 +280,9 @@ jobs:
 
   # Image smoke tests (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
   # The image is assembled from the exact binaries the `musl` job built (docs/decisions/0008); no compilation
-  # here, so no Rust toolchain either.
-  smoke:
+  # here, so no Rust toolchain either. Two jobs run in parallel (the default and the edge scenarios), each
+  # with its own Podman.
+  smoke-behind:
     needs: [changes, musl]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
@@ -286,6 +303,27 @@ jobs:
         run: .github/scripts/smoke-image.sh localhost/weglarka:ci bin/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh
       - name: Image smoke test from the quadlet arguments (no runtime.socket, hardened)
         run: .github/scripts/smoke-quadlet.sh localhost/weglarka:ci bin/weglarka bin/weglarka-daemon "$WEGLARKA_PODMAN_SOCKET"
+      - name: Podman service log
+        if: failure()
+        run: cat "$RUNNER_TEMP/podman-service.log" || true
+
+  smoke-edge:
+    needs: [changes, musl]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/podman-rootless
+      - uses: actions/download-artifact@v4
+        with:
+          name: musl-bin
+          path: bin
+      - name: Build the image from the prebuilt binaries
+        run: |
+          set -euo pipefail
+          chmod +x bin/weglarka bin/weglarka-daemon
+          podman build -q -t localhost/weglarka:ci -f Containerfile --build-arg BIN_SOURCE=prebuilt .
+          podman images
       # Edge mode (issue #95): the same image with `[ingress] mode = "edge"` — both web ports published,
       # TLS + ACME through nginx, no Traefik file, and a certificate change reloads nginx without a recreate.
       - name: Image smoke test in edge mode (TLS, no Traefik)

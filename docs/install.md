@@ -294,7 +294,7 @@ first `apps start`, export with a content check.
 
 **The webhook on the host** checks the protocol (a valid signature → 202 for the canary image — the deploy ends
 `Unchanged`, a bad signature → 401, `ping` → 204, a foreign tag → 204). The **full rollback test** (exit code 6, return
-to the previous digest) and the webhook with a real deploy and a duplicate delivery run in CI (`smoke`);
+to the previous digest) and the webhook with a real deploy and a duplicate delivery run in CI (`smoke-behind`);
 on the host they are optional (`--with-local-registry`) — they need a temporary registry on `127.0.0.1:15099` and a
 `[[registry]] location = "127.0.0.1:15099" insecure = true` entry in the user's `registries.conf` **before** the
 Podman service starts (it reads the file at startup). The script configures nothing itself; without the entry the
