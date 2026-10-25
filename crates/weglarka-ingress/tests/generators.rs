@@ -295,6 +295,85 @@ fn nginx_max_body_size_snapshot() {
     insta::assert_snapshot!("nginx_max_body_size", conf);
 }
 
+/// A chatty poller (exact and prefix entries) next to an ordinary app, a shared domain, and an app with
+/// an entry that needs regex escaping (issue #181).
+const ACCESS_LOG_SKIP_APPS: &str = r#"
+[apps.forgejo]
+image = "ghcr.io/x/forgejo:latest"
+domains = ["git.example.eu"]
+port = 3000
+ingress = { access_log_skip_paths = ["/api/actions/runner.v1.RunnerService/", "/healthz"] }
+
+[apps.plain]
+image = "ghcr.io/x/plain:latest"
+domains = ["plain.example.eu"]
+port = 3001
+
+[apps.v1]
+image = "ghcr.io/x/v1:latest"
+domains = ["shared.example.eu"]
+paths = ["/v1"]
+port = 3002
+ingress = { access_log_skip_paths = ["/v1/poll/"] }
+
+[apps.web]
+image = "ghcr.io/x/web:latest"
+domains = ["shared.example.eu"]
+paths = ["/"]
+port = 3003
+"#;
+
+#[test]
+fn access_log_skip_paths_render_maps_and_a_conditional_log() {
+    let conf = nginx::generate(&host(), &apps(ACCESS_LOG_SKIP_APPS), &opts()).unwrap();
+    assert!(
+        conf.contains("access_log /dev/stdout weglarka if=$weglarka_loggable;"),
+        "{conf}"
+    );
+    // A trailing slash is a prefix, anything else is anchored; the dots are escaped.
+    assert!(
+        conf.contains(r#""~^forgejo /api/actions/runner\.v1\.RunnerService/" 1;"#),
+        "{conf}"
+    );
+    assert!(conf.contains(r#""~^forgejo /healthz$" 1;"#), "{conf}");
+    assert!(conf.contains(r#""~^v1 /v1/poll/" 1;"#), "{conf}");
+    // Only successes and redirects are dropped; errors stay in the log.
+    assert!(conf.contains(r#""~^1:[123][0-9][0-9]$" 0;"#), "{conf}");
+    assert!(!conf.contains("plain /"), "apps without entries add nothing: {conf}");
+}
+
+#[test]
+fn empty_access_log_skip_paths_leave_the_config_untouched() {
+    let conf = nginx::generate(&host(), &apps(BODY_LIMIT_APPS), &opts()).unwrap();
+    assert!(conf.contains("access_log /dev/stdout weglarka;"), "{conf}");
+    assert!(!conf.contains("weglarka_loggable"), "{conf}");
+    assert!(!conf.contains("weglarka_skip_path"), "{conf}");
+}
+
+#[test]
+fn stopped_apps_contribute_no_access_log_rules() {
+    let conf =
+        nginx::generate(&host(), &stopped(apps(ACCESS_LOG_SKIP_APPS)), &opts()).unwrap();
+    assert!(!conf.contains("weglarka_loggable"), "{conf}");
+}
+
+#[test]
+fn nginx_access_log_skip_snapshot() {
+    let conf = nginx::generate(&host(), &apps(ACCESS_LOG_SKIP_APPS), &opts()).unwrap();
+    insta::assert_snapshot!("nginx_access_log_skip", conf);
+}
+
+#[test]
+fn nginx_edge_access_log_skip_snapshot() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(ACCESS_LOG_SKIP_APPS),
+        &edge_opts(&["git.example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_access_log_skip", conf);
+}
+
 #[test]
 fn traefik_ignores_max_body_size() {
     let mut limited = apps(BODY_LIMIT_APPS);

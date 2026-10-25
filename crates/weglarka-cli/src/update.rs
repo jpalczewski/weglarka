@@ -77,6 +77,13 @@ pub struct UpdateArgs {
     /// Back to the default request body limit (64m) and buffering.
     #[arg(long, conflicts_with = "spec")]
     pub unset_max_body_size: bool,
+    /// Leave a path out of the access log while it succeeds (repeatable); a trailing `/` makes it a
+    /// prefix. Errors are still logged. Ingress-only: nginx reload.
+    #[arg(long = "access-log-skip-path", value_name = "PATH", conflicts_with = "spec")]
+    pub access_log_skip_paths: Vec<String>,
+    /// Log this path again (repeatable).
+    #[arg(long = "remove-access-log-skip-path", value_name = "PATH", conflicts_with = "spec")]
+    pub remove_access_log_skip_paths: Vec<String>,
     /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
@@ -144,6 +151,8 @@ impl UpdateArgs {
             || self.no_streaming
             || self.max_body_size.is_some()
             || self.unset_max_body_size
+            || !self.access_log_skip_paths.is_empty()
+            || !self.remove_access_log_skip_paths.is_empty()
             || !self.env.is_empty()
             || !self.unset_env.is_empty()
             || !self.secret_env.is_empty()
@@ -231,6 +240,7 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
         spec.ingress = AppIngress {
             strip_prefix: spec.ingress.strip_prefix,
             max_body_size: spec.ingress.max_body_size,
+            access_log_skip_paths: std::mem::take(&mut spec.ingress.access_log_skip_paths),
             ..AppIngress::default()
         };
     }
@@ -239,6 +249,17 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     }
     if a.unset_max_body_size {
         spec.ingress.max_body_size = None;
+    }
+    for p in &a.access_log_skip_paths {
+        if !spec.ingress.access_log_skip_paths.contains(p) {
+            spec.ingress.access_log_skip_paths.push(p.clone());
+        }
+    }
+    for p in &a.remove_access_log_skip_paths {
+        if !spec.ingress.access_log_skip_paths.contains(p) {
+            return Err(missing("access log skip path", p));
+        }
+        spec.ingress.access_log_skip_paths.retain(|x| x != p);
     }
     if a.strip_prefix {
         spec.ingress.strip_prefix = true;
@@ -1116,6 +1137,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             streaming: true,
             stream_timeout_secs: 600,
             max_body_size: None,
+            access_log_skip_paths: Vec::new(),
         };
         let s = apply_flags(custom.clone(), &args(&["--streaming"])).unwrap();
         assert_eq!(s.ingress, custom.ingress);

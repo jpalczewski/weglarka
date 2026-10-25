@@ -146,6 +146,10 @@ pub struct AddArgs {
     /// Also streams the request to the app instead of buffering it. Ingress-only.
     #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse, conflicts_with = "spec")]
     pub max_body_size: Option<BodySizeLimit>,
+    /// Path left out of the access log while it succeeds (repeatable); a trailing `/` makes it a
+    /// prefix, e.g. `/api/poll/`. Errors (status >= 400) are still logged. Ingress-only.
+    #[arg(long = "access-log-skip-path", value_name = "PATH", conflicts_with = "spec")]
+    pub access_log_skip_paths: Vec<String>,
     /// Environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
     pub env: Vec<(String, String)>,
