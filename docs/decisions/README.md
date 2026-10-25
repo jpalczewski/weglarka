@@ -47,3 +47,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0038](0038-acme-engine-seams.md) | ACME engine: crate layout and seams |
 | [0039](0039-acme-dns01.md) | ACME DNS-01 through a DNS-provider adapter (wildcard certificates) |
 | [0040](0040-one-off-containers.md) | One-off containers (`weglarka run`) |
+| [0041](0041-temporary-port-forward.md) | Temporary port forward (`weglarka forward`) |
