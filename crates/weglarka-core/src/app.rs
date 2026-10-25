@@ -6,6 +6,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::environments::{SiteName, SiteOrigin, SiteSpec};
+
 /// Instance name (key in `apps.toml`). Instance ≠ image: one image can have many instances.
 /// Allowed `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen (safe as a container, network and
 /// DNS host name, and as a component of a secret name).
@@ -1030,26 +1032,112 @@ fn is_true(value: &bool) -> bool {
 }
 
 /// Contents of `apps.toml`.
+///
+/// Read and written through [`RawAppsFile`]: `[sites]` expands into ordinary instances in `apps` on
+/// load (remembering each one's [`SiteOrigin`]) and the expansion is stripped again on save, so
+/// the instances of a site never appear under `[apps]` in the file (issue #205).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawAppsFile", into = "RawAppsFile")]
 pub struct AppsFile {
     /// On-disk schema version (issue #98, `docs/decisions/0023-state-schema-version.md`). `None` is
     /// the implicit v1 — the shape written before versioning, still the current one, so v1 files
     /// stay byte-for-byte unchanged. Written only once the schema moves past v1; serialized first
     /// because TOML wants values before tables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     /// Volumes shared between instances (issue #33, `docs/decisions/0017-shared-volumes.md`),
     /// declared once here and mounted by apps through [`AppSpec::shared_volumes`]. Serialized
     /// before `apps` so the TOML file keeps its top-level tables first.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeSpec>,
     /// Networks shared by groups of instances (issue #128), declared once here and joined through
     /// [`AppSpec::shared_networks`].
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
-    #[serde(default)]
+    /// Sites with environments (issue #205). Their environments are also present in `apps`, listed
+    /// in `origins`.
+    pub sites: BTreeMap<SiteName, SiteSpec>,
+    /// Every instance, **including** the ones expanded from `sites`.
     pub apps: BTreeMap<InstanceName, AppSpec>,
+    /// Instances of `apps` that come from `sites`. Not serialized; rebuilt by the load.
+    pub origins: BTreeMap<InstanceName, SiteOrigin>,
+}
+
+impl AppsFile {
+    /// The site and environment an instance was expanded from, `None` for a plain `[apps]` entry.
+    pub fn origin(&self, name: &InstanceName) -> Option<&SiteOrigin> {
+        self.origins.get(name)
+    }
+
+    /// A promote-only environment: its release changes only through `weglarka promote`.
+    pub fn is_promote_only(&self, name: &InstanceName) -> bool {
+        self.origin(name).is_some_and(|o| o.promote_from.is_some())
+    }
+
+    /// Replaces the sites and re-derives their instances, keeping every plain `[apps]` entry.
+    pub fn set_sites(&mut self, sites: BTreeMap<SiteName, SiteSpec>) -> Result<(), String> {
+        self.sites = sites;
+        let plain = self.plain_apps();
+        let expanded = crate::environments::expand(&self.sites, &plain)?;
+        self.origins.clear();
+        self.apps = plain;
+        for (name, (spec, origin)) in expanded {
+            self.origins.insert(name.clone(), origin);
+            self.apps.insert(name, spec);
+        }
+        Ok(())
+    }
+
+    /// The `[apps]` entries that were written by hand (everything except site expansions).
+    pub fn plain_apps(&self) -> BTreeMap<InstanceName, AppSpec> {
+        self.apps
+            .iter()
+            .filter(|(n, _)| !self.origins.contains_key(*n))
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect()
+    }
+}
+
+/// The shape of `apps.toml` on disk (see [`AppsFile`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawAppsFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sites: BTreeMap<SiteName, SiteSpec>,
+    #[serde(default)]
+    apps: BTreeMap<InstanceName, AppSpec>,
+}
+
+impl TryFrom<RawAppsFile> for AppsFile {
+    type Error = String;
+
+    fn try_from(raw: RawAppsFile) -> Result<Self, String> {
+        let mut file = AppsFile {
+            schema_version: raw.schema_version,
+            shared_volumes: raw.shared_volumes,
+            shared_networks: raw.shared_networks,
+            apps: raw.apps,
+            ..AppsFile::default()
+        };
+        file.set_sites(raw.sites)?;
+        Ok(file)
+    }
+}
+
+impl From<AppsFile> for RawAppsFile {
+    fn from(file: AppsFile) -> Self {
+        let apps = file.plain_apps();
+        RawAppsFile {
+            schema_version: file.schema_version,
+            shared_volumes: file.shared_volumes,
+            shared_networks: file.shared_networks,
+            sites: file.sites,
+            apps,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1500,5 +1588,57 @@ reload_signal = "SIGHUP"
         ] {
             assert_eq!(normalize_signal(bad), None, "{bad:?}");
         }
+    }
+
+    const BLOG_SITE: &str = r#"[sites.blog]
+kind = "static"
+image = "ghcr.io/me/blog"
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+
+[apps.other]
+image = "x:1"
+"#;
+
+    #[test]
+    fn sites_expand_on_load_and_are_not_written_back() {
+        let parsed: AppsFile = toml::from_str(BLOG_SITE).unwrap();
+        let names: Vec<_> = parsed.apps.keys().map(|n| n.as_str()).collect();
+        assert_eq!(names, ["blog-dev", "blog-prod", "other"]);
+        assert!(parsed.is_promote_only(&InstanceName::new("blog-prod").unwrap()));
+        assert!(!parsed.is_promote_only(&InstanceName::new("blog-dev").unwrap()));
+        assert!(
+            parsed
+                .origin(&InstanceName::new("other").unwrap())
+                .is_none()
+        );
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(!text.contains("apps.blog-"), "{text}");
+        assert!(text.contains("[sites.blog.env.prod]"), "{text}");
+        let again: AppsFile = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn a_file_without_sites_round_trips_byte_identically() {
+        let src = "schema_version = 13\n\n[apps.a]\nimage = \"x:1\"\nauto_update = true\n";
+        let parsed: AppsFile = toml::from_str(src).unwrap();
+        let once = toml::to_string(&parsed).unwrap();
+        let twice = toml::to_string(&toml::from_str::<AppsFile>(&once).unwrap()).unwrap();
+        assert_eq!(once, twice);
+        assert!(!once.contains("sites"), "{once}");
+    }
+
+    #[test]
+    fn a_site_colliding_with_an_app_is_rejected_at_load() {
+        let src = format!("{BLOG_SITE}\n[apps.blog-dev]\nimage = \"x:1\"\n");
+        let err = toml::from_str::<AppsFile>(&src).unwrap_err().to_string();
+        assert!(err.contains("already declared in [apps]"), "{err}");
     }
 }

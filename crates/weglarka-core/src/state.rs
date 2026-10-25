@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -124,6 +124,13 @@ fn static_sites_v12(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v12 → v13: sites with environments (issue #205, ADR 0050). `[sites]` is optional and defaults to
+/// empty, so a v12 document needs no data transformation — the marker records that the file may carry
+/// it. A no-op that must accept a hand-edited file which already has it.
+fn site_environments_v13(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -139,6 +146,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     access_log_skip_paths_v10,
     ingress_streaming_paths_v11,
     static_sites_v12,
+    site_environments_v13,
 ];
 
 const _: () = assert!(

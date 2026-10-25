@@ -26,6 +26,7 @@ pub mod config_mounts;
 pub mod delivery;
 pub mod depends;
 pub mod deploy;
+pub mod environments;
 pub mod forward;
 pub mod host_mounts;
 pub mod images;
