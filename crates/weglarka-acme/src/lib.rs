@@ -34,7 +34,7 @@ pub mod renewal;
 pub use cert::{CertId, CertIdError, CertSpec, Issued, PrivateKeyPem};
 pub use client::{AcmeClient, CertInspector};
 pub use error::AcmeError;
-pub use instant::{InstantAcme, InstantAcmeSettings};
+pub use instant::{InstantAcme, InstantAcmeSettings, chain_not_after};
 pub use manager::{Manager, Outcome, PassReport};
 pub use solver::{Challenge, ChallengeKind, ChallengeSolver, Http01Solver};
 pub use store::CertStore;

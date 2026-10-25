@@ -230,7 +230,7 @@ async fn drive<S: ChallengeSolver>(
 }
 
 /// `notAfter` of the first (leaf) certificate of a PEM chain.
-fn chain_not_after(chain_pem: &[u8]) -> Result<SystemTime, AcmeError> {
+pub fn chain_not_after(chain_pem: &[u8]) -> Result<SystemTime, AcmeError> {
     let expiry = |e: &dyn std::fmt::Display| AcmeError::Expiry(e.to_string());
     let (_, pem) = x509_parser::pem::parse_x509_pem(chain_pem).map_err(|e| expiry(&e))?;
     let cert = pem.parse_x509().map_err(|e| expiry(&e))?;

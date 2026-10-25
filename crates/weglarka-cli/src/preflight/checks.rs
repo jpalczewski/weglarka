@@ -656,7 +656,7 @@ impl Check for IngressConfigCheck {
 
 /// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS directory,
 /// otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A warning, not a
-/// failure: ACME issuance (issue #96) will fill this directory automatically.
+/// failure: `[acme]` (issue #96) fills this directory automatically.
 pub struct IngressTls;
 impl Check for IngressTls {
     fn id(&self) -> &'static str {
@@ -742,7 +742,7 @@ impl Check for IngressTls {
                     missing.join(", "),
                     tls.display()
                 ),
-                "put <domain>.crt (PEM chain) and <domain>.key (0600) there; ACME issuance will automate it (issue #96)",
+                "put <domain>.crt (PEM chain) and <domain>.key (0600) there, or enable [acme] in weglarka.toml (docs/install.md 6q)",
             );
         }
         if !unreadable.is_empty() {

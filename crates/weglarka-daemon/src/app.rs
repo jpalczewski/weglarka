@@ -32,6 +32,8 @@ pub struct Daemon<P: PodmanClient> {
     pub webhook_sources: Vec<Box<dyn WebhookSource>>,
     /// `None` when `weglarka.toml` configures no notification channel.
     pub notify: Option<Arc<NotifyHandle>>,
+    /// What the ACME worker found on its last pass; `None` when `[acme]` is absent or paused.
+    pub acme: Option<Arc<crate::acme::AcmeStatus>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
     pub desired_lock: tokio::sync::Mutex<()>,
     /// When the process started: reported by `GET /v1/health`, the readiness probe the host-side

@@ -1765,6 +1765,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "weglarka-acme",
  "weglarka-api",
  "weglarka-core",
  "weglarka-ingress",

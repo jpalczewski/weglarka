@@ -4,6 +4,7 @@
 //! The daemon is generic over `PodmanClient` (the trait is not dyn-compatible), so tests
 //! run it on `FakePodman` and the binary on `LibpodClient`.
 
+pub mod acme;
 pub mod admin;
 pub mod app;
 pub mod doctor;
@@ -121,6 +122,8 @@ pub struct Running<P: PodmanClient + 'static> {
     reconcile: JoinHandle<()>,
     /// Notification worker; `None` when notifications are not configured.
     notify: Option<JoinHandle<()>>,
+    /// ACME worker; `None` when `[acme]` is absent or paused.
+    acme: Option<JoinHandle<()>>,
 }
 
 fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
@@ -206,13 +209,11 @@ pub async fn start<P: PodmanClient + 'static>(
     let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
     // Self-update (issue #99): confirm which image this process really runs and resolve a switch the
     // host-side switcher requested, before anything reconciles against the old world.
-    {
-        let events: Arc<dyn weglarka_core::events::EventSink> = match &notifier {
-            Some(notifier) => notifier.sink(),
-            None => Arc::new(weglarka_core::events::TracingSink),
-        };
-        self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
-    }
+    let events: Arc<dyn weglarka_core::events::EventSink> = match &notifier {
+        Some(notifier) => notifier.sink(),
+        None => Arc::new(weglarka_core::events::TracingSink),
+    };
+    self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
     let options = ReconcilerOptions {
@@ -239,6 +240,15 @@ pub async fn start<P: PodmanClient + 'static>(
         host.clone(),
         paths.nginx_conf_dir.clone(),
     ));
+    // ACME (issue #96): the worker shares the engine's event sink and asks the ingress to apply
+    // whenever it wrote a certificate.
+    let acme_worker = acme::build(
+        host.acme.as_ref(),
+        &paths,
+        &host.webhook.domain,
+        events,
+        ingress.clone(),
+    );
     let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];
     if let Some(forgejo) = &host.webhook.forgejo {
         webhook_sources.push(Box::new(
@@ -254,6 +264,7 @@ pub async fn start<P: PodmanClient + 'static>(
         ingress: ingress.clone(),
         webhook_sources,
         notify: notify.clone(),
+        acme: acme_worker.as_ref().map(acme::AcmeWorker::status),
         desired_lock: tokio::sync::Mutex::new(()),
         started: std::time::Instant::now(),
         triggers: trigger_tx,
@@ -309,6 +320,10 @@ pub async fn start<P: PodmanClient + 'static>(
         let engine = engine.clone();
         async move { engine.run(trigger_rx, period).await }
     });
+    let acme_task = acme_worker.map(|worker| {
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move { worker.run(rx).await })
+    });
     let notify_task = notifier.map(|notifier| {
         let rx = shutdown_rx.clone();
         tokio::spawn(async move { notifier.run(rx).await })
@@ -329,6 +344,7 @@ pub async fn start<P: PodmanClient + 'static>(
         ingress: ingress_task,
         reconcile,
         notify: notify_task,
+        acme: acme_task,
     })
 }
 
@@ -344,6 +360,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             ingress,
             reconcile,
             notify,
+            acme,
             admin_socket,
             ..
         } = self;
@@ -362,6 +379,13 @@ impl<P: PodmanClient + 'static> Running<P> {
                 .is_err()
         {
             tracing::warn!("notification worker did not stop in time");
+        }
+        if let Some(handle) = acme
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("ACME worker did not stop in time");
         }
 
         let mut tasks =

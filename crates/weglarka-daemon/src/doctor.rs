@@ -67,6 +67,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
+    acme(d, &mut checks);
     webhook(d, &mut checks).await;
     DoctorReport { checks }
 }
@@ -962,21 +963,164 @@ fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     ));
 }
 
-/// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS
-/// directory, otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A
-/// warning, not a failure: until ACME issuance exists (issue #96) the operator places the files, and
-/// a host without any app domain legitimately has an empty directory.
-fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
-    let tls = d.ingress.tls_dir();
-    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
-        return; // `state.apps` already reports this
-    };
+/// The domains the ingress routes: the webhook domain plus every app domain, sorted and unique.
+/// `None` when `apps.toml` cannot be read (`state.apps` reports that).
+fn routed_domains<P: PodmanClient>(d: &Daemon<P>) -> Option<Vec<String>> {
+    let apps = state::load_apps(&d.paths.state.apps).ok()?;
     let mut domains: Vec<String> = vec![d.host.webhook.domain.clone()];
     for spec in apps.apps.values() {
         domains.extend(spec.domains.iter().cloned());
     }
     domains.sort();
     domains.dedup();
+    Some(domains)
+}
+
+/// `[acme]` (issue #96): the configuration, the account key and the state of every certificate.
+/// `acme.certs` is a failure only for a certificate that has already expired; a missing one or one
+/// inside the renewal window is a warning (the worker is expected to deal with it on its next pass),
+/// and so is a failure the last pass recorded.
+fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Some(config) = &d.host.acme else {
+        return;
+    };
+    if !config.enabled {
+        out.push(check(
+            "acme.config",
+            CheckStatus::Info,
+            "paused ([acme] enabled = false)",
+            None,
+        ));
+        return;
+    }
+    let staging = config.directory_url == weglarka_core::config::AcmeConfig::LETS_ENCRYPT_STAGING;
+    out.push(check(
+        "acme.config",
+        if staging {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Ok
+        },
+        format!(
+            "{}{}, renew {} days before expiry, pass every {} s",
+            if staging { "staging " } else { "" },
+            config.directory_url,
+            config.renew_before_days,
+            config.check_interval_secs
+        ),
+        staging.then_some(
+            "staging certificates are not trusted by browsers: remove directory_url (or set the \
+             production one) once the setup works",
+        ),
+    ));
+
+    let key = &d.paths.acme_account_key;
+    match std::fs::metadata(key) {
+        Ok(m) if m.permissions().mode() & 0o077 == 0 => {
+            out.push(ok("acme.account", key.display().to_string()));
+        }
+        Ok(m) => out.push(check(
+            "acme.account",
+            CheckStatus::Fail,
+            format!(
+                "{} has permissions {:o}, expected 600",
+                key.display(),
+                m.permissions().mode() & 0o777
+            ),
+            Some("chmod 600; the daemon refuses a group/other-accessible account key"),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push(check(
+            "acme.account",
+            CheckStatus::Info,
+            "no account yet; it is created at the first issuance",
+            None,
+        )),
+        Err(e) => out.push(check(
+            "acme.account",
+            CheckStatus::Warn,
+            format!("{}: {e}", key.display()),
+            None,
+        )),
+    }
+
+    let Some(domains) = routed_domains(d) else {
+        return; // `state.apps` already reports this
+    };
+    let tls = d.ingress.tls_dir();
+    let now = std::time::SystemTime::now();
+    let window = std::time::Duration::from_secs(config.renew_before_days * 24 * 3600);
+    let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
+    let mut soonest: Option<u64> = None;
+    for domain in &domains {
+        let Ok(chain) = std::fs::read(tls.join(format!("{domain}.crt"))) else {
+            missing.push(domain.as_str());
+            continue;
+        };
+        match weglarka_acme::chain_not_after(&chain) {
+            Err(_) => missing.push(domain.as_str()),
+            Ok(not_after) => match not_after.duration_since(now) {
+                Err(_) => expired.push(domain.as_str()),
+                Ok(left) => {
+                    let days = left.as_secs() / (24 * 3600);
+                    soonest = Some(soonest.map_or(days, |s| s.min(days)));
+                    if left <= window {
+                        due.push(domain.as_str());
+                    }
+                }
+            },
+        }
+    }
+    let status = d.acme.as_ref().map(|s| s.snapshot()).unwrap_or_default();
+    let mut problems = Vec::new();
+    if !expired.is_empty() {
+        problems.push(format!("expired: {}", expired.join(", ")));
+    }
+    if !missing.is_empty() {
+        problems.push(format!("none yet: {}", missing.join(", ")));
+    }
+    if !due.is_empty() {
+        problems.push(format!("renewal due: {}", due.join(", ")));
+    }
+    for (cert, reason) in &status.failures {
+        problems.push(format!("last pass failed for {cert}: {reason}"));
+    }
+    if problems.is_empty() {
+        out.push(ok(
+            "acme.certs",
+            match soonest {
+                Some(days) => format!(
+                    "{} certificate(s), the nearest expires in {days} days",
+                    domains.len()
+                ),
+                None => "no routed domains".to_owned(),
+            },
+        ));
+    } else {
+        out.push(check(
+            "acme.certs",
+            if expired.is_empty() {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            },
+            problems.join("; "),
+            Some(
+                "HTTP-01 needs the plain-HTTP port reachable from the internet as port 80 and the \
+                 domain's DNS pointing at this host; the worker retries every 30 minutes after a failure",
+            ),
+        ));
+    }
+}
+
+/// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS
+/// directory, otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A
+/// warning, not a failure: without `[acme]` the operator places the files, and a host without any
+/// app domain legitimately has an empty directory.
+fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let tls = d.ingress.tls_dir();
+    let Some(domains) = routed_domains(d) else {
+        return; // `state.apps` already reports this
+    };
     let missing: Vec<&str> = domains
         .iter()
         .filter(|domain| {
@@ -999,10 +1143,12 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                 missing.join(", "),
                 tls.display()
             ),
-            Some(
-                "put <domain>.crt (PEM chain) and <domain>.key (0600) there; ACME issuance will \
-                 automate it (issue #96)",
-            ),
+            Some(if d.acme.is_some() {
+                "the ACME worker orders it on its next pass (see acme.certs)"
+            } else {
+                "put <domain>.crt (PEM chain) and <domain>.key (0600) there, or enable [acme] in \
+                 weglarka.toml to have them issued"
+            }),
         ));
     }
 }

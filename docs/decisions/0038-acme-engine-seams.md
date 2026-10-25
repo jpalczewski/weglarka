@@ -1,6 +1,6 @@
 # 0038 — ACME engine: crate layout and seams
 
-Status: proposed (2026-10-25, issue #96)
+Status: accepted (2026-10-25, issue #96)
 
 ## Problem
 
@@ -45,10 +45,22 @@ so it needs no `SCHEMA_VERSION` bump.
 
 ## Consequences
 
-Nothing here changes behaviour for operators yet: no config section, no daemon wiring. The follow-ups are
-`[acme]` (a new section breaks rollback to an older daemon because of
-`deny_unknown_fields`, to be documented in `docs/install.md`), events, `doctor acme.*` and the daemon worker.
-`testing::FakeAcme` plus `Manager` tests cover issue, renew, skip, failure and cleanup without a CA.
+`[acme]` (`accept_terms`, `email`, `directory_url`, `enabled`, `renew_before_days`, `check_interval_secs`) is a
+new `weglarka.toml` section: it requires `edge` ingress (unless `enabled = false`), and it breaks rollback to
+an older daemon because of `deny_unknown_fields` (`docs/install.md` 6q). It does not touch `apps.toml`,
+`state.toml`, `spec_hash` or `SCHEMA_VERSION`.
+
+The daemon runs one worker (`weglarka-daemon/src/acme.rs`): the first pass 30 s after start (nginx must be
+listening), then every `check_interval_secs`, or after 30 minutes when the last pass had failures (the CA
+allows 5 failed validations per hostname per hour). One single-name certificate per routed domain; a name that
+cannot be a public DNS name is skipped with a warning. After a pass that wrote files it calls
+`IngressManager::request_apply`, so nginx reloads through the existing fingerprint path. It emits
+`CertificateIssued` and `CertificateRenewalFailed`; the latter is critical when fewer than 7 days are left or
+there is no certificate at all. `doctor` gets `acme.config`, `acme.account` and `acme.certs`.
+
+`testing::FakeAcme` plus `Manager` and worker tests cover issue, renew, skip, failure and cleanup without a
+CA. An opt-in staging test (`WEGLARKA_ACME_STAGING_DOMAIN` / `_WEBROOT`) needs a public port 80 and is not part
+of default CI.
 
 ## Rejected alternatives
 

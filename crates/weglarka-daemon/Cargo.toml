@@ -34,6 +34,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "fs"
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+weglarka-acme.workspace = true
 weglarka-api.workspace = true
 weglarka-core.workspace = true
 weglarka-ingress.workspace = true
@@ -48,5 +49,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 insta.workspace = true
 tempfile.workspace = true
+weglarka-acme = { workspace = true, features = ["testing"] }
 weglarka-core = { workspace = true, features = ["testing"] }
 weglarka-registry = { workspace = true, features = ["testing"] }
