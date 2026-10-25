@@ -97,6 +97,12 @@ impl CertSpec {
     }
 }
 
+/// The name a certificate name is validated and challenged under: a wildcard `*.example.eu` is
+/// proven at `example.eu` (RFC 8555 §7.1.3), so the `*.` prefix goes.
+pub(crate) fn base_name(name: &str) -> &str {
+    name.strip_prefix("*.").unwrap_or(name)
+}
+
 fn validate_name(name: &str) -> Result<(), AcmeError> {
     let bad = |reason| {
         Err(AcmeError::InvalidName {
@@ -104,7 +110,7 @@ fn validate_name(name: &str) -> Result<(), AcmeError> {
             reason,
         })
     };
-    let host = name.strip_prefix("*.").unwrap_or(name);
+    let host = base_name(name);
     if host.is_empty() || name.len() > MAX_NAME_LEN {
         return bad("empty or too long");
     }

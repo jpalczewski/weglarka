@@ -81,10 +81,13 @@ impl AcmeClient for FakeAcme {
             .names()
             .iter()
             .enumerate()
-            .map(|(i, name)| Challenge {
-                name: name.trim_start_matches("*.").to_owned(),
-                token: format!("fake-token-{i}"),
-                key_authorization: format!("fake-token-{i}.fake-thumbprint"),
+            .map(|(i, name)| {
+                // `name` keeps its wildcard form, as the CA reports it.
+                Challenge::new(
+                    name,
+                    format!("fake-token-{i}"),
+                    format!("fake-token-{i}.fake-thumbprint"),
+                )
             })
             .collect();
         let mut result = Ok(());

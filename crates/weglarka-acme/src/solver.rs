@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 use weglarka_core::state::write_atomic;
 
+use crate::cert::base_name;
 use crate::error::AcmeError;
 
 /// Which ACME challenge type a solver can satisfy.
@@ -28,17 +29,31 @@ impl ChallengeKind {
 
 /// One challenge to present, as handed out by the CA for one name.
 ///
-/// `name` is the identifier being validated (for a wildcard order, the base name without `*.`).
+/// The name is the identifier being validated: [`Challenge::new`] reduces a wildcard identifier
+/// (`*.example.eu`) to its base name, so solvers never see the `*.` prefix.
 /// `key_authorization` is not a secret — it is served publicly at the challenge URL — but it is
 /// kept out of `Debug` anyway so logs stay boring.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Challenge {
-    pub name: String,
-    pub token: String,
-    pub key_authorization: String,
+    name: String,
+    token: String,
+    key_authorization: String,
 }
 
 impl Challenge {
+    /// `identifier` is the name as the CA reports it, wildcard form included.
+    pub fn new(identifier: &str, token: String, key_authorization: String) -> Self {
+        Self {
+            name: base_name(identifier).to_owned(),
+            token,
+            key_authorization,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Value of the DNS-01 TXT record at `_acme-challenge.<name>` (RFC 8555 §8.4).
     pub fn dns01_txt_value(&self) -> String {
         URL_SAFE_NO_PAD.encode(Sha256::digest(self.key_authorization.as_bytes()))
@@ -91,7 +106,7 @@ impl Http01Solver {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         if !ok {
             return Err(AcmeError::InvalidToken {
-                name: challenge.name.clone(),
+                name: challenge.name().to_owned(),
             });
         }
         Ok(self.webroot.join(t))
@@ -126,11 +141,11 @@ mod tests {
     use super::*;
 
     fn challenge(token: &str) -> Challenge {
-        Challenge {
-            name: "app.example.eu".into(),
-            token: token.into(),
-            key_authorization: format!("{token}.thumbprint"),
-        }
+        Challenge::new(
+            "app.example.eu",
+            token.into(),
+            format!("{token}.thumbprint"),
+        )
     }
 
     #[tokio::test]
