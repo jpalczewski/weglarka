@@ -79,10 +79,18 @@ pub struct UpdateArgs {
     pub unset_max_body_size: bool,
     /// Leave a path out of the access log while it succeeds (repeatable); a trailing `/` makes it a
     /// prefix. Errors are still logged. Ingress-only: nginx reload.
-    #[arg(long = "access-log-skip-path", value_name = "PATH", conflicts_with = "spec")]
+    #[arg(
+        long = "access-log-skip-path",
+        value_name = "PATH",
+        conflicts_with = "spec"
+    )]
     pub access_log_skip_paths: Vec<String>,
     /// Log this path again (repeatable).
-    #[arg(long = "remove-access-log-skip-path", value_name = "PATH", conflicts_with = "spec")]
+    #[arg(
+        long = "remove-access-log-skip-path",
+        value_name = "PATH",
+        conflicts_with = "spec"
+    )]
     pub remove_access_log_skip_paths: Vec<String>,
     /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
     #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]

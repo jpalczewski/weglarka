@@ -74,7 +74,43 @@ pub(super) fn write_upgrade_map(c: &mut Conf) {
     });
 }
 
-pub(super) fn write_log(c: &mut Conf, cdn: bool) {
+/// `access_log_skip_paths` (issue #181): two maps decide per request whether it is logged. The first
+/// matches `"$app $uri"` against the routed apps' entries (regexes only — no map hash to size, and
+/// an exact entry is just anchored), the second lets only `status < 400` through, so a failing poll
+/// is still logged. `$app` is the server-level or location-level variable the log format already
+/// uses. Returns whether `$weglarka_loggable` exists; nothing is emitted when no app lists a path.
+fn write_log_skip_maps(c: &mut Conf, plan: &Plan<'_>) -> bool {
+    let mut rules = Vec::new();
+    for app in plan.apps.iter().filter(|app| app.active) {
+        for path in &app.ingress.access_log_skip_paths {
+            // `.` is the only regex metacharacter the path alphabet allows (see `check_skip_path`).
+            let escaped = path.replace('.', "\\.");
+            let tail = if path.ends_with('/') { "" } else { "$" };
+            let instance = app.instance.as_str().replace('.', "\\.");
+            rules.push(format!("\"~^{instance} {escaped}{tail}\" 1;"));
+        }
+    }
+    if rules.is_empty() {
+        return false;
+    }
+    c.line("# Paths an app asked to keep out of the access log (while they succeed).");
+    c.block("map \"$app $uri\" $weglarka_skip_path", |c| {
+        c.line("default 0;");
+        for rule in &rules {
+            c.line(rule);
+        }
+    });
+    c.block(
+        "map \"$weglarka_skip_path:$status\" $weglarka_loggable",
+        |c| {
+            c.line("default 1;");
+            c.line("\"~^1:[123][0-9][0-9]$\" 0;");
+        },
+    );
+    true
+}
+
+pub(super) fn write_log(c: &mut Conf, cdn: bool, plan: &Plan<'_>) {
     c.line("# App name for the access log; set in each `server`.");
     c.line("log_format weglarka escape=json");
     // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
@@ -87,7 +123,11 @@ pub(super) fn write_log(c: &mut Conf, cdn: bool) {
         LOG_FORMAT.to_owned()
     };
     c.line(&format!("    '{format}';"));
-    c.line("access_log /dev/stdout weglarka;");
+    if write_log_skip_maps(c, plan) {
+        c.line("access_log /dev/stdout weglarka if=$weglarka_loggable;");
+    } else {
+        c.line("access_log /dev/stdout weglarka;");
+    }
 }
 
 pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded) {

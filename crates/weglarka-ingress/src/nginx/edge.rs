@@ -67,7 +67,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(c, o.cdn.is_some());
+        write_log(c, o.cdn.is_some(), plan);
         c.blank();
         // No `real_ip` and no trust maps: a direct client is never trusted for `X-Forwarded-*`
         // (ADR 0007). The headers are rebuilt from nginx's own `$remote_addr`/`$scheme`/`$host`.

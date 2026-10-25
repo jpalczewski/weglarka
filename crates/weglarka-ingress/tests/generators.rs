@@ -339,7 +339,10 @@ fn access_log_skip_paths_render_maps_and_a_conditional_log() {
     assert!(conf.contains(r#""~^v1 /v1/poll/" 1;"#), "{conf}");
     // Only successes and redirects are dropped; errors stay in the log.
     assert!(conf.contains(r#""~^1:[123][0-9][0-9]$" 0;"#), "{conf}");
-    assert!(!conf.contains("plain /"), "apps without entries add nothing: {conf}");
+    assert!(
+        !conf.contains("plain /"),
+        "apps without entries add nothing: {conf}"
+    );
 }
 
 #[test]
@@ -352,8 +355,7 @@ fn empty_access_log_skip_paths_leave_the_config_untouched() {
 
 #[test]
 fn stopped_apps_contribute_no_access_log_rules() {
-    let conf =
-        nginx::generate(&host(), &stopped(apps(ACCESS_LOG_SKIP_APPS)), &opts()).unwrap();
+    let conf = nginx::generate(&host(), &stopped(apps(ACCESS_LOG_SKIP_APPS)), &opts()).unwrap();
     assert!(!conf.contains("weglarka_loggable"), "{conf}");
 }
 

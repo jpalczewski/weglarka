@@ -35,7 +35,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(c, false);
+        write_log(c, false, plan);
         c.blank();
         write_proxy_headers(c, &BEHIND_FORWARDED);
         c.blank();

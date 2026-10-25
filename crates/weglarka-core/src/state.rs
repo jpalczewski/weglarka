@@ -962,10 +962,9 @@ mod tests {
         }
         let err = ok(r#"["/a", "/a"]"#).unwrap_err();
         assert!(err.contains("duplicate"), "{err}");
-        let no_domain: AppSpec = toml::from_str(
-            "image = \"i\"\ningress = { access_log_skip_paths = [\"/a\"] }",
-        )
-        .unwrap();
+        let no_domain: AppSpec =
+            toml::from_str("image = \"i\"\ningress = { access_log_skip_paths = [\"/a\"] }")
+                .unwrap();
         assert!(
             validate_app(&name("a"), &no_domain)
                 .unwrap_err()
