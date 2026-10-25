@@ -50,3 +50,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0041](0041-temporary-port-forward.md) | Temporary port forward (`weglarka forward`) |
 | [0042](0042-push-local-images.md) | Deploying a locally built image (`weglarka push`) |
 | [0043](0043-edge-client-address.md) | Edge mode: the client address is lost behind rootlessport |
+| [0044](0044-edge-cdn-client-address.md) | Edge mode behind a CDN: trusting the visitor header of a CDN peer |

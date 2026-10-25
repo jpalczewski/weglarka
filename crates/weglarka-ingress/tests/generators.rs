@@ -1166,3 +1166,66 @@ fn proxy_sockets_are_an_edge_only_option() {
     o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
     assert!(nginx::generate(&host(), &BTreeMap::new(), &o).is_err());
 }
+
+fn edge_cdn_opts(pinned: &[&str]) -> NginxOptions {
+    let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    let pinned: Vec<String> = pinned.iter().map(|r| (*r).to_owned()).collect();
+    o.cdn = Some(
+        weglarka_ingress::CdnTrust::from_config(
+            weglarka_core::config::CdnProvider::Cloudflare,
+            &pinned,
+        )
+        .unwrap(),
+    );
+    o
+}
+
+#[test]
+fn nginx_edge_cdn_snapshot() {
+    let o = edge_cdn_opts(&[]);
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
+    insta::assert_snapshot!("nginx_edge_cdn", conf);
+}
+
+#[test]
+fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
+    let o = edge_cdn_opts(&["203.0.113.0/24"]);
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
+    assert!(conf.contains("geo $remote_addr $weglarka_cdn {"));
+    assert!(conf.contains("203.0.113.0/24 1;"));
+    assert!(
+        !conf.contains("173.245.48.0/20"),
+        "a pin replaces the bundled list"
+    );
+    assert!(conf.contains("proxy_set_header X-Forwarded-For $weglarka_client;"));
+    assert!(conf.contains("proxy_set_header X-Real-IP $weglarka_client;"));
+    assert!(conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"));
+    assert!(!conf.contains("$http_x_forwarded_for"));
+    assert!(conf.contains("\"peer\":\"$remote_addr\""));
+    // A fallback to `$remote_addr` for a CDN peer without a usable header.
+    assert!(conf.contains("default $remote_addr;"));
+}
+
+#[test]
+fn edge_without_a_cdn_is_unchanged() {
+    let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
+    assert!(!conf.contains("weglarka_cdn") && !conf.contains("weglarka_client"));
+    assert!(!conf.contains("\"peer\""));
+}
+
+#[test]
+fn the_cdn_option_needs_the_forwarder_and_edge_mode() {
+    // Invariant: without the forwarder `$remote_addr` is nginx's own address.
+    let mut o = edge_cdn_opts(&[]);
+    o.proxy_socket_dir = None;
+    assert!(nginx::generate(&edge_host(), &BTreeMap::new(), &o).is_err());
+    // `behind` rejects it like `https_bind`.
+    let mut b = NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+        .with_trusted_proxies(&["10.89.0.2".to_owned()])
+        .unwrap();
+    b.cdn = edge_cdn_opts(&[]).cdn;
+    assert!(nginx::generate(&host(), &BTreeMap::new(), &b).is_err());
+}

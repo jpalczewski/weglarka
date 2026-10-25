@@ -32,6 +32,7 @@ against a forged header), prefixed with a PROXY protocol v2 header; nginx listen
 `proxy_protocol` and trusts only them. nginx itself publishes nothing. No systemd is involved, so it works under
 OpenRC too. Decision and measurements: [ADR 0043](../decisions/0043-edge-client-address.md).
 
+- Hostnames behind Cloudflare's proxy: see [edge behind a CDN](edge-cdn.md).
 - A daemon self-update recreates the forwarder (a short gap on 80/443); `doctor` reports `ingress.client_ip`.
 - Downgrading to an older daemon leaves the container behind: `podman rm -f weglarka-forwarder`.
 - Check the address from **another host**: `scripts/acceptance.sh --expect-client-ip <ip>`.

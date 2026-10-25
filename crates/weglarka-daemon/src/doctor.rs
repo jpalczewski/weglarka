@@ -1309,6 +1309,38 @@ async fn ingress_client_ip<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
     }
 }
 
+/// `edge` behind a CDN (issue #159, ADR 0044): which range list nginx trusts for the visitor header.
+fn ingress_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Some(cdn) = &d.host.ingress.cdn else {
+        return;
+    };
+    match crate::ingress::cdn_trust(&d.host) {
+        Ok(Some(trust)) => {
+            let source = match &trust.source {
+                weglarka_ingress::RangeSource::Bundled { etag } => format!("bundled etag {etag}"),
+                weglarka_ingress::RangeSource::Pinned => {
+                    format!("pinned, {} ranges", trust.ranges.len())
+                }
+            };
+            out.push(ok(
+                "ingress.cdn",
+                format!(
+                    "{:?}: the visitor is read from {} for peers in {source}",
+                    cdn.provider,
+                    cdn.provider.client_ip_header()
+                ),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => out.push(check(
+            "ingress.cdn",
+            CheckStatus::Fail,
+            e.to_string(),
+            Some("fix [ingress.cdn] ranges in weglarka.toml"),
+        )),
+    }
+}
+
 /// Apexes with a wildcard pair (`_wildcard.<apex>.crt` + `.key`, regular files) in `tls`.
 fn wildcard_apexes_on_disk(tls: &std::path::Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(tls) else {
@@ -1443,6 +1475,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     if d.host.ingress.mode == IngressMode::Edge {
         ingress_tls(d, out);
         ingress_client_ip(d, out).await;
+        ingress_cdn(d, out);
     }
     // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {

@@ -138,6 +138,19 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// `addr` or `addr/prefix` with the prefix in range for the address family.
+fn is_cidr(value: &str) -> bool {
+    let (addr, prefix) = match value.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (value, None),
+    };
+    let Ok(addr) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    prefix.is_none_or(|p| p.parse::<u8>().is_ok_and(|p| p <= max))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngressMode {
@@ -178,6 +191,38 @@ pub struct IngressConfig {
     /// `behind` only: in `edge` nginx terminates TLS and no direct client is trusted (`docs/decisions/0007`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_proxies: Vec<String>,
+    /// `edge` only: the public hostnames sit behind a CDN/proxy whose edge addresses connect to us
+    /// and announce the visitor in a header (issue #159, `docs/decisions/0044-edge-cdn-client-address.md`).
+    /// Absent = every peer is a direct client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn: Option<CdnConfig>,
+}
+
+/// `[ingress.cdn]` (issue #159): which CDN fronts the `edge` listeners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdnConfig {
+    pub provider: CdnProvider,
+    /// Optional pin: CIDRs (or bare addresses) of the CDN's edge, replacing the provider's bundled
+    /// list (and, later, its refresh). Like `trusted_proxies` in `behind`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnProvider {
+    /// Cloudflare's proxy: the visitor is in `CF-Connecting-IP`.
+    Cloudflare,
+}
+
+impl CdnProvider {
+    /// Request header in which the CDN announces the visitor's address.
+    pub fn client_ip_header(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "CF-Connecting-IP",
+        }
+    }
 }
 
 impl IngressConfig {
@@ -242,7 +287,23 @@ impl IngressConfig {
                             .to_owned(),
                     );
                 }
+                if let Some(cdn) = &self.cdn {
+                    for entry in &cdn.ranges {
+                        if !is_cidr(entry) {
+                            return Err(format!(
+                                "[ingress.cdn] ranges: {entry:?} is not an address or addr/prefix"
+                            ));
+                        }
+                    }
+                }
             }
+        }
+        if self.mode == IngressMode::Behind && self.cdn.is_some() {
+            return Err(
+                "[ingress.cdn] is an `edge`-mode option; in `behind` Traefik is the client-facing \
+                 hop (use trusted_proxies)"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -1107,6 +1168,37 @@ domain = "weglarka.example.com"
             let err = ingress(&src).unwrap_err();
             assert!(err.contains(needle), "{needle}: {err}");
         }
+    }
+
+    #[test]
+    fn cdn_is_an_edge_option_with_checked_ranges() {
+        let cdn =
+            |extra: &str| EDGE.replace("[admin]", &format!("[ingress.cdn]\n{extra}\n[admin]"));
+        // `[ingress.cdn]` must follow the `[ingress]` keys, so build it by inserting before `[admin]`.
+        let ok = cdn("provider = \"cloudflare\"\nranges = [\"203.0.113.0/24\", \"2001:db8::/32\"]");
+        let parsed = HostConfig::from_toml_str(&ok).unwrap();
+        parsed.ingress.validate().unwrap();
+        assert_eq!(
+            parsed
+                .ingress
+                .cdn
+                .as_ref()
+                .unwrap()
+                .provider
+                .client_ip_header(),
+            "CF-Connecting-IP"
+        );
+        let bad = cdn("provider = \"cloudflare\"\nranges = [\"203.0.113.0/33\"]");
+        let err = ingress(&bad).unwrap_err();
+        assert!(err.contains("ranges"), "{err}");
+        let unknown = cdn("provider = \"fastly\"");
+        assert!(HostConfig::from_toml_str(&unknown).is_err());
+        let behind = SAMPLE.replace(
+            "[admin]",
+            "[ingress.cdn]\nprovider = \"cloudflare\"\n\n[admin]",
+        );
+        let err = ingress(&behind).unwrap_err();
+        assert!(err.contains("ingress.cdn"), "{err}");
     }
 
     #[test]

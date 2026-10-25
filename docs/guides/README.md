@@ -47,6 +47,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Streaming](streaming.md) | SSE and long polling |
 | [Request body size](max-body-size.md) | `ingress.max_body_size` |
 | [Edge mode](edge-mode.md) | nginx on 80/443 terminating TLS |
+| [Edge behind a CDN](edge-cdn.md) | Visitor address behind Cloudflare (`[ingress.cdn]`) |
 | [ACME certificates](acme.md) | HTTP-01 issuance and renewal (`[acme]`) |
 | [Wildcard certificates](wildcard-certificates.md) | DNS-01 (`[acme.dns]`) |
 
