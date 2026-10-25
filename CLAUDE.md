@@ -5,7 +5,9 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 (tryb `behind`), auto-update po webhooku GitHub (GHCR). MVP: `ntfy.zig` sam się aktualizuje.
 
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
-funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` — indeks generowany z tytułów ADR-ów:
+funkcje zaplanowane, `bug` = błędy); widok roadmapy (tablica/oś czasu, pole `Area`) to
+[projekt GitHub „Węglarka roadmap”](https://github.com/users/jpalczewski/projects/12) — tylko widok, źródłem prawdy są issues.
+Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` — indeks generowany z tytułów ADR-ów:
 [`docs/decisions/README.md`](docs/decisions/README.md).
 Instalacja: `docs/install.md`; przewodniki tematyczne (migracje, ingress, ACME, rollback…): [`docs/guides/`](docs/guides/README.md) — pliki nazwane tematem, nagłówki bez numerów (żadnego „6k”). Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
