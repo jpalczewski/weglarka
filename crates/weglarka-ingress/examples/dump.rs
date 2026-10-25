@@ -1,7 +1,8 @@
-//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...]|traefik`
+//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...] [WILDCARD_APEX,...]|traefik`
 //! — prints a sample config (used in CI for `nginx -t`, the forwarded-header, streaming, body-size and
 //! edge tests). `nginx-edge` (issue #95) renders the `edge` sample: the domains passed as a comma
-//! list have a certificate under `/etc/nginx/tls`, the rest exercise the plain-HTTP-only branch.
+//! list have a certificate under `/etc/nginx/tls`, the rest exercise the plain-HTTP-only branch; an
+//! optional second list names apexes with a wildcard pair `_wildcard.<apex>.crt|key` (issue #97).
 //!
 //! `sse` is the only app with `ingress.streaming = true` (issue #64); `blog` deliberately keeps the
 //! buffered defaults, so `.github/scripts/test-streaming.sh` can use it as the negative control.
@@ -110,6 +111,14 @@ fn main() {
             let mut options =
                 nginx::NginxOptions::new(vec!["10.89.0.1".parse().expect("resolver")]);
             options.certificates = certificates;
+            // Optional third argument: apexes with a wildcard pair (`_wildcard.<apex>.crt|key`).
+            options.wildcard_certificates = std::env::args()
+                .nth(3)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(|d| Domain::new(d).expect("wildcard apex"))
+                .collect();
             options.tls_fingerprint = Some("1a2b3c4d".to_owned());
             nginx::generate(&host, &apps, &options)
         }

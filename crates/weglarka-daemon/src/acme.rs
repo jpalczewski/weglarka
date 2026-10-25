@@ -19,7 +19,9 @@ use weglarka_acme::{
     AcmeClient, AcmeError, CertId, CertInspector, CertSpec, DnsSolver, Http01Solver, InstantAcme,
     InstantAcmeSettings, Manager, Outcome, PassReport,
 };
-use weglarka_core::config::{AcmeConfig, AcmeDnsConfig, DnsProviderKind};
+use weglarka_core::config::{
+    AcmeConfig, AcmeDnsConfig, DnsProviderKind, WILDCARD_CERT_PREFIX, wildcard_covers,
+};
 use weglarka_core::events::{Event, EventSink};
 use weglarka_core::secret_store::SecretValue;
 use weglarka_core::state;
@@ -109,6 +111,8 @@ impl DnsProvider for DnsBackend {
 struct DnsIssuer<C, P> {
     manager: Manager<C, DnsSolver<P>>,
     specs: Vec<CertSpec>,
+    /// The apexes behind `specs`, to decide which domains a wildcard already covers.
+    apexes: Vec<String>,
 }
 
 pub struct AcmeWorker<C, P = DnsBackend> {
@@ -174,7 +178,11 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
             weglarka_acme::CertStore::new(self.tls.clone()),
             self.renew_before,
         );
-        self.dns = Some(DnsIssuer { manager, specs });
+        self.dns = Some(DnsIssuer {
+            manager,
+            specs,
+            apexes: wildcards.to_vec(),
+        });
         Ok(self)
     }
 
@@ -206,25 +214,11 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
 
     /// One pass over the routed domains. Returns `false` when any certificate failed.
     pub async fn pass(&self) -> bool {
-        let specs = match self.specs() {
-            Ok(specs) => specs,
-            Err(e) => {
-                tracing::error!(error = %e, "ACME pass skipped: cannot read apps.toml");
-                self.status
-                    .record(SystemTime::now(), vec![("apps.toml".into(), e)]);
-                return false;
-            }
-        };
         let now = SystemTime::now();
         let mut failures = Vec::new();
-        let report = self.manager.pass(now, &specs).await;
-        let mut changed = report.changed();
-        self.record(
-            &report,
-            now,
-            |id| self.manager.current_not_after(id),
-            &mut failures,
-        );
+        let mut changed = false;
+        // Wildcards first: a domain they cover needs no certificate of its own, and the domain
+        // certificates below are decided by what is on disk after this step.
         if let Some(dns) = &self.dns {
             let report = dns.manager.pass(now, &dns.specs).await;
             changed |= report.changed();
@@ -235,6 +229,26 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
                 &mut failures,
             );
         }
+        let specs = match self.specs(now) {
+            Ok(specs) => specs,
+            Err(e) => {
+                tracing::error!(error = %e, "ACME pass skipped: cannot read apps.toml");
+                failures.push(("apps.toml".into(), e));
+                self.status.record(SystemTime::now(), failures);
+                if changed {
+                    (self.on_change)();
+                }
+                return false;
+            }
+        };
+        let report = self.manager.pass(now, &specs).await;
+        changed |= report.changed();
+        self.record(
+            &report,
+            now,
+            |id| self.manager.current_not_after(id),
+            &mut failures,
+        );
         if changed {
             (self.on_change)();
         }
@@ -279,9 +293,13 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
         }
     }
 
-    /// One single-name certificate per routed domain; a name that cannot be a public DNS name
-    /// (nothing an ACME CA would sign) is skipped with a warning.
-    fn specs(&self) -> Result<Vec<CertSpec>, String> {
+    /// One single-name certificate per routed domain, except a domain that has no certificate of its
+    /// own and is covered by a valid wildcard on disk (it is served with the wildcard, issue #97). A
+    /// domain that already has its own certificate keeps being renewed — nginx prefers it, so letting
+    /// it expire would serve an expired certificate — and a failed or missing wildcard falls back to
+    /// per-domain issuance. A name that cannot be a public DNS name (nothing an ACME CA would sign)
+    /// is skipped with a warning.
+    fn specs(&self, now: SystemTime) -> Result<Vec<CertSpec>, String> {
         let apps = state::load_apps(&self.apps_path).map_err(|e| e.to_string())?;
         let mut domains = vec![self.webhook_domain.clone()];
         for spec in apps.apps.values() {
@@ -289,8 +307,33 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
         }
         domains.sort();
         domains.dedup();
+        // Apexes whose wildcard certificate is on disk and unexpired, judged by the same inspector
+        // that decides renewals.
+        let covering: Vec<&str> = self
+            .dns
+            .iter()
+            .flat_map(|dns| {
+                dns.apexes
+                    .iter()
+                    .zip(&dns.specs)
+                    .filter(|(_, spec)| {
+                        dns.manager
+                            .current_not_after(spec.id())
+                            .is_some_and(|not_after| not_after > now)
+                    })
+                    .map(|(apex, _)| apex.as_str())
+            })
+            .collect();
         Ok(domains
             .iter()
+            .filter(|domain| {
+                let own = self.tls.join(format!("{domain}.crt")).exists();
+                let covered = !own && covering.iter().any(|apex| wildcard_covers(apex, domain));
+                if covered {
+                    tracing::debug!(%domain, "served by a wildcard certificate, no certificate of its own");
+                }
+                !covered
+            })
             .filter_map(|domain| match CertSpec::single(domain) {
                 Ok(spec) => Some(spec),
                 Err(e) => {
@@ -302,11 +345,31 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
     }
 }
 
+/// Whether the wildcard certificate of one of `apexes` covers `domain` and is on disk and unexpired
+/// (`tls/_wildcard.<apex>.crt`). Used to decide that a domain needs no certificate of its own, and by
+/// `doctor`.
+pub fn valid_covering_wildcard(
+    tls: &Path,
+    apexes: &[String],
+    domain: &str,
+    now: SystemTime,
+) -> bool {
+    apexes
+        .iter()
+        .filter(|apex| wildcard_covers(apex, domain))
+        .any(|apex| {
+            std::fs::read(tls.join(format!("{WILDCARD_CERT_PREFIX}{apex}.crt")))
+                .ok()
+                .and_then(|chain| weglarka_acme::chain_not_after(&chain).ok())
+                .is_some_and(|not_after| not_after > now)
+        })
+}
+
 /// `*.<apex>` plus `<apex>` in one certificate, stored under the id `_wildcard.<apex>` (a literal
 /// `*` never reaches a file name, ADR 0038).
 fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
     CertSpec::new(
-        CertId::new(format!("_wildcard.{apex}"))?,
+        CertId::new(weglarka_core::config::wildcard_cert_stem(apex))?,
         vec![format!("*.{apex}"), apex.to_owned()],
     )
 }
@@ -568,21 +631,47 @@ mod tests {
         assert_eq!(rig.worker.status().snapshot().failures[0].0, "apps.toml");
     }
 
+    const APPS: &str = "[apps.blog]\nimage = \"ghcr.io/example/blog:latest\"\n\
+        domains = [\"blog.example.eu\", \"www.blog.example.eu\", \"site.example.org\"]\n";
+
+    fn certs_on_disk(rig: &Rig) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(rig.dir.path().join("tls"))
+            .map(|dir| {
+                dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".crt"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     #[tokio::test]
-    async fn wildcards_are_ordered_over_dns01_next_to_the_http01_certificates() {
-        let rig = rig_with_wildcards("", &["example.eu"]);
+    async fn a_wildcard_replaces_the_certificates_of_the_domains_it_covers() {
+        let rig = rig_with_wildcards(APPS, &["example.eu"]);
         assert!(rig.worker.pass().await);
-        let tls = rig.dir.path().join("tls");
-        // The routed domain keeps its own certificate, and the wildcard has its own files.
-        assert!(tls.join("hook.example.eu.crt").is_file());
-        assert!(tls.join("_wildcard.example.eu.crt").is_file());
-        assert!(tls.join("_wildcard.example.eu.key").is_file());
-        let orders = rig.fake.0.orders();
-        assert_eq!(orders.len(), 2, "{orders:?}");
+        // The webhook domain and `blog.example.eu` are covered (one label below the apex) and get no
+        // certificate of their own; `www.blog.example.eu` (two labels) and the other apex still do.
+        assert_eq!(
+            certs_on_disk(&rig),
+            [
+                "_wildcard.example.eu.crt",
+                "site.example.org.crt",
+                "www.blog.example.eu.crt"
+            ]
+        );
         assert!(
-            orders
-                .iter()
-                .any(|id| id.as_str() == "_wildcard.example.eu")
+            rig.dir
+                .path()
+                .join("tls/_wildcard.example.eu.key")
+                .is_file()
+        );
+        let orders = rig.fake.0.orders();
+        assert_eq!(orders.len(), 3, "{orders:?}");
+        assert_eq!(
+            orders[0].as_str(),
+            "_wildcard.example.eu",
+            "wildcards go first"
         );
         // The TXT records of both names (apex and wildcard) were published and removed again.
         let sets = rig
@@ -595,23 +684,50 @@ mod tests {
         assert!(rig.dns.records().is_empty());
         // One apply for the whole pass, one event per certificate.
         assert_eq!(rig.applies.load(Ordering::SeqCst), 1);
-        assert_eq!(rig.sink.events().len(), 2);
+        assert_eq!(rig.sink.events().len(), 3);
 
         // Nothing is due on the second pass.
         assert!(rig.worker.pass().await);
-        assert_eq!(rig.fake.0.orders().len(), 2);
+        assert_eq!(rig.fake.0.orders().len(), 3);
         assert_eq!(rig.applies.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn a_failed_wildcard_does_not_hold_back_the_domain_certificates() {
-        let rig = rig_with_wildcards("", &["example.eu"]);
-        // The HTTP-01 order for the webhook domain goes first and succeeds; the next one fails.
-        rig.fake.0.fail_next_after(1, "DNS propagation timed out");
-        assert!(!rig.worker.pass().await);
+    async fn a_domain_with_its_own_certificate_keeps_being_renewed_next_to_a_wildcard() {
+        let rig = rig_with_wildcards(APPS, &["example.eu"]);
+        // `blog.example.eu` already has a (soon expiring) certificate of its own: nginx prefers it
+        // over the wildcard, so it must not be left to expire.
         let tls = rig.dir.path().join("tls");
-        assert!(tls.join("hook.example.eu.crt").is_file());
-        assert!(!tls.join("_wildcard.example.eu.crt").exists());
+        std::fs::create_dir_all(&tls).unwrap();
+        let soon = FakeAcme::chain_expiring_at(SystemTime::now() + DAYS(5));
+        std::fs::write(tls.join("blog.example.eu.crt"), soon).unwrap();
+        std::fs::write(tls.join("blog.example.eu.key"), "old").unwrap();
+        assert!(rig.worker.pass().await);
+        let orders: Vec<String> = rig
+            .fake
+            .0
+            .orders()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert!(orders.contains(&"blog.example.eu".to_owned()), "{orders:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_wildcard_falls_back_to_a_certificate_per_domain() {
+        let rig = rig_with_wildcards(APPS, &["example.eu"]);
+        // The wildcard order goes first and fails: nothing covers the domains yet.
+        rig.fake.0.fail_next("DNS propagation timed out");
+        assert!(!rig.worker.pass().await);
+        assert_eq!(
+            certs_on_disk(&rig),
+            [
+                "blog.example.eu.crt",
+                "hook.example.eu.crt",
+                "site.example.org.crt",
+                "www.blog.example.eu.crt"
+            ]
+        );
         let status = rig.worker.status().snapshot();
         assert_eq!(status.failures.len(), 1);
         assert_eq!(status.failures[0].0, "_wildcard.example.eu");
@@ -622,7 +738,7 @@ mod tests {
         assert_eq!(
             rig.applies.load(Ordering::SeqCst),
             1,
-            "the issued certificate is applied"
+            "the issued certificates are applied"
         );
     }
 

@@ -128,6 +128,37 @@ jobs:
           docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge.conf"
           .github/scripts/test-edge.sh "$RUNNER_TEMP/edge.conf" "$RUNNER_TEMP/edge-certs"
+      # Wildcard certificates (issue #97): a pair named `_wildcard.<apex>` serves the apex and one label below it.
+      # nginx must accept the config and really present the wildcard for a covered domain (SNI), while a domain
+      # two labels below the apex and an unknown name stay refused (fail closed).
+      - name: Edge wildcard certificate
+        run: |
+          set -euo pipefail
+          certs="$RUNNER_TEMP/edge-wildcard"
+          mkdir -p "$certs"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
+            -keyout "$certs/_wildcard.example.eu.key" -out "$certs/_wildcard.example.eu.crt" \
+            -subj "/CN=example.eu" -addext "subjectAltName=DNS:example.eu,DNS:*.example.eu"
+          chmod 600 "$certs/_wildcard.example.eu.key"
+          cargo run -q -p weglarka-ingress --example dump -- nginx-edge "" example.eu > "$RUNNER_TEMP/edge-wildcard.conf"
+          docker run --rm -i -v "$certs:/etc/nginx/tls:ro" docker.io/library/nginx:1-alpine \
+            sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-wildcard.conf"
+          docker run -d --name wg-edge-wildcard -p 127.0.0.1:18447:8443 \
+            -v "$certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-wildcard.conf:/etc/nginx/nginx.conf:ro" \
+            docker.io/library/nginx:1-alpine
+          trap 'docker rm -f wg-edge-wildcard >/dev/null 2>&1 || true' EXIT
+          sleep 3
+          san() { # prints the SAN list of the certificate presented for SNI $1 (empty when the handshake is refused)
+            openssl s_client -connect 127.0.0.1:18447 -servername "$1" </dev/null 2>/dev/null \
+              | openssl x509 -noout -ext subjectAltName 2>/dev/null || true
+          }
+          for host in nz.example.eu blog.example.eu sse.example.eu weglarka.example.eu; do
+            san "$host" | grep -q '\*\.example\.eu' || { echo "FAIL: $host is not served with the wildcard" >&2; exit 1; }
+          done
+          for host in www.blog.example.eu example.org; do
+            [ -z "$(san "$host")" ] || { echo "FAIL: $host must not get a certificate" >&2; exit 1; }
+          done
+          echo "ok: wildcard served for covered domains only"
       # X-Forwarded-* from a trusted peer pass through, from an untrusted one they are overwritten (docs/decisions/0007).
       # The request peer on the published port is the Docker bridge gateway (172.17.0.1) — once trusted, once not.
       - name: Forwarded headers through nginx

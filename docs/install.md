@@ -1621,7 +1621,8 @@ https_bind = "0.0.0.0:443"   # TLS: jeden serwer na domenę, certyfikat z <state
   `301 https://$host$request_uri`; wyjątkiem jest prefiks `/.well-known/acme-challenge/`, obsługiwany
   z webroota. Nieznany `Host` zamyka połączenie (`444`).
 - **TLS tylko z certyfikatem:** serwer TLS powstaje **tylko** dla domeny, która ma parę plików
-  (`<domena>.crt` i `<domena>.key`). Domena bez pary dalej przekierowuje na HTTPS, ale nie ma serwera TLS —
+  (`<domena>.crt` i `<domena>.key`) albo jest pokryta parą wildcard `_wildcard.<apex>.crt|key`
+  ([6s](#6s-certyfikaty-wildcard-dns-01-acmedns); własna para wygrywa). Domena bez pary dalej przekierowuje na HTTPS, ale nie ma serwera TLS —
   handshake jest odrzucany (`ssl_reject_handshake`), więc **nic nie idzie plaintextem** do apki. Certyfikaty
   wystawia `[acme]` ([6q](#6q-certyfikaty-acme-http-01-acme)) albo kładziesz je sam (w testach wystarczy
   self-signed).
@@ -1800,11 +1801,22 @@ wildcards = ["example.eu"]                           # apex'y: powstanie *.examp
   zamówieniu na `_acme-challenge.example.eu` są dwa rekordy TXT naraz — to normalne.
 - **Pliki:** `tls/_wildcard.<apex>.key` (`0600`) i `tls/_wildcard.<apex>.crt` (`0644`), zapis atomowy, klucz
   przed certyfikatem. Nazwa nie zawiera `*`.
-- **Uwaga (stan na dziś):** nginx **jeszcze nie serwuje** wildcarda — ingress dobiera certyfikat po nazwie
-  domeny, więc każda routowana domena nadal dostaje własny certyfikat HTTP-01 z 6q. Wildcard jest wystawiany
-  i odnawiany z góry, a przypisanie do domen (i rezygnacja z osobnych certyfikatów) to osobna zmiana.
+- **Które domeny obsługuje wildcard:** apex i domeny **o jedną etykietę niżej** (`example.eu`, `app.example.eu`,
+  `pr-42.example.eu`; nie `a.b.example.eu`). nginx dobiera certyfikat po nazwie domeny: **własna para
+  `<domena>.crt|key` zawsze wygrywa**, w przeciwnym razie bierze wildcard najdłuższego pasującego apexu
+  (`tls/_wildcard.<apex>.crt|key`), a domena bez żadnej pary dalej nie ma serwera TLS (handshake odrzucony,
+  jak w 6p). Wildcard trafia do `nginx.conf` jak każdy certyfikat: przez `nginx -t` + SIGHUP, bez odtwarzania
+  kontenera. Para wildcarda postawiona ręcznie (bez `[acme.dns]`) działa tak samo, ale ręcznie odpowiadasz za to,
+  że certyfikat naprawdę pokrywa `*.<apex>` i `<apex>`.
+- **Co z certyfikatami per domena:** worker nie zamawia certyfikatu HTTP-01 dla domeny, która (1) nie ma własnego
+  certyfikatu i (2) jest pokryta ważnym (istniejącym, niewygasłym) wildcardem z `wildcards`. Wildcard idzie
+  w przejściu pierwszy, więc nowa domena (np. preview PR-a, #105) od razu jest obsłużona bez osobnego
+  zamówienia. Domena, która **już ma** własny certyfikat, jest dalej odnawiana (nginx preferuje własny, więc
+  wygasły nie może zostać); żeby ją przenieść na wildcard, usuń jej `tls/<domena>.crt|key` i poczekaj na
+  następne przejście. Wildcard nieudany albo wygasły = domeny wracają do własnych certyfikatów HTTP-01.
 - **`doctor`:** `acme.dns` (dostawca, tryb pliku tokena) i `acme.wildcards` (brakujące/wygasłe/do odnowienia).
-  Brak wildcarda przed pierwszym przejściem to `warn`.
+  Brak wildcarda przed pierwszym przejściem to `warn`. `acme.certs` i `ingress.tls` (oraz `doctor --preflight`)
+  traktują domenę pokrytą wildcardem jako obsłużoną.
 - **Wymagania po stronie DNS:** token musi widzieć strefę; rekord CAA strefy (jeśli jest) musi zezwalać CA
   (Let's Encrypt: `letsencrypt.org`). CA sam odpytuje autorytatywne serwery, więc demon nie czeka na propagację.
 - **Test na żywo (opt-in):** na osobnej strefie developerskiej; w CI pomijany, a logika adaptera i solvera

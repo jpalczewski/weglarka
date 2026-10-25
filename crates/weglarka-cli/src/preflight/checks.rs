@@ -709,6 +709,24 @@ impl Check for IngressTls {
         let gids = gids_of(cx.host, user);
         let mut missing = Vec::new();
         let mut unreadable = Vec::new();
+        // Wildcard pairs of `[acme.dns]` (`_wildcard.<apex>.crt|key`, issue #97) that the daemon's user can
+        // read: they serve the apex and one label below it.
+        let readable = |path: &std::path::Path| {
+            cx.host
+                .stat(path)
+                .is_ok_and(|st| st.kind == FileKind::File && can_read(&st, user.uid, &gids))
+        };
+        let wildcards: Vec<&String> = host
+            .acme
+            .iter()
+            .filter_map(|acme| acme.dns.as_ref())
+            .flat_map(|dns| &dns.wildcards)
+            .filter(|apex| {
+                let stem = weglarka_core::config::wildcard_cert_stem(apex);
+                readable(&tls.join(format!("{stem}.crt")))
+                    && readable(&tls.join(format!("{stem}.key")))
+            })
+            .collect();
         for domain in &domains {
             let mut ok_pair = true;
             for suffix in ["crt", "key"] {
@@ -730,7 +748,12 @@ impl Check for IngressTls {
                     }
                 }
             }
-            if !ok_pair && !unreadable.iter().any(|u| u.contains(domain)) {
+            if !ok_pair
+                && !unreadable.iter().any(|u| u.contains(domain))
+                && !wildcards
+                    .iter()
+                    .any(|apex| weglarka_core::config::wildcard_covers(apex, domain))
+            {
                 missing.push(domain.clone());
             }
         }

@@ -22,7 +22,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, watch};
 use weglarka_core::app::{AppSpec, InstanceName, Security};
-use weglarka_core::config::{HostConfig, IngressMode};
+use weglarka_core::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
 use weglarka_core::labels;
 use weglarka_core::podman::{
     BindMount, ContainerFilter, ContainerSpec, ContainerState, NetworkSpec, PodmanClient,
@@ -220,10 +220,14 @@ impl<P: PodmanClient> IngressManager<P> {
         // `edge` (issue #95): certificates come from the state dir on every pass, so a renewal is
         // picked up (the fingerprint makes the config differ) and a missing one simply leaves the
         // domain without a TLS server. `behind` has no TLS material of its own (Traefik owns it).
-        let (certificates, tls_fingerprint) = if self.host.ingress.mode == IngressMode::Edge {
+        let TlsMaterial {
+            certificates,
+            wildcards,
+            fingerprint: tls_fingerprint,
+        } = if self.host.ingress.mode == IngressMode::Edge {
             self.ensure_tls_material()?
         } else {
-            (Vec::new(), None)
+            TlsMaterial::default()
         };
 
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
@@ -236,6 +240,7 @@ impl<P: PodmanClient> IngressManager<P> {
             forwarder_subnets: &forwarder_subnets,
             networks: &networks,
             certificates: &certificates,
+            wildcards: &wildcards,
             tls_fingerprint: tls_fingerprint.as_deref(),
         };
         let mut own_addresses = if behind {
@@ -295,6 +300,7 @@ impl<P: PodmanClient> IngressManager<P> {
             options = options.with_trusted_proxies(&trusted)?;
         } else {
             options.certificates = r.certificates.to_vec();
+            options.wildcard_certificates = r.wildcards.to_vec();
             options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
         }
         let conf = nginx::generate(&self.host, r.apps, &options)?;
@@ -357,13 +363,14 @@ impl<P: PodmanClient> IngressManager<P> {
     /// `edge` TLS material from the state dir (issue #95): creates the ACME webroot (`0755`, the worker
     /// serves the tokens) and the TLS directory (`0700`, only the master — running as the daemon's user
     /// under the ingress uid map — needs it), then returns the domains with a `<domain>.crt` +
-    /// `<domain>.key` pair and a fingerprint of the material.
+    /// `<domain>.key` pair, the apexes with a wildcard pair (`_wildcard.<apex>.crt|key`, issue #97)
+    /// and a fingerprint of the material.
     ///
     /// The fingerprint is rendered into `nginx.conf`, so renewing a certificate changes the config and
     /// rides the normal `nginx -t` + SIGHUP path; it is metadata only (name, size, mtime), the daemon
     /// never reads the private keys. Anything that is not a regular `<domain>.crt` file, or has no
     /// matching key, is ignored: the domain simply keeps its redirect and has no TLS server.
-    fn ensure_tls_material(&self) -> Result<(Vec<Domain>, Option<String>), IngressApplyError> {
+    fn ensure_tls_material(&self) -> Result<TlsMaterial, IngressApplyError> {
         let acme = self.conf_dir.join(ACME_SUBDIR);
         let tls = self.conf_dir.join(TLS_SUBDIR);
         fs::create_dir_all(&acme).map_err(io_err(&acme))?;
@@ -374,10 +381,14 @@ impl<P: PodmanClient> IngressManager<P> {
         }
 
         let mut candidates: Vec<Domain> = Vec::new();
+        let mut wildcard_candidates: Vec<Domain> = Vec::new();
         let entries = match fs::read_dir(&tls) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((candidates, Some(empty_fingerprint())));
+                return Ok(TlsMaterial {
+                    fingerprint: Some(empty_fingerprint()),
+                    ..TlsMaterial::default()
+                });
             }
             Err(e) => return Err(io_err(&tls)(e)),
         };
@@ -388,6 +399,17 @@ impl<P: PodmanClient> IngressManager<P> {
             let Some(stem) = name.strip_suffix(".crt") else {
                 continue;
             };
+            // `_wildcard.<apex>`: the pair of a wildcard certificate (`*.<apex>` + `<apex>`).
+            if let Some(apex) = stem.strip_prefix(WILDCARD_CERT_PREFIX) {
+                match Domain::new(apex) {
+                    Ok(apex) => wildcard_candidates.push(apex),
+                    Err(_) => tracing::warn!(
+                        file = %name,
+                        "ignoring a wildcard TLS file whose name is not `_wildcard.<domain>`"
+                    ),
+                }
+                continue;
+            }
             match Domain::new(stem) {
                 Ok(domain) => candidates.push(domain),
                 Err(_) => {
@@ -397,30 +419,44 @@ impl<P: PodmanClient> IngressManager<P> {
         }
         candidates.sort();
         candidates.dedup();
+        wildcard_candidates.sort();
+        wildcard_candidates.dedup();
 
         let mut material = Vec::new();
-        let mut certificates = Vec::new();
-        for domain in candidates {
-            let cert = tls.join(format!("{domain}.crt"));
-            let key = tls.join(format!("{domain}.key"));
+        let pair = |stem: &str| -> Option<String> {
+            let cert = tls.join(format!("{stem}.crt"));
+            let key = tls.join(format!("{stem}.key"));
             let (Ok(cert_meta), Ok(key_meta)) =
                 (fs::symlink_metadata(&cert), fs::symlink_metadata(&key))
             else {
-                tracing::debug!(%domain, "no certificate pair in the TLS directory");
-                continue;
+                tracing::debug!(%stem, "no certificate pair in the TLS directory");
+                return None;
             };
             if !cert_meta.is_file() || !key_meta.is_file() {
-                tracing::warn!(%domain, "certificate or key is not a regular file, ignoring");
-                continue;
+                tracing::warn!(%stem, "certificate or key is not a regular file, ignoring");
+                return None;
             }
-            material.push(format!(
-                "{domain}:{}:{}:{}:{}",
+            Some(format!(
+                "{stem}:{}:{}:{}:{}",
                 cert_meta.len(),
                 mtime_nanos(&cert_meta),
                 key_meta.len(),
                 mtime_nanos(&key_meta)
-            ));
-            certificates.push(domain);
+            ))
+        };
+        let mut certificates = Vec::new();
+        for domain in candidates {
+            if let Some(entry) = pair(domain.as_str()) {
+                material.push(entry);
+                certificates.push(domain);
+            }
+        }
+        let mut wildcards = Vec::new();
+        for apex in wildcard_candidates {
+            if let Some(entry) = pair(&format!("{WILDCARD_CERT_PREFIX}{apex}")) {
+                material.push(entry);
+                wildcards.push(apex);
+            }
         }
         let fingerprint = if material.is_empty() {
             empty_fingerprint()
@@ -428,7 +464,11 @@ impl<P: PodmanClient> IngressManager<P> {
             let digest = Sha256::digest(material.join("\n").as_bytes());
             hex::encode(&digest[..4])
         };
-        Ok((certificates, Some(fingerprint)))
+        Ok(TlsMaterial {
+            certificates,
+            wildcards,
+            fingerprint: Some(fingerprint),
+        })
     }
 
     /// `edge`: the TLS material directory (`<nginx_conf_dir>/tls`).
@@ -642,6 +682,17 @@ const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v3";
 /// `setgid(101) failed`. `NET_BIND_SERVICE` is not needed (8080), and `pid` plus every `*_temp_path`
 /// already live under `/tmp` (`weglarka-ingress/src/nginx.rs`), the one writable place this profile
 /// leaves — the generator test keeps that invariant.
+/// What the `edge` scan of the TLS directory found (empty in `behind`).
+#[derive(Default)]
+struct TlsMaterial {
+    /// Domains with a `<domain>.crt|key` pair.
+    certificates: Vec<Domain>,
+    /// Apexes with a `_wildcard.<apex>.crt|key` pair (issue #97).
+    wildcards: Vec<Domain>,
+    /// Fingerprint of the material (`None` in `behind`).
+    fingerprint: Option<String>,
+}
+
 /// Inputs of one `nginx.conf` rendering that do not depend on nginx's addresses.
 struct Render<'a> {
     apps: &'a BTreeMap<InstanceName, AppSpec>,
@@ -650,6 +701,8 @@ struct Render<'a> {
     networks: &'a [String],
     /// `edge`: domains with a certificate pair in [`TLS_SUBDIR`]; empty in `behind`.
     certificates: &'a [Domain],
+    /// `edge`: apex domains with a wildcard pair (`_wildcard.<apex>.crt|key`); empty in `behind`.
+    wildcards: &'a [Domain],
     /// `edge`: fingerprint of the TLS material. It is rendered into `nginx.conf`, so a renewed
     /// certificate re-renders the config and goes through the usual `nginx -t` + SIGHUP path
     /// (never a recreate). `None` in `behind`.
