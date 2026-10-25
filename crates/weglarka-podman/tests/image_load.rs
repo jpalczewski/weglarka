@@ -2,19 +2,27 @@
 //! archive instead of pulled. Requires `WEGLARKA_PODMAN_SOCKET`; skipped without it
 //! (docs/decisions/0002-podman-in-ci.md).
 //!
-//! The test records what it observes (`--nocapture` shows it) and asserts only what the push design
-//! depends on: the loaded image keeps the manifest digest of the archive's image, and that digest is
-//! resolvable through `image_inspect`.
+//! `weglarka push` pins the digest of the image *after* the load (a docker archive carries no manifest,
+//! so libpod computes one and it differs from the registry's), so the properties the design depends on are:
+//! the loaded image reports a digest, `repo@digest` resolves to it (after tagging it with the app's
+//! repository when the archive has no name), and loading the same archive again gives the same digest.
+//! Whether the digest equals the original one is only recorded (`--nocapture`), not asserted.
+//!
+//! One test runs every scenario in turn: they share one image in the store and remove it in between, so
+//! parallel tests would pull it out from under each other.
 
 use std::fs;
 use std::process::Command;
 
-use weglarka_core::podman::{PodmanClient, PodmanError, PullEvent};
+use futures_util::StreamExt;
+use serde_json::Value;
+use weglarka_core::podman::{ImageInfo, PodmanClient, PodmanError};
 use weglarka_podman::LibpodClient;
 
-use futures_util::StreamExt;
-
 const ALPINE: &str = "docker.io/library/alpine:3.20";
+const ALPINE_REPO: &str = "docker.io/library/alpine";
+/// Repository an archive without a name is tagged with, as the daemon will tag it with the app's.
+const APP_REPO: &str = "localhost/wg-spike/app";
 
 fn socket() -> Option<String> {
     let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
@@ -26,7 +34,7 @@ fn socket() -> Option<String> {
     socket
 }
 
-/// Raw libpod call with the response body written to `out` (`GET`) or `data` sent as the body (`POST`).
+/// Raw libpod call: `data` is a file sent as the body, `out` a file the response is written to.
 fn curl(socket: &str, method: &str, path: &str, data: Option<&str>, out: Option<&str>) -> String {
     let mut cmd = Command::new("curl");
     cmd.args([
@@ -60,83 +68,146 @@ fn curl(socket: &str, method: &str, path: &str, data: Option<&str>, out: Option<
 async fn pull(client: &LibpodClient, reference: &str) {
     let mut stream = std::pin::pin!(client.image_pull(reference));
     while let Some(event) = stream.next().await {
-        if let PullEvent::Complete { .. } = event.expect("pull") {}
+        event.expect("pull");
     }
 }
 
-/// Saves `ALPINE` in `format`, removes it, loads the archive back and reports what libpod made of it.
-async fn round_trip(socket: &str, client: &LibpodClient, format: &str) {
-    pull(client, ALPINE).await;
-    let before = client.image_inspect(ALPINE).await.expect("inspect");
-    let digest = before.digest.clone().expect("a pulled image has a digest");
+/// Loads `archive` and returns the names libpod reports for it.
+fn load(socket: &str, archive: &str, label: &str) -> Vec<String> {
+    let response = curl(socket, "POST", "/images/load", Some(archive), None);
+    println!("[{label}] load response: {response}");
+    let parsed: Value = serde_json::from_str(&response).expect("load answers JSON");
+    parsed["Names"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    let dir = std::env::temp_dir().join(format!("wg-image-load-{format}-{}", std::process::id()));
+/// One scenario: save the pulled image as `format` (under its name, or by id when `nameless`), remove it,
+/// load it, tag it when it came without a name, and check the pin. Returns the loaded digest and what
+/// went wrong.
+async fn scenario(
+    socket: &str,
+    client: &LibpodClient,
+    format: &str,
+    nameless: bool,
+) -> Result<String, Vec<String>> {
+    let label = format!("{format}{}", if nameless { ", nameless" } else { "" });
+    let mut problems = Vec::new();
+
+    pull(client, ALPINE).await;
+    let original = client.image_inspect(ALPINE).await.expect("inspect");
+    let original_digest = original
+        .digest
+        .clone()
+        .expect("a pulled image has a digest");
+
+    let dir = std::env::temp_dir().join(format!(
+        "wg-image-load-{format}-{nameless}-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let archive = dir.join("image.tar");
     let archive = archive.to_str().unwrap();
+    let saved = if nameless { &original.id } else { ALPINE };
     curl(
         socket,
         "GET",
-        &format!("/images/{ALPINE}/get?format={format}"),
+        &format!("/images/{saved}/get?format={format}"),
         None,
         Some(archive),
     );
 
-    client.image_remove(ALPINE).await.expect("remove");
-    assert!(matches!(
-        client.image_inspect(ALPINE).await,
-        Err(PodmanError::NotFound(_))
-    ));
-
-    let response = curl(socket, "POST", "/images/load", Some(archive), None);
-    println!("[{format}] load response: {response}");
-
-    // 1. By the original name (the archive carries it).
-    let by_name = client.image_inspect(ALPINE).await;
-    println!("[{format}] inspect {ALPINE}: {by_name:?}");
-
-    // 2. By `repo@digest` — what `ensure_image` looks up after a deploy pinned the digest.
-    let pinned = format!("docker.io/library/alpine@{digest}");
-    let by_digest = client.image_inspect(&pinned).await;
-    println!("[{format}] inspect {pinned}: {by_digest:?}");
-
-    // 3. By image id — the `local_id` fallback.
-    let by_id = match &by_name {
-        Ok(info) => Some(client.image_inspect(&info.id).await),
-        Err(_) => None,
+    // The repository the pin is built from, and the way the loaded image is reached afterwards.
+    let (repo, tag) = if nameless {
+        (APP_REPO, "pushed")
+    } else {
+        (ALPINE_REPO, "3.20")
     };
-    println!("[{format}] inspect by id: {by_id:?}");
+    let name = format!("{repo}:{tag}");
 
-    let loaded = by_name.expect("the loaded image is known by the name stored in the archive");
-    println!(
-        "[{format}] digest before {digest}, after {:?}; repo_digests {:?}",
-        loaded.digest, loaded.repo_digests
-    );
-    assert_eq!(
-        loaded.digest.as_ref(),
-        Some(&digest),
-        "{format}: loading must keep the manifest digest, or the pin cannot be reproduced"
-    );
-    let found = by_digest.as_ref().map(|i| i.id.clone());
-    assert_eq!(
-        found.as_deref().ok(),
-        Some(loaded.id.as_str()),
-        "{format}: `repo@digest` must resolve to the loaded image, got {by_digest:?}"
-    );
+    let mut digests = Vec::new();
+    for round in ["first load", "second load"] {
+        client.image_remove(&name).await.ok();
+        client.image_remove(ALPINE).await.ok();
+        assert!(
+            matches!(
+                client.image_inspect(&original.id).await,
+                Err(PodmanError::NotFound(_))
+            ),
+            "[{label}] the image must be gone before {round}"
+        );
 
+        let names = load(socket, archive, &format!("{label}, {round}"));
+        if nameless {
+            client
+                .image_tag(&original.id, repo, tag)
+                .await
+                .expect("tag the loaded image with the app repository");
+        }
+        let info: ImageInfo = match client.image_inspect(&original.id).await {
+            Ok(info) => info,
+            Err(e) => {
+                problems.push(format!("{round}: loaded image not found by id: {e:?}"));
+                break;
+            }
+        };
+        println!("[{label}, {round}] names {names:?}, inspect: {info:?}");
+        let Some(digest) = info.digest.clone() else {
+            problems.push(format!("{round}: the loaded image has no digest"));
+            break;
+        };
+        println!(
+            "[{label}, {round}] digest {digest} (registry digest {original_digest}, equal: {})",
+            digest == original_digest
+        );
+
+        let pinned = format!("{repo}@{digest}");
+        match client.image_inspect(&pinned).await {
+            Ok(by_pin) if by_pin.id == info.id => {}
+            Ok(other) => problems.push(format!("{round}: {pinned} resolved to {}", other.id)),
+            Err(e) => problems.push(format!("{round}: {pinned} does not resolve: {e:?}")),
+        }
+        digests.push(digest);
+    }
+    if let [first, second] = digests.as_slice()
+        && first != second
+    {
+        problems.push(format!(
+            "the same archive gave two digests: {first} then {second}"
+        ));
+    }
+
+    client.image_remove(&name).await.ok();
+    client.image_remove(ALPINE).await.ok();
     let _ = fs::remove_dir_all(&dir);
+
+    match (problems.is_empty(), digests.first()) {
+        (true, Some(digest)) => Ok(digest.to_string()),
+        _ => Err(problems),
+    }
 }
 
 #[tokio::test]
-async fn loaded_oci_archive_keeps_its_digest() {
+async fn loaded_archives_can_be_pinned_by_digest() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(&socket);
-    round_trip(&socket, &client, "oci-archive").await;
-}
-
-#[tokio::test]
-async fn loaded_docker_archive_keeps_its_digest() {
-    let Some(socket) = socket() else { return };
-    let client = LibpodClient::new(&socket);
-    round_trip(&socket, &client, "docker-archive").await;
+    let mut failures = Vec::new();
+    for (format, nameless) in [
+        ("oci-archive", false),
+        ("oci-archive", true),
+        ("docker-archive", false),
+        ("docker-archive", true),
+    ] {
+        match scenario(&socket, &client, format, nameless).await {
+            Ok(digest) => println!("OK {format} nameless={nameless}: pinned {digest}"),
+            Err(problems) => failures.push(format!("{format} nameless={nameless}: {problems:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
