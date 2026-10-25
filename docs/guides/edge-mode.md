@@ -41,7 +41,7 @@ OpenRC too. Decision and measurements: [ADR 0043](../decisions/0043-edge-client-
   or a release that changes the identity format. During a recreate the forwarder holds new connections for up to
   20 s until nginx listens again, so clients see a slow request rather than a refusal. Each recreate is logged as
   `nginx recreated (not reloaded)` with `reason` (the changed inputs) and the measured `gap_ms`
-  ([ADR 0046](../decisions/0046-edge-recreate-gap.md)).
+  ([ADR 0048](../decisions/0048-edge-recreate-gap.md)).
 - Downgrading to an older daemon leaves the container behind: `podman rm -f weglarka-forwarder`.
 - Check the address from **another host**: `scripts/acceptance.sh --expect-client-ip <ip>`.
 

@@ -147,9 +147,14 @@ pub(crate) struct CreateContainer<'a> {
     cap_add: Vec<&'a str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     no_new_privileges: bool,
+    /// OCI annotations; only `run.oci.keep_original_groups` today (ADR 0045).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    annotations: BTreeMap<&'static str, &'static str>,
 }
 
 /// Options of a tmpfs mount from `security.tmpfs` (writable, no devices or setuid).
+/// crun annotation behind `podman run --group-add keep-groups` (ADR 0045).
+const KEEP_ORIGINAL_GROUPS: &str = "run.oci.keep_original_groups";
 const TMPFS_OPTIONS: [&str; 3] = ["rw", "nosuid", "nodev"];
 
 #[derive(Serialize)]
@@ -420,6 +425,11 @@ impl<'a> CreateContainer<'a> {
             cap_drop: spec.security.cap_drop.iter().map(String::as_str).collect(),
             cap_add: spec.security.cap_add.iter().map(String::as_str).collect(),
             no_new_privileges: spec.security.no_new_privileges,
+            annotations: if spec.keep_groups {
+                BTreeMap::from([(KEEP_ORIGINAL_GROUPS, "1")])
+            } else {
+                BTreeMap::new()
+            },
         }
     }
 }
@@ -835,6 +845,9 @@ impl InspectNetwork {
 #[derive(Serialize)]
 pub(crate) struct ConnectNetwork<'a> {
     pub(crate) container: &'a str,
+    /// Extra DNS names on the network; left out of the body when empty.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(crate) aliases: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -1201,6 +1214,26 @@ mod tests {
     }
 
     #[test]
+    fn network_connect_sends_aliases_only_when_there_are_some() {
+        let plain = serde_json::to_value(ConnectNetwork {
+            container: "web",
+            aliases: &[],
+        })
+        .unwrap();
+        assert_eq!(plain, serde_json::json!({ "container": "web" }));
+        let aliases = ["app".to_owned()];
+        let aliased = serde_json::to_value(ConnectNetwork {
+            container: "web.next",
+            aliases: &aliases,
+        })
+        .unwrap();
+        assert_eq!(
+            aliased,
+            serde_json::json!({ "container": "web.next", "aliases": ["app"] })
+        );
+    }
+
+    #[test]
     fn network_aliases_are_sent_per_network() {
         let mut spec = ContainerSpec {
             name: "api".into(),
@@ -1220,6 +1253,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
@@ -1275,6 +1309,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
@@ -1302,6 +1337,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
@@ -1329,6 +1365,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
@@ -1434,6 +1471,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         let plain = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
@@ -1493,6 +1531,7 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         // Unset: the world-readable mode and root-in-the-container owner, like `podman run --secret`.
@@ -1553,6 +1592,7 @@ mod tests {
                 uid_map: vec![range],
                 gid_map: vec![range],
             }),
+            keep_groups: false,
             security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
@@ -1589,6 +1629,7 @@ mod tests {
                 retries: 3,
             }),
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
@@ -1626,8 +1667,42 @@ mod tests {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    #[test]
+    fn keep_groups_sets_the_crun_annotation_and_nothing_else() {
+        let mut spec = ContainerSpec {
+            name: "alloy".into(),
+            image: "ghcr.io/example/alloy@sha256:aaaa".into(),
+            command: vec![],
+            entrypoint: None,
+            labels: Default::default(),
+            env: Default::default(),
+            networks: vec![],
+            network_aliases: Default::default(),
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: false,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+            keep_groups: true,
+            security: Default::default(),
+        };
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(
+            body["annotations"],
+            serde_json::json!({ "run.oci.keep_original_groups": "1" })
+        );
+        spec.keep_groups = false;
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert!(body.get("annotations").is_none());
     }
 }

@@ -89,6 +89,7 @@ fn spec(name: &str) -> ContainerSpec {
         resources: Resources::default(),
         healthcheck: None,
         id_mapping: None,
+        keep_groups: false,
         security: Default::default(),
     }
 }

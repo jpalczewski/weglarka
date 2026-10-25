@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 7**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 7`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 10**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 10`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-core/src/state.rs`); a compile-time assert
@@ -44,6 +44,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 5 | #130 | `paths` and `ingress.strip_prefix` | [0031](../decisions/0031-path-prefix-routing.md) | [path routing](path-routing.md) |
 | 6 | — | optional `ingress.max_body_size` | [0033](../decisions/0033-ingress-max-body-size.md) | [max body size](max-body-size.md) |
 | 7 | #55 | optional `uid`/`gid` on a mounted secret | [0037](../decisions/0037-secret-mount-ownership.md) | [first app](first-app.md) |
+| 8 | #178 | `host_mounts` and `group_add` in app specs (with `[runtime] host_mounts`/`group_add` in `weglarka.toml`) | [0045](../decisions/0045-host-mounts.md) | [host mounts](host-mounts.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

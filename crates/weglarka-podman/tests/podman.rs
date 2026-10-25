@@ -151,6 +151,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         resources: Default::default(),
         healthcheck: None,
         id_mapping: None,
+        keep_groups: false,
         security: Default::default(),
     }
 }

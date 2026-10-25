@@ -22,6 +22,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Importing data](data-import.md) | Importing and exporting volumes, Coolify migration, SQLite lessons |
 | [Secrets cleanup](secrets-cleanup.md) | `secrets remove`, `apps remove --purge-secrets`, orphaned secrets |
 | [Host config files](host-configs.md) | `config_root`, `configs`, `apps reload` |
+| [Read-only host paths](host-mounts.md) | `[runtime] host_mounts`/`group_add` allowlists, `host_mounts` and `group_add` in the spec |
 
 ## App behaviour
 
@@ -29,6 +30,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 |---|---|
 | [Stopped apps](stopped-apps.md) | `start = false`, provisioning without a container |
 | [App dependencies](dependencies.md) | `depends_on` start order and health gate |
+| [Blue-green deploys](blue-green.md) | `strategy = "blue_green"`: deploys without the restart outage for stateless apps |
 | [Container command](container-command.md) | `command` (argv) |
 | [Container hardening](container-hardening.md) | `security` for apps, the always-hardened ingress container |
 | [Image retention](image-retention.md) | Which images stay, `images prune` |
@@ -46,6 +48,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Path routing](path-routing.md) | `paths` and `strip_prefix` on one domain |
 | [Streaming](streaming.md) | SSE and long polling |
 | [Request body size](max-body-size.md) | `ingress.max_body_size` |
+| [Access log](access-log.md) | `ingress.access_log_skip_paths`, what `169.254.1.2` means |
 | [Edge mode](edge-mode.md) | nginx on 80/443 terminating TLS |
 | [Edge behind a CDN](edge-cdn.md) | Visitor address behind Cloudflare (`[ingress.cdn]`) |
 | [ACME behind a CDN](acme-behind-cdn.md) | HTTP-01 through the Cloudflare proxy, `acme.cdn` |

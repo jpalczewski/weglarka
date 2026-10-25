@@ -61,6 +61,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
         image_retention(d, observed, &mut checks).await;
     }
     configs(d, &mut checks);
+    host_mounts(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     shared_network_state(d, &mut checks).await;
     secrets(d, &mut checks);
@@ -470,6 +471,59 @@ fn dependencies(
 ///   "other read" bit (0644) and directories "other execute" (0755).
 ///
 /// Report-only, like the rest of doctor: nothing here touches the files or the containers.
+/// Host mounts (issue #178): which apps read which host paths, and whether each is still allowlisted,
+/// present and unredirected. Silent while no app uses them.
+fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_core::host_mounts::{HostMountStatus, describe};
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    let allowlist = &d.host.runtime.host_mounts;
+    let mut used = Vec::new();
+    let mut broken = Vec::new();
+    for (name, spec) in &apps.apps {
+        for view in describe(allowlist, spec) {
+            used.push(format!("{name}: {}", view.source));
+            if view.status != HostMountStatus::Ok {
+                broken.push(format!(
+                    "{name}: {}",
+                    view.detail.unwrap_or_else(|| view.source.clone())
+                ));
+            }
+        }
+    }
+    for (name, spec) in &apps.apps {
+        if spec.group_add.is_empty() {
+            continue;
+        }
+        used.push(format!("{name}: groups {}", spec.group_add.join(",")));
+        if let Err(e) = weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec) {
+            broken.push(format!("{name}: {e}"));
+        }
+    }
+    if used.is_empty() {
+        return;
+    }
+    out.push(if broken.is_empty() {
+        check(
+            "host_mounts.apps",
+            CheckStatus::Ok,
+            format!("read-only host paths in use ({})", used.join("; ")),
+            None,
+        )
+    } else {
+        check(
+            "host_mounts.apps",
+            CheckStatus::Warn,
+            format!("host mounts cannot be mounted: {}", broken.join("; ")),
+            Some(
+                "list the path in `[runtime] host_mounts` of weglarka.toml (then re-run `weglarka \
+                 platform install` so the daemon container sees it), or fix the path on the host",
+            ),
+        )
+    });
+}
+
 fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
         return; // reported by `state.apps_file`

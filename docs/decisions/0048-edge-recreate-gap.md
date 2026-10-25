@@ -1,4 +1,4 @@
-# 0046 — Edge mode: no refused connections while nginx or the forwarder is replaced
+# 0048 — Edge mode: no refused connections while nginx or the forwarder is replaced
 
 Status: accepted (2026-10-25, issue #183). Cause established from the code and the report (a stop that takes the full timeout); the gap itself is measured on a real host, not in CI.
 

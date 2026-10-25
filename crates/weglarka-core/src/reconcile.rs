@@ -233,6 +233,15 @@ pub struct ReconcilerOptions {
     /// already resolved against the config file's directory by the caller. `None` = the feature is
     /// off: an app that declares `configs` then fails validation instead of mounting anything.
     pub config_root: Option<PathBuf>,
+    /// Allowlist for apps' `host_mounts` (`[runtime] host_mounts`, issue #178); empty = no app may
+    /// mount a host path.
+    pub host_mounts: Vec<PathBuf>,
+    /// Allowlist for apps' `group_add` (`[runtime] group_add`, issue #178).
+    pub group_add: Vec<String>,
+    /// How long a blue-green switch keeps the old container serving after the new one joined the app
+    /// network: at least the ingress resolver's cache lifetime, so no request still resolves to a
+    /// container that is about to stop (ADR 0046).
+    pub switch_drain: Duration,
 }
 
 impl Default for ReconcilerOptions {
@@ -242,6 +251,9 @@ impl Default for ReconcilerOptions {
             stop_timeout_secs: 10,
             dependency_wait_secs: 10,
             config_root: None,
+            host_mounts: Vec::new(),
+            group_add: Vec::new(),
+            switch_drain: Duration::from_secs(3),
         }
     }
 }
@@ -329,7 +341,18 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
         let main_name = labels::container_name(&t.instance);
         let main = own.and_then(|cs| cs.iter().find(|c| c.name == main_name));
         // Duplicates with our label but a different name are removed regardless of `blocked`.
-        for c in own.into_iter().flatten().filter(|c| c.name != main_name) {
+        // The challenger and the retiring container of a blue-green switch (ADR 0046) carry the
+        // instance label on purpose and live only inside a deploy, which holds the engine lock; a
+        // leftover of a crashed deploy is swept by the instance's next blue-green deploy.
+        let transient = [
+            labels::challenger_name(&t.instance),
+            labels::retiring_name(&t.instance),
+        ];
+        for c in own
+            .into_iter()
+            .flatten()
+            .filter(|c| c.name != main_name && !transient.contains(&c.name))
+        {
             actions.push(Action::Remove {
                 container: c.name.clone(),
             });
@@ -681,9 +704,7 @@ impl<P: PodmanClient> Reconciler<P> {
             } else if let Some(why) = unranged.get(name) {
                 blocked = true;
                 report.blocked.push((name.clone(), why.clone()));
-            } else if let Err(e) =
-                crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
-            {
+            } else if let Err(e) = self.resolve_mounts(spec) {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
                 // stays as it is until the operator fixes the root or the file (ADR 0028).
                 blocked = true;

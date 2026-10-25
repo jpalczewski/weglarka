@@ -534,6 +534,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 resources: Default::default(),
                 healthcheck: None,
                 id_mapping: None,
+                keep_groups: false,
                 security,
             })
             .await?;
@@ -893,6 +894,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 // `edge`/`behind`: container uid 0 is the daemon's host user, so the TLS master reads
                 // the 0600 keys; the worker stays in the reserved ingress range (docs/decisions/0036).
                 id_mapping: Some(volumes::ingress_id_mapping(range)),
+                keep_groups: false,
                 security: nginx_security(),
             })
             .await?;

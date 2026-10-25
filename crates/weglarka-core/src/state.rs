@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -89,6 +89,27 @@ fn secret_mount_ownership_v7(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v7 → v8: host mounts and groups (issue #178, ADR 0045). `AppSpec::host_mounts` and
+/// `AppSpec::group_add` are optional fields that default to empty, so a v7 document needs no data transformation — the marker records that the
+/// file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn host_mounts_v8(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
+/// v8 → v9: deploy strategy (issue #39, ADR 0046). `AppSpec::strategy` is an optional field that
+/// defaults to `recreate`, so a v8 document needs no data transformation; the marker records that
+/// the file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn deploy_strategy_v9(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
+/// v9 → v10: access-log exclusions (issue #181). `AppIngress::access_log_skip_paths` is optional and
+/// defaults to empty, so a v9 document needs no data transformation — the marker records that the
+/// file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn access_log_skip_paths_v10(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -99,6 +120,9 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     path_prefix_routing_v5,
     ingress_max_body_size_v6,
     secret_mount_ownership_v7,
+    host_mounts_v8,
+    deploy_strategy_v9,
+    access_log_skip_paths_v10,
 ];
 
 const _: () = assert!(
@@ -323,7 +347,29 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     }
     validate_depends_on(name, spec)?;
     validate_ingress(name, spec)?;
+    validate_strategy(name, spec)?;
     validate_iteration2(name, spec)
+}
+
+/// `blue_green` runs two containers of the app at once, so it is only for stateless apps (ADR 0046):
+/// two containers cannot bind one host port, and a read-write volume would have two writers (SQLite
+/// has a single one). Read-only volumes and host config mounts are fine.
+fn validate_strategy(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    if spec.strategy != crate::app::Strategy::BlueGreen {
+        return Ok(());
+    }
+    if !spec.host_ports.is_empty() {
+        return Err(format!(
+            "{name}: strategy \"blue_green\" cannot be combined with host_ports (two containers cannot bind one host port)"
+        ));
+    }
+    if spec.volumes.iter().any(|v| !v.read_only) || spec.shared_volumes.iter().any(|v| !v.read_only)
+    {
+        return Err(format!(
+            "{name}: strategy \"blue_green\" needs a stateless app: read-write volumes (private or shared) would have two writers"
+        ));
+    }
+    Ok(())
 }
 
 /// `depends_on` rules an app can break on its own. The cross-app rules (an unknown target, a cycle)
@@ -374,6 +420,22 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if ingress.strip_prefix && spec.paths.iter().all(|p| p == "/") {
         return Err(format!(
             "{name}: ingress.strip_prefix requires a path other than \"/\""
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &ingress.access_log_skip_paths {
+        crate::app::check_skip_path(path).map_err(|reason| {
+            format!("{name}: invalid ingress.access_log_skip_paths entry {path:?}: {reason}")
+        })?;
+        if !seen.insert(path) {
+            return Err(format!(
+                "{name}: duplicate ingress.access_log_skip_paths entry {path:?}"
+            ));
+        }
+    }
+    if !ingress.access_log_skip_paths.is_empty() && spec.domains.is_empty() {
+        return Err(format!(
+            "{name}: ingress.access_log_skip_paths requires at least one domain"
         ));
     }
     Ok(())
@@ -471,6 +533,37 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
                 "{name}: duplicate config target {:?}",
                 mount.target
             ));
+        }
+    }
+    // Host mounts (issue #178): lexical rules only; membership in the operator's allowlist is
+    // checked against the host config by `crate::host_mounts` (admin API, reconcile, launch).
+    for mount in &spec.host_mounts {
+        if !crate::app::valid_host_source(&mount.source) {
+            return Err(format!(
+                "{name}: host mount source {:?} must be an absolute, normalized path",
+                mount.source
+            ));
+        }
+        if !valid_mount_target(&mount.target) {
+            return Err(format!(
+                "{name}: host mount target {:?} must be an absolute path (no '..', ':' or ',')",
+                mount.target
+            ));
+        }
+        if !seen_targets.insert(mount.target.trim_end_matches('/')) {
+            return Err(format!(
+                "{name}: duplicate host mount target {:?}",
+                mount.target
+            ));
+        }
+    }
+    let mut groups = BTreeSet::new();
+    for group in &spec.group_add {
+        if !crate::app::valid_group_name(group) {
+            return Err(format!("{name}: invalid group_add entry {group:?}"));
+        }
+        if !groups.insert(group) {
+            return Err(format!("{name}: duplicate group_add entry {group:?}"));
         }
     }
     if let Some(signal) = &spec.reload_signal
@@ -881,6 +974,35 @@ mod tests {
     }
 
     #[test]
+    fn access_log_skip_paths_are_validated() {
+        let ok = |list: &str| {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\ningress = {{ access_log_skip_paths = {list} }}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(ok("[]").is_ok());
+        assert!(ok(r#"["/healthz", "/api/poll/", "/a.b/c-d_e"]"#).is_ok());
+        for bad in [
+            "/", "healthz", "/a//b", "/a/../b/", "/a b", "/a;b", "/a\"b", "/ä", "//", "",
+        ] {
+            let err = ok(&format!("[{bad:?}]")).unwrap_err();
+            assert!(err.contains("access_log_skip_paths"), "{bad}: {err}");
+        }
+        let err = ok(r#"["/a", "/a"]"#).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        let no_domain: AppSpec =
+            toml::from_str("image = \"i\"\ningress = { access_log_skip_paths = [\"/a\"] }")
+                .unwrap();
+        assert!(
+            validate_app(&name("a"), &no_domain)
+                .unwrap_err()
+                .contains("requires at least one domain")
+        );
+    }
+
+    #[test]
     fn security_values_are_validated() {
         let ok = |sec: crate::app::Security| {
             let spec = AppSpec {
@@ -1148,6 +1270,37 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         )
         .unwrap();
         assert!(matches!(load_state(&p), Err(StateError::Invalid { .. })));
+    }
+
+    #[test]
+    fn blue_green_needs_a_stateless_app() {
+        let check = |extra: &str| {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\nstrategy = \"blue_green\"\n{extra}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(check("").is_ok());
+        assert!(
+            check("volumes = [{ name = \"cfg\", target = \"/cfg\", read_only = true }]").is_ok()
+        );
+        assert!(
+            check("shared_volumes = [{ name = \"s\", target = \"/s\", read_only = true }]").is_ok()
+        );
+        for bad in [
+            "volumes = [{ name = \"data\", target = \"/data\" }]",
+            "shared_volumes = [{ name = \"s\", target = \"/s\" }]",
+            "host_ports = [{ host = 8080, container = 80 }]",
+        ] {
+            let err = check(bad).unwrap_err();
+            assert!(err.contains("blue_green"), "{bad}: {err}");
+        }
+        // The default strategy has no such restriction.
+        let spec: AppSpec =
+            toml::from_str("image = \"i\"\nvolumes = [{ name = \"data\", target = \"/data\" }]")
+                .unwrap();
+        assert!(validate_app(&name("a"), &spec).is_ok());
     }
 
     #[test]

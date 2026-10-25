@@ -937,6 +937,7 @@ impl<P: PodmanClient> Reconciler<P> {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: Some(id_mapping(range)),
+            keep_groups: false,
             security: Default::default(),
         };
         let result = async {

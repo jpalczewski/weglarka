@@ -27,6 +27,7 @@ pub mod delivery;
 pub mod depends;
 pub mod deploy;
 pub mod forward;
+pub mod host_mounts;
 pub mod images;
 pub mod limits;
 pub mod push;

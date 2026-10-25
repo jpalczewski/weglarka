@@ -15,10 +15,11 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use weglarka_api::{
     AddAppRequest, ApiError, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome,
-    DeployRequest, DeployResponse, ErrorCode, HealthResponse, ListAppsResponse,
-    ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse,
-    ReloadAction, ReloadRequest, ReloadResponse, RunFrame, RunRequest, RuntimeState, SecretInfo,
-    SetSecretRequest, ShowAppResponse, StatusResponse, endpoints,
+    DeployRequest, DeployResponse, ErrorCode, HealthResponse,
+    HostMountStatus as ApiHostMountStatus, HostMountView, ListAppsResponse, ListSecretsResponse,
+    NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse, ReloadAction, ReloadRequest,
+    ReloadResponse, RunFrame, RunRequest, RuntimeState, SecretInfo, SetSecretRequest,
+    ShowAppResponse, StatusResponse, endpoints,
 };
 use weglarka_core::app::{AppSpec, InstanceName};
 use weglarka_core::config_mounts::{self, MountStatus, MountView};
@@ -385,6 +386,7 @@ async fn show_app<P: PodmanClient + 'static>(
             app_state,
         ),
         configs: config_views(&d, &spec),
+        host_mounts: host_mount_views(&d, &spec),
         name,
         spec,
     }))
@@ -428,6 +430,29 @@ fn config_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<Co
     })
 }
 
+/// Declared host mounts of `spec` (issue #178) against the allowlist; `None` when there are none.
+fn host_mount_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<HostMountView>> {
+    use weglarka_core::host_mounts::{self, HostMountStatus as S};
+    (!spec.host_mounts.is_empty()).then(|| {
+        host_mounts::describe(&d.host.runtime.host_mounts, spec)
+            .into_iter()
+            .map(|v| HostMountView {
+                source: v.source,
+                target: v.target,
+                status: match v.status {
+                    S::Ok => ApiHostMountStatus::Ok,
+                    S::NotAllowed => ApiHostMountStatus::NotAllowed,
+                    S::Missing => ApiHostMountStatus::Missing,
+                    S::Redirected => ApiHostMountStatus::Redirected,
+                    S::NotFileOrDir => ApiHostMountStatus::NotFileOrDir,
+                    S::Unreadable => ApiHostMountStatus::Unreadable,
+                },
+                detail: v.detail,
+            })
+            .collect()
+    })
+}
+
 /// `apps add`/`apps update`: an app with `configs` needs `config_root` in `weglarka.toml`. The
 /// sources themselves are not checked here — a file that does not exist yet must not block adding
 /// the app; reconcile blocks the instance and `doctor` warns until the source appears. The lexical
@@ -436,6 +461,12 @@ pub(crate) fn validate_config_mounts<P: PodmanClient>(
     d: &Daemon<P>,
     spec: &AppSpec,
 ) -> ApiResult<()> {
+    // Host mounts (issue #178): the source must be an exact entry of the operator's allowlist, so a
+    // bad one is a 400 now instead of a blocked app later.
+    weglarka_core::host_mounts::check_allowed(&d.host.runtime.host_mounts, spec)
+        .map_err(|e| Fail::invalid(e.to_string()))?;
+    weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec)
+        .map_err(|e| Fail::invalid(e.to_string()))?;
     if spec.configs.is_empty() || d.paths.config_root.is_some() {
         return Ok(());
     }
@@ -503,6 +534,7 @@ async fn add_app<P: PodmanClient + 'static>(
         state: app_state.cloned().unwrap_or_default(),
         // Only `GET /v1/apps/{name}` resolves the mounts: add/update never touch `config_root`.
         configs: None,
+        host_mounts: None,
         name: req.name,
         spec: req.spec,
     }))

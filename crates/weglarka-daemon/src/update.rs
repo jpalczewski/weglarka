@@ -121,6 +121,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
         state: app_state.cloned().unwrap_or_default(),
         // Only `GET /v1/apps/{name}` resolves the mounts: update never touches `config_root`.
         configs: None,
+        host_mounts: None,
         name,
         spec: req.spec,
     };
