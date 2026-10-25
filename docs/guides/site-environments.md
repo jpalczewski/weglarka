@@ -50,6 +50,12 @@ A push of `ghcr.io/me/blog:main` deploys `blog-dev` only. A promote-only environ
 nothing for it. Until its first promotion its domain is reserved but answers `503`, and `weglarka doctor` warns
 (`sites.unpromoted`).
 
+The route switches from 503 to the site as soon as the release exists when a webhook, `weglarka promote`, `deploy` or
+`push` made it; a first release made by the periodic reconcile pass is picked up by the next ingress refresh, at most
+one `reconcile_interval_secs` later. Changing a `track` tag with `sites declare` takes effect on the next webhook or
+`weglarka deploy <site>-<env>`, not immediately. `weglarka apps list` shows an environment that has no release yet
+as `missing`; the `SITE` column and the `sites.unpromoted` check explain why.
+
 ## Promoting
 
 ```sh
