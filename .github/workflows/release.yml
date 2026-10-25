@@ -17,6 +17,9 @@ on:
 
 env:
   IMAGE: ghcr.io/jpalczewski/weglarka
+  # Same as ci.yml: RUSTFLAGS is part of rust-cache's key, so the linux leg below only shares the
+  # `musl-release` entry with the CI `musl` job when the value is identical.
+  RUSTFLAGS: -D warnings
 
 jobs:
   # The image is assembled from the binaries built once in `binaries` below (also the release assets):
@@ -116,7 +119,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.target }}
+          # The linux leg is the very same build as ci.yml's `musl` job on main (`--release` = `--profile
+          # release`), so both use one entry. This workflow is the single writer: both have identical
+          # `paths-ignore`, so they run on the same pushes, and the entry is written here because this
+          # run also covers tags. The macOS leg (tags only) keeps its own key.
+          shared-key: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'musl-release' || format('release-{0}', matrix.target) }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
       # Raw binaries for the image job (the very same files that go into the release tarball).
       - if: matrix.target == 'x86_64-unknown-linux-musl'
