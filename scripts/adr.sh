@@ -131,7 +131,9 @@ lint_cross_references() {
 
 # Every relative link in a Markdown file must resolve: the target file exists and, for `file.md#anchor`
 # or `#anchor`, the anchor matches a heading of that file. Duplicate "##"/"###" headings in one file are
-# rejected because they make anchors ambiguous. Every guide must be listed in docs/guides/README.md.
+# rejected because they make anchors ambiguous, except in the generated per-crate changelogs
+# (crates/*/CHANGELOG.md): release-plz repeats "### Added"/"### Fixed"/"### Other" under every version and nothing
+# links into them. Every guide must be listed in docs/guides/README.md.
 lint_doc_links() {
   local problems=0
   git ls-files -z --cached --others --exclude-standard -- '*.md' | perl -0 -CSD -e '
@@ -145,7 +147,7 @@ lint_doc_links() {
       while (<$fh>) {
         $fence = !$fence if /^```/;
         next if $fence;
-        if (/^(#{1,6}) /) { chomp; my $s = slug($_); $h{$s}++; $dups{$f}{$s} = 1 if /^#{2,3} / && $h{$s} > 1 }
+        if (/^(#{1,6}) /) { chomp; my $s = slug($_); $h{$s}++; $dups{$f}{$s} = 1 if /^#{2,3} / && $h{$s} > 1 && $f !~ m{^crates/[^/]+/CHANGELOG\.md$} }
       }
       return $slugs{$f} = \%h;
     }
