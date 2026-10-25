@@ -5,6 +5,7 @@
 //! deliberately not used. The account is created on first use and its credentials (which contain
 //! the account private key) are kept in a `0600` file outside the webroot and `tls/`.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -222,11 +223,35 @@ async fn drive<S: ChallengeSolver>(
     let policy = RetryPolicy::new().timeout(ORDER_TIMEOUT);
     let status = order.poll_ready(&policy).await.map_err(order_err)?;
     if status != OrderStatus::Ready {
-        return Err(AcmeError::Order(format!("order ended as {status:?}")));
+        let why = challenge_failures(order, &wanted).await;
+        return Err(AcmeError::Order(format!("order ended as {status:?}{why}")));
     }
     let key_pem = order.finalize().await.map_err(order_err)?;
     let chain_pem = order.poll_certificate(&policy).await.map_err(order_err)?;
     Ok((chain_pem, key_pem))
+}
+
+/// Why the CA rejected the challenges of a failed order, as `"; <name>: <detail>"` pieces (empty when
+/// the CA gave no reason or the authorizations cannot be fetched again).
+async fn challenge_failures(order: &mut instant_acme::Order, wanted: &ChallengeType) -> String {
+    let mut out = String::new();
+    let mut authorizations = order.authorizations();
+    while let Some(Ok(authz)) = authorizations.next().await {
+        for problem in authz
+            .challenges
+            .iter()
+            .filter(|c| c.r#type == *wanted)
+            .filter_map(|c| c.error.as_ref())
+        {
+            let _ = write!(
+                out,
+                "; {}: {}",
+                authz.identifier(),
+                problem.detail.as_deref().unwrap_or("no detail")
+            );
+        }
+    }
+    out
 }
 
 /// `notAfter` of the first (leaf) certificate of a PEM chain.
