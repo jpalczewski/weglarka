@@ -153,6 +153,13 @@ impl<P: PodmanClient> IngressManager<P> {
         let _ = self.cdn_ranges.set(ranges);
     }
 
+    /// The CDN trust the next `nginx.conf` renders (`None` without `[ingress.cdn]`).
+    pub fn cdn_trust(
+        &self,
+    ) -> Result<Option<weglarka_ingress::CdnTrust>, weglarka_ingress::IngressError> {
+        cdn_trust(&self.host, self.cdn_ranges.get().map(|r| &**r))
+    }
+
     /// The refresh state for `doctor`; `None` unless the ranges come from the provider.
     pub fn cdn_status(&self) -> Option<crate::cdn::CdnStatus> {
         self.cdn_ranges.get().map(|r| r.status())

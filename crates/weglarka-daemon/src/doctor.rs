@@ -1366,6 +1366,69 @@ fn ingress_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     });
 }
 
+/// `acme.cdn` (issue #159): a routed domain whose address lies in the CDN ranges is validated through
+/// the proxy, and unless a wildcard covers it (DNS-01 does not care about the proxy) its HTTP-01
+/// depends on the zone settings (`docs/guides/acme-behind-cdn.md`). A hint, not a failure.
+async fn acme_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_ingress::Cidr;
+
+    if d.host.ingress.cdn.is_none() || !d.host.acme.as_ref().is_some_and(|a| a.enabled) {
+        return;
+    }
+    let (Ok(Some(trust)), Some(domains)) = (d.ingress.cdn_trust(), routed_domains(d)) else {
+        return;
+    };
+    let wildcards = wildcard_apexes_on_disk(&d.ingress.tls_dir());
+    let mut proxied = Vec::new();
+    for domain in domains {
+        if wildcards
+            .iter()
+            .any(|apex| weglarka_core::config::wildcard_covers(apex, &domain))
+        {
+            continue;
+        }
+        let resolve = async {
+            tokio::net::lookup_host((domain.as_str(), 443))
+                .await
+                .map(Iterator::collect::<Vec<_>>)
+        };
+        let Ok(Ok(addresses)) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), resolve).await
+        else {
+            continue; // unresolvable here is `acme.certs`' business, not this hint's
+        };
+        let behind_cdn = addresses.into_iter().any(|a| {
+            a.ip()
+                .to_string()
+                .parse::<Cidr>()
+                .is_ok_and(|ip| trust.ranges.iter().any(|r| r.covers(&ip)))
+        });
+        if behind_cdn {
+            proxied.push(domain);
+        }
+    }
+    if proxied.is_empty() {
+        out.push(ok(
+            "acme.cdn",
+            "no routed domain without wildcard coverage resolves into the CDN ranges",
+        ));
+    } else {
+        out.push(check(
+            "acme.cdn",
+            CheckStatus::Warn,
+            format!(
+                "{} resolve{} into the CDN ranges and {} no wildcard certificate: HTTP-01 goes through the proxy",
+                proxied.join(", "),
+                if proxied.len() == 1 { "s" } else { "" },
+                if proxied.len() == 1 { "has" } else { "have" },
+            ),
+            Some(
+                "cover them with [acme.dns] wildcards, or follow docs/guides/acme-behind-cdn.md for the zone settings",
+            ),
+        ));
+    }
+}
+
 fn human_age(age: std::time::Duration) -> String {
     let hours = age.as_secs() / 3600;
     if hours >= 48 {
@@ -1510,6 +1573,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ingress_tls(d, out);
         ingress_client_ip(d, out).await;
         ingress_cdn(d, out);
+        acme_cdn(d, out).await;
     }
     // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {
