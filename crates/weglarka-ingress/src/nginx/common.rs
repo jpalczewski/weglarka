@@ -77,17 +77,25 @@ pub(super) fn write_upgrade_map(c: &mut Conf) {
     });
 }
 
-pub(super) fn write_log(c: &mut Conf, cdn: bool) {
+/// Where the access log takes the client address from.
+#[derive(Clone, Copy)]
+pub(super) enum ClientAddr {
+    /// `$remote_addr` is the client (`behind`, `edge` without a CDN).
+    Direct,
+    /// `edge` behind a CDN: `$weglarka_client` is the visitor, `$remote_addr` the CDN's address.
+    BehindCdn,
+}
+
+pub(super) fn write_log(c: &mut Conf, client: ClientAddr) {
     c.line("# App name for the access log; set in each `server`.");
     c.line("log_format weglarka escape=json");
     // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
-    let format = if cdn {
-        LOG_FORMAT.replace(
+    let format = match client {
+        ClientAddr::BehindCdn => LOG_FORMAT.replace(
             "\"remote_addr\":\"$remote_addr\"",
             "\"remote_addr\":\"$weglarka_client\",\"peer\":\"$remote_addr\"",
-        )
-    } else {
-        LOG_FORMAT.to_owned()
+        ),
+        ClientAddr::Direct => LOG_FORMAT.to_owned(),
     };
     c.line(&format!("    '{format}';"));
     c.line("access_log /dev/stdout weglarka;");
@@ -118,12 +126,26 @@ pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded) {
     c.line("add_header X-Request-Id $request_id always;");
 }
 
-pub(super) fn listen(c: &mut Conf, port: u16, default_server: bool) {
-    let suffix = if default_server {
+/// The `$app` value of a server that hosts no single app (several apps, or none).
+pub(super) const NO_APP: &str = "-";
+
+/// `set $app "<name>";`: the app name the access log attributes the server's requests to. Every
+/// `server` and, in shared servers, every app `location` goes through here.
+pub(super) fn set_app(c: &mut Conf, name: &str) {
+    c.line(&format!("set $app \"{name}\";"));
+}
+
+/// The `listen` parameter that makes a server the fallback for unknown `Host`/SNI values.
+fn default_server_suffix(default_server: bool) -> &'static str {
+    if default_server {
         " default_server"
     } else {
         ""
-    };
+    }
+}
+
+pub(super) fn listen(c: &mut Conf, port: u16, default_server: bool) {
+    let suffix = default_server_suffix(default_server);
     c.line(&format!("listen {port}{suffix};"));
 }
 
@@ -132,11 +154,7 @@ pub(super) fn listen(c: &mut Conf, port: u16, default_server: bool) {
 pub(super) fn listen_edge_plain(c: &mut Conf, o: &NginxOptions, default_server: bool) {
     listen(c, o.listen_port, default_server);
     if let Some(dir) = &o.proxy_socket_dir {
-        let suffix = if default_server {
-            " default_server"
-        } else {
-            ""
-        };
+        let suffix = default_server_suffix(default_server);
         c.line(&format!(
             "listen unix:{dir}/{PLAIN_SOCKET}{suffix} proxy_protocol;"
         ));
@@ -146,11 +164,7 @@ pub(super) fn listen_edge_plain(c: &mut Conf, o: &NginxOptions, default_server: 
 /// `listen` of an `edge` TLS server (`default_server` for the certificate-less one); see
 /// [`listen_edge_plain`].
 pub(super) fn listen_edge_tls(c: &mut Conf, o: &NginxOptions, default_server: bool) {
-    let suffix = if default_server {
-        " default_server"
-    } else {
-        ""
-    };
+    let suffix = default_server_suffix(default_server);
     c.line(&format!("listen {} ssl{suffix};", o.https_listen_port));
     if let Some(dir) = &o.proxy_socket_dir {
         c.line(&format!(
@@ -164,7 +178,7 @@ pub(super) fn write_default_server(c: &mut Conf, o: &NginxOptions) {
     c.block("server", |c| {
         listen_edge_plain(c, o, true);
         c.line("server_name _;");
-        c.line("set $app \"-\";");
+        set_app(c, NO_APP);
         c.line("return 444;");
     });
 }

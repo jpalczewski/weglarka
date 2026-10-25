@@ -35,7 +35,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(c, false);
+        write_log(c, ClientAddr::Direct);
         c.blank();
         write_proxy_headers(c, &BEHIND_FORWARDED);
         c.blank();
@@ -48,7 +48,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.line(&format!("server_name {};", plan.webhook.domain));
             // `set` before the redirect: rewrite directives run in order, and the access log needs
             // `$app` also for the 301.
-            c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
+            set_app(c, WEBHOOK_UPSTREAM_HOST);
             behind_redirect(c);
             write_webhook_body(c, plan, o);
         });
@@ -78,14 +78,14 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
                 // One app: known up front, so the redirect is attributed too. Several: each
                 // `location` sets its own and the redirect logs `-`.
                 let shared = apps.len() > 1;
-                c.line(&format!(
-                    "set $app \"{}\";",
+                set_app(
+                    c,
                     if shared {
-                        "-"
+                        NO_APP
                     } else {
                         apps[0].instance.as_str()
-                    }
-                ));
+                    },
+                );
                 behind_redirect(c);
                 write_app_locations(c, o, apps, shared);
             });

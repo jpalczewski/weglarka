@@ -3,6 +3,7 @@
 use weglarka_core::app::AppIngress;
 
 use super::NginxOptions;
+use super::common::set_app;
 use super::conf::Conf;
 use crate::plan::{AppRoute, PathPrefix};
 
@@ -66,7 +67,7 @@ impl Backend<'_> {
     fn write_location(&self, c: &mut Conf, location: &Location<'_>, ingress: &AppIngress) {
         c.block(&location.header, |c| {
             if let Some(app) = location.app {
-                c.line(&format!("set $app \"{app}\";"));
+                set_app(c, app);
             }
             self.write_upstream(c, location.strip.as_ref());
             write_body_limit(c, ingress);
