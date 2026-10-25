@@ -95,7 +95,7 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `registry → core`;
+Zależności: `api → core`; `podman → core`; `ingress → core`; `notify → core`; `registry → core`; `acme → core`;
 `cli → api, core`; `daemon → wszystko`.
 
 | Crate | Zawartość |
@@ -105,6 +105,7 @@ Zależności: `api → core`; `podman → core`; `ingress → core`; `notify →
 | `weglarka-ingress` | czyste generatory `nginx.conf` (`behind` i `edge`) i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), własny klient HTTP/TLS (rustls + webpki-roots) |
 | `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); własny minimalny klient HTTP/TLS, `FakeRegistry`/`TestSigner` (feature `testing`) |
+| `weglarka-acme` | silnik ACME dla trybu `edge` (#96, ADR 0038): `CertSpec`/`CertId` (certyfikat = lista nazw, plik z id), trait `ChallengeSolver` (`Http01Solver`; DNS-01 = #97), `AcmeClient`/`CertInspector`, `CertStore` (klucz 0600 przed certem 0644, atomowo), czyste `renewal::decide`, `Manager::pass`; `FakeAcme` (feature `testing`); klient `instant-acme`, `[acme]` i wiring w demonie dochodzą w kolejnych PR-ach |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
 | `weglarka-daemon` | demon: admin API (unix socket, w tym `GET /v1/health`), webhooki, zapis ingressu, `Platform` systemd (quadlet + timery samoaktualizacji i watchdoga), worker powiadomień, host-side `self-update` i `supervise` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
