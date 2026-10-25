@@ -25,12 +25,12 @@
 //! variant) and the two renderers, which share the location/log/scaffolding helpers, so a third mode
 //! only has to write its own `server` blocks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
-use weglarka_core::config::{HostConfig, IngressMode};
+use weglarka_core::config::{HostConfig, IngressMode, wildcard_cert_stem, wildcard_covers};
 
 use crate::plan::{AppRoute, Cidr, Domain, IngressError, PathPrefix, Plan, WEBHOOK_UPSTREAM_HOST};
 
@@ -66,6 +66,10 @@ pub struct NginxOptions {
     /// `edge`: domains with a certificate pair in [`Self::cert_dir`]. A routed domain missing here
     /// gets a plain-HTTP server (redirect + ACME) but no TLS server.
     pub certificates: Vec<Domain>,
+    /// `edge`: apex domains with a wildcard pair (`_wildcard.<apex>.crt|key`, issue #97). A routed
+    /// domain without a pair of its own is served with the wildcard of the apex that covers it (the
+    /// apex itself or one label below, [`wildcard_covers`]); a domain's own pair always wins.
+    pub wildcard_certificates: Vec<Domain>,
     /// `edge`: container path of the TLS material, mounted read-only (default [`CERT_CONTAINER_DIR`]).
     pub cert_dir: String,
     /// `edge`: container path of the ACME webroot (default [`ACME_CONTAINER_DIR`]).
@@ -77,6 +81,20 @@ pub struct NginxOptions {
 }
 
 impl NginxOptions {
+    /// File stem (`<domain>` or `_wildcard.<apex>`) of the certificate pair `domain` is served with
+    /// in `edge`: its own pair first, else the wildcard of the longest covering apex. `None` = no
+    /// TLS server for the domain (its handshake is refused, fail closed).
+    pub fn certificate_stem(&self, domain: &Domain) -> Option<String> {
+        if self.certificates.contains(domain) {
+            return Some(domain.to_string());
+        }
+        self.wildcard_certificates
+            .iter()
+            .filter(|apex| wildcard_covers(apex.as_str(), domain.as_str()))
+            .max_by_key(|apex| apex.as_str().len())
+            .map(|apex| wildcard_cert_stem(apex.as_str()))
+    }
+
     pub fn new(resolvers: Vec<IpAddr>) -> Self {
         Self {
             resolvers,
@@ -87,6 +105,7 @@ impl NginxOptions {
             webhook_max_body_bytes: 1024 * 1024,
             app_max_body_bytes: 64 * 1024 * 1024,
             certificates: Vec::new(),
+            wildcard_certificates: Vec::new(),
             cert_dir: CERT_CONTAINER_DIR.to_owned(),
             acme_webroot: ACME_CONTAINER_DIR.to_owned(),
             tls_fingerprint: None,
@@ -613,7 +632,6 @@ fn behind_prelude(c: &mut Conf, o: &NginxOptions) {
 /// redirects (ACME token requests excepted); the TLS listener has one `server` per domain, because
 /// nginx picks the server — and therefore the certificate — by SNI.
 fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
-    let certificates: BTreeSet<&Domain> = o.certificates.iter().collect();
     let mut c = Conf::default();
     write_preamble(&mut c, o.tls_fingerprint.as_deref());
     c.block("http", |c| {
@@ -658,10 +676,10 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
             write_plain_http_body(c, o);
         });
-        if certificates.contains(&plan.webhook.domain) {
+        if let Some(stem) = o.certificate_stem(&plan.webhook.domain) {
             c.blank();
             c.block("server", |c| {
-                write_tls_listener(c, o, &plan.webhook.domain);
+                write_tls_listener(c, o, &stem);
                 c.line(&format!("server_name {};", plan.webhook.domain));
                 c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
                 write_webhook_body(c, plan, o);
@@ -690,12 +708,12 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
                 c.line(&format!("set $app \"{app_name}\";"));
                 write_plain_http_body(c, o);
             });
-            if !certificates.contains(domain) {
+            let Some(stem) = o.certificate_stem(domain) else {
                 continue;
-            }
+            };
             c.blank();
             c.block("server", |c| {
-                write_tls_listener(c, o, domain);
+                write_tls_listener(c, o, &stem);
                 c.line(&format!("server_name {domain};"));
                 c.line(&format!("set $app \"{app_name}\";"));
                 write_app_locations(c, o, &apps, shared);
@@ -720,11 +738,12 @@ fn write_plain_http_body(c: &mut Conf, o: &NginxOptions) {
     });
 }
 
-fn write_tls_listener(c: &mut Conf, o: &NginxOptions, domain: &Domain) {
+/// `stem` is the certificate file stem from [`NginxOptions::certificate_stem`].
+fn write_tls_listener(c: &mut Conf, o: &NginxOptions, stem: &str) {
     c.line(&format!("listen {} ssl;", o.https_listen_port));
     c.line("http2 on;");
-    c.line(&format!("ssl_certificate {}/{domain}.crt;", o.cert_dir));
-    c.line(&format!("ssl_certificate_key {}/{domain}.key;", o.cert_dir));
+    c.line(&format!("ssl_certificate {}/{stem}.crt;", o.cert_dir));
+    c.line(&format!("ssl_certificate_key {}/{stem}.key;", o.cert_dir));
 }
 
 fn join_domains(domains: &[Domain]) -> String {

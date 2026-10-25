@@ -93,9 +93,15 @@ convention `tls/_wildcard.<apex>.crt|key`.
    certificates, on the same store and the same pass. An unusable token file is a startup error (opt-in, but
    once configured a silent skip would hide a broken deployment). The wildcard certificates are issued and
    renewed but **not served yet**: every routed domain keeps its own HTTP-01 certificate until step 4.
-4. A separate change for ingress: map a routed domain to its certificate (exact `<domain>.crt` first, then
-   a one-label wildcard `*.<apex>`; the apex itself is not covered), which touches the certificate scan in
-   the daemon and the `edge` generator and its snapshots; `behind` stays byte-for-byte unchanged.
+4. **Serving the wildcards** (done): the ingress maps a routed domain to its certificate — its own pair
+   first, then the wildcard pair of the longest apex that covers it (`wildcard_covers`: the apex itself or
+   exactly one label below; `NginxOptions::certificate_stem` in the generator, the daemon's `tls/` scan finds
+   `_wildcard.<apex>` pairs and fingerprints them). A domain with no pair still gets no TLS server (fail
+   closed), `behind` is byte for byte unchanged and the existing `edge` snapshots did not move. The ACME
+   worker runs the wildcard manager first and skips the HTTP-01 certificate of a domain that has none of its
+   own and is covered by a valid wildcard on disk; a domain that already has its own pair keeps being renewed
+   (nginx prefers it, so it must not expire), and a failed or expired wildcard falls back to per-domain
+   issuance. `doctor` (`acme.certs`, `ingress.tls`) and the CLI preflight count a covered domain as served.
 5. Doctor `acme.dns` and `acme.wildcards` and `docs/install.md` 6s (done with step 3); a CAA check and the opt-in
    live test on a development zone remain.
 

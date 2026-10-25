@@ -489,3 +489,100 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     std::fs::remove_file(tls.join("h.example.eu.crt")).unwrap();
     assert_eq!(action(manager.apply().await), None);
 }
+
+/// `edge` (issue #97): a wildcard pair (`_wildcard.<apex>.crt|key`) in the TLS directory serves the
+/// covered domains; it is picked up like any certificate (reload, never a recreate), and a stray or
+/// half-present pair serves nothing.
+#[tokio::test]
+async fn edge_serves_covered_domains_with_a_wildcard_pair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let host = HostConfig::from_toml_str(&format!(
+        "[ingress]\nmode=\"edge\"\nbind=\"127.0.0.1:18080\"\nhttps_bind=\"127.0.0.1:18443\"\n[admin]\nsocket=\"{}/a.sock\"\n[webhook]\nlisten=\"127.0.0.1:0\"\ndomain=\"h.example.eu\"\n",
+        root.display()
+    ))
+    .unwrap();
+    host.validate().unwrap();
+    let paths = StatePaths::in_dir(root);
+    let fake = FakePodman::new();
+    let engine = Arc::new(Reconciler::new(
+        fake.clone(),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        paths.clone(),
+        ReconcilerOptions::default(),
+    ));
+    let manager = IngressManager::new(engine, host, root.join("nginx"));
+    let reloaded = |r: Result<ApplyReport, _>| {
+        matches!(
+            r.unwrap(),
+            ApplyReport::Changed {
+                nginx: NginxAction::Reloaded,
+                ..
+            }
+        )
+    };
+    manager.apply().await.unwrap();
+    let nginx_id = fake.container_inspect("weglarka-nginx").await.unwrap().id;
+    let tls = manager.tls_dir();
+    let write_file = |name: &str| {
+        let path = tls.join(name);
+        std::fs::write(&path, "pem\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    let conf = || std::fs::read_to_string(manager.conf_path()).unwrap();
+
+    // A wildcard for another apex covers nothing; so do half a pair and names that are no apex.
+    write_file("_wildcard.example.org.crt");
+    write_file("_wildcard.example.org.key");
+    write_file("_wildcard.example.eu.crt"); // no key yet
+    write_file("_wildcard..crt");
+    write_file("_wildcard.Not A Domain.crt");
+    write_file("_wildcard.Not A Domain.key");
+    manager.apply().await.unwrap();
+    assert!(!conf().contains("h.example.eu.crt"), "{}", conf());
+    assert!(
+        !conf().contains("ssl_certificate /etc/nginx/tls/h.example.eu"),
+        "{}",
+        conf()
+    );
+
+    // The matching pair appears: the webhook domain (one label below the apex) is served with it.
+    write_file("_wildcard.example.eu.key");
+    assert!(reloaded(manager.apply().await));
+    let c = conf();
+    assert!(
+        c.contains("ssl_certificate /etc/nginx/tls/_wildcard.example.eu.crt;"),
+        "{c}"
+    );
+    assert!(
+        c.contains("ssl_certificate_key /etc/nginx/tls/_wildcard.example.eu.key;"),
+        "{c}"
+    );
+    assert!(!c.contains("example.org"), "{c}");
+    assert_eq!(
+        fake.container_inspect("weglarka-nginx").await.unwrap().id,
+        nginx_id,
+        "a wildcard never recreates the container"
+    );
+    assert_eq!(manager.apply().await.unwrap(), ApplyReport::Unchanged);
+
+    // The domain's own pair wins over the wildcard.
+    write_file("h.example.eu.crt");
+    write_file("h.example.eu.key");
+    assert!(reloaded(manager.apply().await));
+    let c = conf();
+    assert!(
+        c.contains("ssl_certificate /etc/nginx/tls/h.example.eu.crt;"),
+        "{c}"
+    );
+    assert!(!c.contains("_wildcard.example.eu.crt"), "{c}");
+
+    // Without the wildcard key the (own-pair-less) domain loses TLS again.
+    std::fs::remove_file(tls.join("h.example.eu.crt")).unwrap();
+    std::fs::remove_file(tls.join("h.example.eu.key")).unwrap();
+    std::fs::remove_file(tls.join("_wildcard.example.eu.key")).unwrap();
+    assert!(reloaded(manager.apply().await));
+    assert!(!conf().contains("ssl_certificate "), "{}", conf());
+}

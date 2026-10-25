@@ -1055,9 +1055,16 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let window = std::time::Duration::from_secs(config.renew_before_days * 24 * 3600);
     let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
     let mut soonest: Option<u64> = None;
+    let wildcards: &[String] = config.dns.as_ref().map_or(&[], |dns| &dns.wildcards);
+    let mut covered = 0usize;
     for domain in &domains {
         let Ok(chain) = std::fs::read(tls.join(format!("{domain}.crt"))) else {
-            missing.push(domain.as_str());
+            // No certificate of its own: fine when a valid wildcard serves it (issue #97).
+            if crate::acme::valid_covering_wildcard(&tls, wildcards, domain, now) {
+                covered += 1;
+            } else {
+                missing.push(domain.as_str());
+            }
             continue;
         };
         match weglarka_acme::chain_not_after(&chain) {
@@ -1093,9 +1100,15 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             "acme.certs",
             match soonest {
                 Some(days) => format!(
-                    "{} certificate(s), the nearest expires in {days} days",
-                    domains.len()
+                    "{} certificate(s){}, the nearest expires in {days} days",
+                    domains.len() - covered,
+                    if covered > 0 {
+                        format!(" and {covered} domain(s) served by a wildcard")
+                    } else {
+                        String::new()
+                    }
                 ),
+                None if covered > 0 => format!("{covered} domain(s) served by a wildcard"),
                 None => "no routed domains".to_owned(),
             },
         ));
@@ -1228,11 +1241,16 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Some(domains) = routed_domains(d) else {
         return; // `state.apps` already reports this
     };
+    // A wildcard pair on disk (`_wildcard.<apex>.crt|key`) serves the apex and one label below it.
+    let wildcards = wildcard_apexes_on_disk(&tls);
     let missing: Vec<&str> = domains
         .iter()
         .filter(|domain| {
-            !(tls.join(format!("{domain}.crt")).is_file()
-                && tls.join(format!("{domain}.key")).is_file())
+            let own = tls.join(format!("{domain}.crt")).is_file()
+                && tls.join(format!("{domain}.key")).is_file();
+            !own && !wildcards
+                .iter()
+                .any(|apex| weglarka_core::config::wildcard_covers(apex, domain))
         })
         .map(String::as_str)
         .collect();
@@ -1258,6 +1276,28 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             }),
         ));
     }
+}
+
+/// Apexes with a wildcard pair (`_wildcard.<apex>.crt` + `.key`, regular files) in `tls`.
+fn wildcard_apexes_on_disk(tls: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(tls) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let apex = name
+                .strip_suffix(".crt")?
+                .strip_prefix(weglarka_core::config::WILDCARD_CERT_PREFIX)?
+                .to_owned();
+            let key = tls.join(format!(
+                "{}{apex}.key",
+                weglarka_core::config::WILDCARD_CERT_PREFIX
+            ));
+            (entry.path().is_file() && key.is_file()).then_some(apex)
+        })
+        .collect()
 }
 
 fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

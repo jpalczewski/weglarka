@@ -575,6 +575,90 @@ fn nginx_edge_paths_snapshot() {
     insta::assert_snapshot!("nginx_edge_paths", conf);
 }
 
+/// `edge` options with wildcard pairs (`_wildcard.<apex>.crt|key`) next to the per-domain ones.
+fn edge_wildcard_opts(certificates: &[&str], wildcards: &[&str]) -> NginxOptions {
+    let mut o = edge_opts(certificates);
+    o.wildcard_certificates = wildcards.iter().map(|d| Domain::new(*d).unwrap()).collect();
+    o
+}
+
+#[test]
+fn nginx_edge_wildcard_snapshot() {
+    // `example.eu` wildcard + the own pair of `blog.example.eu` (which must win over it).
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(MANY_APPS),
+        &edge_wildcard_opts(&["blog.example.eu"], &["example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_wildcard", conf);
+}
+
+#[test]
+fn edge_serves_a_covered_domain_with_the_wildcard_and_prefers_its_own_pair() {
+    let conf = nginx::generate(
+        &edge_host(),
+        &apps(MANY_APPS),
+        &edge_wildcard_opts(&["blog.example.eu"], &["example.eu"]),
+    )
+    .unwrap();
+    // The apex and one label below are covered; the webhook domain too.
+    for domain in ["example.eu", "nz.example.eu", "weglarka.example.eu"] {
+        let tls = tls_server(&conf, domain);
+        assert!(
+            tls.contains("ssl_certificate /etc/nginx/tls/_wildcard.example.eu.crt;"),
+            "{domain}: {tls}"
+        );
+        assert!(
+            tls.contains("ssl_certificate_key /etc/nginx/tls/_wildcard.example.eu.key;"),
+            "{domain}: {tls}"
+        );
+    }
+    // An own pair always wins over a wildcard.
+    let own = tls_server(&conf, "blog.example.eu");
+    assert!(own.contains("/etc/nginx/tls/blog.example.eu.crt;"), "{own}");
+    assert!(!own.contains("_wildcard"), "{own}");
+    // Two labels below the apex are not covered: no TLS server, plain HTTP still redirects.
+    assert!(
+        !conf.contains("ssl_certificate /etc/nginx/tls/www.blog.example.eu.crt"),
+        "{conf}"
+    );
+    assert!(
+        !conf
+            .split("    server {\n")
+            .skip(1)
+            .any(|b| b.contains(" ssl;") && b.contains("server_name www.blog.example.eu;")),
+        "www.blog.example.eu is two labels below the apex"
+    );
+    assert!(
+        server_block(&conf, "www.blog.example.eu")
+            .contains("return 301 https://$host$request_uri;")
+    );
+}
+
+#[test]
+fn certificate_stem_picks_own_pair_then_the_longest_covering_wildcard() {
+    let o = edge_wildcard_opts(&["own.example.eu"], &["example.eu", "dev.example.eu"]);
+    let stem = |d: &str| o.certificate_stem(&Domain::new(d).unwrap());
+    assert_eq!(stem("own.example.eu").as_deref(), Some("own.example.eu"));
+    assert_eq!(
+        stem("a.example.eu").as_deref(),
+        Some("_wildcard.example.eu")
+    );
+    assert_eq!(stem("example.eu").as_deref(), Some("_wildcard.example.eu"));
+    // `dev.example.eu` is covered by both: the more specific apex wins.
+    assert_eq!(
+        stem("dev.example.eu").as_deref(),
+        Some("_wildcard.dev.example.eu")
+    );
+    assert_eq!(
+        stem("x.dev.example.eu").as_deref(),
+        Some("_wildcard.dev.example.eu")
+    );
+    assert_eq!(stem("a.b.example.eu"), None);
+    assert_eq!(stem("example.org"), None);
+}
+
 /// The `server { … }` block of `domain` that listens on TLS.
 fn tls_server(conf: &str, domain: &str) -> String {
     let block = conf

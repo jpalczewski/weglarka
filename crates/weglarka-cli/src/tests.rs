@@ -397,6 +397,45 @@ fn preflight_edge_reports_missing_certificates_as_a_warning() {
 }
 
 #[test]
+fn preflight_edge_accepts_a_wildcard_pair_for_the_domains_it_covers() {
+    // `weglarka.example.eu` has no pair of its own, but `[acme.dns]` lists `example.eu` and the
+    // wildcard pair `_wildcard.example.eu` is on disk and readable (issue #97).
+    let cfg = format!(
+        "{EDGE_CONFIG}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n\
+         token_file = \"/var/lib/weglarka/cf-token\"\nwildcards = [\"example.eu\"]\n"
+    );
+    let with_wildcard = FakeHost::healthy()
+        .stat(
+            "/etc/weglarka/nginx/tls/_wildcard.example.eu.crt",
+            FileKind::File,
+            0o600,
+            1001,
+            1001,
+        )
+        .stat(
+            "/etc/weglarka/nginx/tls/_wildcard.example.eu.key",
+            FileKind::File,
+            0o600,
+            1001,
+            1001,
+        );
+    let status = |host: &FakeHost| {
+        report(host, Some(&cfg))
+            .checks
+            .into_iter()
+            .find(|c| c.id == "ingress.tls")
+            .expect("ingress.tls")
+            .status
+    };
+    assert_eq!(status(&with_wildcard), weglarka_api::CheckStatus::Ok);
+    // Without the wildcard pair on disk the domain is missing a certificate again.
+    assert_eq!(
+        status(&FakeHost::healthy()),
+        weglarka_api::CheckStatus::Warn
+    );
+}
+
+#[test]
 fn preflight_edge_requires_the_sysctl_for_privileged_ports() {
     let cfg = EDGE_CONFIG
         .replace(

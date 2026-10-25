@@ -440,6 +440,26 @@ pub struct AcmeDnsConfig {
     pub wildcards: Vec<String>,
 }
 
+/// File-stem prefix of a wildcard certificate in the TLS directory: `_wildcard.<apex>.crt|key`
+/// (a literal `*` never reaches a file name, `docs/decisions/0038`).
+pub const WILDCARD_CERT_PREFIX: &str = "_wildcard.";
+
+/// The file stem of the wildcard certificate of `apex`.
+pub fn wildcard_cert_stem(apex: &str) -> String {
+    format!("{WILDCARD_CERT_PREFIX}{apex}")
+}
+
+/// Whether the wildcard certificate of `apex` (`*.<apex>` plus `<apex>`) covers `domain`: the apex
+/// itself or exactly one label below it (`a.example.eu`, not `a.b.example.eu`). Both arguments are
+/// lower-case domain names.
+pub fn wildcard_covers(apex: &str, domain: &str) -> bool {
+    domain == apex
+        || domain
+            .strip_suffix(apex)
+            .and_then(|rest| rest.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+}
+
 impl AcmeDnsConfig {
     /// Lower-case DNS name of at least two labels (`[a-z0-9-]`, no wildcard, no trailing dot).
     fn valid_apex(apex: &str) -> bool {
@@ -1195,6 +1215,24 @@ domain = "weglarka.descriptortable.eu"
             "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n{extra}"
         );
         HostConfig::from_toml_str(&src).is_err()
+    }
+
+    #[test]
+    fn a_wildcard_covers_its_apex_and_exactly_one_label_below() {
+        assert!(wildcard_covers("example.eu", "example.eu"));
+        assert!(wildcard_covers("example.eu", "app.example.eu"));
+        assert!(wildcard_covers("example.eu", "pr-42.example.eu"));
+        for no in [
+            "a.b.example.eu",
+            "xexample.eu",
+            "example.eu.evil.org",
+            "app.example.org",
+            "eu",
+            ".example.eu",
+        ] {
+            assert!(!wildcard_covers("example.eu", no), "{no}");
+        }
+        assert_eq!(wildcard_cert_stem("example.eu"), "_wildcard.example.eu");
     }
 
     #[test]
