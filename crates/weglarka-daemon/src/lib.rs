@@ -230,6 +230,7 @@ pub async fn start<P: PodmanClient + 'static>(
     let options = ReconcilerOptions {
         config_root: paths.config_root.clone(),
         host_mounts: host.runtime.host_mounts.clone(),
+        group_add: host.runtime.group_add.clone(),
         dependency_wait_secs: host
             .runtime
             .dependency_wait_secs

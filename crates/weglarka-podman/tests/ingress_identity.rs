@@ -139,6 +139,7 @@ impl Env {
                 resources: Default::default(),
                 healthcheck: None,
                 id_mapping: Some(mapping),
+                keep_groups: false,
                 security: Default::default(),
             })
             .await

@@ -217,6 +217,11 @@ pub struct ContainerSpec {
     pub healthcheck: Option<ContainerHealthcheck>,
     /// Explicit uid/gid maps; replaces `userns_auto` when set (iteration 2).
     pub id_mapping: Option<IdMapping>,
+    /// Keep the Podman user's own supplementary groups inside the container (crun's
+    /// `run.oci.keep_original_groups`, the `--group-add keep-groups` of the CLI; ADR 0045). All
+    /// groups, not a chosen one; access checks use the host gids even though the container shows
+    /// them as `nobody`.
+    pub keep_groups: bool,
     /// Hardening from the spec (read-only root, tmpfs, capabilities, no-new-privileges).
     pub security: crate::app::Security,
 }
@@ -623,6 +628,7 @@ mod fake_tests {
             resources: Resources::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         }
     }

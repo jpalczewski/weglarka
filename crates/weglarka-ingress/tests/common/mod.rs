@@ -68,6 +68,7 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         // Host config mounts and the reload signal (issue #118) do not affect ingress generation.
         configs: vec![],
         host_mounts: vec![],
+        group_add: vec![],
         reload_signal: None,
     };
     spec.domains.shrink_to_fit();

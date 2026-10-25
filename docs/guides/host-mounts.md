@@ -35,15 +35,30 @@ in the path is refused, so what you approved is what is mounted. A failing mount
 container stays) and fails a deploy before the old container is touched. `weglarka apps show alloy` prints a
 `[host_mounts]` block and `weglarka doctor` reports `host_mounts.apps`.
 
-**4. Journal groups.** Journal files are `root:systemd-journal 0640`, so a path alone is not enough to read them. The group
-half of this feature (`group_add`) is not available yet; it is waiting for a measurement of rootless Podman with an
-explicit user-namespace mapping ([ADR 0045](../decisions/0045-host-mounts.md), "Open").
+**4. Journal groups.** Journal files are `root:systemd-journal 0640`, so the app also needs the group. Allowlist the name and
+request it:
 
-Changing `host_mounts` of an app recreates its container; changing the allowlist alone recreates nothing.
+```toml
+[runtime]
+group_add = ["systemd-journal"]
+```
+
+```sh
+sudo usermod -aG systemd-journal weglarka          # the runtime user must be a member
+systemctl --user -M weglarka@ restart podman.socket weglarka.service   # long-lived user services keep their old groups
+weglarka apps update alloy --group-add systemd-journal
+```
+
+`group_add` makes the container keep **all** supplementary groups of the runtime user (crun `keep-groups`); the name
+list is a gate, not a selector. Keep the runtime user out of groups apps do not need. Inside the container the group
+shows as `nobody`, which is expected. A numeric gid does not work in a mapped user namespace, hence names only. The
+daemon image has no `/etc/group`, so `doctor` cannot verify the membership: check `id weglarka`.
+
+Changing `host_mounts` or `group_add` of an app recreates its container; changing an allowlist alone recreates nothing.
 
 ## Rollback
 
 `apps.toml` now carries `schema_version = 8` and `weglarka.toml` has `deny_unknown_fields`. Before downgrading to an older
-daemon, remove `host_mounts` from the apps and `[runtime] host_mounts` from `weglarka.toml`, and remove the
+daemon, remove `host_mounts` and `group_add` from the apps and `[runtime] host_mounts`/`group_add` from `weglarka.toml`, and remove the
 `schema_version` line from `apps.toml` and `state.toml` — or restore both files from a backup taken before the upgrade
 (see [state schema version](state-schema.md)).

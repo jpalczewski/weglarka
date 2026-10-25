@@ -236,6 +236,8 @@ pub struct ReconcilerOptions {
     /// Allowlist for apps' `host_mounts` (`[runtime] host_mounts`, issue #178); empty = no app may
     /// mount a host path.
     pub host_mounts: Vec<PathBuf>,
+    /// Allowlist for apps' `group_add` (`[runtime] group_add`, issue #178).
+    pub group_add: Vec<String>,
 }
 
 impl Default for ReconcilerOptions {
@@ -246,6 +248,7 @@ impl Default for ReconcilerOptions {
             dependency_wait_secs: 10,
             config_root: None,
             host_mounts: Vec::new(),
+            group_add: Vec::new(),
         }
     }
 }

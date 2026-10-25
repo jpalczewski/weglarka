@@ -44,7 +44,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 5 | #130 | `paths` and `ingress.strip_prefix` | [0031](../decisions/0031-path-prefix-routing.md) | [path routing](path-routing.md) |
 | 6 | — | optional `ingress.max_body_size` | [0033](../decisions/0033-ingress-max-body-size.md) | [max body size](max-body-size.md) |
 | 7 | #55 | optional `uid`/`gid` on a mounted secret | [0037](../decisions/0037-secret-mount-ownership.md) | [first app](first-app.md) |
-| 8 | #178 | `host_mounts` in app specs (with `[runtime] host_mounts` in `weglarka.toml`) | [0045](../decisions/0045-host-mounts.md) | [host mounts](host-mounts.md) |
+| 8 | #178 | `host_mounts` and `group_add` in app specs (with `[runtime] host_mounts`/`group_add` in `weglarka.toml`) | [0045](../decisions/0045-host-mounts.md) | [host mounts](host-mounts.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

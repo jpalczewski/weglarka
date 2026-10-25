@@ -465,6 +465,8 @@ pub(crate) fn validate_config_mounts<P: PodmanClient>(
     // bad one is a 400 now instead of a blocked app later.
     weglarka_core::host_mounts::check_allowed(&d.host.runtime.host_mounts, spec)
         .map_err(|e| Fail::invalid(e.to_string()))?;
+    weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec)
+        .map_err(|e| Fail::invalid(e.to_string()))?;
     if spec.configs.is_empty() || d.paths.config_root.is_some() {
         return Ok(());
     }

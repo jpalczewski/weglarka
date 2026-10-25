@@ -1911,6 +1911,30 @@ async fn host_mounts_are_read_only_and_need_the_allowlist() {
     assert!(h.fake.container_spec("alloy").is_none());
 }
 
+/// `group_add` makes the container keep the runtime user's groups, and only when the operator
+/// allowlisted the name (issue #178).
+#[tokio::test(start_paused = true)]
+async fn group_add_needs_the_allowlist_and_sets_keep_groups() {
+    let apps = "[apps.alloy]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n\
+                health = { attempts = 1, window_secs = 1 }\ngroup_add = [\"systemd-journal\"]\n";
+    let h = Harness::with_options(
+        apps,
+        ReconcilerOptions {
+            group_add: vec!["systemd-journal".into()],
+            ..Default::default()
+        },
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert!(h.fake.container_spec("alloy").unwrap().keep_groups);
+
+    let h = Harness::new(apps);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    assert!(!h.rec.reconcile().await.unwrap().is_clean());
+    assert!(h.fake.container_spec("alloy").is_none());
+}
+
 /// A broken config fails the deploy **before** the old container is touched: no stop, no remove, no
 /// rollback that would only bring back the same broken spec.
 #[tokio::test(start_paused = true)]

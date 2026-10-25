@@ -88,6 +88,9 @@ struct HashInput<'a> {
     /// Sorted and skipped while empty, so an app without them hashes exactly as before.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     host_mounts: Vec<&'a crate::app::HostMount>,
+    /// Requested supplementary groups (issue #178); sorted, skipped while empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    group_add: Vec<&'a str>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -155,6 +158,9 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
     configs.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
     let mut host_mounts: Vec<&crate::app::HostMount> = spec.host_mounts.iter().collect();
     host_mounts.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    let mut group_add: Vec<&str> = spec.group_add.iter().map(String::as_str).collect();
+    group_add.sort_unstable();
+    group_add.dedup();
     let mut shared_networks: Vec<HashSharedNetwork> = spec
         .shared_networks
         .iter()
@@ -185,6 +191,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         command: &spec.command,
         configs,
         host_mounts,
+        group_add,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -590,6 +597,22 @@ env = { B = "2", A = "1" }
             "the source is part of the mount"
         );
         assert_ne!(with("/etc/machine-id", "/a"), with("/etc/machine-id", "/b"));
+    }
+
+    #[test]
+    fn group_add_recreates_but_order_and_absence_do_not() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let with = |groups: &[&str]| {
+            let mut s = spec();
+            s.group_add = groups.iter().map(|g| (*g).to_owned()).collect();
+            spec_hash(&s, &digest('a'))
+        };
+        assert_eq!(base, with(&[]));
+        assert_ne!(base, with(&["systemd-journal"]));
+        assert_eq!(
+            with(&["adm", "systemd-journal"]),
+            with(&["systemd-journal", "adm"])
+        );
     }
 
     fn mounting(uid: Option<u32>, gid: Option<u32>) -> AppSpec {

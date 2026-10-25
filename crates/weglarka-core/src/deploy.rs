@@ -152,6 +152,8 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut mounts =
             crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
                 .map_err(|e| EngineError::Configs(e.to_string()))?;
+        crate::host_mounts::check_groups(&self.options.group_add, spec)
+            .map_err(|e| EngineError::Configs(e.to_string()))?;
         mounts.extend(
             crate::host_mounts::resolve_all(&self.options.host_mounts, spec)
                 .map_err(|e| EngineError::Configs(e.to_string()))?,
@@ -486,6 +488,7 @@ impl<P: PodmanClient> Reconciler<P> {
             // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
             // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
             mounts: config_binds(&configs),
+            keep_groups: !spec.group_add.is_empty(),
             volumes: vec![],
             resources: spec.resources.clone(),
             healthcheck: crate::limits::container_healthcheck(&spec.health),

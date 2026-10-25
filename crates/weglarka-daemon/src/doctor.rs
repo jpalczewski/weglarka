@@ -492,6 +492,15 @@ fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             }
         }
     }
+    for (name, spec) in &apps.apps {
+        if spec.group_add.is_empty() {
+            continue;
+        }
+        used.push(format!("{name}: groups {}", spec.group_add.join(",")));
+        if let Err(e) = weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec) {
+            broken.push(format!("{name}: {e}"));
+        }
+    }
     if used.is_empty() {
         return;
     }

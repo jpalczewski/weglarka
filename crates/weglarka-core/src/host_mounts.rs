@@ -73,6 +73,23 @@ fn allowed(allowlist: &[PathBuf], mount: &HostMount) -> Result<(), HostMountErro
     }
 }
 
+/// A requested group that is not in `[runtime] group_add`.
+#[derive(Debug, thiserror::Error)]
+#[error("group {group:?} is not in `[runtime] group_add` in weglarka.toml")]
+pub struct GroupNotAllowed {
+    pub group: String,
+}
+
+/// Pure check: every `group_add` entry of `spec` must be on the operator's allowlist.
+pub fn check_groups(allowlist: &[String], spec: &AppSpec) -> Result<(), GroupNotAllowed> {
+    match spec.group_add.iter().find(|g| !allowlist.contains(g)) {
+        None => Ok(()),
+        Some(group) => Err(GroupNotAllowed {
+            group: group.clone(),
+        }),
+    }
+}
+
 /// Resolves every host mount of `spec`; fails on the first unmountable one (a deploy must not start
 /// with a partially mounted spec).
 pub fn resolve_all(allowlist: &[PathBuf], spec: &AppSpec) -> Result<Vec<Resolved>, HostMountError> {

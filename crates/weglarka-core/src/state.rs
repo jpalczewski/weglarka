@@ -89,8 +89,8 @@ fn secret_mount_ownership_v7(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
-/// v7 → v8: host mounts (issue #178, ADR 0045). `AppSpec::host_mounts` is an optional field that
-/// defaults to empty, so a v7 document needs no data transformation — the marker records that the
+/// v7 → v8: host mounts and groups (issue #178, ADR 0045). `AppSpec::host_mounts` and
+/// `AppSpec::group_add` are optional fields that default to empty, so a v7 document needs no data transformation — the marker records that the
 /// file may carry it. A no-op that must accept a hand-edited file which already has it.
 fn host_mounts_v8(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
@@ -501,6 +501,15 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
                 "{name}: duplicate host mount target {:?}",
                 mount.target
             ));
+        }
+    }
+    let mut groups = BTreeSet::new();
+    for group in &spec.group_add {
+        if !crate::app::valid_group_name(group) {
+            return Err(format!("{name}: invalid group_add entry {group:?}"));
+        }
+        if !groups.insert(group) {
+            return Err(format!("{name}: duplicate group_add entry {group:?}"));
         }
     }
     if let Some(signal) = &spec.reload_signal

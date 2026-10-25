@@ -6,7 +6,7 @@ use clap::Args;
 use weglarka_core::app::{
     AppSpec, ConfigMount, CpuLimit, HostMount, HostPort, InstanceName, MemoryLimit,
     SharedNetworkName, SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount,
-    normalize_signal, valid_config_source, valid_host_source, valid_mount_target,
+    normalize_signal, valid_config_source, valid_group_name, valid_host_source, valid_mount_target,
     valid_volume_name,
 };
 
@@ -44,6 +44,13 @@ pub enum ConfigFlag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMountFlag {
     Set(HostMount),
+    Clear,
+}
+
+/// Value of [`SpecFlags::group_add`]: an allowlisted group name, or `none` to clear the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupFlag {
+    Set(String),
     Clear,
 }
 
@@ -100,6 +107,11 @@ pub struct SpecFlags {
     /// (repeatable; replaces a mount with the same `source`; `none` clears the list).
     #[arg(long = "host-mount", value_name = "SOURCE:TARGET|none", value_parser = parse_host_mount, conflicts_with = "spec")]
     pub host_mounts: Vec<HostMountFlag>,
+    /// Supplementary group from `[runtime] group_add` in weglarka.toml (ADR 0045), e.g.
+    /// `systemd-journal` (repeatable; `none` clears the list). It makes the container keep **all**
+    /// groups of the runtime user, which must be a member of the named group.
+    #[arg(long = "group-add", value_name = "GROUP|none", value_parser = parse_group, conflicts_with = "spec")]
+    pub group_add: Vec<GroupFlag>,
     /// Signal `apps reload` sends to the container, e.g. SIGHUP (`none` removes it). Without it
     /// `apps reload` restarts the container instead. Not part of the spec hash.
     #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
@@ -147,6 +159,7 @@ impl SpecFlags {
             && self.shared_volumes.is_empty()
             && self.configs.is_empty()
             && self.host_mounts.is_empty()
+            && self.group_add.is_empty()
             && self.reload_signal.is_none()
             && self.shared_network.is_none()
             && !self.hardened
@@ -184,6 +197,16 @@ impl SpecFlags {
             spec.shared_volumes.push(v.clone());
         }
         apply_configs(&mut spec.configs, &self.configs);
+        for flag in &self.group_add {
+            match flag {
+                GroupFlag::Clear => spec.group_add.clear(),
+                GroupFlag::Set(group) => {
+                    if !spec.group_add.contains(group) {
+                        spec.group_add.push(group.clone());
+                    }
+                }
+            }
+        }
         for flag in &self.host_mounts {
             match flag {
                 HostMountFlag::Clear => spec.host_mounts.clear(),
@@ -349,6 +372,17 @@ fn parse_host_mount(s: &str) -> Result<HostMountFlag, String> {
         source: source.to_owned(),
         target: target.to_owned(),
     }))
+}
+
+/// A group name (`useradd` rules), or `none` to clear the list.
+fn parse_group(s: &str) -> Result<GroupFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(GroupFlag::Clear);
+    }
+    if !valid_group_name(s) {
+        return Err(format!("invalid group name {s:?}"));
+    }
+    Ok(GroupFlag::Set(s.to_owned()))
 }
 
 /// A signal name like `SIGHUP` (stored normalized, without the `SIG` prefix), or `none` to remove it.

@@ -51,6 +51,7 @@ impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.ingress.validate()?;
         validate_host_mount_allowlist(&self.runtime.host_mounts)?;
+        validate_group_allowlist(&self.runtime.group_add)?;
         // Public ingress ports below 1024 are rootless Podman's privileged-port problem
         // (`docs/decisions/0013`): the host needs `net.ipv4.ip_unprivileged_port_start=0`, and the
         // explicit opt-in is the operator's promise that it is there. Apps' `host_ports` follow the
@@ -127,6 +128,12 @@ pub struct RuntimeConfig {
     /// `platform install`, so changing the list needs a re-install.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_mounts: Vec<PathBuf>,
+    /// Group names an app may request with `group_add` (issue #178, ADR 0045), e.g.
+    /// `["systemd-journal"]`. Requesting one makes the container keep **all** supplementary groups
+    /// of the runtime user (`keep-groups`), so the runtime user must be a member of the group and
+    /// should have no others it does not need.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<String>,
 }
 
 impl RuntimeConfig {
@@ -148,6 +155,7 @@ impl Default for RuntimeConfig {
             allow_privileged_host_ports: false,
             dependency_wait_secs: None,
             host_mounts: Vec::new(),
+            group_add: Vec::new(),
         }
     }
 }
@@ -166,6 +174,22 @@ fn validate_host_mount_allowlist(entries: &[PathBuf]) -> Result<(), String> {
         }
         if !seen.insert(entry) {
             return Err(format!("[runtime] host_mounts lists {text:?} twice"));
+        }
+    }
+    Ok(())
+}
+
+/// Rules for the `[runtime] group_add` allowlist: valid group names, no duplicates.
+fn validate_group_allowlist(entries: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in entries {
+        if !crate::app::valid_group_name(name) {
+            return Err(format!(
+                "[runtime] group_add entry {name:?} is not a valid group name"
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(format!("[runtime] group_add lists {name:?} twice"));
         }
     }
     Ok(())
@@ -1402,6 +1426,30 @@ domain = "weglarka.example.com"
             .unwrap()
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn group_allowlist_takes_group_names_only() {
+        let host = |entries: &str| {
+            HostConfig::from_toml_str(&format!(
+                "[ingress]\nmode = \"behind\"\nbind = \"172.17.0.1:8080\"\n\
+                 [admin]\nsocket = \"/run/weglarka/admin.sock\"\n\
+                 [webhook]\nlisten = \"0.0.0.0:9180\"\ndomain = \"w.example.eu\"\n\
+                 [runtime]\ngroup_add = {entries}\n"
+            ))
+            .unwrap()
+            .validate()
+        };
+        assert!(host(r#"["systemd-journal", "adm"]"#).is_ok());
+        for bad in [
+            r#"["999"]"#,
+            r#"["Journal"]"#,
+            r#"[""]"#,
+            r#"["a b"]"#,
+            r#"["adm", "adm"]"#,
+        ] {
+            assert!(host(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]

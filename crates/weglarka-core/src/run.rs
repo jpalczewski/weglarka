@@ -191,6 +191,7 @@ impl<P: PodmanClient> Reconciler<P> {
             restart: RestartPolicy::No,
             userns_auto: true,
             mounts: config_binds(&configs),
+            keep_groups: !spec.group_add.is_empty(),
             volumes: vec![],
             resources: spec.resources.clone(),
             // The image's own HEALTHCHECK would only add noise to a process that lives seconds.

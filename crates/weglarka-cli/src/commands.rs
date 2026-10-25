@@ -203,6 +203,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         shared_volumes: vec![],
         configs: Vec::new(),
         host_mounts: Vec::new(),
+        group_add: Vec::new(),
         reload_signal: None,
         shared_networks: vec![],
         host_ports: Vec::new(),

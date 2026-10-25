@@ -169,6 +169,7 @@ async fn not_found_and_name_conflict() {
         resources: Default::default(),
         healthcheck: None,
         id_mapping: None,
+        keep_groups: false,
         security: Default::default(),
     };
     assert!(

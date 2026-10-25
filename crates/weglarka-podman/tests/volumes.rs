@@ -722,6 +722,7 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: Default::default(),
         })
         .await
@@ -799,6 +800,7 @@ fn member_spec(name: &str, shared_volume: &str, range: UidRange) -> ContainerSpe
         }],
         resources: Default::default(),
         healthcheck: None,
+        keep_groups: false,
         id_mapping: Some(id_mapping(range)),
         security: Default::default(),
     }
