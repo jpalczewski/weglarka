@@ -1149,3 +1149,20 @@ port = 80
         Err(IngressError::InvalidPath { .. })
     ));
 }
+
+#[test]
+fn nginx_edge_proxy_sockets_snapshot() {
+    let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    let conf = nginx::generate(&edge_host(), &BTreeMap::new(), &o).unwrap();
+    insta::assert_snapshot!("nginx_edge_proxy_sockets", conf);
+}
+
+#[test]
+fn proxy_sockets_are_an_edge_only_option() {
+    let mut o = NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+        .with_trusted_proxies(&["10.89.0.2".to_owned()])
+        .unwrap();
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    assert!(nginx::generate(&host(), &BTreeMap::new(), &o).is_err());
+}

@@ -10,6 +10,7 @@ pub mod app;
 pub mod doctor;
 pub mod forgejo;
 pub mod forward;
+pub mod forwarder;
 pub mod github;
 pub mod health_probe;
 pub mod images;

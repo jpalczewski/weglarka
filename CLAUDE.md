@@ -206,7 +206,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `apply`, a odcisk materiału w `nginx.conf` powoduje reload (`nginx -t` + SIGHUP) — **nigdy** odtworzenie
   kontenera; to jest ścieżka, którą idzie worker ACME (`[acme]`, ADR 0038, `docs/guides/acme.md`). W edge **nikt nie jest zaufany** w sprawie `X-Forwarded-*` (0007), a mapa
   uid ingressu jest dwuliniowa (uid 0 = użytkownik runtime, 1.. = zakres ingressu), żeby master czytał klucze
-  0600 — dlatego **do nginx wolno montować tylko `<nginx_conf_dir>`**. Porty < 1024 wymagają sysctla i
+  0600 — dlatego **do nginx wolno montować tylko `<nginx_conf_dir>`**. Porty publikuje kontener `weglarka-forwarder` (obraz demona, pasta, PROXY protocol po gnieździe `<nginx_conf_dir>/run`, `0700`; ADR 0043, #162), nie nginx — inaczej rootlessport gubi adres klienta; `weglarka.ingress-hash` w edge = v4. Porty < 1024 wymagają sysctla i
   `[runtime] allow_privileged_host_ports`; `weglarka.ingress-hash` = v3 (tryb + oba puby).
 - **Sekrety są w zakresie per instancja (ADR 0024, `<apka>.<nazwa>` w `secrets.toml`)** — `apps remove`
   domyślnie **zachowuje** je (dane i poświadczenia to osobne decyzje), więc nowa apka pod starą nazwą

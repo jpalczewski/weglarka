@@ -14,6 +14,7 @@ use hyper::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use weglarka_core::config::HostConfig;
+use weglarka_core::podman::PodmanClient;
 use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign};
 use weglarka_daemon::{Settings, start};
@@ -699,20 +700,61 @@ async fn edge_ingress_owns_two_ports_and_doctor_reports_tls() {
         .unwrap();
     let root = dir.path().to_owned();
     let fake = FakePodman::new();
+    // The forwarder runs from the daemon's own image (issue #162).
+    let mut pull = std::pin::pin!(fake.image_pull("ghcr.io/jpalczewski/weglarka:test"));
+    while let Some(event) = futures_util::StreamExt::next(&mut pull).await {
+        event.unwrap();
+    }
+    fake.add_foreign_container("weglarka", "ghcr.io/jpalczewski/weglarka:test");
     let running = start(edge_settings(&root), fake.clone()).await.unwrap();
 
     eventually("edge ingress applied", || async {
-        fake.containers().iter().any(|c| c.name == "weglarka-nginx")
+        fake.containers()
+            .iter()
+            .any(|c| c.name == "weglarka-forwarder")
     })
     .await;
 
+    // nginx publishes nothing in `edge`: the forwarder owns the public sockets and relays to nginx's
+    // unix sockets, which is what keeps the client address (rootlessport would hide it).
     let spec = fake.container_spec("weglarka-nginx").unwrap();
-    let publishes: Vec<(u16, u16)> = spec
+    assert!(spec.publish.is_empty(), "{:?}", spec.publish);
+    assert!(
+        spec.mounts
+            .iter()
+            .any(|m| m.target == "/run/weglarka-ingress" && !m.read_only),
+        "{:?}",
+        spec.mounts
+    );
+    let forwarder = fake.container_spec("weglarka-forwarder").unwrap();
+    let publishes: Vec<(u16, u16)> = forwarder
         .publish
         .iter()
         .map(|p| (p.host_port, p.container_port))
         .collect();
     assert_eq!(publishes, [(18080, 8080), (18443, 8443)]);
+    assert!(forwarder.networks.is_empty(), "default (pasta) network");
+    assert!(forwarder.id_mapping.is_none());
+    assert_eq!(
+        forwarder.command,
+        [
+            "forward",
+            "--route",
+            "0.0.0.0:8080=/run/weglarka-ingress/http.sock",
+            "--route",
+            "0.0.0.0:8443=/run/weglarka-ingress/https.sock",
+        ]
+    );
+    assert!(forwarder.security.read_only && forwarder.security.cap_add.is_empty());
+    assert_eq!(
+        PermissionsExt::mode(
+            &std::fs::metadata(root.join("state/nginx/run"))
+                .unwrap()
+                .permissions()
+        ) & 0o777,
+        0o700,
+        "the socket directory is the protection against a forged PROXY header"
+    );
     // Traefik has no part in edge: no file is written even though the state dir exists.
     assert!(!root.join("traefik.yml").exists());
     let nginx_dir = root.join("state/nginx");
@@ -729,6 +771,14 @@ async fn edge_ingress_owns_two_ports_and_doctor_reports_tls() {
         .map(|c| c["id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&"ingress.tls"), "{ids:?}");
+    assert!(ids.contains(&"ingress.client_ip"), "{ids:?}");
+    let client_ip = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "ingress.client_ip")
+        .unwrap();
+    assert_eq!(client_ip["status"], "ok", "{client_ip}");
     assert!(!ids.contains(&"ingress.traefik_file"), "{ids:?}");
     let tls = v["checks"]
         .as_array()

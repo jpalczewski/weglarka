@@ -18,7 +18,7 @@ use weglarka_core::shared_volumes;
 use weglarka_core::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
-use crate::ingress::NGINX_CONTAINER;
+use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
 
 fn check(
     id: &str,
@@ -1278,6 +1278,37 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
 }
 
+/// `edge` (issue #162, ADR 0043): the client address survives only through the port forwarder
+/// (pasta network + PROXY protocol). Without a running forwarder nothing is published at all.
+async fn ingress_client_ip<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    match d
+        .engine
+        .podman()
+        .container_inspect(FORWARDER_CONTAINER)
+        .await
+    {
+        Ok(c) if c.state == ContainerState::Running => out.push(ok(
+            "ingress.client_ip",
+            "the port forwarder runs: nginx sees the real client address (PROXY protocol)",
+        )),
+        Ok(c) => out.push(check(
+            "ingress.client_ip",
+            CheckStatus::Fail,
+            format!(
+                "port forwarder {FORWARDER_CONTAINER} is {:?}: nothing is published",
+                c.state
+            ),
+            Some("the next ingress pass restarts it; see `podman logs weglarka-forwarder`"),
+        )),
+        Err(_) => out.push(check(
+            "ingress.client_ip",
+            CheckStatus::Fail,
+            format!("port forwarder {FORWARDER_CONTAINER} does not exist: nothing is published"),
+            Some("it is created by the next ingress pass; check ingress.apply for the error"),
+        )),
+    }
+}
+
 /// Apexes with a wildcard pair (`_wildcard.<apex>.crt` + `.key`, regular files) in `tls`.
 fn wildcard_apexes_on_disk(tls: &std::path::Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(tls) else {
@@ -1411,6 +1442,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     ingress_routes(d, out);
     if d.host.ingress.mode == IngressMode::Edge {
         ingress_tls(d, out);
+        ingress_client_ip(d, out).await;
     }
     // Admin socket: mode 0600.
     if let Ok(m) = std::fs::metadata(&d.host.admin.socket) {

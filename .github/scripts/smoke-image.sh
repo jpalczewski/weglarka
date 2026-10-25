@@ -93,7 +93,8 @@ cleanup() {
   echo "::group::weglarka logs"; podman logs weglarka-smoke 2>&1 || true; echo "::endgroup::"
   echo "::group::weglarka-nginx logs"; podman logs weglarka-nginx 2>&1 || true; echo "::endgroup::"
   echo "::group::containers"; podman ps -a || true; echo "::endgroup::"
-  podman rm -f weglarka-smoke weglarka-nginx wg-edge-rel >/dev/null 2>&1 || true
+  echo "::group::weglarka-forwarder logs"; podman logs weglarka-forwarder 2>&1 || true; echo "::endgroup::"
+  podman rm -f weglarka-smoke weglarka-nginx weglarka-forwarder wg-edge-rel >/dev/null 2>&1 || true
   podman network rm -f net-weglarka >/dev/null 2>&1 || true
   exit "$status"
 }
@@ -137,18 +138,28 @@ podman exec weglarka-nginx nginx -t -c /etc/nginx/nginx.conf \
 echo "weglarka-nginx is hardened: read-only root, no-new-privileges, CHOWN+SETGID+SETUID only"
 
 if [ "$mode" = edge ]; then
-  # Edge mode publishes both web ports on the host: plain HTTP (the redirects and the ACME webroot) and
-  # TLS (the proxied apps, the fail-closed default server).
-  bindings=$(podman inspect -f '{{json .HostConfig.PortBindings}}' weglarka-nginx)
+  # Edge mode publishes both web ports on the host, but through the forwarder (issue #162): plain HTTP
+  # (the redirects and the ACME webroot) and TLS (the proxied apps, the fail-closed default server).
+  # nginx itself publishes nothing and listens on the forwarder's unix sockets with proxy_protocol.
+  for _ in $(seq 1 30); do podman inspect weglarka-forwarder >/dev/null 2>&1 && break; sleep 1; done
+  bindings=$(podman inspect -f '{{json .HostConfig.PortBindings}}' weglarka-forwarder)
   for pair in '8080/tcp:18080' '8443/tcp:18443'; do
     container_port=${pair%:*}
     host_port=${pair##*:}
     printf '%s' "$bindings" | grep -qF "\"$container_port\"" \
-      || { echo "weglarka-nginx does not publish $container_port: $bindings"; exit 1; }
+      || { echo "weglarka-forwarder does not publish $container_port: $bindings"; exit 1; }
     printf '%s' "$bindings" | grep -qE "\"HostPort\"[[:space:]]*:[[:space:]]*\"$host_port\"" \
-      || { echo "weglarka-nginx does not publish $container_port on host port $host_port: $bindings"; exit 1; }
+      || { echo "weglarka-forwarder does not publish $container_port on host port $host_port: $bindings"; exit 1; }
   done
-  echo "weglarka-nginx publishes plain HTTP on 18080 and TLS on 18443"
+  nginx_bindings=$(podman inspect -f '{{json .HostConfig.PortBindings}}' weglarka-nginx)
+  case "$nginx_bindings" in
+    '{}'|'null'|'') ;;
+    *) echo "weglarka-nginx must not publish ports in edge mode: $nginx_bindings"; exit 1 ;;
+  esac
+  podman exec weglarka-nginx grep -qF 'listen unix:/run/weglarka-ingress/https.sock' /etc/nginx/nginx.conf \
+    || { echo "nginx.conf has no forwarder socket listener"; exit 1; }
+  echo "weglarka-forwarder publishes plain HTTP on 18080 and TLS on 18443; nginx listens on unix sockets"
+
 fi
 
 echo "--- weglarka doctor (kody 0/1/2 = ok/warn/fail to wynik, nie awaria smoke testu)"

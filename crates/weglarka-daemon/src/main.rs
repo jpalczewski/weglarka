@@ -51,6 +51,13 @@ enum Command {
     /// answer the admin API within `[self_update] fallback_timeout_secs` (issue #100). Runs from
     /// `weglarka-watchdog.timer`; a manual run prints what it would do.
     Supervise,
+    /// Port forwarder of `edge` mode: relays public sockets to nginx's unix sockets with a PROXY
+    /// protocol header (issue #162). Runs in its own container; needs no configuration file.
+    Forward {
+        /// `<address:port>=<socket path>`; repeat per public socket.
+        #[arg(long = "route", required = true)]
+        routes: Vec<weglarka_daemon::forwarder::Route>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -273,11 +280,17 @@ async fn run_daemon(settings: Settings) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
+    if let Some(Command::Forward { routes }) = cli.command {
+        return weglarka_daemon::forwarder::run(routes)
+            .await
+            .context("port forwarder");
+    }
     let settings = Settings::load(&cli.config).context("loading configuration")?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(settings).await,
         Command::Platform { action } => run_platform(settings, action).await,
         Command::SelfUpdate(args) => run_self_update(settings, args).await,
         Command::Supervise => run_supervise(settings).await,
+        Command::Forward { .. } => unreachable!("handled before the configuration is loaded"),
     }
 }
