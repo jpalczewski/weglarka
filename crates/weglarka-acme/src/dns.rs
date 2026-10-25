@@ -33,11 +33,7 @@ impl<P: DnsProvider> DnsSolver<P> {
 
     fn key(challenge: &Challenge) -> (String, String) {
         (
-            // The record lives at the base name even if a caller passes the wildcard form.
-            format!(
-                "_acme-challenge.{}",
-                challenge.name.trim_start_matches("*.")
-            ),
+            format!("_acme-challenge.{}", challenge.name()),
             challenge.dns01_txt_value(),
         )
     }
@@ -50,7 +46,7 @@ impl<P: DnsProvider> DnsSolver<P> {
 /// The provider's text only: a `DnsError` never carries the token or the TXT value.
 fn failed(challenge: &Challenge, e: weglarka_dns::DnsError) -> AcmeError {
     AcmeError::Challenge {
-        name: challenge.name.clone(),
+        name: challenge.name().to_owned(),
         reason: e.to_string(),
     }
 }
@@ -106,11 +102,7 @@ mod tests {
     const DAY: Duration = Duration::from_secs(24 * 3600);
 
     fn challenge(name: &str, token: &str) -> Challenge {
-        Challenge {
-            name: name.into(),
-            token: token.into(),
-            key_authorization: format!("{token}.thumbprint"),
-        }
+        Challenge::new(name, token.into(), format!("{token}.thumbprint"))
     }
 
     /// `Manager` owns its solver, so the tests keep a second reference to the fake provider.
@@ -275,11 +267,7 @@ mod tests {
 
     #[test]
     fn wildcard_identifier_maps_to_the_base_record_name() {
-        let c = Challenge {
-            name: "*.example.eu".into(),
-            token: "t".into(),
-            key_authorization: "k".into(),
-        };
+        let c = Challenge::new("*.example.eu", "t".into(), "k".into());
         assert_eq!(
             DnsSolver::<FakeDns>::key(&c).0,
             "_acme-challenge.example.eu"

@@ -166,7 +166,7 @@ impl AcmeClient for InstantAcme {
         // Cleanup runs on every path; its own failure never masks the order result.
         for challenge in &presented {
             if let Err(e) = solver.cleanup(challenge).await {
-                tracing::warn!(name = %challenge.name, error = %e, "challenge cleanup failed");
+                tracing::warn!(name = %challenge.name(), error = %e, "challenge cleanup failed");
             }
         }
         let (chain_pem, key_pem) = result?;
@@ -210,14 +210,11 @@ async fn drive<S: ChallengeSolver>(
                 solver.kind().as_str()
             ))
         })?;
-        // A wildcard authorization is for the base name; the CA reports it with its `*.` prefix, but
-        // the challenge record (`_acme-challenge.<name>`) lives at the base name (RFC 8555 §7.1.3).
-        let identifier = handle.identifier().to_string();
-        let challenge = Challenge {
-            name: identifier.trim_start_matches("*.").to_owned(),
-            token: handle.token.clone(),
-            key_authorization: handle.key_authorization().as_str().to_owned(),
-        };
+        let challenge = Challenge::new(
+            &handle.identifier().to_string(),
+            handle.token.clone(),
+            handle.key_authorization().as_str().to_owned(),
+        );
         solver.present(&challenge).await?;
         presented.push(challenge);
         handle.set_ready().await.map_err(order_err)?;
