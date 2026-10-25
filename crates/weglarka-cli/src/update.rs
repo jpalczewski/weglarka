@@ -69,6 +69,14 @@ pub struct UpdateArgs {
     /// Stop streaming: resets the streaming settings, a custom `stream_timeout_secs` included.
     #[arg(long, conflicts_with = "spec")]
     pub no_streaming: bool,
+    /// Replace the long-lived streaming paths (repeatable; e.g. `/user/events`): 1 h idle timeout on
+    /// those paths only. Ingress-only: nginx reload.
+    #[arg(long = "streaming-path", value_name = "PATH",
+        conflicts_with_all = ["spec", "no_streaming_paths"])]
+    pub streaming_paths: Vec<String>,
+    /// Remove all streaming paths.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_streaming_paths: bool,
     /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
     /// Also streams the request to the app instead of buffering it. Ingress-only: nginx reload.
     #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse,
@@ -158,6 +166,8 @@ impl UpdateArgs {
             || self.streaming
             || self.no_streaming
             || self.max_body_size.is_some()
+            || !self.streaming_paths.is_empty()
+            || self.no_streaming_paths
             || self.unset_max_body_size
             || !self.access_log_skip_paths.is_empty()
             || !self.remove_access_log_skip_paths.is_empty()
@@ -240,7 +250,8 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
         spec.port = a.port;
     }
     // Ingress-only (issue #64): `--no-streaming` resets the streaming settings, a custom timeout
-    // included, and leaves `strip_prefix` (issue #130) and `max_body_size` (ADR 0033) alone.
+    // included, and leaves `strip_prefix` (issue #130), `max_body_size` (ADR 0033) and `streaming_paths`
+    // (issue #180) alone.
     if a.streaming {
         spec.ingress.streaming = true;
     }
@@ -249,8 +260,15 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
             strip_prefix: spec.ingress.strip_prefix,
             max_body_size: spec.ingress.max_body_size,
             access_log_skip_paths: std::mem::take(&mut spec.ingress.access_log_skip_paths),
+            streaming_paths: spec.ingress.streaming_paths.clone(),
             ..AppIngress::default()
         };
+    }
+    if a.no_streaming_paths {
+        spec.ingress.streaming_paths.clear();
+    }
+    if !a.streaming_paths.is_empty() {
+        spec.ingress.streaming_paths = a.streaming_paths.clone();
     }
     if a.max_body_size.is_some() {
         spec.ingress.max_body_size = a.max_body_size;
@@ -1091,6 +1109,34 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     #[test]
+    fn streaming_path_flags_set_replace_clear_and_survive_no_streaming() {
+        let s = apply_flags(spec(), &args(&["--streaming-path", "/user/events"])).unwrap();
+        assert_eq!(s.ingress.streaming_paths, ["/user/events"]);
+        assert!(
+            !s.ingress.streaming,
+            "a streaming path does not imply streaming"
+        );
+        assert!(args(&["--streaming-path", "/a"]).has_edits());
+        assert!(args(&["--no-streaming-paths"]).has_edits());
+
+        // The flag replaces the list.
+        let s = apply_flags(
+            s,
+            &args(&["--streaming-path", "/a", "--streaming-path", "/b"]),
+        )
+        .unwrap();
+        assert_eq!(s.ingress.streaming_paths, ["/a", "/b"]);
+
+        // `--no-streaming` resets the streaming knobs only.
+        let both = apply_flags(s, &args(&["--streaming"])).unwrap();
+        let s = apply_flags(both, &args(&["--no-streaming"])).unwrap();
+        assert!(!s.ingress.streaming && s.ingress.streaming_paths.len() == 2);
+
+        let s = apply_flags(s, &args(&["--no-streaming-paths"])).unwrap();
+        assert!(s.ingress.is_default());
+    }
+
+    #[test]
     fn max_body_size_flag_sets_clears_and_survives_no_streaming() {
         let s = apply_flags(spec(), &args(&["--max-body-size", "4g"])).unwrap();
         assert_eq!(
@@ -1146,6 +1192,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             stream_timeout_secs: 600,
             max_body_size: None,
             access_log_skip_paths: Vec::new(),
+            streaming_paths: Vec::new(),
         };
         let s = apply_flags(custom.clone(), &args(&["--streaming"])).unwrap();
         assert_eq!(s.ingress, custom.ingress);

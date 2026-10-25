@@ -142,6 +142,10 @@ pub struct AddArgs {
     /// itself is set through `--spec` (`stream_timeout_secs`, default 180 s).
     #[arg(long, conflicts_with = "spec")]
     pub streaming: bool,
+    /// Path that is served as a long-lived stream (SSE) with a 1 h idle timeout while the rest of
+    /// the app keeps the default (repeatable; e.g. `/user/events`). Ingress-only.
+    #[arg(long = "streaming-path", value_name = "PATH", conflicts_with = "spec")]
+    pub streaming_paths: Vec<String>,
     /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
     /// Also streams the request to the app instead of buffering it. Ingress-only.
     #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse, conflicts_with = "spec")]

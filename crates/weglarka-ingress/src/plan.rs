@@ -324,6 +324,14 @@ impl<'a> Plan<'a> {
                     reason: "listed more than once",
                 });
             }
+            // Streaming paths (issue #180) are carved out of the app's own catch-all, so they must not
+            // shadow a prefix another app owns on the same domain.
+            let streaming = spec
+                .ingress
+                .streaming_paths
+                .iter()
+                .map(PathPrefix::new)
+                .collect::<Result<Vec<_>, _>>()?;
             let mut domains = Vec::with_capacity(spec.domains.len());
             for raw in &spec.domains {
                 let domain = Domain::new(raw.clone())?;
@@ -331,7 +339,7 @@ impl<'a> Plan<'a> {
                     return Err(IngressError::DuplicateDomain(raw.clone()));
                 }
                 let others = claimed.entry(domain.clone()).or_default();
-                for path in &paths {
+                for path in paths.iter().chain(&streaming) {
                     if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
                     {
                         // Two catch-alls are the pre-#130 "domain already taken" case.
@@ -347,7 +355,12 @@ impl<'a> Plan<'a> {
                         });
                     }
                 }
-                others.extend(paths.iter().map(|p| (instance, p.clone())));
+                others.extend(
+                    paths
+                        .iter()
+                        .chain(&streaming)
+                        .map(|p| (instance, p.clone())),
+                );
                 domains.push(domain);
             }
             domains.sort();

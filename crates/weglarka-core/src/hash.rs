@@ -394,6 +394,7 @@ env = { B = "2", A = "1" }
             strip_prefix: true,
             max_body_size: Some(crate::app::BodySizeLimit::UNLIMITED),
             access_log_skip_paths: vec!["/healthz".into()],
+            streaming_paths: vec!["/user/events".into()],
         };
         s.paths = vec!["/api".into()];
         assert_eq!(

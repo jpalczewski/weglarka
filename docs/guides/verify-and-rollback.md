@@ -47,7 +47,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `strategy` (`weglarka apps update <app> --strategy recreate`, then remove the key) | [blue-green deploys](blue-green.md) |
 | `apps.toml`, apps | `command` | [container command](container-command.md) |
 | `apps.toml`, apps | `host_ports` | [host ports](host-ports.md) |
-| `apps.toml`, apps | `[apps.X.ingress]` blocks — `streaming` | [streaming](streaming.md) |
+| `apps.toml`, apps | `[apps.X.ingress]` blocks — `streaming`, `streaming_paths` (`weglarka apps update <app> --no-streaming-paths`) | [streaming](streaming.md) |
 | `apps.toml`, apps | `paths` and `ingress.strip_prefix` | [path routing](path-routing.md) |
 | `apps.toml`, apps | `ingress.max_body_size` (`weglarka apps update <app> --unset-max-body-size`) | [max body size](max-body-size.md) |
 | `apps.toml`, apps | `ingress.access_log_skip_paths` (`weglarka apps update <app> --remove-access-log-skip-path <path>`) | [access log](access-log.md) |

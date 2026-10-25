@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -110,6 +110,13 @@ fn access_log_skip_paths_v10(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v10 → v11: streaming paths (issue #180). `AppIngress::streaming_paths` is optional and defaults to
+/// empty, so a v10 document needs no data transformation — the marker records that the file may carry
+/// it. A no-op that must accept a hand-edited file which already has it.
+fn ingress_streaming_paths_v11(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -123,6 +130,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     host_mounts_v8,
     deploy_strategy_v9,
     access_log_skip_paths_v10,
+    ingress_streaming_paths_v11,
 ];
 
 const _: () = assert!(
@@ -437,6 +445,31 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         return Err(format!(
             "{name}: ingress.access_log_skip_paths requires at least one domain"
         ));
+    }
+    if !ingress.streaming_paths.is_empty() {
+        if ingress.streaming {
+            return Err(format!(
+                "{name}: ingress.streaming_paths is redundant with ingress.streaming = true"
+            ));
+        }
+        if spec.paths.iter().any(|p| p != "/") {
+            return Err(format!(
+                "{name}: ingress.streaming_paths cannot be combined with path prefixes in `paths`"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for path in &ingress.streaming_paths {
+            crate::app::check_path_prefix(path)
+                .map_err(|reason| format!("{name}: invalid streaming path {path:?}: {reason}"))?;
+            if path == "/" {
+                return Err(format!(
+                    "{name}: use ingress.streaming = true instead of streaming path \"/\""
+                ));
+            }
+            if !seen.insert(path) {
+                return Err(format!("{name}: duplicate streaming path {path:?}"));
+            }
+        }
     }
     Ok(())
 }
@@ -933,6 +966,43 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("requires ingress.streaming = true"), "{err}");
+    }
+
+    #[test]
+    fn streaming_paths_are_validated() {
+        let ok = |extra: &str| -> Result<(), String> {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(ok("ingress = { streaming_paths = [\"/user/events\", \"/a/b\"] }").is_ok());
+        for (extra, needle) in [
+            (
+                "ingress = { streaming_paths = [\"/\"] }",
+                "instead of streaming path",
+            ),
+            (
+                "ingress = { streaming_paths = [\"x\"] }",
+                "invalid streaming path",
+            ),
+            (
+                "ingress = { streaming_paths = [\"/a\", \"/a\"] }",
+                "duplicate",
+            ),
+            (
+                "ingress = { streaming = true, streaming_paths = [\"/a\"] }",
+                "redundant",
+            ),
+            (
+                "paths = [\"/p\"]\ningress = { streaming_paths = [\"/a\"] }",
+                "cannot be combined",
+            ),
+        ] {
+            let err = ok(extra).unwrap_err();
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
     }
 
     #[test]
