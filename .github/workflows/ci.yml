@@ -152,7 +152,7 @@ jobs:
             openssl s_client -connect 127.0.0.1:18447 -servername "$1" </dev/null 2>/dev/null \
               | openssl x509 -noout -ext subjectAltName 2>/dev/null || true
           }
-          for host in nz.example.eu blog.example.eu example.eu; do
+          for host in nz.example.eu blog.example.eu sse.example.eu weglarka.example.eu; do
             san "$host" | grep -q '\*\.example\.eu' || { echo "FAIL: $host is not served with the wildcard" >&2; exit 1; }
           done
           for host in www.blog.example.eu example.org; do
