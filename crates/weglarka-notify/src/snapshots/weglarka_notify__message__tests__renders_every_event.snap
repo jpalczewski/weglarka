@@ -185,5 +185,35 @@ expression: rendered
     "tags": [
       "warning"
     ]
+  },
+  {
+    "severity": "info",
+    "key": "acme:app.example.eu",
+    "title": "certificate issued: app.example.eu",
+    "body": "valid for 89 more days",
+    "priority": 3,
+    "tags": [
+      "lock"
+    ]
+  },
+  {
+    "severity": "warning",
+    "key": "acme:app.example.eu",
+    "title": "certificate renewal failed: app.example.eu",
+    "body": "rate limited; the current certificate has 12 days left",
+    "priority": 4,
+    "tags": [
+      "warning"
+    ]
+  },
+  {
+    "severity": "critical",
+    "key": "acme:app.example.eu",
+    "title": "certificate renewal failed: app.example.eu",
+    "body": "challenge failed; there is no certificate for this domain yet",
+    "priority": 5,
+    "tags": [
+      "warning"
+    ]
   }
 ]
