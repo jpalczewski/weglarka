@@ -48,6 +48,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Path routing](path-routing.md) | `paths` and `strip_prefix` on one domain |
 | [Streaming](streaming.md) | SSE and long polling |
 | [Request body size](max-body-size.md) | `ingress.max_body_size` |
+| [Access log](access-log.md) | `ingress.access_log_skip_paths`, what `169.254.1.2` means |
 | [Edge mode](edge-mode.md) | nginx on 80/443 terminating TLS |
 | [Edge behind a CDN](edge-cdn.md) | Visitor address behind Cloudflare (`[ingress.cdn]`) |
 | [ACME behind a CDN](acme-behind-cdn.md) | HTTP-01 through the Cloudflare proxy, `acme.cdn` |

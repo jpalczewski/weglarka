@@ -49,6 +49,10 @@ image = "ghcr.io/jpalczewski/ntfy.zig:latest"
 domains = ["nz.example.eu"]
 port = 8085
 
+# Exercises the access-log skip maps (issue #181) under `nginx -t` in both modes.
+[apps.ntfy.ingress]
+access_log_skip_paths = ["/v1/health", "/v1/poll/"]
+
 [apps.blog]
 image = "ghcr.io/x/blog:latest"
 domains = ["blog.example.eu", "www.blog.example.eu"]
