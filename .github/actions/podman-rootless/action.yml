@@ -1,0 +1,114 @@
+name: Rootless Podman 6
+description: >-
+  Podman from OBS home:alvistack on ubuntu-24.04 (mirror of the host), configured rootless, with a larger
+  subuid pool and the libpod service listening on a unix socket. Decision: docs/decisions/0002-podman-in-ci.md.
+outputs:
+  socket:
+    description: Path of the rootless Podman socket (also exported as WEGLARKA_PODMAN_SOCKET).
+    value: ${{ steps.service.outputs.socket }}
+runs:
+  using: composite
+  steps:
+  - name: Add the alvistack repository
+    shell: bash
+    run: |
+      set -euo pipefail
+      base="https://downloadcontent.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
+      curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
+      echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
+        | sudo tee /etc/apt/sources.list.d/alvistack.list
+      # Pinning: the Podman stack only from alvistack (as on the production host).
+      sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
+      Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
+      Pin: origin downloadcontent.opensuse.org
+      Pin-Priority: 1001
+      PIN
+      # The runner ships Podman 4.9 from Ubuntu; its golang-github-containers-common collides on files
+      # (/etc/containers/policy.json) with containers-common from alvistack.
+      sudo apt-get purge -y podman buildah skopeo crun conmon \
+        golang-github-containers-common golang-github-containers-image || true
+      # download.opensuse.org redirects to mirrors with stale files ("unexpected size");
+      # downloadcontent.opensuse.org has no mirrors. Retries just in case.
+      for attempt in 1 2 3 4; do
+        sudo apt-get update && break
+        [ "$attempt" = 4 ] && exit 1
+        sleep 15
+      done
+  # The cache key is the candidate versions of the packages we install, so a new alvistack build
+  # misses the cache and downloads fresh .debs; an empty/missing cache just means a normal install.
+  - name: Resolve Podman package versions
+    id: podman-ver
+    shell: bash
+    run: |
+      ver=$(apt-cache policy podman netavark passt | awk '/Candidate:/{print $2}' | tr '\n' '_')
+      echo "key=podman-debs-ubuntu2404-$ver" >> "$GITHUB_OUTPUT"
+  - uses: actions/cache@v4
+    with:
+      path: ${{ runner.temp }}/podman-debs
+      key: ${{ steps.podman-ver.outputs.key }}
+  - name: Install Podman 6
+    shell: bash
+    run: |
+      set -euo pipefail
+      debs="$RUNNER_TEMP/podman-debs"
+      sudo mkdir -p "$debs/partial"
+      for attempt in 1 2 3 4; do
+        sudo apt-get install -y -o Acquire::Retries=3 -o "Dir::Cache::archives=$debs" \
+          podman netavark passt uidmap && break
+        [ "$attempt" = 4 ] && exit 1
+        sleep 15
+      done
+      # Keep only the .debs in the cached directory (no lock/partial, readable by the cache action).
+      sudo rm -rf "$debs/partial" "$debs/lock"
+      sudo chmod -R a+rX "$debs"
+      podman --version
+  - name: Configure rootless containers
+    shell: bash
+    run: |
+      set -euo pipefail
+      # The alvistack package ships no /etc/containers/*.conf (measured in CI: no files,
+      # Podman falls back to the default rootful graphroot). The user configuration is explicit.
+      dpkg -l | grep -E 'podman|containers-common|crun|netavark|passt' || true
+      ls -la /etc/containers /usr/share/containers 2>&1 || true
+      mkdir -p "$HOME/.config/containers"
+      cat > "$HOME/.config/containers/storage.conf" <<STORAGE
+      [storage]
+      driver = "overlay"
+      graphroot = "$HOME/.local/share/containers/storage"
+      runroot = "$XDG_RUNTIME_DIR/containers"
+      STORAGE
+      echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
+      # The acceptance script's local registry (scripts/acceptance.sh --with-local-registry) runs over http;
+      # the Podman service reads registries.conf at startup, so the entry must be there before it starts.
+      cat > "$HOME/.config/containers/registries.conf" <<'REG'
+      [[registry]]
+      location = "127.0.0.1:15099"
+      insecure = true
+      REG
+      podman info 2>&1 | head -40
+  - name: Larger subuid pool
+    shell: bash
+    run: |
+      set -euo pipefail
+      # Each Węglarka instance takes a 65 536-uid range and the CI user has exactly 65 536 subuids
+      # (docs/decisions/0009). Production has 2 000 000; mirror that order of magnitude here.
+      sudo usermod --add-subuids 1000000-1999999 --add-subgids 1000000-1999999 "$USER"
+      grep "^$USER:" /etc/subuid /etc/subgid
+      # `podman info` in the previous step created the rootless user namespace (pause process) with the
+      # old pool; migrate restarts it so the new subuids are mapped.
+      podman system migrate
+      podman info --format '{{json .Host.IDMappings.UIDMap}}'
+  - name: Start rootless podman service
+    id: service
+    shell: bash
+    run: |
+      set -euo pipefail
+      sock="$XDG_RUNTIME_DIR/podman/podman.sock"
+      mkdir -p "$(dirname "$sock")"
+      podman system service --time 0 "unix://$sock" 2>"$RUNNER_TEMP/podman-service.log" &
+      for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
+      echo "socket=$sock" >> "$GITHUB_OUTPUT"
+      # Also exported to the later steps of the calling job (the Podman tests skip themselves without it).
+      echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
+      podman version
+      grep "^$USER:" /etc/subuid /etc/subgid

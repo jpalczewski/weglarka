@@ -171,21 +171,28 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.201 > "$RUNNER_TEMP/neighbor.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf" \
             "$RUNNER_TEMP/peer.conf" "$RUNNER_TEMP/neighbor.conf"
-      # Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream
-      # reaches the client immediately and an idle stream survives the 60 s default read timeout; the same
-      # upstream without the option is held back by nginx (the negative control in the script).
-      - name: Streaming through nginx
+      # The two long nginx end-to-end tests run concurrently: they share nothing (own Docker network,
+      # container names, host port and temp dir each), and each is dominated by an intentional wait.
+      #  - Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream
+      #    reaches the client immediately and an idle stream survives the 60 s default read timeout; the same
+      #    upstream without the option is held back by nginx (the negative control in the script).
+      #  - Per-app request body limit (ADR 0033): 413 above the limit, success above the 64 MiB default, nothing
+      #    spooled to the read-only ingress container's tmpfs, and a ~76 s upload survives the 60 s defaults.
+      - name: Streaming and request body limit through nginx (concurrent)
         run: |
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/streaming.conf"
-          .github/scripts/test-streaming.sh "$RUNNER_TEMP/streaming.conf"
-      # Per-app request body limit (ADR 0033): 413 above the limit, success above the 64 MiB default, nothing
-      # spooled to the read-only ingress container's tmpfs, and a ~76 s upload survives the 60 s defaults.
-      - name: Request body limit through nginx
-        run: |
-          set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/body-size.conf"
-          .github/scripts/test-body-size.sh "$RUNNER_TEMP/body-size.conf"
+          .github/scripts/test-streaming.sh "$RUNNER_TEMP/streaming.conf" > "$RUNNER_TEMP/streaming.log" 2>&1 &
+          stream_pid=$!
+          .github/scripts/test-body-size.sh "$RUNNER_TEMP/body-size.conf" > "$RUNNER_TEMP/body-size.log" 2>&1 &
+          body_pid=$!
+          failed=0
+          if wait "$stream_pid"; then :; else failed=1; echo "::error::test-streaming.sh failed"; fi
+          if wait "$body_pid"; then :; else failed=1; echo "::error::test-body-size.sh failed"; fi
+          echo "::group::test-streaming.sh"; cat "$RUNNER_TEMP/streaming.log"; echo "::endgroup::"
+          echo "::group::test-body-size.sh"; cat "$RUNNER_TEMP/body-size.log"; echo "::endgroup::"
+          exit "$failed"
 
   # Static (musl) daemon + CLI — built once and used three ways: build check, image content, and the
   # binaries run by the smoke test. PRs build the cheap `ci` profile, main the full `release` profile
@@ -232,108 +239,16 @@ jobs:
       - run: cargo build --profile ci --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli
 
   # Integration tests with a real Podman 6.1 — decision: docs/decisions/0002-podman-in-ci.md.
-  # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host). The tests (session a) read
-  # WEGLARKA_PODMAN_SOCKET and skip themselves when the variable is not set.
-  integration-podman:
-    needs: [changes, musl]
+  # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host), set up by the local action
+  # `podman-rootless`. The tests read WEGLARKA_PODMAN_SOCKET and skip themselves when it is not set.
+  # They need no musl artifact, so this job starts right after `changes` instead of waiting for `musl`.
+  podman-tests:
+    needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Add the alvistack repository
-        run: |
-          set -euo pipefail
-          base="https://downloadcontent.opensuse.org/repositories/home:/alvistack/xUbuntu_24.04"
-          curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
-          echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
-            | sudo tee /etc/apt/sources.list.d/alvistack.list
-          # Pinning: the Podman stack only from alvistack (as on the production host).
-          sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
-          Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
-          Pin: origin downloadcontent.opensuse.org
-          Pin-Priority: 1001
-          PIN
-          # The runner ships Podman 4.9 from Ubuntu; its golang-github-containers-common collides on files
-          # (/etc/containers/policy.json) with containers-common from alvistack.
-          sudo apt-get purge -y podman buildah skopeo crun conmon \
-            golang-github-containers-common golang-github-containers-image || true
-          # download.opensuse.org redirects to mirrors with stale files ("unexpected size");
-          # downloadcontent.opensuse.org has no mirrors. Retries just in case.
-          for attempt in 1 2 3 4; do
-            sudo apt-get update && break
-            [ "$attempt" = 4 ] && exit 1
-            sleep 15
-          done
-      # The cache key is the candidate versions of the packages we install, so a new alvistack build
-      # misses the cache and downloads fresh .debs; an empty/missing cache just means a normal install.
-      - name: Resolve Podman package versions
-        id: podman-ver
-        run: |
-          ver=$(apt-cache policy podman netavark passt | awk '/Candidate:/{print $2}' | tr '\n' '_')
-          echo "key=podman-debs-ubuntu2404-$ver" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/podman-debs
-          key: ${{ steps.podman-ver.outputs.key }}
-      - name: Install Podman 6
-        run: |
-          set -euo pipefail
-          debs="$RUNNER_TEMP/podman-debs"
-          sudo mkdir -p "$debs/partial"
-          for attempt in 1 2 3 4; do
-            sudo apt-get install -y -o Acquire::Retries=3 -o "Dir::Cache::archives=$debs" \
-              podman netavark passt uidmap && break
-            [ "$attempt" = 4 ] && exit 1
-            sleep 15
-          done
-          # Keep only the .debs in the cached directory (no lock/partial, readable by the cache action).
-          sudo rm -rf "$debs/partial" "$debs/lock"
-          sudo chmod -R a+rX "$debs"
-          podman --version
-      - name: Configure rootless containers
-        run: |
-          set -euo pipefail
-          # The alvistack package ships no /etc/containers/*.conf (measured in CI: no files,
-          # Podman falls back to the default rootful graphroot). The user configuration is explicit.
-          dpkg -l | grep -E 'podman|containers-common|crun|netavark|passt' || true
-          ls -la /etc/containers /usr/share/containers 2>&1 || true
-          mkdir -p "$HOME/.config/containers"
-          cat > "$HOME/.config/containers/storage.conf" <<STORAGE
-          [storage]
-          driver = "overlay"
-          graphroot = "$HOME/.local/share/containers/storage"
-          runroot = "$XDG_RUNTIME_DIR/containers"
-          STORAGE
-          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$HOME/.config/containers/policy.json"
-          # The acceptance script's local registry (scripts/acceptance.sh --with-local-registry) runs over http;
-          # the Podman service reads registries.conf at startup, so the entry must be there before it starts.
-          cat > "$HOME/.config/containers/registries.conf" <<'REG'
-          [[registry]]
-          location = "127.0.0.1:15099"
-          insecure = true
-          REG
-          podman info 2>&1 | head -40
-      - name: Larger subuid pool
-        run: |
-          set -euo pipefail
-          # Each Węglarka instance takes a 65 536-uid range and the CI user has exactly 65 536 subuids
-          # (docs/decisions/0009). Production has 2 000 000; mirror that order of magnitude here.
-          sudo usermod --add-subuids 1000000-1999999 --add-subgids 1000000-1999999 "$USER"
-          grep "^$USER:" /etc/subuid /etc/subgid
-          # `podman info` in the previous step created the rootless user namespace (pause process) with the
-          # old pool; migrate restarts it so the new subuids are mapped.
-          podman system migrate
-          podman info --format '{{json .Host.IDMappings.UIDMap}}'
-      - name: Start rootless podman service
-        run: |
-          set -euo pipefail
-          sock="$XDG_RUNTIME_DIR/podman/podman.sock"
-          mkdir -p "$(dirname "$sock")"
-          podman system service --time 0 "unix://$sock" 2>"$RUNNER_TEMP/podman-service.log" &
-          for _ in $(seq 30); do [ -S "$sock" ] && break; sleep 1; done
-          echo "WEGLARKA_PODMAN_SOCKET=$sock" >> "$GITHUB_ENV"
-          podman version
-          grep "^$USER:" /etc/subuid /etc/subgid
+      - uses: ./.github/actions/podman-rootless
       - run: rustup show active-toolchain || rustup toolchain install
       # Read-only: the cache is written by the `check` job on main (same debug target).
       - uses: Swatinem/rust-cache@v2
@@ -343,8 +258,20 @@ jobs:
       # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
       # so `--nocapture` shows that nothing was skipped.
       - run: cargo test -p weglarka-podman -- --nocapture
-      # Image smoke test (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
-      # The image is assembled from the exact binaries the `musl` job built (docs/decisions/0008); no compilation here.
+      - name: Podman service log
+        if: failure()
+        run: cat "$RUNNER_TEMP/podman-service.log" || true
+
+  # Image smoke tests (docs/decisions/0006): daemon in a container, CLI over the socket, doctor, nginx.
+  # The image is assembled from the exact binaries the `musl` job built (docs/decisions/0008); no compilation
+  # here, so no Rust toolchain either.
+  smoke:
+    needs: [changes, musl]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/podman-rootless
       - uses: actions/download-artifact@v4
         with:
           name: musl-bin

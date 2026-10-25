@@ -11,7 +11,7 @@ Status: accepted (foundation, 2026-10-23); to be confirmed by the first green ru
 - Rootless Podman in a container requires privileged mode and nested user namespaces, which changes
   the semantics of `userns=auto`/subuid — that is exactly what we want to test.
 - Cost: installation from an external repo (tens of seconds) and a dependency on OBS availability.
-  Mitigation: the `integration-podman` job is separate; if OBS fails it does not block fmt/clippy/test.
+  Mitigation: the `podman-tests` job is separate; if OBS fails it does not block fmt/clippy/test.
 
 **Contract with the tests (session a).** The job starts `podman system service` and exports
 `WEGLARKA_PODMAN_SOCKET`. Integration tests read this variable and skip when it is absent
