@@ -13,9 +13,9 @@ use sha2::{Digest as _, Sha256};
 use crate::app::Digest;
 use crate::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, LogChunk, LogSource, LogStream, NetworkInfo, NetworkSpec, NetworkSummary,
-    PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream,
-    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
+    ImageInfo, LoadedImage, LogChunk, LogSource, LogStream, NetworkInfo, NetworkSpec,
+    NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result,
+    TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
@@ -30,6 +30,10 @@ pub enum Call {
         signal: String,
     },
     ImagePull(String),
+    /// `image_load`: the number of archive bytes the fake consumed.
+    ImageLoad {
+        bytes: usize,
+    },
     ImageTag {
         id: String,
         repo: String,
@@ -87,6 +91,10 @@ struct State {
     containers: BTreeMap<String, ContainerInfo>,
     /// reference → image
     images: BTreeMap<String, ImageInfo>,
+    /// Names the next `image_load` gives its image (empty = an archive saved by id, no name).
+    load_names: VecDeque<Vec<String>>,
+    /// The next `image_load` fails with this message (a broken archive).
+    load_failures: VecDeque<String>,
     pull_digests: BTreeMap<String, Digest>,
     pull_failures: BTreeMap<String, String>,
     /// References that only pull with exactly these credentials (a private registry).
@@ -261,6 +269,19 @@ impl FakePodman {
     /// (reported by `container_wait`); without a script it exits 0 silently.
     pub fn script_next_run(&self, script: RunScript) {
         self.lock().run_queue.push_back(script);
+    }
+
+    /// The next `image_load` names its image `names` (as the archive would); without a script the
+    /// loaded image has no name, like an archive saved by id.
+    pub fn script_next_load(&self, names: &[&str]) {
+        self.lock()
+            .load_names
+            .push_back(names.iter().map(|n| (*n).to_owned()).collect());
+    }
+
+    /// The next `image_load` fails with `message` (a corrupt or unsupported archive).
+    pub fn script_next_load_failure(&self, message: &str) {
+        self.lock().load_failures.push_back(message.to_owned());
     }
 
     /// Exit code returned by subsequent `container_exec`s in this container.
@@ -759,12 +780,80 @@ impl PodmanClient for FakePodman {
             .ok_or_else(|| PodmanError::NotFound(format!("image {id}")))?;
         let name = format!("{repo}:{tag}");
         image.repo_tags.push(name.clone());
+        // Like libpod, a repository the image is tagged into also resolves `repo@digest` (the pin
+        // `weglarka push` relies on, docs/decisions/0042).
+        let digest_name = image.digest.as_ref().map(|d| format!("{repo}@{d}"));
+        if let Some(digest_name) = &digest_name
+            && !image.repo_digests.contains(digest_name)
+        {
+            image.repo_digests.push(digest_name.clone());
+        }
         // Every alias of the image reports the new tag too.
         for existing in s.images.values_mut().filter(|i| i.id == id) {
             *existing = image.clone();
         }
-        s.images.insert(name, image);
+        s.images.insert(name, image.clone());
+        if let Some(digest_name) = digest_name {
+            s.images.insert(digest_name, image);
+        }
         Ok(())
+    }
+
+    async fn image_load(&self, tar: TarStream) -> Result<LoadedImage> {
+        let mut tar = tar;
+        let mut hasher = Sha256::new();
+        let mut bytes = 0usize;
+        while let Some(chunk) = tar.next().await {
+            let chunk = chunk?;
+            bytes += chunk.len();
+            hasher.update(&chunk);
+        }
+        let mut s = self.lock();
+        s.calls.push(Call::ImageLoad { bytes });
+        if let Some(message) = s.load_failures.pop_front() {
+            return Err(PodmanError::Api {
+                status: 500,
+                message,
+            });
+        }
+        // The same archive is the same image: the digest is the hash of the bytes.
+        let digest = Digest::new(format!("sha256:{}", hex::encode(hasher.finalize())))
+            .expect("sha256 hex is a valid digest");
+        let id = digest.as_str().trim_start_matches("sha256:").to_owned();
+        let names = s.load_names.pop_front().unwrap_or_default();
+        let repo_tags: Vec<String> = names.iter().filter(|n| !n.contains('@')).cloned().collect();
+        let repo_digests: Vec<String> = repo_tags
+            .iter()
+            .map(|n| format!("{}@{digest}", image_repo(n)))
+            .collect();
+        let image = ImageInfo {
+            id: id.clone(),
+            digest: Some(digest.clone()),
+            repo_tags: repo_tags.clone(),
+            repo_digests: repo_digests.clone(),
+            size_bytes: DEFAULT_IMAGE_SIZE_BYTES,
+            labels: BTreeMap::new(),
+        };
+        // A repeated load keeps the names the image already had in the store.
+        for tag in &repo_tags {
+            for existing in s.images.values_mut() {
+                existing.repo_tags.retain(|t| t != tag);
+            }
+            s.images.insert(tag.clone(), image.clone());
+        }
+        for name in &repo_digests {
+            s.images.insert(name.clone(), image.clone());
+        }
+        s.images.insert(id.clone(), image);
+        Ok(LoadedImage {
+            names: if names.is_empty() {
+                vec![id.clone()]
+            } else {
+                names
+            },
+            id,
+            digest: Some(digest),
+        })
     }
 
     async fn image_remove(&self, reference: &str) -> Result<()> {

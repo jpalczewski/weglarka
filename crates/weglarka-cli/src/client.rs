@@ -251,6 +251,31 @@ impl ApiClient {
         query: &str,
         body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     ) -> Result<(), CliError> {
+        self.upload_bytes(endpoint, params, query, body)
+            .await
+            .map(drop)
+    }
+
+    /// [`Self::upload`] for an endpoint that answers with JSON (`weglarka push`): the deploy that
+    /// follows the upload is part of the same request, so there is no overall timeout here either.
+    pub async fn upload_json<T: DeserializeOwned>(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    ) -> Result<T, CliError> {
+        let bytes = self.upload_bytes(endpoint, params, "", body).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| CliError::internal(format!("unexpected response from the daemon: {e}")))
+    }
+
+    async fn upload_bytes(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        query: &str,
+        body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    ) -> Result<Bytes, CliError> {
         let path = request_path(endpoint, params, query);
         let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
         let req = Request::builder()
@@ -273,7 +298,7 @@ impl ApiClient {
             .map_err(|e| CliError::internal(format!("upload to daemon failed: {e}")))?
             .to_bytes();
         if status.is_success() {
-            Ok(())
+            Ok(bytes)
         } else {
             Err(error_from_response(status, &bytes))
         }

@@ -49,6 +49,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Run(a) => crate::run::run(json, &overrides, a).await,
         Command::Forward(a) => crate::forward::run(json, &overrides, a).await,
         Command::Deploy(a) => deploy(json, &overrides, a).await,
+        Command::Push(a) => crate::push::run(json, &overrides, a).await,
         Command::Status => status(json, &overrides).await,
         Command::Secrets(SecretsCommand::Set(a)) => secrets_set(json, &overrides, a).await,
         Command::Secrets(SecretsCommand::List { app }) => {
@@ -367,7 +368,7 @@ fn reload_conflict(err: CliError, name: &InstanceName) -> CliError {
 
 // ---------- deploy / status ----------
 
-async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i32, CliError> {
+pub(crate) async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i32, CliError> {
     let name = instance(&a.app)?;
     let params = [("name", name.as_str())];
     let req = DeployRequest {
@@ -385,7 +386,13 @@ async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i32, CliErro
     let resp: DeployResponse = client
         .call(endpoints::APPS_DEPLOY, &params, Some(&req))
         .await?;
-    emit(json, &resp, || {
+    Ok(report_deploy(json, &name, &resp))
+}
+
+/// Prints what a deploy did and returns the exit code (`ROLLED_BACK` when it was rolled back); shared
+/// by `deploy` and `push`.
+pub(crate) fn report_deploy(json: bool, name: &InstanceName, resp: &DeployResponse) -> i32 {
+    emit(json, resp, || {
         let digest = resp.digest.as_ref().map(|d| d.as_str()).unwrap_or("-");
         if resp.outcome == DeployOutcome::Provisioned {
             format!(
@@ -400,11 +407,11 @@ async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i32, CliErro
             )
         }
     });
-    Ok(if resp.outcome == DeployOutcome::RolledBack {
+    if resp.outcome == DeployOutcome::RolledBack {
         exit::ROLLED_BACK
     } else {
         exit::OK
-    })
+    }
 }
 
 async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {

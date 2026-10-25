@@ -11,6 +11,7 @@ expression: list
   "Put /v1/apps/{name}",
   "Delete /v1/apps/{name}",
   "Post /v1/apps/{name}/deploy",
+  "Put /v1/apps/{name}/image",
   "Post /v1/apps/{name}/reload",
   "Post /v1/apps/{name}/run",
   "Post /v1/apps/{name}/forward",

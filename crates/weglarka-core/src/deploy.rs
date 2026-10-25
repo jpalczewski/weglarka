@@ -116,6 +116,17 @@ pub fn instances_tracking(apps: &AppsFile, image_ref: &str) -> Vec<InstanceName>
         .collect()
 }
 
+/// Where a deploy takes the digest it pins from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DigestSource<'a> {
+    /// The tag in `spec.image`: webhook, `apps deploy`, reconcile.
+    Tag,
+    /// Another reference of the same repository, pulled now (`weglarka push --image`).
+    Reference(&'a str),
+    /// A digest already in the local store (`weglarka push ARCHIVE`, docs/decisions/0042).
+    Local(&'a Digest),
+}
+
 #[derive(Debug)]
 pub struct WebhookOutcome {
     pub duplicate: bool,
@@ -278,6 +289,19 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await?
                 .digest
                 .ok_or_else(|| EngineError::NoDigest(reference.to_owned())),
+        }
+    }
+
+    async fn digest_from(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        source: DigestSource<'_>,
+    ) -> Result<Digest, EngineError> {
+        match source {
+            DigestSource::Tag => self.resolve_digest(instance, &spec.image).await,
+            DigestSource::Reference(reference) => self.resolve_digest(instance, reference).await,
+            DigestSource::Local(digest) => Ok(digest.clone()),
         }
     }
 
@@ -546,10 +570,21 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
+        self.deploy_locked_from(instance, force, DigestSource::Tag)
+            .await
+    }
+
+    /// [`Self::deploy_locked`] with the digest taken from `source` instead of the tag.
+    pub(crate) async fn deploy_locked_from(
+        &self,
+        instance: &InstanceName,
+        force: bool,
+        source: DigestSource<'_>,
+    ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
         // `start = false` — provision only (no container, no secrets, no health gate).
         if !spec.start {
-            return self.provision_locked(instance, &spec).await;
+            return self.provision_from(instance, &spec, source).await;
         }
         // A deploy starts a container: every app in `depends_on` has to be running/healthy first
         // (issue #35). Not a failure — the start is retried once the dependency is up.
@@ -562,7 +597,7 @@ impl<P: PodmanClient> Reconciler<P> {
         self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
 
-        let digest = match self.resolve_digest(instance, &spec.image).await {
+        let digest = match self.digest_from(instance, &spec, source).await {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {
@@ -717,6 +752,16 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<DeployOutcome, EngineError> {
+        self.provision_from(instance, spec, DigestSource::Tag).await
+    }
+
+    /// [`Self::provision_locked`] with the digest taken from `source` instead of the tag.
+    pub(crate) async fn provision_from(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        source: DigestSource<'_>,
+    ) -> Result<DeployOutcome, EngineError> {
         // Config mounts are validated before anything is pinned or touched, exactly like a deploy.
         crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
             .map_err(|e| EngineError::Configs(e.to_string()))?;
@@ -724,7 +769,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
         self.assign_range(instance, spec).await?;
-        let digest = match self.resolve_digest(instance, &spec.image).await {
+        let digest = match self.digest_from(instance, spec, source).await {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {

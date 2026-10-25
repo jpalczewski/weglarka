@@ -82,6 +82,15 @@ pub enum EngineError {
     /// `weglarka forward` request that cannot be served.
     #[error("{0}")]
     ForwardInvalid(String),
+    /// `weglarka push` while another image upload is in progress (docs/decisions/0042).
+    #[error("another image upload is in progress; retry when it has finished")]
+    PushBusy,
+    /// `weglarka push` archive that Podman cannot load (corrupt, unsupported, or cut off).
+    #[error("cannot load the image archive: {0}")]
+    PushLoad(String),
+    /// `weglarka push` request that names an image the app may not be deployed from.
+    #[error("{0}")]
+    PushInvalid(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
     #[error("app {0} has no running container; use `weglarka apps start {0}`")]
     ReloadNotRunning(InstanceName),
@@ -474,6 +483,9 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) runs: Arc<tokio::sync::Semaphore>,
     /// Free slots for forward relays ([`crate::forward::MAX_CONCURRENT_FORWARDS`]).
     pub(crate) forwards: Arc<tokio::sync::Semaphore>,
+    /// The single slot of `weglarka push` image uploads: an archive is streamed into the image store
+    /// outside the engine lock, so one at a time bounds the disk and I/O a client can take.
+    pub(crate) uploads: Arc<tokio::sync::Semaphore>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
     /// The instance being mutated right now (`None` when the engine is idle). See [`InFlight`].
     pub(crate) activity: std::sync::Mutex<Option<InFlight>>,
@@ -505,6 +517,7 @@ impl<P: PodmanClient> Reconciler<P> {
             forwards: Arc::new(tokio::sync::Semaphore::new(
                 crate::forward::MAX_CONCURRENT_FORWARDS,
             )),
+            uploads: Arc::new(tokio::sync::Semaphore::new(1)),
             dedup: std::sync::Mutex::new(dedup),
             activity: std::sync::Mutex::new(None),
             monitor: crash::Policy::default(),

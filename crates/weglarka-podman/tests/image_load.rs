@@ -1,6 +1,6 @@
-//! Spike for docs/decisions/0042-push-local-images.md: what libpod does when an image is loaded from an
-//! archive instead of pulled. Requires `WEGLARKA_PODMAN_SOCKET`; skipped without it
-//! (docs/decisions/0002-podman-in-ci.md).
+//! `PodmanClient::image_load` against a real Podman 6, and what libpod does when an image is loaded from
+//! an archive instead of pulled (the spike behind docs/decisions/0042-push-local-images.md). Requires
+//! `WEGLARKA_PODMAN_SOCKET`; skipped without it (docs/decisions/0002-podman-in-ci.md).
 //!
 //! `weglarka push` pins the digest of the image *after* the load (a docker archive carries no manifest,
 //! so libpod computes one and it differs from the registry's), so the properties the design depends on are:
@@ -14,9 +14,9 @@
 use std::fs;
 use std::process::Command;
 
-use futures_util::StreamExt;
-use serde_json::Value;
-use weglarka_core::podman::{ImageInfo, PodmanClient, PodmanError};
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use weglarka_core::podman::{ImageInfo, LoadedImage, PodmanClient, PodmanError, TarStream};
 use weglarka_podman::LibpodClient;
 
 const ALPINE: &str = "docker.io/library/alpine:3.20";
@@ -34,7 +34,8 @@ fn socket() -> Option<String> {
     socket
 }
 
-/// Raw libpod call: `data` is a file sent as the body, `out` a file the response is written to.
+/// Raw libpod call for what the client has no method for (`images/{ref}/get`): `out` is a file the
+/// response is written to.
 fn curl(socket: &str, method: &str, path: &str, data: Option<&str>, out: Option<&str>) -> String {
     let mut cmd = Command::new("curl");
     cmd.args([
@@ -72,20 +73,13 @@ async fn pull(client: &LibpodClient, reference: &str) {
     }
 }
 
-/// Loads `archive` and returns the names libpod reports for it.
-fn load(socket: &str, archive: &str, label: &str) -> Vec<String> {
-    let response = curl(socket, "POST", "/images/load", Some(archive), None);
-    println!("[{label}] load response: {response}");
-    let parsed: Value = serde_json::from_str(&response).expect("load answers JSON");
-    parsed["Names"]
-        .as_array()
-        .map(|names| {
-            names
-                .iter()
-                .filter_map(|n| n.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Loads `archive` through the client (`PodmanClient::image_load`, what `weglarka push` uses).
+async fn load(client: &LibpodClient, archive: &str, label: &str) -> LoadedImage {
+    let bytes = Bytes::from(fs::read(archive).expect("read the archive"));
+    let tar: TarStream = stream::iter([Ok(bytes)]).boxed();
+    let loaded = client.image_load(tar).await.expect("image_load");
+    println!("[{label}] loaded: {loaded:?}");
+    loaded
 }
 
 /// One scenario: save the pulled image as `format` (under its name, or by id when `nameless`), remove it,
@@ -143,7 +137,14 @@ async fn scenario(
             "[{label}] the image must be gone before {round}"
         );
 
-        let names = load(socket, archive, &format!("{label}, {round}"));
+        let loaded = load(client, archive, &format!("{label}, {round}")).await;
+        let names = loaded.names.clone();
+        if loaded.id != original.id {
+            problems.push(format!(
+                "{round}: image_load reports id {} instead of {}",
+                loaded.id, original.id
+            ));
+        }
         if nameless {
             client
                 .image_tag(&original.id, repo, tag)
@@ -162,6 +163,12 @@ async fn scenario(
             problems.push(format!("{round}: the loaded image has no digest"));
             break;
         };
+        if loaded.digest.as_ref() != Some(&digest) {
+            problems.push(format!(
+                "{round}: image_load reports digest {:?}, inspect {digest}",
+                loaded.digest
+            ));
+        }
         println!(
             "[{label}, {round}] digest {digest} (registry digest {original_digest}, equal: {})",
             digest == original_digest

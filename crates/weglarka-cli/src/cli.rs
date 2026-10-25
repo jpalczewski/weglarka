@@ -47,6 +47,9 @@ pub enum Command {
     Forward(crate::forward::ForwardArgs),
     /// Force an app deploy (pull, container swap, health gate, rollback if needed).
     Deploy(DeployArgs),
+    /// Deploy an image that did not come through the webhook: an archive built on this machine
+    /// (`podman save … | weglarka push <app> -`) or another tag of the app's image repository.
+    Push(crate::push::PushArgs),
     /// Daemon and app status.
     Status,
     /// App secrets (set/list/remove). Values are never returned by the API.
@@ -215,7 +218,9 @@ pub struct RemoveArgs {
 #[derive(Debug, Args)]
 pub struct DeployArgs {
     pub app: String,
-    /// Override the image reference for this deploy only (e.g. a pinned sha-… tag).
+    /// Deploy this tag or digest of the app's image repository instead of the spec's tag (e.g. a
+    /// pinned sha-… tag). Its digest is pinned in the state; the spec keeps its tag, so the next
+    /// deploy of that tag replaces it.
     #[arg(long, value_name = "REF")]
     pub image: Option<String>,
     /// Deploy nothing; check that the app exists and show the request.

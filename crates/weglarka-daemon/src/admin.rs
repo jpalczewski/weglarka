@@ -39,6 +39,7 @@ use weglarka_core::volumes::RemoveAppOptions;
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
 use crate::images;
+use crate::push;
 use crate::shared_networks;
 use crate::shared_volumes;
 use crate::update;
@@ -136,6 +137,11 @@ impl From<EngineError> for Fail {
                 Fail(ErrorCode::Conflict, e.to_string())
             }
             EngineError::ForwardInvalid(message) => Fail::invalid(message),
+            // `weglarka push` (issue #109): nothing was deployed for any of these.
+            e @ EngineError::PushBusy => Fail(ErrorCode::Conflict, e.to_string()),
+            e @ (EngineError::PushLoad(_) | EngineError::PushInvalid(_)) => {
+                Fail::invalid(e.to_string())
+            }
             other => Fail::internal(other),
         }
     }
@@ -200,6 +206,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .merge(shared_volumes::routes())
         .merge(shared_networks::routes())
         .merge(images::routes())
+        .merge(push::routes()) // a streamed archive, like the volume tars
         .with_state(daemon)
 }
 
@@ -533,21 +540,33 @@ async fn deploy_app<P: PodmanClient + 'static>(
     } else {
         parse_json(&body)?
     };
-    if req.image_ref.is_some() {
-        return Err(Fail::invalid(
-            "image_ref override is not supported yet; change `image` in the app spec",
-        ));
-    }
     load_spec(&d, &name)?;
     // A deploy holds the engine mutex through pull and health gate — deliberately without a timeout.
-    let mut outcome = d.engine.deploy(&name, false).await?;
-    if matches!(outcome, CoreOutcome::KnownBad { .. }) {
-        // A manual deploy is the operator's explicit will: retry a known-bad digest.
-        outcome = d.engine.deploy(&name, true).await?;
-    }
+    let outcome = match &req.image_ref {
+        // An image of the same repository: pinned in the state, the spec keeps its tag (issue #109).
+        Some(reference) => d.engine.push_reference(&name, reference).await?,
+        None => {
+            let mut outcome = d.engine.deploy(&name, false).await?;
+            if matches!(outcome, CoreOutcome::KnownBad { .. }) {
+                // A manual deploy is the operator's explicit will: retry a known-bad digest.
+                outcome = d.engine.deploy(&name, true).await?;
+            }
+            outcome
+        }
+    };
+    deploy_response(&d, &name, outcome)
+}
+
+/// Marks the state as changed and turns the engine's outcome into the `deploy` response; shared by
+/// `apps deploy` and `weglarka push`.
+pub(crate) fn deploy_response<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    name: &InstanceName,
+    outcome: CoreOutcome,
+) -> ApiResult<Response> {
     d.changed();
     let generation = state::load_state(&d.paths.state.state)
-        .map(|s| s.apps.get(&name).map_or(0, |a| a.generation))
+        .map(|s| s.apps.get(name).map_or(0, |a| a.generation))
         .map_err(Fail::internal)?;
     let resp = match outcome {
         CoreOutcome::Deployed { digest, generation } => DeployResponse {

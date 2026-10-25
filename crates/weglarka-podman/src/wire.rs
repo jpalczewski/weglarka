@@ -701,6 +701,20 @@ fn useful_names(names: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Answer of `images/load`: the names of the loaded images (the id for an archive saved by id).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct LoadReport {
+    #[serde(rename = "Names")]
+    names: Option<Vec<String>>,
+}
+
+impl LoadReport {
+    pub(crate) fn into_names(self) -> Vec<String> {
+        self.names.unwrap_or_default()
+    }
+}
+
 /// One line of the `images/pull` stream.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -1376,6 +1390,19 @@ mod tests {
         let mut header = vec![1, 0, 0, 0];
         header.extend_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(demux.push(&header), Err(PodmanError::Protocol(_))));
+    }
+
+    #[test]
+    fn load_report_reads_the_names_and_tolerates_none() {
+        let report: LoadReport =
+            decode(br#"{"Names":["docker.io/library/alpine:3.20","sha256:abc"]}"#).unwrap();
+        assert_eq!(
+            report.into_names(),
+            ["docker.io/library/alpine:3.20", "sha256:abc"]
+        );
+        for empty in [&b"{}"[..], br#"{"Names":null}"#, br#"{"Names":[]}"#] {
+            assert!(decode::<LoadReport>(empty).unwrap().into_names().is_empty());
+        }
     }
 
     #[test]

@@ -6,9 +6,10 @@ use futures_core::Stream;
 use futures_util::stream;
 use hyper::Method;
 use weglarka_core::podman::{
-    ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo, LogStream,
-    NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent,
-    RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
+    LoadedImage, LogStream, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError,
+    PodmanEvent, PullEvent, RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo,
+    VolumeSpec,
 };
 
 use crate::registry_auth;
@@ -16,9 +17,9 @@ use crate::transport::{Lines, Transport, encode_component, name_conflict, path_n
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
-    InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, LogDemux,
-    NetworkRmReport, PullLine, PullReport, StartExec, Version, WireEvent, WireVolume, decode,
-    health_status, parse_wait,
+    InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, LoadReport,
+    LogDemux, NetworkRmReport, PullLine, PullReport, StartExec, Version, WireEvent, WireVolume,
+    decode, health_status, parse_wait,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -268,6 +269,27 @@ impl PodmanClient for LibpodClient {
         );
         self.transport.call(Method::POST, &path, None).await?;
         Ok(())
+    }
+
+    async fn image_load(&self, tar: TarStream) -> Result<LoadedImage> {
+        let body = self
+            .transport
+            .call_streaming_body(Method::POST, "/images/load", "application/x-tar", tar)
+            .await?;
+        let names = decode::<LoadReport>(&body)?.into_names();
+        // The report only names the images; the first name libpod can inspect gives the id and digest.
+        for name in &names {
+            if let Ok(image) = self.image_inspect(name).await {
+                return Ok(LoadedImage {
+                    id: image.id,
+                    digest: image.digest,
+                    names,
+                });
+            }
+        }
+        Err(PodmanError::Protocol(format!(
+            "images/load reported no image that can be inspected: {names:?}"
+        )))
     }
 
     async fn image_remove(&self, reference: &str) -> Result<()> {
