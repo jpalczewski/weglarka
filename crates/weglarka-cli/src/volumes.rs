@@ -20,7 +20,7 @@ use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
 use crate::settings::Overrides;
 
-const CHUNK: usize = 256 * 1024;
+pub(crate) const CHUNK: usize = 256 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum VolumesCommand {
@@ -450,7 +450,7 @@ async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliErro
 }
 
 /// Reads `reader` in [`CHUNK`]-sized pieces, counting the bytes.
-fn chunks(
+pub(crate) fn chunks(
     reader: impl AsyncRead + Send + Unpin + 'static,
     counter: Arc<AtomicU64>,
 ) -> stream::BoxStream<'static, std::io::Result<Bytes>> {

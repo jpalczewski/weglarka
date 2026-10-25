@@ -15,6 +15,8 @@ pub mod health_probe;
 pub mod images;
 pub mod ingress;
 pub mod platform;
+/// `PUT /v1/apps/{name}/image`: deploy an image archive built elsewhere (issue #109).
+pub mod push;
 /// Host-side switcher of Węglarka's own image (issue #99, `docs/decisions/0027`).
 pub mod self_update;
 /// The service description shared by `platform install` and the switcher.

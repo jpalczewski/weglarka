@@ -59,6 +59,15 @@ pub const APPS_DEPLOY: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/deploy",
 };
+/// `PUT` a streamed `application/x-tar` image archive (`oci-archive` or `docker-archive`, as written by
+/// `podman save`) → [`DeployResponse`](crate::DeployResponse). Loads the image into Podman's store,
+/// tags it into the app's image repository and deploys it like any other digest: health gate,
+/// rollback, `current`/`previous` in `state.toml`; `apps.toml` is not touched. One upload at a time
+/// (409 otherwise); an archive Podman cannot load is a 400 (issue #109, docs/decisions/0042).
+pub const APPS_PUSH_IMAGE: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/apps/{name}/image",
+};
 /// `POST` [`ReloadRequest`](crate::ReloadRequest) → [`ReloadResponse`](crate::ReloadResponse).
 /// Sends the app's `reload_signal`, restarts the container when the spec sets none, or recreates it
 /// when `recreate = true` (issue #118). Changes no desired state.
@@ -189,6 +198,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_UPDATE,
     APPS_REMOVE,
     APPS_DEPLOY,
+    APPS_PUSH_IMAGE,
     APPS_RELOAD,
     APPS_RUN,
     APPS_FORWARD,

@@ -2823,3 +2823,251 @@ host_ports = [{ host = 2222, container = 22 }]
         assert_eq!(h.rec.remove_stale_forwards().await.unwrap(), 0);
     }
 }
+
+/// `weglarka push` (issue #109, docs/decisions/0042).
+mod push {
+    use bytes::Bytes;
+    use futures_util::stream;
+    use sha2::{Digest as _, Sha256};
+
+    use super::*;
+    use crate::podman::TarStream;
+    use crate::push::PUSHED_TAG;
+
+    const REPO: &str = "ghcr.io/jpalczewski/ntfy.zig";
+
+    fn tar(bytes: &'static [u8]) -> TarStream {
+        stream::iter([Ok(Bytes::from_static(bytes))]).boxed()
+    }
+
+    /// The digest the fake gives an archive: the hash of its bytes.
+    fn archive_digest(bytes: &[u8]) -> Digest {
+        Digest::new(format!("sha256:{}", hex::encode(Sha256::digest(bytes)))).unwrap()
+    }
+
+    async fn deployed(apps_toml: &str) -> Harness {
+        let h = Harness::new(apps_toml);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_reference_pins_its_digest_and_leaves_the_spec_alone() {
+        let h = deployed(NTFY).await;
+        let reference = format!("{REPO}:sha-1");
+        h.fake.set_pull_digest(&reference, digest('b'));
+        let before = h.fake.calls().len();
+
+        let out = h.rec.push_reference(&name("ntfy"), &reference).await;
+        assert_eq!(
+            out.unwrap(),
+            DeployOutcome::Deployed {
+                digest: digest('b'),
+                generation: 2
+            }
+        );
+        let st = h.state("ntfy");
+        assert_eq!(
+            (st.current, st.previous),
+            (Some(digest('b')), Some(digest('a')))
+        );
+        assert!(
+            h.container_digest_ref("ntfy")
+                .ends_with(digest('b').as_str())
+        );
+        let calls = h.fake.calls()[before..].to_vec();
+        assert!(calls.contains(&Call::ImagePull(reference)));
+        assert!(
+            !calls.contains(&Call::ImagePull(IMAGE.into())),
+            "the tag in the spec must not be pulled: {calls:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&h.rec.paths().apps).unwrap(), NTFY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reference_of_another_repository_is_refused_before_anything_is_pulled() {
+        let h = deployed(NTFY).await;
+        let before = h.fake.calls().len();
+        for reference in ["ghcr.io/jpalczewski/other:latest", "docker.io/x/ntfy.zig:1"] {
+            let err = h
+                .rec
+                .push_reference(&name("ntfy"), reference)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, EngineError::PushInvalid(_)), "{err:?}");
+        }
+        assert_eq!(h.fake.calls().len(), before);
+        assert_eq!(h.state("ntfy").current, Some(digest('a')));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_archive_is_loaded_tagged_into_the_apps_repository_and_deployed() {
+        let h = deployed(NTFY).await;
+        let before = h.fake.calls().len();
+
+        let out = h.rec.push_archive(&name("ntfy"), tar(b"image-1")).await;
+        let pushed = archive_digest(b"image-1");
+        assert_eq!(
+            out.unwrap(),
+            DeployOutcome::Deployed {
+                digest: pushed.clone(),
+                generation: 2
+            }
+        );
+        let st = h.state("ntfy");
+        assert_eq!(
+            (st.current, st.previous),
+            (Some(pushed.clone()), Some(digest('a')))
+        );
+        assert!(h.container_digest_ref("ntfy").ends_with(pushed.as_str()));
+
+        let calls = h.fake.calls()[before..].to_vec();
+        assert!(calls.contains(&Call::ImageLoad { bytes: 7 }), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::ImageTag { repo, tag, .. }
+                if repo == REPO && tag == PUSHED_TAG)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::ImagePull(_))),
+            "a pushed image is never pulled: {calls:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&h.rec.paths().apps).unwrap(), NTFY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pushing_the_same_archive_again_is_unchanged_and_a_new_one_moves_the_pointers() {
+        let h = deployed(NTFY).await;
+        let ntfy = name("ntfy");
+        h.rec.push_archive(&ntfy, tar(b"image-1")).await.unwrap();
+        let first = archive_digest(b"image-1");
+
+        assert_eq!(
+            h.rec.push_archive(&ntfy, tar(b"image-1")).await.unwrap(),
+            DeployOutcome::Unchanged {
+                digest: first.clone()
+            }
+        );
+
+        let second = archive_digest(b"image-2");
+        assert_eq!(
+            h.rec.push_archive(&ntfy, tar(b"image-2")).await.unwrap(),
+            DeployOutcome::Deployed {
+                digest: second.clone(),
+                generation: 3
+            }
+        );
+        let st = h.state("ntfy");
+        assert_eq!((st.current, st.previous), (Some(second), Some(first)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_image_that_fails_the_gate_rolls_back_and_is_retried_by_the_next_push() {
+        let h = deployed(NTFY).await;
+        let ntfy = name("ntfy");
+        h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+        h.fake.script_health(
+            "ntfy",
+            [
+                HealthStatus::Unhealthy,
+                HealthStatus::Unhealthy,
+                HealthStatus::Unhealthy,
+                HealthStatus::Healthy,
+            ],
+        );
+        let bad = archive_digest(b"broken");
+        let out = h.rec.push_archive(&ntfy, tar(b"broken")).await.unwrap();
+        assert!(
+            matches!(&out, DeployOutcome::RolledBack { failed, restored, .. }
+                if *failed == bad && *restored == digest('a')),
+            "{out:?}"
+        );
+        let st = h.state("ntfy");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.failed.as_ref().unwrap().digest, bad);
+
+        // A manual push is the operator's will: the known-bad digest is tried again, not refused.
+        h.fake.script_health(
+            "ntfy",
+            [
+                HealthStatus::Unhealthy,
+                HealthStatus::Unhealthy,
+                HealthStatus::Unhealthy,
+                HealthStatus::Healthy,
+            ],
+        );
+        let again = h.rec.push_archive(&ntfy, tar(b"broken")).await.unwrap();
+        assert!(
+            matches!(again, DeployOutcome::RolledBack { .. }),
+            "{again:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pushing_to_an_app_with_start_false_only_pins_the_image() {
+        let h = Harness::new(PROVISION_ONLY);
+        let out = h.rec.push_archive(&name("gate"), tar(b"image-1")).await;
+        let pushed = archive_digest(b"image-1");
+        assert_eq!(
+            out.unwrap(),
+            DeployOutcome::Provisioned {
+                digest: pushed.clone()
+            }
+        );
+        assert!(h.fake.containers().is_empty());
+        assert_eq!(h.state("gate").current, Some(pushed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_archive_changes_nothing_and_frees_the_upload_slot() {
+        let h = deployed(NTFY).await;
+        let ntfy = name("ntfy");
+        h.fake.script_next_load_failure("unrecognized image format");
+        let err = h
+            .rec
+            .push_archive(&ntfy, tar(b"not a tar"))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, EngineError::PushLoad(m) if m.contains("unrecognized")));
+        assert_eq!(h.state("ntfy").current, Some(digest('a')));
+        assert_eq!(h.state("ntfy").generation, 1);
+        // The slot is free again.
+        h.rec.push_archive(&ntfy, tar(b"image-1")).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_upload_is_refused_while_one_is_in_progress() {
+        let h = deployed(NTFY).await;
+        let rec = h.rec.clone();
+        let upload = tokio::spawn(async move {
+            let endless: TarStream = stream::pending().boxed();
+            let _ = rec.push_archive(&name("ntfy"), endless).await;
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let err = h
+            .rec
+            .push_archive(&name("ntfy"), tar(b"image-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PushBusy), "{err:?}");
+        // The engine itself is not held by the upload: a deploy still goes through.
+        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+        upload.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_app_is_refused_before_the_archive_is_read() {
+        let h = deployed(NTFY).await;
+        let before = h.fake.calls().len();
+        let err = h
+            .rec
+            .push_archive(&name("nope"), tar(b"image-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownInstance(_)), "{err:?}");
+        assert_eq!(h.fake.calls().len(), before);
+    }
+}

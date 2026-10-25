@@ -34,6 +34,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Image retention](image-retention.md) | Which images stay, `images prune` |
 | [One-off commands](one-off-commands.md) | `weglarka run` |
 | [Port forward](port-forward.md) | `weglarka forward`, `cli.toml` (`ssh_host`) |
+| [Deploying a local image](push-local-images.md) | `weglarka push`: an image archive or another tag of the repository |
 | [apps update](apps-update.md) | What each change does to a running app |
 
 ## Networking and ingress

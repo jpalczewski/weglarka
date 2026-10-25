@@ -334,6 +334,18 @@ pub struct ImageInfo {
     pub labels: std::collections::BTreeMap<String, String>,
 }
 
+/// An image created by [`PodmanClient::image_load`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedImage {
+    pub id: String,
+    /// Manifest digest of the loaded image. A docker archive carries no manifest, so libpod computes
+    /// one: it need not equal the digest the image had in a registry, but it is stable for the same
+    /// archive (docs/decisions/0042).
+    pub digest: Option<Digest>,
+    /// Names libpod reported for the archive's image; empty or just the id for an archive saved by id.
+    pub names: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullEvent {
     Progress {
@@ -477,6 +489,9 @@ pub trait PodmanClient: Send + Sync {
     fn image_tag(&self, id: &str, repo: &str, tag: &str)
     -> impl Future<Output = Result<()>> + Send;
     fn image_remove(&self, reference: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Loads an image archive (`oci-archive` or `docker-archive`) from a streamed tar and reports the
+    /// image it created (`weglarka push`, docs/decisions/0042). Nothing is buffered by the client.
+    fn image_load(&self, tar: TarStream) -> impl Future<Output = Result<LoadedImage>> + Send;
 
     // Networks
     /// Idempotent: an existing network with that name → `Ok`.

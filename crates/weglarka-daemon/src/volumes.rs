@@ -226,7 +226,7 @@ async fn import_volume<P: PodmanClient + 'static>(
 }
 
 /// Request body as a tar stream that fails once more than `limit` bytes have passed through.
-fn capped(body: Body, limit: u64) -> TarStream {
+pub(crate) fn capped(body: Body, limit: u64) -> TarStream {
     let mut seen: u64 = 0;
     body.into_data_stream()
         .map(move |chunk| {

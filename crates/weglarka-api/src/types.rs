@@ -258,7 +258,9 @@ pub struct PruneImagesResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployRequest {
-    /// Defaults to `spec.image`; a given reference overrides it for this deploy only.
+    /// Defaults to `spec.image`. A given reference (a tag or digest of the **same repository**) is
+    /// pulled and deployed instead: its digest is pinned in `state.toml` like any deploy's, `apps.toml`
+    /// keeps `image`, and the next deploy of the tag replaces it (`weglarka push --image`, issue #109).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
 }

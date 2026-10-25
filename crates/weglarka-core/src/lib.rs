@@ -29,6 +29,7 @@ pub mod deploy;
 pub mod forward;
 pub mod images;
 pub mod limits;
+pub mod push;
 pub mod reconcile;
 pub mod run;
 pub mod secrets;
