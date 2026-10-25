@@ -1314,30 +1314,64 @@ fn ingress_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Some(cdn) = &d.host.ingress.cdn else {
         return;
     };
-    match crate::ingress::cdn_trust(&d.host) {
-        Ok(Some(trust)) => {
-            let source = match &trust.source {
-                weglarka_ingress::RangeSource::Bundled { etag } => format!("bundled etag {etag}"),
-                weglarka_ingress::RangeSource::Pinned => {
-                    format!("pinned, {} ranges", trust.ranges.len())
-                }
-            };
-            out.push(ok(
+    let status = d.ingress.cdn_status();
+    let trust = match crate::ingress::cdn_trust(&d.host, None) {
+        Ok(Some(trust)) => trust,
+        Ok(None) => return,
+        Err(e) => {
+            out.push(check(
                 "ingress.cdn",
-                format!(
-                    "{:?}: the visitor is read from {} for peers in {source}",
-                    cdn.provider,
-                    cdn.provider.client_ip_header()
-                ),
+                CheckStatus::Fail,
+                e.to_string(),
+                Some("fix [ingress.cdn] ranges in weglarka.toml"),
             ));
+            return;
         }
-        Ok(None) => {}
-        Err(e) => out.push(check(
+    };
+    let source = if !cdn.ranges.is_empty() {
+        format!("pinned, {} ranges", trust.ranges.len())
+    } else {
+        match status.as_ref().and_then(|s| s.refreshed.as_ref()) {
+            Some((etag, age)) => format!("refreshed {} ago, etag {etag}", human_age(*age)),
+            None => match &trust.source {
+                weglarka_ingress::RangeSource::Bundled { etag } => format!("bundled etag {etag}"),
+                _ => "bundled".to_owned(),
+            },
+        }
+    };
+    let message = format!(
+        "{:?}: the visitor is read from {} for peers in the list ({source})",
+        cdn.provider,
+        cdn.provider.client_ip_header()
+    );
+    let stale = status
+        .as_ref()
+        .and_then(|s| s.refreshed.as_ref())
+        .is_some_and(|(_, age)| *age > crate::cdn::STALE_AFTER);
+    let error = status.as_ref().and_then(|s| s.last_error.clone());
+    out.push(match (error, stale) {
+        (Some(error), _) => check(
             "ingress.cdn",
-            CheckStatus::Fail,
-            e.to_string(),
-            Some("fix [ingress.cdn] ranges in weglarka.toml"),
-        )),
+            CheckStatus::Warn,
+            format!("{message}; the last refresh was not applied: {error}"),
+            Some("the last good list stays in use; the refresh is retried hourly"),
+        ),
+        (None, true) => check(
+            "ingress.cdn",
+            CheckStatus::Warn,
+            format!("{message}; the last successful refresh is older than 7 days"),
+            Some("check the daemon's outbound HTTPS to api.cloudflare.com"),
+        ),
+        (None, false) => ok("ingress.cdn", message),
+    });
+}
+
+fn human_age(age: std::time::Duration) -> String {
+    let hours = age.as_secs() / 3600;
+    if hours >= 48 {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{hours}h")
     }
 }
 

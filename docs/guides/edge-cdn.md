@@ -23,13 +23,20 @@ provider = "cloudflare"            # the only provider for now
 - **Where it shows.** `X-Forwarded-For` and `X-Real-IP` carry the visitor; the access log has `remote_addr` (the
   visitor) and `peer` (the connecting address). `X-Forwarded-Proto` is still the scheme of the connection.
 - **No per-domain switch:** non-proxied domains keep working, they simply never receive a CDN peer.
-- **Ranges.** The binary bundles Cloudflare's published prefixes (`doctor` shows the `etag` of the snapshot as
-  `ingress.cdn`). Pin `ranges` to use your own list instead, for example when you front the host with another
-  proxy; a changed list is applied with `nginx -t` and a reload, the container is not recreated.
+- **Ranges.** The binary bundles Cloudflare's published prefixes. Unless you pin `ranges`, the daemon refreshes
+  them once a day from `https://api.cloudflare.com/client/v4/ips` (no token) and keeps the last good list in
+  `<state dir>/cdn-ranges.toml`. A list that is empty, malformed, too long, or that no longer covers the bundled
+  prefixes is rejected and the previous list stays in use; a changed list is applied with `nginx -t` and a reload
+  and never recreates the container. `ranges = [...]` disables the refresh and the bundled list entirely.
+- **Check it:** `doctor` shows `ingress.cdn` with the source (`bundled etag …`, `refreshed <age> ago, etag …` or
+  `pinned, N ranges`) and warns when a refresh failed or the last success is older than 7 days. If the daemon
+  cannot reach `api.cloudflare.com`, the list simply stays as it is; an edge address that is not on it is treated
+  as a plain client, never trusted.
 - **Zone setting:** use SSL/TLS mode **Full (strict)**. With Flexible, Cloudflare connects to the plain listener
   and loops on the redirect to HTTPS.
 
 ## Rollback
 
 `[ingress.cdn]` is a new table in `weglarka.toml`, so an older daemon refuses the file (`deny_unknown_fields`):
-remove the table before downgrading. `apps.toml` and `state.toml` are unchanged.
+remove the table before downgrading. `apps.toml` and `state.toml` are unchanged, and `cdn-ranges.toml` is ignored
+by an older daemon.

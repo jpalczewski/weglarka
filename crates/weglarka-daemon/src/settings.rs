@@ -28,6 +28,8 @@ pub struct Paths {
     pub notifications: PathBuf,
     /// ACME account credentials (`[acme]`, issue #96): `0600`, outside the webroot and `tls/`.
     pub acme_account_key: PathBuf,
+    /// Last good CDN range list refreshed from the provider (`[ingress.cdn]`, issue #159): public data.
+    pub cdn_ranges: PathBuf,
     /// Host directory with the apps' config files/directories (issue #118), resolved from
     /// `weglarka.toml`'s `config_root`. `None` = config mounts are off.
     pub config_root: Option<PathBuf>,
@@ -59,6 +61,7 @@ impl Paths {
                 .unwrap_or_else(|| state_dir.join("nginx")),
             notifications: state_dir.join("notifications.toml"),
             acme_account_key: state_dir.join("acme").join("account.key"),
+            cdn_ranges: state_dir.join("cdn-ranges.toml"),
             config_root,
             state_dir,
         }

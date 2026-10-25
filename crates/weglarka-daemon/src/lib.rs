@@ -7,6 +7,7 @@
 pub mod acme;
 pub mod admin;
 pub mod app;
+pub mod cdn;
 pub mod doctor;
 pub mod forgejo;
 pub mod forward;
@@ -131,6 +132,8 @@ pub struct Running<P: PodmanClient + 'static> {
     notify: Option<JoinHandle<()>>,
     /// ACME worker; `None` when `[acme]` is absent or paused.
     acme: Option<JoinHandle<()>>,
+    /// CDN range refresh (`[ingress.cdn]` without a pin).
+    cdn: Option<JoinHandle<()>>,
 }
 
 fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
@@ -268,6 +271,16 @@ pub async fn start<P: PodmanClient + 'static>(
     ));
     // ACME (issue #96): the worker shares the engine's event sink and asks the ingress to apply
     // whenever it wrote a certificate.
+    // `[ingress.cdn]` without a pin (issue #159): the saved or bundled provider list, refreshed daily.
+    let cdn_ranges = host
+        .ingress
+        .cdn
+        .as_ref()
+        .filter(|cdn| cdn.ranges.is_empty())
+        .map(|cdn| Arc::new(cdn::CdnRanges::load(cdn.provider, paths.cdn_ranges.clone())));
+    if let Some(ranges) = &cdn_ranges {
+        ingress.set_cdn_ranges(ranges.clone());
+    }
     let acme_worker = acme::build(
         host.acme.as_ref(),
         &paths,
@@ -350,6 +363,15 @@ pub async fn start<P: PodmanClient + 'static>(
         let rx = shutdown_rx.clone();
         tokio::spawn(async move { worker.run(rx).await })
     });
+    let cdn_task = cdn_ranges.map(|ranges| {
+        let rx = shutdown_rx.clone();
+        let ingress = ingress.clone();
+        tokio::spawn(async move {
+            ranges
+                .run(&cdn::CloudflareApi, move || ingress.request_apply(), rx)
+                .await;
+        })
+    });
     let notify_task = notifier.map(|notifier| {
         let rx = shutdown_rx.clone();
         tokio::spawn(async move { notifier.run(rx).await })
@@ -371,6 +393,7 @@ pub async fn start<P: PodmanClient + 'static>(
         reconcile,
         notify: notify_task,
         acme: acme_task,
+        cdn: cdn_task,
     })
 }
 
@@ -387,6 +410,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             reconcile,
             notify,
             acme,
+            cdn,
             admin_socket,
             ..
         } = self;
@@ -405,6 +429,13 @@ impl<P: PodmanClient + 'static> Running<P> {
                 .is_err()
         {
             tracing::warn!("notification worker did not stop in time");
+        }
+        if let Some(handle) = cdn
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("CDN ranges refresh did not stop in time");
         }
         if let Some(handle) = acme
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)

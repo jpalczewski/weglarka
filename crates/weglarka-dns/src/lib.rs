@@ -15,7 +15,7 @@ mod provider;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use cloudflare::Cloudflare;
+pub use cloudflare::{Cloudflare, PublicIps, public_ips, public_ips_from};
 pub use http::HttpError;
 pub use name::{valid_record_name, valid_txt_value};
 pub use provider::{DnsError, DnsProvider, RecordHandle};

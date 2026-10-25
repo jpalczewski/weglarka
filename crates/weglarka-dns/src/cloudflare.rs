@@ -111,7 +111,10 @@ impl Cloudflare {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<Response, DnsError> {
-        Ok(self.client.request(method, path, &self.token, body).await?)
+        Ok(self
+            .client
+            .request(method, path, Some(&self.token), body)
+            .await?)
     }
 
     /// Id of the zone that contains `name`: the longest suffix (at least two labels) the token can see.
@@ -145,6 +148,47 @@ impl Cloudflare {
         }
         Err(DnsError::ZoneNotFound(name.to_owned()))
     }
+}
+
+/// A published-ranges answer is ~1 KiB; anything above this is not that endpoint.
+const MAX_PUBLIC_IPS: usize = 64 * 1024;
+
+/// Cloudflare's published edge prefixes (`GET /ips`, no authentication) with the list's `etag`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicIps {
+    pub etag: String,
+    /// IPv4 then IPv6 prefixes as published; the caller validates them.
+    pub cidrs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct IpsResult {
+    #[serde(default)]
+    etag: String,
+    #[serde(default)]
+    ipv4_cidrs: Vec<String>,
+    #[serde(default)]
+    ipv6_cidrs: Vec<String>,
+}
+
+/// Fetches the published prefixes from the production API (host pinned, HTTPS, bundled roots, the
+/// response capped at 64 KiB). No token is sent.
+pub async fn public_ips() -> Result<PublicIps, DnsError> {
+    public_ips_from(DEFAULT_BASE_URL).await
+}
+
+/// [`public_ips`] against another API root (tests use a loopback mock).
+pub async fn public_ips_from(base_url: &str) -> Result<PublicIps, DnsError> {
+    let client = Client::new(Base::parse(base_url)?, TIMEOUT)?.with_max_body(MAX_PUBLIC_IPS);
+    let response = client.request("GET", "/ips", None, None).await?;
+    let result: IpsResult =
+        parse(&response)?.ok_or_else(|| DnsError::Response("no result in the answer".into()))?;
+    let mut cidrs = result.ipv4_cidrs;
+    cidrs.extend(result.ipv6_cidrs);
+    Ok(PublicIps {
+        etag: result.etag,
+        cidrs,
+    })
 }
 
 /// The `result` of a successful envelope; an unsuccessful one becomes [`DnsError::Api`] with the
@@ -300,6 +344,35 @@ mod tests {
 
     fn zone_hit(name: &str) -> (u16, String) {
         ok(&format!(r#"[{{"id":"{ZONE}","name":"{name}"}}]"#))
+    }
+
+    #[tokio::test]
+    async fn public_ips_are_fetched_without_a_token() {
+        let mock = Mock::serve(vec![ok(
+            r#"{"etag":"abc123","ipv4_cidrs":["103.21.244.0/22"],"ipv6_cidrs":["2400:cb00::/32"]}"#,
+        )])
+        .await;
+        let ips = public_ips_from(&format!("http://{}/client/v4", mock.addr))
+            .await
+            .unwrap();
+        assert_eq!(ips.etag, "abc123");
+        assert_eq!(ips.cidrs, ["103.21.244.0/22", "2400:cb00::/32"]);
+        let request = &mock.requests()[0];
+        assert!(request.starts_with("GET /client/v4/ips HTTP/1.1\r\n"));
+        assert!(!request.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_public_ips_answer_is_refused() {
+        let big = format!(r#"{{"etag":"x","ipv4_cidrs":["{}"]}}"#, "1".repeat(70_000));
+        let mock = Mock::serve(vec![ok(&big)]).await;
+        let err = public_ips_from(&format!("http://{}/client/v4", mock.addr))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DnsError::Http(HttpError::TooLarge { .. })),
+            "{err}"
+        );
     }
 
     #[tokio::test]

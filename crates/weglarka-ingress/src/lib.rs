@@ -10,7 +10,7 @@ pub mod nginx;
 mod plan;
 pub mod traefik;
 
-pub use cdn::{CLOUDFLARE_ETAG, CLOUDFLARE_RANGES, CdnTrust, RangeSource};
+pub use cdn::{CLOUDFLARE_ETAG, CLOUDFLARE_RANGES, CdnTrust, MAX_REFRESHED_RANGES, RangeSource};
 pub use plan::{
     AppRoute, Cidr, Domain, IngressError, PathPrefix, Plan, RouteRow, WEBHOOK_UPSTREAM_HOST,
     WebhookRoute,

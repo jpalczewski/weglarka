@@ -128,6 +128,8 @@ pub struct IngressManager<P: PodmanClient> {
     last_error: Mutex<Option<String>>,
     /// Set when a best-effort step (detaching a stale network) failed: `run` retries soon.
     retry_soon: AtomicBool,
+    /// The refreshed CDN range list (`[ingress.cdn]` without a pin); `None` = bundled or pinned.
+    cdn_ranges: std::sync::OnceLock<Arc<crate::cdn::CdnRanges>>,
 }
 
 impl<P: PodmanClient> IngressManager<P> {
@@ -142,7 +144,18 @@ impl<P: PodmanClient> IngressManager<P> {
             notify: Notify::new(),
             last_error: Mutex::new(None),
             retry_soon: AtomicBool::new(false),
+            cdn_ranges: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Hands the manager the refreshed CDN list; set once at startup.
+    pub fn set_cdn_ranges(&self, ranges: Arc<crate::cdn::CdnRanges>) {
+        let _ = self.cdn_ranges.set(ranges);
+    }
+
+    /// The refresh state for `doctor`; `None` unless the ranges come from the provider.
+    pub fn cdn_status(&self) -> Option<crate::cdn::CdnStatus> {
+        self.cdn_ranges.get().map(|r| r.status())
     }
 
     /// The set of apps/domains changed — recompute ingress (coalesces many calls into one).
@@ -323,7 +336,7 @@ impl<P: PodmanClient> IngressManager<P> {
             options.wildcard_certificates = r.wildcards.to_vec();
             options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
             options.proxy_socket_dir = Some(SOCKET_CONTAINER_DIR.to_owned());
-            options.cdn = cdn_trust(&self.host)?;
+            options.cdn = cdn_trust(&self.host, self.cdn_ranges.get().map(|r| &**r))?;
         }
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
@@ -1053,12 +1066,15 @@ pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyErr
 /// `[ingress.cdn]` as the generator's trust: the pinned ranges, else the provider's bundled list.
 pub(crate) fn cdn_trust(
     host: &weglarka_core::config::HostConfig,
+    refreshed: Option<&crate::cdn::CdnRanges>,
 ) -> Result<Option<weglarka_ingress::CdnTrust>, weglarka_ingress::IngressError> {
-    host.ingress
-        .cdn
-        .as_ref()
-        .map(|cdn| weglarka_ingress::CdnTrust::from_config(cdn.provider, &cdn.ranges))
-        .transpose()
+    let Some(cdn) = host.ingress.cdn.as_ref() else {
+        return Ok(None);
+    };
+    match refreshed {
+        Some(ranges) if cdn.ranges.is_empty() => ranges.trust().map(Some),
+        _ => weglarka_ingress::CdnTrust::from_config(cdn.provider, &cdn.ranges).map(Some),
+    }
 }
 
 #[cfg(test)]

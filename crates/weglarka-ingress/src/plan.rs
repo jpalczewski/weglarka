@@ -171,6 +171,25 @@ impl Cidr {
     }
 }
 
+impl Cidr {
+    /// `true` when every address of `other` lies inside `self` (same family, shorter or equal prefix).
+    pub fn covers(&self, other: &Cidr) -> bool {
+        fn bits(addr: IpAddr) -> (u128, u8) {
+            match addr {
+                IpAddr::V4(a) => (u128::from(u32::from(a)), 32),
+                IpAddr::V6(a) => (u128::from(a), 128),
+            }
+        }
+        let (a, width) = bits(self.addr);
+        let (b, other_width) = bits(other.addr);
+        if width != other_width || self.prefix > other.prefix {
+            return false;
+        }
+        let shift = u32::from(width - self.prefix);
+        shift >= 128 || a >> shift == b >> shift
+    }
+}
+
 impl FromStr for Cidr {
     type Err = IngressError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
