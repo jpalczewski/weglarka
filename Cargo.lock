@@ -1689,6 +1689,7 @@ dependencies = [
  "tracing",
  "webpki-roots",
  "weglarka-core",
+ "weglarka-dns",
  "x509-parser",
 ]
 
@@ -1772,6 +1773,21 @@ dependencies = [
  "weglarka-notify",
  "weglarka-podman",
  "weglarka-registry",
+]
+
+[[package]]
+name = "weglarka-dns"
+version = "0.0.2"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
+ "weglarka-core",
 ]
 
 [[package]]

@@ -1,0 +1,30 @@
+[package]
+name = "weglarka-dns"
+description = "Węglarka: DNS-provider adapters for ACME DNS-01 (trait + Cloudflare)"
+version = "0.0.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# In-memory `DnsProvider` that records its calls — for the ACME manager and daemon tests.
+testing = []
+
+[dependencies]
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+weglarka-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

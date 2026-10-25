@@ -8,7 +8,7 @@
 //! * [`CertSpec`] / [`CertId`] — one *certificate* is a list of names; the file stem on disk comes
 //!   from the id, never from a name (a literal `*` in a file name is a path-safety problem).
 //! * [`ChallengeSolver`] — `present` / `cleanup` for one challenge; [`Http01Solver`] writes the
-//!   token into the webroot. A DNS-01 solver is just another implementation.
+//!   token into the webroot; [`DnsSolver`] answers DNS-01 through a `weglarka_dns::DnsProvider`.
 //! * [`AcmeClient`] — talks to the CA for one certificate and drives the solver; [`CertInspector`]
 //!   reads the expiry of an issued chain. Both are implemented by [`testing::FakeAcme`] for tests.
 //! * [`CertStore`] — writes the pair atomically, **key first, then certificate**, so the ingress
@@ -21,6 +21,7 @@
 
 mod cert;
 mod client;
+mod dns;
 mod error;
 mod instant;
 mod manager;
@@ -33,6 +34,7 @@ pub mod renewal;
 
 pub use cert::{CertId, CertIdError, CertSpec, Issued, PrivateKeyPem};
 pub use client::{AcmeClient, CertInspector};
+pub use dns::DnsSolver;
 pub use error::AcmeError;
 pub use instant::{InstantAcme, InstantAcmeSettings, chain_not_after};
 pub use manager::{Manager, Outcome, PassReport};
