@@ -43,9 +43,14 @@ pub const NGINX_CONTAINER: &str = "weglarka-nginx";
 /// (pasta) network, which keeps the client address, and relays to nginx's unix sockets with PROXY protocol.
 pub const FORWARDER_CONTAINER: &str = "weglarka-forwarder";
 pub const HASH_LABEL: &str = "weglarka.ingress-hash";
+/// The canonical JSON the hash was computed from, so a later mismatch can name the field that changed
+/// (the `reason` logged when a container has to be recreated, issue #183). Informational: only the hash decides.
+pub const SPEC_LABEL: &str = "weglarka.ingress-spec";
 const NGINX_CONF_FILE: &str = "nginx.conf";
 const NGINX_CONF_MOUNT: &str = "/etc/nginx";
 const NGINX_STOP_TIMEOUT: u32 = 10;
+/// The forwarder is a stateless relay that exits on SIGTERM: a stop that takes longer is a bug worth failing fast on.
+const FORWARDER_STOP_TIMEOUT: u32 = 3;
 /// `<nginx_conf_dir>/run` (`0700`): the two unix sockets nginx listens on for the forwarder. A subdirectory
 /// of the one directory nginx already mounts, so the trust boundary of docs/decisions/0036 is unchanged; it is
 /// mounted a second time, writable, at [`SOCKET_CONTAINER_DIR`].
@@ -421,8 +426,9 @@ impl<P: PodmanClient> IngressManager<P> {
     }
 
     /// `edge`: the forwarder container, created from the daemon's own image (the binary is already
-    /// there, so no second image to pin or pull). Identity = image + publishes + hardening; a daemon
-    /// self-update therefore recreates it once (a short gap on the public ports).
+    /// there, so no second image to pin or pull). Identity = [`FORWARDER_REVISION`] + publishes + hardening
+    /// — deliberately *not* the image id, so a daemon self-update leaves it running (issue #183): its
+    /// ports are the one thing that cannot be swapped without a gap.
     async fn ensure_forwarder(&self) -> Result<(), IngressApplyError> {
         let podman = self.engine.podman();
         let own = Self::own_container(podman).await?;
@@ -430,7 +436,7 @@ impl<P: PodmanClient> IngressManager<P> {
         // Validated at startup (`HostConfig::validate`); the plain publish is the fallback.
         let https_bind = self.host.ingress.https_bind.unwrap_or(bind);
         let security = forwarder_security();
-        let hash = forwarder_hash(&own.image_id, bind, https_bind, &security);
+        let (hash, spec) = forwarder_identity(bind, https_bind, &security);
 
         let existing = podman
             .container_list(&ContainerFilter::default())
@@ -444,9 +450,36 @@ impl<P: PodmanClient> IngressManager<P> {
                 }
                 return Ok(());
             }
+            let reason = recreate_reason(existing.labels.get(SPEC_LABEL), &spec);
+            let gap = std::time::Instant::now();
             self.remove_forwarder().await?;
+            let result = self
+                .create_forwarder(own.image_id, hash, spec, bind, https_bind, security)
+                .await;
+            // Unlike nginx the forwarder cannot be swapped while serving: its published ports are
+            // closed from the stop until the new container starts.
+            tracing::warn!(
+                container = FORWARDER_CONTAINER,
+                reason = %reason,
+                gap_ms = u64::try_from(gap.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "forwarder recreated: the public ports were closed meanwhile"
+            );
+            return result;
         }
+        self.create_forwarder(own.image_id, hash, spec, bind, https_bind, security)
+            .await
+    }
 
+    async fn create_forwarder(
+        &self,
+        image_id: String,
+        hash: String,
+        spec: String,
+        bind: SocketAddr,
+        https_bind: SocketAddr,
+        security: Security,
+    ) -> Result<(), IngressApplyError> {
+        let podman = self.engine.podman();
         let listen = |bind: SocketAddr, port: u16, socket: &str| {
             let any = if bind.is_ipv6() { "[::]" } else { "0.0.0.0" };
             format!("{any}:{port}={SOCKET_CONTAINER_DIR}/{socket}")
@@ -474,11 +507,14 @@ impl<P: PodmanClient> IngressManager<P> {
         podman
             .container_create(&ContainerSpec {
                 name: FORWARDER_CONTAINER.to_owned(),
-                image: own.image_id,
+                image: image_id,
                 command,
                 entrypoint: None,
                 // No `weglarka.instance` — reconcile would treat the container as an orphan.
-                labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
+                labels: BTreeMap::from([
+                    (HASH_LABEL.to_owned(), hash),
+                    (SPEC_LABEL.to_owned(), spec),
+                ]),
                 env: BTreeMap::new(),
                 // No network: libpod's rootless default (pasta), the one that keeps the client address.
                 networks: vec![],
@@ -528,7 +564,7 @@ impl<P: PodmanClient> IngressManager<P> {
     async fn remove_forwarder(&self) -> Result<(), IngressApplyError> {
         let podman = self.engine.podman();
         match podman
-            .container_stop(FORWARDER_CONTAINER, NGINX_STOP_TIMEOUT)
+            .container_stop(FORWARDER_CONTAINER, FORWARDER_STOP_TIMEOUT)
             .await
         {
             Ok(()) | Err(PodmanError::NotFound(_)) => {}
@@ -690,7 +726,7 @@ impl<P: PodmanClient> IngressManager<P> {
         // The range is part of the container's identity: nginx created before ranges existed is
         // recreated once, now on its own map instead of libpod's shared default (docs/decisions/0009).
         let range = self.engine.ensure_ingress_range().await?;
-        let hash = ingress_hash(
+        let (hash, spec) = ingress_identity(
             image,
             bind,
             https_bind,
@@ -708,14 +744,18 @@ impl<P: PodmanClient> IngressManager<P> {
             .find(|c| c.name == NGINX_CONTAINER);
 
         let existed = existing.is_some();
+        let reason = existing
+            .as_ref()
+            .filter(|c| c.labels.get(HASH_LABEL) != Some(&hash))
+            .map(|c| recreate_reason(c.labels.get(SPEC_LABEL), &spec));
         let Some(existing) = existing.filter(|c| c.labels.get(HASH_LABEL) == Some(&hash)) else {
             self.create_nginx(
                 networks,
                 listen_port,
                 https_listen_port,
-                hash,
+                (hash, spec),
                 range,
-                existed,
+                reason,
             )
             .await?;
             return Ok(if existed {
@@ -780,10 +820,11 @@ impl<P: PodmanClient> IngressManager<P> {
         networks: &[String],
         listen_port: u16,
         https_listen_port: u16,
-        hash: String,
+        identity: (String, String),
         range: UidRange,
-        replace: bool,
+        replace: Option<String>,
     ) -> Result<(), IngressApplyError> {
+        let (hash, spec) = identity;
         let podman = self.engine.podman();
         let image = &self.host.ingress.nginx_image;
         let bind = self.host.ingress.bind;
@@ -814,7 +855,9 @@ impl<P: PodmanClient> IngressManager<P> {
         }
         let _ = https_listen_port;
         self.ensure_image(image).await?;
-        if replace {
+        // Everything slow (the image pull) is done: from here to the start below nothing serves.
+        let gap = std::time::Instant::now();
+        if replace.is_some() {
             match podman
                 .container_stop(NGINX_CONTAINER, NGINX_STOP_TIMEOUT)
                 .await
@@ -832,7 +875,10 @@ impl<P: PodmanClient> IngressManager<P> {
                 command: vec![],
                 entrypoint: None,
                 // No `weglarka.instance` — reconcile would treat the container as an orphan.
-                labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
+                labels: BTreeMap::from([
+                    (HASH_LABEL.to_owned(), hash),
+                    (SPEC_LABEL.to_owned(), spec),
+                ]),
                 env: BTreeMap::new(),
                 networks: networks.to_vec(),
                 network_aliases: Default::default(),
@@ -851,6 +897,16 @@ impl<P: PodmanClient> IngressManager<P> {
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;
+        if let Some(reason) = replace {
+            // In `edge` the forwarder keeps the public sockets and holds new connections until nginx
+            // listens again (it retries the unix socket); in `behind` Traefik sees a refused upstream.
+            tracing::warn!(
+                container = NGINX_CONTAINER,
+                reason = %reason,
+                gap_ms = u64::try_from(gap.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "nginx recreated (not reloaded)"
+            );
+        }
         Ok(())
     }
 
@@ -946,11 +1002,9 @@ pub(crate) fn nginx_security() -> Security {
     }
 }
 
-/// Spec hash of the nginx container: only what cannot change on a live container. The set of app
-/// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
-/// Hardening is in: changing the profile must recreate the container, not leave an old, writable one.
+/// Canonical spec JSON of the nginx container and the hash of it.
 #[allow(clippy::too_many_arguments)]
-fn ingress_hash(
+fn ingress_identity(
     image: &str,
     bind: SocketAddr,
     https_bind: Option<SocketAddr>,
@@ -959,7 +1013,7 @@ fn ingress_hash(
     range: UidRange,
     security: &Security,
     proxy_sockets: bool,
-) -> String {
+) -> (String, String) {
     let input = IngressHashInput {
         format: if proxy_sockets {
             INGRESS_HASH_FORMAT_SOCKETS
@@ -975,34 +1029,93 @@ fn ingress_hash(
         range_size: range.size,
         security,
     };
-    let json = serde_json::to_vec(&input).expect("ingress hash input is always serializable");
-    hex::encode(&Sha256::digest(json)[..8])
+    let json = serde_json::to_string(&input).expect("ingress hash input is always serializable");
+    (hex::encode(&Sha256::digest(json.as_bytes())[..8]), json)
 }
 
-/// Identity of the forwarder container: the image it runs, what it publishes and its hardening.
-fn forwarder_hash(
-    image_id: &str,
+/// Names what differs between the spec a container was created from (its [`SPEC_LABEL`]) and the
+/// wanted one: the `reason` logged when a recreate is unavoidable.
+fn recreate_reason(old: Option<&String>, new: &str) -> String {
+    let Some(old) = old else {
+        return "container predates the recorded spec (identity inputs or hash format changed)"
+            .to_owned();
+    };
+    let (Ok(serde_json::Value::Object(old)), Ok(serde_json::Value::Object(new))) = (
+        serde_json::from_str::<serde_json::Value>(old),
+        serde_json::from_str::<serde_json::Value>(new),
+    ) else {
+        return "recorded spec is unreadable".to_owned();
+    };
+    let changed: Vec<&str> = new
+        .iter()
+        .filter(|(k, v)| old.get(*k) != Some(v))
+        .map(|(k, _)| k.as_str())
+        .chain(
+            old.keys()
+                .filter(|k| !new.contains_key(*k))
+                .map(String::as_str),
+        )
+        .collect();
+    format!("changed: {}", changed.join(", "))
+}
+
+/// Spec hash of the nginx container: only what cannot change on a live container. The set of app
+/// networks is deliberately absent (it is synced with connect/disconnect), as is the config (reload).
+/// Hardening is in: changing the profile must recreate the container, not leave an old, writable one.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn ingress_hash(
+    image: &str,
+    bind: SocketAddr,
+    https_bind: Option<SocketAddr>,
+    listen_port: u16,
+    https_listen_port: u16,
+    range: UidRange,
+    security: &Security,
+    proxy_sockets: bool,
+) -> String {
+    ingress_identity(
+        image,
+        bind,
+        https_bind,
+        listen_port,
+        https_listen_port,
+        range,
+        security,
+        proxy_sockets,
+    )
+    .0
+}
+
+/// Bump when the forwarder's behaviour changes in a way that needs the new binary running: a plain
+/// daemon self-update does not recreate it (its published ports would be closed meanwhile, issue #183).
+/// 2: exits on SIGTERM and holds connections while nginx is replaced.
+const FORWARDER_REVISION: u32 = 2;
+
+/// Identity of the forwarder container: its revision, what it publishes and its hardening (canonical
+/// spec JSON and its hash).
+fn forwarder_identity(
     bind: SocketAddr,
     https_bind: SocketAddr,
     security: &Security,
-) -> String {
+) -> (String, String) {
     #[derive(Serialize)]
     struct Input<'a> {
         format: &'static str,
-        image: &'a str,
+        revision: u32,
         bind: String,
         https_bind: String,
         security: &'a Security,
     }
-    let json = serde_json::to_vec(&Input {
-        format: "weglarka.forwarder-hash/v1",
-        image: image_id,
+    let json = serde_json::to_string(&Input {
+        format: "weglarka.forwarder-hash/v2",
+        revision: FORWARDER_REVISION,
         bind: bind.to_string(),
         https_bind: https_bind.to_string(),
         security,
     })
     .expect("forwarder hash input is always serializable");
-    hex::encode(&Sha256::digest(json)[..8])
+    (hex::encode(&Sha256::digest(json.as_bytes())[..8]), json)
 }
 
 /// The forwarder needs nothing: no capability, a read-only root, no privilege escalation. (Binding
@@ -1111,6 +1224,56 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
         assert!(!write_in_place(&path, b"new").unwrap());
+    }
+
+    #[test]
+    fn recreate_reason_names_the_changed_inputs() {
+        let sec = nginx_security();
+        let range = UidRange {
+            start: 100_000,
+            size: 65_536,
+        };
+        let spec = |image: &str, bind: &str| {
+            ingress_identity(
+                image,
+                bind.parse().unwrap(),
+                None,
+                8080,
+                8443,
+                range,
+                &sec,
+                true,
+            )
+            .1
+        };
+        let old = spec("nginx:1", "127.0.0.1:80");
+        assert_eq!(
+            recreate_reason(Some(&old), &spec("nginx:2", "127.0.0.1:80")),
+            "changed: image"
+        );
+        assert_eq!(
+            recreate_reason(Some(&old), &spec("nginx:2", "127.0.0.1:81")),
+            "changed: bind, image"
+        );
+        assert!(recreate_reason(None, &old).contains("predates"));
+        assert!(recreate_reason(Some(&"{".to_owned()), &old).contains("unreadable"));
+    }
+
+    #[test]
+    fn forwarder_identity_ignores_the_daemon_image() {
+        let sec = forwarder_security();
+        let a = forwarder_identity(
+            "0.0.0.0:80".parse().unwrap(),
+            "0.0.0.0:443".parse().unwrap(),
+            &sec,
+        );
+        let b = forwarder_identity(
+            "0.0.0.0:80".parse().unwrap(),
+            "0.0.0.0:444".parse().unwrap(),
+            &sec,
+        );
+        assert_ne!(a.0, b.0);
+        assert!(!a.1.contains("image"));
     }
 
     #[test]

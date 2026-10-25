@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -25,8 +26,11 @@ use tokio::task::JoinSet;
 const SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
 /// Connections relayed at once per route; further clients wait in the kernel's accept queue.
 const MAX_CONNECTIONS: usize = 4096;
-/// nginx is local, so a connect that takes longer means it is down: drop the client fast.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client waits for nginx's socket before the connection is dropped. nginx is local, so it
+/// is normally there at once; the wait covers a recreate of the nginx container (stop, create, start),
+/// during which the public sockets stay open here instead of refusing (issue #183).
+const UPSTREAM_WAIT: Duration = Duration::from_secs(20);
+const UPSTREAM_RETRY: Duration = Duration::from_millis(100);
 
 /// One public socket relayed to one nginx unix socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,9 +112,21 @@ pub async fn run(routes: Vec<Route>) -> std::io::Result<()> {
         tasks.spawn(accept_loop(listener, route.socket));
     }
     // The loops never end; a panicked one ends the process so the restart policy brings it back.
-    while let Some(done) = tasks.join_next().await {
-        done.map_err(std::io::Error::other)?;
+    // As the container's PID 1 the process ignores SIGTERM unless it handles it, which turned every
+    // stop into the full stop timeout with the ports closed (issue #183): exit at once instead.
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            done = tasks.join_next() => match done {
+                Some(done) => done.map_err(std::io::Error::other)?,
+                None => return Ok(()),
+            },
+            _ = term.recv() => break,
+            _ = int.recv() => break,
+        }
     }
+    tracing::info!("stopping");
     Ok(())
 }
 
@@ -156,6 +172,25 @@ enum Relay {
     Io(std::io::Error),
 }
 
+/// Connects to nginx's socket, retrying while it is missing or refusing (nginx being replaced).
+async fn connect_upstream(socket: &std::path::Path) -> std::io::Result<UnixStream> {
+    let deadline = tokio::time::Instant::now() + UPSTREAM_WAIT;
+    loop {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => return Ok(stream),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(UPSTREAM_RETRY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn relay(
     mut client: TcpStream,
     peer: SocketAddr,
@@ -163,15 +198,7 @@ async fn relay(
 ) -> Result<(), Relay> {
     let local = client.local_addr().map_err(Relay::Io)?;
     client.set_nodelay(true).map_err(Relay::Io)?;
-    let mut upstream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(socket))
-        .await
-        .map_err(|_| {
-            Relay::Upstream(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "nginx socket timeout",
-            ))
-        })?
-        .map_err(Relay::Upstream)?;
+    let mut upstream = connect_upstream(socket).await.map_err(Relay::Upstream)?;
     upstream
         .write_all(&proxy_v2_header(peer, local))
         .await
@@ -185,6 +212,25 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_waits_for_a_socket_that_appears_late() {
+        let dir = std::env::temp_dir().join(format!("wg-fwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.sock");
+        let _ = std::fs::remove_file(&path);
+        let late = path.clone();
+        let bind = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::net::UnixListener::bind(&late).unwrap()
+        });
+        // Refused/missing at first (nginx being replaced); the client is held, not dropped.
+        connect_upstream(&path)
+            .await
+            .expect("connects once nginx listens");
+        drop(bind.await.unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn route_parses_and_rejects() {
