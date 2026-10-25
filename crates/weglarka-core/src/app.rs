@@ -790,6 +790,11 @@ pub struct AppIngress {
     /// app's locations, so a large upload is streamed to the app instead of spooled in nginx.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body_size: Option<BodySizeLimit>,
+    /// Paths whose successful requests (`status < 400`) are left out of the access log, e.g. a
+    /// runner polling every 2 s. An entry ending in `/` is a prefix, anything else matches exactly;
+    /// errors on these paths are still logged. Empty (default) logs everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_skip_paths: Vec<String>,
 }
 
 impl Default for AppIngress {
@@ -799,6 +804,7 @@ impl Default for AppIngress {
             stream_timeout_secs: Self::DEFAULT_STREAM_TIMEOUT_SECS,
             strip_prefix: false,
             max_body_size: None,
+            access_log_skip_paths: Vec::new(),
         }
     }
 }
@@ -848,6 +854,17 @@ pub fn check_path_prefix(path: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// Syntax of an `access_log_skip_paths` entry: `/seg[/seg…]` with an optional trailing `/` (which makes
+/// it a prefix), segments of `[A-Za-z0-9_.-]`, no empty or dot segments, at most 128 bytes. A bare `/`
+/// would silence the whole app and is rejected. It lands in `nginx.conf`, hence the strict alphabet.
+pub fn check_skip_path(path: &str) -> Result<(), &'static str> {
+    let body = path.strip_suffix('/').unwrap_or(path);
+    if body.is_empty() || body == "/" {
+        return Err("would exclude every request; list a narrower prefix");
+    }
+    check_path_prefix(body)
 }
 
 fn default_stream_timeout_secs() -> u64 {

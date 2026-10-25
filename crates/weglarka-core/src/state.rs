@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -103,6 +103,13 @@ fn deploy_strategy_v9(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v9 → v10: access-log exclusions (issue #181). `AppIngress::access_log_skip_paths` is optional and
+/// defaults to empty, so a v9 document needs no data transformation — the marker records that the
+/// file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn access_log_skip_paths_v10(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -115,6 +122,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     secret_mount_ownership_v7,
     host_mounts_v8,
     deploy_strategy_v9,
+    access_log_skip_paths_v10,
 ];
 
 const _: () = assert!(
@@ -412,6 +420,22 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if ingress.strip_prefix && spec.paths.iter().all(|p| p == "/") {
         return Err(format!(
             "{name}: ingress.strip_prefix requires a path other than \"/\""
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &ingress.access_log_skip_paths {
+        crate::app::check_skip_path(path).map_err(|reason| {
+            format!("{name}: invalid ingress.access_log_skip_paths entry {path:?}: {reason}")
+        })?;
+        if !seen.insert(path) {
+            return Err(format!(
+                "{name}: duplicate ingress.access_log_skip_paths entry {path:?}"
+            ));
+        }
+    }
+    if !ingress.access_log_skip_paths.is_empty() && spec.domains.is_empty() {
+        return Err(format!(
+            "{name}: ingress.access_log_skip_paths requires at least one domain"
         ));
     }
     Ok(())
@@ -947,6 +971,35 @@ mod tests {
             let err = ok(extra).unwrap_err();
             assert!(err.contains("strip_prefix requires a path"), "{err}");
         }
+    }
+
+    #[test]
+    fn access_log_skip_paths_are_validated() {
+        let ok = |list: &str| {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\ningress = {{ access_log_skip_paths = {list} }}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(ok("[]").is_ok());
+        assert!(ok(r#"["/healthz", "/api/poll/", "/a.b/c-d_e"]"#).is_ok());
+        for bad in [
+            "/", "healthz", "/a//b", "/a/../b/", "/a b", "/a;b", "/a\"b", "/ä", "//", "",
+        ] {
+            let err = ok(&format!("[{bad:?}]")).unwrap_err();
+            assert!(err.contains("access_log_skip_paths"), "{bad}: {err}");
+        }
+        let err = ok(r#"["/a", "/a"]"#).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        let no_domain: AppSpec =
+            toml::from_str("image = \"i\"\ningress = { access_log_skip_paths = [\"/a\"] }")
+                .unwrap();
+        assert!(
+            validate_app(&name("a"), &no_domain)
+                .unwrap_err()
+                .contains("requires at least one domain")
+        );
     }
 
     #[test]
