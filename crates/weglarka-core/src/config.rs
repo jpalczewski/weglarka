@@ -413,6 +413,71 @@ pub struct AcmeConfig {
     /// Time between two passes over the certificates (seconds).
     #[serde(default = "AcmeConfig::default_check_interval_secs")]
     pub check_interval_secs: u64,
+    /// Wildcard certificates through DNS-01 (issue #97, `docs/decisions/0039`). Absent = HTTP-01
+    /// per domain only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<AcmeDnsConfig>,
+}
+
+/// DNS host that answers DNS-01 for `[acme.dns]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsProviderKind {
+    Cloudflare,
+}
+
+/// `[acme.dns]`: one wildcard certificate (`*.<apex>` plus `<apex>`) per listed apex, ordered over
+/// DNS-01 through the provider's API (issue #97, `docs/decisions/0039`). The API token can rewrite the
+/// zone, so it is a 0600 file read once at startup — `weglarka.toml` never holds it — and should be
+/// scoped to the listed zones only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDnsConfig {
+    pub provider: DnsProviderKind,
+    /// File with the provider's API token (mode 0600, absolute path); never logged.
+    pub token_file: PathBuf,
+    /// Apex domains that get a wildcard certificate, e.g. `["example.eu"]`.
+    pub wildcards: Vec<String>,
+}
+
+impl AcmeDnsConfig {
+    /// Lower-case DNS name of at least two labels (`[a-z0-9-]`, no wildcard, no trailing dot).
+    fn valid_apex(apex: &str) -> bool {
+        apex.len() <= 253
+            && apex.split('.').count() >= 2
+            && apex.split('.').all(|label| {
+                (1..=63).contains(&label.len())
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.token_file.is_absolute() {
+            return Err(format!(
+                "[acme.dns] token_file {} must be an absolute path",
+                self.token_file.display()
+            ));
+        }
+        if self.wildcards.is_empty() {
+            return Err("[acme.dns] wildcards must list at least one apex domain".to_owned());
+        }
+        for (i, apex) in self.wildcards.iter().enumerate() {
+            if !Self::valid_apex(apex) {
+                return Err(format!(
+                    "[acme.dns] wildcards: {apex:?} is not a lower-case domain of at least two \
+                     labels (write the apex, e.g. \"example.eu\", not \"*.example.eu\")"
+                ));
+            }
+            if self.wildcards[..i].contains(apex) {
+                return Err(format!("[acme.dns] wildcards lists {apex:?} twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AcmeConfig {
@@ -472,6 +537,9 @@ impl AcmeConfig {
                 Self::MIN_CHECK_INTERVAL_SECS,
                 self.check_interval_secs
             ));
+        }
+        if let Some(dns) = &self.dns {
+            dns.validate()?;
         }
         Ok(())
     }
@@ -1092,6 +1160,70 @@ domain = "weglarka.descriptortable.eu"
         acme("email = \"ops@example.eu\"\nrenew_before_days = 60\ncheck_interval_secs = 600")
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn acme_dns_lists_the_wildcard_apexes_and_keeps_the_token_in_a_file() {
+        let dns = |extra: &str| {
+            let src = format!(
+                "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n{extra}"
+            );
+            HostConfig::from_toml_str(&src)
+        };
+        let cfg = dns("token_file = \"/var/lib/weglarka/cf-token\"\nwildcards = [\"example.eu\", \"b.example.org\"]\n")
+            .unwrap();
+        let acme = cfg.acme.unwrap();
+        let dns = acme.dns.as_ref().unwrap();
+        assert_eq!(dns.provider, DnsProviderKind::Cloudflare);
+        assert_eq!(dns.wildcards, ["example.eu", "b.example.org"]);
+        acme.validate().unwrap();
+        // The section is optional and does not show up when unset.
+        let plain = format!("{EDGE}\n[acme]\naccept_terms = true\n");
+        let plain = HostConfig::from_toml_str(&plain).unwrap();
+        assert!(!toml::to_string(&plain).unwrap().contains("dns"));
+
+        // A token inline, a missing file or an unknown key is a parse error, never a silent default.
+        assert!(dns_parse_fails(
+            "token = \"abc\"\nwildcards = [\"example.eu\"]\n"
+        ));
+        assert!(dns_parse_fails("wildcards = [\"example.eu\"]\n"));
+        assert!(dns_parse_fails("token_file = \"/t\"\n"));
+    }
+
+    fn dns_parse_fails(extra: &str) -> bool {
+        let src = format!(
+            "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n{extra}"
+        );
+        HostConfig::from_toml_str(&src).is_err()
+    }
+
+    #[test]
+    fn acme_dns_rejects_what_cannot_work() {
+        let check = |token_file: &str, wildcards: &str| {
+            let src = format!(
+                "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n\
+                 token_file = \"{token_file}\"\nwildcards = {wildcards}\n"
+            );
+            HostConfig::from_toml_str(&src)
+                .unwrap()
+                .acme
+                .unwrap()
+                .validate()
+        };
+        check("/t", "[\"example.eu\"]").unwrap();
+        for bad in [
+            "[]",
+            "[\"*.example.eu\"]",
+            "[\"example\"]",
+            "[\"Example.eu\"]",
+            "[\"example.eu.\"]",
+            "[\"-a.example.eu\"]",
+            "[\"a b.eu\"]",
+            "[\"example.eu\", \"example.eu\"]",
+        ] {
+            assert!(check("/t", bad).is_err(), "{bad}");
+        }
+        assert!(check("relative/token", "[\"example.eu\"]").is_err());
     }
 
     #[test]

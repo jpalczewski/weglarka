@@ -1,24 +1,31 @@
 //! The ACME worker: keeps one certificate per routed domain valid (issue #96,
-//! `docs/decisions/0038-acme-engine-seams.md`).
+//! `docs/decisions/0038-acme-engine-seams.md`) and, with `[acme.dns]`, one wildcard certificate per
+//! configured apex over DNS-01 (issue #97, `docs/decisions/0039-acme-dns01.md`).
 //!
 //! Each pass takes the domains the ingress routes (the webhook domain plus every app domain), asks
 //! [`weglarka_acme::Manager`] to issue or renew what is missing or inside the renewal window, emits
 //! the resulting events and, when a file changed, asks the ingress to apply — it rescans `tls/` and
-//! reloads nginx (`nginx -t` + SIGHUP), it never recreates the container (ADR 0036).
+//! reloads nginx (`nginx -t` + SIGHUP), it never recreates the container (ADR 0036). The wildcard
+//! certificates go through a second manager (same store, a DNS-01 solver); the ingress does not
+//! serve them yet, so every routed domain keeps its own HTTP-01 certificate.
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 use weglarka_acme::{
-    AcmeClient, CertInspector, CertSpec, Http01Solver, InstantAcme, InstantAcmeSettings, Manager,
-    Outcome,
+    AcmeClient, AcmeError, CertId, CertInspector, CertSpec, DnsSolver, Http01Solver, InstantAcme,
+    InstantAcmeSettings, Manager, Outcome, PassReport,
 };
-use weglarka_core::config::AcmeConfig;
+use weglarka_core::config::{AcmeConfig, AcmeDnsConfig, DnsProviderKind};
 use weglarka_core::events::{Event, EventSink};
+use weglarka_core::secret_store::SecretValue;
 use weglarka_core::state;
+use weglarka_dns::{Cloudflare, DnsError, DnsProvider, RecordHandle};
 
+use crate::StartError;
 use crate::settings::Paths;
 
 /// First pass waits for the ingress to come up: HTTP-01 is answered by nginx, so ordering before
@@ -77,8 +84,38 @@ pub struct Dirs {
     pub apps: PathBuf,
 }
 
-pub struct AcmeWorker<C> {
+/// The configured DNS host (`[acme.dns] provider`). A new provider is a variant here and in
+/// [`DnsProviderKind`]; the worker only sees [`DnsProvider`].
+pub enum DnsBackend {
+    Cloudflare(Cloudflare),
+}
+
+impl DnsProvider for DnsBackend {
+    async fn set_txt(&self, name: &str, value: &str) -> Result<RecordHandle, DnsError> {
+        match self {
+            Self::Cloudflare(cloudflare) => cloudflare.set_txt(name, value).await,
+        }
+    }
+
+    async fn remove_txt(&self, handle: &RecordHandle) -> Result<(), DnsError> {
+        match self {
+            Self::Cloudflare(cloudflare) => cloudflare.remove_txt(handle).await,
+        }
+    }
+}
+
+/// The wildcard side of the worker: its own manager (a DNS-01 solver on the same store) and the
+/// certificates it keeps.
+struct DnsIssuer<C, P> {
+    manager: Manager<C, DnsSolver<P>>,
+    specs: Vec<CertSpec>,
+}
+
+pub struct AcmeWorker<C, P = DnsBackend> {
     manager: Manager<C, Http01Solver>,
+    dns: Option<DnsIssuer<C, P>>,
+    tls: PathBuf,
+    renew_before: Duration,
     apps_path: PathBuf,
     webhook_domain: String,
     events: Arc<dyn EventSink>,
@@ -88,7 +125,7 @@ pub struct AcmeWorker<C> {
     period: Duration,
 }
 
-impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
+impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
     pub fn new(
         client: C,
         config: &AcmeConfig,
@@ -97,14 +134,18 @@ impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
         events: Arc<dyn EventSink>,
         on_change: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
+        let renew_before = Duration::from_secs(config.renew_before_days * DAY.as_secs());
         let manager = Manager::new(
             client,
             Http01Solver::new(dirs.webroot),
-            weglarka_acme::CertStore::new(dirs.tls),
-            Duration::from_secs(config.renew_before_days * DAY.as_secs()),
+            weglarka_acme::CertStore::new(dirs.tls.clone()),
+            renew_before,
         );
         Self {
             manager,
+            dns: None,
+            tls: dirs.tls,
+            renew_before,
             apps_path: dirs.apps,
             webhook_domain,
             events,
@@ -112,6 +153,29 @@ impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
             status: Arc::new(AcmeStatus::default()),
             period: Duration::from_secs(config.check_interval_secs),
         }
+    }
+
+    /// Adds a wildcard certificate (`*.<apex>` and `<apex>`, stored as `_wildcard.<apex>`) per
+    /// apex, ordered over DNS-01 through `provider`. `client` is a second ACME client for the same
+    /// account: a manager owns its client.
+    pub fn with_dns(
+        mut self,
+        client: C,
+        provider: P,
+        wildcards: &[String],
+    ) -> Result<Self, AcmeError> {
+        let specs = wildcards
+            .iter()
+            .map(|apex| wildcard_spec(apex))
+            .collect::<Result<Vec<_>, _>>()?;
+        let manager = Manager::new(
+            client,
+            DnsSolver::new(provider),
+            weglarka_acme::CertStore::new(self.tls.clone()),
+            self.renew_before,
+        );
+        self.dns = Some(DnsIssuer { manager, specs });
+        Ok(self)
     }
 
     pub fn status(&self) -> Arc<AcmeStatus> {
@@ -152,8 +216,41 @@ impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
             }
         };
         let now = SystemTime::now();
-        let report = self.manager.pass(now, &specs).await;
         let mut failures = Vec::new();
+        let report = self.manager.pass(now, &specs).await;
+        let mut changed = report.changed();
+        self.record(
+            &report,
+            now,
+            |id| self.manager.current_not_after(id),
+            &mut failures,
+        );
+        if let Some(dns) = &self.dns {
+            let report = dns.manager.pass(now, &dns.specs).await;
+            changed |= report.changed();
+            self.record(
+                &report,
+                now,
+                |id| dns.manager.current_not_after(id),
+                &mut failures,
+            );
+        }
+        if changed {
+            (self.on_change)();
+        }
+        let all_ok = failures.is_empty();
+        self.status.record(SystemTime::now(), failures);
+        all_ok
+    }
+
+    /// Emits the event of every outcome of one manager's pass and collects its failures.
+    fn record(
+        &self,
+        report: &PassReport,
+        now: SystemTime,
+        current_not_after: impl Fn(&CertId) -> Option<SystemTime>,
+        failures: &mut Vec<(String, String)>,
+    ) {
         for (id, outcome) in &report.outcomes {
             let cert = id.to_string();
             match outcome {
@@ -173,21 +270,13 @@ impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
                     self.events.emit(Event::CertificateRenewalFailed {
                         cert: cert.clone(),
                         reason: reason.clone(),
-                        expires_in_days: self
-                            .manager
-                            .current_not_after(id)
+                        expires_in_days: current_not_after(id)
                             .map(|not_after| days_left(now, not_after)),
                     });
                     failures.push((cert, reason));
                 }
             }
         }
-        if report.changed() {
-            (self.on_change)();
-        }
-        let all_ok = failures.is_empty();
-        self.status.record(SystemTime::now(), failures);
-        all_ok
     }
 
     /// One single-name certificate per routed domain; a name that cannot be a public DNS name
@@ -213,6 +302,46 @@ impl<C: AcmeClient + CertInspector> AcmeWorker<C> {
     }
 }
 
+/// `*.<apex>` plus `<apex>` in one certificate, stored under the id `_wildcard.<apex>` (a literal
+/// `*` never reaches a file name, ADR 0038).
+fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
+    CertSpec::new(
+        CertId::new(format!("_wildcard.{apex}"))?,
+        vec![format!("*.{apex}"), apex.to_owned()],
+    )
+}
+
+/// Reads the DNS API token: a 0600 file whose trailing newline is dropped, printable ASCII only (it
+/// becomes an `Authorization` header). The value never appears in an error.
+fn read_token(path: &Path) -> Result<SecretValue, String> {
+    let fail = |what: &str| format!("[acme.dns] token_file {}: {what}", path.display());
+    let metadata = std::fs::metadata(path).map_err(|e| fail(&e.to_string()))?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(fail(
+            "must not be accessible by group or others (chmod 600)",
+        ));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| fail(&e.to_string()))?;
+    let token = raw.trim_end_matches(['\r', '\n']);
+    if token.is_empty() {
+        return Err(fail("is empty"));
+    }
+    if !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(fail("has characters that cannot go into an HTTP header"));
+    }
+    Ok(SecretValue::new(token))
+}
+
+/// The provider named by `[acme.dns]`, with its token read from the file.
+fn dns_backend(config: &AcmeDnsConfig) -> Result<DnsBackend, String> {
+    let token = read_token(&config.token_file)?;
+    match config.provider {
+        DnsProviderKind::Cloudflare => Cloudflare::new(&token)
+            .map(DnsBackend::Cloudflare)
+            .map_err(|e| format!("[acme.dns] {e}")),
+    }
+}
+
 /// Whole days left, rounded down; `0` once expired.
 fn days_left(now: SystemTime, not_after: SystemTime) -> u64 {
     not_after
@@ -220,23 +349,29 @@ fn days_left(now: SystemTime, not_after: SystemTime) -> u64 {
         .map_or(0, |left| left.as_secs() / DAY.as_secs())
 }
 
-/// The worker for the configured `[acme]` section, or `None` when it is absent or paused.
+/// The worker for the configured `[acme]` section, or `None` when it is absent or paused. An
+/// unusable `[acme.dns]` (unreadable or world-readable token file) is a startup error: wildcard
+/// certificates are opt-in, but once configured a silent skip would hide a broken deployment.
 pub fn build<P: weglarka_core::podman::PodmanClient + 'static>(
     config: Option<&AcmeConfig>,
     paths: &Paths,
     webhook_domain: &str,
     events: Arc<dyn EventSink>,
     ingress: Arc<crate::ingress::IngressManager<P>>,
-) -> Option<AcmeWorker<InstantAcme>> {
-    let config = config.filter(|c| c.enabled)?;
-    let client = InstantAcme::new(InstantAcmeSettings {
-        directory_url: config.directory_url.clone(),
-        contact_email: config.email.clone(),
-        account_key: paths.acme_account_key.clone(),
-        terms_agreed: config.accept_terms,
-    });
-    Some(AcmeWorker::new(
-        client,
+) -> Result<Option<AcmeWorker<InstantAcme>>, StartError> {
+    let Some(config) = config.filter(|c| c.enabled) else {
+        return Ok(None);
+    };
+    let client = || {
+        InstantAcme::new(InstantAcmeSettings {
+            directory_url: config.directory_url.clone(),
+            contact_email: config.email.clone(),
+            account_key: paths.acme_account_key.clone(),
+            terms_agreed: config.accept_terms,
+        })
+    };
+    let mut worker = AcmeWorker::new(
+        client(),
         config,
         Dirs {
             webroot: ingress.acme_dir(),
@@ -246,7 +381,14 @@ pub fn build<P: weglarka_core::podman::PodmanClient + 'static>(
         webhook_domain.to_owned(),
         events,
         Box::new(move || ingress.request_apply()),
-    ))
+    );
+    if let Some(dns) = &config.dns {
+        let backend = dns_backend(dns).map_err(StartError::Acme)?;
+        worker = worker
+            .with_dns(client(), backend, &dns.wildcards)
+            .map_err(|e| StartError::Acme(format!("[acme.dns] {e}")))?;
+    }
+    Ok(Some(worker))
 }
 
 #[cfg(test)]
@@ -255,6 +397,7 @@ mod tests {
 
     use weglarka_acme::testing::FakeAcme;
     use weglarka_core::events::VecSink;
+    use weglarka_dns::testing::FakeDns;
 
     use super::*;
 
@@ -262,10 +405,31 @@ mod tests {
 
     struct Rig {
         dir: tempfile::TempDir,
-        worker: AcmeWorker<SharedFake>,
+        worker: AcmeWorker<SharedFake, SharedDns>,
         sink: Arc<VecSink>,
         applies: Arc<AtomicUsize>,
         fake: SharedFake,
+        dns: Arc<FakeDns>,
+    }
+
+    /// `FakeDns` behind an `Arc`, for the same reason as [`SharedFake`].
+    struct SharedDns(Arc<FakeDns>);
+
+    impl DnsProvider for SharedDns {
+        fn set_txt(
+            &self,
+            name: &str,
+            value: &str,
+        ) -> impl std::future::Future<Output = Result<RecordHandle, DnsError>> + Send {
+            self.0.set_txt(name, value)
+        }
+
+        fn remove_txt(
+            &self,
+            handle: &RecordHandle,
+        ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send {
+            self.0.remove_txt(handle)
+        }
     }
 
     /// `FakeAcme` behind an `Arc` so the test keeps a handle to script and inspect it.
@@ -291,6 +455,10 @@ mod tests {
     }
 
     fn rig(apps_toml: &str) -> Rig {
+        rig_with_wildcards(apps_toml, &[])
+    }
+
+    fn rig_with_wildcards(apps_toml: &str, wildcards: &[&str]) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("acme")).unwrap();
         let apps_path = dir.path().join("apps.toml");
@@ -302,10 +470,12 @@ mod tests {
             enabled: true,
             renew_before_days: 30,
             check_interval_secs: 3600,
+            dns: None,
         };
         let fake = SharedFake(Arc::new(FakeAcme::new(SystemTime::now() + DAYS(90))));
         let sink = Arc::new(VecSink::default());
         let applies = Arc::new(AtomicUsize::new(0));
+        let dns = Arc::new(FakeDns::new());
         let worker = AcmeWorker::new(
             fake.clone(),
             &config,
@@ -323,12 +493,21 @@ mod tests {
                 }
             }),
         );
+        let worker = if wildcards.is_empty() {
+            worker
+        } else {
+            let apexes: Vec<String> = wildcards.iter().map(|w| (*w).to_owned()).collect();
+            worker
+                .with_dns(fake.clone(), SharedDns(dns.clone()), &apexes)
+                .unwrap()
+        };
         Rig {
             dir,
             worker,
             sink,
             applies,
             fake,
+            dns,
         }
     }
 
@@ -387,5 +566,101 @@ mod tests {
         assert!(!rig.worker.pass().await);
         assert!(rig.fake.0.orders().is_empty());
         assert_eq!(rig.worker.status().snapshot().failures[0].0, "apps.toml");
+    }
+
+    #[tokio::test]
+    async fn wildcards_are_ordered_over_dns01_next_to_the_http01_certificates() {
+        let rig = rig_with_wildcards("", &["example.eu"]);
+        assert!(rig.worker.pass().await);
+        let tls = rig.dir.path().join("tls");
+        // The routed domain keeps its own certificate, and the wildcard has its own files.
+        assert!(tls.join("hook.example.eu.crt").is_file());
+        assert!(tls.join("_wildcard.example.eu.crt").is_file());
+        assert!(tls.join("_wildcard.example.eu.key").is_file());
+        let orders = rig.fake.0.orders();
+        assert_eq!(orders.len(), 2, "{orders:?}");
+        assert!(
+            orders
+                .iter()
+                .any(|id| id.as_str() == "_wildcard.example.eu")
+        );
+        // The TXT records of both names (apex and wildcard) were published and removed again.
+        let sets = rig
+            .dns
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, weglarka_dns::testing::Call::Set { .. }))
+            .count();
+        assert_eq!(sets, 2);
+        assert!(rig.dns.records().is_empty());
+        // One apply for the whole pass, one event per certificate.
+        assert_eq!(rig.applies.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.sink.events().len(), 2);
+
+        // Nothing is due on the second pass.
+        assert!(rig.worker.pass().await);
+        assert_eq!(rig.fake.0.orders().len(), 2);
+        assert_eq!(rig.applies.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_wildcard_does_not_hold_back_the_domain_certificates() {
+        let rig = rig_with_wildcards("", &["example.eu"]);
+        // The HTTP-01 order for the webhook domain goes first and succeeds; the next one fails.
+        rig.fake.0.fail_next_after(1, "DNS propagation timed out");
+        assert!(!rig.worker.pass().await);
+        let tls = rig.dir.path().join("tls");
+        assert!(tls.join("hook.example.eu.crt").is_file());
+        assert!(!tls.join("_wildcard.example.eu.crt").exists());
+        let status = rig.worker.status().snapshot();
+        assert_eq!(status.failures.len(), 1);
+        assert_eq!(status.failures[0].0, "_wildcard.example.eu");
+        assert!(
+            rig.dns.records().is_empty(),
+            "cleanup also ran after the failure"
+        );
+        assert_eq!(
+            rig.applies.load(Ordering::SeqCst),
+            1,
+            "the issued certificate is applied"
+        );
+    }
+
+    #[test]
+    fn the_token_file_must_be_private_and_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, content: &[u8], mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let ok = read_token(&write("ok", b"cf-token\n", 0o600)).unwrap();
+        assert_eq!(ok.expose(), b"cf-token");
+        for (name, content, mode, expect) in [
+            ("open", &b"cf-token"[..], 0o644, "chmod 600"),
+            ("empty", b"\n", 0o600, "is empty"),
+            ("spaced", b"two words", 0o600, "HTTP header"),
+            ("multiline", b"a\nb", 0o600, "HTTP header"),
+        ] {
+            let err = read_token(&write(name, content, mode)).unwrap_err();
+            assert!(err.contains(expect), "{name}: {err}");
+            assert!(
+                !err.contains("cf-token") && !err.contains("two words"),
+                "{err}"
+            );
+        }
+        assert!(read_token(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn a_bad_wildcard_apex_is_refused_before_the_worker_starts() {
+        let rig = rig("");
+        let err = rig.worker.with_dns(
+            rig.fake.clone(),
+            SharedDns(rig.dns.clone()),
+            &["Not A Domain".into()],
+        );
+        assert!(err.is_err());
     }
 }

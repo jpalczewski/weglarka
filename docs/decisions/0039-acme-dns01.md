@@ -60,13 +60,16 @@ internal crate is a follow-up, not part of this decision.
 * **Errors carry the provider's own error text** (`code: message`, capped) and never the request, so the
   token cannot appear in an error, a log line or a notification.
 
-**The token is a secret by name.** It lives in `secrets.toml` under a reserved name and reaches the adapter
-as a `SecretValue` (redacting `Debug`), is trimmed and validated once (printable ASCII), and is never
-rendered anywhere else. The operator creates a Cloudflare token with `Zone:Read` and `DNS:Edit`
+**The token is a secret read from a file.** `[acme.dns] token_file` points at a `0600` file that the daemon
+reads once at startup (the pattern of `[notify.ntfy] token_file`: `weglarka.toml` never holds a secret, and
+the store's `<instance>.<name>` scope has no instance for a daemon-level credential). It reaches the adapter
+as a `SecretValue` (redacting `Debug`), is trimmed and validated once (printable ASCII), a group/other-readable
+file stops the daemon, and the value is never rendered anywhere else. The operator creates a Cloudflare token with `Zone:Read` and `DNS:Edit`
 **scoped to the zones Węglarka may certify** — never the global API key. Compromise of this token lets an
 attacker rewrite every record of those zones (including pointing the domain elsewhere), which is the
-reason for the scope rule and for a dedicated token per installation; the doctor will warn when the token
-can see zones the configuration does not mention (planned with the configuration).
+reason for the scope rule and for a dedicated token per installation; the doctor reports the token file and the
+wildcard certificates (a check that the token cannot see other zones would need an extra API call and is
+left out).
 
 **Wildcard only.** `challenge = "dns-01"` issues the wildcard certificate (`*.<apex>`, optionally with the
 apex in the same order); per-domain certificates stay with HTTP-01. DNS-01 per domain would only trade
@@ -83,13 +86,18 @@ convention `tls/_wildcard.<apex>.crt|key`.
    a wildcard order's two challenges on the same name are two records removed independently. `present` and
    `cleanup` are idempotent, a failed delete keeps its handle for a retry, and the provider's error text is
    the only thing that reaches `AcmeError::Challenge`.
-3. After the `instant-acme` client and `[acme]` of #96 land: the additions `challenge` and `[acme.dns]` (the
-   provider and the *name* of the token secret), building the solver from them, and the wildcard
-   `CertSpec` (`_wildcard.<apex>`: `*.<apex>` + `<apex>`) in the daemon's certificate list.
+3. **Configuration and wiring** (done): `[acme.dns]` (`provider`, `token_file`, `wildcards`, optional and
+   additive, `deny_unknown_fields`, so it is one more rollback caveat after `[acme]`), a `DnsBackend` enum that
+   implements `DnsProvider` for the configured provider, and a second `Manager` in the ACME worker that keeps
+   a wildcard `CertSpec` per apex (`_wildcard.<apex>`: `*.<apex>` + `<apex>`) next to the per-domain HTTP-01
+   certificates, on the same store and the same pass. An unusable token file is a startup error (opt-in, but
+   once configured a silent skip would hide a broken deployment). The wildcard certificates are issued and
+   renewed but **not served yet**: every routed domain keeps its own HTTP-01 certificate until step 4.
 4. A separate change for ingress: map a routed domain to its certificate (exact `<domain>.crt` first, then
    a one-label wildcard `*.<apex>`; the apex itself is not covered), which touches the certificate scan in
    the daemon and the `edge` generator and its snapshots; `behind` stays byte-for-byte unchanged.
-5. Doctor checks (`acme.dns.*`, CAA), `docs/install.md` and the operator documentation.
+5. Doctor `acme.dns` and `acme.wildcards` and `docs/install.md` 6s (done with step 3); a CAA check and the opt-in
+   live test on a development zone remain.
 
 ## Consequences
 
