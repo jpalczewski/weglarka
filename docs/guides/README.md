@@ -30,6 +30,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 |---|---|
 | [Stopped apps](stopped-apps.md) | `start = false`, provisioning without a container |
 | [App dependencies](dependencies.md) | `depends_on` start order and health gate |
+| [Blue-green deploys](blue-green.md) | `strategy = "blue_green"`: deploys without the restart outage for stateless apps |
 | [Container command](container-command.md) | `command` (argv) |
 | [Container hardening](container-hardening.md) | `security` for apps, the always-hardened ingress container |
 | [Image retention](image-retention.md) | Which images stay, `images prune` |

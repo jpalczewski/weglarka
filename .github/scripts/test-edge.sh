@@ -42,7 +42,7 @@ conf=$(abs "$conf")
 # nginx container mounts gets exactly that one directive rewritten — listeners, server blocks, TLS paths
 # and the ACME webroot stay byte-for-byte the dumped config. (`nginx -t` in CI runs on the undedited dump.)
 runtime_conf=$work/nginx.conf
-sed -E 's|^([[:space:]]*resolver)[[:space:]]+[^;]+;|\1 127.0.0.11 valid=5s ipv6=off;|' "$conf" >"$runtime_conf"
+sed -E 's|^([[:space:]]*resolver)[[:space:]]+[^;]+;|\1 127.0.0.11 valid=1s ipv6=off;|' "$conf" >"$runtime_conf"
 chmod 644 "$runtime_conf"
 if ! cmp -s "$conf" "$runtime_conf"; then
   echo "--- runtime config: resolver rewritten to Docker's embedded DNS (127.0.0.11)"

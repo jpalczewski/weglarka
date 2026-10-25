@@ -446,8 +446,11 @@ fn write_http_scaffolding(c: &mut Conf, o: &NginxOptions) {
             IpAddr::V6(v6) => format!("[{v6}]"),
         })
         .collect();
+    // `valid=1s`: a blue-green switch (ADR 0046) moves the instance alias to a new container, and
+    // nginx must not keep the old address longer than the drain that follows. aardvark is local, so
+    // the extra lookups cost nothing.
     c.line(&format!(
-        "resolver {} valid=5s ipv6=off;",
+        "resolver {} valid=1s ipv6=off;",
         resolvers.join(" ")
     ));
     c.line("resolver_timeout 2s;");

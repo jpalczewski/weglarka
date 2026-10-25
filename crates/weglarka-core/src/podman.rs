@@ -437,6 +437,15 @@ pub trait PodmanClient: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
     fn container_remove(&self, name: &str, force: bool) -> impl Future<Output = Result<()>> + Send;
     /// Sends a signal (name without `SIG`, e.g. `HUP`) to a running container — reloads nginx.
+    /// Renames a container, running or not. libpod does **not** update the DNS entry of a running
+    /// container on its networks: the old name keeps resolving and the new one does not (ADR 0046), so
+    /// a rename is bookkeeping, never a way to move traffic. `Conflict` when `new_name` is taken.
+    fn container_rename(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn container_kill(&self, name: &str, signal: &str) -> impl Future<Output = Result<()>> + Send;
     /// `PodmanError::NotFound` if missing.
     /// Runs `cmd` in a running container, waits for it to finish and returns the exit code.
@@ -505,6 +514,16 @@ pub trait PodmanClient: Send + Sync {
         &self,
         network: &str,
         container: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// [`Self::network_connect`] with DNS aliases on that network (ADR 0046). libpod refuses a network
+    /// the container is already on ("network is already connected"), so a container that should gain
+    /// an alias later has to start on a different network first.
+    fn network_connect_aliased(
+        &self,
+        network: &str,
+        container: &str,
+        aliases: &[String],
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Detaches a running container from a network. Idempotent: not attached → `Ok`.

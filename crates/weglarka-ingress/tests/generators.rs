@@ -116,7 +116,7 @@ fn nginx_ipv6_resolver_and_extra_trust() {
     o.trusted_proxies
         .push("10.0.0.0/8".parse::<Cidr>().unwrap());
     let conf = nginx::generate(&host(), &apps(ONE_APP), &o).unwrap();
-    assert!(conf.contains("resolver [fd00::1] valid=5s ipv6=off;"));
+    assert!(conf.contains("resolver [fd00::1] valid=1s ipv6=off;"));
     assert!(conf.contains("set_real_ip_from 10.0.0.0/8;"));
 }
 

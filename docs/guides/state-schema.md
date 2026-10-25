@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 8**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 8`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 9**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 9`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-core/src/state.rs`); a compile-time assert

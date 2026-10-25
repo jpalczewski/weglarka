@@ -1,6 +1,6 @@
-# 0045 — Blue-green deploys for stateless apps (issue #39)
+# 0046 — Blue-green deploys for stateless apps (issue #39)
 
-Status: proposed (2026-10-25, issue #39).
+Status: proposed (2026-10-25, issue #39). Implemented; moves to accepted once the open points below are measured on a host.
 
 ## Problem
 
@@ -29,15 +29,18 @@ no-dropped-requests goal is not met by the first sequence and is decided after t
   challenger cannot start on the app network and gain the alias later. It starts on a per-instance staging network
   (`net-<instance>.next`, labelled with the instance so purge and orphan cleanup find it), together with the
   shared networks it needs for its own gate, and passes the health gate there.
-* **Switch.** After the gate the challenger is connected to the app network with the alias `<instance>`. The old
-  container keeps serving through the old DNS entry; after a drain of at least the resolver TTL plus a margin it
-  is stopped and removed. Names are then swapped (old to `.prev`, challenger to `<instance>`) so that
-  `container_name` keeps meaning "the container that serves"; the order (alias, renames, drain, stop) is the one
-  the spike ran without a failed request on plain DNS. The staging network is removed.
+* **Switch.** After the gate the challenger is connected to the app network with the alias `<instance>`. The names
+  are swapped (old to `.prev`, challenger to `<instance>`) so that `container_name` keeps meaning "the container
+  that serves" and a container with that name exists throughout. The old container keeps serving through its old
+  DNS entry for a drain (`ReconcilerOptions::switch_drain`, 3 s: the resolver TTL plus a margin), then is stopped
+  and removed, and the staging network goes away. The order (alias, renames, drain, stop) is the one the spike ran
+  without a failed request on plain DNS.
 * **Resolver TTL.** The generated nginx lowers `resolver ... valid=5s` to `valid=1s` in both modes (aardvark is
   local, so the extra lookups are negligible). This is a change to every generated `nginx.conf` (snapshots).
 * **Stateless.** Validation rejects `blue_green` with a read-write volume (private or shared) or `host_ports`.
-  Read-only volumes and `configs` are allowed. Aliases from shared networks are attached at the switch, not before.
+  Read-only volumes and `configs` are allowed. The challenger joins the shared network (and its aliases) when it
+  is created, since an alias cannot be added to a network the container is already on; during the overlap both
+  containers carry those aliases, and aardvark answers with the old one first.
 * **Health gate.** `blue_green` requires a container-side gate (`health.command` or the image healthcheck):
   `health.http` goes through nginx by `Host` and would probe the old container. `health.http` still runs after the
   switch as a confirmation.
@@ -45,6 +48,9 @@ no-dropped-requests goal is not met by the first sequence and is decided after t
   bad deploy). A failure after the switch uses the existing rollback (previous digest). Keeping the old container
   stopped until the next deploy is out of scope (separate issue).
 * **Dependents.** `dependency_ready` inspects `<instance>`, which runs throughout; nothing cascades.
+* **Leftovers.** Reconcile's `plan()` does not treat `<instance>.next` / `<instance>.prev` as duplicates (they carry
+  the instance label and live only inside a deploy, which holds the engine lock). A leftover of a crashed deploy
+  is removed by the instance's next blue-green deploy, or with the app; it is not swept on its own.
 
 ## Evidence (spike, 2026-10-25)
 
@@ -74,10 +80,18 @@ no-dropped-requests goal is not met by the first sequence and is decided after t
 
 ## Consequences
 
-*To be completed with the implementation:* `apps.toml` gets `strategy` (`schema_version` bump, no-op step, rollback
-note in `docs/guides/blue-green.md` and `verify-and-rollback.md`); `PodmanClient` gains `container_rename` and
-`network_connect` with aliases (`FakePodman` updated); long-lived connections (websocket, SSE) are cut when the
-old container stops.
+* `apps.toml` gets `strategy`: `state::SCHEMA_VERSION` 8 → 9 with a no-op step, the image label moves with it
+  (`Containerfile`), and the rollback note is in [`docs/guides/blue-green.md`](../guides/blue-green.md) and the table
+  in `verify-and-rollback.md`. The field is outside `spec_hash`.
+* `PodmanClient` gains `container_rename` and `network_connect_aliased` (`FakePodman` updated: a connected
+  network refuses a second connect, like libpod; a rename moves scripts and network membership).
+* Every generated `nginx.conf` changes (`valid=1s`): the ingress reloads on the next apply, no container is recreated.
+* `blue_green` needs a container healthcheck; without one a swap is refused at deploy time (the image's own
+  `HEALTHCHECK` is only known then, so it cannot be a validation rule).
+* Long-lived connections (websocket, SSE) on the old container are cut when it stops.
+* Tests: `engine_tests::blue_green` (order of the swap, a failed challenger leaves the old container untouched,
+  refusal without a container check, transient containers survive reconcile); validation in `state.rs`; the
+  Podman-level assumptions in `weglarka-podman/tests/blue_green.rs`.
 
 ## Rejected alternatives
 
