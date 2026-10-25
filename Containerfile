@@ -40,7 +40,7 @@ ARG VERSION=dev
 ARG REVISION=unknown
 # The state schema this image writes (crates/weglarka-core/src/schema.rs). The self-updater compares
 # the label with the running daemon's schema before replacing the image (docs/decisions/0023).
-ARG STATE_SCHEMA=10
+ARG STATE_SCHEMA=11
 LABEL org.opencontainers.image.title="weglarka" \
       org.opencontainers.image.description="Węglarka — deploy-tool dla rootless Podmana" \
       org.opencontainers.image.source="https://github.com/jpalczewski/weglarka" \

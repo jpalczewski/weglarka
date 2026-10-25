@@ -931,6 +931,14 @@ fn add_accepts_max_body_size() {
 }
 
 #[test]
+fn add_accepts_streaming_paths() {
+    let spec = build_spec(&add_args(&["--streaming-path", "/user/events"])).unwrap();
+    assert_eq!(spec.ingress.streaming_paths, ["/user/events"]);
+    assert!(!spec.ingress.streaming);
+    assert!(build_spec(&add_args(&[])).unwrap().ingress.is_default());
+}
+
+#[test]
 fn add_accepts_streaming() {
     let spec = build_spec(&add_args(&["--streaming"])).unwrap();
     assert!(spec.ingress.streaming);
