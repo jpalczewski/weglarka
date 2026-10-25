@@ -115,6 +115,11 @@ pub struct RuntimeConfig {
     /// (`docs/decisions/0013-host-ports.md`).
     #[serde(default)]
     pub allow_privileged_host_ports: bool,
+    /// How long a start waits for the apps in `depends_on` (seconds); `0` = a single check, no
+    /// waiting. Unset = the engine default (10 s). Mostly useful to keep tests fast; the admin
+    /// API's mutation timeout still bounds what makes sense in production.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_wait_secs: Option<u32>,
 }
 
 impl RuntimeConfig {
@@ -134,6 +139,7 @@ impl Default for RuntimeConfig {
             socket: None,
             reconcile_interval_secs: Self::default_reconcile_interval_secs(),
             allow_privileged_host_ports: false,
+            dependency_wait_secs: None,
         }
     }
 }

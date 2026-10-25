@@ -4,6 +4,8 @@
 [workspace]
 # Nothing is published to crates.io; git tags are the source of truth for "the previous release".
 git_only = true
+# Nothing is published to crates.io (`git_only = true`), so cargo-semver-checks has no consumer; it cost ~115 s per run.
+semver_check = false
 # The image/binaries are built by release.yml from the `v*` tag; GitHub Releases are created there.
 git_release_enable = false
 # Each crate gets a CHANGELOG.md in its own directory, generated from Conventional Commits that touched its files.

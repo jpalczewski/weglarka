@@ -8,6 +8,15 @@ use common::*;
 use hyper::StatusCode;
 use serde_json::{Value, json};
 
+/// A daemon whose dependency gate waits 1 s instead of the production 10 s, so the tests that hit
+/// the full budget stay fast.
+async fn short_gate() -> Harness {
+    Builder::new()
+        .sections("\n[runtime]\ndependency_wait_secs = 1\n")
+        .build()
+        .await
+}
+
 fn with_deps(mut spec: Value, deps: &[&str]) -> Value {
     if !deps.is_empty() {
         spec["depends_on"] = json!(deps);
@@ -31,7 +40,7 @@ async fn put(h: &Harness, name: &str, spec: Value) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn invalid_dependency_graphs_are_rejected_with_400() {
-    let h = harness().await;
+    let h = short_gate().await;
     add(&h, "db", spec("db.example.eu")).await;
     add(&h, "api", spec("api.example.eu")).await;
 
@@ -65,7 +74,7 @@ async fn invalid_dependency_graphs_are_rejected_with_400() {
 
 #[tokio::test]
 async fn deleting_a_dependency_is_refused_with_409() {
-    let h = harness().await;
+    let h = short_gate().await;
     add(&h, "db", spec("db.example.eu")).await;
     deployed(&h, "db").await;
     add(&h, "api", with_deps(spec("api.example.eu"), &["db"])).await;
@@ -91,7 +100,7 @@ async fn deleting_a_dependency_is_refused_with_409() {
 
 #[tokio::test]
 async fn a_dependent_does_not_deploy_while_its_dependency_is_stopped() {
-    let h = harness().await;
+    let h = short_gate().await;
     add(&h, "db", spec("db.example.eu")).await;
     deployed(&h, "db").await;
     add(&h, "api", with_deps(spec("api.example.eu"), &["db"])).await;

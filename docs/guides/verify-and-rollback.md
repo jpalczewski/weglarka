@@ -52,6 +52,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `configs` and `reload_signal` | [host configs](host-configs.md) |
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
+| `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |
 | `weglarka.toml` | `[monitor]` | [crash detection](crash-detection.md) |
 | `weglarka.toml` | `[self_update]`, together with `systemctl --user disable --now weglarka-self-update.timer weglarka-watchdog.timer` | [self-update](self-update.md) |
