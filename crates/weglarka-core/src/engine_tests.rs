@@ -2331,3 +2331,279 @@ async fn a_declaration_with_members_cannot_be_removed() {
     h.rec.declare_shared_network(net.clone()).await.unwrap();
     h.rec.declare_shared_network(net).await.unwrap();
 }
+
+// ── One-off containers (`weglarka run`, issue #106) ─────────────────────────
+
+mod run {
+    use super::*;
+    use crate::podman::{ContainerSpec, LogChunk, LogSource};
+    use crate::run::{MAX_CONCURRENT_RUNS, RunOptions, RunOutcome};
+    use crate::testing::RunScript;
+
+    const APP: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+domains = ["ntfy.example.eu"]
+env = { MODE = "prod", KEEP = "yes" }
+host_ports = [{ host = 2222, container = 22 }]
+command = ["serve"]
+"#;
+
+    async fn deployed() -> Harness {
+        let h = Harness::new(APP);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    fn options(cmd: &[&str]) -> RunOptions {
+        RunOptions {
+            command: cmd.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn chunk(source: LogSource, text: &str) -> (LogSource, Vec<u8>) {
+        (source, text.as_bytes().to_vec())
+    }
+
+    /// The single run container ever created, whether or not it still exists.
+    fn run_spec(h: &Harness) -> ContainerSpec {
+        let mut runs: Vec<_> = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .filter(|s| s.labels.contains_key(labels::RUN))
+            .collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        runs.remove(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_and_exit_code_come_back_and_the_container_is_removed() {
+        let h = deployed().await;
+        h.fake.script_next_run(RunScript {
+            output: vec![
+                chunk(LogSource::Stdout, "migrating\n"),
+                chunk(LogSource::Stderr, "warning\n"),
+            ],
+            exit_code: 3,
+            hang: false,
+        });
+        let calls_before = h.fake.calls().len();
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = h
+            .rec
+            .run_once(&name("ntfy"), options(&["migrate", "--up"]), tx)
+            .await
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Exited(3));
+        let mut got = Vec::new();
+        while let Some(c) = rx.recv().await {
+            got.push((c.source, String::from_utf8(c.data.to_vec()).unwrap()));
+        }
+        assert_eq!(
+            got,
+            [
+                (LogSource::Stdout, "migrating\n".to_owned()),
+                (LogSource::Stderr, "warning\n".to_owned())
+            ]
+        );
+        // Only the app is left, and it was neither stopped nor recreated.
+        let names: Vec<_> = h.fake.containers().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["ntfy"]);
+        let calls = h.fake.calls().split_off(calls_before);
+        for app_call in [
+            Call::ContainerStop("ntfy".into()),
+            Call::ContainerRemove("ntfy".into()),
+            Call::ContainerCreate("ntfy".into()),
+        ] {
+            assert!(!calls.contains(&app_call), "{app_call:?} in {calls:?}");
+        }
+        assert_eq!(h.state("ntfy").generation, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_container_never_gets_host_ports_ingress_or_the_apps_identity() {
+        let h = deployed().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let mut opts = options(&["sh", "-c", "env"]);
+        opts.entrypoint = Some(vec!["/bin/busybox".into()]);
+        opts.env = BTreeMap::from([("MODE".into(), "debug".into())]);
+        h.rec.run_once(&name("ntfy"), opts, tx).await.unwrap();
+
+        let run = run_spec(&h);
+        assert!(run.publish.is_empty(), "host_ports must not be published");
+        assert_eq!(run.restart, crate::podman::RestartPolicy::No);
+        assert!(run.healthcheck.is_none());
+        assert!(run.network_aliases.is_empty());
+        assert_eq!(run.networks, ["net-ntfy"]);
+        assert_eq!(run.command, ["sh", "-c", "env"]);
+        assert_eq!(run.entrypoint, Some(vec!["/bin/busybox".to_owned()]));
+        // The app's env, with the request's values on top.
+        assert_eq!(run.env["MODE"], "debug");
+        assert_eq!(run.env["KEEP"], "yes");
+        assert_eq!(
+            run.image,
+            format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('a'))
+        );
+        // Not the app: reconcile, the crash watcher and ingress key on `weglarka.instance`.
+        assert!(!run.labels.contains_key(labels::INSTANCE));
+        assert_eq!(run.labels[labels::RUN_FOR], "ntfy");
+        assert_ne!(run.name, "ntfy");
+        assert!(run.name.starts_with("wg-run.ntfy."), "{}", run.name);
+        // The app's own spec keeps its port.
+        assert_eq!(h.fake.container_spec("ntfy").unwrap().publish.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_app_that_was_never_deployed_is_refused() {
+        let h = Harness::new(APP);
+        let (tx, _rx) = mpsc::channel(1);
+        let err = h
+            .rec
+            .run_once(&name("ntfy"), options(&["true"]), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::RunNotDeployed(_)), "{err:?}");
+        let err = h
+            .rec
+            .run_once(&name("nope"), options(&["true"]), mpsc::channel(1).0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownInstance(_)), "{err:?}");
+        assert!(h.fake.created_specs().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_that_cannot_start_a_process_are_refused_before_anything_is_created() {
+        let h = deployed().await;
+        let before = h.fake.created_specs().len();
+        let bad = [
+            options(&[]),
+            RunOptions {
+                entrypoint: Some(vec![]),
+                ..options(&["x"])
+            },
+            RunOptions {
+                env: BTreeMap::from([("A=B".into(), "c".into())]),
+                ..options(&["x"])
+            },
+            RunOptions {
+                timeout: Some(Duration::ZERO),
+                ..options(&["x"])
+            },
+        ];
+        for opts in bad {
+            let err = h
+                .rec
+                .run_once(&name("ntfy"), opts.clone(), mpsc::channel(1).0)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, EngineError::RunInvalid(_)),
+                "{opts:?}: {err:?}"
+            );
+        }
+        assert_eq!(h.fake.created_specs().len(), before);
+        // An entrypoint alone is enough.
+        let ok = RunOptions {
+            entrypoint: Some(vec!["/bin/sh".into()]),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_overstays_its_timeout_is_killed_and_removed() {
+        let h = deployed().await;
+        h.fake.script_next_run(RunScript {
+            hang: true,
+            ..Default::default()
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        let mut opts = options(&["sleep", "infinity"]);
+        opts.timeout = Some(Duration::from_secs(30));
+        let outcome = h.rec.run_once(&name("ntfy"), opts, tx).await.unwrap();
+        assert_eq!(outcome, RunOutcome::TimedOut);
+        assert!(h.fake.calls().iter().any(|c| matches!(
+            c,
+            Call::ContainerKill { name, signal } if name.starts_with("wg-run.") && signal == "KILL"
+        )));
+        assert_eq!(h.fake.containers().len(), 1, "only the app is left");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_goes_away_cancels_the_run() {
+        let h = deployed().await;
+        h.fake.script_next_run(RunScript {
+            hang: true,
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::channel::<LogChunk>(1);
+        let rec = h.rec.clone();
+        let task = tokio::spawn(async move {
+            rec.run_once(&name("ntfy"), options(&["sleep", "infinity"]), tx)
+                .await
+        });
+        // Let the run start, then hang up.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(h.fake.containers().len(), 2);
+        drop(rx);
+        assert_eq!(task.await.unwrap().unwrap(), RunOutcome::Cancelled);
+        assert_eq!(h.fake.containers().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_few_runs_may_be_alive_at_once() {
+        let h = deployed().await;
+        let mut keep = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RUNS {
+            h.fake.script_next_run(RunScript {
+                hang: true,
+                ..Default::default()
+            });
+            let (tx, rx) = mpsc::channel::<LogChunk>(1);
+            keep.push(rx);
+            let rec = h.rec.clone();
+            tokio::spawn(async move {
+                let _ = rec
+                    .run_once(&name("ntfy"), options(&["sleep", "1d"]), tx)
+                    .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let err = h
+            .rec
+            .run_once(&name("ntfy"), options(&["true"]), mpsc::channel(1).0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::RunLimit(_)), "{err:?}");
+        // A finished run frees its slot.
+        keep.pop();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (tx, _rx) = mpsc::channel(4);
+        h.rec
+            .run_once(&name("ntfy"), options(&["true"]), tx)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_run_containers_are_swept_and_the_app_is_left_alone() {
+        let h = deployed().await;
+        let mut stale = h.fake.container_spec("ntfy").unwrap();
+        stale.name = "wg-run.ntfy.dead".into();
+        stale.labels = BTreeMap::from([
+            (labels::RUN.to_owned(), "true".to_owned()),
+            (labels::RUN_FOR.to_owned(), "ntfy".to_owned()),
+        ]);
+        h.fake.container_create(&stale).await.unwrap();
+        h.fake.container_start("wg-run.ntfy.dead").await.unwrap();
+        assert_eq!(h.rec.remove_stale_runs().await.unwrap(), 1);
+        let names: Vec<_> = h.fake.containers().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["ntfy"]);
+        assert_eq!(h.rec.remove_stale_runs().await.unwrap(), 0);
+    }
+}

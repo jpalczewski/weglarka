@@ -14,7 +14,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use weglarka_api::{ApiError, Endpoint, Method};
+use weglarka_api::{
+    ApiError, Endpoint, Method, RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest,
+    endpoints,
+};
 
 use crate::error::{CliError, Kind};
 
@@ -27,6 +30,42 @@ const BUSY_WAIT: Duration = Duration::from_secs(180);
 /// Pause between retries of a `busy` request (grows up to `BUSY_BACKOFF_MAX`).
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(500);
 const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// The frames of a run response, as they arrive.
+pub struct RunStream {
+    body: hyper::body::Incoming,
+    decoder: RunFrameDecoder,
+    ready: std::collections::VecDeque<RunFrame>,
+    /// Keeps the connection's request side open for as long as the response is read.
+    _sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+}
+
+impl RunStream {
+    /// The next frame, or `None` when the daemon closed the stream.
+    pub async fn next(&mut self) -> Result<Option<RunFrame>, CliError> {
+        loop {
+            if let Some(frame) = self.ready.pop_front() {
+                return Ok(Some(frame));
+            }
+            let Some(frame) = self.body.frame().await else {
+                return if self.decoder.is_clean() {
+                    Ok(None)
+                } else {
+                    Err(CliError::internal("run stream ended inside a frame"))
+                };
+            };
+            let frame =
+                frame.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
+            if let Some(data) = frame.data_ref() {
+                self.ready.extend(
+                    self.decoder
+                        .push(data)
+                        .map_err(|e| CliError::internal(e.to_string()))?,
+                );
+            }
+        }
+    }
+}
 
 pub struct ApiClient {
     socket: PathBuf,
@@ -277,6 +316,53 @@ impl ApiClient {
         }
         sink.flush().await.map_err(|e| io(&e))?;
         Ok(written)
+    }
+
+    /// `POST /v1/apps/{name}/run`: opens the response stream of a run. No overall timeout (a run can
+    /// take hours) and no busy retry (the request has side effects once the stream starts); an
+    /// error before the stream is an ordinary API error. Dropping the returned stream closes the
+    /// connection, which makes the daemon kill the run.
+    pub async fn open_run(&self, name: &str, request: &RunRequest) -> Result<RunStream, CliError> {
+        let payload = serde_json::to_vec(request)
+            .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?;
+        let req = Request::builder()
+            .method(method_str(endpoints::APPS_RUN.method))
+            .uri(request_path(endpoints::APPS_RUN, &[("name", name)], ""))
+            .header(HOST, "weglarka")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(payload)))
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let mut sender = self.connect().await?;
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
+        let status = resp.status();
+        let is_run_stream = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .is_some_and(|v| v == RUN_STREAM_CONTENT_TYPE);
+        let body = resp.into_body();
+        if !status.is_success() {
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
+                .to_bytes();
+            return Err(error_from_response(status, &bytes));
+        }
+        if !is_run_stream {
+            return Err(
+                CliError::internal("the daemon did not answer with a run stream")
+                    .with_hint("CLI and daemon versions may differ"),
+            );
+        }
+        Ok(RunStream {
+            body,
+            decoder: RunFrameDecoder::default(),
+            ready: std::collections::VecDeque::new(),
+            _sender: sender,
+        })
     }
 
     fn unreachable(&self, cause: &str) -> CliError {

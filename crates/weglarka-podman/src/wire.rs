@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{Digest, Resources, SecretTarget};
 use weglarka_core::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
-    IdRange, ImageInfo, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError, PodmanEvent,
-    PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec, image_repo,
+    IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError,
+    PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec, image_repo,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -99,6 +100,9 @@ pub(crate) struct CreateContainer<'a> {
     /// override (issue #79). Omitted keeps the image's own `CMD`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     command: &'a Vec<String>,
+    /// `SpecGenerator.entrypoint`: replaces the image's `ENTRYPOINT`; only one-off containers set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<&'a Vec<String>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     labels: &'a BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -339,6 +343,7 @@ impl<'a> CreateContainer<'a> {
             name: &spec.name,
             image: &spec.image,
             command: &spec.command,
+            entrypoint: spec.entrypoint.as_ref(),
             labels: &spec.labels,
             env: &spec.env,
             restart_policy: match spec.restart {
@@ -875,6 +880,68 @@ impl WireEvent {
     }
 }
 
+/// Splits libpod's multiplexed log stream (no TTY) into stdout/stderr chunks. Each frame is an 8-byte
+/// header — stream type (1 stdout, 2 stderr), three zero bytes, big-endian payload length — and the
+/// payload; frames may arrive split across or merged into network chunks.
+#[derive(Debug, Default)]
+pub(crate) struct LogDemux {
+    buf: Vec<u8>,
+}
+
+impl LogDemux {
+    /// Largest frame accepted; libpod frames are far smaller, so anything bigger is a corrupt stream.
+    const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+    pub(crate) fn push(&mut self, data: &[u8]) -> Result<Vec<LogChunk>, PodmanError> {
+        self.buf.extend_from_slice(data);
+        let mut out = Vec::new();
+        while let Some(&[kind, _, _, _, a, b, c, d]) = self.buf.first_chunk::<8>() {
+            let len = u32::from_be_bytes([a, b, c, d]) as usize;
+            if len > Self::MAX_FRAME {
+                return Err(PodmanError::Protocol(format!(
+                    "log frame of {len} bytes exceeds the limit"
+                )));
+            }
+            if self.buf.len() < 8 + len {
+                break;
+            }
+            let source = match kind {
+                1 => Some(LogSource::Stdout),
+                2 => Some(LogSource::Stderr),
+                // 0 = stdin echo, 3 = a daemon-side error line: not container output.
+                _ => None,
+            };
+            if let Some(source) = source {
+                out.push(LogChunk {
+                    source,
+                    data: Bytes::copy_from_slice(&self.buf[8..8 + len]),
+                });
+            }
+            self.buf.drain(..8 + len);
+        }
+        Ok(out)
+    }
+
+    /// The stream ended in the middle of a frame.
+    pub(crate) fn is_clean(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+/// `POST /containers/{name}/wait` answers with the bare exit code (libpod) or `{"StatusCode": n}`
+/// (the Docker-compatible shape); accept both.
+pub(crate) fn parse_wait(body: &[u8]) -> Result<i32, PodmanError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Compat {
+        status_code: i32,
+    }
+    let text = std::str::from_utf8(body).unwrap_or_default().trim();
+    text.parse::<i32>()
+        .or_else(|_| serde_json::from_str::<Compat>(text).map(|c| c.status_code))
+        .map_err(|_| PodmanError::Protocol(format!("unexpected wait response: {text:?}")))
+}
+
 #[cfg(test)]
 mod tests {
     use weglarka_core::podman::{PortMapping as DomainPort, SecretAttachment};
@@ -1070,6 +1137,7 @@ mod tests {
             name: "api".into(),
             image: "img".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec!["net-api".into(), "net-shared-kajet".into()],
@@ -1110,6 +1178,7 @@ mod tests {
             name: "ntfy-1".into(),
             image: "ghcr.io/jpalczewski/ntfy.zig@sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::from([("weglarka.instance".into(), "ntfy".into())]),
             env: BTreeMap::from([("CONFIG_FILE".into(), "/config.json".into())]),
             networks: vec!["net-ntfy".into()],
@@ -1150,6 +1219,7 @@ mod tests {
             name: "ntfy".into(),
             image: "docker.io/binwiederhier/ntfy:latest".into(),
             command: vec!["serve".into(), "--no-log".into()],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1168,12 +1238,107 @@ mod tests {
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
 
+    /// `entrypoint` replaces the image's `ENTRYPOINT`; only a one-off container sets it, so it is
+    /// omitted otherwise and an ordinary app's create body does not change.
+    #[test]
+    fn entrypoint_is_sent_only_when_set() {
+        let mut spec = ContainerSpec {
+            name: "wg-run.a.1".into(),
+            image: "i".into(),
+            command: vec!["-c".into(), "env".into()],
+            entrypoint: Some(vec!["/bin/sh".into()]),
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: vec![],
+            network_aliases: Default::default(),
+            secrets: vec![],
+            publish: vec![],
+            restart: RestartPolicy::No,
+            userns_auto: true,
+            mounts: vec![],
+            volumes: vec![],
+            resources: Default::default(),
+            healthcheck: None,
+            id_mapping: None,
+            security: Default::default(),
+        };
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(body["entrypoint"], serde_json::json!(["/bin/sh"]));
+        assert_eq!(body["command"], serde_json::json!(["-c", "env"]));
+        spec.entrypoint = None;
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert!(body.get("entrypoint").is_none(), "{body}");
+    }
+
+    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![kind, 0, 0, 0];
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn texts(chunks: &[LogChunk]) -> Vec<(LogSource, String)> {
+        chunks
+            .iter()
+            .map(|c| (c.source, String::from_utf8_lossy(&c.data).into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn log_frames_are_split_by_stream_even_when_the_network_cuts_them_anywhere() {
+        let mut bytes = frame(1, b"out one\n");
+        bytes.extend(frame(2, b"err\n"));
+        bytes.extend(frame(0, b"stdin echo is not output"));
+        bytes.extend(frame(1, b""));
+        bytes.extend(frame(1, b"out two"));
+        // The whole stream in one go.
+        let mut whole = LogDemux::default();
+        let all = whole.push(&bytes).unwrap();
+        let expected = vec![
+            (LogSource::Stdout, "out one\n".to_owned()),
+            (LogSource::Stderr, "err\n".to_owned()),
+            (LogSource::Stdout, String::new()),
+            (LogSource::Stdout, "out two".to_owned()),
+        ];
+        assert_eq!(texts(&all), expected);
+        assert!(whole.is_clean());
+        // And one byte at a time: same chunks, nothing lost at the seams.
+        let mut slow = LogDemux::default();
+        let mut got = Vec::new();
+        for byte in &bytes {
+            got.extend(slow.push(&[*byte]).unwrap());
+        }
+        assert_eq!(texts(&got), expected);
+        assert!(slow.is_clean());
+    }
+
+    #[test]
+    fn a_log_stream_cut_mid_frame_is_not_clean_and_a_huge_frame_is_refused() {
+        let mut demux = LogDemux::default();
+        assert!(demux.push(&frame(1, b"hello")[..10]).unwrap().is_empty());
+        assert!(!demux.is_clean());
+        let mut demux = LogDemux::default();
+        let mut header = vec![1, 0, 0, 0];
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(demux.push(&header), Err(PodmanError::Protocol(_))));
+    }
+
+    #[test]
+    fn wait_answers_in_both_shapes() {
+        assert_eq!(parse_wait(b"3").unwrap(), 3);
+        assert_eq!(parse_wait(b" 0\n").unwrap(), 0);
+        assert_eq!(parse_wait(br#"{"StatusCode":137}"#).unwrap(), 137);
+        assert!(parse_wait(b"nope").is_err());
+        assert!(parse_wait(b"").is_err());
+    }
+
     #[test]
     fn security_maps_to_libpod_fields_and_is_omitted_when_unset() {
         let mut spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1224,6 +1389,7 @@ mod tests {
             name: "a".into(),
             image: "i".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1277,6 +1443,7 @@ mod tests {
             name: "pogoda".into(),
             image: "i".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1317,6 +1484,7 @@ mod tests {
             name: "a".into(),
             image: "i".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],
@@ -1362,6 +1530,7 @@ mod tests {
             name: "a".into(),
             image: "i".into(),
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::new(),
             env: BTreeMap::new(),
             networks: vec![],

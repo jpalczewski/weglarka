@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use weglarka_core::app::SecretTarget;
 use weglarka_core::podman::{
     ContainerFilter, ContainerSpec, ContainerState, EventFilter, EventKind, HealthStatus,
-    NetworkSpec, PodmanClient, PodmanError, PortMapping, PullEvent, RestartPolicy,
+    LogSource, NetworkSpec, PodmanClient, PodmanError, PortMapping, PullEvent, RestartPolicy,
     SecretAttachment,
 };
 use weglarka_podman::LibpodClient;
@@ -137,6 +137,7 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
         name: name.into(),
         image: IMAGE.into(),
         command: vec![],
+        entrypoint: None,
         labels,
         env: BTreeMap::from([("WEGLARKA_IT".into(), "1".into())]),
         networks: vec![],
@@ -599,6 +600,64 @@ async fn command_reaches_libpod_as_arguments_to_the_image_entrypoint() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(state["ExitCode"], 0, "{state}");
+}
+
+/// One-off containers (issue #106): `entrypoint` replaces the image's, the log stream arrives split
+/// by stream with `follow`, `wait` returns the exit code, and a forced remove leaves nothing behind.
+#[tokio::test]
+async fn one_off_container_streams_its_output_and_reports_the_exit_code() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-run-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.image = BUSYBOX.into();
+    s.entrypoint = Some(vec!["/bin/sh".into()]);
+    s.command = vec!["-c".into(), "echo out; echo err >&2; exit 3".into()];
+    s.restart = RestartPolicy::No;
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+
+    let mut logs = timeout(STEP, client.container_logs(&name, true))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
+        let chunk = chunk.unwrap();
+        let text = String::from_utf8(chunk.data.to_vec()).unwrap();
+        match chunk.source {
+            LogSource::Stdout => stdout.push_str(&text),
+            LogSource::Stderr => stderr.push_str(&text),
+        }
+    }
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("out\n", "err\n"));
+    assert_eq!(
+        timeout(STEP, client.container_wait(&name))
+            .await
+            .unwrap()
+            .unwrap(),
+        3
+    );
+
+    client.container_remove(&name, true).await.unwrap();
+    assert!(matches!(
+        client.container_inspect(&name).await,
+        Err(PodmanError::NotFound(_))
+    ));
 }
 
 /// libpod reports `RestartCount` in `GET /containers/{name}/json`; `weglarka-core`'s crash-loop detector

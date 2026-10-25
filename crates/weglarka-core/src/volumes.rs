@@ -916,6 +916,7 @@ impl<P: PodmanClient> Reconciler<P> {
             name: name.clone(),
             image,
             command: vec![],
+            entrypoint: None,
             labels: BTreeMap::from([
                 (labels::IMPORT_FOR.to_owned(), instance.to_string()),
                 (labels::UID_RANGE.to_owned(), labels::uid_range_label(range)),

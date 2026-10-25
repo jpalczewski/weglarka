@@ -38,6 +38,10 @@ pub enum Command {
     /// Manage apps (add/update/start/stop/reload/remove/list/show).
     #[command(subcommand)]
     Apps(AppsCommand),
+    /// Run a command once in a fresh container of an app (its image, env, secrets, volumes, configs
+    /// and networks; never its ports or routing) and print the output. For migrations and admin
+    /// commands: `weglarka run <app> -- <command>`.
+    Run(crate::run::RunArgs),
     /// Force an app deploy (pull, container swap, health gate, rollback if needed).
     Deploy(DeployArgs),
     /// Daemon and app status.

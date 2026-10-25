@@ -75,6 +75,7 @@ fn spec(
         name: name.into(),
         image: BUSYBOX.into(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
+        entrypoint: None,
         labels: BTreeMap::new(),
         env: BTreeMap::new(),
         networks: networks.iter().map(|s| (*s).to_owned()).collect(),
