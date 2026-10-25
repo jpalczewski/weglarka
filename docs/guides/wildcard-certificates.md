@@ -14,6 +14,7 @@ accept_terms = true
 provider = "cloudflare"
 token_file = "/var/lib/weglarka/cloudflare-token"   # a 0600 file, absolute path
 wildcards = ["example.com"]                          # apexes: creates *.example.com + example.com
+propagation_secs = 30                                # optional (default 30): wait after publishing the TXT records
 ```
 
 - **Cloudflare token:** create an API token with `Zone → Zone → Read` and `Zone → DNS → Edit` permissions
@@ -47,8 +48,9 @@ wildcards = ["example.com"]                          # apexes: creates *.example
   A missing wildcard before the first pass is a `warn`. `acme.certs` and `ingress.tls` (and `doctor --preflight`)
   treat a domain covered by a wildcard as served.
 - **DNS requirements:** the token must see the zone; the zone's CAA record (if any) must allow the CA (Let's
-  Encrypt: `letsencrypt.org`). The CA queries the authoritative servers itself, so the daemon does not wait for
-  propagation.
+  Encrypt: `letsencrypt.org`). The CA queries the authoritative servers once, and a record it cannot see yet fails the
+  whole order (`NXDOMAIN looking up TXT`). The daemon therefore publishes every TXT record first and waits
+  `propagation_secs` (default 30) before asking the CA to validate; raise it if a provider is slow, `0` disables the wait.
 - **Live test (opt-in):** on a separate development zone; skipped in CI, and the adapter and solver logic is
   tested against a Cloudflare API fake.
 
@@ -56,5 +58,5 @@ wildcards = ["example.com"]                          # apexes: creates *.example
 
 `[acme.dns]` is a new sub-block of the `[acme]` section with `deny_unknown_fields`, so **an older daemon refuses
 to start** until you remove it (the same as `[acme]` in [ACME certificates](acme.md)). Remove `[acme.dns]` and
-restart; issued wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
+restart (this includes `propagation_secs`, which an older daemon does not know); issued wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
 dashboard. `apps.toml`/`state.toml` did not change (no schema version bump).

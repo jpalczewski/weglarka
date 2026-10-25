@@ -167,6 +167,7 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
         client: C,
         provider: P,
         wildcards: &[String],
+        propagation: Duration,
     ) -> Result<Self, AcmeError> {
         let specs = wildcards
             .iter()
@@ -174,7 +175,7 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
             .collect::<Result<Vec<_>, _>>()?;
         let manager = Manager::new(
             client,
-            DnsSolver::new(provider),
+            DnsSolver::new(provider, propagation),
             weglarka_acme::CertStore::new(self.tls.clone()),
             self.renew_before,
         );
@@ -448,7 +449,12 @@ pub fn build<P: weglarka_core::podman::PodmanClient + 'static>(
     if let Some(dns) = &config.dns {
         let backend = dns_backend(dns).map_err(StartError::Acme)?;
         worker = worker
-            .with_dns(client(), backend, &dns.wildcards)
+            .with_dns(
+                client(),
+                backend,
+                &dns.wildcards,
+                Duration::from_secs(dns.propagation_secs),
+            )
             .map_err(|e| StartError::Acme(format!("[acme.dns] {e}")))?;
     }
     Ok(Some(worker))
@@ -561,7 +567,12 @@ mod tests {
         } else {
             let apexes: Vec<String> = wildcards.iter().map(|w| (*w).to_owned()).collect();
             worker
-                .with_dns(fake.clone(), SharedDns(dns.clone()), &apexes)
+                .with_dns(
+                    fake.clone(),
+                    SharedDns(dns.clone()),
+                    &apexes,
+                    Duration::ZERO,
+                )
                 .unwrap()
         };
         Rig {
@@ -776,6 +787,7 @@ mod tests {
             rig.fake.clone(),
             SharedDns(rig.dns.clone()),
             &["Not A Domain".into()],
+            Duration::ZERO,
         );
         assert!(err.is_err());
     }

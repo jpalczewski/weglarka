@@ -556,6 +556,14 @@ pub struct AcmeDnsConfig {
     pub token_file: PathBuf,
     /// Apex domains that get a wildcard certificate, e.g. `["example.eu"]`.
     pub wildcards: Vec<String>,
+    /// Seconds to wait after publishing the TXT records before the CA validates them: Let's Encrypt
+    /// checks once, and a record its resolvers cannot see yet fails the order.
+    #[serde(default = "default_propagation_secs")]
+    pub propagation_secs: u64,
+}
+
+fn default_propagation_secs() -> u64 {
+    30
 }
 
 /// File-stem prefix of a wildcard certificate in the TLS directory: `_wildcard.<apex>.crt|key`

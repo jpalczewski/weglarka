@@ -197,6 +197,8 @@ async fn drive<S: ChallengeSolver>(
         ChallengeKind::Http01 => ChallengeType::Http01,
         ChallengeKind::Dns01 => ChallengeType::Dns01,
     };
+    // Present every challenge first, let the answers settle, and only then ask the CA to validate:
+    // it checks once, so a record that is not visible yet fails the whole order.
     let mut authorizations = order.authorizations();
     while let Some(next) = authorizations.next().await {
         let mut authz = next.map_err(order_err)?;
@@ -205,7 +207,7 @@ async fn drive<S: ChallengeSolver>(
             AuthorizationStatus::Valid => continue,
             other => return Err(AcmeError::Order(format!("authorization is {other:?}"))),
         }
-        let mut handle = authz.challenge(wanted.clone()).ok_or_else(|| {
+        let handle = authz.challenge(wanted.clone()).ok_or_else(|| {
             AcmeError::Order(format!(
                 "the CA offers no {} challenge for this name",
                 solver.kind().as_str()
@@ -218,7 +220,17 @@ async fn drive<S: ChallengeSolver>(
         );
         solver.present(&challenge).await?;
         presented.push(challenge);
-        handle.set_ready().await.map_err(order_err)?;
+    }
+    solver.settle().await;
+    let mut authorizations = order.authorizations();
+    while let Some(next) = authorizations.next().await {
+        let mut authz = next.map_err(order_err)?;
+        if authz.status != AuthorizationStatus::Pending {
+            continue;
+        }
+        if let Some(mut handle) = authz.challenge(wanted.clone()) {
+            handle.set_ready().await.map_err(order_err)?;
+        }
     }
     let policy = RetryPolicy::new().timeout(ORDER_TIMEOUT);
     let status = order.poll_ready(&policy).await.map_err(order_err)?;

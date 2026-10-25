@@ -120,7 +120,9 @@ convention `tls/_wildcard.<apex>.crt|key`.
 - **CT and DNS exposure**: a wildcard hides individual subdomains, but the apex and the zone's existing
   records stay public; the operator documentation says so.
 - **Propagation**: the ACME server queries the authoritative servers itself, so no resolver is needed in the
-  daemon; the solver only retries within the ACME order's own limits.
+  daemon. It validates only once, though, and a provider API answers before its name servers do, so the solver
+  publishes every record, then waits `[acme.dns] propagation_secs` (default 30) before the CA is asked to
+  validate (amended after the first production orders ended `Invalid` with `NXDOMAIN`).
 
 ## Rejected alternatives
 
