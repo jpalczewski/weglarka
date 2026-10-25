@@ -113,7 +113,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # nextest runs every test in its own process, in parallel across binaries; it does not run doc tests,
+      # so those keep their own step (all empty today, but a future doc test must not be skipped silently).
+      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      - run: cargo nextest run --workspace
+      - run: cargo test --workspace --doc
 
   # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-core +
   # weglarka-ingress) and Docker. The debug cache is `check`'s, restored read-only; the example is built once up
