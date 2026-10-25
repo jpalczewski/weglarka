@@ -26,6 +26,7 @@ pub mod service;
 pub mod settings;
 pub mod shared_networks;
 pub mod shared_volumes;
+pub mod sites;
 /// Host-side watchdog of a switch in flight: the automatic fallback of issue #100
 /// (`docs/decisions/0034`).
 pub mod supervise;

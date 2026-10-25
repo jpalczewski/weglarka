@@ -10,6 +10,7 @@ use crate::app::InstanceName;
 use crate::deploy::{DeployOutcome, DigestSource, normalize_image};
 use crate::podman::{PodmanClient, TarStream, image_repo};
 use crate::reconcile::{EngineError, Reconciler};
+use crate::state;
 
 /// Tag a pushed image gets in the app's repository, so that `repo@digest` resolves for every source
 /// (an archive saved by id has no name at all). It moves to the newest push, like any tag.
@@ -88,6 +89,10 @@ impl<P: PodmanClient> Reconciler<P> {
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
         let _g = self.lock.lock().await;
+        // A promote-only environment changes only through `weglarka promote` (issue #205).
+        if state::load_apps(&self.paths.apps)?.is_promote_only(instance) {
+            return Err(EngineError::PromoteOnly(instance.clone()));
+        }
         let outcome = self.deploy_locked_from(instance, false, source).await?;
         // A manual push is the operator's explicit will: retry a known-bad digest, as `apps deploy`.
         if matches!(outcome, DeployOutcome::KnownBad { .. }) {

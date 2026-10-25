@@ -44,6 +44,11 @@ A static site has no process, so the fields that configure one are rejected: `po
 
 A failed deploy leaves the served release untouched and records the digest as failed (`weglarka apps show`).
 
+## A development and a production version
+
+A site that needs both is declared once with environments, and the production one changes only by an explicit
+promotion: see [site environments](site-environments.md).
+
 ## Limits of this release
 
 - Rolling back to the previous release by command, per-site options (404 page, redirects, cache headers) and HTTP

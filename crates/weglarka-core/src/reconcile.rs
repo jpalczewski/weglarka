@@ -94,6 +94,28 @@ pub enum EngineError {
     /// `weglarka push` request that names an image the app may not be deployed from.
     #[error("{0}")]
     PushInvalid(String),
+    /// A tag-sourced deploy (`apps deploy`) of a promote-only environment: its release changes only
+    /// through `weglarka promote` (issue #205).
+    #[error(
+        "{0} is a promote-only environment of a site and never resolves a tag; use `weglarka promote`"
+    )]
+    PromoteOnly(InstanceName),
+    /// `weglarka promote`/`sites` named a site or environment that `apps.toml` does not declare.
+    #[error("unknown site or environment: {0}")]
+    UnknownSite(String),
+    /// `weglarka promote` request that cannot be served (nothing was changed): the operator's fix is
+    /// in the request.
+    #[error("{0}")]
+    PromoteInvalid(String),
+    /// `weglarka promote` blocked by the state of the site (e.g. a digest marked failed).
+    #[error("{0}")]
+    PromoteRefused(String),
+    /// `apps update`/`apps remove` of an instance that is expanded from a site.
+    #[error("{instance} is managed by site {site}; change the site instead (`weglarka sites`)")]
+    ManagedBySite {
+        instance: InstanceName,
+        site: String,
+    },
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
     #[error("app {0} has no running container; use `weglarka apps start {0}`")]
     ReloadNotRunning(InstanceName),
@@ -629,6 +651,7 @@ impl<P: PodmanClient> Reconciler<P> {
     pub async fn upsert_app(&self, name: InstanceName, spec: AppSpec) -> Result<(), EngineError> {
         let _g = self.lock.lock().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
+        crate::promote::ensure_unmanaged(&apps, &name)?;
         apps.apps.insert(name, spec);
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
@@ -708,6 +731,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 let pinned = app_state.and_then(|s| s.current.clone());
                 // A failed first deploy waits for `deploy`, as for containers.
                 let blocked = pinned.is_none() && app_state.is_some_and(|s| s.failed.is_some());
+                // A promote-only environment waits for its first promotion: reconcile never
+                // resolves a tag for it (issue #205). Not reported as blocked — that would warn on
+                // every pass; `doctor` carries the signal.
+                let awaiting = pinned.is_none() && apps.is_promote_only(name);
                 if blocked {
                     report.blocked.push((
                         name.clone(),
@@ -718,7 +745,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     instance: name.clone(),
                     pinned,
                     expected_hash: None,
-                    blocked,
+                    blocked: blocked || awaiting,
                     uid_range: None,
                     start: true,
                     depends_on: Vec::new(),

@@ -164,6 +164,37 @@ pub const SHARED_NETWORKS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/networks/{network}",
 };
+/// `GET` → [`ListSitesResponse`](crate::ListSitesResponse): sites with their environments and the
+/// digest each serves (issue #205).
+pub const SITES_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/sites",
+};
+/// `GET` → [`SiteSummary`](crate::SiteSummary).
+pub const SITES_SHOW: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/sites/{site}",
+};
+/// `PUT` [`DeclareSiteRequest`](crate::DeclareSiteRequest) → 204. Declares or replaces a site; its
+/// environments become the instances `<site>-<env>`. An instance name taken by `[apps]` or another
+/// site is a 400.
+pub const SITES_DECLARE: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/sites/{site}",
+};
+/// `DELETE` → 204. Query [`RemoveSiteQuery`](crate::RemoveSiteQuery): refused (409) while an
+/// environment serves a release unless `?purge=true`.
+pub const SITES_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
+    path: "/v1/sites/{site}",
+};
+/// `POST` [`PromoteRequest`](crate::PromoteRequest) → [`PromoteResponse`](crate::PromoteResponse).
+/// Deploys the digest of the environment's `promote_from` source (or an explicit one, or the
+/// previous one) without pulling it again (issue #205, docs/decisions/0050).
+pub const SITES_PROMOTE: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/sites/{site}/envs/{env}/promote",
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -214,6 +245,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SHARED_NETWORKS_LIST,
     SHARED_NETWORKS_DECLARE,
     SHARED_NETWORKS_REMOVE,
+    SITES_LIST,
+    SITES_SHOW,
+    SITES_DECLARE,
+    SITES_REMOVE,
+    SITES_PROMOTE,
     DOCTOR,
     IMAGES_PRUNE,
     NOTIFICATIONS_STATUS,

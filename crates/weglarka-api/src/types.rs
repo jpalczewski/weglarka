@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
+use weglarka_core::environments::{EnvName, SiteName, SiteSpec};
 use weglarka_core::events::Severity;
 use weglarka_core::state::AppState;
 use weglarka_core::uid_range::UidRange;
@@ -62,6 +63,9 @@ pub struct AppSummary {
     pub runtime: RuntimeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest>,
+    /// `<site>/<env>` when the instance is expanded from a site (issue #205).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +260,79 @@ pub struct SharedNetworkSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSharedNetworksResponse {
     pub networks: Vec<SharedNetworkSummary>,
+}
+
+/// One environment of a site as the daemon sees it (issue #205).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteEnvSummary {
+    pub env: EnvName,
+    /// The instance the environment expands into (`<site>-<env>`).
+    pub instance: InstanceName,
+    /// Tag the environment follows (`track` environments).
+    pub track: Option<String>,
+    /// Environment it receives digests from (promote-only environments).
+    pub promote_from: Option<EnvName>,
+    pub domains: Vec<String>,
+    /// Digest being served; `None` before the first release.
+    pub current: Option<Digest>,
+    pub previous: Option<Digest>,
+}
+
+/// A site with its environments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteSummary {
+    pub name: SiteName,
+    pub image: String,
+    pub envs: Vec<SiteEnvSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSitesResponse {
+    pub sites: Vec<SiteSummary>,
+}
+
+/// `PUT /v1/sites/{site}`: the declaration (replaces an existing site of that name).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclareSiteRequest {
+    pub spec: SiteSpec,
+}
+
+/// Query of `DELETE /v1/sites/{site}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveSiteQuery {
+    /// Also forget the state of environments that still serve a release.
+    #[serde(default)]
+    pub purge: bool,
+}
+
+/// `POST /v1/sites/{site}/envs/{env}/promote`. With neither field set, the source environment's
+/// current digest is promoted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteRequest {
+    /// Promote this digest of the site's repository instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Digest>,
+    /// Return to the environment's previous digest.
+    #[serde(default)]
+    pub rollback: bool,
+    /// Report what would happen; change nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What a promotion did or, for a dry run, would do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteResponse {
+    pub instance: InstanceName,
+    /// Environment instance the digest comes from; `None` for a rollback.
+    pub source: Option<InstanceName>,
+    pub source_current: Option<Digest>,
+    pub target_current: Option<Digest>,
+    pub target_previous: Option<Digest>,
+    /// The digest the environment serves after the promotion.
+    pub digest: Digest,
+    /// `None` for a dry run.
+    pub deploy: Option<DeployResponse>,
 }
 
 /// `POST /v1/images/prune` (issue #40): remove images older than each app's current and previous one.

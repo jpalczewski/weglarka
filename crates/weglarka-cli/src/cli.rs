@@ -65,6 +65,12 @@ pub enum Command {
     /// other.
     #[command(subcommand)]
     Networks(crate::networks::NetworksCommand),
+    /// Sites with environments: list, show, declare and remove (a development and a production
+    /// version of one static site).
+    #[command(subcommand)]
+    Sites(crate::sites::SitesCommand),
+    /// Promote the digest one environment of a site runs into another: `weglarka promote blog prod`.
+    Promote(crate::sites::PromoteArgs),
     /// Local images: remove the ones older than each app's current and previous image.
     #[command(subcommand)]
     Images(ImagesCommand),

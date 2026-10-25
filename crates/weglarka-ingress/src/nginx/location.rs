@@ -17,6 +17,8 @@ enum Backend<'a> {
     Directory {
         root: &'a str,
     },
+    /// A static site that has no release yet: the route is reserved but answers 503.
+    Unreleased,
 }
 
 /// One `location` block of an app, before its directives are rendered. Extra locations of an app
@@ -119,9 +121,16 @@ impl Backend<'_> {
             if let Some(app) = location.app {
                 set_app(c, app);
             }
-            if let Backend::Directory { root } = self {
-                write_directory(c, root, location.strip.as_ref());
-                return;
+            match self {
+                Backend::Directory { root } => {
+                    write_directory(c, root, location.strip.as_ref());
+                    return;
+                }
+                Backend::Unreleased => {
+                    c.line("return 503;");
+                    return;
+                }
+                Backend::Container { .. } => {}
             }
             self.write_upstream(c, location.strip.as_ref());
             write_body_limit(c, ingress);
@@ -143,7 +152,9 @@ impl Backend<'_> {
                 }
                 c.line("proxy_pass $upstream;");
             }
-            Backend::Directory { .. } => unreachable!("a directory is rendered by write_directory"),
+            Backend::Directory { .. } | Backend::Unreleased => {
+                unreachable!("a static site is rendered by write_location")
+            }
         }
     }
 }
@@ -215,9 +226,12 @@ pub(super) fn write_app_locations(
                 host: app.instance.as_str(),
                 port: *port,
             },
+            RouteBackend::Directory { .. } if o.unreleased.contains(app.instance) => {
+                Backend::Unreleased
+            }
             RouteBackend::Directory { root } => Backend::Directory { root },
         };
-        let directory = matches!(backend, Backend::Directory { .. });
+        let directory = matches!(backend, Backend::Directory { .. } | Backend::Unreleased);
         let name = shared.then(|| app.instance.as_str());
         for location in path_locations(&app.ingress, path, name, directory) {
             backend.write_location(c, &location, &app.ingress);

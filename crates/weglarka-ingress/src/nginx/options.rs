@@ -1,7 +1,9 @@
 //! [`NginxOptions`]: generator settings and their validation.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 
+use weglarka_core::app::InstanceName;
 use weglarka_core::config::{IngressMode, wildcard_cert_stem, wildcard_covers};
 
 use super::{ACME_CONTAINER_DIR, CERT_CONTAINER_DIR};
@@ -53,6 +55,10 @@ pub struct NginxOptions {
     /// docs/decisions/0044). Requires [`Self::proxy_socket_dir`]: only then `$remote_addr` is the
     /// real peer the ranges can be compared with.
     pub cdn: Option<CdnTrust>,
+    /// Static sites without a release yet (a first deploy has not happened, or a promote-only
+    /// environment has not been promoted into, issue #205): their routes answer `503` instead of a
+    /// missing `current` directory.
+    pub unreleased: BTreeSet<InstanceName>,
 }
 
 impl NginxOptions {
@@ -86,6 +92,7 @@ impl NginxOptions {
             tls_fingerprint: None,
             proxy_socket_dir: None,
             cdn: None,
+            unreleased: BTreeSet::new(),
         }
     }
 

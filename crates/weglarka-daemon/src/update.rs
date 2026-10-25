@@ -65,6 +65,12 @@ pub async fn update_app<P: PodmanClient + 'static>(
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
         let mut apps = state::load_apps(&d.paths.state.apps).map_err(internal)?;
+        if let Some(origin) = apps.origin(&name) {
+            return Err(Fail::from(EngineError::ManagedBySite {
+                instance: name.clone(),
+                site: origin.site.to_string(),
+            }));
+        }
         let old = apps
             .apps
             .insert(name.clone(), req.spec.clone())
