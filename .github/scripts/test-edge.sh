@@ -305,6 +305,14 @@ case $out in
   *) echo "FAIL unknown Host on plain HTTP: got '$out', expected 444 or a dropped connection"; fail=1 ;;
 esac
 
+# Requests that reach no app server (the 444 above, the rejected handshakes) must not make nginx warn
+# about an uninitialized `$app` (issue #182).
+if docker logs wg-edge-nginx 2>&1 | grep -qF 'uninitialized "app" variable'; then
+  echo 'FAIL catch-all: nginx warned about an uninitialized "app" variable'; fail=1
+else
+  echo 'ok   catch-all: no uninitialized "app" warning'
+fi
+
 # ── Optional: HTTP/2 advertised on the TLS listener ──────────────────────────
 
 h2=$(curl -sS -k -o /dev/null -w '%{http_version}' --max-time 10 \

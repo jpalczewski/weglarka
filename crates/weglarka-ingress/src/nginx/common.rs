@@ -74,17 +74,37 @@ pub(super) fn write_upgrade_map(c: &mut Conf) {
     });
 }
 
-pub(super) fn write_log(c: &mut Conf, cdn: bool) {
-    c.line("# App name for the access log; set in each `server`.");
+/// `$app` for requests that never reach a `set $app` (catch-all servers, and requests nginx rejects
+/// with 400 before the rewrite phase). A `map` variable is changeable, so the `set $app` in the
+/// `server`/`location` blocks still wins where it runs.
+fn write_app_default(c: &mut Conf) {
+    c.block("map \"\" $app", |c| c.line("default \"-\";"));
+}
+
+/// The connection's peer address in `edge` behind the forwarder. `$remote_addr` is replaced from the
+/// PROXY header only when the request is processed (`realip` runs after the headers are parsed), so a
+/// request nginx rejects earlier still has `unix:`; the PROXY header itself is available from the start.
+pub(super) fn write_peer_address(c: &mut Conf) {
+    c.block("map $remote_addr $weglarka_peer", |c| {
+        c.line("\"unix:\" $proxy_protocol_addr;");
+        c.line("default $remote_addr;");
+    });
+}
+
+/// `peer` is the variable holding the connection's address (`$remote_addr`, or
+/// [`write_peer_address`]'s).
+pub(super) fn write_log(c: &mut Conf, cdn: bool, peer: &str) {
+    c.line("# App name for the access log; `-` unless a `server`/`location` sets it.");
+    write_app_default(c);
     c.line("log_format weglarka escape=json");
     // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
     let format = if cdn {
         LOG_FORMAT.replace(
             "\"remote_addr\":\"$remote_addr\"",
-            "\"remote_addr\":\"$weglarka_client\",\"peer\":\"$remote_addr\"",
+            &format!("\"remote_addr\":\"$weglarka_client\",\"peer\":\"{peer}\""),
         )
     } else {
-        LOG_FORMAT.to_owned()
+        LOG_FORMAT.replace("$remote_addr", peer)
     };
     c.line(&format!("    '{format}';"));
     c.line("access_log /dev/stdout weglarka;");
