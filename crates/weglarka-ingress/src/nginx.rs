@@ -32,6 +32,7 @@ use std::net::IpAddr;
 use weglarka_core::app::{AppIngress, AppSpec, InstanceName};
 use weglarka_core::config::{HostConfig, IngressMode, wildcard_cert_stem, wildcard_covers};
 
+use crate::cdn::CdnTrust;
 use crate::plan::{AppRoute, Cidr, Domain, IngressError, PathPrefix, Plan, WEBHOOK_UPSTREAM_HOST};
 
 /// Container directory with the TLS material (`<nginx_conf_dir>/tls`): `<domain>.crt` (PEM chain,
@@ -87,6 +88,10 @@ pub struct NginxOptions {
     /// in the PROXY header becomes `$remote_addr`. `None` = TCP listeners only (nginx's own address is
     /// then what a published port shows as the client).
     pub proxy_socket_dir: Option<String>,
+    /// `edge`: the peers that are a CDN and announce the visitor in a header (issue #159,
+    /// docs/decisions/0044). Requires [`Self::proxy_socket_dir`]: only then `$remote_addr` is the
+    /// real peer the ranges can be compared with.
+    pub cdn: Option<CdnTrust>,
 }
 
 impl NginxOptions {
@@ -119,6 +124,7 @@ impl NginxOptions {
             acme_webroot: ACME_CONTAINER_DIR.to_owned(),
             tls_fingerprint: None,
             proxy_socket_dir: None,
+            cdn: None,
         }
     }
 
@@ -173,6 +179,12 @@ impl NginxOptions {
                         "is an `edge`-mode option (Traefik is the client-facing hop in `behind`)",
                     ));
                 }
+                if self.cdn.is_some() {
+                    return Err(bad(
+                        "cdn",
+                        "is an `edge`-mode option (Traefik is the client-facing hop in `behind`)",
+                    ));
+                }
                 if self.trusted_proxies.is_empty() {
                     return Err(bad(
                         "trusted_proxies",
@@ -192,6 +204,14 @@ impl NginxOptions {
                 check_container_dir("acme_webroot", &self.acme_webroot)?;
                 if let Some(dir) = &self.proxy_socket_dir {
                     check_container_dir("proxy_socket_dir", dir)?;
+                }
+                if self.cdn.is_some() && self.proxy_socket_dir.is_none() {
+                    // Without the forwarder `$remote_addr` is nginx's own address, so the CDN ranges
+                    // would be compared with the wrong peer (an invariant: `edge` always sets it).
+                    return Err(bad(
+                        "cdn",
+                        "requires proxy_socket_dir (the real peer address)",
+                    ));
                 }
                 if self.cert_dir == self.acme_webroot {
                     return Err(bad("cert_dir", "must differ from acme_webroot"));
@@ -250,19 +270,31 @@ fn is_tls_fingerprint(value: &str) -> bool {
 /// The three expressions the shared proxy headers are built from. `behind` reuses the trust maps
 /// (ADR 0007/0032); `edge` has no trusted peer, so the values are nginx's own.
 struct Forwarded {
+    real_ip: &'static str,
     xff: &'static str,
     proto: &'static str,
     fwd_host: &'static str,
 }
 
 const BEHIND_FORWARDED: Forwarded = Forwarded {
+    real_ip: "$remote_addr",
     xff: "$weglarka_xff",
     proto: "$weglarka_proto",
     fwd_host: "$weglarka_fwd_host",
 };
 
 const EDGE_FORWARDED: Forwarded = Forwarded {
+    real_ip: "$remote_addr",
     xff: "$remote_addr",
+    proto: "$scheme",
+    fwd_host: "$host",
+};
+
+/// `edge` behind a CDN: the client address is the one `$weglarka_client` resolves (see
+/// [`write_cdn_client`]); proto and host stay nginx's own.
+const EDGE_CDN_FORWARDED: Forwarded = Forwarded {
+    real_ip: "$weglarka_client",
+    xff: "$weglarka_client",
     proto: "$scheme",
     fwd_host: "$host",
 };
@@ -429,17 +461,29 @@ fn write_upgrade_map(c: &mut Conf) {
     });
 }
 
-fn write_log(c: &mut Conf) {
+fn write_log(c: &mut Conf, cdn: bool) {
     c.line("# App name for the access log; set in each `server`.");
     c.line("log_format weglarka escape=json");
-    c.line(&format!("    '{LOG_FORMAT}';"));
+    // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
+    let format = if cdn {
+        LOG_FORMAT.replace(
+            "\"remote_addr\":\"$remote_addr\"",
+            "\"remote_addr\":\"$weglarka_client\",\"peer\":\"$remote_addr\"",
+        )
+    } else {
+        LOG_FORMAT.to_owned()
+    };
+    c.line(&format!("    '{format}';"));
     c.line("access_log /dev/stdout weglarka;");
 }
 
 fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded) {
     c.line("proxy_http_version 1.1;");
     c.line("proxy_set_header Host $host;");
-    c.line("proxy_set_header X-Real-IP $remote_addr;");
+    c.line(&format!(
+        "proxy_set_header X-Real-IP {};",
+        forwarded.real_ip
+    ));
     c.line(&format!(
         "proxy_set_header X-Forwarded-For {};",
         forwarded.xff
@@ -565,7 +609,7 @@ fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(c);
+        write_log(c, false);
         c.blank();
         write_proxy_headers(c, &BEHIND_FORWARDED);
         c.blank();
@@ -633,12 +677,12 @@ fn behind_prelude(c: &mut Conf, o: &NginxOptions) {
     c.line("real_ip_recursive on;");
     c.blank();
     // We honor `X-Forwarded-Proto` only from a trusted peer (Traefik terminates TLS).
-    c.block("geo $realip_remote_addr $weglarka_trusted", |c| {
-        c.line("default 0;");
-        for net in &o.trusted_proxies {
-            c.line(&format!("{net} 1;"));
-        }
-    });
+    write_trusted_peers(
+        c,
+        "$realip_remote_addr",
+        "$weglarka_trusted",
+        &o.trusted_proxies,
+    );
     c.block(
         "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_proto",
         |c| {
@@ -679,6 +723,39 @@ fn behind_prelude(c: &mut Conf, o: &NginxOptions) {
     );
 }
 
+/// `geo <address> <variable>` that is `1` for an address inside `peers` and `0` otherwise: the
+/// trust decision of `behind` (`$realip_remote_addr`) and of `edge` behind a CDN (`$remote_addr`).
+fn write_trusted_peers(c: &mut Conf, address: &str, variable: &str, peers: &[Cidr]) {
+    c.block(&format!("geo {address} {variable}"), |c| {
+        c.line("default 0;");
+        for net in peers {
+            c.line(&format!("{net} 1;"));
+        }
+    });
+}
+
+/// The visitor's address behind a CDN (issue #159): the CDN header for a peer inside the ranges,
+/// `$remote_addr` for everyone else, and also for a CDN peer whose header is missing or not an IP
+/// literal (the edge address, never empty). `X-Forwarded-For` is never read: a CDN appends to it,
+/// so its prefix is client-controlled. The regex runs only for CDN peers.
+fn write_cdn_client(c: &mut Conf, cdn: &CdnTrust) {
+    c.line(&format!(
+        "# CDN peers ({}): only they may announce the visitor.",
+        cdn.source_label()
+    ));
+    write_trusted_peers(c, "$remote_addr", "$weglarka_cdn", &cdn.ranges);
+    c.block(
+        &format!(
+            "map \"$weglarka_cdn:{}\" $weglarka_client",
+            cdn.header_variable
+        ),
+        |c| {
+            c.line("default $remote_addr;");
+            c.line("\"~^1:(?<ip>[0-9A-Fa-f.:]{3,45})$\" $ip;");
+        },
+    );
+}
+
 /// `edge` (issue #95, docs/decisions/0036): nginx terminates TLS. The plain-HTTP listener only
 /// redirects (ACME token requests excepted); the TLS listener has one `server` per domain, because
 /// nginx picks the server — and therefore the certificate — by SNI.
@@ -698,7 +775,7 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_upgrade_map(c);
         c.blank();
-        write_log(c);
+        write_log(c, o.cdn.is_some());
         c.blank();
         // No `real_ip` and no trust maps: a direct client is never trusted for `X-Forwarded-*`
         // (ADR 0007). The headers are rebuilt from nginx's own `$remote_addr`/`$scheme`/`$host`.
@@ -708,7 +785,14 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.line("real_ip_header proxy_protocol;");
             c.blank();
         }
-        write_proxy_headers(c, &EDGE_FORWARDED);
+        let forwarded = if let Some(cdn) = &o.cdn {
+            write_cdn_client(c, cdn);
+            c.blank();
+            &EDGE_CDN_FORWARDED
+        } else {
+            &EDGE_FORWARDED
+        };
+        write_proxy_headers(c, forwarded);
         c.blank();
 
         write_default_server(c, o);

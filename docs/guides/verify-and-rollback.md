@@ -60,6 +60,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[webhook.forgejo]` | [webhooks](webhooks.md) |
 | `weglarka.toml` | `[acme]` (or set `enabled = false` before rolling back to a release that knows it) | [ACME certificates](acme.md) |
 | `weglarka.toml` | `[acme.dns]` | [wildcard certificates](wildcard-certificates.md) |
+| `weglarka.toml` | `[ingress.cdn]` | [edge behind a CDN](edge-cdn.md) |
 | `weglarka.toml`, edge mode | set `mode = "behind"`, remove `https_bind`, restore `traefik_dynamic_file` | [edge mode](edge-mode.md) |
 
 Notes:
@@ -68,6 +69,6 @@ Notes:
   alternatively be handled by restoring both files from the backup taken before the upgrade — see
   [state schema version](state-schema.md).
 - `weglarka.toml` sections that are not part of the state schema (`[notify]`, `[monitor]`, `[self_update]`,
-  `[acme]`, `[acme.dns]`, `[webhook.forgejo]`) are not covered by `schema_version`; they always have to be removed by hand.
+  `[acme]`, `[acme.dns]`, `[ingress.cdn]`, `[webhook.forgejo]`) are not covered by `schema_version`; they always have to be removed by hand.
 - Settings that need no action: webhook delivery dedup (`webhook-deliveries.toml`) is ignored by an older daemon,
   and `weglarka run` ([one-off commands](one-off-commands.md)) writes no state.

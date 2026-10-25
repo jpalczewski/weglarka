@@ -323,6 +323,7 @@ impl<P: PodmanClient> IngressManager<P> {
             options.wildcard_certificates = r.wildcards.to_vec();
             options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
             options.proxy_socket_dir = Some(SOCKET_CONTAINER_DIR.to_owned());
+            options.cdn = cdn_trust(&self.host)?;
         }
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
@@ -1047,6 +1048,17 @@ pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyErr
     file.write_all(bytes).map_err(io_err(path))?;
     file.sync_all().map_err(io_err(path))?;
     Ok(true)
+}
+
+/// `[ingress.cdn]` as the generator's trust: the pinned ranges, else the provider's bundled list.
+pub(crate) fn cdn_trust(
+    host: &weglarka_core::config::HostConfig,
+) -> Result<Option<weglarka_ingress::CdnTrust>, weglarka_ingress::IngressError> {
+    host.ingress
+        .cdn
+        .as_ref()
+        .map(|cdn| weglarka_ingress::CdnTrust::from_config(cdn.provider, &cdn.ranges))
+        .transpose()
 }
 
 #[cfg(test)]
