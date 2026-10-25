@@ -238,6 +238,10 @@ pub struct ReconcilerOptions {
     pub host_mounts: Vec<PathBuf>,
     /// Allowlist for apps' `group_add` (`[runtime] group_add`, issue #178).
     pub group_add: Vec<String>,
+    /// How long a blue-green switch keeps the old container serving after the new one joined the app
+    /// network: at least the ingress resolver's cache lifetime, so no request still resolves to a
+    /// container that is about to stop (ADR 0046).
+    pub switch_drain: Duration,
 }
 
 impl Default for ReconcilerOptions {
@@ -249,6 +253,7 @@ impl Default for ReconcilerOptions {
             config_root: None,
             host_mounts: Vec::new(),
             group_add: Vec::new(),
+            switch_drain: Duration::from_secs(3),
         }
     }
 }
@@ -336,7 +341,18 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
         let main_name = labels::container_name(&t.instance);
         let main = own.and_then(|cs| cs.iter().find(|c| c.name == main_name));
         // Duplicates with our label but a different name are removed regardless of `blocked`.
-        for c in own.into_iter().flatten().filter(|c| c.name != main_name) {
+        // The challenger and the retiring container of a blue-green switch (ADR 0046) carry the
+        // instance label on purpose and live only inside a deploy, which holds the engine lock; a
+        // leftover of a crashed deploy is swept by the instance's next blue-green deploy.
+        let transient = [
+            labels::challenger_name(&t.instance),
+            labels::retiring_name(&t.instance),
+        ];
+        for c in own
+            .into_iter()
+            .flatten()
+            .filter(|c| c.name != main_name && !transient.contains(&c.name))
+        {
             actions.push(Action::Remove {
                 container: c.name.clone(),
             });

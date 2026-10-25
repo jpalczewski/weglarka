@@ -40,7 +40,7 @@ address (see [edge CDN](edge-cdn.md) for the address behind Cloudflare). Do not 
 
 ## Rollback
 
-This is a state-file schema change (version 9): `apps.toml` and `state.toml` get `schema_version = 9` on the
+This is a state-file schema change (version 10): `apps.toml` and `state.toml` get `schema_version = 10` on the
 first write after the update. Before a downgrade, remove `ingress.access_log_skip_paths` from the apps
 (`weglarka apps update <app> --remove-access-log-skip-path <path>`) or restore the files **from a backup taken
 before the update** (see [state schema](state-schema.md)).

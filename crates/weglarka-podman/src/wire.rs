@@ -845,6 +845,9 @@ impl InspectNetwork {
 #[derive(Serialize)]
 pub(crate) struct ConnectNetwork<'a> {
     pub(crate) container: &'a str,
+    /// Extra DNS names on the network; left out of the body when empty.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(crate) aliases: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -1208,6 +1211,26 @@ mod tests {
         assert_eq!(info.subuid_pool(), 1_000_000);
         // Rootful or unknown layout: no pool rather than a guess.
         assert_eq!(decode::<Info>(b"{}").unwrap().subuid_pool(), 0);
+    }
+
+    #[test]
+    fn network_connect_sends_aliases_only_when_there_are_some() {
+        let plain = serde_json::to_value(ConnectNetwork {
+            container: "web",
+            aliases: &[],
+        })
+        .unwrap();
+        assert_eq!(plain, serde_json::json!({ "container": "web" }));
+        let aliases = ["app".to_owned()];
+        let aliased = serde_json::to_value(ConnectNetwork {
+            container: "web.next",
+            aliases: &aliases,
+        })
+        .unwrap();
+        assert_eq!(
+            aliased,
+            serde_json::json!({ "container": "web.next", "aliases": ["app"] })
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ http {
     uwsgi_temp_path /tmp/uwsgi;
     scgi_temp_path /tmp/scgi;
 
-    resolver 10.89.0.1 valid=5s ipv6=off;
+    resolver 10.89.0.1 valid=1s ipv6=off;
     resolver_timeout 2s;
 
     ssl_protocols TLSv1.2 TLSv1.3;

@@ -963,6 +963,28 @@ pub struct AppSpec {
     /// Part of the spec hash only when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_add: Vec<String>,
+    /// How a deploy replaces the running container (issue #39, `docs/decisions/0046-blue-green-deploy.md`).
+    /// Not part of the spec hash: it decides how a container is swapped, never what it is made of.
+    #[serde(default, skip_serializing_if = "Strategy::is_default")]
+    pub strategy: Strategy,
+}
+
+/// Deploy strategy of an app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    /// Stop and remove the old container, then start the new one (a short outage per deploy).
+    #[default]
+    Recreate,
+    /// Start the new container next to the old one, move traffic after its health gate, then stop the
+    /// old one. Stateless apps only (no read-write volumes, no host ports); costs 2x memory meanwhile.
+    BlueGreen,
+}
+
+impl Strategy {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Recreate
+    }
 }
 
 fn default_true() -> bool {

@@ -62,6 +62,14 @@ pub enum ReloadSignalFlag {
     Clear,
 }
 
+/// Value of [`SpecFlags::strategy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StrategyFlag {
+    Recreate,
+    #[value(name = "blue_green", alias = "blue-green")]
+    BlueGreen,
+}
+
 /// Value of [`SpecFlags::shared_network`]: join a declared shared network (with optional extra DNS
 /// aliases), or `none` to leave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +124,11 @@ pub struct SpecFlags {
     /// `apps reload` restarts the container instead. Not part of the spec hash.
     #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
     pub reload_signal: Option<ReloadSignalFlag>,
+    /// How a deploy replaces the container: `recreate` (stop, then start; a short outage) or
+    /// `blue_green` (start the new container next to the old one, switch after its health gate; stateless
+    /// apps only, needs a container healthcheck, ADR 0046). Not part of the spec hash.
+    #[arg(long, value_enum, conflicts_with = "spec")]
+    pub strategy: Option<StrategyFlag>,
     /// Join a shared network: NAME[:ALIAS,ALIAS] (`none` leaves it). Members of one network reach
     /// each other by instance name (plus the aliases) on every port; a network membership replaces
     /// the previous one. The network must be declared first (`weglarka networks add NAME`).
@@ -161,6 +174,7 @@ impl SpecFlags {
             && self.host_mounts.is_empty()
             && self.group_add.is_empty()
             && self.reload_signal.is_none()
+            && self.strategy.is_none()
             && self.shared_network.is_none()
             && !self.hardened
             && self.read_only.is_none()
@@ -219,6 +233,13 @@ impl SpecFlags {
         match &self.reload_signal {
             Some(ReloadSignalFlag::Set(signal)) => spec.reload_signal = Some(signal.clone()),
             Some(ReloadSignalFlag::Clear) => spec.reload_signal = None,
+            None => {}
+        }
+        match self.strategy {
+            Some(StrategyFlag::Recreate) => spec.strategy = weglarka_core::app::Strategy::Recreate,
+            Some(StrategyFlag::BlueGreen) => {
+                spec.strategy = weglarka_core::app::Strategy::BlueGreen
+            }
             None => {}
         }
         match &self.shared_network {
