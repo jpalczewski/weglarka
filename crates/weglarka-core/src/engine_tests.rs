@@ -3485,3 +3485,253 @@ domains = ["blog.example.com"]
         assert!(matches!(err, EngineError::Site(_)), "{err:?}");
     }
 }
+
+/// Sites with environments (issue #205): `track` environments follow the webhook, promote-only ones
+/// change only through `promote`.
+mod environments {
+    use super::*;
+    use crate::environments::{EnvName, SiteName};
+    use crate::promote::PromoteSource;
+
+    const SITES: &str = r#"
+[sites.blog]
+kind = "static"
+image = "registry.example.com/me/blog"
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+"#;
+    const DEV_IMAGE: &str = "registry.example.com/me/blog:main";
+
+    fn archive(body: &str) -> Vec<u8> {
+        fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut b = tar::Builder::new(Vec::new());
+            for (path, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, *data).unwrap();
+            }
+            b.into_inner().unwrap()
+        }
+        tar_of(&[
+            (
+                "manifest.json",
+                br#"[{"Config":"c.json","Layers":["l/layer.tar"]}]"#,
+            ),
+            ("l/layer.tar", &tar_of(&[("index.html", body.as_bytes())])),
+        ])
+    }
+
+    fn harness() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::build(
+            SITES,
+            ReconcilerOptions {
+                sites_root: Some(dir.path().join("sites")),
+                ..Default::default()
+            },
+            crash::Policy::disabled(),
+        );
+        drop(dir);
+        h
+    }
+
+    fn publish(h: &Harness, d: char, body: &str) {
+        h.fake.set_pull_digest(DEV_IMAGE, digest(d));
+        h.fake.script_image_archive(&digest(d), archive(body));
+    }
+
+    fn site() -> SiteName {
+        SiteName::new("blog").unwrap()
+    }
+
+    fn env(e: &str) -> EnvName {
+        EnvName::new(e).unwrap()
+    }
+
+    fn served(h: &Harness, instance: &str) -> String {
+        let root = h.rec.options.sites_root.clone().unwrap();
+        std::fs::read_to_string(root.join(instance).join("current/index.html")).unwrap()
+    }
+
+    fn pulls(h: &Harness) -> usize {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ImagePull(_)))
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_and_the_webhook_deploy_only_the_tracking_environment() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        let report = h.rec.reconcile().await.unwrap();
+        // Only `blog-dev` is planned; the promote-only environment waits and is not "blocked".
+        assert_eq!(report.actions.len(), 1, "{:?}", report.actions);
+        assert!(report.blocked.is_empty(), "{:?}", report.blocked);
+        assert_eq!(served(&h, "blog-dev"), "one");
+        assert_eq!(h.state("blog-prod").current, None);
+
+        publish(&h, 'b', "two");
+        let ev = WebhookEvent {
+            delivery_id: Some("d-1".into()),
+            image_ref: DEV_IMAGE.into(),
+        };
+        let out = h.rec.handle_webhook(&ev).await.unwrap();
+        assert_eq!(out.matched, vec![name("blog-dev")]);
+        assert_eq!(h.state("blog-prod").current, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apps_deploy_of_a_promote_only_environment_is_refused() {
+        let h = harness();
+        let err = h.rec.deploy(&name("blog-prod"), false).await.unwrap_err();
+        assert!(matches!(err, EngineError::PromoteOnly(_)), "{err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promote_serves_the_sources_digest_without_a_pull() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        let pulled = pulls(&h);
+
+        let dry = h
+            .rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, true)
+            .await
+            .unwrap();
+        assert_eq!(dry.plan.digest, digest('a'));
+        assert!(dry.outcome.is_none());
+        assert_eq!(h.state("blog-prod").current, None);
+
+        let report = h
+            .rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.outcome,
+            Some(DeployOutcome::Deployed { .. })
+        ));
+        assert_eq!(served(&h, "blog-prod"), "one");
+        assert_eq!(h.state("blog-prod").current, Some(digest('a')));
+        assert_eq!(pulls(&h), pulled, "promotion must not pull");
+        // Reconcile leaves the promoted environment alone.
+        assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_moves_on_while_prod_stays_until_promoted_and_rollback_returns() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        publish(&h, 'b', "two");
+        h.rec.deploy(&name("blog-dev"), false).await.unwrap();
+        assert_eq!(served(&h, "blog-dev"), "two");
+        assert_eq!(served(&h, "blog-prod"), "one");
+
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        assert_eq!(served(&h, "blog-prod"), "two");
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::Rollback, false)
+            .await
+            .unwrap();
+        assert_eq!(served(&h, "blog-prod"), "one");
+        assert_eq!(h.state("blog-prod").current, Some(digest('a')));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_digest_that_failed_in_the_source_cannot_be_promoted() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        // A release without index.html fails in dev and is marked `failed` there.
+        h.fake.set_pull_digest(DEV_IMAGE, digest('b'));
+        let bad = {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "about.html", &b""[..]).unwrap();
+            b.into_inner().unwrap()
+        };
+        let archive = {
+            let mut b = tar::Builder::new(Vec::new());
+            for (path, data) in [
+                (
+                    "manifest.json",
+                    &br#"[{"Config":"c.json","Layers":["l/layer.tar"]}]"#[..],
+                ),
+                ("l/layer.tar", &bad[..]),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, data).unwrap();
+            }
+            b.into_inner().unwrap()
+        };
+        h.fake.script_image_archive(&digest('b'), archive);
+        h.rec.deploy(&name("blog-dev"), false).await.unwrap();
+        let err = h
+            .rec
+            .promote(
+                &site(),
+                &env("prod"),
+                PromoteSource::Digest(digest('b')),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PromoteRefused(_)), "{err:?}");
+        assert_eq!(h.state("blog-prod").current, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promote_rejects_unknown_tracking_and_empty_sources() {
+        let h = harness();
+        let e = h
+            .rec
+            .promote(&site(), &env("dev"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, EngineError::PromoteInvalid(_)), "{e:?}");
+        let e = h
+            .rec
+            .promote(&site(), &env("nope"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, EngineError::UnknownSite(_)), "{e:?}");
+        // dev has no release yet.
+        let e = h
+            .rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, EngineError::PromoteInvalid(_)), "{e:?}");
+        let e = h
+            .rec
+            .promote(&site(), &env("prod"), PromoteSource::Rollback, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, EngineError::PromoteInvalid(_)), "{e:?}");
+    }
+}

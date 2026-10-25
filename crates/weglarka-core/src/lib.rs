@@ -31,6 +31,7 @@ pub mod forward;
 pub mod host_mounts;
 pub mod images;
 pub mod limits;
+pub mod promote;
 pub mod push;
 pub mod reconcile;
 pub mod run;

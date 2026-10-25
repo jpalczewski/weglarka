@@ -817,7 +817,16 @@ impl<P: PodmanClient> Reconciler<P> {
         force: bool,
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
-        let spec = self.load_spec(instance)?;
+        let mut apps = state::load_apps(&self.paths.apps)?;
+        // A promote-only environment never resolves a tag (issue #205): this covers `apps deploy`
+        // and a stray reconcile action alike.
+        if matches!(source, DigestSource::Tag) && apps.is_promote_only(instance) {
+            return Err(EngineError::PromoteOnly(instance.clone()));
+        }
+        let spec = apps
+            .apps
+            .remove(instance)
+            .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         if spec.kind == AppKind::Static {
             return self
                 .deploy_static_from(instance, &spec, force, source)
