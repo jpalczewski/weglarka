@@ -299,6 +299,9 @@ pub struct ContainerInfo {
     /// running. Ingress trusts the nginx container's own addresses as the port forwarder's source
     /// (`docs/decisions/0032`).
     pub addresses: Vec<IpAddr>,
+    /// Ports the container publishes on the host as libpod reports them (`NetworkSettings.Ports`), with
+    /// the **actual** host port — so a mapping created with `host_port = 0` shows the one it got.
+    pub published_ports: Vec<PortMapping>,
 }
 
 /// Repository from an image reference — without tag and digest but **with** the registry port:

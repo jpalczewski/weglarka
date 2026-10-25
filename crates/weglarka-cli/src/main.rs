@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod commands;
 mod error;
+mod forward;
 mod networks;
 mod output;
 mod preflight;
@@ -11,6 +12,7 @@ mod run;
 mod settings;
 mod spec_flags;
 mod update;
+mod user_config;
 mod volumes;
 
 #[cfg(test)]

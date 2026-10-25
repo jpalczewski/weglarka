@@ -73,6 +73,15 @@ pub enum EngineError {
     /// `weglarka run` request that cannot start a process.
     #[error("{0}")]
     RunInvalid(String),
+    /// `weglarka forward` of an app that is not running: there is nothing to forward to.
+    #[error("app {0} is not running; use `weglarka apps start {0}`")]
+    ForwardNotRunning(InstanceName),
+    /// `weglarka forward` while the maximum number of relays is already alive.
+    #[error("too many forwards running (at most {0}); retry when one has ended")]
+    ForwardLimit(usize),
+    /// `weglarka forward` request that cannot be served.
+    #[error("{0}")]
+    ForwardInvalid(String),
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
     #[error("app {0} has no running container; use `weglarka apps start {0}`")]
     ReloadNotRunning(InstanceName),
@@ -463,6 +472,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) lock: tokio::sync::Mutex<()>,
     /// Free slots for one-off containers ([`crate::run::MAX_CONCURRENT_RUNS`]).
     pub(crate) runs: Arc<tokio::sync::Semaphore>,
+    /// Free slots for forward relays ([`crate::forward::MAX_CONCURRENT_FORWARDS`]).
+    pub(crate) forwards: Arc<tokio::sync::Semaphore>,
     pub(crate) dedup: std::sync::Mutex<DeliveryDedup>,
     /// The instance being mutated right now (`None` when the engine is idle). See [`InFlight`].
     pub(crate) activity: std::sync::Mutex<Option<InFlight>>,
@@ -491,6 +502,9 @@ impl<P: PodmanClient> Reconciler<P> {
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             runs: Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
+            forwards: Arc::new(tokio::sync::Semaphore::new(
+                crate::forward::MAX_CONCURRENT_FORWARDS,
+            )),
             dedup: std::sync::Mutex::new(dedup),
             activity: std::sync::Mutex::new(None),
             monitor: crash::Policy::default(),
@@ -872,6 +886,7 @@ mod tests {
             restarts: 0,
             networks: vec![],
             addresses: vec![],
+            published_ports: vec![],
         }
     }
     fn target(inst: &str, pinned: Option<char>) -> (Target, SpecHash) {

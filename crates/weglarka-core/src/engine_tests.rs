@@ -2607,3 +2607,219 @@ command = ["serve"]
         assert_eq!(h.rec.remove_stale_runs().await.unwrap(), 0);
     }
 }
+
+// ── Temporary port forward (`weglarka forward`, issue #108) ─────────────────
+
+mod forward {
+    use super::*;
+    use crate::app::Security;
+    use crate::forward::{ForwardOptions, ForwardOutcome, MAX_CONCURRENT_FORWARDS};
+    use crate::podman::{ContainerSpec, RestartPolicy};
+    use crate::testing::RunScript;
+
+    const APP: &str = r#"
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+domains = ["ntfy.example.eu"]
+host_ports = [{ host = 2222, container = 22 }]
+"#;
+    const RELAY_IMAGE: &str = "docker.io/library/nginx:1-alpine";
+
+    async fn deployed() -> Harness {
+        let h = Harness::new(APP);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    fn options(port: u16) -> ForwardOptions {
+        ForwardOptions {
+            port,
+            timeout: None,
+            image: RELAY_IMAGE.into(),
+            security: Security::default(),
+        }
+    }
+
+    fn hang() -> RunScript {
+        RunScript {
+            hang: true,
+            ..Default::default()
+        }
+    }
+
+    fn relay_spec(h: &Harness) -> ContainerSpec {
+        let mut relays: Vec<_> = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .filter(|s| s.labels.contains_key(labels::FORWARD))
+            .collect();
+        assert_eq!(relays.len(), 1, "{relays:?}");
+        relays.remove(0)
+    }
+
+    fn container_names(h: &Harness) -> Vec<String> {
+        h.fake.containers().into_iter().map(|c| c.name).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_is_not_the_app_and_listens_on_loopback_only() {
+        let h = deployed().await;
+        h.fake.script_next_run(hang());
+        let pending = h
+            .rec
+            .prepare_forward(&name("ntfy"), &options(8085))
+            .await
+            .unwrap();
+        let spec = relay_spec(&h);
+        assert!(spec.name.starts_with("wg-fwd.ntfy."), "{}", spec.name);
+        assert!(!spec.labels.contains_key(labels::INSTANCE));
+        assert_eq!(spec.labels[labels::FORWARD_FOR], "ntfy");
+        assert_eq!(spec.networks.len(), 1, "{:?}", spec.networks);
+        assert!(spec.network_aliases.is_empty());
+        assert_eq!(spec.restart, RestartPolicy::No);
+        assert!(spec.healthcheck.is_none());
+        let [mapping] = spec.publish.as_slice() else {
+            panic!("{:?}", spec.publish)
+        };
+        assert_eq!(mapping.host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(mapping.host_port, 0, "the host port is left to libpod");
+        // The target travels as positional arguments, never inside the script text.
+        let entry = spec.entrypoint.unwrap();
+        assert_eq!(entry[0..2], ["/bin/sh", "-c"]);
+        assert_eq!(entry[4..], ["8080", "ntfy", "8085"]);
+        assert!(!entry[2].contains("ntfy"));
+        // The port that came back is the one libpod assigned.
+        let info = h
+            .fake
+            .containers()
+            .into_iter()
+            .find(|c| c.name == spec.name)
+            .unwrap();
+        assert_eq!(info.published_ports[0].host_port, pending.host_port());
+        assert_ne!(pending.host_port(), 0);
+        pending.discard().await;
+        assert_eq!(container_names(&h), ["ntfy"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_caller_or_timing_out_removes_the_relay() {
+        let h = deployed().await;
+        h.fake.script_next_run(hang());
+        let pending = h
+            .rec
+            .prepare_forward(&name("ntfy"), &options(8085))
+            .await
+            .unwrap();
+        let outcome = pending.hold(std::future::ready(())).await;
+        assert_eq!(outcome, ForwardOutcome::Closed);
+        assert_eq!(container_names(&h), ["ntfy"]);
+
+        h.fake.script_next_run(hang());
+        let mut short = options(8085);
+        short.timeout = Some(Duration::from_secs(30));
+        let pending = h.rec.prepare_forward(&name("ntfy"), &short).await.unwrap();
+        let outcome = pending.hold(std::future::pending()).await;
+        assert_eq!(outcome, ForwardOutcome::TimedOut);
+        assert_eq!(container_names(&h), ["ntfy"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_dies_ends_the_forward_and_is_removed() {
+        let h = deployed().await;
+        h.fake.script_next_run(RunScript {
+            exit_code: 1,
+            ..Default::default()
+        });
+        let pending = h
+            .rec
+            .prepare_forward(&name("ntfy"), &options(8085))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.hold(std::future::pending()).await,
+            ForwardOutcome::RelayExited(1)
+        );
+        assert_eq!(container_names(&h), ["ntfy"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_cannot_be_forwarded_is_refused_before_anything_is_created() {
+        let h = deployed().await;
+        let err = |r: Result<_, EngineError>| match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err(h.rec.prepare_forward(&name("ntfy"), &options(0)).await),
+            EngineError::ForwardInvalid(_)
+        ));
+        let mut zero = options(80);
+        zero.timeout = Some(Duration::ZERO);
+        assert!(matches!(
+            err(h.rec.prepare_forward(&name("ntfy"), &zero).await),
+            EngineError::ForwardInvalid(_)
+        ));
+        assert!(matches!(
+            err(h.rec.prepare_forward(&name("nope"), &options(80)).await),
+            EngineError::UnknownInstance(_)
+        ));
+        // Declared but never started: no container to forward to.
+        let idle = Harness::new(APP);
+        assert!(matches!(
+            err(idle.rec.prepare_forward(&name("ntfy"), &options(80)).await),
+            EngineError::ForwardNotRunning(_)
+        ));
+        assert!(
+            h.fake
+                .created_specs()
+                .iter()
+                .all(|s| !s.labels.contains_key(labels::FORWARD))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_few_forwards_may_be_alive_at_once() {
+        let h = deployed().await;
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_FORWARDS {
+            h.fake.script_next_run(hang());
+            held.push(
+                h.rec
+                    .prepare_forward(&name("ntfy"), &options(8085))
+                    .await
+                    .unwrap(),
+            );
+        }
+        h.fake.script_next_run(hang());
+        let refused = h.rec.prepare_forward(&name("ntfy"), &options(8085)).await;
+        assert!(matches!(refused, Err(EngineError::ForwardLimit(_))));
+        // A finished forward frees its slot.
+        held.pop().unwrap().discard().await;
+        h.fake.script_next_run(hang());
+        h.rec
+            .prepare_forward(&name("ntfy"), &options(8085))
+            .await
+            .unwrap()
+            .discard()
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_relays_are_swept_and_the_app_is_left_alone() {
+        let h = deployed().await;
+        let mut stale = h.fake.container_spec("ntfy").unwrap();
+        stale.name = "wg-fwd.ntfy.dead".into();
+        stale.labels = BTreeMap::from([
+            (labels::FORWARD.to_owned(), "true".to_owned()),
+            (labels::FORWARD_FOR.to_owned(), "ntfy".to_owned()),
+        ]);
+        h.fake.container_create(&stale).await.unwrap();
+        h.fake.container_start("wg-fwd.ntfy.dead").await.unwrap();
+        assert_eq!(h.rec.remove_stale_forwards().await.unwrap(), 1);
+        assert_eq!(container_names(&h), ["ntfy"]);
+        assert_eq!(h.rec.remove_stale_forwards().await.unwrap(), 0);
+    }
+}

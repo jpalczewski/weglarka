@@ -725,7 +725,7 @@ fn default_trusted(own_addresses: &[IpAddr], bootstrap_subnets: &[String]) -> Ve
     }
 }
 
-fn nginx_security() -> Security {
+pub(crate) fn nginx_security() -> Security {
     Security {
         read_only: true,
         tmpfs: vec![],

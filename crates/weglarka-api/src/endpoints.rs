@@ -74,6 +74,14 @@ pub const APPS_RUN: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/run",
 };
+/// `POST` [`ForwardRequest`](crate::ForwardRequest) → a stream of
+/// [`ForwardFrame`](crate::ForwardFrame)s (`application/vnd.weglarka.forward-stream`). Starts a relay
+/// container on the app's network, published on a loopback port of the host (the first frame names it),
+/// and keeps it for as long as the connection is open; closing the connection removes it (issue #108).
+pub const APPS_FORWARD: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/apps/{name}/forward",
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -183,6 +191,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_DEPLOY,
     APPS_RELOAD,
     APPS_RUN,
+    APPS_FORWARD,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

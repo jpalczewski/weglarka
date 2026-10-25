@@ -466,6 +466,15 @@ pub(crate) struct InspectContainer {
 struct InspectNetworkSettings {
     /// Keys are network names; the per-network addresses feed the ingress trust list.
     networks: Option<BTreeMap<String, InspectAttachment>>,
+    /// `"8080/tcp"` → host bindings; `null` for a port that is not published.
+    ports: Option<BTreeMap<String, Option<Vec<InspectBinding>>>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct InspectBinding {
+    host_ip: String,
+    host_port: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -528,6 +537,22 @@ impl InspectContainer {
             .flat_map(|n| [&n.ip_address, &n.global_ipv6_address])
             .filter_map(|a| a.parse().ok())
             .collect();
+        let published_ports = self
+            .network_settings
+            .ports
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(key, bindings)| Some((key.split('/').next()?.parse().ok()?, bindings?)))
+            .flat_map(|(container_port, bindings): (u16, Vec<InspectBinding>)| {
+                bindings.into_iter().filter_map(move |b| {
+                    Some(weglarka_core::podman::PortMapping {
+                        host_ip: (!b.host_ip.is_empty()).then(|| b.host_ip.clone()),
+                        host_port: b.host_port.parse().ok()?,
+                        container_port,
+                    })
+                })
+            })
+            .collect();
         ContainerInfo {
             id: self.id,
             name: self.name.trim_start_matches('/').to_owned(),
@@ -541,6 +566,7 @@ impl InspectContainer {
             restarts: self.restart_count,
             networks: networks.keys().cloned().collect(),
             addresses: addresses.into_iter().collect(),
+            published_ports,
         }
     }
 }
@@ -998,6 +1024,35 @@ mod tests {
             .unwrap()
             .into_domain();
         assert!(info.addresses.is_empty());
+    }
+
+    #[test]
+    fn inspect_reports_the_host_ports_libpod_assigned() {
+        let json = br#"{"Id":"1","Name":"n","NetworkSettings":{"Ports":{
+            "8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"43211"}],
+            "9090/tcp":null,
+            "53/udp":[{"HostIp":"","HostPort":"5353"}]}}}"#;
+        let info = decode::<InspectContainer>(json).unwrap().into_domain();
+        let mapping = |ip: Option<&str>, host, container| weglarka_core::podman::PortMapping {
+            host_ip: ip.map(str::to_owned),
+            host_port: host,
+            container_port: container,
+        };
+        assert_eq!(
+            info.published_ports,
+            [
+                mapping(None, 5353, 53),
+                mapping(Some("127.0.0.1"), 43211, 8080)
+            ]
+        );
+        // A container without `NetworkSettings.Ports` publishes nothing.
+        assert!(
+            decode::<InspectContainer>(br#"{"Id":"1"}"#)
+                .unwrap()
+                .into_domain()
+                .published_ports
+                .is_empty()
+        );
     }
 
     #[test]

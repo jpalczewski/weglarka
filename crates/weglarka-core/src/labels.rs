@@ -22,6 +22,12 @@ pub const RUN: &str = "weglarka.run";
 /// The instance a one-off container was started for.
 pub const RUN_FOR: &str = "weglarka.run-for";
 
+/// Marks a `weglarka forward` relay container (the value is always `"true"`). Deliberately not
+/// [`INSTANCE`], for the same reason as [`RUN`].
+pub const FORWARD: &str = "weglarka.forward";
+/// The instance a relay forwards to.
+pub const FORWARD_FOR: &str = "weglarka.forward-for";
+
 /// Set of labels that reconcile applies to an instance's container.
 pub fn container_labels(
     instance: &InstanceName,
@@ -99,4 +105,10 @@ pub fn import_container_name(instance: &InstanceName) -> String {
 /// container; `token` keeps concurrent runs of one app apart.
 pub fn run_container_name(instance: &InstanceName, token: &str) -> String {
     format!("wg-run.{instance}.{token}")
+}
+
+/// Name of one `weglarka forward` relay; `.` cannot occur in an instance name, so it never collides
+/// with an app's container. `token` keeps concurrent forwards of one app apart.
+pub fn forward_container_name(instance: &InstanceName, token: &str) -> String {
+    format!("wg-fwd.{instance}.{token}")
 }
