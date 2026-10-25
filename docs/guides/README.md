@@ -33,6 +33,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Container hardening](container-hardening.md) | `security` for apps, the always-hardened ingress container |
 | [Image retention](image-retention.md) | Which images stay, `images prune` |
 | [One-off commands](one-off-commands.md) | `weglarka run` |
+| [Port forward](port-forward.md) | `weglarka forward`, `cli.toml` (`ssh_host`) |
 | [apps update](apps-update.md) | What each change does to a running app |
 
 ## Networking and ingress

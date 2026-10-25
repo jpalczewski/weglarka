@@ -98,7 +98,7 @@ pub(crate) fn append_query(mut path: String, query: &str) -> String {
     path
 }
 
-fn method_str(m: Method) -> &'static str {
+pub(crate) fn method_str(m: Method) -> &'static str {
     match m {
         Method::Get => "GET",
         Method::Post => "POST",
@@ -205,7 +205,9 @@ impl ApiClient {
     }
 
     /// One HTTP/1.1 connection to the admin socket (the connection task is spawned).
-    async fn connect<B>(&self) -> Result<hyper::client::conn::http1::SendRequest<B>, CliError>
+    pub(crate) async fn connect<B>(
+        &self,
+    ) -> Result<hyper::client::conn::http1::SendRequest<B>, CliError>
     where
         B: hyper::body::Body + Send + 'static,
         B::Data: Send,
@@ -377,7 +379,7 @@ impl ApiClient {
     }
 }
 
-fn error_from_response(status: StatusCode, body: &[u8]) -> CliError {
+pub(crate) fn error_from_response(status: StatusCode, body: &[u8]) -> CliError {
     match serde_json::from_slice::<ApiError>(body) {
         Ok(e) => CliError::from_api(e.code, e.message),
         Err(_) => CliError::internal(format!(

@@ -131,6 +131,11 @@ impl From<EngineError> for Fail {
                 Fail(ErrorCode::Conflict, e.to_string())
             }
             EngineError::RunInvalid(message) => Fail::invalid(message),
+            // `weglarka forward` (issue #108): nothing was created for any of these.
+            e @ (EngineError::ForwardNotRunning(_) | EngineError::ForwardLimit(_)) => {
+                Fail(ErrorCode::Conflict, e.to_string())
+            }
+            EngineError::ForwardInvalid(message) => Fail::invalid(message),
             other => Fail::internal(other),
         }
     }
@@ -140,11 +145,11 @@ fn json<T: Serialize>(v: T) -> Response {
     axum::Json(v).into_response()
 }
 
-fn parse_json<T: DeserializeOwned>(body: &Bytes) -> ApiResult<T> {
+pub(crate) fn parse_json<T: DeserializeOwned>(body: &Bytes) -> ApiResult<T> {
     serde_json::from_slice(body).map_err(|e| Fail::invalid(format!("invalid JSON body: {e}")))
 }
 
-fn parse_name(raw: &str) -> ApiResult<InstanceName> {
+pub(crate) fn parse_name(raw: &str) -> ApiResult<InstanceName> {
     InstanceName::new(raw).map_err(|e| Fail::invalid(e.to_string()))
 }
 
@@ -185,6 +190,10 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
             get(notify_status::<P>),
         )
         .route(endpoints::NOTIFICATIONS_TEST.path, post(notify_test::<P>))
+        .route(
+            endpoints::APPS_FORWARD.path,
+            post(crate::forward::forward_app::<P>),
+        )
         .fallback(|| async { Fail::not_found("no such endpoint") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .merge(volumes::routes()) // after the layer: tar bodies are streamed and have their own cap

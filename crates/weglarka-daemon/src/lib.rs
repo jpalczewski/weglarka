@@ -9,6 +9,7 @@ pub mod admin;
 pub mod app;
 pub mod doctor;
 pub mod forgejo;
+pub mod forward;
 pub mod github;
 pub mod health_probe;
 pub mod images;
@@ -245,6 +246,12 @@ pub async fn start<P: PodmanClient + 'static>(
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "removed stale one-off containers"),
         Err(error) => tracing::warn!(%error, "cannot look for stale one-off containers"),
+    }
+    // The same for a forward relay (issue #108).
+    match engine.remove_stale_forwards().await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed stale forward relays"),
+        Err(error) => tracing::warn!(%error, "cannot look for stale forward relays"),
     }
     let ingress = Arc::new(IngressManager::new(
         engine.clone(),
