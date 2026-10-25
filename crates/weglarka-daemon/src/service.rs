@@ -43,6 +43,18 @@ pub fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) 
             mounts.push((root.clone(), format!("{root}:ro")));
         }
     }
+    // Allowlisted `host_mounts` (issue #178): the daemon must see each path to canonicalize it before
+    // an app's bind, so every entry is mounted read-only at the same path. Existing installs need a
+    // `platform install` re-run after changing the list (ADR 0045).
+    for entry in &settings.host.runtime.host_mounts {
+        let entry = s(entry);
+        let already_mounted = mounts.iter().any(|(_, target)| {
+            target == &entry || target.strip_suffix(":ro") == Some(entry.as_str())
+        });
+        if !already_mounted {
+            mounts.push((entry.clone(), format!("{entry}:ro")));
+        }
+    }
     if !settings
         .paths
         .nginx_conf_dir
@@ -143,5 +155,27 @@ domain = "w.example.eu"
         );
         // Same mount set as before the feature existed: the socket, state dir, admin dir, config file.
         assert_eq!(plain.mounts.len(), 4, "{:?}", plain.mounts);
+    }
+
+    #[test]
+    fn host_mounts_are_mounted_read_only_at_the_same_path() {
+        let host = HostConfig::from_toml_str(&format!(
+            "{HOST}\n[runtime]\nhost_mounts = [\"/var/log/journal\", \"/etc/machine-id\"]\n"
+        ))
+        .unwrap();
+        let settings = Settings::from_host(host, PathBuf::from("/etc/weglarka/weglarka.toml"));
+        let spec = service_spec(
+            &settings,
+            PathBuf::from("/run/user/1001/podman/podman.sock"),
+            "image:1".to_owned(),
+        );
+        for path in ["/var/log/journal", "/etc/machine-id"] {
+            assert!(
+                spec.mounts
+                    .contains(&(path.to_owned(), format!("{path}:ro"))),
+                "{:?}",
+                spec.mounts
+            );
+        }
     }
 }

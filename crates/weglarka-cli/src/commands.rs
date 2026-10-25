@@ -202,6 +202,8 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         volumes: vec![],
         shared_volumes: vec![],
         configs: Vec::new(),
+        host_mounts: Vec::new(),
+        group_add: Vec::new(),
         reload_signal: None,
         shared_networks: vec![],
         host_ports: Vec::new(),
@@ -786,6 +788,37 @@ pub(crate) fn render_show(r: &ShowAppResponse) -> String {
             out.push('\n');
         }
         out.push_str(&render_configs(configs));
+    }
+    if let Some(mounts) = &r.host_mounts
+        && !mounts.is_empty()
+    {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&render_host_mounts(mounts));
+    }
+    out
+}
+
+/// `[host_mounts]` block of `apps show` (issue #178): privileged-ish like `host_ports < 1024`, so the
+/// operator sees which host paths the app reads and whether each is still allowlisted.
+fn render_host_mounts(mounts: &[weglarka_api::HostMountView]) -> String {
+    use weglarka_api::HostMountStatus as S;
+    let mut out =
+        String::from("[host_mounts] (read-only host paths, allowlisted by the operator)\n");
+    for m in mounts {
+        let status = match m.status {
+            S::Ok => "ok",
+            S::NotAllowed => "not allowlisted",
+            S::Missing => "missing",
+            S::Redirected => "redirected (symlink)",
+            S::NotFileOrDir => "not a file or directory",
+            S::Unreadable => "unreadable",
+        };
+        out.push_str(&format!("  {} -> {}  [{status}]\n", m.source, m.target));
+        if let Some(detail) = &m.detail {
+            out.push_str(&format!("    {detail}\n"));
+        }
     }
     out
 }

@@ -208,6 +208,7 @@ impl<P: PodmanClient> Reconciler<P> {
             resources: Default::default(),
             healthcheck: None,
             id_mapping: None,
+            keep_groups: false,
             security: options.security.clone(),
         };
         self.podman.container_create(&container).await?;

@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -89,6 +89,13 @@ fn secret_mount_ownership_v7(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v7 → v8: host mounts and groups (issue #178, ADR 0045). `AppSpec::host_mounts` and
+/// `AppSpec::group_add` are optional fields that default to empty, so a v7 document needs no data transformation — the marker records that the
+/// file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn host_mounts_v8(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -99,6 +106,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     path_prefix_routing_v5,
     ingress_max_body_size_v6,
     secret_mount_ownership_v7,
+    host_mounts_v8,
 ];
 
 const _: () = assert!(
@@ -471,6 +479,37 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
                 "{name}: duplicate config target {:?}",
                 mount.target
             ));
+        }
+    }
+    // Host mounts (issue #178): lexical rules only; membership in the operator's allowlist is
+    // checked against the host config by `crate::host_mounts` (admin API, reconcile, launch).
+    for mount in &spec.host_mounts {
+        if !crate::app::valid_host_source(&mount.source) {
+            return Err(format!(
+                "{name}: host mount source {:?} must be an absolute, normalized path",
+                mount.source
+            ));
+        }
+        if !valid_mount_target(&mount.target) {
+            return Err(format!(
+                "{name}: host mount target {:?} must be an absolute path (no '..', ':' or ',')",
+                mount.target
+            ));
+        }
+        if !seen_targets.insert(mount.target.trim_end_matches('/')) {
+            return Err(format!(
+                "{name}: duplicate host mount target {:?}",
+                mount.target
+            ));
+        }
+    }
+    let mut groups = BTreeSet::new();
+    for group in &spec.group_add {
+        if !crate::app::valid_group_name(group) {
+            return Err(format!("{name}: invalid group_add entry {group:?}"));
+        }
+        if !groups.insert(group) {
+            return Err(format!("{name}: duplicate group_add entry {group:?}"));
         }
     }
     if let Some(signal) = &spec.reload_signal

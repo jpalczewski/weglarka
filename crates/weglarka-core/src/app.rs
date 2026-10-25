@@ -272,6 +272,42 @@ pub fn valid_config_source(source: &str) -> bool {
         && !source.chars().any(char::is_control)
 }
 
+/// Host path mounted **read-only** into the app container (issue #178,
+/// `docs/decisions/0045-host-mounts.md`). `source` must be an exact entry of the operator's
+/// `[runtime] host_mounts` allowlist; there is no `read_only` flag to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostMount {
+    /// Absolute host path, exactly as listed in `[runtime] host_mounts`.
+    pub source: String,
+    /// Absolute path in the container.
+    pub target: String,
+}
+
+/// Host mount source rules, lexical only: an absolute, normalized path (no `.`/`..`/empty segments,
+/// control characters, `:` or `,` — libpod's volume syntax separators) other than `/`.
+pub fn valid_host_source(source: &str) -> bool {
+    source.starts_with('/')
+        && source.len() > 1
+        && !source.ends_with('/')
+        && !source[1..]
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
+        && !source
+            .chars()
+            .any(|c| c.is_control() || c == ',' || c == ':')
+}
+
+/// Group name as `useradd` accepts it: lowercase letter or `_` first, then `[a-z0-9_-]`, at most 32.
+pub fn valid_group_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 /// Normalizes `reload_signal` to the name the engine sends to the container: trimmed, upper case,
 /// without the `SIG` prefix (`"sighup"` → `Some("HUP")`). A valid name is 2–10 characters of
 /// `[A-Z][A-Z0-9]*`; anything else is rejected instead of forwarded to libpod.
@@ -901,6 +937,15 @@ pub struct AppSpec {
     /// part of the spec hash: it only affects reload, never what the container is made of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload_signal: Option<String>,
+    /// Read-only host paths from the operator's `[runtime] host_mounts` allowlist (issue #178).
+    /// Part of the spec hash only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_mounts: Vec<HostMount>,
+    /// Supplementary groups from the operator's `[runtime] group_add` allowlist (issue #178,
+    /// ADR 0045). Any entry makes the container keep the runtime user's groups (`keep-groups`).
+    /// Part of the spec hash only when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<String>,
 }
 
 fn default_true() -> bool {

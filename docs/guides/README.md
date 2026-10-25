@@ -22,6 +22,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Importing data](data-import.md) | Importing and exporting volumes, Coolify migration, SQLite lessons |
 | [Secrets cleanup](secrets-cleanup.md) | `secrets remove`, `apps remove --purge-secrets`, orphaned secrets |
 | [Host config files](host-configs.md) | `config_root`, `configs`, `apps reload` |
+| [Read-only host paths](host-mounts.md) | `[runtime] host_mounts`/`group_add` allowlists, `host_mounts` and `group_add` in the spec |
 
 ## App behaviour
 

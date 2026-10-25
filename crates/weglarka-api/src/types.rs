@@ -86,6 +86,40 @@ pub struct ShowAppResponse {
     /// `config_root` on demand and the list endpoint does not touch the filesystem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configs: Option<Vec<ConfigMountView>>,
+    /// Declared `host_mounts` with their status against the operator's allowlist (issue #178);
+    /// absent when the app declares none. Only `GET /v1/apps/{name}` fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_mounts: Option<Vec<HostMountView>>,
+}
+
+/// State of one declared host mount as the daemon sees it (issue #178).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMountStatus {
+    /// Allowlisted, exists, resolves to itself.
+    Ok,
+    /// The source is not in `[runtime] host_mounts` of `weglarka.toml`.
+    NotAllowed,
+    /// The source does not exist on the host.
+    Missing,
+    /// The path resolves somewhere else (a symlink in the path).
+    Redirected,
+    /// The source exists but is neither a regular file nor a directory.
+    NotFileOrDir,
+    /// The source cannot be statted.
+    Unreadable,
+}
+
+/// One host mount of an app: always read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMountView {
+    /// Absolute host path, as declared (and allowlisted).
+    pub source: String,
+    /// Absolute path in the container.
+    pub target: String,
+    pub status: HostMountStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// State of one declared config mount as the daemon sees it on disk (issue #118).

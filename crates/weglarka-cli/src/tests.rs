@@ -817,6 +817,7 @@ fn show_app(start: bool) -> ShowAppResponse {
             RuntimeState::NotStarted
         },
         configs: None,
+        host_mounts: None,
     }
 }
 
