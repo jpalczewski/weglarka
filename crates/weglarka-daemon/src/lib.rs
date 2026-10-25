@@ -229,6 +229,7 @@ pub async fn start<P: PodmanClient + 'static>(
     let defaults = ReconcilerOptions::default();
     let options = ReconcilerOptions {
         config_root: paths.config_root.clone(),
+        host_mounts: host.runtime.host_mounts.clone(),
         dependency_wait_secs: host
             .runtime
             .dependency_wait_secs

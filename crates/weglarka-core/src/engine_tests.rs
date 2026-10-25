@@ -1871,6 +1871,46 @@ async fn configs_are_mounted_read_only_from_the_canonical_root() {
     assert_eq!(h.state("prometheus").current, Some(digest('a')));
 }
 
+/// An allowlisted host path reaches libpod as a read-only bind from its canonical path; one that is
+/// not on the list blocks the app instead of mounting anything (issue #178).
+#[tokio::test(start_paused = true)]
+async fn host_mounts_are_read_only_and_need_the_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().canonicalize().unwrap().join("journal");
+    std::fs::create_dir(&journal).unwrap();
+    let apps = format!(
+        "[apps.alloy]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nhealth = {{ attempts = 1, window_secs = 1 }}\n\
+         host_mounts = [{{ source = {:?}, target = \"/var/log/journal\" }}]\n",
+        journal.display().to_string()
+    );
+
+    let h = Harness::with_options(
+        &apps,
+        ReconcilerOptions {
+            host_mounts: vec![journal.clone()],
+            ..Default::default()
+        },
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(
+        h.fake.container_spec("alloy").unwrap().mounts,
+        vec![BindMount {
+            source: journal.display().to_string(),
+            target: "/var/log/journal".into(),
+            read_only: true,
+        }]
+    );
+
+    // Without the allowlist entry the app is blocked and no container is created.
+    let h = Harness::new(&apps);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(!report.is_clean(), "{report:?}");
+    assert!(h.fake.container_spec("alloy").is_none());
+}
+
 /// A broken config fails the deploy **before** the old container is touched: no stop, no remove, no
 /// rollback that would only bring back the same broken spec.
 #[tokio::test(start_paused = true)]

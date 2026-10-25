@@ -50,12 +50,14 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `paths` and `ingress.strip_prefix` | [path routing](path-routing.md) |
 | `apps.toml`, apps | `ingress.max_body_size` (`weglarka apps update <app> --unset-max-body-size`) | [max body size](max-body-size.md) |
 | `apps.toml`, apps | `configs` and `reload_signal` | [host configs](host-configs.md) |
+| `apps.toml`, apps | `host_mounts` | [host mounts](host-mounts.md) |
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |
 | `weglarka.toml` | `[monitor]` | [crash detection](crash-detection.md) |
 | `weglarka.toml` | `[self_update]`, together with `systemctl --user disable --now weglarka-self-update.timer weglarka-watchdog.timer` | [self-update](self-update.md) |
+| `weglarka.toml` | `[runtime] host_mounts` | [host mounts](host-mounts.md) |
 | `weglarka.toml` | `config_root` | [host configs](host-configs.md) |
 | `weglarka.toml` | `[webhook.forgejo]` | [webhooks](webhooks.md) |
 | `weglarka.toml` | `[acme]` (or set `enabled = false` before rolling back to a release that knows it) | [ACME certificates](acme.md) |

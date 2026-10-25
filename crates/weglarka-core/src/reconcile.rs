@@ -233,6 +233,9 @@ pub struct ReconcilerOptions {
     /// already resolved against the config file's directory by the caller. `None` = the feature is
     /// off: an app that declares `configs` then fails validation instead of mounting anything.
     pub config_root: Option<PathBuf>,
+    /// Allowlist for apps' `host_mounts` (`[runtime] host_mounts`, issue #178); empty = no app may
+    /// mount a host path.
+    pub host_mounts: Vec<PathBuf>,
 }
 
 impl Default for ReconcilerOptions {
@@ -242,6 +245,7 @@ impl Default for ReconcilerOptions {
             stop_timeout_secs: 10,
             dependency_wait_secs: 10,
             config_root: None,
+            host_mounts: Vec::new(),
         }
     }
 }
@@ -681,9 +685,7 @@ impl<P: PodmanClient> Reconciler<P> {
             } else if let Some(why) = unranged.get(name) {
                 blocked = true;
                 report.blocked.push((name.clone(), why.clone()));
-            } else if let Err(e) =
-                crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
-            {
+            } else if let Err(e) = self.resolve_mounts(spec) {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
                 // stays as it is until the operator fixes the root or the file (ADR 0028).
                 blocked = true;

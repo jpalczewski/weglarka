@@ -143,6 +143,22 @@ struct Launched {
 }
 
 impl<P: PodmanClient> Reconciler<P> {
+    /// Host-side read-only mounts of an app: `configs` under `config_root` plus the allowlisted
+    /// `host_mounts` (issue #178). Both are canonical paths, mounted read-only by [`config_binds`].
+    pub(crate) fn resolve_mounts(
+        &self,
+        spec: &AppSpec,
+    ) -> Result<Vec<crate::config_mounts::Resolved>, EngineError> {
+        let mut mounts =
+            crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
+                .map_err(|e| EngineError::Configs(e.to_string()))?;
+        mounts.extend(
+            crate::host_mounts::resolve_all(&self.options.host_mounts, spec)
+                .map_err(|e| EngineError::Configs(e.to_string()))?,
+        );
+        Ok(mounts)
+    }
+
     /// Manual/webhook deploy of a single instance. `force` skips `Unchanged` and `KnownBad`.
     pub async fn deploy(
         &self,
@@ -161,8 +177,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let _g = self.lock.lock().await;
         let spec = self.load_spec(instance)?;
         // Same precondition as a deploy: a config that cannot be mounted is not reloadable either.
-        crate::config_mounts::resolve_all(self.options.config_root.as_deref(), &spec)
-            .map_err(|e| EngineError::Configs(e.to_string()))?;
+        self.resolve_mounts(&spec)?;
         let name = labels::container_name(instance);
         let info = match self.podman.container_inspect(&name).await {
             Ok(info) => info,
@@ -391,8 +406,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
         // ADR 0028). The resolved canonical paths are what `launch` mounts.
-        let configs = crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
-            .map_err(|e| EngineError::Configs(e.to_string()))?;
+        let configs = self.resolve_mounts(spec)?;
         self.podman
             .network_create(&NetworkSpec {
                 name: labels::network_name(instance),
@@ -763,8 +777,7 @@ impl<P: PodmanClient> Reconciler<P> {
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
         // Config mounts are validated before anything is pinned or touched, exactly like a deploy.
-        crate::config_mounts::resolve_all(self.options.config_root.as_deref(), spec)
-            .map_err(|e| EngineError::Configs(e.to_string()))?;
+        self.resolve_mounts(spec)?;
         let _activity = self.begin_activity(instance, ActivityKind::Provision);
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.

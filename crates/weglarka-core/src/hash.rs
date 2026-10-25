@@ -84,6 +84,10 @@ struct HashInput<'a> {
     /// exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     configs: Vec<&'a ConfigMount>,
+    /// Host mounts (issue #178): the allowlisted source and the target are container settings.
+    /// Sorted and skipped while empty, so an app without them hashes exactly as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    host_mounts: Vec<&'a crate::app::HostMount>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -149,6 +153,8 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         .sort_by(|a, b| (&a.name, &a.target, a.read_only).cmp(&(&b.name, &b.target, b.read_only)));
     let mut configs: Vec<&ConfigMount> = spec.configs.iter().collect();
     configs.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    let mut host_mounts: Vec<&crate::app::HostMount> = spec.host_mounts.iter().collect();
+    host_mounts.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
     let mut shared_networks: Vec<HashSharedNetwork> = spec
         .shared_networks
         .iter()
@@ -178,6 +184,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         shared_networks,
         command: &spec.command,
         configs,
+        host_mounts,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -563,6 +570,26 @@ env = { B = "2", A = "1" }
         let mut s = spec();
         s.reload_signal = Some("SIGHUP".into());
         assert_eq!(base, spec_hash(&s, &digest('a')));
+    }
+
+    #[test]
+    fn host_mounts_are_container_settings_and_absent_ones_hash_as_before() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let with = |source: &str, target: &str| {
+            let mut s = spec();
+            s.host_mounts.push(crate::app::HostMount {
+                source: source.into(),
+                target: target.into(),
+            });
+            spec_hash(&s, &digest('a'))
+        };
+        assert_ne!(base, with("/var/log/journal", "/var/log/journal"));
+        assert_ne!(
+            with("/var/log/journal", "/j"),
+            with("/run/log/journal", "/j"),
+            "the source is part of the mount"
+        );
+        assert_ne!(with("/etc/machine-id", "/a"), with("/etc/machine-id", "/b"));
     }
 
     fn mounting(uid: Option<u32>, gid: Option<u32>) -> AppSpec {

@@ -4,9 +4,10 @@
 
 use clap::Args;
 use weglarka_core::app::{
-    AppSpec, ConfigMount, CpuLimit, HostPort, InstanceName, MemoryLimit, SharedNetworkName,
-    SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount, normalize_signal,
-    valid_config_source, valid_volume_name,
+    AppSpec, ConfigMount, CpuLimit, HostMount, HostPort, InstanceName, MemoryLimit,
+    SharedNetworkName, SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount,
+    normalize_signal, valid_config_source, valid_host_source, valid_mount_target,
+    valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -36,6 +37,13 @@ pub enum DependsOnFlag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigFlag {
     Set(ConfigMount),
+    Clear,
+}
+
+/// Value of [`SpecFlags::host_mounts`]: an allowlisted read-only host mount, or `none` to clear the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMountFlag {
+    Set(HostMount),
     Clear,
 }
 
@@ -87,6 +95,11 @@ pub struct SpecFlags {
     /// `--config FILE`; it conflicts with no other flag except `--spec`.
     #[arg(long = "config-mount", value_name = "SOURCE:TARGET|none", value_parser = parse_config, conflicts_with = "spec")]
     pub configs: Vec<ConfigFlag>,
+    /// Read-only mount of an allowlisted host path (ADR 0045): SOURCE:TARGET, with `source` an exact
+    /// entry of `[runtime] host_mounts` in weglarka.toml and `target` absolute in the container
+    /// (repeatable; replaces a mount with the same `source`; `none` clears the list).
+    #[arg(long = "host-mount", value_name = "SOURCE:TARGET|none", value_parser = parse_host_mount, conflicts_with = "spec")]
+    pub host_mounts: Vec<HostMountFlag>,
     /// Signal `apps reload` sends to the container, e.g. SIGHUP (`none` removes it). Without it
     /// `apps reload` restarts the container instead. Not part of the spec hash.
     #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
@@ -133,6 +146,7 @@ impl SpecFlags {
             && self.volumes.is_empty()
             && self.shared_volumes.is_empty()
             && self.configs.is_empty()
+            && self.host_mounts.is_empty()
             && self.reload_signal.is_none()
             && self.shared_network.is_none()
             && !self.hardened
@@ -170,6 +184,15 @@ impl SpecFlags {
             spec.shared_volumes.push(v.clone());
         }
         apply_configs(&mut spec.configs, &self.configs);
+        for flag in &self.host_mounts {
+            match flag {
+                HostMountFlag::Clear => spec.host_mounts.clear(),
+                HostMountFlag::Set(mount) => {
+                    spec.host_mounts.retain(|m| m.source != mount.source);
+                    spec.host_mounts.push(mount.clone());
+                }
+            }
+        }
         match &self.reload_signal {
             Some(ReloadSignalFlag::Set(signal)) => spec.reload_signal = Some(signal.clone()),
             Some(ReloadSignalFlag::Clear) => spec.reload_signal = None,
@@ -298,6 +321,31 @@ fn parse_config(s: &str) -> Result<ConfigFlag, String> {
         ));
     }
     Ok(ConfigFlag::Set(ConfigMount {
+        source: source.to_owned(),
+        target: target.to_owned(),
+    }))
+}
+
+/// `SOURCE:TARGET`, or `none` to clear the list. `source` is an absolute host path (membership in
+/// the daemon's allowlist is checked by the daemon), `target` an absolute path in the container.
+fn parse_host_mount(s: &str) -> Result<HostMountFlag, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(HostMountFlag::Clear);
+    }
+    let (source, target) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected SOURCE:TARGET, got {s:?}"))?;
+    if !valid_host_source(source) {
+        return Err(format!(
+            "invalid host mount source {source:?}: an absolute, normalized host path"
+        ));
+    }
+    if !valid_mount_target(target) {
+        return Err(format!(
+            "host mount target must be an absolute path in the container, got {target:?}"
+        ));
+    }
+    Ok(HostMountFlag::Set(HostMount {
         source: source.to_owned(),
         target: target.to_owned(),
     }))
