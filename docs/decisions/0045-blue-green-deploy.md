@@ -17,17 +17,25 @@ both `behind` and `edge`, so the switch is the same hop in both modes.
 
 ## Decision
 
-*Draft — filled in as the implementation lands. Recommended shape, to be confirmed by the spike below:*
+*Shaped by a spike on a live host (rootless Podman 6.1.3, `edge` nginx) — see Evidence. Still `proposed`: the
+no-dropped-requests goal is not met by the first sequence and is decided after the implementation is measured.*
 
 * **Opt-in strategy.** `strategy = "recreate" | "blue_green"` on the app, default `recreate`. It does not change
   the container, so it stays out of `spec_hash`.
 * **Naming.** The serving container is always `<instance>`. The challenger is `<instance>.next` (`.` cannot occur
   in an instance name). Reconcile does not treat the challenger as a duplicate while a deploy is in flight and
-  sweeps a leftover one otherwise.
-* **Switch.** The challenger starts without the `<instance>` alias and passes the health gate on its own. Only
-  then does it join the app network with the alias `<instance>`; the old container keeps serving for at least the
-  nginx resolver TTL, then the names are swapped (old to `.prev`, challenger to `<instance>`) and the old one is
-  stopped and removed. `<instance>` exists and runs throughout.
+  sweeps a leftover one otherwise. Renames are bookkeeping only (see Evidence): the DNS name is carried by the alias.
+* **Staging network.** `network connect --alias` fails on a network the container already belongs to, so the
+  challenger cannot start on the app network and gain the alias later. It starts on a per-instance staging network
+  (`net-<instance>.next`, labelled with the instance so purge and orphan cleanup find it), together with the
+  shared networks it needs for its own gate, and passes the health gate there.
+* **Switch.** After the gate the challenger is connected to the app network with the alias `<instance>`. The old
+  container keeps serving through the old DNS entry; after a drain of at least the resolver TTL plus a margin it
+  is stopped and removed. Names are then swapped (old to `.prev`, challenger to `<instance>`) so that
+  `container_name` keeps meaning "the container that serves"; the order (alias, renames, drain, stop) is the one
+  the spike ran without a failed request on plain DNS. The staging network is removed.
+* **Resolver TTL.** The generated nginx lowers `resolver ... valid=5s` to `valid=1s` in both modes (aardvark is
+  local, so the extra lookups are negligible). This is a change to every generated `nginx.conf` (snapshots).
 * **Stateless.** Validation rejects `blue_green` with a read-write volume (private or shared) or `host_ports`.
   Read-only volumes and `configs` are allowed. Aliases from shared networks are attached at the switch, not before.
 * **Health gate.** `blue_green` requires a container-side gate (`health.command` or the image healthcheck):
@@ -38,8 +46,31 @@ both `behind` and `edge`, so the switch is the same hop in both modes.
   stopped until the next deploy is out of scope (separate issue).
 * **Dependents.** `dependency_ready` inspects `<instance>`, which runs throughout; nothing cascades.
 
-Open until the spike on a real Podman 6 passes: does `podman rename` of a running container keep DNS and aliases
-in aardvark, and does `network connect --alias` on a running container give both addresses.
+## Evidence (spike, 2026-10-25)
+
+* `podman rename` of a running container does **not** update aardvark: the new name does not resolve within 5 s and
+  the old one keeps resolving. The old container leaves DNS only when it is stopped and removed. The "drain" after
+  the renames therefore drains nothing by itself; the old container serves until `stop`.
+* `connect --alias` on a network the container is already on fails (`network is already connected`); it works from
+  a separate staging network, and the alias resolves after ~160-190 ms.
+* With two containers behind one alias aardvark returns both addresses in a **fixed order** (no rotation): a plain
+  client always reaches the old one, so the overlap is not a load split.
+* The full sequence on plain DNS: 65 requests at 100 ms, 0 failed.
+* Through nginx the sequence is **not** clean: 3 failed requests of 89 with `valid=5s` and a 7 s drain (two runs);
+  with `valid=1s` and a 3 s drain, one failed request per run. The failures cluster at `stop` and in the cache
+  window after it: nginx keeps the old address for up to `valid`, and a connection to a removed container does not
+  fail fast (the client sees timeouts).
+* Baseline `recreate` on a live app: 3 of 315 requests failed, a 4.2 s window (in line with the ~3.8 s above).
+
+## Open
+
+* **Goal.** The first target ("zero non-2xx") is not met by the sequence above. Candidates, to be measured on the
+  implementation: `proxy_next_upstream` with a short `proxy_connect_timeout` for `blue_green` apps (nginx retries
+  the next resolved address), a stop that first closes the old listener, or the rejected alternative below. The
+  acceptance test asserts the best of these; until then the criterion is "far below the `recreate` window, and no
+  outage on a failed deploy".
+* Does an alias added by `connect` survive a container restart (`restart = always`, host reboot)? If not, the
+  challenger must be created with the alias on the app network after all and the staging step is moot.
 
 ## Consequences
 
@@ -51,7 +82,8 @@ old container stops.
 ## Rejected alternatives
 
 * **Rewrite the nginx upstream and reload.** Gives a harder no-dropped-requests guarantee, but couples every
-  deploy to the ingress writer for a hop that alias DNS already covers.
+  deploy to the ingress writer. Rejected for now; the spike's failures through nginx make it the fallback if the
+  retry options under Open do not reach the goal.
 * **Generation-suffixed names for every container.** Touches every `container_name` call site and the reconcile
   contract for no gain over a temporary challenger name.
 * **Probing the challenger by IP from the daemon.** The daemon is not on app networks; joining them weakens
