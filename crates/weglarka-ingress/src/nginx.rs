@@ -40,6 +40,9 @@ pub const CERT_CONTAINER_DIR: &str = "/etc/nginx/tls";
 /// Container directory with ACME HTTP-01 tokens (`<nginx_conf_dir>/acme`): the file `<token>` is
 /// served at [`ACME_CHALLENGE_PREFIX`]`<token>`. Read by the **worker** on request.
 pub const ACME_CONTAINER_DIR: &str = "/etc/nginx/acme";
+/// Socket files (in [`NginxOptions::proxy_socket_dir`]) the port forwarder connects to: plain HTTP and TLS.
+pub const PLAIN_SOCKET: &str = "http.sock";
+pub const TLS_SOCKET: &str = "https.sock";
 /// ACME HTTP-01 prefix, reserved on the plain-HTTP listener and exempt from the HTTPS redirect.
 pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
@@ -78,6 +81,12 @@ pub struct NginxOptions {
     /// renewed certificate changes `nginx.conf` (and therefore triggers `nginx -t` + reload) even
     /// though no route changed. The generator does not interpret it beyond its alphabet.
     pub tls_fingerprint: Option<String>,
+    /// `edge`: container directory with the two unix sockets ([`PLAIN_SOCKET`], [`TLS_SOCKET`]) on
+    /// which nginx also listens, with `proxy_protocol`, for the port forwarder (issue #162,
+    /// docs/decisions/0043). The forwarder is the only peer on them; the client address it announces
+    /// in the PROXY header becomes `$remote_addr`. `None` = TCP listeners only (nginx's own address is
+    /// then what a published port shows as the client).
+    pub proxy_socket_dir: Option<String>,
 }
 
 impl NginxOptions {
@@ -109,6 +118,7 @@ impl NginxOptions {
             cert_dir: CERT_CONTAINER_DIR.to_owned(),
             acme_webroot: ACME_CONTAINER_DIR.to_owned(),
             tls_fingerprint: None,
+            proxy_socket_dir: None,
         }
     }
 
@@ -157,6 +167,12 @@ impl NginxOptions {
         }
         match mode {
             IngressMode::Behind => {
+                if self.proxy_socket_dir.is_some() {
+                    return Err(bad(
+                        "proxy_socket_dir",
+                        "is an `edge`-mode option (Traefik is the client-facing hop in `behind`)",
+                    ));
+                }
                 if self.trusted_proxies.is_empty() {
                     return Err(bad(
                         "trusted_proxies",
@@ -174,6 +190,9 @@ impl NginxOptions {
                 }
                 check_container_dir("cert_dir", &self.cert_dir)?;
                 check_container_dir("acme_webroot", &self.acme_webroot)?;
+                if let Some(dir) = &self.proxy_socket_dir {
+                    check_container_dir("proxy_socket_dir", dir)?;
+                }
                 if self.cert_dir == self.acme_webroot {
                     return Err(bad("cert_dir", "must differ from acme_webroot"));
                 }
@@ -448,10 +467,42 @@ fn listen(c: &mut Conf, port: u16, default_server: bool) {
     c.line(&format!("listen {port}{suffix};"));
 }
 
+/// `listen` of an `edge` plain-HTTP server: the TCP port (the daemon's health probe, nothing is
+/// published on it any more) plus the forwarder's unix socket with `proxy_protocol`.
+fn listen_edge_plain(c: &mut Conf, o: &NginxOptions, default_server: bool) {
+    listen(c, o.listen_port, default_server);
+    if let Some(dir) = &o.proxy_socket_dir {
+        let suffix = if default_server {
+            " default_server"
+        } else {
+            ""
+        };
+        c.line(&format!(
+            "listen unix:{dir}/{PLAIN_SOCKET}{suffix} proxy_protocol;"
+        ));
+    }
+}
+
+/// `listen` of an `edge` TLS server (`default_server` for the certificate-less one); see
+/// [`listen_edge_plain`].
+fn listen_edge_tls(c: &mut Conf, o: &NginxOptions, default_server: bool) {
+    let suffix = if default_server {
+        " default_server"
+    } else {
+        ""
+    };
+    c.line(&format!("listen {} ssl{suffix};", o.https_listen_port));
+    if let Some(dir) = &o.proxy_socket_dir {
+        c.line(&format!(
+            "listen unix:{dir}/{TLS_SOCKET} ssl{suffix} proxy_protocol;"
+        ));
+    }
+}
+
 /// The default server: a foreign `Host` gets nothing.
 fn write_default_server(c: &mut Conf, o: &NginxOptions) {
     c.block("server", |c| {
-        listen(c, o.listen_port, true);
+        listen_edge_plain(c, o, true);
         c.line("server_name _;");
         c.line("set $app \"-\";");
         c.line("return 444;");
@@ -651,6 +702,12 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         // No `real_ip` and no trust maps: a direct client is never trusted for `X-Forwarded-*`
         // (ADR 0007). The headers are rebuilt from nginx's own `$remote_addr`/`$scheme`/`$host`.
+        if o.proxy_socket_dir.is_some() {
+            // Only the forwarder's unix socket carries a PROXY header; TCP peers are never replaced.
+            c.line("set_real_ip_from unix:;");
+            c.line("real_ip_header proxy_protocol;");
+            c.blank();
+        }
         write_proxy_headers(c, &EDGE_FORWARDED);
         c.blank();
 
@@ -659,10 +716,7 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         // The TLS default server: no certificate at all, every unknown SNI is refused.
         c.blank();
         c.block("server", |c| {
-            c.line(&format!(
-                "listen {} ssl default_server;",
-                o.https_listen_port
-            ));
+            listen_edge_tls(c, o, true);
             c.line("ssl_reject_handshake on;");
             c.line("server_name _;");
             c.line("return 444;");
@@ -671,7 +725,7 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         // The webhook domain: plain HTTP redirect + ACME, TLS only when its certificate exists.
         c.blank();
         c.block("server", |c| {
-            listen(c, o.listen_port, false);
+            listen_edge_plain(c, o, false);
             c.line(&format!("server_name {};", plan.webhook.domain));
             c.line(&format!("set $app \"{WEBHOOK_UPSTREAM_HOST}\";"));
             write_plain_http_body(c, o);
@@ -703,7 +757,7 @@ fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             };
             c.blank();
             c.block("server", |c| {
-                listen(c, o.listen_port, false);
+                listen_edge_plain(c, o, false);
                 c.line(&format!("server_name {domain};"));
                 c.line(&format!("set $app \"{app_name}\";"));
                 write_plain_http_body(c, o);
@@ -740,7 +794,7 @@ fn write_plain_http_body(c: &mut Conf, o: &NginxOptions) {
 
 /// `stem` is the certificate file stem from [`NginxOptions::certificate_stem`].
 fn write_tls_listener(c: &mut Conf, o: &NginxOptions, stem: &str) {
-    c.line(&format!("listen {} ssl;", o.https_listen_port));
+    listen_edge_tls(c, o, false);
     c.line("http2 on;");
     c.line(&format!("ssl_certificate {}/{stem}.crt;", o.cert_dir));
     c.line(&format!("ssl_certificate_key {}/{stem}.key;", o.cert_dir));

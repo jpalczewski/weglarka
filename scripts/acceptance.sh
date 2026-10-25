@@ -35,6 +35,7 @@ WEBHOOK_BASE=
 DIRECT=
 EDGE=0
 EDGE_FORCE=0
+EXPECT_CLIENT_IP=
 EDGE_HTTP_HOST=
 EDGE_HTTP_PORT=
 EDGE_HTTPS_HOST=
@@ -66,6 +67,9 @@ Użycie: acceptance.sh --canary-domain DOMENA [opcje]
   --direct URL           zamiast https://<domena>/ pytaj nginx Węglarki bezpośrednio (Host: <domena>),
                          bez Traefika i TLS — do testów lokalnych/CI, np. http://127.0.0.1:8088
                          (tylko tryb behind; w trybie edge jest odrzucane)
+  --expect-client-ip IP  tryb edge (issue #162): uruchom skrypt z INNEJ maszyny niż host i sprawdź, że apka
+                         widzi w X-Forwarded-For dokładnie ten adres (a nie adres nginx/forwardera).
+                         Z tej samej maszyny nie ma czego sprawdzać, więc CI tej flagi nie używa.
   --edge                 wymuś tryb edge, gdy [ingress] mode nie jest widoczne w configu (normalnie tryb
                          wykrywany jest z configu). W trybie edge adresy publikacji biorą się z
                          [ingress] bind (HTTP) i https_bind (TLS), certyfikat kanarka ląduje w
@@ -107,6 +111,7 @@ while [ $# -gt 0 ]; do
     --webhook-base) WEBHOOK_BASE=${2:?--webhook-base wymaga wartości}; shift 2 ;;
     --direct) DIRECT=${2:?--direct wymaga wartości}; shift 2 ;;
     --edge) EDGE_FORCE=1; shift ;;
+    --expect-client-ip) EXPECT_CLIENT_IP=${2:?--expect-client-ip wymaga wartości}; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --with-local-registry) LOCAL_REGISTRY=1; shift ;;
     --with-volume) WITH_VOLUME=1; shift ;;
@@ -571,6 +576,12 @@ step_traffic() {
     fi
     if body_has_line 'X-Forwarded-For: 203.0.113.9'; then
       die "podszyty X-Forwarded-For (203.0.113.9) dotarł do apki — w trybie edge nginx ma go nadpisać"
+    fi
+    if [ -n "$EXPECT_CLIENT_IP" ]; then
+      # The point of the forwarder (issue #162): the app must see the *client's* address, not nginx's own.
+      body_has_line "X-Forwarded-For: $EXPECT_CLIENT_IP" \
+        || die "apka nie widzi 'X-Forwarded-For: $EXPECT_CLIENT_IP' — nginx w trybie edge gubi adres klienta (forwarder z PROXY protocol?)"
+      note "X-Forwarded-For = $EXPECT_CLIENT_IP (prawdziwy adres klienta)"
     fi
     note "https://$CANARY_DOMAIN:$EDGE_HTTPS_PORT/ → 200, cert (testowy), X-Forwarded-* przebudowane z połączenia"
   elif [ -z "$DIRECT" ]; then

@@ -34,13 +34,27 @@ use weglarka_core::uid_range::UidRange;
 use weglarka_core::volumes;
 use weglarka_ingress::{Domain, nginx, traefik};
 
+use crate::service::SERVICE_NAME;
+
 /// Network joined by both the Węglarka and nginx containers (webhooks: `proxy_pass http://weglarka:<port>`).
 pub const WEBHOOK_NETWORK: &str = labels::INGRESS_NETWORK;
 pub const NGINX_CONTAINER: &str = "weglarka-nginx";
+/// `edge` port forwarder (issue #162, docs/decisions/0043): publishes the public sockets on the default
+/// (pasta) network, which keeps the client address, and relays to nginx's unix sockets with PROXY protocol.
+pub const FORWARDER_CONTAINER: &str = "weglarka-forwarder";
 pub const HASH_LABEL: &str = "weglarka.ingress-hash";
 const NGINX_CONF_FILE: &str = "nginx.conf";
 const NGINX_CONF_MOUNT: &str = "/etc/nginx";
 const NGINX_STOP_TIMEOUT: u32 = 10;
+/// `<nginx_conf_dir>/run` (`0700`): the two unix sockets nginx listens on for the forwarder. A subdirectory
+/// of the one directory nginx already mounts, so the trust boundary of docs/decisions/0036 is unchanged; it is
+/// mounted a second time, writable, at [`SOCKET_CONTAINER_DIR`].
+const SOCKET_SUBDIR: &str = "run";
+const SOCKET_CONTAINER_DIR: &str = "/run/weglarka-ingress";
+/// Ports the forwarder listens on inside its container (the host side is `bind` / `https_bind`).
+const FORWARDER_HTTP_PORT: u16 = 8080;
+const FORWARDER_HTTPS_PORT: u16 = 8443;
+
 /// `<nginx_conf_dir>` subdirectories (issue #95): TLS material and the ACME HTTP-01 webroot. Both sit
 /// inside the directory mounted at `/etc/nginx`, so `edge` needs no extra mount and no hash entry
 /// for mounts: the nginx container already sees them.
@@ -64,6 +78,8 @@ pub enum IngressApplyError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot find the daemon's own container to run the port forwarder from its image: {0}")]
+    ForwarderImage(PodmanError),
     #[error("network {0} has no gateway address (no DNS resolver for nginx)")]
     NoResolver(String),
     #[error(
@@ -230,6 +246,10 @@ impl<P: PodmanClient> IngressManager<P> {
             TlsMaterial::default()
         };
 
+        if self.host.ingress.mode == IngressMode::Edge {
+            self.ensure_socket_dir()?;
+        }
+
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
         // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
         let behind = self.host.ingress.mode == IngressMode::Behind;
@@ -302,6 +322,7 @@ impl<P: PodmanClient> IngressManager<P> {
             options.certificates = r.certificates.to_vec();
             options.wildcard_certificates = r.wildcards.to_vec();
             options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
+            options.proxy_socket_dir = Some(SOCKET_CONTAINER_DIR.to_owned());
         }
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
@@ -316,7 +337,14 @@ impl<P: PodmanClient> IngressManager<P> {
             )
             .await
         {
-            Ok(action) => Ok((conf_written, action)),
+            Ok(action) => {
+                if self.host.ingress.mode == IngressMode::Edge {
+                    self.ensure_forwarder().await?;
+                } else {
+                    self.remove_forwarder().await?;
+                }
+                Ok((conf_written, action))
+            }
             Err(e) => {
                 // Roll back so the next `apply` sees the difference again and retries.
                 if let (true, Some(old)) = (conf_written, &previous) {
@@ -343,6 +371,152 @@ impl<P: PodmanClient> IngressManager<P> {
             .find(|c| c.name == NGINX_CONTAINER && c.state == ContainerState::Running)
             .map(|c| c.addresses)
             .unwrap_or_default())
+    }
+
+    fn socket_dir(&self) -> PathBuf {
+        self.conf_dir.join(SOCKET_SUBDIR)
+    }
+
+    /// The `0700` directory of nginx's forwarder sockets. The mode is the whole protection against a
+    /// local user forging a PROXY header, so it is re-applied on every pass.
+    fn ensure_socket_dir(&self) -> Result<(), IngressApplyError> {
+        let dir = self.socket_dir();
+        fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(io_err(&dir))
+    }
+
+    /// nginx does not unlink a socket file a killed predecessor left behind (`bind() … Address already
+    /// in use`), so the files go before every start of the container.
+    fn remove_stale_sockets(&self) -> Result<(), IngressApplyError> {
+        for name in [nginx::PLAIN_SOCKET, nginx::TLS_SOCKET] {
+            let path = self.socket_dir().join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&path)(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `edge`: the forwarder container, created from the daemon's own image (the binary is already
+    /// there, so no second image to pin or pull). Identity = image + publishes + hardening; a daemon
+    /// self-update therefore recreates it once (a short gap on the public ports).
+    async fn ensure_forwarder(&self) -> Result<(), IngressApplyError> {
+        let podman = self.engine.podman();
+        let own = Self::own_container(podman).await?;
+        let bind = self.host.ingress.bind;
+        // Validated at startup (`HostConfig::validate`); the plain publish is the fallback.
+        let https_bind = self.host.ingress.https_bind.unwrap_or(bind);
+        let security = forwarder_security();
+        let hash = forwarder_hash(&own.image_id, bind, https_bind, &security);
+
+        let existing = podman
+            .container_list(&ContainerFilter::default())
+            .await?
+            .into_iter()
+            .find(|c| c.name == FORWARDER_CONTAINER);
+        if let Some(existing) = &existing {
+            if existing.labels.get(HASH_LABEL) == Some(&hash) {
+                if existing.state != ContainerState::Running {
+                    podman.container_start(FORWARDER_CONTAINER).await?;
+                }
+                return Ok(());
+            }
+            self.remove_forwarder().await?;
+        }
+
+        let listen = |bind: SocketAddr, port: u16, socket: &str| {
+            let any = if bind.is_ipv6() { "[::]" } else { "0.0.0.0" };
+            format!("{any}:{port}={SOCKET_CONTAINER_DIR}/{socket}")
+        };
+        let mut command = vec!["forward".to_owned()];
+        for route in [
+            listen(bind, FORWARDER_HTTP_PORT, nginx::PLAIN_SOCKET),
+            listen(https_bind, FORWARDER_HTTPS_PORT, nginx::TLS_SOCKET),
+        ] {
+            command.push("--route".to_owned());
+            command.push(route);
+        }
+        let publish = vec![
+            PortMapping {
+                host_ip: Some(bind.ip().to_string()),
+                host_port: bind.port(),
+                container_port: FORWARDER_HTTP_PORT,
+            },
+            PortMapping {
+                host_ip: Some(https_bind.ip().to_string()),
+                host_port: https_bind.port(),
+                container_port: FORWARDER_HTTPS_PORT,
+            },
+        ];
+        podman
+            .container_create(&ContainerSpec {
+                name: FORWARDER_CONTAINER.to_owned(),
+                image: own.image_id,
+                command,
+                entrypoint: None,
+                // No `weglarka.instance` — reconcile would treat the container as an orphan.
+                labels: BTreeMap::from([(HASH_LABEL.to_owned(), hash)]),
+                env: BTreeMap::new(),
+                // No network: libpod's rootless default (pasta), the one that keeps the client address.
+                networks: vec![],
+                network_aliases: Default::default(),
+                secrets: vec![],
+                publish,
+                restart: RestartPolicy::Always,
+                userns_auto: false,
+                // Container root is the runtime user on libpod's default map, so it can open the
+                // `0700` socket directory; nothing else is mounted.
+                mounts: vec![BindMount {
+                    source: self.socket_dir().display().to_string(),
+                    target: SOCKET_CONTAINER_DIR.to_owned(),
+                    read_only: false,
+                }],
+                volumes: vec![],
+                resources: Default::default(),
+                healthcheck: None,
+                id_mapping: None,
+                security,
+            })
+            .await?;
+        podman.container_start(FORWARDER_CONTAINER).await?;
+        Ok(())
+    }
+
+    /// The daemon's own container. Podman sets a container's hostname to its id prefix, which also
+    /// works when the quadlet's name is not `weglarka` (the smoke tests name it differently); the
+    /// well-known name is the fallback.
+    async fn own_container(
+        podman: &P,
+    ) -> Result<weglarka_core::podman::ContainerInfo, IngressApplyError> {
+        let hostname = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        let hostname = hostname.trim();
+        if !hostname.is_empty()
+            && let Ok(info) = podman.container_inspect(hostname).await
+        {
+            return Ok(info);
+        }
+        podman
+            .container_inspect(SERVICE_NAME)
+            .await
+            .map_err(IngressApplyError::ForwarderImage)
+    }
+
+    /// Removes the forwarder if there is one (a switch to `behind`, or a replaced identity).
+    async fn remove_forwarder(&self) -> Result<(), IngressApplyError> {
+        let podman = self.engine.podman();
+        match podman
+            .container_stop(FORWARDER_CONTAINER, NGINX_STOP_TIMEOUT)
+            .await
+        {
+            Ok(()) | Err(PodmanError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match podman.container_remove(FORWARDER_CONTAINER, true).await {
+            Ok(()) | Err(PodmanError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// `nginx.conf` atomically (the directory is mounted, so the `rename` is visible in the container).
@@ -503,6 +677,7 @@ impl<P: PodmanClient> IngressManager<P> {
             https_listen_port,
             range,
             &nginx_security(),
+            self.host.ingress.mode == IngressMode::Edge,
         );
 
         let existing = podman
@@ -545,6 +720,7 @@ impl<P: PodmanClient> IngressManager<P> {
 
         let mut action = NginxAction::None;
         if existing.state != ContainerState::Running {
+            self.remove_stale_sockets()?;
             podman.container_start(NGINX_CONTAINER).await?;
             action = NginxAction::Started;
         } else if conf_changed {
@@ -592,18 +768,30 @@ impl<P: PodmanClient> IngressManager<P> {
         let bind = self.host.ingress.bind;
         // nginx listens on unprivileged ports inside the container; only the *host* side is 80/443 in
         // `edge`, so the hardened profile needs no `NET_BIND_SERVICE` (ADR 0014).
-        let mut publish = vec![PortMapping {
-            host_ip: Some(bind.ip().to_string()),
-            host_port: bind.port(),
-            container_port: listen_port,
+        let edge = self.host.ingress.mode == IngressMode::Edge;
+        // `edge`: the forwarder owns the public sockets (rootlessport would hide the client address,
+        // issue #162); nginx publishes nothing and is reached over its unix sockets.
+        let mut publish = Vec::new();
+        let mut mounts = vec![BindMount {
+            source: self.conf_dir.display().to_string(),
+            target: NGINX_CONF_MOUNT.to_owned(),
+            read_only: true,
         }];
-        if let Some(https) = self.host.ingress.https_bind {
+        if edge {
+            mounts.push(BindMount {
+                source: self.socket_dir().display().to_string(),
+                target: SOCKET_CONTAINER_DIR.to_owned(),
+                read_only: false,
+            });
+            self.remove_stale_sockets()?;
+        } else {
             publish.push(PortMapping {
-                host_ip: Some(https.ip().to_string()),
-                host_port: https.port(),
-                container_port: https_listen_port,
+                host_ip: Some(bind.ip().to_string()),
+                host_port: bind.port(),
+                container_port: listen_port,
             });
         }
+        let _ = https_listen_port;
         self.ensure_image(image).await?;
         if replace {
             match podman
@@ -631,11 +819,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 publish,
                 restart: RestartPolicy::Always,
                 userns_auto: false,
-                mounts: vec![BindMount {
-                    source: self.conf_dir.display().to_string(),
-                    target: NGINX_CONF_MOUNT.to_owned(),
-                    read_only: true,
-                }],
+                mounts,
                 volumes: vec![],
                 resources: Default::default(),
                 healthcheck: None,
@@ -668,6 +852,9 @@ impl<P: PodmanClient> IngressManager<P> {
 /// Version of the ingress hash input; bump when its shape changes (recreates every nginx container).
 /// v3 (issue #95): the mode and the second publish are part of the identity.
 const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v3";
+/// v4 (issue #162): `edge` nginx publishes nothing and listens on the forwarder's unix sockets. Only
+/// `edge` hashes with it, so `behind` keeps its v3 identity and is not recreated by the upgrade.
+const INGRESS_HASH_FORMAT_SOCKETS: &str = "weglarka.ingress-hash/v4";
 
 /// Hardened profile of the nginx container — ours to choose, unlike an app's `security`, so it is always
 /// on (docs/decisions/0014): read-only root with libpod's writable `/tmp`, `/var/tmp` and `/run` tmpfs
@@ -750,9 +937,14 @@ fn ingress_hash(
     https_listen_port: u16,
     range: UidRange,
     security: &Security,
+    proxy_sockets: bool,
 ) -> String {
     let input = IngressHashInput {
-        format: INGRESS_HASH_FORMAT,
+        format: if proxy_sockets {
+            INGRESS_HASH_FORMAT_SOCKETS
+        } else {
+            INGRESS_HASH_FORMAT
+        },
         image,
         bind: bind.to_string(),
         https_bind: https_bind.map(|b| b.to_string()),
@@ -764,6 +956,44 @@ fn ingress_hash(
     };
     let json = serde_json::to_vec(&input).expect("ingress hash input is always serializable");
     hex::encode(&Sha256::digest(json)[..8])
+}
+
+/// Identity of the forwarder container: the image it runs, what it publishes and its hardening.
+fn forwarder_hash(
+    image_id: &str,
+    bind: SocketAddr,
+    https_bind: SocketAddr,
+    security: &Security,
+) -> String {
+    #[derive(Serialize)]
+    struct Input<'a> {
+        format: &'static str,
+        image: &'a str,
+        bind: String,
+        https_bind: String,
+        security: &'a Security,
+    }
+    let json = serde_json::to_vec(&Input {
+        format: "weglarka.forwarder-hash/v1",
+        image: image_id,
+        bind: bind.to_string(),
+        https_bind: https_bind.to_string(),
+        security,
+    })
+    .expect("forwarder hash input is always serializable");
+    hex::encode(&Sha256::digest(json)[..8])
+}
+
+/// The forwarder needs nothing: no capability, a read-only root, no privilege escalation. (Binding
+/// host ports below 1024 is the host sysctl's business, not a container capability.)
+fn forwarder_security() -> Security {
+    Security {
+        read_only: true,
+        tmpfs: vec![],
+        cap_drop: vec!["ALL".to_owned()],
+        cap_add: vec![],
+        no_new_privileges: true,
+    }
 }
 
 /// Field order is part of the hash format (mirrors `weglarka_core::hash::HashInput`).
@@ -870,9 +1100,9 @@ mod tests {
         };
         let sec = nginx_security();
         let bind = "127.0.0.1:18080".parse().unwrap();
-        let a = ingress_hash("i", bind, None, 8080, 8443, r, &sec);
-        assert_eq!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
-        assert_ne!(a, ingress_hash("j", bind, None, 8080, 8443, r, &sec));
+        let a = ingress_hash("i", bind, None, 8080, 8443, r, &sec, false);
+        assert_eq!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec, false));
+        assert_ne!(a, ingress_hash("j", bind, None, 8080, 8443, r, &sec, false));
         assert_ne!(
             a,
             ingress_hash(
@@ -882,10 +1112,11 @@ mod tests {
                 8080,
                 8443,
                 r,
-                &sec
+                &sec,
+                false
             )
         );
-        assert_ne!(a, ingress_hash("i", bind, None, 8081, 8443, r, &sec));
+        assert_ne!(a, ingress_hash("i", bind, None, 8081, 8443, r, &sec, false));
         assert_ne!(
             a,
             ingress_hash(
@@ -898,7 +1129,8 @@ mod tests {
                     start: 4097,
                     size: 4096
                 },
-                &sec
+                &sec,
+                false
             )
         );
     }
@@ -914,8 +1146,11 @@ mod tests {
         let sec = nginx_security();
         let bind = "0.0.0.0:80".parse().unwrap();
         let https = "0.0.0.0:443".parse().unwrap();
-        let a = ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec);
-        assert_eq!(a, ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec));
+        let a = ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec, false);
+        assert_eq!(
+            a,
+            ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec, false)
+        );
         assert_ne!(
             a,
             ingress_hash(
@@ -925,11 +1160,15 @@ mod tests {
                 8080,
                 8443,
                 r,
-                &sec
+                &sec,
+                false
             )
         );
-        assert_ne!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
-        assert_ne!(a, ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec));
+        assert_ne!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec, false));
+        assert_ne!(
+            a,
+            ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec, false)
+        );
     }
 
     /// Upgrading from a build without hardening must recreate nginx: the profile is in the hash.
@@ -943,15 +1182,15 @@ mod tests {
         let hardened = nginx_security();
         let unhardened = Security::default();
         assert_ne!(
-            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
-            ingress_hash("i", bind, None, 8080, 8443, r, &unhardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened, false),
+            ingress_hash("i", bind, None, 8080, 8443, r, &unhardened, false),
             "a profile change must not leave the old container in place"
         );
         let mut no_nnp = hardened.clone();
         no_nnp.no_new_privileges = false;
         assert_ne!(
-            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
-            ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp)
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened, false),
+            ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp, false)
         );
     }
 }

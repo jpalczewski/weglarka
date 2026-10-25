@@ -120,6 +120,8 @@ fn main() {
                 .map(|d| Domain::new(d).expect("wildcard apex"))
                 .collect();
             options.tls_fingerprint = Some("1a2b3c4d".to_owned());
+            // Optional: also listen on the port forwarder's unix sockets (issue #162).
+            options.proxy_socket_dir = std::env::var("WEGLARKA_DUMP_PROXY_SOCKET_DIR").ok();
             nginx::generate(&host, &apps, &options)
         }
         Some("traefik") => traefik::generate(&host, &apps, &traefik::TraefikOptions::default()),

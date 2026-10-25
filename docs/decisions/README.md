@@ -49,3 +49,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0040](0040-one-off-containers.md) | One-off containers (`weglarka run`) |
 | [0041](0041-temporary-port-forward.md) | Temporary port forward (`weglarka forward`) |
 | [0042](0042-push-local-images.md) | Deploying a locally built image (`weglarka push`) |
+| [0043](0043-edge-client-address.md) | Edge mode: the client address is lost behind rootlessport |

@@ -22,6 +22,20 @@ https_bind = "0.0.0.0:443"   # TLS: one server per domain, certificate from <sta
   app in plaintext**. Certificates are issued by `[acme]` ([ACME certificates](acme.md)) or you put them there
   yourself (a self-signed one is enough in tests).
 
+## Client address (the port forwarder)
+
+The public ports are published by a separate container, `weglarka-forwarder` (the daemon's own image,
+`weglarka-daemon forward`, default rootless network = pasta). rootlessport would reconnect from inside nginx's
+network namespace and nginx would see its own address as every client. The forwarder keeps the real peer address
+and relays each connection to nginx over a unix socket in `<nginx_conf_dir>/run` (mode `0700`, the protection
+against a forged header), prefixed with a PROXY protocol v2 header; nginx listens on those sockets with
+`proxy_protocol` and trusts only them. nginx itself publishes nothing. No systemd is involved, so it works under
+OpenRC too. Decision and measurements: [ADR 0043](../decisions/0043-edge-client-address.md).
+
+- A daemon self-update recreates the forwarder (a short gap on 80/443); `doctor` reports `ingress.client_ip`.
+- Downgrading to an older daemon leaves the container behind: `podman rm -f weglarka-forwarder`.
+- Check the address from **another host**: `scripts/acceptance.sh --expect-client-ip <ip>`.
+
 ## Certificates and the ACME webroot
 
 | path | mode | role |

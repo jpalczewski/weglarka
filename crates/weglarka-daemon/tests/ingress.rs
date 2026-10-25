@@ -381,6 +381,7 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     host.validate().unwrap();
     let paths = StatePaths::in_dir(root);
     let fake = FakePodman::new();
+    seed_own_container(&fake).await;
     let engine = Arc::new(Reconciler::new(
         fake.clone(),
         Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
@@ -398,7 +399,11 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     // every SNI, because no certificate exists yet.
     assert_eq!(action(manager.apply().await), Some(NginxAction::Created));
     let spec = id(&fake);
-    let publishes: Vec<(u16, u16)> = spec
+    // The forwarder owns the public sockets (issue #162); nginx publishes nothing.
+    assert!(spec.publish.is_empty(), "{:?}", spec.publish);
+    let publishes: Vec<(u16, u16)> = fake
+        .container_spec("weglarka-forwarder")
+        .unwrap()
         .publish
         .iter()
         .map(|p| (p.host_port, p.container_port))
@@ -417,7 +422,15 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     assert!(conf.contains("listen 8443 ssl default_server;"), "{conf}");
     assert!(conf.contains("ssl_reject_handshake on;"), "{conf}");
     assert!(!conf.contains("ssl_certificate "), "{conf}");
-    assert!(!conf.contains("set_real_ip_from"), "{conf}");
+    // Only the forwarder's unix socket is trusted to announce the client (PROXY protocol).
+    assert!(conf.contains("set_real_ip_from unix:;"), "{conf}");
+    assert_eq!(conf.matches("set_real_ip_from").count(), 1, "{conf}");
+    assert!(
+        conf.contains(
+            "listen unix:/run/weglarka-ingress/https.sock ssl default_server proxy_protocol;"
+        ),
+        "{conf}"
+    );
     let tls = manager.tls_dir();
     let acme = manager.acme_dir();
     assert_eq!(
@@ -507,6 +520,7 @@ async fn edge_serves_covered_domains_with_a_wildcard_pair() {
     host.validate().unwrap();
     let paths = StatePaths::in_dir(root);
     let fake = FakePodman::new();
+    seed_own_container(&fake).await;
     let engine = Arc::new(Reconciler::new(
         fake.clone(),
         Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
@@ -585,4 +599,13 @@ async fn edge_serves_covered_domains_with_a_wildcard_pair() {
     std::fs::remove_file(tls.join("_wildcard.example.eu.key")).unwrap();
     assert!(reloaded(manager.apply().await));
     assert!(!conf().contains("ssl_certificate "), "{}", conf());
+}
+
+/// The daemon's own container: the `edge` forwarder runs from its image (issue #162).
+async fn seed_own_container(fake: &FakePodman) {
+    let mut pull = std::pin::pin!(fake.image_pull("ghcr.io/jpalczewski/weglarka:test"));
+    while let Some(event) = futures_util::StreamExt::next(&mut pull).await {
+        event.unwrap();
+    }
+    fake.add_foreign_container("weglarka", "ghcr.io/jpalczewski/weglarka:test");
 }
