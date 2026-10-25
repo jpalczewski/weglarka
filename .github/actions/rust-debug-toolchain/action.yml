@@ -1,0 +1,36 @@
+name: Rust debug toolchain
+description: >-
+  Toolchain, mold and the shared debug-build cache for the gnu CI jobs (check, nginx-e2e, podman-tests).
+inputs:
+  shared-key:
+    description: rust-cache shared-key.
+    required: true
+  save-if:
+    description: Whether this job writes the cache ("true"/"false").
+    required: true
+runs:
+  using: composite
+  steps:
+  - name: Install mold
+    shell: bash
+    run: sudo apt-get install -y mold
+  # A composite action cannot set job-level `env`, so the variables go through $GITHUB_ENV. This step must stay
+  # before rust-cache: its key hashes these variables, and every job restoring the `check` entry has to see the
+  # same values. RUSTFLAGS links the debug test binaries with mold (the daemon alone has 15 integration-test
+  # binaries, so linking dominates); it replaces the workflow-level value because RUSTFLAGS takes precedence
+  # over a per-target CARGO_TARGET_<triple>_RUSTFLAGS. Line tables are enough for test backtraces and make
+  # the debug objects and linking cheaper.
+  - name: Export the debug build environment
+    shell: bash
+    run: |
+      {
+        echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=mold"
+        echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
+      } >> "$GITHUB_ENV"
+  - name: Install the pinned toolchain
+    shell: bash
+    run: rustup show active-toolchain || rustup toolchain install
+  - uses: Swatinem/rust-cache@v2
+    with:
+      shared-key: ${{ inputs.shared-key }}
+      save-if: ${{ inputs.save-if }}

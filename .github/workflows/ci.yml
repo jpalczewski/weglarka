@@ -94,20 +94,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    env:
-      # Link the debug test binaries with mold (the daemon alone has 15 integration-test binaries, so
-      # linking dominates the build). Only these gnu jobs set it; the musl jobs keep the workflow-level
-      # RUSTFLAGS. RUSTFLAGS must be overridden here because it takes precedence over a per-target
-      # CARGO_TARGET_<triple>_RUSTFLAGS, and the mold flag would be silently dropped.
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-      # Line tables are enough for test backtraces and make the debug objects and linking cheaper.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y mold
       - run: shellcheck -x scripts/*.sh .github/scripts/*.sh
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-debug-toolchain
         with:
           shared-key: check
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -126,16 +116,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    env:
-      # Same as `check`: rust-cache keys on these variables, so the read-only restore of the `check` cache
-      # only hits with identical values.
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y mold
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      # Read-only restore of the cache `check` writes (same environment, so the same key).
+      - uses: ./.github/actions/rust-debug-toolchain
         with:
           shared-key: check
           save-if: false
@@ -284,18 +268,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    env:
-      # Same as `check`: rust-cache keys on these variables, so the read-only restore of the `check` cache
-      # only hits with identical values.
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y mold
       - uses: ./.github/actions/podman-rootless
-      - run: rustup show active-toolchain || rustup toolchain install
       # Read-only: the cache is written by the `check` job on main (same debug target).
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-debug-toolchain
         with:
           shared-key: check
           save-if: false
