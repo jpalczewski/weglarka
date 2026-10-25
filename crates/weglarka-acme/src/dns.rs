@@ -33,7 +33,11 @@ impl<P: DnsProvider> DnsSolver<P> {
 
     fn key(challenge: &Challenge) -> (String, String) {
         (
-            format!("_acme-challenge.{}", challenge.name),
+            // The record lives at the base name even if a caller passes the wildcard form.
+            format!(
+                "_acme-challenge.{}",
+                challenge.name.trim_start_matches("*.")
+            ),
             challenge.dns01_txt_value(),
         )
     }
@@ -267,5 +271,18 @@ mod tests {
             .collect();
         assert_eq!(sets, ["_acme-challenge.example.eu"; 2], "wildcard + apex");
         assert!(dns.records().is_empty(), "both records were removed");
+    }
+
+    #[test]
+    fn wildcard_identifier_maps_to_the_base_record_name() {
+        let c = Challenge {
+            name: "*.example.eu".into(),
+            token: "t".into(),
+            key_authorization: "k".into(),
+        };
+        assert_eq!(
+            DnsSolver::<FakeDns>::key(&c).0,
+            "_acme-challenge.example.eu"
+        );
     }
 }

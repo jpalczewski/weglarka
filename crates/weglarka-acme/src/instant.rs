@@ -210,8 +210,11 @@ async fn drive<S: ChallengeSolver>(
                 solver.kind().as_str()
             ))
         })?;
+        // A wildcard authorization is for the base name; the CA reports it with its `*.` prefix, but
+        // the challenge record (`_acme-challenge.<name>`) lives at the base name (RFC 8555 §7.1.3).
+        let identifier = handle.identifier().to_string();
         let challenge = Challenge {
-            name: handle.identifier().to_string(),
+            name: identifier.trim_start_matches("*.").to_owned(),
             token: handle.token.clone(),
             key_authorization: handle.key_authorization().as_str().to_owned(),
         };
