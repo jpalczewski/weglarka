@@ -44,6 +44,35 @@ daemon is expressed by the `weglarka-api` version, so breaking changes to the ad
 - The config was written without running release-plz locally; verify with `release-plz update --dry-run` (or a
   first run of the workflow) and adjust `release-plz.toml` if the options differ in the installed version.
 
+## Amendment (2026-10-25): internal requirements are `"0.0"`, except for the contract
+
+The first release PRs showed the cost of the rule above. The internal dependencies carried the exact
+current version (`version = "0.0.2"`), and on 0.0.x a caret requirement matches that one version only, so
+every bump of `weglarka-core` broke the requirement of each dependent. release-plz then rewrote the
+dependents' `Cargo.toml` and bumped them too, with the changelog line “updated the following local
+packages: weglarka-core” — `weglarka-api`, `weglarka-notify` and `weglarka-registry` got a release without a
+single change of their own, which defeats “which crate actually changed” (the point of per-crate versions).
+
+A requirement cannot tell a breaking bump of the third field from an ordinary one: release-plz releases a
+dependent exactly when the requirement stops matching. So the decision is made per dependency:
+
+- **Implementation crates** (`core`, `podman`, `ingress`, `notify`, `registry`, `acme`) keep `path` and use
+  `version = "0.0"`, which every 0.0.x release satisfies. A bump of such a crate releases only that crate;
+  a dependent is released for it only when the crate leaves 0.0.x (`0.1.0`, a deliberate step).
+- **The contract** (`weglarka-api`, which is how the CLI and the daemon agree, see the invariants above)
+  keeps the exact current version (`version = "0.0.N"`). Every release of `weglarka-api` rewrites the
+  requirement and releases its consumers (`weglarka-cli`, `weglarka-daemon`), which is intended: a contract
+  change must reach both sides.
+
+The `version` field stays on every entry (cargo requires one to package a crate, which release-plz does to
+compare releases). Measured with release-plz 0.4.1: on this repository's history since `v0.0.2`, before
+the change all nine crates were bumped (`api` and `registry` only through the cascade), after it `api` and
+`registry` stay put and the others bump for their own commits; on a two-pair toy workspace a change in a
+crate with an exact requirement released its dependent, and the same change in a crate with `"0.0"` did not.
+Nothing is published, so the looser requirement has no effect on consumers; `Cargo.lock` is unchanged.
+New internal crates default to `"0.0"`; use the exact version only for a crate that is a contract between
+two binaries.
+
 ## Rejected alternatives
 
 - **git-cliff alone**: one root changelog from history; simpler, but no per-crate versions or changelogs.
