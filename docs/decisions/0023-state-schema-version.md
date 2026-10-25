@@ -60,7 +60,7 @@ digest, and both have to know *why* a daemon refused to start instead of guessin
 
 **Invariants an implementer must preserve:** v1 files stay byte-for-byte unchanged (no marker until
 the first bump); a new field in either file comes with a `SCHEMA_VERSION` bump, a `SCHEMA_STEPS` entry
-and an `docs/install.md` note; the gate never lets a newer file reach the strict parser; a file is
+and a [state schema guide](../guides/state-schema.md) note; the gate never lets a newer file reach the strict parser; a file is
 only ever written by the daemon, atomically, through `save_apps`/`save_state`.
 
 ## Consequences

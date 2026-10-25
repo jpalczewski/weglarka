@@ -112,8 +112,8 @@ is group/world-writable.
   `schema_version = 2` and an older daemon refuses to start with the schema message instead of a TOML
   parse error. Rolling back across the bump means restoring `apps.toml`/`state.toml` from before the
   upgrade, or removing the new fields **and** the marker. `weglarka.toml` stays unversioned
-  (human-written config), so `config_root` must be removed by hand. Documented in `docs/install.md`
-  ([the install guide](../install.md#wersja-schematu-plików-stanu-rollback-między-wersjami) and its
+  (human-written config), so `config_root` must be removed by hand. Documented in [the host configs guide](../guides/host-configs.md)
+  ([the state schema guide](../guides/state-schema.md) and its
   section 6k) and in the PR.
 - No `spec_hash` change for apps that do not use configs (golden snapshot stays); adding `configs`
   recreates the container on the next deploy.

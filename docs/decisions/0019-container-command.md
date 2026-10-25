@@ -106,14 +106,14 @@ reconcile recreates the container from the pinned digest — without pulling any
 - **Only the main process, not the probe.** `command` and `health.command` are different things with the
   same exec-form shape: one configures the container's argv, the other a health probe. The names keep
   them apart; neither implies the other.
-- **The rollback caveat is permanent user-facing behaviour.** It is documented in `docs/install.md` (6f
-  and section 7) because it is the failure mode most likely to be misread: the deploy "succeeds" at
+- **The rollback caveat is permanent user-facing behaviour.** It is documented in [the command guide](../guides/container-command.md) and
+  [the rollback guide](../guides/verify-and-rollback.md) because it is the failure mode most likely to be misread: the deploy "succeeds" at
   rolling back and the app is still down, while nothing in the image was wrong.
 - **Backward compatibility in both directions needs a note.** An older `apps.toml` parses fine with the
   new daemon (the field is optional). The reverse is not true: `apps.toml` has `deny_unknown_fields`, so
   **downgrading Węglarka requires removing `command` first** (`apps update <app> --command none` or
   editing the file), otherwise the older daemon refuses to start with a parse error. Documented in
-  `docs/install.md` (section 7).
+  [the rollback guide](../guides/verify-and-rollback.md).
 - **Verification.** The wire mapping is pinned by a snapshot of the libpod create body and by an
   integration test against a real rootless Podman (`weglarka-podman/tests/podman.rs`): the `pause`
   image, started with `command = ["-v"]`, receives the argument after its `ENTRYPOINT` and exits 0
@@ -121,7 +121,7 @@ reconcile recreates the container from the pinned digest — without pulling any
   (unset and empty hash as before, order matters), the argument validation and the CLI flags.
   End-to-end acceptance, as in the issue, is a deploy of the motivating image —
   `weglarka apps add ntfy docker.io/binwiederhier/ntfy:<tag> --command serve …` passing the health
-  gate — documented in `docs/install.md` (6f).
+  gate — documented in [the command guide](../guides/container-command.md).
 
 ## Rejected alternatives
 

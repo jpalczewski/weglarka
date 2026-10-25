@@ -40,7 +40,7 @@ what is left.**
      scope of a renamed instance are cleaned up.
    - **`--force` on a bound secret** is the operator's explicit "I know": the value is gone, the next
      reconcile puts the app into `waiting-for-secret` (blocked, not failed — see
-     [`docs/install.md` 6](../install.md#6-pierwsza-apka-ntfyzig)),
+     [the first app guide](../guides/first-app.md)),
      and a running container keeps the materialized value it already holds until it is recreated.
      The removal itself **never triggers a deploy**.
 2. **`weglarka apps remove <app> --purge-secrets`** deletes the entire `<app>.*` scope of
@@ -77,7 +77,7 @@ existing; `doctor` only warns.
   rolling back the daemon/CLI recreates nothing. A **new CLI against an old daemon** silently ignores
   `--purge-secrets` (the old daemon does not know the query field: the app is removed and its secrets
   stay) and gets 404 for the new `DELETE`. Upgrade the daemon first — documented in
-  [`docs/install.md` 6i](../install.md#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
+  [the secrets cleanup guide](../guides/secrets-cleanup.md).
 - After `--force` on a bound secret the app blocks at the next reconcile; setting the secret again
   (`weglarka secrets set <app> <name> < file`) clears the state and the deploy resumes by itself.
 - The materialized Podman secrets of a removed app are not deleted by this change (known gap); the

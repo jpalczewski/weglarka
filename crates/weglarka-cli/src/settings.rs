@@ -29,7 +29,7 @@ pub fn load_config(path: &Path) -> Result<HostConfig, CliError> {
             format!("invalid config {}: {e}", path.display()),
         )
         .with_hint(
-            "required sections: [ingress], [admin], [webhook]; example: docs/install.md (section 2)",
+            "required sections: [ingress], [admin], [webhook]; example: docs/install.md (Host configuration)",
         )
     })
 }

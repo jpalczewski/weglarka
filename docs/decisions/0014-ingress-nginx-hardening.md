@@ -60,7 +60,7 @@ Security {
 - **A custom `ingress.nginx_image` must tolerate the profile.** The official `nginx:*-alpine` image does: its
   entrypoint only writes `/etc/nginx`, which is already mounted read-only and skipped when unwritable; the pid and
   temp paths come from our generated config. An image that writes to its own rootfs at startup now fails — a
-  deliberate constraint, documented in `docs/install.md`.
+  deliberate constraint, documented in [the container hardening guide](../guides/container-hardening.md).
 - **Verification** (the issue's list): `nginx -t` inside the container, `.github/scripts/test-forwarded-headers.sh`,
   `scripts/acceptance.sh`, and the smoke scripts (`.github/scripts/smoke-image.sh`, `smoke-quadlet.sh`), which now
   assert a read-only root, `no-new-privileges`, an effective capability set of exactly

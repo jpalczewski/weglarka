@@ -51,7 +51,7 @@ must never open a service to the network by itself, and Podman's own default (`0
 failure mode to avoid.
 
 **The ingress is bypassed entirely.** A published port has no TLS, no certificate, no nginx/Traefik router, no
-routing by domain and no access log; `docs/install.md` says so next to the example. The host firewall is the
+routing by domain and no access log; the [host ports guide](../guides/host-ports.md) says so next to the example. The host firewall is the
 only gate, and it is owned **outside** Węglarka: the Ansible role `weglarka_host` manages UFW, while Węglarka
 runs rootless (and `DropCapability=ALL` in the quadlet) and never edits firewall rules — an app spec must not
 be able to open the host's firewall as a side effect. Closing the port is therefore an operator action in
@@ -107,7 +107,7 @@ API surface.
 - Rollback: `apps.toml` and `weglarka.toml` use `deny_unknown_fields`, so an older daemon cannot read a file
   containing `host_ports` or `[runtime] allow_privileged_host_ports`. A downgrade requires removing those
   entries first; `apps update --spec` replaces the whole spec, so a file without `host_ports` drops them like
-  any other field. Documented in `docs/install.md` (6c and the rollback section).
+  any other field. Documented in [the host ports guide](../guides/host-ports.md).
 - Tests: unit tests for the structural rules (zero ports, invalid IP, a duplicate socket within one app), the
   cross-app module (two apps, wildcard overlap, the ingress bind, privileged ports with and without the
   opt-in), the hash (`host_ports_are_container_settings`: empty list unchanged, explicit loopback equal to the

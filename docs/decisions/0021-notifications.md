@@ -110,7 +110,7 @@ name in the outbox; `Severity` ordering is `debug < info < warning < critical`.
   `weglarka-daemon` (`start`, `Daemon.notify`, `Running::stop`) and in `weglarka-api` (two endpoints,
   additive). Per-crate versioning picks the crate up automatically (`release-plz.toml` entry).
 - **Rollback caveat:** `weglarka.toml` uses `deny_unknown_fields`, so an older daemon refuses to start
-  with a `[notify]` section. Remove the section before downgrading (documented in `docs/install.md`).
+  with a `[notify]` section. Remove the section before downgrading (documented in [the notifications guide](../guides/notifications.md)).
 - The daemon must be able to reach the ntfy endpoint: `notify test` is the check. For a self-hosted ntfy
   the documented paths are its public HTTPS domain or the internal `weglarka-nginx:8080` + `host` pair.
 - Tests: the notify crate covers message rendering (insta snapshots), the severity table, dedup windows

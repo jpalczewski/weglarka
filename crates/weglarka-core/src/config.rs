@@ -743,7 +743,7 @@ socket = "/run/user/1001/weglarka/admin.sock"
 
 [webhook]
 listen = "0.0.0.0:9180"
-domain = "weglarka.descriptortable.eu"
+domain = "weglarka.example.com"
 
 [platform]
 kind = "systemd"
@@ -1044,7 +1044,7 @@ socket = "/run/user/1001/weglarka/admin.sock"
 
 [webhook]
 listen = "0.0.0.0:9180"
-domain = "weglarka.descriptortable.eu"
+domain = "weglarka.example.com"
 "#;
 
     fn ingress(src: &str) -> Result<(), String> {

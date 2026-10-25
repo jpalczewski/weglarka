@@ -108,7 +108,7 @@ looped.
 The daemon confirms the outcome on its next start and exposes it as the `doctor` check `self_update`; a switch
 that did not take effect is reported there (and as a `SelfUpdatePending` notification) instead of being assumed,
 and a confirmed fallback becomes a `SelfUpdateFellBack` notification.
-Operator runbook: `docs/install.md` section 6k.
+Operator runbook: `docs/guides/self-update.md`.
 
 ## Known limitations (before deployment)
 
@@ -121,6 +121,6 @@ Operator runbook: `docs/install.md` section 6k.
 - No concurrency limit/rate limit on the webhook listener (nginx with a body-size limit sits in front of it).
 - `deploy` with `image_ref` → 400; `Failed` without rollback → 500.
 - Changing `[ingress]`/`[webhook]` in `weglarka.toml` requires a daemon restart (config is read once).
-- `edge` certificates come from the `[acme]` worker (`src/acme.rs`, HTTP-01, docs/install.md 6q) or are
+- `edge` certificates come from the `[acme]` worker (`src/acme.rs`, HTTP-01, docs/guides/acme.md) or are
   operator-provided; a routed domain without a certificate pair gets no TLS server (fail closed) and
   `doctor` reports it as `ingress.tls` (and `acme.certs` when `[acme]` is on).

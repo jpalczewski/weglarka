@@ -1,136 +1,115 @@
-# Instalacja Węglarki
+# Installing Węglarka
 
-Węglarka działa jako **kontener rootless Podmana** (quadlet w systemd usera) obok własnego kontenera nginx;
-CLI `weglarka` zostaje poza kontenerem — na hoście albo na laptopie przez tunel SSH do socketu admina.
-Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z Coolify). Decyzje:
-[0005](decisions/0005-ingress-i-platforma.md), [0006](decisions/0006-pakowanie-obrazy-i-release.md).
+Węglarka runs as a **rootless Podman container** (a quadlet in the user's systemd) next to its own nginx container.
+The `weglarka` CLI stays outside the container: on the host, or on a laptop through an SSH tunnel to the admin socket.
+Examples assume the host `myhost` (Ubuntu 24.04, `behind` mode, Traefik from Coolify). Decisions:
+[ADR 0005](decisions/0005-ingress-i-platforma.md), [ADR 0006](decisions/0006-pakowanie-obrazy-i-release.md).
 
-**Spis treści:** [1. Wymagania hosta](#1-wymagania-hosta) · [2. Konfiguracja hosta](#2-konfiguracja-hosta) ·
-[3. Binarki na hoście](#3-binarki-na-hoście-platform-install) · [4. Quadlet i start](#4-quadlet-i-start) ·
-[5. CLI z laptopa](#5-cli-z-laptopa-macos-przez-tunel-ssh) · [Odbiór](#odbiór-na-hoście-scriptsacceptancesh) ·
-[6. Pierwsza apka](#6-pierwsza-apka-ntfyzig) ·
-[6a. Wolumeny, UID i import](#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2)
-([wolumeny współdzielone](#wolumeny-współdzielone-grupa-uid-iteracja-2)) ·
-[6b. `start = false`](#6b-zatrzymywanie-apek-start--false) ·
-[6c. Porty na hoście](#6c-porty-publikowane-na-hoście-host_ports) ·
-[6d. Zależności między apkami](#6d-zależności-między-apkami-depends_on) ·
-[6e. Streaming](#6e-streaming-sse-long-polling) ·
-[6f. Komenda i argumenty](#6f-komenda-i-argumenty-kontenera-command) ·
-[6g. Retencja obrazów](#6g-retencja-obrazów-i-jednorazowe-sprzątanie) ·
-[6h. Powiadomienia](#6h-powiadomienia-ntfy) ·
-[6i. Wykrywanie awarii](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) ·
-[6j. Sekrety: usuwanie i sprzątanie](#6j-sekrety-usuwanie-i-sprzątanie-po-apce) ·
-[6k. Samoaktualizacja](#6k-samoaktualizacja-węglarki-self_update) ·
-[6l. Configi z hosta](#6l-configi-z-hosta-config_root-i-apps-reload) ·
-[6m. Wspólna sieć między apkami](#6m-wspólna-sieć-między-apkami-shared_networks) ·
-[6n. Ścieżki na jednej domenie](#6n-ścieżki-na-jednej-domenie-paths) ·
-[6o. Limit rozmiaru żądania](#6o-limit-rozmiaru-żądania-ingressmax_body_size) ·
-[6p. Tryb `edge`](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu) ·
-[6q. Certyfikaty ACME](#6q-certyfikaty-acme-http-01-acme) ·
-[6r. Jednorazowe polecenia](#6r-jednorazowe-polecenia-weglarka-run) ·
-[6s. Wildcard przez DNS-01](#6s-certyfikaty-wildcard-dns-01-acmedns) ·
-[7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
+This page covers installation only: host requirements, host configuration, binaries, the quadlet, image
+verification, the CLI from a laptop and the acceptance test. Everything else (your first app, volumes, webhooks,
+ports, TLS, self-update, rollback, ...) lives in task-oriented guides in [`docs/guides/`](guides/README.md).
+Ready-made app specs and `apps.toml` snippets (copy-paste): [`docs/examples/`](examples/).
 
-Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
+## Host requirements
 
-## 1. Wymagania hosta
+Prepare these with your host provisioning (e.g. an Ansible role); Węglarka installs none of it by itself:
 
-Przygotowuje je Ansible (repo `niechybnie`); Węglarka niczego z tego sama nie instaluje:
-
-- **Podman 6.x** z repo OBS `home:alvistack` (apt-pinning tylko dla stosu Podmana), netavark 2 (nftables), pasta;
-- użytkownik runtime'u (domyślnie `weglarka`) z zakresami `subuid`/`subgid` ≥ 65536 i **linger**
+- **Podman 6.x** from the OBS repo `home:alvistack` (apt pinning for the Podman stack only), netavark 2 (nftables), pasta;
+- a runtime user (default `weglarka`) with `subuid`/`subgid` ranges ≥ 65536 and **linger**
   (`loginctl enable-linger weglarka`);
-- `systemctl --user enable --now podman.socket` dla tego użytkownika (socket: `/run/user/<uid>/podman/podman.sock`);
-- katalogi (właściciel `weglarka`): stan `/var/lib/weglarka` (0755) i **`/var/lib/weglarka/run` (0700)**.
-  Socket admina leży w trwałym katalogu, bo `/run/user/<uid>` znika po restarcie, a Podman nie startuje
-  kontenera, jeśli zamontowany katalog nie istnieje;
-- `/etc/weglarka/weglarka.toml` czytelny dla `weglarka` (sekcja 2);
-- (tryb `behind`) plik Traefika **po stronie Węglarki**: `/var/lib/weglarka/traefik/weglarka.yml` założony z góry
-  (właściciel `weglarka`, 0644, treść może być komentarzem — quadlet montuje ten pojedynczy plik, więc musi istnieć
-  przed startem). Węglarka nadpisuje go w miejscu. **Nie dostaje dostępu do katalogu Traefika** (`/data` i
-  `/data/coolify` mają 0700, ACL na `/data` odsłoniłby inne usługi) — publikację robi root, patrz niżej;
-- (tryb `behind`) **publikacja do Traefika przez root-owy path-unit z walidatorem**: `weglarka-traefik-sync.path`
-  (obserwuje `/var/lib/weglarka/traefik`) → `weglarka-traefik-sync.service` → `/usr/local/sbin/weglarka-traefik-sync`.
-  Walidator (polityka w `/etc/weglarka/traefik-policy.json`) przepuszcza tylko `http.routers`/`http.services`
-  o nazwie `weglarka` lub `weglarka-*`, reguły `Host()` (opcjonalnie `&& PathPrefix()`) dla domen z allowlisty,
-  jedyny backend `http://host.docker.internal:<port z bind>`, `tls.certResolver: letsencrypt` (routery na
-  entrypoincie `http` bez `tls`); bez middlewares, tcp/udp. Węglarka generuje dla każdej domeny drugi router
-  `weglarka-http-*` na entrypoincie `http` — redirect 301 na HTTPS robi nginx Węglarki (nie Traefik), więc polityka
-  walidatora musi dopuszczać entrypoint `http` bez `tls`. Zwalidowany YAML jest kopiowany atomowo do `/data/coolify/proxy/dynamic/weglarka.yml`; przy błędzie
-  zostaje poprzednia wersja, powód w `journalctl -t weglarka-traefik-sync`. Nowa domena apki = najpierw dopisanie
-  jej do allowlisty w Ansible (`weglarka_allowed_domains`);
-- (tryb `behind`) port nginx Węglarki na adresie `docker0` **inny niż 8080** (8080 na `0.0.0.0` trzyma docker-proxy
-  Traefika z Coolify) — na niechybnie `172.17.0.1:8088`, a UFW wpuszcza na niego tylko sieć `coolify`
-  (`172.18.0.0/16`);
-- AppArmor (Ubuntu 24.04, `apparmor_restrict_unprivileged_userns=1`): systemowy profil `podman` z pakietu wystarcza,
-  rootless działa bez zmian sysctl;
-- **porty publikowane na hoście** (`host_ports`, [6c](#6c-porty-publikowane-na-hoście-host_ports)): ruch do nich
-  przekazuje forwarder portów rootless Podmana, więc na hoście nie trzeba nic instalować, ale **UFW musi je
-  wpuszczać** — reguły dodaje rola `weglarka_host` w Ansible, Węglarka firewalla nie zmienia. Porty < 1024
-  wymagają `net.ipv4.ip_unprivileged_port_start=0` na hoście **i** `[runtime] allow_privileged_host_ports = true`
-  w `weglarka.toml`; bez sysctla sam start kontenera się nie powiedzie;
-- (tryb `edge`) **porty 80/443 na hoście**: nginx Węglarki publikuje je bezpośrednio (w kontenerze nadal
-  nasłuchuje na 8080/8443), więc rootless Podman potrzebuje `net.ipv4.ip_unprivileged_port_start=0` **i**
-  `[runtime] allow_privileged_host_ports = true` w `weglarka.toml` (ta sama flaga co przy `host_ports`,
-  [6c](#6c-porty-publikowane-na-hoście-host_ports)); bez niej walidacja odmawia startu, a bez sysctla nie
-  powiedzie się publikacja portu. UFW musi wpuszczać 80 i 443. TLS i certyfikaty leżą w katalogu stanu
-  (`<state>/nginx/tls`, katalog `0700`, klucz `0600`), webroot ACME w `<state>/nginx/acme` (`0755`, pliki
-  `0644`) — [6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu). Porty inne niż 80/443 (np. 18080/18443)
-  pozwalają uruchomić `edge` bez sysctla — tak robi CI;
-- DNS: rekord domeny webhooków (`[webhook] domain`) i domen apek wskazuje na host (w `behind` TLS terminuje
-  Traefik, w `edge` — nginx Węglarki).
+- `systemctl --user enable --now podman.socket` for that user (socket: `/run/user/<uid>/podman/podman.sock`);
+- directories (owner `weglarka`): state `/var/lib/weglarka` (0755) and **`/var/lib/weglarka/run` (0700)**.
+  The admin socket lives in a persistent directory because `/run/user/<uid>` disappears on reboot, and Podman
+  does not start a container if a mounted directory does not exist;
+- `/etc/weglarka/weglarka.toml` readable by `weglarka` ([Host configuration](#host-configuration));
+- (`behind` mode) a Traefik file **on Węglarka's side**: `/var/lib/weglarka/traefik/weglarka.yml` created up front
+  (owner `weglarka`, 0644, the content may be a comment — the quadlet mounts this single file, so it must exist
+  before start). Węglarka overwrites it in place. It **gets no access to Traefik's directory** (`/data` and
+  `/data/coolify` are 0700, an ACL on `/data` would expose other services) — publishing is done by root, see below;
+- (`behind` mode) **publishing to Traefik through a root-owned path unit with a validator**:
+  `weglarka-traefik-sync.path` (watches `/var/lib/weglarka/traefik`) → `weglarka-traefik-sync.service` →
+  `/usr/local/sbin/weglarka-traefik-sync`. The validator (policy in `/etc/weglarka/traefik-policy.json`) only lets
+  through `http.routers`/`http.services` named `weglarka` or `weglarka-*`, `Host()` rules (optionally
+  `&& PathPrefix()`) for domains on the allowlist, a single backend `http://host.docker.internal:<port from bind>`,
+  and `tls.certResolver: letsencrypt` (routers on the `http` entrypoint without `tls`); no middlewares, no tcp/udp.
+  For every domain Węglarka generates a second router `weglarka-http-*` on the `http` entrypoint — the 301 redirect
+  to HTTPS is done by Węglarka's nginx (not Traefik), so the validator policy must allow the `http` entrypoint
+  without `tls`. The validated YAML is copied atomically to `/data/coolify/proxy/dynamic/weglarka.yml`; on an error
+  the previous version stays, and the reason is in `journalctl -t weglarka-traefik-sync`. A new app domain means
+  adding it to the domain allowlist in your publish-validator policy first (`allowed_domains` in
+  `/etc/weglarka/traefik-policy.json`);
+- (`behind` mode) Węglarka's nginx port on the `docker0` address **other than 8080** (8080 on `0.0.0.0` is held by
+  the docker-proxy of Coolify's Traefik) — on `myhost` that is `172.17.0.1:8088`, and UFW lets only the `coolify`
+  network (`172.18.0.0/16`) reach it;
+- AppArmor (Ubuntu 24.04, `apparmor_restrict_unprivileged_userns=1`): the system `podman` profile from the package
+  is enough, rootless works without sysctl changes;
+- **ports published on the host** (`host_ports`, [Host ports](guides/host-ports.md)): traffic to them is forwarded
+  by rootless Podman's port forwarder, so nothing needs to be installed on the host, but **UFW must allow them** —
+  add the rules in your host provisioning, Węglarka does not change the firewall. Ports < 1024 need
+  `net.ipv4.ip_unprivileged_port_start=0` on the host **and** `[runtime] allow_privileged_host_ports = true` in
+  `weglarka.toml`; without the sysctl the container itself fails to start;
+- (`edge` mode) **ports 80/443 on the host**: Węglarka's nginx publishes them directly (inside the container it
+  still listens on 8080/8443), so rootless Podman needs `net.ipv4.ip_unprivileged_port_start=0` **and**
+  `[runtime] allow_privileged_host_ports = true` in `weglarka.toml` (the same flag as for `host_ports`,
+  [Host ports](guides/host-ports.md)); without the flag validation refuses to start, and without the sysctl
+  publishing the port fails. UFW must allow 80 and 443. TLS and certificates live in the state directory
+  (`<state>/nginx/tls`, directory `0700`, key `0600`), the ACME webroot in `<state>/nginx/acme` (`0755`, files
+  `0644`) — [Edge mode](guides/edge-mode.md). Ports other than 80/443 (e.g. 18080/18443) let you run `edge`
+  without the sysctl — that is what CI does;
+- DNS: the record for the webhook domain (`[webhook] domain`) and for app domains points at the host (in `behind`
+  TLS is terminated by Traefik, in `edge` by Węglarka's nginx).
 
-Sprawdzenie (jako użytkownik runtime'u, po zapisaniu `weglarka.toml`):
+Check (as the runtime user, after writing `weglarka.toml`):
 
 ```sh
 sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
   weglarka doctor --preflight --config /etc/weglarka/weglarka.toml
 ```
 
-Każde `warn`/`fail` ma podpowiedź naprawy (`runtime.subuid`, `runtime.linger`, `runtime.podman_source`,
-`ingress.traefik_file`, `state.secrets_file`, …).
-Wybrane sprawdzenia hosta:
-`runtime.subuid`/`subgid` (warn < 1 000 000 id, fail < 65 536), `runtime.apparmor_userns` (Ubuntu 24.04:
-profil `podman` załadowany, gdy `apparmor_restrict_unprivileged_userns=1`; pełny wynik tylko jako root),
-`ingress.config` (klucze `[ingress]` pasują do trybu: `edge` wymaga `https_bind`, a odrzuca
-`traefik_dynamic_file`/`trusted_proxies` oraz porty < 1024 bez `allow_privileged_host_ports`),
-`ingress.bind`/`ingress.bind_free` (adresy i porty publikacji — w `edge` **oba**, HTTP i TLS — nie zajęte
-przez cudzy proces, np. Traefika), `ingress.tls` (tylko `edge`: każda routowana domena ma parę
-`<domena>.crt`/`<domena>.key` w `<nginx_conf_dir>/tls`; brak to `warn`; `[acme]` — sekcja 6q — wystawia je automatycznie),
-`ingress.privileged_ports` (tylko `edge` z portem < 1024: czy `net.ipv4.ip_unprivileged_port_start` na to
-pozwala), `ingress.traefik_sync`
-(tryb `behind`: aktywny `weglarka-traefik-sync.path`, gdy istnieje `/etc/weglarka/traefik-policy.json`;
-domeny z `apps.toml` na allowliście polityki, klucz `allowed_domains`), `apps.host_ports_free` (porty z
-`apps.toml` nie zajęte przez cudzy proces — `/proc/net/tcp*`, jak `ingress.bind_free` — oraz porty < 1024 bez
-`allow_privileged_host_ports`). Reguły firewalla (także dla `host_ports`) nie są sprawdzane. Kody wyjścia: 0 ok, 1 warn, 2 fail.
+Every `warn`/`fail` comes with a fix hint (`runtime.subuid`, `runtime.linger`, `runtime.podman_source`,
+`ingress.traefik_file`, `state.secrets_file`, ...). Selected host checks:
+`runtime.subuid`/`subgid` (warn < 1 000 000 ids, fail < 65 536), `runtime.apparmor_userns` (Ubuntu 24.04:
+the `podman` profile is loaded when `apparmor_restrict_unprivileged_userns=1`; full result only as root),
+`ingress.config` (the `[ingress]` keys match the mode: `edge` requires `https_bind` and rejects
+`traefik_dynamic_file`/`trusted_proxies` as well as ports < 1024 without `allow_privileged_host_ports`),
+`ingress.bind`/`ingress.bind_free` (the publishing addresses and ports — in `edge` **both**, HTTP and TLS — are not
+taken by a foreign process, e.g. Traefik), `ingress.tls` (`edge` only: every routed domain has a
+`<domain>.crt`/`<domain>.key` pair in `<nginx_conf_dir>/tls`; a missing pair is a `warn`; `[acme]` —
+[ACME certificates](guides/acme.md) — issues them automatically),
+`ingress.privileged_ports` (`edge` with a port < 1024 only: whether `net.ipv4.ip_unprivileged_port_start` allows
+it), `ingress.traefik_sync` (`behind` mode: `weglarka-traefik-sync.path` is active when
+`/etc/weglarka/traefik-policy.json` exists; the domains from `apps.toml` are on the policy allowlist, key
+`allowed_domains`), `apps.host_ports_free` (ports from `apps.toml` are not taken by a foreign process —
+`/proc/net/tcp*`, like `ingress.bind_free` — and no ports < 1024 without `allow_privileged_host_ports`).
+Firewall rules (including those for `host_ports`) are not checked. Exit codes: 0 ok, 1 warn, 2 fail.
 
-## 2. Konfiguracja hosta
+## Host configuration
 
-`/etc/weglarka/weglarka.toml` (UID z `id -u weglarka`; ścieżki są montowane do kontenera pod tą samą nazwą,
-więc ten sam plik działa dla demona i dla CLI na hoście):
+`/etc/weglarka/weglarka.toml` (the UID comes from `id -u weglarka`; paths are mounted into the container under the
+same name, so the same file works for the daemon and for the CLI on the host):
 
 ```toml
 [runtime]
 user = "weglarka"
-# Porty publikowane na hoście < 1024 (`host_ports`, sekcja 6c): host musi mieć
-# net.ipv4.ip_unprivileged_port_start=0. Domyślnie false — takie porty są odrzucane w walidacji.
+# Ports published on the host < 1024 (`host_ports`, see the host-ports guide): the host must have
+# net.ipv4.ip_unprivileged_port_start=0. Default false — such ports are rejected during validation.
 # allow_privileged_host_ports = true
 
 [ingress]
 mode = "behind"
-bind = "172.17.0.1:8088"                                   # docker0; 8080 zajmuje Traefik z Coolify
-traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # root-owy path-unit waliduje i publikuje do dynamic/
-# nginx przypięty po digeście (0006); podbijaj świadomie — zmiana odtwarza kontener nginx:
+bind = "172.17.0.1:8088"                                   # docker0; 8080 is taken by Coolify's Traefik
+traefik_dynamic_file = "/var/lib/weglarka/traefik/weglarka.yml"  # a root-owned path unit validates and publishes to dynamic/
+# nginx pinned by digest (ADR 0006); bump it deliberately — a change recreates the nginx container:
 nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421428ce13bd1eaa412404953859cf7a5b6512c25e67a60"
-# Kontener nginx jest zawsze osłoniony (0014): read-only root, cap_drop ALL (+ CHOWN/SETGID/SETUID),
-# no-new-privileges. Własny obraz musi to tolerować (nie może pisać po swoim rootfs przy starcie).
-# Opcjonalnie: peery, którym nginx ufa w sprawie X-Forwarded-* (0007, 0032). Domyślnie *własne adresy*
-# kontenera nginx we wszystkich jego sieciach (stąd łączy forwarder portów rootless Podmana); lista ZASTĘPUJE
-# domyślną i jest statyczna (adresy kontenera mogą się zmienić). Zwykle zostaw nieustawione.
+# The nginx container is always hardened (ADR 0014): read-only root, cap_drop ALL (+ CHOWN/SETGID/SETUID),
+# no-new-privileges. A custom image must tolerate that (it must not write to its rootfs at startup).
+# Optional: peers nginx trusts for X-Forwarded-* (ADR 0007, ADR 0032). By default the nginx container's *own
+# addresses* in all its networks (that is where rootless Podman's port forwarder connects from); the list REPLACES
+# the default and is static (container addresses may change). Usually leave it unset.
 # trusted_proxies = ["10.89.1.2"]
-# Tryb `edge` (issue #95, 0036): nginx sam terminuje TLS i publikuje DWA porty — `bind` (HTTP: tylko
-# przekierowanie na HTTPS i ACME) oraz `https_bind` (TLS). `traefik_dynamic_file` i `trusted_proxies` są
-# wtedy odrzucane przez walidację, a certyfikaty kładziesz w <state>/nginx/tls (6p).
+# `edge` mode (#95, ADR 0036): nginx terminates TLS itself and publishes TWO ports — `bind` (HTTP: only the
+# redirect to HTTPS and ACME) and `https_bind` (TLS). `traefik_dynamic_file` and `trusted_proxies` are then
+# rejected by validation, and you put certificates in <state>/nginx/tls (see the edge-mode guide).
 # mode = "edge"
 # bind = "0.0.0.0:80"
 # https_bind = "0.0.0.0:443"
@@ -139,44 +118,48 @@ nginx_image = "docker.io/library/nginx:1.31.8-alpine@sha256:1ef7ca94d7879df82421
 socket = "/var/lib/weglarka/run/admin.sock"
 
 [webhook]
-listen = "0.0.0.0:9180"                                    # wewnątrz kontenera, w sieci net-weglarka
-domain = "weglarka.descriptortable.eu"                     # wystawiane są tylko ścieżki /webhook/
+listen = "0.0.0.0:9180"                                    # inside the container, on the net-weglarka network
+domain = "weglarka.example.com"                            # only /webhook/ paths are exposed
 
 [state]
 dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
 
-# Katalog z plikami konfiguracyjnymi apek (sekcja 6i). Montowany read-only do kontenera Węglarki.
-# Absolutny albo względny do katalogu weglarka.toml. Nieustawione = funkcja wyłączona.
+# Directory with the apps' configuration files (see the host-configs guide). Mounted read-only into Węglarka's container.
+# Absolute, or relative to the directory of weglarka.toml. Unset = feature disabled.
 # config_root = "/var/lib/weglarka/config"
 
 [platform]
 kind = "systemd"
-memory = "128M"                                            # limit pamięci kontenera Węglarki (z swapem); domyślnie 128M
-pids_limit = 256                                           # limit procesów/wątków; domyślnie 256
+memory = "128M"                                            # memory limit of Węglarka's container (with swap); default 128M
+pids_limit = 256                                           # process/thread limit; default 256
 ```
 
-`[runtime] socket` **nie jest potrzebny**: `platform install` wylicza socket na hoście (`/run/user/<uid>/podman/podman.sock`)
-i przekazuje go kontenerowi zmienną `WEGLARKA_PODMAN_SOCKET` w quadlecie. Jawne `socket` ma pierwszeństwo przed zmienną.
-Demon w kontenerze nie czyta `/etc/passwd` (obraz jest na `scratch`); bez socketu w configu i bez zmiennej kończy się
-czytelnym błędem.
+The guides for the optional parts of this file: [Host ports](guides/host-ports.md) (`allow_privileged_host_ports`),
+[Edge mode](guides/edge-mode.md) (`mode = "edge"`), [Host configs](guides/host-configs.md) (`config_root`).
 
-**Zaufanie nginx do `X-Forwarded-*` (0032).** Bez `trusted_proxies` demon przy każdym `apply` czyta *własne adresy*
-kontenera `weglarka-nginx` (we wszystkich jego sieciach: `net-weglarka` i `net-<apka>`) i ufa dokładnie im (wpisy
-`/32`). Forwarder portów rootless Podmana otwiera połączenie od środka netns nginx, więc jego adres źródłowy to
-któryś z tych adresów — niekoniecznie z `net-weglarka`. Kontenery apek łączące się po `net-<apka>` mają inne adresy
-i nie mogą podrobić nagłówków. Adres nginx w nowo dołączonej sieci (albo po odtworzeniu kontenera) poznajemy dopiero
-po jego pojawieniu się, więc ten sam przebieg `apply` czyta adresy ponownie i w razie zmiany regeneruje config
-oraz przeładowuje nginx. Restart kontenera przez Podmana, który zmienia adresy, zostanie zauważony dopiero przy
-następnym okresowym `apply`. Objaw rozjazdu: apka sprawdzająca schemat (np. OIDC wymagające https)
-odpowiada 400; porównaj `remote_addr` z logu nginx z `podman inspect weglarka-nginx` (pole `IPAddress` każdej sieci).
+`[runtime] socket` is **not needed**: `platform install` works out the socket on the host
+(`/run/user/<uid>/podman/podman.sock`) and passes it to the container in the `WEGLARKA_PODMAN_SOCKET` variable in
+the quadlet. An explicit `socket` takes precedence over the variable. The daemon in the container does not read
+`/etc/passwd` (the image is `scratch`); with no socket in the config and no variable it exits with a clear error.
 
-## 3. Binarki na hoście (`platform install`)
+**nginx trust in `X-Forwarded-*` (ADR 0032).** Without `trusted_proxies`, on every `apply` the daemon reads the
+*own addresses* of the `weglarka-nginx` container (in all its networks: `net-weglarka` and `net-<app>`) and trusts
+exactly those (`/32` entries). Rootless Podman's port forwarder opens the connection from inside the nginx netns, so
+its source address is one of those addresses — not necessarily one from `net-weglarka`. App containers connecting
+over `net-<app>` have different addresses and cannot forge the headers. The nginx address in a newly joined network
+(or after the container is recreated) is only known once it appears, so the same `apply` pass reads the addresses
+again and, if they changed, regenerates the config and reloads nginx. A container restart by Podman that changes
+the addresses is noticed only on the next periodic `apply`. Symptom of a mismatch: an app that checks the scheme
+(e.g. OIDC requiring https) answers 400; compare `remote_addr` from the nginx log with `podman inspect weglarka-nginx`
+(the `IPAddress` field of each network).
 
-`platform install` używa `systemctl --user` i `/etc/passwd`, więc **nie działa w kontenerze** — potrzebny jest
-`weglarka-daemon` na hoście (CLI i demon, `x86_64-unknown-linux-musl`).
+## Host binaries
 
-**Przed pierwszym tagiem `v*`** release'u nie ma — wyciągnij binarki z podpisanego obrazu `:main`
-(najpierw `cosign verify` jak w sekcji 4, „Weryfikacja”):
+`platform install` uses `systemctl --user` and `/etc/passwd`, so it **does not work inside the container** — you need
+`weglarka-daemon` on the host (CLI and daemon, `x86_64-unknown-linux-musl`).
+
+**Before the first `v*` tag** there is no release — extract the binaries from the signed `:main` image
+(first `cosign verify` as in [Verifying the image and binaries](#verifying-the-image-and-binaries)):
 
 ```sh
 IMG=ghcr.io/jpalczewski/weglarka:main
@@ -188,7 +171,7 @@ podman rm wg-extract
 sudo install -m 0755 weglarka weglarka-daemon /usr/local/bin/
 ```
 
-**Od pierwszego tagu** — z tarballa release'u:
+**From the first tag on** — from the release tarball:
 
 ```sh
 VER=0.1.0
@@ -200,26 +183,26 @@ tar xzf weglarka-$VER-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 weglarka-$VER-x86_64-unknown-linux-musl/{weglarka,weglarka-daemon} /usr/local/bin/
 ```
 
-## 4. Quadlet i start
+## Quadlet and start
 
-Obraz `ghcr.io/jpalczewski/weglarka` jest publiczny (pobieranie bez `podman login`).
-Tag `:latest` powstaje dopiero z pierwszego tagu `v*`; wcześniej użyj `--image ghcr.io/jpalczewski/weglarka:main`.
+The `ghcr.io/jpalczewski/weglarka` image is public (pulling needs no `podman login`).
+The `:latest` tag only exists from the first `v*` tag; before that use `--image ghcr.io/jpalczewski/weglarka:main`.
 
 ```sh
 sudo -iu weglarka
 export XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
 
-weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # podgląd plików
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # preview the files
 weglarka-daemon --config /etc/weglarka/weglarka.toml platform install \
-  --image ghcr.io/jpalczewski/weglarka:latest                                     # zapis + daemon-reload
+  --image ghcr.io/jpalczewski/weglarka:latest                                     # write + daemon-reload
 systemctl --user start weglarka.service
 systemctl --user status weglarka.service
-podman logs weglarka                                                              # JSON, bez sekretów
+podman logs weglarka                                                              # JSON, no secrets
 ```
 
-Wygenerowany quadlet (przykład dla `weglarka`, UID 1004) jest utwardzony: root FS tylko do odczytu (`ReadOnly=true`,
-`Tmpfs=/tmp`), `DropCapability=ALL`, `NoNewPrivileges=true`, limit pamięci (`PodmanArgs=--memory=128M --memory-swap=128M`)
-i `PidsLimit=256`:
+The generated quadlet (example for `weglarka`, UID 1004) is hardened: read-only root FS (`ReadOnly=true`,
+`Tmpfs=/tmp`), `DropCapability=ALL`, `NoNewPrivileges=true`, a memory limit (`PodmanArgs=--memory=128M --memory-swap=128M`)
+and `PidsLimit=256`:
 
 ```ini
 [Container]
@@ -240,15 +223,15 @@ PidsLimit=256
 Exec=run --config /etc/weglarka/weglarka.toml
 ```
 
-(pełny plik: `platform install --dry-run`; te same opcje jako argumenty `podman run`: `platform run-args`).
+(The full file: `platform install --dry-run`; the same options as `podman run` arguments: `platform run-args`.)
 
-Quadlet ma `WantedBy=default.target` — z lingerem usługa wstaje po restarcie hosta. Przy starcie demon zakłada
-sieć `net-weglarka`, ciągnie i uruchamia kontener `weglarka-nginx` na `bind` i zapisuje plik Traefika.
-Aktualizacja samej Węglarki: automatycznie przez timer `weglarka-self-update.timer`, a nieudaną podmianę cofa
-watchdog `weglarka-watchdog.timer` — patrz [6k](#6k-samoaktualizacja-węglarki-self_update); ręcznie
-`platform install --image <obraz>@<digest>` + `systemctl --user restart weglarka.service`.
+The quadlet has `WantedBy=default.target` — with linger the service comes up after a host reboot. On startup the
+daemon creates the `net-weglarka` network, pulls and starts the `weglarka-nginx` container on `bind`, and writes the
+Traefik file. Updating Węglarka itself: automatic through the `weglarka-self-update.timer` timer, and a failed swap
+is rolled back by the `weglarka-watchdog.timer` watchdog — see [Self-update](guides/self-update.md); manually:
+`platform install --image <image>@<digest>` + `systemctl --user restart weglarka.service`.
 
-### Weryfikacja obrazu i binarek
+### Verifying the image and binaries
 
 ```sh
 cosign verify \
@@ -256,1687 +239,73 @@ cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/jpalczewski/weglarka:latest
 
-# ten sam obraz, klucz statyczny (dokładnie to sprawdza Węglarka przed samoaktualizacją, 6k):
+# the same image, static key (exactly what Węglarka checks before a self-update, see the self-update guide):
 cosign verify --key cosign.pub ghcr.io/jpalczewski/weglarka:latest
 
-# SBOM (SPDX) – atestacja cosign:
-cosign verify-attestation --type spdxjson <jak wyżej> ghcr.io/jpalczewski/weglarka:latest | jq -r .payload | base64 -d | jq .predicate | head
+# SBOM (SPDX) – a cosign attestation:
+cosign verify-attestation --type spdxjson <as above> ghcr.io/jpalczewski/weglarka:latest | jq -r .payload | base64 -d | jq .predicate | head
 
-# SHA256SUMS z release'u:
-cosign verify-blob --signature SHA256SUMS.sig --certificate SHA256SUMS.pem <flagi tożsamości jak wyżej> SHA256SUMS
+# SHA256SUMS from the release:
+cosign verify-blob --signature SHA256SUMS.sig --certificate SHA256SUMS.pem <identity flags as above> SHA256SUMS
 ```
 
-## 5. CLI z laptopa (macOS) przez tunel SSH
+## CLI from a laptop
 
-Socket admina jest 0600 i należy do `weglarka`, więc tunel zestawiamy jako ten użytkownik (albo root):
+The admin socket is 0600 and owned by `weglarka`, so the tunnel is set up as that user (or root). Example for macOS:
 
 ```sh
-# CLI (aarch64-apple-darwin) z tej samej strony release'u, sprawdź sumę z SHA256SUMS
+# CLI (aarch64-apple-darwin) from the same release page, check the sum against SHA256SUMS
 mkdir -p ~/.weglarka
 ssh -N -o StreamLocalBindUnlink=yes \
-  -L ~/.weglarka/admin.sock:/var/lib/weglarka/run/admin.sock weglarka@niechybnie &
+  -L ~/.weglarka/admin.sock:/var/lib/weglarka/run/admin.sock weglarka@myhost &
 
 export WEGLARKA_SOCKET=~/.weglarka/admin.sock
 weglarka status
-weglarka doctor            # autodiagnoza przez API (--json dla maszyn)
+weglarka doctor            # self-diagnosis through the API (--json for machines)
 ```
 
-## Odbiór na hoście (`scripts/acceptance.sh`)
+## Acceptance test
 
-Test łańcucha na prawdziwym hoście: preflight i `doctor`, kanarek `traefik/whoami` na domenie testowej
-(Traefik → nginx → kontener, TLS), webhook GitHub (202/401/204) i sprzątanie. **W trybie `edge`** skrypt
-wykrywa tryb z `weglarka.toml` (albo `--edge`), sam składa certyfikat testowy dla domeny kanarka w
-`<nginx_conf_dir>/tls`, czeka na przeładowanie nginx i sprawdza ruch po `https` na porcie z `[ingress]
-https_bind`, przekierowanie na porcie HTTP oraz webroot ACME (`/.well-known/acme-challenge/`); `--direct`
-jest wtedy odrzucane. Uruchamiaj **po instalacji**
-i **po każdej aktualizacji Węglarki** (zanim ruszysz prawdziwą apkę), jako użytkownik runtime'u:
+`scripts/acceptance.sh` tests the whole chain on a real host: preflight and `doctor`, a `traefik/whoami` canary on a
+test domain (Traefik → nginx → container, TLS), the GitHub webhook (202/401/204) and cleanup. **In `edge` mode** the
+script detects the mode from `weglarka.toml` (or `--edge`), builds a test certificate for the canary domain in
+`<nginx_conf_dir>/tls` itself, waits for the nginx reload, and checks traffic over `https` on the port from
+`[ingress] https_bind`, the redirect on the HTTP port and the ACME webroot (`/.well-known/acme-challenge/`);
+`--direct` is rejected then. Run it **after installation** and **after every Węglarka update** (before you touch a
+real app), as the runtime user:
 
 ```sh
 sudo -iu weglarka env XDG_RUNTIME_DIR=/run/user/$(id -u weglarka) \
-  scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
+  scripts/acceptance.sh --canary-domain wg-test.example.com
 ```
 
-Wymaganie: domena kanarka jest w DNS (wskazuje na host) **i na allowliście walidatora**
-(`weglarka_allowed_domains`) — bez tego Traefik nie dostanie routera i krok „ruch” skończy się timeoutem.
-Skrypt dotyka tylko instancji `wg-canary` (domyślnie), `wg-webhook`/`wg-rollback` (z `--with-local-registry`),
-`wg-volume`/`wg-nostart` (z `--with-volume`) i kontenera `wg-accept-registry` — nigdy `ntfy`. Opcje: `--canary-image`,
-`--webhook-base`, `--keep` (kanarek zostaje), `--skip-preflight`, `--strict` (warn z `doctor` = błąd), `--cert-timeout`,
-`--json` (raport maszynowy na stdout), `--direct http://127.0.0.1:8088` (ruch prosto do nginx, bez Traefika/TLS — używa
-tego CI). Kod wyjścia ≠ 0 przy jakimkolwiek FAIL; `ACCEPTANCE_VERBOSE=1` pokazuje log także udanych kroków.
-Wymaga `weglarka`, `curl`, `openssl`, `jq`, `podman`. Opcjonalne `--with-volume` (też w CI; wymaga `tar`) dodaje
-dwa kroki wolumenów: na instancji `wg-volume` import obcego tara, dane i zakres UID przeżywają `apps remove` + `apps add`,
-eksport z właścicielem `uid_range.start`, `--purge-volumes`; na instancji `wg-nostart` apka dodana z `start = false`
-(bez kontenera), import przed pierwszym `apps start`, eksport ze sprawdzeniem zawartości.
-
-**Webhook na hoście** sprawdza protokół (poprawny podpis → 202 dla obrazu kanarka — deploy kończy się `Unchanged`,
-zły podpis → 401, `ping` → 204, obcy tag → 204). **Pełny test rollbacku** (kod 6, powrót do poprzedniego digestu)
-oraz webhook z realnym deployem i duplikatem dostarczenia biegną w CI (`integration-podman`); na hoście są
-opcjonalne (`--with-local-registry`) — wymagają tymczasowego rejestru na `127.0.0.1:15099` i wpisu
-`[[registry]] location = "127.0.0.1:15099" insecure = true` w `registries.conf` użytkownika **przed startem**
-usługi Podmana (czyta go przy starcie). Skrypt sam niczego nie konfiguruje; bez wpisu deploy kończy się FAIL
-z podpowiedzią. Na produkcji nie zalecane.
-
-Uwaga: `apps remove` domyślnie **zachowuje** sekrety kanarka w `secrets.toml` (`webhook-hmac`); skrypt
-sprząta je w kroku „sprzątanie” przez `--purge-secrets`, więc po przebiegu nie zostają osierocone wpisy
-(i `doctor` nie zgłasza ich w `state.orphan_secrets`). Sprzątanie po fakcie — [6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
-
-## 6. Pierwsza apka: ntfy.zig
-
-Kolejność ma znaczenie: `secrets set` wymaga istniejącej apki, a pierwszy deploy potrzebuje sekretu `config`.
-Dopóki sekretu nie ma, apka jest w stanie **„czeka na sekret”** (`weglarka status` → `waiting-for-secret`,
-`apps show` wypisuje brakujące nazwy, `doctor` ostrzega) — to nie błąd i demon nie próbuje deployu. Po
-`secrets set` stan znika, a deploy rusza sam; osobne `weglarka deploy` nie jest potrzebne.
-
-```sh
-weglarka apps add ntfy ghcr.io/jpalczewski/ntfy.zig:latest \
-  --domain nz.descriptortable.eu --port 8085 \
-  --env CONFIG_FILE=/config.json \
-  --secret-mount config=/config.json
-
-weglarka secrets set ntfy config < ./config.json                # plik trafia pod /config.json
-weglarka apps show ntfy                                         # deploy rusza sam: pull, bramka zdrowia
-```
-
-`secrets set` tylko nadpisuje wartość — sekret usuwa się przez `secrets remove`, a cały zakres apki
-sprząta `apps remove --purge-secrets` ([6j](#6j-sekrety-usuwanie-i-sprzątanie-po-apce)).
-
-### Zamontowany sekret: tryb i właściciel (`mode`, `uid`, `gid`)
-
-`--secret-mount` montuje plik z domyślnym trybem `0444` (czytelny dla każdego w kontenerze) i właścicielem
-`0:0` — rootem kontenera. Obraz, który uruchamia się jako konkretny nieuprzywilejowany użytkownik i wymaga
-strictejszego trybu (np. `0400` tylko dla niego), dostaje oba ustawienia przez `--spec`/`apps.toml`:
-
-```toml
-# apps.toml
-[apps.ntfy]
-image = "ghcr.io/jpalczewski/ntfy.zig:latest"
-secrets = [
-  { secret = "config", kind = "mount", path = "/config.json", mode = 0o400, uid = 1000, gid = 1000 },
-]
-```
-
-- **`mode`, `uid`, `gid` są opcjonalne.** Bez nich zostaje `0o444` i `0/0` (jak w `podman run --secret`).
-- **Identyfikatory są liczbowe i „kontenerowe”** — w tej samej przestrzeni, w której mówi `USER` obrazu
-  (np. `1000`). Podman mapuje je przez zakres UID instancji (ADR 0009), więc `stat` **wewnątrz kontenera**
-  pokazuje `1000`, a na hoście offset `zakres.start + 1000`. **Nie podawaj UID-ów hosta ani nazw
-  użytkowników** — nazwa to błąd parsowania, a hostowy UID trafiłby w innego właściciela.
-- **Zakres `0..=65535`** (`0` = root w kontenerze); większa wartość odrzuca `apps.toml`/`--spec` przy wczytaniu.
-- **Tylko przez `--spec`:** nie ma flagi CLI dla `uid`/`gid`. `apps update --secret-mount SECRET=PATH` wiąże
-  sekret **od nowa**, więc resetuje `mode`/`uid`/`gid` tej pozycji do domyślnych — ustaw je ponownie w specu.
-- **W `spec-hash`:** nieustawione pola nic nie zmieniają (aktualizacja Węglarki nie odtwarza kontenera),
-  a ustawione lub zmienione odtwarzają kontener przy następnym reconcile — właściciel jest nadawany przy
-  tworzeniu kontenera. Decyzja i odrzucone alternatywy: [0037](decisions/0037-secret-mount-ownership.md).
-
-**Rollback:** to zmiana schematu plików stanu (wersja 7) — `apps.toml` i `state.toml` dostają
-`schema_version = 7` przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `uid`/`gid` z zamontowanych
-sekretów (albo przywróć pliki **z kopii sprzed aktualizacji**,
-[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
-
-### Wartość sekretu: `< plik`, nie `/dev/stdin`
-
-**Prywatne obrazy (rejestr z uwierzytelnianiem).** Poświadczenia do pulla to zwykły sekret apki o zarezerwowanej
-nazwie `registry-auth`, w formacie `<użytkownik>:<hasło-lub-token>` (ADR
-[0026](decisions/0026-registry-credentials.md)):
-
-```
-weglarka secrets set moja-apka registry-auth < creds.txt   # np. "ci-bot:ghp_xxx"
-```
-
-Demon wysyła je jako `X-Registry-Auth` przy każdym pullu tej apki; bez sekretu pull jest anonimowy (jak dotąd —
-działa też `auth.json` użytkownika Podmana). Odrzucone dane daje błąd `409` z nazwą sekretu do poprawienia;
-sekretu `registry-auth` nie wolno podpiąć do kontenera (`secrets = [...]`). Kompatybilność wstecz: brak zmian
-w plikach stanu — starszy demon po prostu ignoruje ten sekret.
-
-Przekaż wartość **przekierowaniem** (`secrets set <app> <nazwa> < plik`) albo potokiem
-(`pbpaste | weglarka secrets set …`) — CLI czyta wtedy standardowe wejście. Nie używaj
-`--from-file /dev/stdin` przez `sudo -u`/`ssh` na innego użytkownika: `/dev/stdin` to dowiązanie do
-`/proc/self/fd/0`, które CLI otwiera *od nowa*, już jako użytkownik runtime'u — a ten nie ma prawa do pliku
-ani potoku, który należy do wywołującego, więc kończy się to `Permission denied`. Przekierowanie `<` otwiera
-plik powłoka wywołującego (jego uprawnieniami) i przekazuje gotowy deskryptor, więc działa także w
-`sudo -u weglarka weglarka secrets set ntfy config < config.json`. `--from-file ścieżka` jest w porządku
-tylko dla pliku czytelnego dla użytkownika, który uruchamia CLI. Sekret nie trafia do argumentów (`ps`,
-historia powłoki).
-
-**Przełączenie z Coolify z minimalną przerwą** (domena nie może mieć jednocześnie dwóch routerów z tym samym
-`Host()` — Coolify i Węglarki):
-
-1. Dodaj apkę **bez `--domain`**, ustaw sekret, `deploy` — kontener przechodzi bramkę zdrowia, ruch nadal
-   obsługuje Coolify.
-2. Upewnij się, że domena jest na allowliście walidatora (`weglarka_allowed_domains` w Ansible).
-3. Zatrzymaj stary kontener w Coolify (na niechybnie: `coolify-relay`) — znika jego router.
-4. Dodaj domenę: `weglarka apps update ntfy --domain nz.descriptortable.eu` (sprawdź najpierw z `--dry-run`).
-   To zmienia tylko ingress (przeładowanie nginx) — kontener nie jest odtwarzany, więc bez przerwy i bez
-   ponownego deployu. (`apps add` na istniejącą nazwę zwraca 409; `remove` + `add` nie jest już potrzebne.)
-5. Rollback: `weglarka apps remove ntfy` i ponowny start starego kontenera w Coolify (nie usuwaj go od razu).
-
-Dane ntfy.zig: brak, więc `recreate` jest bezpieczne.
-
-### Webhook GitHub (auto-update)
-
-HMAC jest per apka (0004). Ten sam ciąg trafia do Węglarki i do GitHuba:
-
-```sh
-openssl rand -hex 32 > hmac.txt
-weglarka secrets set ntfy webhook-hmac --from-file hmac.txt
-cat hmac.txt          # wklej do pola Secret na GitHubie, potem: rm hmac.txt
-```
-
-Repozytorium `jpalczewski/ntfy.zig` → Settings → Webhooks → Add webhook:
-
-| Pole | Wartość |
-|---|---|
-| Payload URL | `https://weglarka.descriptortable.eu/webhook/github/ntfy` (`<webhook.domain>/webhook/github/<instancja>`) |
-| Content type | `application/json` |
-| Secret | zawartość `hmac.txt` |
-| Events | *Let me select individual events* → tylko **Registry packages** (`registry_package`/`package`, akcja `published`) |
-
-Po pierwszym pushu sprawdź *Recent Deliveries*: `latest` → **202**, `sha-…` → 204 (apka śledzi `:latest`); 401 =
-zły sekret, 204 dla `latest` = niezgodna nazwa obrazu. Nazwy pól payloadu są jeszcze niepotwierdzone na prawdziwym
-pushu (0004) — pierwsza dostawa jest też testem.
-
-**Powtórki po restarcie.** Identyfikatory dostaw (`X-GitHub-Delivery`, a dla Forgejo `X-Forgejo-Delivery`) są
-zapisywane w `<katalog stanu>/webhook-deliveries.toml` (0600, maks. 256 wpisów, najstarsze wypadają), więc powtórka
-tego samego zdarzenia po restarcie, samoaktualizacji albo reboocie hosta kończy się **202** i nie robi pulla ani
-deployu. Plik to tylko księgowość: można go bezpiecznie usunąć (dedup zacznie się od zera), nie jest wersjonowany,
-a starszy demon go ignoruje — rollback nie wymaga migracji (ADR 0035).
-
-### Webhook Forgejo (prywatne obrazy)
-
-Adapter Forgejo (ADR 0026) obsługuje zdarzenie `package` (`created`) dla obrazów w rejestrze kontenerów
-Forgejo. Trasa: `<webhook.domain>/webhook/forgejo/<instancja>`; sekret jak wyżej (`webhook-hmac`, per apka).
-
-1. **Rejestr z konfiguracji.** Payload nie zawiera hosta rejestru, więc podaj go w `weglarka.toml`:
-
-   ```toml
-   [webhook.forgejo]
-   registry = "git.example.eu"   # sam host[:port], bez schematu i ścieżki
-   ```
-
-   Bez tej sekcji trasa odpowiada 404. Starszy demon nie wystartuje z tą sekcją (`deny_unknown_fields`) —
-   przed downgradem usuń ją, tak samo jak `[notify]`.
-2. **Obraz apki** to `<registry>/<org>/<nazwa>:<tag>` (małe litery), np. `git.example.eu/acme/shop:main`.
-3. **Webhook w Forgejo** (repo lub organizacja → Settings → Webhooks → Forgejo): URL jak wyżej, content type
-   `application/json`, Secret = wartość `webhook-hmac`, zdarzenie **Package**.
-4. **Pull z prywatnego rejestru** idzie przez `auth.json` użytkownika Podmana (opcja (a) z ADR 0026). Zaloguj
-   się raz jako użytkownik uruchamiający Podmana, kontem serwisowym z tokenem tylko do odczytu pakietów:
-
-   ```sh
-   podman login git.example.eu     # login konta serwisowego + token read:package
-   ```
-
-   Token leży w `auth.json` na hoście, poza magazynem sekretów Węglarki. Gdy rejestr odrzuci pull (401/403),
-   deploy kończy się błędem „registry rejected the pull of …; check the podman user's credentials”, a nie
-   „image not found”.
-5. **Dostawy:** push `main` + `sha-<commit>` daje 202 dla `main` i 204 dla `sha-…` (apka śledzi `:main`).
-   Nazwy pól payloadu i to, czy ponowny push ruchomego tagu wysyła `package.created`, są jeszcze niepotwierdzone
-   na prawdziwej instancji — jeśli nie wysyła, potrzebne jest #83.
-
-## 6a. Wolumeny, zakresy UID i import z Coolify (iteracja 2)
-
-Decyzja i pomiary: [0009](decisions/0009-volume-ownership.md). Import danych przed pierwszym startem apki
-(provisioning z `start = false`) i zatrzymywanie apek: [6b](#6b-zatrzymywanie-apek-start--false).
-
-**Każdy kontener Węglarki działa w jawnym zakresie UID** z puli subuid użytkownika runtime'u (`userns: private` +
-jawne `UIDMap`/`GIDMap`): zwykła apka ma własny zakres (65 536 UID), **wolumen współdzielony** — jeden zakres na
-całą swoją grupę apek ([niżej](#wolumeny-współdzielone-grupa-uid-iteracja-2)), a nginx ingressu ma własny (4 096).
-Zakres trafia do `state.toml` (`uid_range`, `shared_volumes.<nazwa>.uid_range`, `ingress_uid_range`) i **nie zmienia
-się, dopóki istnieją dane**: apka dostaje go przy pierwszym deployu, wolumen współdzielony — przy pierwszym
-deployu/provisioningu pierwszego członka; dzięki temu pliki w wolumenie mają tego samego właściciela po każdym
-deployu i rollbacku, a grupa N apek kosztuje **jeden** zakres zamiast N. Pulę Węglarka pyta u Podmana (`GET /info`),
-nie czyta `/etc/subuid` (demon w kontenerze go nie widzi). Pula 2 000 000 mieści zakres ingressu i 30 apek lub grup;
-brak miejsca = instancja zablokowana z komunikatem w logu reconcile (powiększ `subuid` w Ansible, rozmiar zakresu
-się nie zmienia).
-Każdy zakres kosztuje też jednorazowo kopię warstw obrazu z przesuniętymi właścicielami (czas i miejsce w
-`~/.local/share/containers` przy pierwszym starcie obrazu w nowym zakresie).
-
-`state.toml` trzyma też `effective_uid_range` — ostatni zakres, w którym przygotowano kontener i wolumeny apki (jej
-własny albo zakres wolumenu współdzielonego). To z niego korzysta guard zmiany zakresu, gdy kontenera nie ma
-(apka provisionowana `start = false` albo po `apps stop`), więc dane w wolumenach prywatnych nie zmieniają
-właściciela po cichu ([#75](https://github.com/jpalczewski/weglarka/issues/75)).
-
-### Wolumeny w spec apki
-
-```toml
-# apps.toml / --spec
-volumes = [{ name = "data", target = "/data" }]   # read_only = true dla montowania tylko do odczytu
-resources = { memory = "128m", pids_limit = 256 } # opcjonalnie; domyślnie bez limitów
-```
-
-To samo flagami `apps add` / `apps update` (bez pliku spec): `--volume data=/data` (`:ro` na końcu = tylko do
-odczytu; ta sama nazwa podmienia wpis), `--memory 128m`, `--pids-limit 256`, `--cpus 0.5`; `none` usuwa limit
-(`--memory none`). Literówka w polu pliku spec (np. `memory` zamiast `resources.memory`) daje błąd z listą pól.
-
-Wolumen odłącza się bez pełnej podmiany specu: `weglarka apps update <apka> --remove-volume data` odpina wolumen
-prywatny, a `weglarka apps update <apka> --remove-shared-volume kajet-data` — wolumen współdzielony (obie flagi
-powtarzalne, obie wykluczają się z `--spec`). **Żadna z nich nie usuwa danych:**
-
-- dane wolumenu prywatnego zostają w wolumenie Podmana (`<apka>.<nazwa>`) — do `weglarka apps remove <apka>
-  --purge-volumes` albo ręcznego `podman volume rm`; po odłączeniu następny reconcile odtwarza kontener bez tego
-  montowania, a ponowne `--volume data=/data` podłącza te same pliki;
-- odłączenie **ostatniego** członka wolumenu współdzielonego nie usuwa ani deklaracji `[shared_volumes.<nazwa>]`,
-  ani wolumenu `wg-shared-<nazwa>` (dane i zakres UID zostają) — deklarację sprząta dopiero
-  `weglarka volumes remove <nazwa> --purge`;
-- literówka w nazwie to błąd użycia (kod `64`, nic nie jest wysyłane), a `--dry-run` pokazuje usunięte linie
-  diffu specu.
-
-Wolumen `<instancja>.<nazwa>` (np. `szklana-pogoda.data`) powstaje przy deployu z etykietą `weglarka.instance`.
-`weglarka volumes list <apka>` pokazuje deklarowane wolumeny. `apps remove` **nie usuwa danych** (wolumeny i zakres
-UID zostają; ponowne `apps add` tej samej nazwy znajduje je z poprawnym właścicielem). Usunięcie danych:
-`weglarka apps remove <apka> --purge-volumes` (kasuje kontener i wolumeny, zwalnia zakres UID — bez odwrotu).
-Zakres UID jest też zwalniany, gdy usuniętą apkę zostawiono bez wolumenów. Sieć apki (`net-<instancja>`) demon usuwa
-sam przy najbliższym przebiegu reconcile po `apps remove` (gdy nic już z niej nie korzysta).
-
-### Wolumeny współdzielone (grupa UID, iteracja 2)
-
-Kilka apek (kontenerów) może pracować na **jednym** wolumenie — typowy przypadek to SQLite i procesy obok niego
-(api, mcp, worker). Decyzja i odrzucone alternatywy: [0014](decisions/0017-shared-volumes.md). Wolumen deklaruje się
-**raz**, w sekcji najwyższego poziomu `apps.toml`, a apka montuje go po nazwie:
-
-```toml
-[shared_volumes.kajet-data]   # deklaracja: na razie bez pól (miejsce na przyszłe opcje wolumenu)
-
-[apps.kajet-api]
-image = "ghcr.io/.../kajet-api:latest"
-shared_volumes = [{ name = "kajet-data", target = "/data" }]
-
-[apps.kajet-worker]
-image = "ghcr.io/.../kajet-worker:latest"
-shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]   # tylko do odczytu
-```
-
-Gotowy plik (deklaracja + dwie apki): [`docs/examples/sqlite-shared-volume.toml`](examples/sqlite-shared-volume.toml).
-
-Dwa wolumeny, jedna grupa (np. baza SQLite w `/data` i drzewa robocze gita w `/workspaces`, montowane przez te same
-procesy):
-
-```toml
-[shared_volumes.kajet-data]
-group = "kajet"            # opcjonalne; domyślnie grupą jest sam wolumen
-
-[shared_volumes.kajet-workspaces]
-group = "kajet"
-
-[apps.kajet-api]
-image = "ghcr.io/.../kajet-api:latest"
-shared_volumes = [
-  { name = "kajet-data", target = "/data" },
-  { name = "kajet-workspaces", target = "/workspaces" },
-]
-```
-
-Z CLI: `weglarka volumes add kajet-data --group kajet`. **Grupa wolumenu jest stała, dopóki wolumen istnieje** — jego
-pliki należą do zakresu grupy, więc `volumes add` z inną grupą (albo ręczna zmiana `group` w `apps.toml`) kończy się
-`409` / odmową deployu, a `doctor` ostrzega o rozjeździe. Żeby przenieść wolumen do innej grupy: `volumes export`,
-`volumes remove --purge`, `volumes add --group …`, `volumes import`. Zakres grupy jest zwalniany dopiero wtedy, gdy
-znika **ostatni** wolumen grupy (i ostatni jej członek) — purge jednego wolumenu nie uwalnia zakresu, w którym leżą
-dane pozostałych.
-Sekcję `[shared_volumes]` dopisuje `weglarka volumes add <nazwa>`; `apps.toml` jest plikiem demona, więc nie edytuj
-go równolegle z działającym CLI.
-
-- Kontener Podmana nazywa się `wg-shared-<nazwa>` i ma etykietę `weglarka.shared-volume=<nazwa>`, **bez**
-  `weglarka.instance` — dlatego `apps remove --purge-volumes`, sprzątanie osieroconych wolumenów i filtry wolumenów
-  per instancja nigdy go nie ruszają.
-- **Jeden zakres UID na grupę:** wszyscy członkowie dostają ten sam `UIDMap`/`GIDMap` i tę samą etykietę
-  `weglarka.uid-range`, więc ten sam plik ma w każdym kontenerze tego samego właściciela. Członek **nie** dostaje
-  własnego `uid_range` w `state.toml`; każdy członek ma nadal swój kontener, sieć i domeny.
-- Deklaracja chroni przed literówką: `shared_volumes` z nazwą, której nie ma w `[shared_volumes]`, odrzuca
-  walidacja (HTTP 400, podpowiedź `weglarka volumes add <nazwa>`), a `apps.toml` z takim wpisem nie wczyta się przy
-  starcie demona.
-- **Kilka wolumenów na apkę tylko z jednej grupy** (issue #129, [0029](decisions/0029-shared-volume-groups.md)): zakres
-  UID należy do **grupy** wolumenów, nie do pojedynczego wolumenu. Bez pola `group` grupą wolumenu jest on sam
-  (zachowanie sprzed grup), więc istniejące pliki nic nie tracą. Apka może zamontować dowolnie wiele wolumenów
-  **jednej** grupy; wolumeny z różnych grup w jednej apce odrzuca walidacja (HTTP 400, „belong to different groups”).
-  Wolumeny prywatne (`volumes`) można łączyć ze współdzielonym — powstają w zakresie grupy, więc pozostali członkowie
-  mogą je czytać (celowo słabsza izolacja wewnątrz grupy; wygodny sposób na własny cache jednego procesu).
-- `start = false` członka provisionuje zakres i wolumen **bez kontenera** ([6b](#6b-zatrzymywanie-apek-start--false)),
-  więc dane można zaimportować przed pierwszym startem.
-- **Zmiana zakresu UID przy danych jest odrzucana także bez kontenera:** dołączenie apki z prywatnymi wolumenami do
-  grupy (albo wystąpienie z niej) kończy się `409` (`PUT /v1/apps/<nazwa>`) albo błędem akcji reconcile — również
-  wtedy, gdy apka jest tylko provisionowana lub zatrzymana, bo guard czyta ostatni zakres z `state.toml`
-  (`effective_uid_range`). Provisioning i deploy mają wspólny prolog, więc ręczna edycja `apps.toml` przy
-  zatrzymanym demonie też nie przejdzie. Zmiana zakresu jest bezpieczna dopiero po usunięciu danych
-  (`apps remove --purge-volumes` albo ręcznie skasowane wolumeny).
-- **`doctor`:** `state.shared_volumes` raportuje członkostwo w grupach (wolumeny i członkowie każdej grupy
-  z więcej niż jednym wolumenem), wolumen istniejący w innej grupie, niż deklaruje `apps.toml`,
-  dane bez deklaracji (podpowiedź `weglarka volumes remove <nazwa>
-  --purge`), zadeklarowany a jeszcze nieutworzony wolumen, rozjazd etykiety `weglarka.uid-range` i przypomnienie,
-  że wszystkie obrazy grupy muszą działać jako ten sam `USER` — porównania użytkowników `doctor` nie robi za Ciebie.
-- **Sprzątanie:** `apps remove` (bez `--purge-volumes`) **nie usuwa danych** — wolumen i zakres zostają, a ponowne
-  `apps add` znajduje te same pliki. `apps remove --purge-volumes` członka, gdy w grupie są **inni** członkowie,
-  kończy się `409` z listą członków i **niczego nie kasuje**: usuń apkę bez `--purge-volumes` (dane zostają dla
-  reszty grupy) albo najpierw przenieś dane poza Węglarkę (`volumes export`). Purge **ostatniego** członka usuwa
-  wolumen grupy i zwalnia zakres; deklaracja w `apps.toml` **zostaje**, a następny członek dostaje nowy, pusty
-  wolumen.
-
-Deklaracja i sprzątanie z CLI (przez API, jak `apps`):
-
-```sh
-weglarka volumes add kajet-data                 # deklaracja w apps.toml (idempotentna; PUT /v1/volumes/<nazwa>)
-weglarka volumes add kajet-data --group kajet   # ...w grupie, która dzieli jeden zakres UID (PUT ...?group=kajet)
-weglarka volumes list                           # bez apki: wszystkie wolumeny współdzielone
-                                                # (NAME, GROUP, PODMAN NAME, MEMBERS, RANGE, EXISTS)
-weglarka volumes remove kajet-data              # 409, gdy wolumen montuje jakakolwiek apka; bez danych usuwa
-                                                # deklarację (bez --purge nie rusza wolumenu z danymi)
-weglarka volumes remove kajet-data --purge      # usuwa wolumen grupy (dane!) i wpis w state.toml; 409, dopóki
-                                                # są członkowie (najpierw usuń/odłącz apki)
-```
-
-`weglarka volumes list <apka>` działa jak dotąd i pokazuje też wolumeny współdzielone (kolumna `SHARED`).
-`apps add` / `apps update` przyjmują `--shared-volume kajet-data=/data` (`:ro` na końcu = tylko do odczytu; ta sama
-nazwa podmienia wpis, jak `--volume`; flaga wyklucza się z `--spec`). Montowanie odłącza
-`weglarka apps update <apka> --remove-shared-volume kajet-data` — bez kasowania danych, deklaracja
-i `wg-shared-kajet-data` zostają ([wyżej](#wolumeny-w-spec-apki)).
-
-**Przeniesienie istniejącej apki do grupy (migracja danych).** Dołączenie do grupy zmienia efektywny zakres UID
-apki, więc pliki w jej dotychczasowych prywatnych wolumenach stałyby się nieczytelne. Węglarka tego pilnuje: jeśli
-stary kontener miał etykietę `weglarka.uid-range` różną od nowej, a instancja ma już wolumeny prywatne (etykieta
-`weglarka.instance`), deploy jest odrzucany z błędem o zmianie zakresu z danymi, a `PUT /v1/apps/<apka>` zwraca
-`409` — **stary kontener działa dalej**. Kolejność migracji:
-
-1. Zatrzymaj apkę i zrób kopię: `weglarka apps stop <apka>`,
-   `weglarka volumes export <apka> <wolumen> --out kopia.tar` dla każdego prywatnego wolumenu (bazę SQLite
-   najlepiej przez `.backup`/`VACUUM INTO`).
-2. Usuń dane prywatne, żeby strażnik przepuścił zmianę zakresu: `weglarka apps remove <apka> --purge-volumes`
-   (albo `podman volume rm <apka>.<wolumen>`) — nieodwracalne, dlatego najpierw kopia.
-3. Dodaj apkę z montowaniem wolumenu współdzielonego i `start = false` (provisioning bez kontenera).
-4. `weglarka volumes import <apka> kajet-data --from kopia.tar` — tryb domyślny (obcy tar) spłaszcza
-   właścicieli do użytkownika kontenera, czyli poprawnie do zakresu grupy.
-5. `weglarka apps start <apka>` i weryfikacja danych.
-
-Odejście z grupy (usunięcie montowania) to ta sama zmiana zakresu i ten sam strażnik. Gdy członek ma własne
-wolumeny prywatne, `apps remove --purge-volumes` jest zablokowane przez pozostałych członków, więc: eksport →
-`apps stop <apka>` → `podman volume rm <apka>.<wolumen>` (ręcznie) → `apps update --spec` bez współdzielonego
-wolumenu.
-
-Wymagania dla SQLite z kilkoma pisarzami (wspólny `USER` obrazów, WAL, `busy_timeout`, kopia grupy) i zasady
-importu/eksportu wolumenu współdzielonego: [„Import danych z Coolify”](#import-danych-z-coolify-np-szklanapogoda)
-niżej.
-
-### Osłonienie kontenera (`security`)
-
-Domyślnie kontener apki ma tylko izolację UID (osobny zakres per instancja, a przy wolumenie współdzielonym —
-wspólny zakres grupy, [wyżej](#wolumeny-współdzielone-grupa-uid-iteracja-2)) i ewentualne limity. Dla apek z
-sekretami (klucze API, tokeny) i prywatnymi danymi włącz osłonienie — to samo, co Coolify dawał usługom
-z `read_only` / `cap_drop` / `no-new-privileges`:
-
-```toml
-# apps.toml / --spec
-security = { read_only = true, tmpfs = ["/cache"], cap_drop = ["ALL"], no_new_privileges = true }
-```
-
-Flagami: `--hardened` (= `read_only`, `cap_drop = ["ALL"]`, `no_new_privileges`), do tego `--tmpfs /ścieżka` dla
-zapisywalnych katalogów poza wolumenami i `--cap-add NAZWA`, jeśli apka czegoś potrzebuje (np.
-`NET_BIND_SERVICE` dla portu < 1024 w kontenerze). Pojedynczo: `--read-only true|false`,
-`--no-new-privileges true|false`, `--cap-drop`, `--cap-add`, `--tmpfs` (`none` czyści listę).
-
-- Przy `read_only` Podman montuje zapisywalne tmpfs na `/tmp`, `/var/tmp` i `/run`; wolumeny i sekrety działają
-  jak zwykle. Apka, która pisze gdzie indziej poza wolumenem (cache, pid w katalogu aplikacji), potrzebuje `--tmpfs`.
-- Zmiana `security` odtwarza kontener. Apki bez osłonienia hashują się jak wcześniej (aktualizacja Węglarki nic
-  nie odtwarza).
-- Sprawdź po deployu: `podman inspect <kontener> --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'`.
-
-### Kontener ingressu (`weglarka-nginx`)
-
-Kontener nginx jest osłoniony **zawsze** (0014): to jedyny kontener wystawiony na zewnątrz, a jego profil wybiera
-Węglarka, nie spec apki. `read_only`, `no_new_privileges`, `cap_drop = ["ALL"]` i tylko trzy capability z powrotem
-(`CHOWN`, `SETGID`, `SETUID` — nginx zmienia właściciela swoich katalogów tymczasowych na użytkownika workera z obrazu
-i do niego zrzuca uprawnienia; bez nich nie wystartuje). Wszystko, co nginx zapisuje w runtime (pid i katalogi
-`*_temp_path`), leży w `/tmp`, który Podman przy `read_only` montuje jako zapisywalny tmpfs (razem z `/var/tmp`
-i `/run`) — dlatego profil nie potrzebuje własnego wpisu `tmpfs`.
-
-- Profil jest częścią `weglarka.ingress-hash`, więc **aktualizacja Węglarki odtwarza nginx jednorazowo** (krótka
-  przerwa ruchu; obraz jest już na hoście, jeśli `nginx_image` się nie zmienił). Powrót do starszej Węglarki też go
-  odtworzy — wtedy bez osłonienia. Żadne pole w TOML-ach się nie zmieniło, więc `deny_unknown_fields` nie
-  przeszkadza w rollbacku w żadną stronę.
-- Własny `ingress.nginx_image` musi działać z read-only rootem i z dokładnie tymi capability (oficjalny
-  `nginx:*-alpine` działa).
-- Sprawdź: `podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'` (oczekiwane
-  `true` i `[CAP_CHOWN CAP_SETGID CAP_SETUID]`) oraz
-  `podman exec weglarka-nginx nginx -t -c /etc/nginx/nginx.conf`.
-
-### Import danych z Coolify (np. szklana.pogoda)
-
-Importuj tar z Coolify trybem domyślnym (**obcy** tar): libpod nadaje wypakowanym plikom właściciela z konfiguracji
-kontenera (`USER` obrazu, root gdy brak) — niezależnie od UID-ów w tarze, więc drzewo z wieloma właścicielami zostaje
-spłaszczone do jednego (dla SQLite w jednym użytkowniku to właśnie to, o co chodzi).
-
-```sh
-# Na hoście Coolify: sam plik z wolumenu, nieskompresowany tar (rozpakuj .tar.gz przez gunzip)
-tar -cf szklana-data.tar -C /var/lib/docker/volumes/<wolumen>/_data .
-```
-
-Apki nie trzeba najpierw uruchamiać: `start = false` ją **provisionuje** — pull obrazu i przypięcie digestu, sieć,
-zakres UID i wolumeny — ale nie tworzy kontenera. Import tego nie wymaga, bo tar wypakowuje pomocniczy, niestartowany
-kontener z tego samego obrazu. Cała kolejność: provisioning → import → sekrety → pierwszy start:
-
-```toml
-# szklana.toml — apka przygotowana, ale jeszcze nie uruchomiona
-image = "ghcr.io/.../szklana-pogoda:latest"
-start = false
-volumes = [{ name = "data", target = "/data" }]
-```
-
-```sh
-# Po stronie Węglarki:
-weglarka apps add szklana-pogoda --spec szklana.toml                    # obraz, zakres UID, wolumen — bez kontenera
-weglarka volumes import szklana-pogoda data --from szklana-data.tar     # lub: < szklana-data.tar
-weglarka secrets set szklana-pogoda config < config.json                # jeśli apka ma sekrety
-weglarka apps start szklana-pogoda                                      # pull, bramka zdrowia, kontener i router
-```
-
-Dopiero `apps start` zdejmuje `start = false`: pull najnowszego tagu, bramka zdrowia (rollback przy porażce), kontener
-i router w ingressie. Dane z importu czekają w wolumenie z poprawnym właścicielem (zakres UID), więc apka startuje z nimi
-od pierwszego ruchu. Odpowiednik flagowy zamiast pliku: `apps add ... --no-start` (ale wolumeny wymagają `--spec`).
-
-Import zatrzymuje działający kontener apki, wypakowuje tar (robi to Podman w pomocniczym, niestartowanym kontenerze tego
-samego obrazu — Węglarka niczego nie rozpakowuje) i uruchamia apkę z powrotem. Dla apki z `start = false` nie ma czego
-zatrzymywać ani uruchamiać: import tylko wypakowuje dane. Pliki o tej samej ścieżce są nadpisywane, pozostałe zostają;
-przerwany import zostawia część plików. Limit jednego importu: 8 GiB.
-
-**`--replace` — import do pustego wolumenu.** Bez niej pliki spoza tara zostają w wolumenie. Przy SQLite w trybie
-**WAL** to pułapka: jeśli apka wystartowała przed importem, w wolumenie leżą jej `*.db-wal`/`*.db-shm`, a po starcie
-SQLite odtwarza ten stary WAL na zaimportowaną bazę — dane „znikają”, choć plik `.db` jest poprawny (tak było przy
-kartoteka-develop; weryfikacja z `?immutable=1` tego nie widzi, bo ignoruje WAL). `weglarka volumes import <apka>
-<wolumen> --from kopia.tar --replace` usuwa i zakłada wolumen od nowa (kontener apki jest przy tym odtwarzany).
-Kopię bazy WAL rób przez `.backup` (albo `PRAGMA wal_checkpoint(TRUNCATE)` na kopii), a weryfikuj ją razem z
-plikami `-wal`/`-shm`, nie samym `.db`.
-
-**Własne kopie** (`volumes export`) wracają **tylko** z `--own` i tylko do apki o tym samym zakresie UID:
-
-```sh
-weglarka volumes export szklana-pogoda data --out backup.tar
-weglarka volumes import szklana-pogoda data --from backup.tar --own
-```
-
-Nie myl trybów: obcy tar zaimportowany z `--own` ląduje **po cichu** na złych UID-ach; eksport Węglarki
-zaimportowany bez `--own` traci właścicieli (wszystko dostaje użytkownika kontenera).
-
-**SQLite w wolumenie współdzielonym (kilku pisarzy).** Wspólny zakres UID wyrównuje właścicieli plików tylko
-wtedy, gdy **wszystkie obrazy członków działają jako ten sam użytkownik kontenera** — Węglarka nie nadpisuje
-`USER` z obrazu, a uid 1000 w kontenerze to `zakres.start + 1000`, uid 999 to `zakres.start + 999`. Sprawdź przed
-dodaniem grupy: `podman inspect <kontener> --format '{{.Config.User}}'` (pusty wynik = root, uid 0 — też musi być
-taki sam w całej grupie); `doctor` (`state.shared_volumes`) tylko przypomina o tym i wypisuje członków.
-
-Do tego zwykłe zasady SQLite: `journal_mode=WAL` zapisuje się w pliku bazy i zostaje po restarcie; zapisy i tak
-serializuje SQLite (jeden pisarz naraz), więc ustaw `busy_timeout` — bez niego drugi proces dostanie `SQLITE_BUSY`
-zamiast poczekać. Wolumen musi leżeć na **lokalnym** dysku (na NFS blokady POSIX są zawodne), a kopię rób przez
-`.backup`/`VACUUM INTO` przy zatrzymanej grupie albo z wnętrza kontenera. Litestream zakłada jednego pisarza — to
-issue #37; tutaj są tylko wymagania, nie konfiguracja.
-
-**Import/eksport wolumenu współdzielonego.** `volumes export <apka> <wolumen>` działa, ale dla spójnej kopii
-SQLite zatrzymaj najpierw **całą grupę** (`apps stop` każdego członka). Import jest odrzucany (`409`, komunikat z
-listą działających członków), dopóki którykolwiek członek działa — pisanie do bazy pod żywymi procesami ją psuje.
-`--replace` usuwa i zakłada wolumen grupy od nowa (w grupie jest więc jeszcze bardziej ryzykowne), a `--own` jest
-poprawne tylko dla eksportu z **tego samego** zakresu, czyli z tej samej grupy; obcy tar importuj trybem domyślnym.
-Nazwą wolumenu w tych komendach jest nazwa z deklaracji (`kajet-data`), nie `wg-shared-kajet-data`.
-
-### Migracja apki z SQLite (na przykładzie szklana.pogoda)
-
-Wnioski z migracji szklana.pogoda (2026-10-23, przerwa ≈ 46 s, z czego ~25 s dało się uniknąć):
-
-1. **Próba bez przerwy:** apka w Węglarce **bez domeny**, z wolumenem i `auto_update = false`, jeśli apka migruje
-   schemat przy starcie (rollback obrazu nie cofa schematu). Kopia z działającej apki **tylko przez SQLite**
-   (`sqlite3 -readonly <baza> ".backup /tmp/kopia.db"` albo `VACUUM INTO`) — nigdy surowy plik bazy, do której
-   ktoś właśnie pisze. Import obcym tarem, deploy, porównanie liczności tabel ze starą apką.
-2. **Przełączenie:** zatrzymaj starą apkę w Coolify — przez API to `POST /api/v1/applications/{uuid}/stop`
-   (`GET` daje 405); samo zatrzymanie trwa do ~30 s. Wyłącz w Coolify jej auto-deploy, żeby push na `main` jej
-   nie podniósł. Końcowa kopia `.backup` z **zatrzymanej** bazy → ponowny import → `apps update --domain …`.
-3. **Weryfikacja po przełączeniu, nie w oknie przerwy:** `PRAGMA integrity_check` na bazie w wolumenie i
-   porównanie liczności rób **po** dodaniu domeny (na kopii końcowej możesz je zrobić równolegle, poza
-   oknem). Przy szklanej.pogodzie sprawdzanie w oknie wydłużyło przerwę o ~25 s.
-4. **Za proxy:** apka widzi ruch od nginx Węglarki z podsieci swojej sieci (`net-<instancja>`); jeśli apka sama
-   ufa nagłówkom proxy, podaj jej tę podsieć (szklana.pogoda: `TRUSTED_PROXIES=10.89.5.0/24`, sprawdź
-   `podman network inspect net-<instancja>`). Ustaw publiczny origin, jeśli apka go ma (cookie `Secure`).
-5. **Rollback:** `apps update --remove-domain …` + start starej apki. Dane zapisane po przełączeniu przepadają —
-   przed powrotem przy realnym ruchu zrób `weglarka volumes export`.
-
-### Aktualizacja Węglarki do wersji z zakresami UID (jednorazowo)
-
-Kontenery stworzone przez starszą Węglarkę (ntfy, nginx) działają na wspólnej domyślnej mapie Podmana (root w
-kontenerze = użytkownik `weglarka` na hoście). Po aktualizacji demon przydziela im zakresy i **odtwarza je
-jednorazowo**:
-
-1. Zrób `podman ps` i zapisz stan; upewnij się, że masz świeży rollback (poprzedni obraz Węglarki).
-2. Zaktualizuj Węglarkę (`podman pull … && systemctl --user restart weglarka.service`).
-3. Przy starcie: nginx dostaje zakres (`ingress_uid_range`) i jest odtwarzany — **krótka przerwa ruchu** (kilka
-   sekund); pierwszy start obrazu w nowym zakresie jest wolniejszy (kopia warstw).
-4. Reconcile przydziela zakres `ntfy`, wykrywa brak etykiety `weglarka.uid-range` na kontenerze i odtwarza go raz
-   (bez rollbacku — ten sam digest; ntfy nie ma wolumenów). Kolejne przebiegi nic nie zmieniają.
-5. Sprawdź: `podman exec ntfy cat /proc/self/uid_map` (oczekiwane: `0 <start> 65536`, gdzie `<start>` to
-   `uid_range.start` z `weglarka apps show ntfy`), `weglarka doctor`, `scripts/acceptance.sh` (obowiązkowo).
-6. Gdyby ntfy nie wstał po bramce zdrowia: `journalctl --user -u weglarka` / `weglarka apps show ntfy`; powrót do
-   poprzedniej Węglarki zostawia kontenery z zakresami — nginx i ntfy wrócą na domyślną mapę dopiero przy ich
-   następnym odtworzeniu przez starą wersję.
-
-Pliki zamontowane z hosta (`nginx.conf` w `/var/lib/weglarka/nginx`) muszą być czytelne dla „obcych” UID-ów
-(0644 w katalogu 0755 — tak je zapisuje demon).
-
-### Rollback do Węglarki bez wolumenów współdzielonych
-
-`[shared_volumes]` w `apps.toml` i sekcja `shared_volumes` w `state.toml` to nowe pola, a oba pliki mają
-`deny_unknown_fields` — **starszy demon ich nie odczyta**. Przed downgradem:
-
-1. Usuń z apek wszystkie wpisy `shared_volumes` (albo najpierw `apps remove` członków) i sekcję `[shared_volumes.*]`
-   z `apps.toml` oraz sekcję `shared_volumes` ze `state.toml` — albo po prostu przywróć oba pliki z kopii zrobionej
-   przed wdrożeniem wolumenów współdzielonych.
-2. Stara Węglarka nie widzi wolumenów `wg-shared-*` (brak etykiety `weglarka.instance`) i **nie da się jej
-   wskazać** takiego wolumenu jako prywatnego wolumenu apki. Jeśli dane nie są potrzebne:
-   `podman volume rm wg-shared-<nazwa>`; jeśli są — skopiuj je do prywatnego wolumenu apki przed downgradem
-   (pamiętając, że stara Węglarka odtworzy kontener we własnym zakresie UID) albo zostaw wolumen na później.
-3. Kontenery członków działają w zakresie grupy, dopóki stary demon ich nie odtworzy — a odtworzy je we własnych
-   zakresach i dane w wolumenie staną się nieczytelne. Przed downgradem zrób `volumes export` i zatrzymaj apki
-   (`apps stop`).
-
-### Rollback do Węglarki bez pola `effective_uid_range` (issue #75)
-
-`effective_uid_range` w `state.toml` to nowe pole `AppState`, a `state.toml` ma `deny_unknown_fields` — **starszy
-demon nie odczyta pliku**. Wartość jest pochodna (kopia `uid_range` apki albo `shared_volumes.<nazwa>.uid_range`),
-więc przed downgradem wystarczy:
-
-1. Zatrzymaj apki (`apps stop`) i zrób kopię `state.toml` — nowszy demon odtworzy pole przy najbliższym
-   provision/deploy.
-2. Usuń z `state.toml` linie `effective_uid_range` (albo przywróć kopię sprzed wdrożenia) i uruchom starszego demona.
-   Bez tego daemon odmówi startu z błędem parsowania stanu.
-3. **Aktualizuj CLI razem z demonem:** starsze CLI nie odczyta odpowiedzi `apps show`, `apps add`, `apps update`
-   oraz `apps start`/`apps stop`, bo `AppState` w API też ma `deny_unknown_fields`. Nowe CLI czyta starszy demon bez
-   zmian.
-
-## 6b. Zatrzymywanie apek: `start = false`
-
-`start` w spec apki (domyślnie `true`, w `apps.toml` zapisywany tylko jako `start = false`) mówi, czy apka ma
-**działać**, czy być tylko **przygotowana**. Decyzja i odrzucone alternatywy: [0011](decisions/0011-start-false-provisioning.md).
-
-```sh
-weglarka apps add stara-apka ghcr.io/.../stara:latest --domain stara.descriptortable.eu --port 8080 --no-start
-weglarka apps start stara-apka               # start = true: pull tagu, bramka zdrowia, kontener i router
-weglarka apps stop stara-apka                # start = false: usuwa kontener, zostawia wolumeny i zakres UID
-weglarka apps update stara-apka --no-start   # to samo co `apps stop`, przez update spec
-weglarka apps update stara-apka --start      # to samo co `apps start`
-```
-
-- Apka z `start = false` jest **provisionowana**: przypięty digest obrazu, sieć apki, zakres UID i wolumeny —
-  bez kontenera. `weglarka status` / `apps show` pokazują wtedy `not_started` i to jest stan poprawny (brak
-  kontenera z założenia), a nie błąd ani „czeka na sekret”.
-- `apps stop` **usuwa** kontener (nie tylko go zatrzymuje); wolumeny, zakres UID i sekrety zostają. Zakres i dane
-  zwalnia dopiero `apps remove --purge-volumes`.
-- Dopóki apka stoi, webhook/auto-update są wstrzymane: pakiet z GitHuba nie robi dla niej pullu ani deployu.
-  `apps start` sam pobiera najnowszy tag, więc apka wstaje z aktualnym obrazem (stop nie zamraża wersji).
-- Apka z `start = false` **nie dostaje routera** w nginx/Traefik — nie ma dokąd kierować ruchu. Jej domeny
-  pozostają jednak zarezerwowane i walidowane: duplikat domeny (także z drugą, działającą apką) nadal jest
-  błędem. Dzięki temu możesz trzymać domenę w Coolify i przygotować Węglarkę wcześniej, a przełączyć się bez
-  kolizji routerów.
-- `apps update --spec plik.toml` podmienia **całą** spec: jeśli w pliku nie ma `start`, obowiązuje domyślne `true`
-  i apka wstanie. Zatrzymaną apkę opisuj w pliku z `start = false`.
-- Uwaga przy rollbacku: `start` to nowe pole w `apps.toml` z `deny_unknown_fields`, więc **starszy** demon/CLI
-  nie odczyta specu zatrzymanej apki (`start = false`). Wracając do poprzedniej wersji Węglarki usuń `start = false`
-  z `apps.toml` (albo najpierw `weglarka apps start`) — inaczej daemon odmówi startu z błędem parsowania.
-- Uwaga przy łączeniu wersji: `doctor` raportuje trwającą operację statusem `info` (`state.deploying`). Starsze CLI
-  nie zna tego wariantu i gdy w chwili `weglarka doctor` trwa deploy/recreate, nie sparsuje odpowiedzi — aktualizuj
-  CLI razem z demonem (nowe CLI czyta starszy demon bez zmian).
-
-## 6c. Porty publikowane na hoście (`host_ports`)
-
-Niektóre usługi muszą być widoczne na **stałym porcie TCP hosta**, obok swojej strony HTTPS w ingressie. Typowy
-przypadek: serwer gita, którego SSH musi zostać pod znanym numerem (np. `2222` → port `22` w kontenerze), bo ten
-numer siedzi w `git remote` i w przekierowaniu portów na routerze — a UI dalej idzie przez ingress po domenie.
-Decyzja i odrzucone alternatywy: [0013](decisions/0013-host-ports.md).
-
-```toml
-# apps.toml / --spec: git.example.com po HTTPS przez ingress + SSH na porcie hosta
-image = "ghcr.io/example/git-server:latest"
-domains = ["git.example.com"]
-port = 3000
-# 127.0.0.1:2222 → 22 w kontenerze (bez `ip` = tylko loopback):
-host_ports = [{ host = 2222, container = 22 }]
-# publicznie, dopiero po regule UFW:
-# host_ports = [{ host = 2222, container = 22, ip = "0.0.0.0" }]
-```
-
-Zastosowanie: `weglarka apps add git --spec git.toml` (albo `apps update git --spec git.toml`); gotowy plik:
-[`docs/examples/host-ports.toml`](examples/host-ports.toml). To samo flagami `apps add` / `apps update`:
-`--host-port 2222:22` (bez IP = loopback), `--host-port 0.0.0.0:2222:22`, `--host-port none` czyści listę.
-Flaga, jak `--volume`, wyklucza się z `--spec`; reszta specu (obraz, domeny, limity) zostaje na dotychczasowych
-flagach albo w pliku.
-
-- `host` to port na hoście, `container` to port w kontenerze, `ip` — opcjonalny adres nasłuchu. **Bez `ip` port
-  słucha tylko na `127.0.0.1`**: z hosta, przez tunel SSH albo lokalne proxy. Wystawienie na świat wymaga jawnego
-  `ip = "0.0.0.0"` (albo `::`, albo adresu konkretnego interfejsu) — celowo, żeby nowe pole nie odsłaniało
-  usługi przez przypadek.
-- Tylko **TCP**. Nie ma UDP, TLS ani PROXY protocolu: to zwykłe mapowanie portu w Podmanie
-  (`ContainerSpec.publish`), a nie proxy.
-- **Ingress jest całkowicie pomijany:** żadnego routera nginx/Traefik, certyfikatu, logu dostępu ani routingu po
-  domenie. Jedyne «drzwi» to firewall hosta — regułę UFW dodaje rola `weglarka_host` w Ansible, **Węglarka
-  firewalla nie zmienia** (działa rootless). Port bez reguły jest nieosiągalny z zewnątrz, choć działa lokalnie:
-  nie zakładaj, że «skoro `curl` z hosta działa, to działa też z internetu».
-- `host_ports` **wchodzi do `spec-hash`**: zmiana `host`, `container` albo wystawionego adresu odtwarza kontener
-  (krótka przerwa; bramka zdrowia i rollback jak przy każdym recreate). Pusta/nieustawiona lista haszuje się jak
-  dotąd — aktualizacja Węglarki niczego nie odtwarza. Zapisanie `ip = "127.0.0.1"` zamiast pominięcia `ip` to ten
-  sam hash (kolejność wpisów też nie ma znaczenia) — jawny loopback nie odtwarza kontenera.
-- `apps update --spec` podmienia **całą** spec, więc plik bez `host_ports` po cichu usuwa wpisy — jak każde inne
-  pole.
-- Apka z `start = false` ([6b](#6b-zatrzymywanie-apek-start--false)) nie publikuje nic (nie ma kontenera, więc nikt
-  nie słucha), ale wpisy zostają w specu i w walidacji konfliktów — zarezerwowane jak domeny.
-- **Walidacja:** `host` i `container` ≠ 0, `ip` musi być literałem IP, żadnych dwóch wpisów tej samej apki na tym
-  samym gnieździe; między apkami i względem `[ingress] bind` też nie może być kolizji (adres `0.0.0.0`/`::`
-  koliduje z każdym innym adresem na tym porcie). Demon odrzuca taki spec przy `apps add`/`apps update` (HTTP 400,
-  `invalid_request`), a `apps.toml` z kolizją nie wczyta się przy starcie — komunikat wskazuje apkę i port.
-- **Porty < 1024** (np. samo `22`): rootless Podman zwiąże je tylko wtedy, gdy host ma ustawione
-  `net.ipv4.ip_unprivileged_port_start=0`, a Węglarka dodatkowo wymaga
-  `[runtime] allow_privileged_host_ports = true` ([2](#2-konfiguracja-hosta), domyślnie `false`). Bez tego spec
-  jest odrzucany od razu, zamiast wywalać się przy starcie kontenera.
-- Sprawdzenie przed dodaniem: `weglarka doctor --preflight` — `apps.host_ports_free` czyta lokalny `apps.toml`,
-  waliduje deklarację (kolizje, porty < 1024 bez opt-inu) i pokazuje porty zajęte przez cudzy proces. Po
-  deployu: `podman port <instancja>` albo `ss -lnt | grep 2222`.
-
-**Uwaga bezpieczeństwa:** publikowany port omija cały ingress — nie ma tam TLS, logu dostępu, routingu po domenie
-ani żadnej warstwy Węglarki. Autoryzację (klucze SSH, tokeny aplikacji) robi sama usługa, a dostęp ogranicza tylko
-firewall hosta. Wystawiaj wyłącznie to, co naprawdę musi być publiczne, i zaczynaj od loopbacku, dopóki nie masz
-reguły UFW.
-
-Uwaga przy rollbacku: `host_ports` to nowe pole w `apps.toml`, a `[runtime] allow_privileged_host_ports` — w
-`weglarka.toml`; oba pliki mają `deny_unknown_fields`, więc **starszy demon** ich nie odczyta. Wracając do
-poprzedniej wersji Węglarki usuń wpisy `host_ports` z apek i tę flagę z configu — inaczej demon odmówi startu z
-błędem parsowania.
-
-## 6d. Zależności między apkami (`depends_on`)
-
-Część apek potrzebuje, żeby inna apka już działała — usługa i jej baza, worker i kolejka. Bez deklaracji obie
-startują w tym samym przebiegu reconcile, więc zależna apka może trafić na bramkę zdrowia, zanim zależność ma
-kontener: deploy „raz działa, raz się cofa”. Decyzja i odrzucone alternatywy: [0015](decisions/0016-depends-on.md).
-
-```toml
-# apps.toml / --spec: `api` startuje dopiero, gdy `db` działa (i jest zdrowa, jeśli ma healthcheck)
-depends_on = ["db"]
-# kilka zależności naraz, kolejność na liście nie ma znaczenia:
-# depends_on = ["db", "redis"]
-```
-
-Zastosowanie: `weglarka apps add api --depends-on db` (albo `apps update api --depends-on db`); `db` musi już być
-w `apps.toml`. Gotowy plik: [`docs/examples/depends-on.toml`](examples/depends-on.toml) — fragment `apps.toml`
-z dwiema apkami (nie `--spec`: plik specu opisuje jedną apkę). Flagi: `--depends-on` jest powtarzalna,
-`--depends-on none` czyści listę, a `apps update api --remove-depends-on db` usuwa jedną pozycję (błąd użycia, gdy
-jej nie ma); jak `--host-port`, wykluczają się z `--spec`.
-
-- `depends_on` to **tylko kolejność startu i bramka zdrowia**, nie sieć: każda apka ma własną sieć `net-<instancja>`
-  (0009), więc `api` nie rozwiąże nazwy `db` i nie połączy się z nią. Łączność daje osobna, jawna deklaracja:
-  [wspólna sieć grupy (6m)](#6m-wspólna-sieć-między-apkami-shared_networks) — obie rzeczy się składają (najpierw
-  startuje `db`, potem `api`, która się z nią łączy), ale jedna nie implikuje drugiej.
-- Kolejność obowiązuje tam, gdzie Węglarka **startuje** kontener: reconcile po starcie demona, pierwszy deploy,
-  `apps start`, deploy z CLI i z webhooka oraz recreate, gdy kontenera nie ma. Nie dotyczy podmiany działającego
-  kontenera przy zmianie spec-hash (apka już działa) ani provisioningu (`start = false` — nie ma kontenera).
-- **Bramka:** kontener zależności musi **działać**, a jeśli zależność ma healthcheck (`health.command` albo
-  `HEALTHCHECK` z obrazu), musi być **zdrowa**; `health.http` jest sprawdzane przez ingress, jak w bramce deployu
-  (0010). Samo istnienie kontenera nie wystarcza.
-- **Czekanie jest ograniczone:** gdy kontener zależności istnieje, ale nie jest jeszcze gotowy (np. właśnie trwa
-  jego deploy), Węglarka czeka do 10 s, odpytując co 1 s. Potem — a także gdy czekanie nie ma sensu (brak
-  kontenera, `start = false`) — admin API zwraca **409 Conflict** z listą niespełnionych zależności i powodów, a
-  reconcile zgłasza „waiting for dependencies” i ponawia w następnym przebiegu, **bez oznaczania apki jako
-  błędnej** (bez rollbacku i bez błędu w stanie).
-- **Walidacja:** nieznana nazwa, odwołanie do samej siebie, duplikat i cykl są odrzucane przy zapisie specu
-  (`apps add`/`apps update` → HTTP 400 `invalid_request`) i przy wczytywaniu `apps.toml` na starcie demona (demon
-  odmawia startu, komunikat wskazuje apki). Dlatego `apps add api --depends-on db` wymaga, żeby `db` już było
-  w `apps.toml`.
-- **Usuwanie:** `apps remove db`, gdy inna apka ma `depends_on = ["db"]`, kończy się 409 Conflict z listą zależnych
-  apek — nic nie jest usuwane, także z `--purge-volumes`. Najpierw usuń zależne apki albo ich wpisy `depends_on`.
-- Zależność z `start = false` ([6b](#6b-zatrzymywanie-apek-start--false)) nie ma kontenera, więc zależna apka nie
-  wystartuje: reconcile zgłasza oczekiwanie, a `doctor` ostrzega. Wystarczy `weglarka apps start db`.
-- `depends_on` **nie wchodzi do `spec-hash`**: zmiana, przełożenie czy wyczyszczenie listy nie odtwarza kontenera,
-  a `state.toml` się nie zmienia.
-- `apps update --spec` podmienia **całą** spec, więc plik bez `depends_on` po cichu usuwa listę — jak każde inne
-  pole.
-- Sprawdzenie: `weglarka doctor` — nowy check `state.dependencies`: Warn, gdy zależność działającej apki nie
-  istnieje, stoi albo jest niezdrowa, lub gdy zależność ma `start = false`; Info, gdy apka nie jest jeszcze wdrożona
-  i czeka na zależności; Ok inaczej.
-
-Uwaga przy rollbacku: `depends_on` to nowe pole w `apps.toml`, a ten plik ma `deny_unknown_fields`, więc **starszy
-demon** go nie odczyta. Wracając do poprzedniej wersji Węglarki usuń wpisy `depends_on`
-(`weglarka apps update <apka> --remove-depends-on <zależność>`) — inaczej demon odmówi startu z błędem parsowania.
-
-## 6e. Streaming (SSE, long polling)
-
-Aplikacje, które trzymają odpowiedź otwartą — SSE (np. `/<topic>/sse` w ntfy), strumień chunked albo long polling —
-muszą ominąć dwa domyślne zachowania nginxa: `proxy_buffering on` (zdarzenia czekają w buforze proxy zamiast
-iść do klienta) i `proxy_read_timeout 60s` (dłuższa cisza kończy strumień błędem 504). WebSocket działa już dziś
-(nagłówki `Upgrade`/`Connection`), więc chodzi o klientów, którzy streamują po zwykłym HTTP. Decyzja i odrzucone
-alternatywy: [0018](decisions/0018-ingress-streaming.md).
-
-```toml
-# apps.toml: strumieniowanie włączone tylko dla tej apki
-[apps.ntfy.ingress]
-streaming = true
-# stream_timeout_secs = 180   # opcjonalne: domyślnie 180, dozwolone 1..=3600
-```
-
-Zastosowanie: `weglarka apps update ntfy --streaming` dla istniejącej apki, `weglarka apps add ntfy --streaming`
-przy dodawaniu. W pliku `--spec` (jedna apka, nie cały `apps.toml`) ten sam blok to zwykła tabela `[ingress]`:
-
-```toml
-image = "ghcr.io/jpalczewski/ntfy.zig:latest"
-domains = ["ntfy.example.com"]
-port = 8080
-[ingress]
-streaming = true
-```
-
-Gotowy plik: [`docs/examples/streaming.toml`](examples/streaming.toml).
-
-- `streaming = true` dodaje w `location /` **tej jednej apki** cztery dyrektywy: `proxy_buffering off;`,
-  `proxy_request_buffering off;`, `proxy_read_timeout <n>s;` i `proxy_send_timeout <n>s;`. Pozostałe apki, bloki
-  webhooków i serwer domyślny zostają bez zmian — apka bez `ingress` dostaje `nginx.conf` dokładnie taki jak dziś.
-- `stream_timeout_secs` to bezczynność w obie strony: **domyślnie 180**, dozwolone **1–3600**. Samo
-  `streaming = true` wystarcza (domyślny timeout nie jest zapisywany). Ustawienie timeoutu przy
-  `streaming = false` jest odrzucane przez walidację komunikatem „requires ingress.streaming = true” — timeout,
-  który nigdy nie trafi do configu, to literówka, nie opcja. W v1 **nie ma flagi CLI** dla timeoutu: ustawiasz go
-  w `apps.toml` albo przez `apps update --spec`.
-- **Tylko ingress:** zmiana renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP — tak samo jak `--domain`.
-  Kontener apki, jego digest i `spec-hash` zostają nietknięte, nie ma deployu ani przerwy w ruchu do apki. Zmiana
-  działa na nowe połączenia; nginx domyka stare workery, więc otwarty strumień kończy się na starym.
-- `--no-streaming` zeruje ustawienia streamingu (razem z własnym timeoutem; `strip_prefix` zostaje) i nic nie wysyła, gdy apka i tak nie
-  streamuje. Flagi, jak `--domain`, wykluczają się z `--spec`.
-- **Uwaga operacyjna:** `proxy_buffering off` to cel, ale ma koszt — wolny klient trzyma połączenie workera nginxa
-  przez cały czas trwania strumienia (`worker_processes 1`, `worker_connections 1024`), a
-  `proxy_request_buffering off` rozciąga to samo na wolno wysyłane ciało żądania. Włączaj streaming apkom, które
-  naprawdę streamują, a nie wszystkim «na wszelki wypadek».
-- Apka, która ma WebSocket i włączy streaming, dostaje przy okazji dłuższy idle timeout (180 s zamiast 60 s) —
-  zwykle dokładnie to, czego chce, ale to zmiana zachowania, nie efekt uboczny.
-- **Traefik (`behind`) się nie zmienia:** przekazuje odpowiedź na bieżąco i jej nie buforuje, a jego `idleTimeout`
-  dotyczy bezczynności między żądaniami keep-alive, nie trwającego strumienia. (W trybie `edge` ruch idzie
-  prosto do nginx Węglarki, który terminuje TLS — buforowanie i timeouty działają identycznie,
-  [6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu).)
-- **Bezpieczeństwo configu:** gdy nginx odrzuci wygenerowany config, `nginx -t` w demonie kończy się błędem,
-  a poprzedni, działający config zostaje przywrócony — zły wpis nie zostawia ingressu bez ruchu.
-- Rollback: `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta bloku `[apps.X.ingress]`.
-  Przed downgradem usuń go (`apps update --no-streaming` albo ręcznie) — patrz [7](#7-weryfikacja-i-rollback).
-
-## 6f. Komenda i argumenty kontenera (`command`)
-
-Obraz może definiować tylko `ENTRYPOINT` i oczekiwać podkomendy jako argumentu: `docker.io/binwiederhier/ntfy`
-ma `ENTRYPOINT ["ntfy"]` i nie ma `CMD`, więc kontener startuje bez argumentów, wypisuje pomoc i kończy się
-kodem 0 — a bramka zdrowia zgłasza „container not running (Stopped, exit code 0)”. To nie awaria obrazu ani
-brakujący healthcheck: brakuje argumentu `serve`. Opcjonalne pole `command` podaje argv kontenera. Decyzja
-i odrzucone alternatywy: [0019](decisions/0019-container-command.md).
-
-```toml
-# apps.toml / --spec: ntfy uruchamia się jako `ntfy serve`
-[apps.ntfy]
-image = "docker.io/binwiederhier/ntfy:latest"
-domains = ["ntfy.example.com"]
-port = 80
-command = ["serve"]             # argv kontenera: ["ntfy", "serve"]
-```
-
-Zastosowanie: `weglarka apps add ntfy docker.io/binwiederhier/ntfy:latest --command serve` dla nowej apki,
-`weglarka apps update ntfy --command serve` dla istniejącej; w pliku `--spec` `command` jest polem
-najwyższego poziomu (jak `image`). Gotowy plik: [`docs/examples/command.toml`](examples/command.toml).
-
-- **Exec form, bez shella:** każdy element listy to dokładnie jeden argument argv — nic nie jest cytowane,
-  dzielone ani rozwijane. `command = ["serve", "-v"]` to dwa argumenty, `command = ["serve -v"]` to jeden
-  argument ze spacją, a `$VAR`, `*`, `;` i `&&` są danymi, nie składnią shella (obraz bez shella, np.
-  `scratch`, działa tak samo).
-- **To nie jest nadpisanie entrypointu:** pole trafia do `Cmd` / `SpecGenerator.command` w libpodzie, czyli
-  jest doklejane do `ENTRYPOINT` obrazu (dla ntfy: `["ntfy", "serve"]`). Osobne pole `entrypoint` jest poza
-  zakresem tej zmiany — to inna decyzja o innym znaczeniu (podmiana `["ntfy"]`, nie dodanie argumentu).
-- **Puste = `CMD` obrazu, ustawione zastępuje `CMD`** (nie dopisuje): obraz z `CMD ["serve"]` i
-  `command = ["worker"]` uruchomi `worker`, a nie `serve worker`; obraz bez `ENTRYPOINT` dostaje całe argv
-  z `command`. Puste `command` znaczy to samo co brak pola („bez argumentów” to dokładnie domyślny `CMD`).
-- **`spec-hash`:** `command` wchodzi do hasha **tylko gdy jest ustawione** (dopisywane na końcu wejścia,
-  format v1 bez zmian), więc upgrade Węglarki nie odtworzy żadnego istniejącego kontenera. Zmiana `command`
-  — także kolejność argumentów — zmienia `spec-hash`, a kolejny reconcile odtwarza kontener z **przypiętego
-  digestu** (bez pullu).
-- **CLI:** `--command ARG` jest powtarzalna — jedno wystąpienie to jeden element argv; argument zaczynający
-  się od myślnika wymaga formy z `=`: `apps update ntfy --command serve --command=-v`. Flagi **zastępują
-  cały wektor** (nie dopisują do niego), a `--command none` (wielkość liter bez znaczenia) czyści pole do
-  `CMD` obrazu — na obrazie z samym `ENTRYPOINT` to powrót do zepsutego domyślnego zachowania. Jak inne
-  flagi specu, `--command` wyklucza się z `--spec`; `--dry-run` pokazuje diff i niczego nie wysyła.
-- **Walidacja:** każdy argument musi być niepusty; pusty string kończy się HTTP 400 z komunikatem
-  `command argument <i> must not be empty`. Pusta **lista** to nie błąd — to „nie ustawiono”, czyli `CMD`
-  obrazu.
-- **Uwaga operacyjna (rollback):** bramka zdrowia po nieudanym deployu przywraca tylko poprzedni **digest**,
-  nie spec. Błędny `command` obleje więc deploy *i* rollback (stary digest, te same złe argumenty) i apka
-  zostanie zatrzymana, dopóki spec nie zostanie poprawiony: `weglarka apps update <apka> --command ...`
-  (kolejny reconcile odtworzy kontener z przypiętego digestu, bez pullu). Rozpoznanie objawu: deploy pada
-  na bramce z kodem wyjścia 0 i pomocą obrazu — to brakujące lub złe `command`, nie zły obraz.
-- **Downgrade:** `apps.toml` ma `deny_unknown_fields`, więc **starszy demon** nie odczyta `command`. Przed
-  powrotem do starszej Węglarki usuń pole z apek (`apps update <apka> --command none` albo ręcznie) — patrz
-  [7](#7-weryfikacja-i-rollback).
-## 6g. Retencja obrazów i jednorazowe sprzątanie
-
-Do tej pory każdy deploy zostawiał poprzedni obraz na zawsze (issue #40), więc dysk się zapełniał
-(`niechybnie`: ~83 %). Teraz Węglarka sama pilnuje porządku i daje jednorazowe sprzątanie tego, co
-zostało po starszych deployach.
-
-- **Co zostaje:** po udanym deployu (także po rollbacku i przy `start = false`) trzymane są dwa obrazy
-  repozytorium apki — bieżący (`current`) i poprzedni (`previous`, cel rollbacku). Starsze obrazy tego
-  samego repozytorium są usuwane. Obraz, którego używa **jakikolwiek** kontener (także zatrzymany), obraz
-  przypięty w `state.toml` dowolnej apki i obraz, którego tag nadal występuje w `apps.toml`, nigdy nie
-  zostanie usunięty; `image remove` nie jest wołane z `force`, więc Podman odmawia usunięcia obrazu
-  w użyciu. Deploy nie pada przez sprzątanie — problem z retencją jest tylko logowany.
-- **Czego Węglarka nie rusza:** obrazów spoza repozytoriów wymienionych w `apps.toml` (ingress nginx,
-  ręczne `podman pull`, warstwy pośrednie) oraz obrazów repozytorium, którego żadna apka już nie
-  wymienia (usunięta apka albo zmieniony `image`) — te nie są przypisywalne, patrz
-  [0020](decisions/0020-image-retention.md).
-- **Jednorazowo po aktualizacji** (obrazy zostawione przez wcześniejsze deploye):
-
-  ```sh
-  weglarka images prune --dry-run   # lista: ID, tag/digest, rozmiar; nic nie usuwa
-  weglarka images prune             # usuwa i podaje, ile miejsca zwolniono (górna granica)
-  ```
-
-  Sprzątanie jest **jawne**, nie automatyczne przy starcie demona: masowe kasowanie obrazów należy do
-  decyzji operatora. Demon serializuje je z deployami (w trakcie deployu odpowiada `busy`, podobnie jak
-  pozostałe mutacje).
-- **Ostrzeżenie w `doctor`:** check `runtime.images` zgłasza `warn` z liczbą nieużywanych obrazów
-  i rozmiarem („at most” — warstwy wspólne liczone są per obraz), a `hint` wskazuje
-  `weglarka images prune`. W trakcie deployu check jest informacyjny (`info`): świeżo przyciągnięty obraz
-  nie jest jeszcze w `state.toml`, więc wyglądałby na nieużywany.
-- Brak zmian w `apps.toml`/`state.toml`, więc upgrade i rollback demona są bezpieczne.
-
-## 6h. Powiadomienia (ntfy)
-
-Nieudany deploy, rollback i zdarzenia z pętli reconcile trafiają do telefonu przez ntfy — wysyłanego przez
-Węglarkę samą (apka `ntfy`), więc powiadomienia muszą przetrwać deploy ntfy. Decyzja i odrzucone alternatywy:
-[0021](decisions/0021-notifications.md). Wycinek konfiguracji: [`docs/examples/notify.toml`](examples/notify.toml).
-
-Co przychodzi: `deploy ok`, `deploy failed`, `rolled back`, `ROLLBACK FAILED` (krytyczne),
-`provisioned`, `recreated`, `waiting for secrets` (info) oraz — gdy podniesiesz `min_severity` do `debug` —
-`sprzątanie kontenera`, `oczekiwanie na zależności` i `duplikat webhooka`. Pętle restartów i failing
-healthchecki opisuje [6i](#6i-wykrywanie-awarii-apek-crash-loop-unhealthy) i
-[0022](decisions/0022-crash-loop-detection.md); fallback mailowy to #113.
-
-**1. Temat i token w ntfy.** Utwórz temat (np. `weglarka`) i — jeśli serwer nie jest publiczny — token dostępu
-w panelu ntfy. Token trzymaj w pliku 0600 obok konfiguracji; **nie wpisuj go do `weglarka.toml`**:
-
-```sh
-umask 077 && printf '%s\n' 'tk_…' | sudo -u weglarka tee /var/lib/weglarka/ntfy-token >/dev/null
-sudo -u weglarka chmod 600 /var/lib/weglarka/ntfy-token
-```
-
-**2. Sekcja w `weglarka.toml`** (plik konfiguracyjny hosta, nie `apps.toml`):
-
-```toml
-[notify]
-dedup_window_secs = 300          # okno łączenia powtórzeń; 0 = bez łączenia
-
-[notify.ntfy]
-url = "https://nz.example.com"   # musi być osiągalny Z KONTENERA Węglarki (patrz niżej)
-topic = "weglarka"
-token_file = "/var/lib/weglarka/ntfy-token"   # opcjonalny; bez niego temat jest publiczny
-min_severity = "info"            # debug | info | warning | critical
-```
-
-- **Adres:** jeśli kontener Węglarki nie potrafi wyjść na publiczną domenę hosta (hairpin NAT / DNS w
-  kontenerze), użyj trasy wewnętrznej przez ingress: `url = "http://weglarka-nginx:8080"` oraz
-  `host = "nz.example.com"` (nagłówek `Host` i nazwa SNI; nginx routuje po `Host`, tak samo jak
-  `health.http`). Wewnętrzna trasa jest po HTTP w sieci Podmana — token nie opuszcza hosta.
-- **Walidacja przy starcie:** zły URL, temat albo nieczytelny/rozluźniony plik tokenu **zatrzymuje demona**
-  (`notifications: …` w logu) — raz włączone powiadomienia nie mogą po cichu nie działać.
-- **Test:** po restarcie `systemctl --user restart weglarka`:
-
-```sh
-weglarka notify test      # „test notification delivered” = URL, DNS, ingress i token działają
-weglarka notify status    # kanały, kolejka, licznik odrzuconych, ostatni błąd i czas dostarczenia
-```
-
-`notify test` idzie **poza kolejką** (natychmiast, bez dedup), a przy odmowie kanału kończy się kodem 7.
-
-**3. Co się dzieje, gdy ntfy nie odpowiada.** Każde powiadomienie najpierw trafia do trwałej kolejki
-`/var/lib/weglarka/notifications.toml` (0600), a dopiero potem jest wysyłane. Nieudana próba zostaje w kolejce
-i jest powtarzana z backoffem 30 s → 1 min → … → 30 min, maksymalnie 12 razy (≈3,5 h); kolejkę ograniczają też
-200 pozycji i 7 dni (najstarsze wypadają, licznik `dropped` widać w `notify status`). Dzięki temu deploy ntfy —
-czyli chwila, w której powiadomienia są najbardziej potrzebne — nie gubi powiadomień. Kolejka przeżywa restart
-demona; okna dedup (poniżej) są tylko w pamięci.
-
-**4. Powtórzenia (flapping).** Pierwsze zdarzenie danego rodzaju dla danej apki idzie od razu; kolejne w oknie
-`dedup_window_secs` są liczone i po jego zamknięciu przychodzi jedno podsumowanie („3 more: deploy failed: ntfy”).
-Sukces nie zeruje okna niepowodzeń — apka, która na przemian wstaje i pada, nadal daje jedno zgłoszenie na okno.
-
-**5. Rollback.** `weglarka.toml` ma `deny_unknown_fields`, więc **starszy demon nie wystartuje** z sekcją
-`[notify]`. Przed downgradem usuń ją z konfiguracji (albo zostaw w kopii) i zrestartuj usługę — powiadomienia
-nie są częścią stanu apek, więc nic więcej nie trzeba czyścić.
-
-## 6l. Configi z hosta (`config_root`) i `apps reload`
-
-Infra-apki (Authelia #88, Prometheus, Grafana, Loki) potrzebują plików konfiguracyjnych. Zamiast wrzucać je do
-obrazu, do sekretów albo importować do wolumenu, Węglarka montuje je **read-only** z jednego katalogu na hoście i
-pozwala wskazać, jak apka ma je przeładować. Decyzja: [0028](decisions/0028-config-root-mounts.md); gotowy
-przykład: [`docs/examples/configs.toml`](examples/configs.toml).
-
-**1. Katalog.** W `weglarka.toml` dodaj `config_root` — absolutny albo względny do katalogu tego pliku:
-
-```toml
-# config_root = "/var/lib/weglarka/config"
-```
-
-Katalog należy do użytkownika runtime'u (zwykle trzyma się go jako repo git: commituj zmiany, `git checkout` to
-rollback). Demon montuje ten katalog do **swojego** kontenera read-only (potrzebuje go do `apps show` i
-`doctor`), a kontenery apek dostają własne bind-mounty read-only z libpoda. Bez `config_root` funkcja jest
-wyłączona; apka z `configs` przy pustym `config_root` jest odrzucana przy zapisie. Sam `config_root`, jeśli
-jest ustawiony, musi istnieć i być katalogiem — inaczej demon nie wystartuje.
-
-Po aktualizacji Węglarki **uruchom ponownie `weglarka platform install`** (quadlet dostaje nowy mount) — bez tego
-demon nie widzi katalogu i `doctor` to zgłosi.
-
-**2. Spec apki.** `source` jest zawsze względny do `config_root`, `target` to ścieżka w kontenerze. Mount jest
-zawsze read-only (nie ma flagi rw). Lista `configs` jest częścią `spec-hash` — zmiana **co** jest montowane
-odtwarza kontener; zmiana **treści** plików już nie.
-
-```toml
-# apps.toml / --spec
-configs = [
-  { source = "prometheus/prometheus.yml", target = "/etc/prometheus/prometheus.yml" },
-  { source = "prometheus/rules", target = "/etc/prometheus/rules" },   # katalog
-]
-reload_signal = "SIGHUP"   # opcjonalnie: bez niego `apps reload` restartuje kontener
-```
-
-Przez flagi CLI: `weglarka apps update prometheus --config-mount prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
---reload-signal SIGHUP` (flaga zastępuje wpis o tym samym `source`; `--config-mount none` czyści listę). To flaga
-specu apki — globalne `--config plik.toml` (plik konfiguracji hosta) jej nie koliduje i dalej działa jak dotąd.
-
-Bezpieczeństwo: `source` musi być względny, bez `.`/`..`, po rozwiązaniu symlinków musi zostać wewnątrz
-`config_root`, a `target` podlega regułom wolumenów. Sekretów nie trzymaj w `config_root` — apka powinna czytać je
-przez `*_FILE`/env. Walidacja jest dwuwarstwowa: reguły składniowe (`source` względny, bez `..`, unikalny `target`) przy
-każdym `apps.toml`, a reguły systemu plików (symlinki, containment, plik/katalog) w reconcile, przed startem
-kontenera i przy `apps reload`. Brakujący plik nie blokuje więc dodania apki ani startu demona — blokuje samą
-apkę (`weglarka doctor` to pokaże).
-
-**3. Zmiana i reload.** Treść plików nie jest częścią `spec-hash`, więc pętla reconcile niczego nie odtwarza.
-Aplikuj zmianę jawnie:
-
-```sh
-vim /var/lib/weglarka/config/prometheus/prometheus.yml
-weglarka apps reload prometheus        # SIGHUP (spec ma reload_signal) albo restart kontenera
-git -C /var/lib/weglarka/config commit -am "scrape nowy cel"
-```
-
-`apps reload` bierze mutex silnika (serializuje się z deployem), nie zmienia `apps.toml`/`state.toml` i odmawia
-(409), gdy kontener nie działa — wtedy `weglarka apps start`. Rollback configu to `git checkout` + `apps reload`;
-rollback obrazu przywraca digest, nie pliki.
-
-**4. Edytor, inode i `--recreate`.** Edytory zapisujące przez write-and-rename zostawiają single-file bind mount
-na starym inodzie — apka nadal widzi poprzednią treść, mimo poprawnego `git status`. Rozwiązania: mountować
-**katalog** (`source = "prometheus"`, `target = "/etc/prometheus"`) albo po takim zapisie:
-
-```sh
-weglarka apps reload prometheus --recreate   # odtworzenie kontenera z przypiętego digestu (bez pullu)
-```
-
-**5. Uprawnienia i widoczność.** Pliki użytkownika runtime'u są w zakresie UID apki widoczne jako `nobody`
-([0009](decisions/0009-volume-ownership.md)), więc wystarczą `0644` dla plików i `0755` dla katalogów:
-
-```sh
-chmod -R u=rwX,go=rX /var/lib/weglarka/config
-```
-
-`weglarka apps show prometheus` wypisuje każdy mount z aktualnym fingerprintem treści, a `weglarka doctor`
-ostrzega o brakującym źródle, ucieczce poza katalog, zbyt luźnych uprawnieniach oraz o tym, że sam katalog jest
-group/world-writable.
-
-**6. Rollback Węglarki.** `weglarka.toml` i `apps.toml` mają `deny_unknown_fields`, a `apps.toml` niesie teraz
-`schema_version = 2` ([0023](decisions/0023-state-schema-version.md), powód: `configs`/`reload_signal` z #118):
-starszy demon odmówi startu z komunikatem o wersji schematu. Przed downgradem (1) usuń `config_root` z
-`weglarka.toml`, (2) usuń `configs`/`reload_signal` z apek, (3) usuń linię `schema_version` z `apps.toml` i
-`state.toml` — albo prościej: przywróć oba pliki z kopii sprzed aktualizacji (patrz
-[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Configi zostają na dysku, po prostu
-nie są montowane.
-## 6i. Wykrywanie awarii apek (crash loop, unhealthy)
-
-Apka, która w kółko pada, nie jest dziś widoczna: każdy kontener chodzi z `restart = always`, więc Podman
-podnosi go, zanim następne przejście reconcile zauważy cokolwiek złego — a bramka zdrowia sprawdza healthcheck
-tylko przy deployu. Pętla reconcile wykrywa teraz dwie rzeczy i wysyła je jako **zdarzenia silnika**: przy
-skonfigurowanych powiadomieniach trafiają do ntfy (patrz [6h](#6h-powiadomienia-ntfy)), a bez nich zostają
-w logu demona. Decyzja i odrzucone alternatywy: [0022](decisions/0022-crash-loop-detection.md). Wycinek
-konfiguracji: [`docs/examples/monitor.toml`](examples/monitor.toml).
-
-**Co powstaje:**
-
-- `crash loop: <apka>` (krytyczne) — liczba **nowych** restartów w oknie osiągnęła próg. Licznik to
-  `RestartCount` z libpoda; odtworzenie kontenera (deploy, recreate, rollback) zaczyna liczyć od zera,
-  więc nowa wersja nie dziedziczy alarmu po starej.
-- `unhealthy: <apka>` (ostrzeżenie) — healthcheck kontenera nie przechodzi od `unhealthy_observations`
-  kolejnych obserwacji. Kontener bez healthchecku nigdy nie jest tak zgłaszany.
-- `running again: <apka>` (info) — apka wróciła do zdrowia: całe okno bez nowego restartu albo healthcheck
-  znów przechodzi. Jedno zdarzenie na powrót, nie na każdą obserwację.
-
-**Konfiguracja** (sekcja opcjonalna; domyślne wartości działają bez niej):
-
-```toml
-[monitor]
-crash_loop_restarts = 3        # ile nowych restartów w oknie = pętla; 0 wyłącza detekcję
-crash_loop_window_secs = 600   # okno licznika i okres ciszy, po którym uznajemy powrót do zdrowia
-unhealthy_observations = 2     # ile kolejnych obserwacji z failing healthcheck = unhealthy; 0 wyłącza
-```
-
-- **Bez dodatkowego obciążenia:** detekcja korzysta z listy kontenerów, którą reconcile i tak pobiera
-  (`container_list` robi inspect każdego kontenera), i nie zapisuje nic na dysk. Wszystko dzieje się w pamięci
-  i pod mutexem silnika, więc obserwacja nie nakłada się na deploy.
-- **Restart demona:** stan obserwacji jest pamięciowy. Pierwsza obserwacja po starcie tylko ustala punkt
-  odniesienia, więc trwająca pętla zaalarmuje po kolejnych `crash_loop_restarts` restartach — nie od razu.
-- **Appki `start = false`, czekające na sekrety i przed pierwszym deployem:** nie mają kontenera, więc nie
-  generują zdarzeń. Kontenery spoza `apps.toml` (w trakcie sprzątania) też są pomijane.
-- **Powtórzenia:** detektor wysyła jedno zdarzenie na pętlę, a nie na każdy restart; okna dedup powiadomień
-  (sekcja 6h) nadal zbiorą ewentualne podsumowanie, gdy apka migocze między awarią a powrotem.
-- **Rollback:** `[monitor]` to nowa sekcja w `weglarka.toml`, więc starszy demon jej nie odczyta — przed
-  downgradem usuń ją razem z `[notify]` (patrz [7](#7-weryfikacja-i-rollback)).
-## 6j. Sekrety: usuwanie i sprzątanie po apce
-
-Sekrety trzyma się per instancja, w zakresie `<apka>.<nazwa>` w `secrets.toml` (0600). Do tej pory nic
-ich nie usuwało: `apps remove` kasowało apkę, a jej sekrety — w tym `webhook-hmac` — zostawały. Plik
-rósł, a **nowa apka pod starą nazwą dziedziczyła stare wartości** (np. stary `webhook-hmac`, który nie
-zgadza się już z webhookiem w GitHubie). Decyzja i odrzucone alternatywy: [0024](decisions/0024-secret-removal-and-purge.md).
-
-**Pojedynczy sekret: `secrets remove`.**
-
-```sh
-weglarka secrets list ntfy                     # nazwy, fingerprint, data — bez wartości
-weglarka secrets remove ntfy config            # 409, gdy spec apki nadal wiąże ten sekret
-weglarka secrets remove ntfy config --force    # usuwa mimo wiązania; apka czeka na sekret
-weglarka secrets remove ntfy config --dry-run  # pokazuje, co by usunął
-```
-
-- **409 domyślnie:** dopóki spec apki wiąże sekret (`--secret-env`/`--secret-mount`), usunięcie jest
-  odrzucane — apka bez wartości nigdy nie wstanie. Najpierw odwiąż go
-  (`weglarka apps update ntfy --unbind-secret config`) albo użyj `--force`.
-- **`--force`:** wartość znika, a apka przy kolejnym reconcile przechodzi w stan „czeka na sekret”
-  ([6](#6-pierwsza-apka-ntfyzig)) — to nie błąd, deploy czeka na `secrets set`. Działający kontener
-  zachowuje zmaterializowaną wartość do najbliższego odtworzenia; samo usunięcie **nie** wywołuje
-  deployu.
-- **404**, gdy takiego sekretu nie ma; **400** przy niepoprawnej nazwie apki/sekretu.
-- **Apka nie musi istnieć w `apps.toml`** — właśnie po to jest ten endpoint: sprząta pozostałości po
-  usuniętej apecie i **po zmianie nazwy instancji** (stary zakres `<stara-nazwa>.*` zostaje w pliku,
-  dopóki go nie usuniesz).
-
-**Cały zakres apki: `apps remove --purge-secrets`.**
-
-```sh
-weglarka apps remove ntfy --purge-secrets                  # apka + wszystkie jej sekrety
-weglarka apps remove ntfy --purge-secrets --purge-volumes  # + wolumeny (dane)
-```
-
-- Usuwa **cały** zakres `<apka>.*`, w tym `webhook-hmac`. `--purge-secrets` i `--purge-volumes` są
-  niezależne: dane domyślnie przeżywają `remove` + `add`, a poświadczenia nie muszą być trzymane tylko
-  dlatego, że dane zostają.
-- Purge dzieje się **przed** zapisem `apps.toml`: jeśli się nie uda, apka zostaje zarejestrowana
-  i można spróbować ponownie.
-- Działa tylko dla apki obecnej w `apps.toml`; po fakcie użyj `secrets remove` (wyżej).
-- Nie rusza **zmaterializowanych sekretów Podmana** — te powstają z magazynu przy każdym deployu
-  i pozostają po usuniętej apecie do czasu osobnego sprzątania (znana luka, opisana w 0024).
-
-**Pozostałości po apecie: ostrzeżenie w `doctor`.** Check `state.orphan_secrets` zgłasza `warn` z listą
-sekretów, których instancji nie ma już w `apps.toml`, z podpowiedzią (`weglarka secrets remove <apka>
-<nazwa>`; przy kolejnym usuwaniu — `apps remove --purge-secrets`). Gdy wszystko jest czyste, checka nie
-ma. Ostrzeżenie niczego nie blokuje — zostawione sekrety nie psują działania, są problemem higieny
-i bezpieczeństwa.
-
-**Czego to nie zmienia:** format `secrets.toml`/`apps.toml`/`state.toml` zostaje ten sam, więc upgrade
-i rollback demona są bezpieczne, a usunięcie sekretu nie zmienia specu ani `spec_hash` (zmienia się
-tylko wartość, nie wiązanie). Plik nadal jest zapisywany atomowo z prawami 0600. Nowe CLI wobec
-**starego demona** po cichu zignoruje `--purge-secrets` (usunie apkę, sekrety zostaną) i dostanie 404
-na `secrets remove` — najpierw zaktualizuj demona.
-
-## 6k. Samoaktualizacja Węglarki (`self_update`)
-
-Węglarka aktualizuje własny obraz bez ręcznego `platform install`: pobiera tag, **weryfikuje podpis cosign**
-przypiętym kluczem, sprawdza zgodność schematu stanu, przypina digest w definicji usługi (quadlet) i restartuje
-usługę. Decyzje i odrzucone alternatywy: [0027](decisions/0027-self-update.md); schemat plików stanu:
-[0023](decisions/0023-state-schema-version.md). Wycinek konfiguracji:
-[`docs/examples/self-update.toml`](examples/self-update.toml).
-
-Podmiana dzieje się **na hoście**, nie w kontenerze: obraz jest `scratch` (brak `systemctl`, `/etc/passwd`,
-D-Bus), a kontener nie ma prawa zapisu do własnego unitu. `platform install` instaluje dlatego dwa timery usera:
-`weglarka-self-update.timer` (co 10 minut `weglarka-daemon self-update`; `interval_secs` decyduje, czy przebieg
-naprawdę pyta rejestr) oraz `weglarka-watchdog.timer` (co minutę `weglarka-daemon supervise`, który pilnuje, czy
-przełączony demon odpowiedział na `/v1/health` — punkt 4). Oba nic nie robią bez skonfigurowanej sekcji
-`[self_update]`. Decyzja o automacie powrotu: [0034](decisions/0034-automatic-fallback.md).
-
-**1. Klucz podpisujący (raz).** Release podpisuje obraz **dwoma** podpisami: keyless (dla ludzi, `cosign verify`)
-i kluczem statycznym, którym weryfikuje się demon. Klucz publiczny leży w repo (`cosign.pub`) i jest wkompilowany
-w binarkę; prywatny jest tylko w sekretach repo (`COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`):
-
-```sh
-cosign generate-key-pair                       # cosign.key (zahaszowane) + cosign.pub
-gh secret set COSIGN_PRIVATE_KEY < cosign.key
-gh secret set COSIGN_PASSWORD
-```
-
-Rotacja klucza: podmień `cosign.pub` w repo i sekrety (nowy obraz) albo wskaż nowy klucz w
-`[self_update] public_key_file` (bez przebudowy).
-
-**2. Sekcja w `weglarka.toml` i jednorazowe przeinstalowanie unitów** (żeby powstały oba timery):
-
-```toml
-[self_update]
-image = "ghcr.io/jpalczewski/weglarka:latest"   # tag, nie digest — digest przypina sama Węglarka
-# fallback = true                                # automatyczny powrót (punkt 4); false = tylko ręczny --rollback
-# fallback_timeout_secs = 180                    # ile sekund nowy demon ma na odpowiedź /v1/health (30..=3600)
-```
-
-```sh
-weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run   # podgląd: quadlet + unity timerów
-weglarka-daemon --config /etc/weglarka/weglarka.toml platform install             # zapis, daemon-reload, enable timerów
-systemctl --user list-timers weglarka-self-update.timer weglarka-watchdog.timer
-```
-
-**3. Ręcznie, bez czekania na timer:**
-
-```sh
-weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --check   # pull + podpis + schemat; nic nie zmienia
-weglarka-daemon --config /etc/weglarka/weglarka.toml self-update           # to samo, co robi timer
-weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --force   # pominąć interwał / powtórzyć nieudany digest
-```
-
-**4. Automatyczny powrót (issue #100) i ręczny rollback.** Stan `self-update.toml` (0600, w katalogu stanu) niesie
-`current`, `previous`, `pending`, a od #100 także rekord trwającej podmiany (`switch_from`/`switch_to`/`switch_at`,
-`switch_attempts`) i ostatni automatyczny powrót (`fallback_*`). `weglarka-watchdog.timer` co minutę uruchamia
-`weglarka-daemon supervise`: ten sondzi `GET /v1/health` na sockecie admina (odpowiedź = wszystkie warunki startu
-spełnione) i gdy nowy obraz nie odpowie w `fallback_timeout_secs`, przypina `switch_from` w quadlecie
-(`systemctl --user reset-failed weglarka.service`, bo pętla restartów wyczerpuje limit startów, potem restart) i
-zapisuje powrót w pliku stanu. Demon po restarcie potwierdza go i emituje zdarzenie `SelfUpdateFellBack`
-(powiadomienie); zepsuty digest trafia do `error`, więc kolejne przebiegi nie przypną go ponownie, dopóki tag się nie
-ruszy (`--force` to świadome obejście). Budżet to **jedna** automatyczna próba na podmianę — powrót, który sam nie
-wstanie, kończy się raportem (unit watchdoga „failed”, `doctor`), a nie pętlą restartów. Watchdog i switcher biorą
-wspólną blokadę (`self-update.lock`), więc nie nachodzą na siebie.
-
-```sh
-weglarka-daemon --config /etc/weglarka/weglarka.toml supervise                # ręcznie: to samo, co robi timer (z raportem)
-weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --rollback   # ręczny powrót do `previous`
-weglarka doctor | grep self_update    # running / previous / pending / automatyczny powrót i ostatni błąd
-```
-
-Gdy nowy obraz nie wstaje wcale, zadziała też ręczne przypięcie:
-`weglarka-daemon platform install --image ghcr.io/jpalczewski/weglarka@sha256:<poprzedni>` + `systemctl --user
-restart weglarka`.
-
-**5. Ograniczenia i diagnostyka.**
-
-- **Czego automatyczny powrót nie obejmuje:** obrazu, który wstał i odpowiada na `/v1/health`, ale jest zepsuty
-  funkcjonalnie; powrotu w poprzek bumpu schematu stanu (label `io.weglarka.state-schema` starszy niż `state.toml`
-  → raport zamiast przypięcia); obrazu, którego nie ma już w lokalnym store (retencja,
-  [0020](decisions/0020-image-retention.md)); wyczerpanego budżetu prób. W tych przypadkach
-  `weglarka-watchdog.service` kończy się błędem, `doctor` pokazuje stan, a decyzja jest operatora.
-- **Schemat stanu:** nowszy obraz może zapisać nowszy `schema_version`; Węglarka porównuje wtedy label obrazu
-  `io.weglarka.state-schema` z wersją w `state.toml` **przed** podmianą i odmawia downgradu („the image writes
-  state schema …”; obejście `--force` wymaga świadomej decyzji o kopii stanu) — patrz
-  [6j](#wersja-schematu-plików-stanu-rollback-między-wersjami) i [0023](decisions/0023-state-schema-version.md).
-- **Niepodpisany obraz** (np. build sprzed dodania klucza) jest odrzucany: „no key-based cosign signature …”;
-  nic nie jest przypinane, działa poprzednia wersja. Rejestr musi być publiczny — pull jest anonimowy.
-- Log: `journalctl --user -u weglarka-self-update.service -u weglarka-watchdog.service -n 50`; stan:
-  `weglarka doctor` (check `self_update`).
-- `[self_update]` to nowa sekcja `weglarka.toml` (`deny_unknown_fields`): **starszy demon z nią nie wystartuje** —
-  usuń sekcję (razem z `fallback`/`fallback_timeout_secs`) i wyłącz oba timery (`weglarka-self-update.timer`,
-  `weglarka-watchdog.timer`) przed downgradem.
-
-**6. Próba na hoście (opcjonalna).** CI nie ma systemd usera, więc zachowanie watchdoga sprawdza się ręcznie:
-
-1. **zepsuty obraz:** `self-update --image <tag> --force` z obrazem, który nie wstaje; po `fallback_timeout_secs`
-   quadlet wraca do poprzedniego digestu, `doctor` pokazuje automatyczny powrót, a `journalctl --user -u
-   weglarka-watchdog.service` — przebieg i powód;
-2. **reboot z `pending`:** zrestartuj host w trakcie podmiany (przed potwierdzeniem); po starcie w ciągu minuty
-   watchdog albo potwierdza nowy obraz (zdrowy), albo przywraca poprzedni (`OnBootSec=1min`);
-3. **rejestr offline:** po przypięciu odetnij rejestr (albo zatrzymaj `podman system service`); automatyczny powrót
-   nie kontaktuje się z rejestrem — bierze obraz z lokalnego store — więc nadal działa.
-## 6m. Wspólna sieć między apkami (`shared_networks`)
-
-Domyślnie apki są odizolowane: każda ma własną sieć `net-<instancja>`. Gdy wdrożenie składa się z kilku
-kontenerów, które rozmawiają po sieci (worker i broker, reverse proxy przed API, apka i baza), zadeklaruj grupę.
-Decyzja i odrzucone alternatywy: [0030](decisions/0030-shared-networks.md). Gotowy fragment:
-[`docs/examples/shared-network.toml`](examples/shared-network.toml).
-
-```toml
-# apps.toml
-[shared_networks.kajet]          # deklaracja; sieć Podmana powstaje przy wdrożeniu pierwszego członka
-
-[apps.kajet-api]
-shared_networks = ["kajet"]      # dołącza do net-shared-kajet; nazwa instancji jest nazwą DNS w grupie
-
-[apps.kajet-proxy]
-shared_networks = [{ name = "kajet", aliases = ["gateway"] }]   # dodatkowe nazwy DNS w grupie
-```
-
-CLI: `weglarka networks add kajet`, potem `weglarka apps add kajet-api … --shared-network kajet` (albo
-`apps update … --shared-network kajet:gateway`; `--shared-network none` wyprowadza apkę z grupy). Lista:
-`weglarka networks list` (członkowie i to, czy sieć już istnieje); `weglarka networks remove kajet` kończy się
-409, dopóki jakaś apka jeszcze dołącza. Flaga wyklucza się z `--spec`, jak inne flagi specu.
-
-- **Kompromis bezpieczeństwa:** członkowie grupy widzą się nawzajem na **każdym porcie** — nie ma polityki per
-  para ani per port. Apki spoza grupy nie rozwiążą ich nazw i do nich nie dotrą. Dodawaj do grupy tylko apki,
-  którym i tak ufasz na tym poziomie. Przynależność nie daje dostępu do danych: wolumeny, sekrety i zakresy UID
-  zostają per instancja (lub per wolumen współdzielony, [6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)).
-- Grupa to **dodatkowa** sieć: kontener zachowuje własną `net-<instancja>` jako pierwszą (ruch z ingressu, wyjście
-  na zewnątrz, porty publikowane), a sieć grupy jest `internal` — bez trasy na zewnątrz — i nigdy nie niesie
-  publikowanych portów. Ingress nie dołącza do niej; z zewnątrz dostępna jest tylko apka z `domains` (w przykładzie
-  proxy).
-- **Co najwyżej jedna grupa na apkę** (v1). Aliasy muszą być poprawnymi nazwami DNS (`[a-z0-9-]`), unikalnymi
-  w grupie i różnymi od nazw instancji członków; demon odrzuca konflikt przy zapisie specu (400).
-- **Przynależność wchodzi do `spec-hash`** (nazwa grupy i aliasy): dołączenie, wyjście lub zmiana aliasu odtwarza
-  kontener raz. Apka bez `shared_networks` ma ten sam hash co dotąd, więc aktualizacja Węglarki nic nie odtwarza.
-- Usunięcie apki z grupy zostawia grupę i pozostałych członków w spokoju; sieć znika dopiero po
-  `networks remove` (reconcile usuwa pustą sieć bez deklaracji, gdy nic już do niej nie jest podłączone).
-- Sprawdzenie: `weglarka doctor` — check `state.shared_networks`: Warn, gdy sieć grupy istnieje bez deklaracji albo
-  gdy kontener członka nie jest podłączony do sieci grupy (np. spec zmieniono, a recreate jeszcze nie nastąpił);
-  Info, gdy deklaracja nie ma członków.
-
-**Rollback:** to zmiana schematu plików stanu (wersja 4) — `apps.toml` i `state.toml` dostają `schema_version = 4`
-przy pierwszym zapisie po aktualizacji, niezależnie od tego, czy używasz sieci grup. Starszy demon odmówi startu
-z komunikatem o wersji schematu; wracając do poprzedniej wersji przywróć `apps.toml` i `state.toml` **z kopii sprzed
-aktualizacji** ([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
-
-## 6n. Ścieżki na jednej domenie (`paths`)
-
-Domyślnie domena należy do jednej instancji. Gdy jedna publiczna nazwa ma obsługiwać kilka usług (REST pod
-`/api`, osobny serwis pod `/mcp`, SPA jako reszta), podaj każdej instancji prefiksy ścieżek — bez dodatkowego
-reverse proxy w stacku. Decyzja i odrzucone alternatywy: [0031](decisions/0031-path-prefix-routing.md). Gotowy
-fragment: [`docs/examples/path-routing.toml`](examples/path-routing.toml).
-
-```toml
-[apps.api]
-domains = ["app.example.com"]
-paths = ["/api", "/healthz"]     # domyślnie ["/"] (dotychczasowe zachowanie)
-[apps.mcp]
-domains = ["app.example.com"]
-paths = ["/mcp", "/.well-known"]
-```
-
-CLI: `weglarka apps add … --path /api --path /healthz [--strip-prefix]`, `apps update <app> --path /x`,
-`--remove-path /x`, `--strip-prefix` / `--no-strip-prefix`. Flagi wykluczają się z `--spec`.
-
-- **Składnia:** `/` albo `/seg[/seg…]`, bez końcowego `/`, bez `//` i segmentów `.`/`..`, znaki `[A-Za-z0-9_.-]`,
-  do 128 bajtów. `paths` wymaga `domains`.
-- **Dopasowanie:** dla `/p` nginx dostaje `location = /p` i `location ^~ /p/` (więc `/pxyz` nie pasuje), `/` jest
-  catch-allem; wygrywa najdłuższy prefiks.
-- **Rozłączność:** dwie instancje mogą dzielić domenę tylko z rozłącznymi prefiksami. Identyczny prefiks i
-  zagnieżdżony (`/api` vs `/api/v2`) są odrzucane (400) z komunikatem `overlap`; `/` współistnieje z innymi
-  prefiksami. Dwa `/` na jednej domenie to dotychczasowy błąd „domena zajęta”. Domena webhooka pozostaje wyłączna.
-- **`strip_prefix`** (`[apps.X.ingress]`, domyślnie `false`): `/p/x?q=1` trafia do apki jako `/x?q=1`, a `/p` jako `/`.
-  Wymaga prefiksu innego niż `/`.
-- **`streaming`** działa per instancja, czyli per ścieżki tej instancji. **`health.http`** idzie przez nginx, więc
-  żądanie ma pierwszy prefiks apki przed `health.http.path` (dla `/api` i `path = "/up"` sonda pyta `/api/up`).
-- **Tylko ingress:** zmiana `paths`/`strip_prefix` renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP;
-  kontener, digest i `spec-hash` zostają nietknięte. Plik Traefika się nie zmienia (jeden router na apkę).
-- **`weglarka doctor`:** check `ingress.routes` wypisuje efektywną tabelę tras (`domena/ścieżka -> instancja:port`).
-
-**Rollback:** to zmiana schematu plików stanu (wersja 5) — `apps.toml` i `state.toml` dostają `schema_version = 5`
-przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `paths` i `ingress.strip_prefix` z apek (albo
-przywróć pliki **z kopii sprzed aktualizacji**,
-[wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
-
-## 6o. Limit rozmiaru żądania (`ingress.max_body_size`)
-
-Domyślnie nginx przyjmuje ciało żądania do **64 MiB** (`client_max_body_size`) i odpowiada `413` na większe. To dobry
-domyślny limit dla zwykłej apki, ale uniemożliwia serwer git (push to setki MB) i rejestr kontenerów (jedna warstwa
-obrazu to jedno żądanie na kilka GB). Pole `ingress.max_body_size` zmienia limit **jednej apki**. Decyzja i odrzucone
-alternatywy: [0033](decisions/0033-ingress-max-body-size.md).
-
-```toml
-# apps.toml
-[apps.git.ingress]
-streaming = true        # zalecane razem z limitem, patrz niżej
-max_body_size = "4g"
-```
-
-Przez CLI: `weglarka apps add git --max-body-size 4g ...`, `weglarka apps update git --max-body-size 4g` oraz
-`--unset-max-body-size` (powrót do 64 MiB). Gotowy plik: [`docs/examples/max-body-size.toml`](examples/max-body-size.toml)
-(Forgejo: HTTP przez ingress + SSH na `host_ports` 2222:22).
-
-- **Składnia** jak `resources.memory`: liczba bajtów albo `<n>[k|m|g]` (wielokrotności binarne, bez rozróżniania
-  wielkości liter). **`0` oznacza brak limitu** (inaczej niż przy pamięci, gdzie `0` jest błędem). Błędna wartość
-  (`"1.5g"`, `"1t"`, przepełnienie) odrzuca `apps.toml`/`--spec` przy wczytaniu.
-- **Gdzie trafia:** `client_max_body_size` w `location` tej apki, nie w `server` — apki dzielące domenę pod różnymi
-  `paths` ([6n](#6n-ścieżki-na-jednej-domenie-paths)) mają osobne limity. Apka bez pola dostaje `nginx.conf` taki
-  jak dotąd (64 MiB w `server`).
-- **Ustawiony limit wyłącza też `proxy_request_buffering`** w locations apki. Kontener ingressu ma root tylko do
-  odczytu i niewielki tmpfs w `/tmp`, więc domyślne buforowanie ciała (nginx zapisuje je do
-  `/tmp/client_body` zanim zadzwoni do apki) oznaczałoby zapis wielu GB do RAM-u albo błąd `500`. Dotyczy to też
-  limitów poniżej 64 MiB. Buforowanie *odpowiedzi* i timeouty zostają bez zmian, dopóki nie ustawisz `streaming`.
-- **Timeouty:** `client_body_timeout`, `proxy_send_timeout` i `proxy_read_timeout` liczą **bezczynność** między
-  kolejnymi odczytami/zapisami, nie czas całego żądania, więc równomierny upload trwający minuty ich nie ucina
-  (test w CI: 96 MiB w ~76 s przechodzi mimo domyślnych 60 s). Ryzykiem jest odpowiedź *po* ostatnim bajcie —
-  rejestr weryfikuje digest warstwy i może milczeć dłużej niż 60 s — dlatego razem z limitem ustaw
-  `streaming = true` (timeouty 180 s, [6e](#6e-streaming-sse-long-polling)) i w razie potrzeby podnieś
-  `stream_timeout_secs`.
-- **Tylko ingress:** zmiana renderuje `nginx.conf`, sprawdza go `nginx -t` i robi SIGHUP — kontener nie jest
-  odtwarzany, `spec-hash` się nie zmienia. `--no-streaming` zeruje streaming, ale zostawia limit.
-- **Traefik (`behind`) się nie zmienia** — w wygenerowanym pliku nie ma limitu rozmiaru, jedyny limit na ścieżce to ten z nginxa.
-
-**Rollback:** to zmiana schematu plików stanu (wersja 6) — `apps.toml` i `state.toml` dostają `schema_version = 6`
-przy pierwszym zapisie po aktualizacji. Przed downgradem usuń `ingress.max_body_size` z apek
-(`weglarka apps update <apka> --unset-max-body-size`) albo przywróć pliki **z kopii sprzed aktualizacji**
-([wersja schematu](#wersja-schematu-plików-stanu-rollback-między-wersjami)).
-
-## 6p. Tryb `edge` (nginx na 80/443, TLS z katalogu stanu)
-
-W trybie `edge` Węglarka nie stoi już za Traefikiem: jej nginx **sam terminuje TLS** i publikuje na hoście dwa
-porty — `bind` (HTTP) i `https_bind` (TLS); w kontenerze nadal nasłuchuje na 8080/8443. Decyzja i odrzucone
-alternatywy: [0036](decisions/0036-edge-mode.md). Tryb `behind` niczego się nie zmienia.
-
-```toml
-[ingress]
-mode = "edge"
-bind = "0.0.0.0:80"          # HTTP: tylko 301 → https (z wyjątkiem ACME) i serwer domyślny 444
-https_bind = "0.0.0.0:443"   # TLS: jeden serwer na domenę, certyfikat z <state>/nginx/tls
-# traefik_dynamic_file i trusted_proxies są w edge zabronione — walidacja zatrzyma demona
-```
-
-- **Przekierowanie:** każda routowana domena (apki i webhook) na porcie HTTP odpowiada
-  `301 https://$host$request_uri`; wyjątkiem jest prefiks `/.well-known/acme-challenge/`, obsługiwany
-  z webroota. Nieznany `Host` zamyka połączenie (`444`).
-- **TLS tylko z certyfikatem:** serwer TLS powstaje **tylko** dla domeny, która ma parę plików
-  (`<domena>.crt` i `<domena>.key`) albo jest pokryta parą wildcard `_wildcard.<apex>.crt|key`
-  ([6s](#6s-certyfikaty-wildcard-dns-01-acmedns); własna para wygrywa). Domena bez pary dalej przekierowuje na HTTPS, ale nie ma serwera TLS —
-  handshake jest odrzucany (`ssl_reject_handshake`), więc **nic nie idzie plaintextem** do apki. Certyfikaty
-  wystawia `[acme]` ([6q](#6q-certyfikaty-acme-http-01-acme)) albo kładziesz je sam (w testach wystarczy
-  self-signed).
-
-### Certyfikaty i webroot ACME
-
-| ścieżka | tryb | rola |
-|---|---|---|
-| `<nginx_conf_dir>/tls/<domena>.crt` | `0644` | łańcuch PEM, liść pierwszy; czytany przez master nginx |
-| `<nginx_conf_dir>/tls/<domena>.key` | `0600` | klucz PEM; czytany **tylko** przez master nginx |
-| `<nginx_conf_dir>/tls/` (katalog) | `0700` | tworzony przez demona przy pierwszym `apply` |
-| `<nginx_conf_dir>/acme/<token>` | `0644` | token HTTP-01, serwowany jako `/.well-known/acme-challenge/<token>` |
-| `<nginx_conf_dir>/acme/` (katalog) | `0755` | tworzony przez demona; pliki czyta worker nginx |
-
-`<nginx_conf_dir>` to `[ingress] nginx_conf_dir` albo `<state dir>/nginx`. Webroot ACME przyjmuje tylko
-`GET`/`HEAD`; token jest **publiczny**, więc `0644` to nie wyciek — klucze prywatne nigdy nie trafiają do
-webroota. Prywatny klucz jest czytany przez master nginx, który od 0036 działa jako użytkownik runtime'u
-(dwuipisowa mapa uid kontenera ingressu); dlatego pliki mogą zostać `0600` i **nie** są czytelne dla
-użytkowników hosta.
-
-Testowy certyfikat (do pierwszego wdrożenia albo dla `scripts/acceptance.sh`):
-
-```sh
-install -d -m 0700 /var/lib/weglarka/nginx/tls
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
-  -keyout /var/lib/weglarka/nginx/tls/nz.example.eu.key \
-  -out    /var/lib/weglarka/nginx/tls/nz.example.eu.crt \
-  -subj "/CN=nz.example.eu" -addext "subjectAltName=DNS:nz.example.eu"
-chmod 0600 /var/lib/weglarka/nginx/tls/nz.example.eu.key
-```
-
-Dopisanie lub odnowienie certyfikatu **nie wymaga restartu ani odtworzenia nginx**: demon skanuje katalog
-`tls/` przy każdym przejściu, a jego odcisk (nazwy, rozmiary, mtime) trafia do `nginx.conf`, więc zmiana
-przechodzi zwykłą ścieżkę `nginx -t` + SIGHUP (a odrzucony config wraca na dysk z komunikatem w `doctor`).
-Sprawdzenie:
-
-```sh
-podman exec weglarka-nginx grep -F 'ssl_certificate /etc/nginx/tls/' /etc/nginx/nginx.conf
-head -2 /var/lib/weglarka/nginx/nginx.conf        # "# tls material: fingerprint …" zmienia się po odnowieniu
-curl -k --resolve nz.example.eu:443:127.0.0.1 https://nz.example.eu/   # -k tylko dla self-signed
-```
-
-### Wymagania i bezpieczeństwo
-
-- Porty < 1024 wymagają sysctla i `[runtime] allow_privileged_host_ports = true`; `doctor --preflight` ma na to
-  check `ingress.privileged_ports`, a `ingress.tls` ostrzega o domenach bez pary certyfikatów. Porty wysokie
-  (np. 18080/18443) nie wymagają niczego — tak `edge` uruchamia CI i lokalny odbiór.
-- **Brak zaufania do nagłówków:** nginx terminuje TLS, więc `X-Forwarded-For/Proto/Host` buduje z
-  `$remote_addr`/`$scheme`/`$host`; podszyte wartości klienta są nadpisywane (ADR 0007). `trusted_proxies`
-  w `edge` jest błędem walidacji.
-- **Kontener ingressu:** profil osłonienia (0014) się nie zmienia (te same trzy capability, read-only root);
-  zmienia się mapa uid — root kontenera to użytkownik runtime'u, worker zostaje w zakresie ingressu
-  ([0036](decisions/0036-edge-mode.md), [0009](decisions/0009-volume-ownership.md)). Konsekwencja: **do
-  kontenera nginx nie wolno montować niczego poza `<nginx_conf_dir>`** (żadnego katalogu stanu, `config_root`
-  ani pliku Traefika).
-- Własny `ingress.nginx_image` musi mieć nginx ≥ 1.25.1 (`http2 on`, `ssl_reject_handshake`); oficjalny
-  `nginx:1-alpine` i digest z sekcji 2 to spełniają, starszy obraz obleje `nginx -t`.
-- **Odbiór:** `scripts/acceptance.sh` sam wykrywa tryb i sprawdza przekierowanie, ruch po TLS, nagłówki i ACME
-  (patrz [Odbiór](#odbiór-na-hoście-scriptsacceptancesh)). Po instalacji: `weglarka doctor` (check
-  `ingress.apply`, `ingress.tls`, `ingress.nginx`).
-
-**Rollback:** przełączenie na `behind` to powrót do konfiguracji sprzed 0036: ustaw `mode = "behind"`, usuń
-`https_bind`, przywróć `traefik_dynamic_file`, zrestartuj demona. Jednorazowo odtworzy się kontener nginx
-(inny `weglarka.ingress-hash`). `apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu), a
-pliki w `tls/`/`acme/` możesz zostawić — `behind` ich nie czyta. Przed downgradem do wydania sprzed 0036
-usuń `https_bind` z `weglarka.toml` (starszy demon nie zna tego klucza).
-
-## 6q. Certyfikaty ACME (HTTP-01, `[acme]`)
-
-W trybie `edge` ([6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu)) demon sam wystawia i odnawia
-certyfikaty: dla każdej routowanej domeny (apki i webhook) zamawia osobny certyfikat przez HTTP-01 i zapisuje go
-do `tls/`; nginx przeładowuje się bez odtwarzania kontenera. Decyzja: [0038](decisions/0038-acme-engine-seams.md).
-
-```toml
-[acme]
-accept_terms = true                  # wymagane: zgoda na regulamin CA, bez niej konto nie powstanie
-email = "ops@example.eu"             # opcjonalnie: adres kontaktowy CA (powiadomienia o wygasaniu)
-# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"   # staging na próbę
-# renew_before_days = 30             # odnawiaj, gdy zostało tyle dni lub mniej (1..=60)
-# check_interval_secs = 21600        # przejście co 6 h (minimum 600)
-# enabled = false                    # wstrzymanie bez usuwania sekcji
-```
-
-- **Wymagania:** `mode = "edge"`, port HTTP (`bind`) osiągalny z internetu jako **port 80** i DNS domeny
-  wskazujący na ten host — CA wchodzi na `http://<domena>/.well-known/acme-challenge/<token>`. Walidacja
-  odrzuca `[acme]` w trybie `behind` (chyba że `enabled = false`).
-- **Przebieg:** pierwsze przejście startuje 30 s po demonie (nginx musi już nasłuchiwać). Domena bez certyfikatu
-  dostaje go od razu; istniejący jest odnawiany, gdy zostało `renew_before_days` dni lub mniej. Po błędzie
-  następne przejście jest za 30 minut (limit CA to 5 nieudanych walidacji na godzinę dla jednej nazwy),
-  a poprzedni certyfikat jest nadal serwowany.
-- **Pliki:** konto CA to `<state dir>/acme/account.key` (`0600`, JSON z kluczem prywatnym konta; poza webrootem
-  i `tls/`; demon odmawia pliku czytelnego dla grupy/innych), klucz domeny to `tls/<domena>.key` (`0600`),
-  łańcuch `tls/<domena>.crt` (`0644`). Zapis jest atomowy, **klucz przed certyfikatem**. Klucze nie trafiają
-  do logów, zdarzeń ani komunikatów błędów.
-- **Powiadomienia:** `CertificateIssued` (info) po wystawieniu/odnowieniu; `CertificateRenewalFailed` (warning,
-  critical gdy zostało mniej niż 7 dni albo certyfikatu nie ma) — przez zwykły kanał `[notify]`.
-- **`doctor`:** `acme.config` (ostrzega przy stagingu), `acme.account` (tryb pliku konta), `acme.certs`
-  (nieistniejące/wygasłe/do odnowienia i ostatni błąd). Domena bez certyfikatu nadal daje `ingress.tls` = warn,
-  z podpowiedzią, że worker zamówi go w następnym przejściu.
-- **Staging:** na próbę ustaw `directory_url` na staging Let's Encrypt; certyfikaty nie są zaufane przez
-  przeglądarki. Przejście na produkcję: usuń `directory_url` i pliki `tls/<domena>.*` oraz
-  `<state dir>/acme/account.key` (konto stagingu nie istnieje na produkcji), zrestartuj demona.
-- **Test na stagingu (opt-in):** `WEGLARKA_ACME_STAGING_DOMAIN=<domena> WEGLARKA_ACME_STAGING_WEBROOT=<katalog>
-  cargo test -p weglarka-acme --test staging -- --nocapture` — wymaga publicznego portu 80, który serwuje
-  `<katalog>` pod `/.well-known/acme-challenge/` (w CI pomijany).
-- **Nie obsługiwane (jeszcze):** kilka nazw w jednym certyfikacie domeny, własne CA poza `directory_url`.
-  Certyfikaty wildcard przez DNS-01: [6s](#6s-certyfikaty-wildcard-dns-01-acmedns).
-
-**Rollback:** `[acme]` jest nową sekcją `weglarka.toml` z `deny_unknown_fields`, więc **starszy demon odmówi
-startu**, dopóki jej nie usuniesz. Usuń sekcję (albo ustaw `enabled = false` przed rollbackiem do wydania, które
-ją zna) i zrestartuj; wystawione certyfikaty w `tls/` zostają i dalej są serwowane, tylko nie będą odnawiane.
-`apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu).
-
-## 6r. Jednorazowe polecenia (`weglarka run`)
-
-`weglarka run <apka> -- <polecenie>` uruchamia **jeden raz** nowy kontener z obrazem, env, sekretami,
-wolumenami, configami i sieciami apki — np. migrację bazy albo komendę administracyjną — drukuje jego wyjście
-na bieżąco i usuwa kontener po zakończeniu. Decyzja: [0040](decisions/0040-one-off-containers.md).
-
-```sh
-weglarka run gitea -- gitea admin user list
-weglarka run ntfy --env LOG_LEVEL=debug --timeout 10m -- ntfy user list
-weglarka run gitea --entrypoint /bin/sh -- -c 'ls -l /data'
-```
-
-- **Co dostaje kontener:** przypięty digest obrazu apki (nigdy nowszy z tagu), jej `env` (flaga `--env`/`-e`
-  dokłada i nadpisuje na ten jeden raz), sekrety, wolumeny (prywatne i współdzielone, do zapisu), configi
-  z hosta (tylko do odczytu), sieć apki i sieć wspólną. Limity zasobów i hardening jak w apce.
-- **Czego nie dostaje:** `host_ports`, routingu ingressu ani aliasów DNS apki — nie odpowiada pod jej nazwą.
-  Reconcile i `doctor` go nie widzą (etykieta `weglarka.run`, bez `weglarka.instance`).
-- **Argumenty:** wszystko po `--` to argumenty entrypointu obrazu (jak `command`, [6f](#6f-komenda-i-argumenty-kontenera-command)),
-  chyba że podasz `--entrypoint ŚCIEŻKA` — wtedy to jego argumenty. Bez polecenia i bez entrypointu: błąd.
-- **Wyjście i kod:** stdout i stderr idą na odpowiednie strumienie CLI; kod wyjścia CLI to kod polecenia.
-  Uwaga: dzieli on przestrzeń z kodami samego CLI (3 = nie ma apki, 4 = konflikt…); błędy sprzed startu
-  polecenia są wypisane na stderr, a `--json` drukuje po jednym obiekcie JSON na linię (`stream`/`data`,
-  na końcu `exit_code`). `--timeout` (domyślnie i maksymalnie 24 h) kończy polecenie przez `SIGKILL`; kod 124.
-- **Ctrl-C / zerwane połączenie** zabija polecenie i usuwa kontener. Demon, który padł w trakcie runu, zostawia
-  kontener z etykietą `weglarka.run=true` — kolejny start demona usuwa takie sieroty.
-- **Limity:** najwyżej 4 jednoczesne runy (409 powyżej); apka musi mieć przypięty obraz (po `deploy` albo po
-  `apps add` z `start = false`, który go pobiera) — nie musi działać, więc migrację można zrobić **przed**
-  pierwszym startem.
-- **Uwaga na dane:** wolumeny są wspólne z działającą apką. Migracja na żywej bazie (np. SQLite w trybie WAL)
-  może pisać po tych samych plikach — zatrzymaj apkę (`apps stop`) przed migracją, która tego wymaga.
-- **Nie ma (jeszcze):** stdin ani TTY (interaktywna konsola) — osobne zadanie pod #49.
-
-**Rollback:** nic nie trzeba robić — `run` nie zapisuje stanu (`apps.toml`/`state.toml` bez zmian, bez bumu
-wersji schematu). Starszy demon nie ma trasy `/v1/apps/{name}/run`, starszy CLI nie ma komendy.
-
-## 6s. Certyfikaty wildcard (DNS-01, `[acme.dns]`)
-
-Obok certyfikatów per domena (6q) demon może wystawiać **wildcard** (`*.example.eu` razem z `example.eu`) przez
-DNS-01: zamawia go u CA i dowodzi kontroli nad domeną rekordem TXT `_acme-challenge.<domena>`, który sam
-zakłada i usuwa przez API dostawcy DNS. Wildcard nie potrzebuje portu 80 i nie ujawnia pojedynczych
-subdomen w logach CT. Pierwszy dostawca: Cloudflare. Decyzja: [0039](decisions/0039-acme-dns01.md).
-
-```toml
-[acme]
-accept_terms = true
-
-[acme.dns]
-provider = "cloudflare"
-token_file = "/var/lib/weglarka/cloudflare-token"   # plik 0600, ścieżka bezwzględna
-wildcards = ["example.eu"]                           # apex'y: powstanie *.example.eu + example.eu
-```
-
-- **Token Cloudflare:** utwórz token API z uprawnieniami `Zone → Zone → Read` i `Zone → DNS → Edit`
-  **zawężonymi do stref z `wildcards`** (nie globalny klucz API, nie token na całe konto). Taki token może
-  przepisać każdy rekord strefy, więc wyciek jest poważny: trzymaj go tylko w tym pliku
-  (`umask 077 && printf '%s\n' '…' | sudo -u weglarka tee /var/lib/weglarka/cloudflare-token >/dev/null`) i
-  rób osobny token na instalację. Demon czyta plik raz przy starcie i odmawia startu, gdy jest czytelny dla
-  grupy/innych (`chmod 600`), pusty albo ma znaki spoza ASCII; wartość nie trafia do `weglarka.toml`, logów,
-  zdarzeń ani błędów.
-- **Przebieg:** to samo przejście co w 6q: po certyfikatach domen worker zamawia wildcard (jeśli go nie ma albo
-  zostało `renew_before_days` dni lub mniej), kładzie TXT, czeka na walidację CA i **usuwa rekord także po
-  błędzie**. Błąd wildcarda nie wstrzymuje certyfikatów domen. Dla `*.example.eu` i `example.eu` w jednym
-  zamówieniu na `_acme-challenge.example.eu` są dwa rekordy TXT naraz — to normalne.
-- **Pliki:** `tls/_wildcard.<apex>.key` (`0600`) i `tls/_wildcard.<apex>.crt` (`0644`), zapis atomowy, klucz
-  przed certyfikatem. Nazwa nie zawiera `*`.
-- **Które domeny obsługuje wildcard:** apex i domeny **o jedną etykietę niżej** (`example.eu`, `app.example.eu`,
-  `pr-42.example.eu`; nie `a.b.example.eu`). nginx dobiera certyfikat po nazwie domeny: **własna para
-  `<domena>.crt|key` zawsze wygrywa**, w przeciwnym razie bierze wildcard najdłuższego pasującego apexu
-  (`tls/_wildcard.<apex>.crt|key`), a domena bez żadnej pary dalej nie ma serwera TLS (handshake odrzucony,
-  jak w 6p). Wildcard trafia do `nginx.conf` jak każdy certyfikat: przez `nginx -t` + SIGHUP, bez odtwarzania
-  kontenera. Para wildcarda postawiona ręcznie (bez `[acme.dns]`) działa tak samo, ale ręcznie odpowiadasz za to,
-  że certyfikat naprawdę pokrywa `*.<apex>` i `<apex>`.
-- **Co z certyfikatami per domena:** worker nie zamawia certyfikatu HTTP-01 dla domeny, która (1) nie ma własnego
-  certyfikatu i (2) jest pokryta ważnym (istniejącym, niewygasłym) wildcardem z `wildcards`. Wildcard idzie
-  w przejściu pierwszy, więc nowa domena (np. preview PR-a, #105) od razu jest obsłużona bez osobnego
-  zamówienia. Domena, która **już ma** własny certyfikat, jest dalej odnawiana (nginx preferuje własny, więc
-  wygasły nie może zostać); żeby ją przenieść na wildcard, usuń jej `tls/<domena>.crt|key` i poczekaj na
-  następne przejście. Wildcard nieudany albo wygasły = domeny wracają do własnych certyfikatów HTTP-01.
-- **`doctor`:** `acme.dns` (dostawca, tryb pliku tokena) i `acme.wildcards` (brakujące/wygasłe/do odnowienia).
-  Brak wildcarda przed pierwszym przejściem to `warn`. `acme.certs` i `ingress.tls` (oraz `doctor --preflight`)
-  traktują domenę pokrytą wildcardem jako obsłużoną.
-- **Wymagania po stronie DNS:** token musi widzieć strefę; rekord CAA strefy (jeśli jest) musi zezwalać CA
-  (Let's Encrypt: `letsencrypt.org`). CA sam odpytuje autorytatywne serwery, więc demon nie czeka na propagację.
-- **Test na żywo (opt-in):** na osobnej strefie developerskiej; w CI pomijany, a logika adaptera i solvera
-  jest testowana na atrapie API Cloudflare.
-
-**Rollback:** `[acme.dns]` to nowy podblok sekcji `[acme]` z `deny_unknown_fields`, więc **starszy demon
-odmówi startu**, dopóki go nie usuniesz (to samo co `[acme]` w 6q). Usuń `[acme.dns]` i zrestartuj;
-wystawione wildcardy w `tls/` zostają, ale nie będą odnawiane. Token Cloudflare możesz też unieważnić w panelu.
-`apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu).
-
-## 7. Weryfikacja i rollback
-
-```sh
-weglarka status && weglarka apps show ntfy      # digest, generacja, ostatni deploy
-curl -fsS https://nz.descriptortable.eu/        # z zewnątrz, przez Traefika
-podman logs weglarka-nginx                      # access log JSON z polem app
-podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'  # true [] (0014)
-```
-
-- **Automatyczny rollback:** deploy, który nie przejdzie bramki zdrowia, wraca do poprzedniego digestu
-  (retencja 1); wynik w `weglarka deploy` (kod wyjścia 6 = `rolled_back`).
-- **Ręczny rollback do wskazanej wersji:** `deploy --image` jest w MVP odrzucane przez demona (400, 0005), więc
-  przypnij tag `sha-…` przez `apps update` (sekrety, wolumeny i reszta spec zostają):
-
-  ```sh
-  weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:sha-<poprzedni> --no-auto-update
-  ```
-
-  Zmiana obrazu przez `update` deployuje od razu (pull, bramka zdrowia; nieudana bramka = automatyczny rollback
-  do poprzedniego digestu, kod wyjścia 6). Wróć na `:latest` tak samo, z `--auto-update`:
-  `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
-- **Rollback Węglarki do starszej wersji:** pliki TOML mają `deny_unknown_fields`, a `apps.toml` i
-  `state.toml` mogą nieść `schema_version` — demon, który zastanie plik nowszy niż rozumie, odmawia
-  startu z czytelnym komunikatem ([wersja schematu plików
-  stanu](#wersja-schematu-plików-stanu-rollback-między-wersjami)). Przed downgradem do wersji, która
-  dane pole dopiero wprowadziła, usuń je ręcznie: z apek `start = false`
-  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on` ([6d](#6d-zależności-między-apkami-depends_on)),
-  wpisy `shared_volumes` z apek, sekcję `[shared_volumes]` i sekcję `shared_volumes` ze `state.toml`
-  ([6a](#wolumeny-współdzielone-grupa-uid-iteracja-2)), pole `command` w apkach
-  ([6f](#6f-komenda-i-argumenty-kontenera-command)) oraz wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) i bloki `[apps.X.ingress]` — `streaming`
-  ([6e](#6e-streaming-sse-long-polling)); z `weglarka.toml` usuń `[notify]` ([6h](#6h-powiadomienia-ntfy))
-  i `[self_update]` ([6k](#6k-samoaktualizacja-węglarki-self_update), razem z `systemctl --user disable --now
-  weglarka-self-update.timer weglarka-watchdog.timer`) oraz `config_root`, a z apek `configs`/`reload_signal`
-  ([6l](#6l-configi-z-hosta-config_root-i-apps-reload)) oraz `paths` i `ingress.strip_prefix`
-  ([6n](#6n-ścieżki-na-jednej-domenie-paths)) oraz `ingress.max_body_size`
-  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)) oraz `uid`/`gid` z zamontowanych sekretów
-  ([6](#6-pierwsza-apka-ntfyzig)). W trybie `edge` przed downgradem ustaw
-  `mode = "behind"`, usuń `https_bind` i przywróć `traefik_dynamic_file`
-  ([6p](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu)). Inaczej daemon nie wystartuje z błędem parsowania.
-
-### Wersja schematu plików stanu (rollback między wersjami)
-
-`apps.toml` i `state.toml` mogą nieść pole `schema_version` (decyzja:
-[0023](decisions/0023-state-schema-version.md)). Zasady:
-
-- **Plik bez `schema_version` to wersja 1** — kształt sprzed wersjonowania. Demon nie dopisuje
-  `schema_version = 1`; znacznik pojawia się od pierwszego realnego bumu. **Bieżąca wersja to 7**
-  (v2: configi z hosta, issue #118, [0028](decisions/0028-config-root-mounts.md); v3: grupy wolumenów
-  współdzielonych, issue #129, [0029](decisions/0029-shared-volume-groups.md); dalsze wersje — niżej):
-  plik v1 wczytuje się bez zmian, a pierwszy zwykły zapis dopisuje `schema_version = 7`.
-- Znacznik pojawia się dopiero w wydaniu, które naprawdę zmienia schemat (dodaje albo zmienia pole
-  `apps.toml`/`state.toml`); taka wersja uruchamia migrację przy odczycie, a pierwszy zwykły zapis
-  dopisuje nowy numer. **Wersja 3** (issue #129, [0029](decisions/0029-shared-volume-groups.md)) dodaje opcjonalne
-  `group` w `[shared_volumes.<nazwa>]`: od aktualizacji do niej oba pliki dostają `schema_version = 3` przy pierwszym
-  zapisie, także gdy nie używasz grup, a rollback do wcześniejszego wydania wymaga kopii plików sprzed aktualizacji.
-  **Wersja 4** (issue #128, [0030](decisions/0030-shared-networks.md)) dodaje `[shared_networks.<nazwa>]` i
-  `shared_networks` w specu apki ([6m](#6m-wspólna-sieć-między-apkami-shared_networks)); te same zasady rollbacku.
-  **Wersja 5** (issue #130, [0031](decisions/0031-path-prefix-routing.md)) dodaje `paths` i `ingress.strip_prefix`
-  ([6n](#6n-ścieżki-na-jednej-domenie-paths)); te same zasady rollbacku.
-  **Wersja 6** ([0033](decisions/0033-ingress-max-body-size.md)) dodaje opcjonalny `ingress.max_body_size`
-  ([6o](#6o-limit-rozmiaru-żądania-ingressmax_body_size)); **wersja 7** (issue #55, [0037](decisions/0037-secret-mount-ownership.md))
-  dodaje opcjonalne `uid`/`gid` w zamontowanym sekrecie ([6](#6-pierwsza-apka-ntfyzig)) — plik v1 wczytuje się
-  bez zmian, a rollback do wydania sprzed danej wersji wymaga usunięcia tych pól albo kopii plików sprzed
-  aktualizacji.
-- **Starszy demon odmawia startu**, gdy plik ma nowszą wersję, niż on rozumie:
-
-  ```text
-  /var/lib/weglarka/state.toml: schema version 4 is newer than this daemon supports (3); written by
-  a newer Węglarka — roll forward to that version, or restore apps.toml and state.toml from before
-  the upgrade
-  ```
-
-  To nie jest błąd pliku, tylko sygnał, że obraz Węglarki jest starszy niż stan. Wyjścia: wróć na
-  nowszy obraz (roll forward) albo przywróć `apps.toml` i `state.toml` z kopii sprzed aktualizacji.
-  `weglarka doctor --preflight` czyta `apps.toml` sam i pokazuje ten sam komunikat jeszcze przed
-  restartem demona.
-- **Przed każdą aktualizacją Węglarki** zrób kopię katalogu stanu (albo przynajmniej `apps.toml`,
-  `state.toml` i `secrets.toml`). Ta kopia jest jedyną drogą powrotu przez granicę wersji schematu:
-  nowszy demon migruje pliki, a starszy ich potem nie odczyta.
-- Po przywróceniu starszej kopii `state.toml` reconcile uzupełni zakresy UID z etykiet kontenerów, ale
-  apki bez przypiętego `current` mogą zostać wdrożone od nowa (pull + bramka zdrowia).
-### `apps update`: co się dzieje po zmianie
-
-Gdy demon jest zajęty innym deployem (bramka zdrowia trwa do kilkudziesięciu sekund), CLI nie zwraca od razu
-błędu „busy”, tylko ponawia żądanie przez maks. 3 min (komunikat „daemon is busy … waiting…” na stderr).
-
-
-`weglarka apps update <app> [flagi]` czyta obecną spec, nakłada flagi i wysyła **całą** spec (pełna podmiana;
-`--spec plik.toml` podmienia ją w całości z pliku — brak `start` w pliku to `start = true`). `--dry-run` pokazuje
-diff i niczego nie wysyła.
-
-| Zmiana | Skutek |
-|---|---|
-| `--domain` / `--remove-domain` | tylko ingress (nginx reload, plik Traefika); kontener bez zmian |
-| `--env`/`--unset-env`, `--port`/`--unset-port`, `--secret-env`/`--secret-mount`/`--unbind-secret`, wolumeny, limity, `health.command` | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu) |
-| `--shared-volume` (`shared_volumes` w `--spec`) | jak wolumeny: zmienia `spec-hash` → kolejny reconcile odtwarza kontener w zakresie wspólnej grupy UID (zmiana `target`/`read_only` też). Zmiana zakresu przy istniejących wolumenach prywatnych jest odrzucana — patrz [6a](#wolumeny-współdzielone-grupa-uid-iteracja-2). Pusta lista hashuje się jak dotąd |
-| obraz (`apps update <app> <obraz>`) | deploy od razu: pull, bramka zdrowia, rollback przy porażce |
-| `--auto-update` / `--no-auto-update` | tylko zapis; dotyczy kolejnych webhooków |
-| `--start` / `--no-start` (`start` w `--spec`) | `start = false` usuwa kontener (wolumen i zakres UID zostają), `start = true` deployuje od razu: pull, bramka zdrowia, rollback przy porażce. `spec-hash` bez zmian |
-| `--command` (`command` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); flagi zastępują cały wektor argumentów, a `--command none` przywraca `CMD` obrazu |
-| `--host-port` (`host_ports` w `--spec`) | zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); publikowany port odtwarza się razem z kontenerem |
-| `--config-mount` (`configs` w `--spec`), `--reload-signal` | lista `configs` zmienia `spec-hash` → kolejny reconcile odtwarza kontener z przypiętego digestu (bez pullu); **treść** plików nie jest w hashu, więc jej zmiany aplikuj przez `weglarka apps reload` ([6i](#6l-configi-z-hosta-config_root-i-apps-reload)). `reload_signal` jest poza hashem i dotyczy tylko reloadu |
-  ([6b](#6b-zatrzymywanie-apek-start--false)), wpisy `depends_on`
-  ([6d](#6d-zależności-między-apkami-depends_on)), wpisy `host_ports` i `[runtime] allow_privileged_host_ports`
-  ([6c](#6c-porty-publikowane-na-hoście-host_ports)) oraz bloki `[apps.X.ingress]` — `streaming`
-  ([6e](#6e-streaming-sse-long-polling)); inaczej daemon nie wystartuje z błędem parsowania.
-
-Relacja z auto-update: webhook rozsyła deploy do apek, których `image` (repo + tag) zgadza się z paczką, które
-mają `auto_update` i nie są zatrzymane (`start = false` — patrz 6b). Przypięcie tagu `sha-…` lub `--no-auto-update`
-to więc ręczny „pin” — webhook jej nie ruszy, dopóki nie wrócisz na `:latest`. Rollback (retencja 1) działa jak przy
-każdym deployu: wraca do poprzedniego digestu, a nieudany digest jest zapamiętany (ponowny deploy go pominie, dopóki
-nie wymusisz `deploy`).
+Requirement: the canary domain is in DNS (points at the host) **and on the validator allowlist** (the publish-validator
+policy) — without that Traefik gets no router and the "traffic" step ends in a timeout.
+The script only touches the `wg-canary` instance (by default), `wg-webhook`/`wg-rollback` (with
+`--with-local-registry`), `wg-volume`/`wg-nostart` (with `--with-volume`) and the `wg-accept-registry` container —
+never `ntfy`. Options: `--canary-image`, `--webhook-base`, `--keep` (the canary stays), `--skip-preflight`,
+`--strict` (a `doctor` warn is an error), `--cert-timeout`, `--json` (machine report on stdout),
+`--direct http://127.0.0.1:8088` (traffic straight to nginx, no Traefik/TLS — used by CI). Exit code ≠ 0 on any FAIL;
+`ACCEPTANCE_VERBOSE=1` shows the log of successful steps too. Requires `weglarka`, `curl`, `openssl`, `jq`, `podman`.
+The optional `--with-volume` (also in CI; needs `tar`) adds two volume steps: on the `wg-volume` instance, import of
+a foreign tar, data and the UID range surviving `apps remove` + `apps add`, export with the owner `uid_range.start`,
+`--purge-volumes`; on the `wg-nostart` instance, an app added with `start = false` (no container), import before the
+first `apps start`, export with a content check.
+
+**The webhook on the host** checks the protocol (a valid signature → 202 for the canary image — the deploy ends
+`Unchanged`, a bad signature → 401, `ping` → 204, a foreign tag → 204). The **full rollback test** (exit code 6, return
+to the previous digest) and the webhook with a real deploy and a duplicate delivery run in CI (`integration-podman`);
+on the host they are optional (`--with-local-registry`) — they need a temporary registry on `127.0.0.1:15099` and a
+`[[registry]] location = "127.0.0.1:15099" insecure = true` entry in the user's `registries.conf` **before** the
+Podman service starts (it reads the file at startup). The script configures nothing itself; without the entry the
+deploy ends in a FAIL with a hint. Not recommended in production.
+
+Note: `apps remove` **keeps** the canary's secrets in `secrets.toml` by default (`webhook-hmac`); the script cleans
+them up in its "cleanup" step with `--purge-secrets`, so no orphaned entries are left after a run (and `doctor` does
+not report them in `state.orphan_secrets`). Cleaning up after the fact: [Secrets cleanup](guides/secrets-cleanup.md).
+
+## Next steps
+
+- [Your first app: ntfy.zig](guides/first-app.md) — add an app, set its secret, switch over from Coolify.
+- [Guide index](guides/README.md) — all guides: volumes, webhooks, host ports, edge mode and ACME, self-update,
+  notifications, verification and rollback, ...

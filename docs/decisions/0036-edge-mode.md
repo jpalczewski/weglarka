@@ -43,7 +43,7 @@ The configuration is explicit per mode and validated at startup
 | port < 1024 | not used by the ingress | requires `[runtime] allow_privileged_host_ports = true` (same opt-in as `host_ports`, ADR 0013; the sysctl itself is check `ingress.privileged_ports`) |
 
 `https_bind` is a new `weglarka.toml` key, so `deny_unknown_fields` makes an older daemon refuse an
-`edge` config — documented in `docs/install.md` (downgrade: remove `https_bind`, switch to `behind`).
+`edge` config — documented in [the edge mode guide](../guides/edge-mode.md) (downgrade: remove `https_bind`, switch to `behind`).
 `apps.toml`/`state.toml` are untouched: no schema bump (ADR 0023).
 
 **The plain-HTTP listener only redirects, except ACME.** Every routed domain (apps and the webhook
@@ -146,7 +146,7 @@ the doctor check; CLI preflight tests cover `ingress.config`, `ingress.tls` and
 - **`behind` is untouched.** Same config, same generated `nginx.conf` byte for byte, same snapshots;
   the daemon does not even read the TLS directories there.
 - **Custom `ingress.nginx_image`**: `ssl_reject_handshake` needs nginx ≥ 1.19.4 and `http2 on` needs
-  ≥ 1.25.1; the official `nginx:1-alpine` (and the digest pinned in `docs/install.md`) is newer. An
+  ≥ 1.25.1; the official `nginx:1-alpine` (and the digest pinned in [the install guide](../install.md)) is newer. An
   older image fails `nginx -t` loudly.
 - **Host preparation**: ports 80/443 on the host need `net.ipv4.ip_unprivileged_port_start=0` (rootless
   Podman), the explicit `[runtime] allow_privileged_host_ports = true` opt-in (validation refuses the

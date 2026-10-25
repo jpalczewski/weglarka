@@ -56,7 +56,7 @@ secrets = [
 ## Consequences
 
 An operator deploying an image with a non-root `USER` can mount its config with `mode = 0o400` and the image's
-`uid`/`gid`, and tighten the file at the same time (documented in `docs/install.md`, section 6). The default
+`uid`/`gid`, and tighten the file at the same time (documented in [the first app guide](../guides/first-app.md)). The default
 path is unchanged: no spec, no hash and no container changes.
 
 The real-Podman engine test (`engine_ranges_volumes_secrets_import_migration_and_purge`,

@@ -15,7 +15,7 @@ rollback, `deny_unknown_fields` compatibility).
 ## Consequences
 
 What changes for operators and for the code: new CLI/API surface, `apps.toml`/`state.toml` fields, migration and
-rollback steps (document them in `docs/install.md`), tests that must exist.
+rollback steps (document them in the matching guide in `docs/guides/`), tests that must exist.
 
 ## Rejected alternatives
 

@@ -25,7 +25,7 @@ Conventions and division of work: [CLAUDE.md](CLAUDE.md). Implementation decisio
 
 The `ghcr.io/jpalczewski/weglarka` image (a rootless Podman container, systemd quadlet) + the `weglarka` CLI
 from GitHub Release assets: host requirements, `weglarka.toml`, startup, the CLI over an SSH tunnel, the first app
-(ntfy.zig), the GitHub webhook, signature verification and rollback — [docs/install.md](docs/install.md).
+(ntfy.zig), the GitHub webhook, signature verification and rollback — [docs/install.md](docs/install.md), then the topic [guides](docs/guides/README.md).
 
 ## License
 

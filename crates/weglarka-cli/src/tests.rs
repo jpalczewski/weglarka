@@ -556,7 +556,7 @@ fn edge_mode_skips_traefik_check_and_openrc_skips_linger() {
     assert!(ids.contains(&"ingress.tls"), "{ids:?}");
 }
 
-// ---------- new host checks (devops, niechybnie) ----------
+// ---------- new host checks (devops) ----------
 
 fn status_of(host: &FakeHost, id: &str) -> weglarka_api::CheckStatus {
     report(host, Some(CONFIG))

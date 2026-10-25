@@ -21,13 +21,13 @@ Connectivity is **opt-in and declared**, mirroring shared volumes (ADR 0017). Is
 ### Desired state (`apps.toml`)
 
 ```toml
-[shared_networks.kajet]            # declaration; the Podman network is created lazily
+[shared_networks.notes]            # declaration; the Podman network is created lazily
 
-[apps.kajet-api]
-shared_networks = ["kajet"]        # joins net-shared-kajet; the instance name is a DNS name there
+[apps.notes-api]
+shared_networks = ["notes"]        # joins net-shared-notes; the instance name is a DNS name there
 
-[apps.kajet-proxy]
-shared_networks = [{ name = "kajet", aliases = ["gateway"] }]
+[apps.notes-proxy]
+shared_networks = [{ name = "notes", aliases = ["gateway"] }]
 ```
 
 * `AppsFile.shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>` — declared once, no owner.
@@ -52,8 +52,8 @@ shared_networks = [{ name = "kajet", aliases = ["gateway"] }]
 * The container is created with `Networks: { net-<instance>: {}, net-shared-<name>: { aliases: [...] } }`.
   The container name is already a DNS name on every network it joins (netavark/aardvark-dns), so the instance
   name needs no alias. `ContainerSpec.network_aliases` is an additive field (network → aliases).
-* Cleanup is keyed on the **label**, never on the `net-` prefix: `net-shared-kajet` also parses as the
-  per-app network of an instance called `shared-kajet`. `prune_networks` removes a labelled network only when
+* Cleanup is keyed on the **label**, never on the `net-` prefix: `net-shared-notes` also parses as the
+  per-app network of an instance called `shared-notes`. `prune_networks` removes a labelled network only when
   its declaration is gone (best effort; a network that still has containers is left for a later pass), and
   never because a member left — the group outlives its members like the shared-volume declaration does.
 
@@ -70,7 +70,7 @@ Węglarka recreates nothing.
 From the first write after the upgrade both files carry `schema_version = 4`,
 and an older daemon refuses them with the schema message instead of a `deny_unknown_fields` parse error.
 Rolling back across the bump needs the copy of the state directory from before the upgrade
-(`docs/install.md`).
+([the shared networks guide](../guides/shared-networks.md)).
 The image label (`ARG STATE_SCHEMA` in the Containerfile) moves with it, so the self-updater (ADR 0027)
 refuses a rollback to an image that writes schema 3 or older.
 
@@ -97,7 +97,7 @@ then the runner that dials it) but never implies one.
 ## Consequences
 
 * New optional fields in `apps.toml`; schema version 4; operators must back up the state directory before
-  upgrading if they may roll back (`docs/install.md` 6m).
+  upgrading if they may roll back ([the shared networks guide](../guides/shared-networks.md)).
 * `FakePodman` records network aliases, spec and membership; `ContainerSpec` gains `network_aliases`.
 * Tests: pure validation and hash tests, engine scenarios on `FakePodman` (lazy creation, outsiders excluded,
   member removal, recreate on join/leave, label-keyed pruning), the admin API, and an integration test on a

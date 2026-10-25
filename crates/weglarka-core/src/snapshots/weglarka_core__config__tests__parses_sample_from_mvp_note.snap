@@ -19,7 +19,7 @@ expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
   },
   "webhook": {
     "listen": "0.0.0.0:9180",
-    "domain": "weglarka.descriptortable.eu"
+    "domain": "weglarka.example.com"
   },
   "platform": {
     "kind": "systemd",

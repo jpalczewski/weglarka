@@ -324,7 +324,7 @@ where
     let Some(previous) = st.previous.clone() else {
         return Ok(Report::Refused {
             reason: format!(
-                "no previous image recorded in {} — nothing to roll back to (docs/install.md 6k)",
+                "no previous image recorded in {} — nothing to roll back to (docs/guides/self-update.md)",
                 state::path(state_dir).display()
             ),
         });
@@ -1256,7 +1256,7 @@ dir = "{root}/state"
         {
             Report::Refused { reason } => {
                 assert!(reason.contains("no previous image"), "{reason}");
-                assert!(reason.contains("docs/install.md"), "{reason}");
+                assert!(reason.contains("docs/guides/self-update.md"), "{reason}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }

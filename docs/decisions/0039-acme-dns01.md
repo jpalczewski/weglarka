@@ -102,7 +102,7 @@ convention `tls/_wildcard.<apex>.crt|key`.
    own and is covered by a valid wildcard on disk; a domain that already has its own pair keeps being renewed
    (nginx prefers it, so it must not expire), and a failed or expired wildcard falls back to per-domain
    issuance. `doctor` (`acme.certs`, `ingress.tls`) and the CLI preflight count a covered domain as served.
-5. Doctor `acme.dns` and `acme.wildcards` and `docs/install.md` 6s (done with step 3); a CAA check and the opt-in
+5. Doctor `acme.dns` and `acme.wildcards` and the [wildcard guide](../guides/wildcard-certificates.md) (done with step 3); a CAA check and the opt-in
    live test on a development zone remain.
 
 ## Consequences

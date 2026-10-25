@@ -60,7 +60,7 @@ modified by a run (volumes are mounted read-write: that is the point of a migrat
 ## Consequences
 
 - New API route `POST /v1/apps/{name}/run`, new CLI command `run`, new `PodmanClient` methods and one new
-  `ContainerSpec` field (every literal gained `entrypoint: None`). Documented in `docs/install.md` 6r.
+  `ContainerSpec` field (every literal gained `entrypoint: None`). Documented in [the one-off commands guide](../guides/one-off-commands.md).
 - Rollback to an older daemon needs nothing: no state was written. An older CLI simply has no `run`.
 - **Volumes are shared with the live app.** A migration against a running app can write the same files
   (a SQLite database in WAL mode, for one). The operator decides whether to `apps stop` first; Węglarka does
