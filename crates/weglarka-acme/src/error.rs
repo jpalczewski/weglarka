@@ -18,6 +18,8 @@ pub enum AcmeError {
     InvalidToken { name: String },
     #[error("challenge failed for {name}: {reason}")]
     Challenge { name: String, reason: String },
+    #[error("ACME account: {0}")]
+    AccountKey(String),
     #[error("ACME order failed: {0}")]
     Order(String),
     #[error("cannot read the expiry of the certificate: {0}")]

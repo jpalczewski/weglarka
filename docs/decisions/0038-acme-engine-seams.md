@@ -23,8 +23,13 @@ The crate is split into seams, each small enough to test on its own:
   (`0644`); the token comes from the CA and is validated as base64url before it becomes a file name.
   Cleanup is idempotent and also runs when the order fails. DNS-01 is another implementation (#97).
 - **`AcmeClient` (order one certificate, driving a solver) and `CertInspector` (read `notAfter`)** are
-  traits with native `async fn` (ADR 0001). The `instant-acme` implementation (`ring` provider, bundled
-  roots; ADR 0021) follows in the next PR; `testing::FakeAcme` implements both for tests.
+  traits with native `async fn` (ADR 0001). `InstantAcme` implements both over `instant-acme` with
+  `default-features = false` and the `ring` provider (the default `aws-lc-rs` needs a C toolchain). Its HTTP
+  client is built by us (hyper + `hyper-rustls`, `ring`, bundled `webpki-roots`, HTTP/1.1; the crate's
+  platform verifier would find no CA store in the `scratch` image, ADR 0021). The account credentials
+  (they contain the account private key) live in a `0600` JSON file that is refused when group/other
+  accessible; the account is created on first use only when the terms are explicitly accepted.
+  `testing::FakeAcme` implements both traits for tests.
 - **`CertStore` writes the key first, then the certificate**, atomically (`state::write_atomic`: key `0600`,
   chain `0644`, `tls/` `0700`). The ingress fingerprint needs both files; this order means it never sees a
   new certificate without its key, and a crash in between leaves a pair `nginx -t` rejects, so the ingress
@@ -40,8 +45,8 @@ so it needs no `SCHEMA_VERSION` bump.
 
 ## Consequences
 
-This PR changes nothing for operators: no config section, no daemon wiring. The follow-ups are the
-`instant-acme` client and `[acme]` (a new section breaks rollback to an older daemon because of
+Nothing here changes behaviour for operators yet: no config section, no daemon wiring. The follow-ups are
+`[acme]` (a new section breaks rollback to an older daemon because of
 `deny_unknown_fields`, to be documented in `docs/install.md`), events, `doctor acme.*` and the daemon worker.
 `testing::FakeAcme` plus `Manager` tests cover issue, renew, skip, failure and cleanup without a CA.
 
