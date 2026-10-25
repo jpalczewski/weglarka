@@ -811,3 +811,90 @@ async fn a_paused_acme_section_starts_no_worker() {
     assert!(running.daemon.acme.is_none());
     running.stop().await;
 }
+
+fn acme_dns_section(token: &Path) -> String {
+    format!(
+        "[acme]\naccept_terms = true\ndirectory_url = \"https://acme.invalid/directory\"\n\n\
+         [acme.dns]\nprovider = \"cloudflare\"\ntoken_file = \"{}\"\nwildcards = [\"example.eu\"]\n",
+        token.display()
+    )
+}
+
+#[tokio::test]
+async fn acme_dns_starts_with_a_private_token_and_doctor_reports_the_wildcards() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let token = dir.path().join("cf-token");
+    std::fs::write(&token, "cf-secret-token\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let running = start(
+        edge_settings_with(dir.path(), &acme_dns_section(&token)),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+    assert!(running.daemon.acme.is_some());
+
+    let (status, v) = admin_running(&running, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let find = |id: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} check in {v}"))
+            .clone()
+    };
+    let dns = find("acme.dns");
+    assert_eq!(dns["status"], "ok", "{dns}");
+    assert!(dns["message"].as_str().unwrap().contains("example.eu"));
+    let wildcards = find("acme.wildcards");
+    assert_eq!(wildcards["status"], "warn", "{wildcards}");
+    assert!(
+        wildcards["message"]
+            .as_str()
+            .unwrap()
+            .contains("*.example.eu")
+    );
+    // The token value never reaches the report.
+    assert!(!v.to_string().contains("cf-secret-token"));
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn acme_dns_refuses_to_start_with_a_world_readable_or_missing_token() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let token = dir.path().join("cf-token");
+    std::fs::write(&token, "cf-secret-token\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = start(
+        edge_settings_with(dir.path(), &acme_dns_section(&token)),
+        FakePodman::new(),
+    )
+    .await
+    .err()
+    .expect("a group/other-readable token must stop the daemon");
+    let text = err.to_string();
+    assert!(
+        text.contains("chmod 600") && !text.contains("cf-secret-token"),
+        "{text}"
+    );
+
+    let missing = dir.path().join("nope");
+    let err = start(
+        edge_settings_with(dir.path(), &acme_dns_section(&missing)),
+        FakePodman::new(),
+    )
+    .await
+    .err()
+    .expect("a missing token file must stop the daemon");
+    assert!(err.to_string().contains("[acme.dns] token_file"), "{err}");
+}

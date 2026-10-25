@@ -79,6 +79,9 @@ pub enum StartError {
     /// `[self_update]` cannot work (a digest instead of a tag, an interval that is too short…).
     #[error("[self_update] {0}")]
     SelfUpdateConfig(String),
+    /// `[acme.dns]` is unusable (an unreadable or world-readable token file, an invalid apex).
+    #[error("{0}")]
+    Acme(String),
     /// `[ingress]` cannot work in the selected mode (an `edge` host without `https_bind`, a
     /// `behind`-only key in `edge`, a privileged publish port without the opt-in — issue #95).
     #[error("{0}")]
@@ -256,7 +259,7 @@ pub async fn start<P: PodmanClient + 'static>(
         &host.webhook.domain,
         events,
         ingress.clone(),
-    );
+    )?;
     let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];
     if let Some(forgejo) = &host.webhook.forgejo {
         webhook_sources.push(Box::new(

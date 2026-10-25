@@ -1770,6 +1770,7 @@ dependencies = [
  "weglarka-acme",
  "weglarka-api",
  "weglarka-core",
+ "weglarka-dns",
  "weglarka-ingress",
  "weglarka-notify",
  "weglarka-podman",

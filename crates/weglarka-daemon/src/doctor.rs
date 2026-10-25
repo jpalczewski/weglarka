@@ -1043,6 +1043,10 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         )),
     }
 
+    if let Some(dns) = &config.dns {
+        acme_dns(d, config, dns, out);
+    }
+
     let Some(domains) = routed_domains(d) else {
         return; // `state.apps` already reports this
     };
@@ -1107,6 +1111,109 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some(
                 "HTTP-01 needs the plain-HTTP port reachable from the internet as port 80 and the \
                  domain's DNS pointing at this host; the worker retries every 30 minutes after a failure",
+            ),
+        ));
+    }
+}
+
+/// `[acme.dns]` (issue #97): the provider, the token file and the state of every wildcard
+/// certificate (`tls/_wildcard.<apex>.crt`). The ingress does not serve the wildcard certificates
+/// yet, so a missing one is a warning like a missing domain certificate.
+fn acme_dns<P: PodmanClient>(
+    d: &Daemon<P>,
+    config: &weglarka_core::config::AcmeConfig,
+    dns: &weglarka_core::config::AcmeDnsConfig,
+    out: &mut Vec<DoctorCheck>,
+) {
+    let token = &dns.token_file;
+    match std::fs::metadata(token) {
+        Ok(m) if m.permissions().mode() & 0o077 == 0 => out.push(ok(
+            "acme.dns",
+            format!(
+                "{:?}, token {}, wildcards for {}",
+                dns.provider,
+                token.display(),
+                dns.wildcards.join(", ")
+            ),
+        )),
+        Ok(m) => out.push(check(
+            "acme.dns",
+            CheckStatus::Fail,
+            format!(
+                "{} has permissions {:o}, expected 600",
+                token.display(),
+                m.permissions().mode() & 0o777
+            ),
+            Some("chmod 600; the daemon refuses a group/other-accessible DNS token"),
+        )),
+        Err(e) => out.push(check(
+            "acme.dns",
+            CheckStatus::Fail,
+            format!("{}: {e}", token.display()),
+            Some(
+                "put the DNS provider's API token (scoped to the wildcard zones only) in this \
+                 file with mode 600",
+            ),
+        )),
+    }
+
+    let tls = d.ingress.tls_dir();
+    let now = std::time::SystemTime::now();
+    let window = std::time::Duration::from_secs(config.renew_before_days * 24 * 3600);
+    let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
+    let mut soonest: Option<u64> = None;
+    for apex in &dns.wildcards {
+        let name = format!("*.{apex}");
+        let Ok(chain) = std::fs::read(tls.join(format!("_wildcard.{apex}.crt"))) else {
+            missing.push(name);
+            continue;
+        };
+        match weglarka_acme::chain_not_after(&chain) {
+            Err(_) => missing.push(name),
+            Ok(not_after) => match not_after.duration_since(now) {
+                Err(_) => expired.push(name),
+                Ok(left) => {
+                    let days = left.as_secs() / (24 * 3600);
+                    soonest = Some(soonest.map_or(days, |s| s.min(days)));
+                    if left <= window {
+                        due.push(name);
+                    }
+                }
+            },
+        }
+    }
+    let mut problems = Vec::new();
+    if !expired.is_empty() {
+        problems.push(format!("expired: {}", expired.join(", ")));
+    }
+    if !missing.is_empty() {
+        problems.push(format!("none yet: {}", missing.join(", ")));
+    }
+    if !due.is_empty() {
+        problems.push(format!("renewal due: {}", due.join(", ")));
+    }
+    if problems.is_empty() {
+        out.push(ok(
+            "acme.wildcards",
+            format!(
+                "{} wildcard certificate(s), the nearest expires in {} days",
+                dns.wildcards.len(),
+                soonest.unwrap_or(0)
+            ),
+        ));
+    } else {
+        out.push(check(
+            "acme.wildcards",
+            if expired.is_empty() {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            },
+            problems.join("; "),
+            Some(
+                "DNS-01 needs the API token to reach the zone and a CAA record (if any) that allows \
+                 the CA; the worker retries every 30 minutes after a failure (see acme.certs for the \
+                 last error)",
             ),
         ));
     }

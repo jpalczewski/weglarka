@@ -22,7 +22,8 @@ pub struct FakeAcme {
 
 #[derive(Debug, Default)]
 struct State {
-    failures: VecDeque<String>,
+    /// One entry per order, in order: `None` succeeds, `Some(reason)` fails.
+    failures: VecDeque<Option<String>>,
     orders: Vec<CertId>,
 }
 
@@ -36,7 +37,15 @@ impl FakeAcme {
 
     /// The next order fails with this reason (after presenting and cleaning up its challenges).
     pub fn fail_next(&self, reason: &str) {
-        self.lock().failures.push_back(reason.to_owned());
+        self.fail_next_after(0, reason);
+    }
+
+    /// The order after the next `skip` orders fails (those succeed), e.g. to fail the second
+    /// certificate of a pass.
+    pub fn fail_next_after(&self, skip: usize, reason: &str) {
+        let mut state = self.lock();
+        state.failures.extend(std::iter::repeat_n(None, skip));
+        state.failures.push_back(Some(reason.to_owned()));
     }
 
     /// Ids of the certificates ordered so far, in order.
@@ -66,7 +75,7 @@ impl AcmeClient for FakeAcme {
         let failure = {
             let mut state = self.lock();
             state.orders.push(spec.id().clone());
-            state.failures.pop_front()
+            state.failures.pop_front().flatten()
         };
         let challenges: Vec<_> = spec
             .names()

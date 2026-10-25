@@ -28,6 +28,7 @@ Przykłady dotyczą hosta `niechybnie` (Ubuntu 24.04, tryb `behind`, Traefik z C
 [6p. Tryb `edge`](#6p-tryb-edge-nginx-na-80443-tls-z-katalogu-stanu) ·
 [6q. Certyfikaty ACME](#6q-certyfikaty-acme-http-01-acme) ·
 [6r. Jednorazowe polecenia](#6r-jednorazowe-polecenia-weglarka-run) ·
+[6s. Wildcard przez DNS-01](#6s-certyfikaty-wildcard-dns-01-acmedns) ·
 [7. Weryfikacja i rollback](#7-weryfikacja-i-rollback)
 
 Gotowe specy apek i wycinki `apps.toml` (kopiuj-wklej): [`docs/examples/`](examples/).
@@ -1726,8 +1727,8 @@ email = "ops@example.eu"             # opcjonalnie: adres kontaktowy CA (powiado
 - **Test na stagingu (opt-in):** `WEGLARKA_ACME_STAGING_DOMAIN=<domena> WEGLARKA_ACME_STAGING_WEBROOT=<katalog>
   cargo test -p weglarka-acme --test staging -- --nocapture` — wymaga publicznego portu 80, który serwuje
   `<katalog>` pod `/.well-known/acme-challenge/` (w CI pomijany).
-- **Nie obsługiwane (jeszcze):** certyfikaty wildcard (DNS-01, #97), kilka nazw w jednym certyfikacie,
-  własne CA poza `directory_url`.
+- **Nie obsługiwane (jeszcze):** kilka nazw w jednym certyfikacie domeny, własne CA poza `directory_url`.
+  Certyfikaty wildcard przez DNS-01: [6s](#6s-certyfikaty-wildcard-dns-01-acmedns).
 
 **Rollback:** `[acme]` jest nową sekcją `weglarka.toml` z `deny_unknown_fields`, więc **starszy demon odmówi
 startu**, dopóki jej nie usuniesz. Usuń sekcję (albo ustaw `enabled = false` przed rollbackiem do wydania, które
@@ -1768,6 +1769,51 @@ weglarka run gitea --entrypoint /bin/sh -- -c 'ls -l /data'
 
 **Rollback:** nic nie trzeba robić — `run` nie zapisuje stanu (`apps.toml`/`state.toml` bez zmian, bez bumu
 wersji schematu). Starszy demon nie ma trasy `/v1/apps/{name}/run`, starszy CLI nie ma komendy.
+
+## 6s. Certyfikaty wildcard (DNS-01, `[acme.dns]`)
+
+Obok certyfikatów per domena (6q) demon może wystawiać **wildcard** (`*.example.eu` razem z `example.eu`) przez
+DNS-01: zamawia go u CA i dowodzi kontroli nad domeną rekordem TXT `_acme-challenge.<domena>`, który sam
+zakłada i usuwa przez API dostawcy DNS. Wildcard nie potrzebuje portu 80 i nie ujawnia pojedynczych
+subdomen w logach CT. Pierwszy dostawca: Cloudflare. Decyzja: [0039](decisions/0039-acme-dns01.md).
+
+```toml
+[acme]
+accept_terms = true
+
+[acme.dns]
+provider = "cloudflare"
+token_file = "/var/lib/weglarka/cloudflare-token"   # plik 0600, ścieżka bezwzględna
+wildcards = ["example.eu"]                           # apex'y: powstanie *.example.eu + example.eu
+```
+
+- **Token Cloudflare:** utwórz token API z uprawnieniami `Zone → Zone → Read` i `Zone → DNS → Edit`
+  **zawężonymi do stref z `wildcards`** (nie globalny klucz API, nie token na całe konto). Taki token może
+  przepisać każdy rekord strefy, więc wyciek jest poważny: trzymaj go tylko w tym pliku
+  (`umask 077 && printf '%s\n' '…' | sudo -u weglarka tee /var/lib/weglarka/cloudflare-token >/dev/null`) i
+  rób osobny token na instalację. Demon czyta plik raz przy starcie i odmawia startu, gdy jest czytelny dla
+  grupy/innych (`chmod 600`), pusty albo ma znaki spoza ASCII; wartość nie trafia do `weglarka.toml`, logów,
+  zdarzeń ani błędów.
+- **Przebieg:** to samo przejście co w 6q: po certyfikatach domen worker zamawia wildcard (jeśli go nie ma albo
+  zostało `renew_before_days` dni lub mniej), kładzie TXT, czeka na walidację CA i **usuwa rekord także po
+  błędzie**. Błąd wildcarda nie wstrzymuje certyfikatów domen. Dla `*.example.eu` i `example.eu` w jednym
+  zamówieniu na `_acme-challenge.example.eu` są dwa rekordy TXT naraz — to normalne.
+- **Pliki:** `tls/_wildcard.<apex>.key` (`0600`) i `tls/_wildcard.<apex>.crt` (`0644`), zapis atomowy, klucz
+  przed certyfikatem. Nazwa nie zawiera `*`.
+- **Uwaga (stan na dziś):** nginx **jeszcze nie serwuje** wildcarda — ingress dobiera certyfikat po nazwie
+  domeny, więc każda routowana domena nadal dostaje własny certyfikat HTTP-01 z 6q. Wildcard jest wystawiany
+  i odnawiany z góry, a przypisanie do domen (i rezygnacja z osobnych certyfikatów) to osobna zmiana.
+- **`doctor`:** `acme.dns` (dostawca, tryb pliku tokena) i `acme.wildcards` (brakujące/wygasłe/do odnowienia).
+  Brak wildcarda przed pierwszym przejściem to `warn`.
+- **Wymagania po stronie DNS:** token musi widzieć strefę; rekord CAA strefy (jeśli jest) musi zezwalać CA
+  (Let's Encrypt: `letsencrypt.org`). CA sam odpytuje autorytatywne serwery, więc demon nie czeka na propagację.
+- **Test na żywo (opt-in):** na osobnej strefie developerskiej; w CI pomijany, a logika adaptera i solvera
+  jest testowana na atrapie API Cloudflare.
+
+**Rollback:** `[acme.dns]` to nowy podblok sekcji `[acme]` z `deny_unknown_fields`, więc **starszy demon
+odmówi startu**, dopóki go nie usuniesz (to samo co `[acme]` w 6q). Usuń `[acme.dns]` i zrestartuj;
+wystawione wildcardy w `tls/` zostają, ale nie będą odnawiane. Token Cloudflare możesz też unieważnić w panelu.
+`apps.toml`/`state.toml` się nie zmieniły (bez bumu wersji schematu).
 
 ## 7. Weryfikacja i rollback
 
