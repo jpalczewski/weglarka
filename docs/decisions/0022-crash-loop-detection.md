@@ -63,7 +63,7 @@ interleave with an observation.
 - Three new engine events in the notification table (`crash loop`, `unhealthy`, `running again`) with the dedup
   keys `crash:<instance>`, `unhealthy:<instance>`, `recovered:<instance>`; snapshots of the rendered messages.
 - A new `[monitor]` section in `weglarka.toml` (defaults apply when absent) and `docs/examples/monitor.toml`;
-  `docs/install.md` gets its own section. `weglarka.toml` uses `deny_unknown_fields`, so an older daemon refuses
+  [the crash detection guide](../guides/crash-detection.md) covers it. `weglarka.toml` uses `deny_unknown_fields`, so an older daemon refuses
   to start with `[monitor]` — same downgrade caveat as `[notify]` (ADR 0021).
 - `Reconciler::with_monitor(Policy)` builder; `ReconcilerOptions` is untouched. The engine's tests override the
   policy (`Policy::disabled()`) so existing event assertions stay stable; the new scenarios enable it and drive

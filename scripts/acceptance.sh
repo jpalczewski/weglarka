@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Acceptance script for Węglarka on a real host (docs/install.md, "Odbiór na hoście").
+# Acceptance script for Węglarka on a real host (docs/install.md, "Acceptance test").
 #
 # Run as the runtime user (`weglarka`) with XDG_RUNTIME_DIR set; dependencies:
 # weglarka, curl, openssl, jq, podman (+ tar for --with-volume). Touches only the instances `wg-canary`,
@@ -11,7 +11,7 @@
 # (`curl --resolve`, `-k`) and checks the ACME HTTP-01 webroot. Mode and ports come from `weglarka.toml`
 # (`[ingress] mode`, `bind`, `https_bind`, `nginx_conf_dir`), so the same script runs on a host and in CI.
 #
-#   scripts/acceptance.sh --canary-domain wg-test.descriptortable.eu
+#   scripts/acceptance.sh --canary-domain wg-test.example.com
 #
 # Exit codes: 0 all PASS, 1 at least one FAIL, 64 invalid invocation / missing dependency.
 set -euo pipefail

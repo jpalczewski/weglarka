@@ -5,7 +5,7 @@ in this iteration). Implementation notes at the end.
 
 ## Problem
 
-Iteration 2 adds named Podman volumes (first user: szklana.pogoda, SQLite in `/data`). Every deploy
+Iteration 2 adds named Podman volumes (first user: a SQLite app keeping its database in `/data`). Every deploy
 *recreates* the container, so the user namespace of the new container must give the files in the volume
 the same owner as before, otherwise the app cannot read or write its own data. The plan assumed
 `--userns=auto` (what the MVP sends) and wanted two candidate fixes tested on Podman 6.1 in CI:
@@ -76,7 +76,7 @@ Rules for session 1:
   range is stable. Use the raw volume endpoints (streamed).
 - **Foreign tars** (Coolify migration): `volume_import` is wrong for them (finding 8). Use
   `container_archive_put` on the instance's container (created, not started, is enough) — ids are
-  mapped correctly (finding 9). The deploy/CLI flow for szklana.pogoda: `apps add` → `deploy` →
+  mapped correctly (finding 9). The deploy/CLI flow for such an app: `apps add` → `deploy` →
   `volumes import --foreign` (archive put) → restart.
 - If a volume must be restored into a *different* range, session 1 can shift tar headers by the range
   difference; not needed for iteration 2.
@@ -105,7 +105,7 @@ app range. `integration-podman` measures it (`weglarka-podman/tests/ingress_iden
 1. Confirm (a) over (c). (c) is a one-day-simpler fallback if the allocator feels like too much state.
 2. Is a 30-instance ceiling on the production host acceptable, or should the range size be per-instance
    configurable (a smaller range is enough for images that stay below uid ~1000)?
-3. Finding 1 means every app and the ingress nginx on `niechybnie` currently runs container root as
+3. Finding 1 means every app and the ingress nginx on the production host currently runs container root as
    the `weglarka` user. Confirm with `podman exec ntfy cat /proc/self/uid_map` (expect `0 <uid> 1`).
    Should adopting ranges for existing apps be part of iteration 2 (recommended) or later?
 

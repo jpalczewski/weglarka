@@ -58,7 +58,7 @@ group.**
 10. **Schema:** `SCHEMA_VERSION` 2 → 3 with a no-op migration step (the field is additive and optional). The
     bump stamps `schema_version = 3` into `apps.toml` and `state.toml` on the first write after the upgrade —
     for every installation, whether or not groups are used — so a rollback to the previous release needs the
-    files from before the upgrade (ADR 0023, `docs/install.md`).
+    files from before the upgrade (ADR 0023, [the shared volumes guide](../guides/shared-volumes.md)).
 
 ## Consequences
 
@@ -66,7 +66,7 @@ group.**
   declarations in `apps.toml` (`shared_volumes::spec_group`); the free functions take `&AppsFile`.
 * New `EngineError::SharedGroupChange` (409). New label `weglarka.shared-group`.
 * Rollback to a daemon without groups: remove `group` from the declarations and restore the state files from
-  before the upgrade (documented in `docs/install.md`).
+  before the upgrade (documented in [the shared volumes guide](../guides/shared-volumes.md)).
 * Tests: validation (two groups rejected, collision rule, serialisation), engine scenarios on `FakePodman`
   (one range for two volumes, purge keeps the range until the last volume, group change refused, declaration
   removal), daemon API tests (query parameter, 400/409), doctor, CLI request tests, and a real-Podman test with

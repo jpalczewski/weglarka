@@ -38,7 +38,7 @@ reverse proxy inside the stack. It is a routing rule, so the ingress should expr
 
 `doctor` adds the `ingress.routes` check; the list API is unchanged (`apps show` carries `paths`).
 `apps.toml` with `paths`/`strip_prefix` is refused by an older daemon (`deny_unknown_fields`, schema gate):
-before a downgrade remove both fields or restore the pre-upgrade files (`docs/install.md`). New CLI flags
+before a downgrade remove both fields or restore the pre-upgrade files ([the path routing guide](../guides/path-routing.md)). New CLI flags
 `--path` and `--strip-prefix`; the API app view gains `paths`. Tests: plan validation, nginx/Traefik
 snapshots, hash stability, probe path, daemon refusal and reload-without-recreate.
 

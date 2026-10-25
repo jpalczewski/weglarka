@@ -91,7 +91,7 @@ on an unattended host, which is the deployment Węglarka targets.
   stripped by `render()`.
 * **New `[self_update]` keys** (`fallback_timeout_secs`, `fallback`), validated both inside the container and by the
   host-side entry points. `[self_update]` uses `deny_unknown_fields`, so a pre-#100 binary refuses the section with
-  the new keys: the downgrade step in `docs/install.md` 6k is to remove the new keys, or the whole section.
+  the new keys: the downgrade step in [the self-update guide](../guides/self-update.md) is to remove the new keys, or the whole section.
 * **New `self-update.toml` fields**; an older daemon ignores them, and one that rewrites the file through its own
   `confirm()` drops them — costing supervision for that one switch only, never correctness of the image pin.
 * **New API surface**: `GET /v1/health` (additive; `API_VERSION` stays `v1`).
@@ -101,7 +101,7 @@ on an unattended host, which is the deployment Węglarka targets.
 * **Tests**: the decision table in `weglarka-core` unit tests; the watchdog on the existing
   `FakePodman`/`FakeRegistry`/`FakePlatform` harness; snapshot tests for the new units; a real unix-socket test for
   `/v1/health` and for the confirmation/event of a fallback. A real systemd trigger cannot run in CI (no user manager
-  there), so `docs/install.md` 6k gains a host drill: break an update on purpose and watch the fallback, reboot with a
+  there), so [the self-update guide](../guides/self-update.md) gains a host drill: break an update on purpose and watch the fallback, reboot with a
   pending switch, and fall back with the registry offline.
 * **Operators**: `doctor` changes from "pending stays until someone looks" to an actionable, usually self-healing
   state; the first release with this feature still needs the new host binary and a `platform install` re-run.

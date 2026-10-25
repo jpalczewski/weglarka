@@ -7,7 +7,7 @@ po unix sockecie), deklaratywny reconcile ze stanu w TOML, nginx w kontenerze za
 **Zadania i plan rozwoju: [GitHub Issues](https://github.com/jpalczewski/weglarka/issues)** (etykieta `roadmap` =
 funkcje zaplanowane, `bug` = błędy). Decyzje implementacyjne z uzasadnieniem: `docs/decisions/` — indeks generowany z tytułów ADR-ów:
 [`docs/decisions/README.md`](docs/decisions/README.md).
-Instrukcja wdrożenia i procedury migracji: `docs/install.md`. Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
+Instalacja: `docs/install.md`; przewodniki tematyczne (migracje, ingress, ACME, rollback…): [`docs/guides/`](docs/guides/README.md) — pliki nazwane tematem, nagłówki bez numerów (żadnego „6k”). Repo jest **publiczne** — nie wpisuj tu (ani w PR-y,
 issues, commity) odwołań do prywatnych notatek ani szczegółów prywatnej infrastruktury (nazwy kont, prywatnych
 organizacji, tokenów).
 
@@ -28,10 +28,20 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 - Git: PR do `main`, merge przez squash po zielonym CI; odwołuj się do issues (`#NN`), nie do prywatnych notatek.
 - **Język: README, komentarze w kodzie i ADR-y po angielsku** (decyzja Jacka, 2026-10-23; ADR-y: 2026-10-24) —
   dotyczy wszystkich `README.md` (root i crate'ów), komentarzy `//`, doc-commentów `///`/`//!`, komentarzy
-  w skryptach i workflowach oraz `docs/decisions/` (ADR-y i ich indeks). `docs/install.md` zostaje po polsku,
+  w skryptach i workflowach oraz `docs/decisions/` (ADR-y i ich indeks). `docs/install.md` i `docs/guides/` są po angielsku (2026-10-25),
   a komunikaty runtime/CLI są w trakcie tłumaczenia (issue #32). Nowy i zmieniany kod piszesz od razu po angielsku;
   istniejące polskie komentarze w plikach, których nie dotykasz, tłumaczy osobne zadanie (nie mieszaj tłumaczeń
   z niezwiązanymi zmianami w PR).
+
+## Dokumentacja dla operatora (`docs/install.md`, `docs/guides/`)
+
+- Nowa funkcja z wpływem na operatora = nowy albo zmieniony przewodnik w `docs/guides/<temat>.md` (po angielsku) i wpis w
+  `docs/guides/README.md`. Pliki nazywamy tematem, nagłówków **nie numerujemy**; linkujemy do pliku, nie do „sekcji 6k”.
+- Linki między przewodnikami są plikowe (bez `#kotwicy` do cudzego pliku); `scripts/adr.sh lint` sprawdza linki, kotwice,
+  unikalność nagłówków i obecność każdego przewodnika w indeksie.
+- Repo jest publiczne: w przykładach tylko `example.com`/`example.org`, host `myhost`, żadnych prawdziwych domen, nazw hostów
+  ani prywatnych projektów. Każdy przewodnik kończy się sekcją `## Rollback`, jeśli zmiana łamie downgrade
+  (`deny_unknown_fields`, `schema_version`) — a pole trafia też do tabeli w `verify-and-rollback.md`.
 
 ## Commity i PR-y (Conventional Commits)
 
@@ -60,8 +70,8 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 4. Nowe pole `AppSpec`/`ContainerSpec`: opcjonalne, poza `spec_hash` gdy nieustawione (`skip_serializing_if`
    w `HashInput`) — inaczej upgrade odtworzy wszystkie działające apki. Nowe pole `apps.toml`/`state.toml`
    (także `AppState`) → podbij `state::SCHEMA_VERSION` i dopisz krok w `SCHEMA_STEPS` (kompilacja tego pilnuje,
-   ADR 0023); kompatybilność wstecz (`deny_unknown_fields` a rollback) opisz w PR i w `docs/install.md`
-   — dla plików stanu to [wersja schematu](docs/install.md#wersja-schematu-plików-stanu-rollback-między-wersjami).
+   ADR 0023); kompatybilność wstecz (`deny_unknown_fields` a rollback) opisz w PR i w odpowiednim przewodniku w `docs/guides/`
+   — dla plików stanu to [wersja schematu](docs/guides/state-schema.md).
 5. Decyzja implementacyjna → nowy ADR z [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md).
    Tabelę indeksu generuje `scripts/adr.sh index` — nie edytuj jej ręcznie. Numer ADR to zasób wspólny
    dla równoległych gałęzi: zarezerwuj go wcześnie (push + draft PR ze stubem ADR-a) i scalaj szybko;
@@ -131,11 +141,11 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 | retencja obrazów | `core/src/images.rs` (czysty `plan()` + `execute()`), wywołania po deployu w `core/src/deploy.rs`, API `daemon/src/images.rs`, check `runtime.images` w `daemon/src/doctor.rs` (ADR 0020) |
 | samoaktualizacja Węglarki | `core/src/self_update.rs` (stan + czyste `decide()`/`supervise()`), `registry/src/` (podpis cosign i weryfikacja kluczem), `daemon/src/self_update.rs` (host-side switcher + akcja fallbacku), `daemon/src/supervise.rs` (host-side watchdog: sonda `GET /v1/health`, blokada stanu), `daemon/src/service.rs` (spec współdzielony z `platform install`), `daemon/src/platform.rs` (timery, `install_user_units`, `restart_service`, `reset_failed`), sekcja `[self_update]` w `core/src/config.rs`, check `self_update` w `daemon/src/doctor.rs` (ADR 0027, ADR 0034) |
 | kontrakt i trasy API | `api/src/types.rs` + `api/src/endpoints.rs` → `daemon/src/admin.rs` (nowy endpoint: najpierw `endpoints.rs`) |
-| ingress | `ingress/src/plan.rs` (`Plan::build` waliduje, w tym rozłączność `paths` na wspólnej domenie; `route_table()` dla `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs`; prefiksy ścieżek: ADR 0031, `paths`/`ingress.strip_prefix` w `core/src/app.rs`, składnia `check_path_prefix`, `docs/install.md` 6n; tryb `edge` (dwa puby, TLS, webroot ACME, mapa uid ingressu): ADR 0036, `docs/install.md` 6p |
-| certyfikaty ACME (edge) | `acme/src/{manager,store,solver,instant,renewal}.rs` (silnik, `FakeAcme` w `testing.rs`), `core/src/config.rs` (`AcmeConfig`, walidacja w `HostConfig::validate`), `core/src/events.rs` (`CertificateIssued`/`CertificateRenewalFailed`), `daemon/src/acme.rs` (worker, `AcmeStatus`) + wiring w `daemon/src/lib.rs`, checki `acme.*` w `daemon/src/doctor.rs`, `docs/install.md` 6q (ADR 0038); wildcard przez DNS-01: `[acme.dns]` (`AcmeDnsConfig`, `token_file` 0600 jak ntfy), `DnsBackend` + drugi `Manager` w `daemon/src/acme.rs`, `DnsSolver` w `acme/src/dns.rs`, adaptery w `weglarka-dns`, checki `acme.dns`/`acme.wildcards`, `docs/install.md` 6s (ADR 0039); serwowanie wildcardów: `core/src/config.rs` (`wildcard_covers`, `wildcard_cert_stem`), `ingress/src/nginx.rs` (`NginxOptions::certificate_stem`: własna para wygrywa, potem wildcard najdłuższego apexu), skan `_wildcard.<apex>` w `daemon/src/ingress.rs`, pominięcie HTTP-01 dla domen pokrytych w `AcmeWorker::specs` |
+| ingress | `ingress/src/plan.rs` (`Plan::build` waliduje, w tym rozłączność `paths` na wspólnej domenie; `route_table()` dla `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshoty); reload: `daemon/src/ingress.rs`; prefiksy ścieżek: ADR 0031, `paths`/`ingress.strip_prefix` w `core/src/app.rs`, składnia `check_path_prefix`, `docs/guides/path-routing.md`; tryb `edge` (dwa puby, TLS, webroot ACME, mapa uid ingressu): ADR 0036, `docs/guides/edge-mode.md` |
+| certyfikaty ACME (edge) | `acme/src/{manager,store,solver,instant,renewal}.rs` (silnik, `FakeAcme` w `testing.rs`), `core/src/config.rs` (`AcmeConfig`, walidacja w `HostConfig::validate`), `core/src/events.rs` (`CertificateIssued`/`CertificateRenewalFailed`), `daemon/src/acme.rs` (worker, `AcmeStatus`) + wiring w `daemon/src/lib.rs`, checki `acme.*` w `daemon/src/doctor.rs`, `docs/guides/acme.md` (ADR 0038); wildcard przez DNS-01: `[acme.dns]` (`AcmeDnsConfig`, `token_file` 0600 jak ntfy), `DnsBackend` + drugi `Manager` w `daemon/src/acme.rs`, `DnsSolver` w `acme/src/dns.rs`, adaptery w `weglarka-dns`, checki `acme.dns`/`acme.wildcards`, `docs/guides/wildcard-certificates.md` (ADR 0039); serwowanie wildcardów: `core/src/config.rs` (`wildcard_covers`, `wildcard_cert_stem`), `ingress/src/nginx.rs` (`NginxOptions::certificate_stem`: własna para wygrywa, potem wildcard najdłuższego apexu), skan `_wildcard.<apex>` w `daemon/src/ingress.rs`, pominięcie HTTP-01 dla domen pokrytych w `AcmeWorker::specs` |
 | powiadomienia | `notify/src/{message,dedup,outbox,worker,ntfy,http,settings}.rs`; sekcja `[notify]`: `core/src/config.rs`; `Severity`: `core/src/events.rs`; wiring: `daemon/src/lib.rs` (`Notifier::build`, sink, worker), trasa: `api/src/endpoints.rs` → `daemon/src/admin.rs` |
 | wykrywanie awarii | `core/src/crash.rs` (polityka `Policy` + maszyna stanu `Watcher`), wywołanie w `core/src/reconcile.rs` (`Reconciler::with_monitor`, raz na przejście), sekcja `[monitor]`: `core/src/config.rs`, zdarzenia: `core/src/events.rs`, testy: `core/src/engine_tests.rs` (ADR 0022) |
-| jednorazowe kontenery (`weglarka run`) | `core/src/run.rs` (`prepare_run`/`PendingRun::drive`, `remove_stale_runs`; wspólne przygotowanie z deployem: `prepare_instance` w `core/src/deploy.rs`), etykiety `weglarka.run`/`run-for` w `core/src/labels.rs`, `container_logs`/`container_wait`/`entrypoint` w `core/src/podman.rs` + `podman/src/{client,wire}.rs`, strumień ramek `api/src/run.rs`, trasa `daemon/src/admin.rs` (`run_app`), CLI `cli/src/run.rs`, `docs/install.md` 6r (ADR 0040) |
+| jednorazowe kontenery (`weglarka run`) | `core/src/run.rs` (`prepare_run`/`PendingRun::drive`, `remove_stale_runs`; wspólne przygotowanie z deployem: `prepare_instance` w `core/src/deploy.rs`), etykiety `weglarka.run`/`run-for` w `core/src/labels.rs`, `container_logs`/`container_wait`/`entrypoint` w `core/src/podman.rs` + `podman/src/{client,wire}.rs`, strumień ramek `api/src/run.rs`, trasa `daemon/src/admin.rs` (`run_app`), CLI `cli/src/run.rs`, `docs/guides/one-off-commands.md` (ADR 0040) |
 | CLI | `cli/src/update.rs` (read-modify-write specu: `apps update/start/stop`, `--dry-run`), `cli/src/commands.rs` |
 | testy silnika | `core/src/engine_tests.rs` (scenariusze na `FakePodman`), testy modułu w `core/src/volumes.rs` |
 | testy daemon/API | `daemon/tests/*.rs` (prawdziwy unix socket + `FakePodman`) |
@@ -164,7 +174,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   --purge-volumes` członka przy innych członkach = 409 (nic nie usuwane), import wymaga zatrzymanych
   członków, a zmiana zakresu przy istniejących prywatnych danych jest odrzucana (`RangeChangeWithData`).
   Szczegóły: [`docs/decisions/0017-shared-volumes.md`](docs/decisions/0017-shared-volumes.md) i
-  [`docs/install.md` 6a](docs/install.md#6a-wolumeny-zakresy-uid-i-import-z-coolify-iteracja-2).
+  [`docs/guides/shared-volumes.md`](docs/guides/shared-volumes.md) i [`volumes.md`](docs/guides/volumes.md).
 - **Powiadomienia (ADR 0021):** `EventSink::emit` jest wołane pod mutexem silnika, więc sink **tylko kolejkuje**
   (`try_send`, bez I/O) — całą robotę robi worker. Źródłem prawdy o wysyłce jest trwały outbox
   `<state dir>/notifications.toml` (tolerancyjny `serde`, 0600); sekcja `[notify]` w `weglarka.toml` łamie
@@ -180,7 +190,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `schema_version` (albo przywrócić pliki z kopii). Pliki runtime usera
   widoczne w zakresie UID apki jako `nobody` → 0644/0755. Szczegóły:
   [`docs/decisions/0028-config-root-mounts.md`](docs/decisions/0028-config-root-mounts.md) i
-  [`docs/install.md` 6l](docs/install.md#6l-configi-z-hosta-config_root-i-apps-reload).
+  [`docs/guides/host-configs.md`](docs/guides/host-configs.md).
 - **Detekcja awarii (ADR 0022):** watcher crash loopów działa w przejściu reconcile — `container_list` już
   robi inspect każdego kontenera, więc licznik restartów (`RestartCount` → `ContainerInfo.restarts`) nie
   kosztuje dodatkowego wywołania libpoda. Stan jest pamięciowy (po restarcie demona pierwsza obserwacja tylko
@@ -192,7 +202,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   (0600/0700), webroot ACME `<nginx_conf_dir>/acme` (0644/0755); serwer TLS powstaje **tylko** dla domeny z
   parą plików (bez pary: redirect i odrzucony handshake — fail closed). Demon skanuje `tls/` przy każdym
   `apply`, a odcisk materiału w `nginx.conf` powoduje reload (`nginx -t` + SIGHUP) — **nigdy** odtworzenie
-  kontenera; to jest ścieżka, którą idzie worker ACME (`[acme]`, ADR 0038, `docs/install.md` 6q). W edge **nikt nie jest zaufany** w sprawie `X-Forwarded-*` (0007), a mapa
+  kontenera; to jest ścieżka, którą idzie worker ACME (`[acme]`, ADR 0038, `docs/guides/acme.md`). W edge **nikt nie jest zaufany** w sprawie `X-Forwarded-*` (0007), a mapa
   uid ingressu jest dwuliniowa (uid 0 = użytkownik runtime, 1.. = zakres ingressu), żeby master czytał klucze
   0600 — dlatego **do nginx wolno montować tylko `<nginx_conf_dir>`**. Porty < 1024 wymagają sysctla i
   `[runtime] allow_privileged_host_ports`; `weglarka.ingress-hash` = v3 (tryb + oba puby).
@@ -203,7 +213,7 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `secrets remove` działa **także po usunięciu apki** (sprząta pozostałości po zmianie nazwy instancji),
   a `doctor` ostrzega checkiem `state.orphan_secrets`. Szczegóły:
   [`docs/decisions/0024-secret-removal-and-purge.md`](docs/decisions/0024-secret-removal-and-purge.md) i
-  [`docs/install.md` 6j](docs/install.md#6j-sekrety-usuwanie-i-sprzątanie-po-apce).
+  [`docs/guides/secrets-cleanup.md`](docs/guides/secrets-cleanup.md).
 - **Testy uruchamiają się w CI tak jak na produkcji:** smoke test startuje demona z argumentów quadletu
   (bez `/etc/passwd`, bez `/etc/subuid` w obrazie `scratch`).
 - **Samoaktualizacja (ADR 0027):** demon siedzi w kontenerze `scratch` (brak `systemctl`, `/etc/passwd`,

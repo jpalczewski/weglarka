@@ -1,21 +1,21 @@
 # Fragment of apps.toml: a reverse proxy and two stateless API containers that talk over a shared network
 # (issue #128). Members reach each other by instance name (`api:8000`, `mcp:8000`) or alias, on every port;
 # apps outside the group cannot. Only the proxy has a domain, so only it is reachable from the ingress.
-# Docs: docs/install.md, section 6m.
+# Docs: docs/guides/shared-networks.md.
 
-[shared_networks.kajet]
+[shared_networks.notes]
 
-[apps.kajet-api]
-image = "ghcr.io/example/kajet-api:latest"
-shared_networks = ["kajet"]
+[apps.notes-api]
+image = "ghcr.io/example/notes-api:latest"
+shared_networks = ["notes"]
 
-[apps.kajet-mcp]
-image = "ghcr.io/example/kajet-mcp:latest"
-shared_networks = ["kajet"]
+[apps.notes-mcp]
+image = "ghcr.io/example/notes-mcp:latest"
+shared_networks = ["notes"]
 
-[apps.kajet-proxy]
+[apps.notes-proxy]
 image = "docker.io/library/caddy:2"
-domains = ["kajet.example.eu"]
+domains = ["notes.example.com"]
 port = 80
-shared_networks = [{ name = "kajet", aliases = ["gateway"] }]
-depends_on = ["kajet-api", "kajet-mcp"]
+shared_networks = [{ name = "notes", aliases = ["gateway"] }]
+depends_on = ["notes-api", "notes-mcp"]

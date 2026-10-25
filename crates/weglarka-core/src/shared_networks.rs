@@ -250,7 +250,7 @@ image = "ghcr.io/x/ntfy:latest"
         let example = include_str!("../../../docs/examples/shared-network.toml");
         let a = apps(example);
         validate(&a).unwrap();
-        assert_eq!(members(&a, &name("kajet")).len(), 3);
+        assert_eq!(members(&a, &name("notes")).len(), 3);
     }
 
     #[test]

@@ -98,7 +98,7 @@ container statuses, which `doctor --preflight` does not have.
 - Operators see two new conflict cases, both actionable: a deploy rejected with its unmet dependencies, and
   `apps remove` rejected with its dependents. Neither leaves partial state.
 - Rollback: `apps.toml` has `deny_unknown_fields`, so an older daemon cannot read a file containing `depends_on`.
-  A downgrade requires removing the `depends_on` entries first — documented in `docs/install.md`
+  A downgrade requires removing the `depends_on` entries first — documented in [the dependencies guide](../guides/dependencies.md)
   (6d and the rollback section).
 - Tests: validation (unknown name, self-reference, duplicate, cycle — at the write and at `apps.toml` load), the
   gate (`FakePodman` scenarios: dependency not started yet and starting within the budget, unhealthy, missing,

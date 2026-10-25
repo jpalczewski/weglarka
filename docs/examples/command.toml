@@ -33,4 +33,4 @@ command = ["serve"]
 # A deploy whose gate fails rolls back the image DIGEST, not the spec: a wrong `command` fails the deploy
 # and the rollback (the app stays down) until it is fixed with `weglarka apps update <app> --command ...`.
 # `apps.toml` has `deny_unknown_fields`: before downgrading Węglarka, remove `command` from the apps
-# (`apps update <app> --command none` or by hand) — see docs/install.md section 7 and ADR 0019.
+# (`apps update <app> --command none` or by hand) — see docs/guides/verify-and-rollback.md and ADR 0019.

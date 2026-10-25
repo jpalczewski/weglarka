@@ -64,7 +64,7 @@ max_body_size = "4g"        # "0" = no limit; unset = the generator default, 64 
 ## Consequences
 
 Operators can host a git/registry service behind the ingress (`docs/examples/max-body-size.toml`,
-`docs/install.md` 6o). A host-wide default is still the 64 MiB constant in `NginxOptions`; making that
+[the max body size guide](../guides/max-body-size.md)). A host-wide default is still the 64 MiB constant in `NginxOptions`; making that
 configurable is possible later without touching specs.
 
 `apps.toml` with `ingress.max_body_size` is refused by an older daemon (`deny_unknown_fields` plus the schema

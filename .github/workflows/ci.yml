@@ -247,7 +247,7 @@ jobs:
           curl -fsSL "$base/Release.key" | sudo gpg --dearmor -o /usr/share/keyrings/alvistack.gpg
           echo "deb [signed-by=/usr/share/keyrings/alvistack.gpg] $base/ /" \
             | sudo tee /etc/apt/sources.list.d/alvistack.list
-          # Pinning: the Podman stack only from alvistack (as on the `niechybnie` host).
+          # Pinning: the Podman stack only from alvistack (as on the production host).
           sudo tee /etc/apt/preferences.d/alvistack >/dev/null <<'PIN'
           Package: podman* netavark* aardvark-dns* conmon* crun* passt* buildah* skopeo* containers-common* golang-github-containers-*
           Pin: origin downloadcontent.opensuse.org

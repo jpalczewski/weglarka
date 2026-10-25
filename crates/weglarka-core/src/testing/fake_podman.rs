@@ -116,7 +116,7 @@ struct State {
     uid_pool: Option<u64>,
 }
 
-/// Production-sized subuid pool (`niechybnie`: `1000000:2000000`).
+/// Production-sized subuid pool (production host: `1000000:2000000`).
 pub const DEFAULT_SUBUID_POOL: u64 = 2_000_000;
 
 /// Size every pulled image reports (10 MiB), so retention/`doctor` sizes are predictable in tests.

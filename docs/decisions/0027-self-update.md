@@ -84,7 +84,7 @@ immediately).
   older nor a newer daemon may be stopped by it. The strict, schema-versioned files stay `state.toml`/`apps.toml`.
 * The container never gets write access to the quadlet directory; the switch is always a host operation.
 * `[self_update]` is a new section of `weglarka.toml`, which uses `deny_unknown_fields`: an older daemon refuses to
-  start with it. Documented in [install.md](../install.md) (6k and 7).
+  start with it. Documented in [the self-update guide](../guides/self-update.md) and [the rollback guide](../guides/verify-and-rollback.md).
 
 ## Consequences
 

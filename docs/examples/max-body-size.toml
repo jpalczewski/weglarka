@@ -11,7 +11,7 @@ image = "codeberg.org/forgejo/forgejo:latest"
 domains = ["git.example.com"]
 port = 3000
 
-# SSH for `git clone git@...` is a plain TCP port, not an HTTP route (docs/install.md 6c).
+# SSH for `git clone git@...` is a plain TCP port, not an HTTP route (docs/guides/host-ports.md).
 host_ports = [{ host = 2222, container = 22 }]
 
 [ingress]

@@ -99,7 +99,7 @@ task rather than a silent assumption.
   ingress down; the failure is reported and the running config stays valid.
 - **Rollback caveat (`deny_unknown_fields`).** `apps.toml` rejects unknown fields, so an older daemon cannot
   parse an `ingress` table. Downgrading Węglarka requires removing the `[apps.X.ingress]` blocks first
-  (`apps update --no-streaming` or editing the file); documented in `docs/install.md` (6d and section 7).
+  (`apps update --no-streaming` or editing the file); documented in [the streaming guide](../guides/streaming.md) and [the rollback guide](../guides/verify-and-rollback.md).
 - **Verification that must exist** (the issue's list): unit and snapshot tests of the generated `nginx.conf`
   (the four directives in the streaming app's `location /`, every other app and the default server unchanged);
   `.github/scripts/test-streaming.sh` in Docker CI with one upstream answering on both hostnames of the sample

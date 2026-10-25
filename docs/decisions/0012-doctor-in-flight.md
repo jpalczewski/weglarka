@@ -45,7 +45,7 @@ is empty — deliberately, because then the state really is temporarily inconsis
 (the startup reconcile fixes it right away). Backward compatibility: a new CLI reads an older daemon without
 changes; an **older CLI does not know the `"info"` variant** (the enum is closed), so while a deploy is running
 `weglarka doctor` fails to parse the response — the CLI and the daemon are upgraded together (same
-image/release). Noted in `docs/install.md`.
+image/release). Noted in [the stopped apps guide](../guides/stopped-apps.md).
 
 **Tests.** `in_flight_is_visible_during_a_deploy` / `in_flight_is_cleared_when_the_deploy_fails` (core) guard the
 registry and the RAII behaviour; `doctor_reports_a_recreate_in_progress_instead_of_state_drift` (daemon, real unix

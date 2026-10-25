@@ -3,7 +3,7 @@
 #
 #   scripts/adr.sh index [--check]   rewrite docs/decisions/README.md from the ADR titles
 #                                    (--check: only verify it is current, for CI)
-#   scripts/adr.sh lint              numbering, index freshness, cross-references, install.md links/TOC
+#   scripts/adr.sh lint              numbering, index freshness, cross-references, Markdown links and anchors, guide index
 #   scripts/adr.sh renumber OLD NEW  rename an ADR and update every reference to it
 #
 # `lint` runs in CI (job `docs-lint`) for every PR, docs-only ones included: a rebase that left two
@@ -18,7 +18,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 adr_dir=docs/decisions
 index=$adr_dir/README.md
-install=docs/install.md
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -78,24 +77,6 @@ check_index() {
   rm -f "$tmp"
 }
 
-# Anchors linked as `](#anchor)` in the given region of a file: the whole file, or only its TOC part.
-linked_anchors() {
-  local file=$1 region=${2:-all}
-  if [ "$region" = toc ]; then
-    awk '/^## /{exit} {print}' "$file"
-  else
-    cat "$file"
-  fi | grep -oE '\]\(#[^)]*\)' | sed -E 's/^\]\(#//; s/\)$//' || true
-}
-
-heading_slugs() {
-  grep -E '^#{2,3} ' "$1" | slugify || true
-}
-
-main_heading_slugs() {
-  grep -E '^## ' "$1" | slugify || true
-}
-
 lint_adr_titles() {
   local problems=0 file line num number_file
   number_file=$(mktemp)
@@ -148,47 +129,68 @@ lint_cross_references() {
   return $((problems > 0))
 }
 
-lint_install_links() {
-  local problems=0 anchor slug
-  local anchors slugs toc
-  anchors=$(mktemp)
-  slugs=$(mktemp)
-  toc=$(mktemp)
-  linked_anchors "$install" all >"$anchors"
-  heading_slugs "$install" >"$slugs"
-  main_heading_slugs "$install" >"$toc"
-  # 1. every anchor points at an existing heading
-  while IFS= read -r anchor; do
-    [ -n "$anchor" ] || continue
-    if ! grep -Fxq -- "$anchor" "$slugs"; then
-      printf 'error: %s: link "#%s" matches no heading\n' "$install" "$anchor" >&2
-      problems=$((problems + 1))
-    fi
-  done <"$anchors"
-  # 2. no two headings share an anchor
-  while IFS= read -r slug; do
-    local count
-    count=$(grep -Fxc -- "$slug" "$slugs")
-    if [ "$count" -gt 1 ]; then
-      printf 'error: %s: %s headings share the anchor "#%s"\n' "$install" "$count" "$slug" >&2
-      problems=$((problems + 1))
-    fi
-  done < <(LC_ALL=C sort -u "$slugs")
-  # 3. the table of contents lists every main section
-  while IFS= read -r slug; do
-    if ! grep -Fxq -- "$slug" <(linked_anchors "$install" toc); then
-      printf 'error: %s: "## " section "#%s" is missing from the table of contents\n' "$install" "$slug" >&2
-      problems=$((problems + 1))
-    fi
-  done <"$toc"
-  rm -f "$anchors" "$slugs" "$toc"
-  return $((problems > 0))
+# Every relative link in a Markdown file must resolve: the target file exists and, for `file.md#anchor`
+# or `#anchor`, the anchor matches a heading of that file. Duplicate "##"/"###" headings in one file are
+# rejected because they make anchors ambiguous. Every guide must be listed in docs/guides/README.md.
+lint_doc_links() {
+  local problems=0
+  git ls-files -z --cached --others --exclude-standard -- '*.md' | perl -0 -CSD -e '
+    use strict; use File::Basename qw(dirname); use File::Spec;
+    my (%slugs, %dups, $bad);
+    sub slug { my $t = shift; $t =~ s/^#+[ \t]+//; $t =~ s/[ \t]+$//; $t = lc $t; $t =~ s/[^\p{L}\p{N} _-]//g; $t =~ s/ /-/g; $t }
+    sub headings {
+      my $f = shift; return $slugs{$f} if $slugs{$f};
+      my %h; my $fence = 0;
+      open my $fh, "<:utf8", $f or return {}; local $/ = "\n";
+      while (<$fh>) {
+        $fence = !$fence if /^```/;
+        next if $fence;
+        if (/^(#{1,6}) /) { chomp; my $s = slug($_); $h{$s}++; $dups{$f}{$s} = 1 if /^#{2,3} / && $h{$s} > 1 }
+      }
+      return $slugs{$f} = \%h;
+    }
+    for my $f (split /\0/, do { local $/; <STDIN> }) {
+      next unless -f $f;
+      headings($f);
+      open my $fh, "<:utf8", $f or next;
+      my ($fence, $n) = (0, 0); local $/ = "\n";
+      while (<$fh>) {
+        $n++;
+        $fence = !$fence if /^```/;
+        next if $fence;
+        s/`[^`]*`//g;
+        while (/\]\(([^)\s]+)\)/g) {
+          my $t = $1;
+          next if $t =~ m{^(https?:|mailto:)};
+          my ($path, $anchor) = split /#/, $t, 2;
+          my $target = $path eq "" ? $f : File::Spec->catfile(dirname($f), $path);
+          $target =~ s{^\./}{};
+          unless (-e $target) { print STDERR "error: $f:$n: link to a missing file: $t\n"; $bad++; next }
+          if (defined $anchor && $anchor ne "" && $target =~ /\.md$/) {
+            unless (headings($target)->{$anchor}) { print STDERR "error: $f:$n: link \"$t\" matches no heading\n"; $bad++ }
+          }
+        }
+      }
+    }
+    for my $f (sort keys %dups) { for my $s (sort keys %{$dups{$f}}) { print STDERR "error: $f: several headings share the anchor \"#$s\"\n"; $bad++ } }
+    exit($bad ? 1 : 0);
+  ' || problems=1
+  # every guide is listed in the guide index
+  local guide
+  for guide in docs/guides/*.md; do
+    [ "${guide##*/}" = README.md ] && continue
+    grep -qF "(${guide##*/})" docs/guides/README.md || {
+      printf 'error: %s is not listed in docs/guides/README.md\n' "$guide" >&2
+      problems=1
+    }
+  done
+  return $problems
 }
 
 lint_no_section_signs() {
   local problems=0 hit
   while IFS= read -r hit; do
-    printf 'error: %s\n       use a link ("../install.md#anchor") instead of a bare "§" reference\n' "$hit" >&2
+    printf 'error: %s\n       use a link ("guide.md") instead of a bare "§" reference\n' "$hit" >&2
     problems=$((problems + 1))
   done < <(git grep -n '§' -- '*.md' || true)
   return $((problems > 0))
@@ -198,7 +200,7 @@ cmd_lint() {
   local problems=0
   lint_adr_titles || problems=$((problems + 1))
   lint_cross_references || problems=$((problems + 1))
-  lint_install_links || problems=$((problems + 1))
+  lint_doc_links || problems=$((problems + 1))
   lint_no_section_signs || problems=$((problems + 1))
   check_index || problems=$((problems + 1))
   if [ "$problems" -gt 0 ]; then

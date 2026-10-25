@@ -6,7 +6,7 @@ Status: accepted (2026-10-23). Section 1's default trust (the `net-weglarka` sub
 
 In `behind` mode Traefik (Docker, network `coolify`) proxies to `172.17.0.1:8088`, a port published by rootless
 Podman. Rootless port publishing goes through the forwarder (rootlessport), which opens a **new** connection
-from *inside the container network*. Measured on the host (`niechybnie`, acceptance report, Podman 6.1.3):
+from *inside the container network*. Measured on the production host (acceptance report, Podman 6.1.3):
 nginx sees every client as `10.89.1.2`, an address of the Podman network — never Traefik's `172.18.x.x`.
 So a `set_real_ip_from` limited to Docker's ranges never matched: no `X-Forwarded-Proto`, no real IPs in the log.
 

@@ -130,7 +130,7 @@ list is readable only by root — as a regular user the result is `warn`; no App
 requires `https_bind` and forbids `traefik_dynamic_file`/`trusted_proxies`, and a publish port below 1024
 requires `[runtime] allow_privileged_host_ports`), `ingress.tls` (`edge` only: every routed domain has a
 `<domain>.crt` + `<domain>.key` pair under `<nginx_conf_dir>/tls`; missing is a `warn`; `[acme]`
-issues them, docs/install.md 6q), `ingress.privileged_ports` (`edge` with a port below 1024: `net.ipv4.ip_unprivileged_port_start`),
+issues them, docs/guides/acme.md), `ingress.privileged_ports` (`edge` with a port below 1024: `net.ipv4.ip_unprivileged_port_start`),
 `ingress.bind`, `ingress.bind_free` (every publish from `publish_sockets()` — one in `behind`, two in
 `edge` — is not held by a socket of a uid other than the runtime user; read from `/proc/net/tcp*`),
 `ingress.traefik_sync` (`behind` + systemd only: if `/etc/weglarka/traefik-policy.json` exists, the

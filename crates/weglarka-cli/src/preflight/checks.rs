@@ -24,7 +24,7 @@ pub const MIN_SUBID_COUNT: u64 = 65_536;
 /// apps. The Ansible role `weglarka_host` provides 2,000,000; we warn below 1,000,000.
 pub const RECOMMENDED_SUBID_COUNT: u64 = 1_000_000;
 
-// The names/paths below are a convention of the Ansible role `weglarka_host` (niechybnie repo),
+// The names/paths below are a convention of the Ansible role `weglarka_host` (host provisioning repo),
 // not part of Węglarka's configuration — a change there requires a change here.
 /// Sync validator policy for Traefik's file (JSON, root-owned).
 pub const TRAEFIK_POLICY_PATH: &str = "/etc/weglarka/traefik-policy.json";
@@ -648,7 +648,7 @@ impl Check for IngressConfigCheck {
             Err(e) => fail(
                 self.id(),
                 e.clone(),
-                "fix [ingress] in weglarka.toml (mode-specific keys are listed in docs/install.md)",
+                "fix [ingress] in weglarka.toml (mode-specific keys are listed in docs/install.md and docs/guides/edge-mode.md)",
             ),
         }
     }
@@ -765,7 +765,7 @@ impl Check for IngressTls {
                     missing.join(", "),
                     tls.display()
                 ),
-                "put <domain>.crt (PEM chain) and <domain>.key (0600) there, or enable [acme] in weglarka.toml (docs/install.md 6q)",
+                "put <domain>.crt (PEM chain) and <domain>.key (0600) there, or enable [acme] in weglarka.toml (docs/guides/acme.md)",
             );
         }
         if !unreadable.is_empty() {

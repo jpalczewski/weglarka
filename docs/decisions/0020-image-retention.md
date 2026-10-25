@@ -6,7 +6,7 @@ Status: accepted (issue #40).
 
 The design says "one previous image per app" — that image is the rollback target when the health gate
 rejects a new version. Nothing in the code ever called `image_remove`, so every deploy left the
-previous image behind forever and the node's disk filled up (`niechybnie`: ~83 %). We need
+previous image behind forever and the node's disk filled up. We need
 
 1. retention of the *current* and the *previous* image of every app after a successful deploy,
 2. a one-off cleanup for images left by deploys that happened before retention existed,
@@ -77,7 +77,7 @@ and rolling back a daemon stays safe. `spec_hash` is untouched: retention never 
 - The prune runs under the engine mutex, so it serialises with deploys and answers `busy` (503) after
   the admin API's 30 s mutation timeout instead of interleaving with a pull.
 - Operators must run `weglarka images prune --dry-run` and then `weglarka images prune` once after
-  upgrading ([`docs/install.md` 6g](../install.md#6g-retencja-obrazów-i-jednorazowe-sprzątanie)).
+  upgrading ([the image retention guide](../guides/image-retention.md)).
 - Tests: the pure planner in `core/src/images.rs`, engine tests on `FakePodman` (three deploys keep two
   images; a deploy ignores another app's repository), the admin API + `doctor` in
   `daemon/tests/images.rs`, and the libpod mapping in `weglarka-podman`.

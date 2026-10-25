@@ -6,7 +6,7 @@ Status: proposed (2026-10-24, issue #33). The "at most one shared volume per app
 ## Problem
 
 Migration of a multi-process app into Węglarka needs several containers to share **one** SQLite
-database in **one** named volume (kajet-turbo: api, mcp, worker, turbo). Today a volume belongs to
+database in **one** named volume (e.g. api, mcp and worker processes). Today a volume belongs to
 exactly one instance: the Podman volume is `<instance>.<volume>`, labelled `weglarka.instance`, and
 `ensure_volumes`/`purge`/`list`/`import`/`export` all derive it from that one instance
 (`crates/weglarka-core/src/volumes.rs`, `crates/weglarka-core/src/labels.rs`). One app is also
@@ -33,13 +33,13 @@ name, declare/store separately).
 ### Desired state (`apps.toml`)
 
 ```toml
-[shared_volumes.kajet-data]
+[shared_volumes.notes-data]
 # no fields yet: the declaration is the guard against typos and the future home of
 # per-volume options (backups / Litestream, range size)
 
-[apps.kajet-api]
-image = "ghcr.io/.../kajet-api:latest"
-shared_volumes = [{ name = "kajet-data", target = "/data" }]
+[apps.notes-api]
+image = "ghcr.io/example/notes-api:latest"
+shared_volumes = [{ name = "notes-data", target = "/data" }]
 ```
 
 * `AppsFile.shared_volumes: BTreeMap<SharedVolumeName, SharedVolumeSpec>` — declared once, no owner
@@ -148,13 +148,13 @@ declared but not created, range/label drift, member user mismatch.
 
 * New `apps.toml` section and `state.toml` field. Both files are `deny_unknown_fields`, so **a
   rollback to an older daemon requires removing them** (and deleting `wg-shared-*` volumes by hand
-  — the old daemon cannot see them). Documented in `docs/install.md` and in the PR.
+  — the old daemon cannot see them). Documented in [the shared volumes guide](../guides/shared-volumes.md) and in the PR.
 * `state.toml` also gains `apps.<name>.effective_uid_range` (issue #75): a derived mirror of the
   effective range, used by the range guard when no container exists. It is not part of the
   disjoint-ranges validation. The same `deny_unknown_fields` rule applies — a downgrade needs the
   line removed — and an older CLI cannot decode `apps show/add/update` and `apps start/stop`
   responses, because `AppState` is part of the API (new CLI with an old daemon is fine). Both are
-  documented in `docs/install.md`.
+  documented in [the shared volumes guide](../guides/shared-volumes.md).
 * API: `PUT /v1/volumes/{volume}`, `GET /v1/volumes`, `DELETE /v1/volumes/{volume}?purge=true`,
   an additive `VolumeSummary.shared`, and the 409 on `apps remove --purge-volumes`. The endpoints
   snapshot test changes.

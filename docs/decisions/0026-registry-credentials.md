@@ -56,7 +56,7 @@ reads the secret and pulls anonymously.
 
 ## Consequences
 
-- Operators of private images: `weglarka secrets set <app> registry-auth` (see `docs/install.md`), one
+- Operators of private images: `weglarka secrets set <app> registry-auth` (see [the first app guide](../guides/first-app.md)), one
   credential per app, scoped to that app's registry host. Two apps on one registry set it twice — the cost of
   never sharing a credential implicitly.
 - A rollback that needs the registry (image no longer local) uses the same secret.

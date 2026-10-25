@@ -47,7 +47,7 @@ so it needs no `SCHEMA_VERSION` bump.
 
 `[acme]` (`accept_terms`, `email`, `directory_url`, `enabled`, `renew_before_days`, `check_interval_secs`) is a
 new `weglarka.toml` section: it requires `edge` ingress (unless `enabled = false`), and it breaks rollback to
-an older daemon because of `deny_unknown_fields` (`docs/install.md` 6q). It does not touch `apps.toml`,
+an older daemon because of `deny_unknown_fields` ([the ACME guide](../guides/acme.md)). It does not touch `apps.toml`,
 `state.toml`, `spec_hash` or `SCHEMA_VERSION`.
 
 The daemon runs one worker (`weglarka-daemon/src/acme.rs`): the first pass 30 s after start (nginx must be
