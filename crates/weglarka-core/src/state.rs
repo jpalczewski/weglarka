@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -96,6 +96,13 @@ fn host_mounts_v8(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v8 → v9: deploy strategy (issue #39, ADR 0046). `AppSpec::strategy` is an optional field that
+/// defaults to `recreate`, so a v8 document needs no data transformation; the marker records that
+/// the file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn deploy_strategy_v9(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -107,6 +114,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     ingress_max_body_size_v6,
     secret_mount_ownership_v7,
     host_mounts_v8,
+    deploy_strategy_v9,
 ];
 
 const _: () = assert!(
@@ -331,7 +339,29 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     }
     validate_depends_on(name, spec)?;
     validate_ingress(name, spec)?;
+    validate_strategy(name, spec)?;
     validate_iteration2(name, spec)
+}
+
+/// `blue_green` runs two containers of the app at once, so it is only for stateless apps (ADR 0046):
+/// two containers cannot bind one host port, and a read-write volume would have two writers (SQLite
+/// has a single one). Read-only volumes and host config mounts are fine.
+fn validate_strategy(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    if spec.strategy != crate::app::Strategy::BlueGreen {
+        return Ok(());
+    }
+    if !spec.host_ports.is_empty() {
+        return Err(format!(
+            "{name}: strategy \"blue_green\" cannot be combined with host_ports (two containers cannot bind one host port)"
+        ));
+    }
+    if spec.volumes.iter().any(|v| !v.read_only) || spec.shared_volumes.iter().any(|v| !v.read_only)
+    {
+        return Err(format!(
+            "{name}: strategy \"blue_green\" needs a stateless app: read-write volumes (private or shared) would have two writers"
+        ));
+    }
+    Ok(())
 }
 
 /// `depends_on` rules an app can break on its own. The cross-app rules (an unknown target, a cycle)
@@ -1187,6 +1217,37 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         )
         .unwrap();
         assert!(matches!(load_state(&p), Err(StateError::Invalid { .. })));
+    }
+
+    #[test]
+    fn blue_green_needs_a_stateless_app() {
+        let check = |extra: &str| {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\nstrategy = \"blue_green\"\n{extra}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        assert!(check("").is_ok());
+        assert!(
+            check("volumes = [{ name = \"cfg\", target = \"/cfg\", read_only = true }]").is_ok()
+        );
+        assert!(
+            check("shared_volumes = [{ name = \"s\", target = \"/s\", read_only = true }]").is_ok()
+        );
+        for bad in [
+            "volumes = [{ name = \"data\", target = \"/data\" }]",
+            "shared_volumes = [{ name = \"s\", target = \"/s\" }]",
+            "host_ports = [{ host = 8080, container = 80 }]",
+        ] {
+            let err = check(bad).unwrap_err();
+            assert!(err.contains("blue_green"), "{bad}: {err}");
+        }
+        // The default strategy has no such restriction.
+        let spec: AppSpec =
+            toml::from_str("image = \"i\"\nvolumes = [{ name = \"data\", target = \"/data\" }]")
+                .unwrap();
+        assert!(validate_app(&name("a"), &spec).is_ok());
     }
 
     #[test]

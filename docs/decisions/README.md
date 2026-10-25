@@ -52,3 +52,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0043](0043-edge-client-address.md) | Edge mode: the client address is lost behind rootlessport |
 | [0044](0044-edge-cdn-client-address.md) | Edge mode behind a CDN: trusting the visitor header of a CDN peer |
 | [0045](0045-host-mounts.md) | Allowlisted read-only host mounts and groups for apps |
+| [0046](0046-blue-green-deploy.md) | Blue-green deploys for stateless apps (issue #39) |

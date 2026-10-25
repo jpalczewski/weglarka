@@ -103,6 +103,16 @@ impl PodmanClient for LibpodClient {
         Ok(())
     }
 
+    async fn container_rename(&self, name: &str, new_name: &str) -> Result<()> {
+        let path = format!(
+            "/containers/{}/rename?name={}",
+            path_name(name)?,
+            encode_component(new_name)
+        );
+        self.transport.call(Method::POST, &path, None).await?;
+        Ok(())
+    }
+
     async fn container_kill(&self, name: &str, signal: &str) -> Result<()> {
         let path = format!(
             "/containers/{}/kill?signal={}",
@@ -314,7 +324,27 @@ impl PodmanClient for LibpodClient {
     async fn network_connect(&self, network: &str, container: &str) -> Result<()> {
         let path = format!("/networks/{}/connect", path_name(network)?);
         self.transport
-            .call_json(Method::POST, &path, &ConnectNetwork { container })
+            .call_json(
+                Method::POST,
+                &path,
+                &ConnectNetwork {
+                    container,
+                    aliases: &[],
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn network_connect_aliased(
+        &self,
+        network: &str,
+        container: &str,
+        aliases: &[String],
+    ) -> Result<()> {
+        let path = format!("/networks/{}/connect", path_name(network)?);
+        self.transport
+            .call_json(Method::POST, &path, &ConnectNetwork { container, aliases })
             .await?;
         Ok(())
     }

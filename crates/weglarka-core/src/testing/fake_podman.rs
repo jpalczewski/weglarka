@@ -45,6 +45,15 @@ pub enum Call {
         network: String,
         container: String,
     },
+    NetworkConnectAliased {
+        network: String,
+        container: String,
+        aliases: Vec<String>,
+    },
+    ContainerRename {
+        from: String,
+        to: String,
+    },
     NetworkDisconnect {
         network: String,
         container: String,
@@ -192,6 +201,13 @@ impl FakePodman {
 
     pub fn clear_pull_failure(&self, reference: &str) {
         self.lock().pull_failures.remove(reference);
+    }
+
+    /// Replaces the labels of an existing container (a container Węglarka labelled, added by hand).
+    pub fn set_container_labels(&self, name: &str, labels: BTreeMap<String, String>) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.labels = labels;
+        }
     }
 
     /// Inserts a running container that Węglarka did not create and therefore does not label — the
@@ -902,6 +918,69 @@ impl PodmanClient for FakePodman {
         Ok(())
     }
 
+    async fn network_connect_aliased(
+        &self,
+        network: &str,
+        container: &str,
+        aliases: &[String],
+    ) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::NetworkConnectAliased {
+            network: network.into(),
+            container: container.into(),
+            aliases: aliases.to_vec(),
+        });
+        if !s.containers.contains_key(container) {
+            return Err(PodmanError::NotFound(container.to_owned()));
+        }
+        let (_, members) = s
+            .networks
+            .get_mut(network)
+            .ok_or_else(|| PodmanError::NotFound(network.to_owned()))?;
+        // Like libpod: a network the container is already on cannot be connected again.
+        if members.iter().any(|m| m == container) {
+            return Err(PodmanError::Conflict(format!(
+                "network is already connected: {container} on {network}"
+            )));
+        }
+        members.push(container.to_owned());
+        Ok(())
+    }
+
+    async fn container_rename(&self, name: &str, new_name: &str) -> Result<()> {
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerRename {
+            from: name.to_owned(),
+            to: new_name.to_owned(),
+        });
+        if !s.containers.contains_key(name) {
+            return Err(PodmanError::NotFound(name.to_owned()));
+        }
+        if s.containers.contains_key(new_name) {
+            return Err(PodmanError::Conflict(new_name.to_owned()));
+        }
+        if let Some(mut info) = s.containers.remove(name) {
+            info.name = new_name.to_owned();
+            s.containers.insert(new_name.to_owned(), info);
+        }
+        if let Some(mut spec) = s.container_specs.remove(name) {
+            spec.name = new_name.to_owned();
+            s.container_specs.insert(new_name.to_owned(), spec);
+        }
+        if let Some(script) = s.run_scripts.remove(name) {
+            s.run_scripts.insert(new_name.to_owned(), script);
+        }
+        if let Some(script) = s.health_scripts.remove(name) {
+            s.health_scripts.insert(new_name.to_owned(), script);
+        }
+        for (_, members) in s.networks.values_mut() {
+            for m in members.iter_mut().filter(|m| *m == name) {
+                *m = new_name.to_owned();
+            }
+        }
+        Ok(())
+    }
+
     async fn network_disconnect(&self, network: &str, container: &str) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::NetworkDisconnect {
@@ -919,6 +998,10 @@ impl PodmanClient for FakePodman {
             .get_mut(network)
             .ok_or_else(|| PodmanError::NotFound(network.to_owned()))?;
         members.retain(|m| m != container);
+        // Detached means detached: the network no longer counts as used by that container.
+        if let Some(spec) = s.container_specs.get_mut(container) {
+            spec.networks.retain(|n| n != network);
+        }
         Ok(())
     }
 

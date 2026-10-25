@@ -44,6 +44,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `depends_on` entries | [dependencies](dependencies.md) |
 | `apps.toml`, apps | `shared_volumes` entries; the `[shared_volumes]` section; the `shared_volumes` section in `state.toml` | [shared volumes](shared-volumes.md) |
 | `apps.toml`, apps | `shared_networks` entries; the `[shared_networks.<name>]` declarations | [shared networks](shared-networks.md) |
+| `apps.toml`, apps | `strategy` (`weglarka apps update <app> --strategy recreate`, then remove the key) | [blue-green deploys](blue-green.md) |
 | `apps.toml`, apps | `command` | [container command](container-command.md) |
 | `apps.toml`, apps | `host_ports` | [host ports](host-ports.md) |
 | `apps.toml`, apps | `[apps.X.ingress]` blocks — `streaming` | [streaming](streaming.md) |
