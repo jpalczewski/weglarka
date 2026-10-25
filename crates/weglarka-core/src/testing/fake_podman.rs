@@ -208,6 +208,7 @@ impl FakePodman {
                 health: None,
                 networks: Vec::new(),
                 addresses: Vec::new(),
+                published_ports: Vec::new(),
                 restarts: 0,
             },
         );
@@ -498,6 +499,7 @@ impl PodmanClient for FakePodman {
                 restarts: 0,
                 networks: Vec::new(),
                 addresses: Vec::new(),
+                published_ports: spec.publish.clone(),
             },
         );
         Ok(id)
@@ -506,7 +508,15 @@ impl PodmanClient for FakePodman {
     async fn container_start(&self, name: &str) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::ContainerStart(name.to_owned()));
-        s.container_mut(name)?.state = ContainerState::Running;
+        // Like libpod, a mapping with host port 0 gets a free port once the container starts.
+        let base = 40_000 + (s.next_id as u16 % 20_000);
+        let container = s.container_mut(name)?;
+        container.state = ContainerState::Running;
+        for (offset, p) in container.published_ports.iter_mut().enumerate() {
+            if p.host_port == 0 {
+                p.host_port = base + offset as u16;
+            }
+        }
         let script = s.run_queue.pop_front().unwrap_or_default();
         s.run_scripts.insert(name.to_owned(), script);
         Ok(())

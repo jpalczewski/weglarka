@@ -253,6 +253,7 @@ mod tests {
             restarts,
             networks: vec![],
             addresses: vec![],
+            published_ports: vec![],
         }
     }
 

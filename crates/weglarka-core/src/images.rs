@@ -328,6 +328,7 @@ mod tests {
             restarts: 0,
             networks: Vec::new(),
             addresses: Vec::new(),
+            published_ports: Vec::new(),
         }
     }
 

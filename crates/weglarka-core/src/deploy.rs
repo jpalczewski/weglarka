@@ -215,7 +215,7 @@ impl<P: PodmanClient> Reconciler<P> {
 
     // ── Internals (called under `lock`) ──────────────────────────────────────────
 
-    fn load_spec(&self, instance: &InstanceName) -> Result<AppSpec, EngineError> {
+    pub(crate) fn load_spec(&self, instance: &InstanceName) -> Result<AppSpec, EngineError> {
         state::load_apps(&self.paths.apps)?
             .apps
             .remove(instance)
