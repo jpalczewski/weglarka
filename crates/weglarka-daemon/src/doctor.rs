@@ -62,6 +62,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     }
     configs(d, &mut checks);
     host_mounts(d, &mut checks);
+    sites(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     shared_network_state(d, &mut checks).await;
     secrets(d, &mut checks);
@@ -473,6 +474,42 @@ fn dependencies(
 /// Report-only, like the rest of doctor: nothing here touches the files or the containers.
 /// Host mounts (issue #178): which apps read which host paths, and whether each is still allowlisted,
 /// present and unredirected. Silent while no app uses them.
+/// Sites with environments (issue #205): a promote-only environment that has never been promoted
+/// into answers 503 on its domain. Nothing is emitted while no site is declared.
+fn sites<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    if apps.sites.is_empty() {
+        return;
+    }
+    let st = state::load_state(&d.paths.state.state).unwrap_or_default();
+    let unpromoted: Vec<String> = apps
+        .origins
+        .iter()
+        .filter(|(name, o)| {
+            o.promote_from.is_some() && st.apps.get(*name).is_none_or(|s| s.current.is_none())
+        })
+        .map(|(_, o)| format!("{}/{}", o.site, o.env))
+        .collect();
+    out.push(if unpromoted.is_empty() {
+        ok(
+            "sites.unpromoted",
+            "every promote-only environment has a release",
+        )
+    } else {
+        check(
+            "sites.unpromoted",
+            CheckStatus::Warn,
+            format!(
+                "promote-only environments without a release (their domains answer 503): {}",
+                unpromoted.join(", ")
+            ),
+            Some("`weglarka promote <site> <env>` after the source environment has a release"),
+        )
+    });
+}
+
 fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     use weglarka_core::host_mounts::{HostMountStatus, describe};
     let Ok(apps) = state::load_apps(&d.paths.state.apps) else {

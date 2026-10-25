@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 12**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 12`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 13**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 13`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-core/src/state.rs`); a compile-time assert
@@ -49,6 +49,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 10 | #181 | optional `ingress.access_log_skip_paths` | — | [access log](access-log.md) |
 | 11 | #180 | optional `ingress.streaming_paths` | [0047](../decisions/0047-ingress-streaming-paths.md) | [streaming](streaming.md) |
 | 12 | #48 | optional `kind = "static"` | [0049](../decisions/0049-static-sites.md) | [static sites](static-sites.md) |
+| 13 | #205 | optional `[sites.<site>]` with environments | [0050](../decisions/0050-site-environments.md) | [site environments](site-environments.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

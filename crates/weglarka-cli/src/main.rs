@@ -11,6 +11,7 @@ mod preflight;
 mod push;
 mod run;
 mod settings;
+mod sites;
 mod spec_flags;
 mod update;
 mod user_config;

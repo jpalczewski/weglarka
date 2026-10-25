@@ -1587,3 +1587,22 @@ fn traefik_routes_a_static_site_to_the_nginx_like_any_app() {
     insta::assert_snapshot!("traefik_sites", yml);
     assert!(yml.contains("Host(`www.example.eu`)"));
 }
+
+#[test]
+fn a_static_site_without_a_release_answers_503() {
+    let a = apps(SITE_APPS);
+    let mut o = opts();
+    o.unreleased.insert(InstanceName::new("landing").unwrap());
+    let conf = nginx::generate(&host(), &a, &o).unwrap();
+    insta::assert_snapshot!("nginx_unreleased_site", conf);
+    let www = server_block(&conf, "www.example.eu");
+    assert!(
+        www.contains("return 503;") && !www.contains("try_files"),
+        "{www}"
+    );
+    // The sibling site that has a release keeps serving files.
+    assert!(
+        conf.contains("root /etc/nginx/sites/docs/current;"),
+        "{conf}"
+    );
+}

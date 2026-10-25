@@ -145,6 +145,16 @@ impl ApiClient {
         self.send(endpoint, params, None::<&()>).await.map(drop)
     }
 
+    /// Call with a JSON request body and no response body (204).
+    pub async fn call_empty_json(
+        &self,
+        endpoint: Endpoint,
+        params: &[(&str, &str)],
+        body: &(impl Serialize + ?Sized),
+    ) -> Result<(), CliError> {
+        self.send(endpoint, params, Some(body)).await.map(drop)
+    }
+
     async fn send(
         &self,
         endpoint: Endpoint,

@@ -59,6 +59,8 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
         Command::Networks(c) => crate::networks::run(json, &overrides, c).await,
+        Command::Sites(c) => crate::sites::run(json, &overrides, c).await,
+        Command::Promote(a) => crate::sites::promote(json, &overrides, a).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
         Command::Notify(NotifyCommand::Status) => notify_status(json, &overrides).await,
         Command::Notify(NotifyCommand::Test) => notify_test(json, &overrides).await,
@@ -768,10 +770,11 @@ fn render_apps(apps: &[AppSummary]) -> String {
                 crate::update::runtime_label(a.runtime),
                 a.image.clone(),
                 a.domains.join(","),
+                a.site.clone().unwrap_or_else(|| "-".to_owned()),
             ]
         })
         .collect::<Vec<_>>();
-    table(&["NAME", "RUNTIME", "IMAGE", "DOMAINS"], &rows)
+    table(&["NAME", "RUNTIME", "IMAGE", "DOMAINS", "SITE"], &rows)
 }
 
 pub(crate) fn render_show(r: &ShowAppResponse) -> String {

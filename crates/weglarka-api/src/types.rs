@@ -63,6 +63,9 @@ pub struct AppSummary {
     pub runtime: RuntimeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest>,
+    /// `<site>/<env>` when the instance is expanded from a site (issue #205).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
