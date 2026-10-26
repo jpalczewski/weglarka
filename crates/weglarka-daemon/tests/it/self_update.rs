@@ -2,9 +2,7 @@
 //! the digest a switch requested and the `self_update` doctor check (off, applied, pending, stale
 //! timer).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::path::PathBuf;
 
 use futures_util::StreamExt;

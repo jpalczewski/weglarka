@@ -1,8 +1,6 @@
 //! Daemon tests on `FakePodman`: admin API over a real unix socket, webhooks over TCP.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

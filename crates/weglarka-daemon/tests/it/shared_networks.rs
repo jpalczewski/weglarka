@@ -2,9 +2,7 @@
 //! the real admin socket: declarations (`/v1/networks`), membership through the app spec, the
 //! in-use guard on removal and the doctor check.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::collections::BTreeMap;
 
 use hyper::StatusCode;

@@ -1,8 +1,6 @@
 //! Volume endpoints and `apps remove --purge-volumes` on `FakePodman`, over the real admin socket.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};

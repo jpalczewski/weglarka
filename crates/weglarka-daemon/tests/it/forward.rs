@@ -2,9 +2,7 @@
 //! response stream, errors before the stream starts, and that a hung-up client does not leave a relay
 //! behind.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use hyper::StatusCode;
 use serde_json::json;
 use weglarka_api::{ForwardFrame, ForwardFrameDecoder};

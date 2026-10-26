@@ -2,9 +2,7 @@
 //! (privileged ports, two apps on one socket, the ingress bind) are enforced wherever the daemon
 //! reads or writes `apps.toml` (`docs/decisions/0013-host-ports.md`).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::path::PathBuf;
 
 use hyper::StatusCode;

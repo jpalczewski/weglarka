@@ -1,9 +1,7 @@
 //! Image retention through the admin API (issue #40): `POST /v1/images/prune` and the `doctor`
 //! warning. Real unix socket, `FakePodman`.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use futures_util::StreamExt;
 use hyper::StatusCode;

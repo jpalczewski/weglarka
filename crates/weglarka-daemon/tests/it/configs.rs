@@ -1,9 +1,7 @@
 //! Host config mounts and `apps reload` (issue #118, ADR 0022) over the admin API: startup
 //! validation, reload/show/doctor on `FakePodman` with a real `config_root` in the temp dir.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
