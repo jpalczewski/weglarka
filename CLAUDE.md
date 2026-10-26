@@ -254,6 +254,9 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
 ## Testy
 
 - `cargo test --workspace` — jednostkowe + snapshoty, bez Podmana.
+- Testy integracyjne demona to **jedna binarka** (`daemon/tests/it/main.rs`); nowy obszar = nowy `mod`, nie nowy
+  `tests/*.rs` (każda binarka generuje od nowa `Daemon<FakePodman>`). Jeden obszar:
+  `cargo test -p weglarka-daemon --test it -- sites::`.
 - Środowiska z sandboxem (agent / CI w kontenerze): jeśli cargo nie może pisać do globalnego `target-dir`
   (`Operation not permitted`), ustaw `CARGO_TARGET_DIR` na katalog zapisywalny w sandboxie. **Worktree nie buduje
   własnego `target/`:** wskaż wspólny katalog głównego checkoutu — `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"` —

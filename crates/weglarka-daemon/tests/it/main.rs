@@ -1,5 +1,7 @@
-//! The daemon's integration tests as one test binary: each module was a `tests/*.rs` file of its
-//! own, which compiled and linked the whole daemon once per file.
+//! The daemon's integration tests, deliberately one test binary. The engine and the admin router are
+//! generic over `PodmanClient`, so every test binary re-generates and re-links `Daemon<FakePodman>`
+//! and the HTTP stack: add new tests as a module here, never as a new `tests/*.rs` file.
+//! Run one area with `cargo test -p weglarka-daemon --test it -- <module>::`.
 
 mod common;
 
