@@ -1,7 +1,7 @@
 [package]
 name = "weglarka-api"
 description = "Węglarka: kontrakt admin API (typy request/response, endpointy, wersja)"
-version = "0.0.2"
+version = "0.0.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

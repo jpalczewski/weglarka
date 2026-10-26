@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.2...weglarka-podman-v0.0.3) - 2026-10-26
+
+### Added
+
+- *(core)* serve static sites from unpacked OCI releases (#48, #101, #102) ([#184](https://github.com/jpalczewski/weglarka/pull/184))
+- *(core)* [**breaking**] blue-green deploys for stateless apps ([#186](https://github.com/jpalczewski/weglarka/pull/186))
+- *(core)* allowlisted host mounts and group_add for log collectors ([#185](https://github.com/jpalczewski/weglarka/pull/185))
+- *(cli)* deploy a locally built image with weglarka push ([#163](https://github.com/jpalczewski/weglarka/pull/163))
+- *(cli)* weglarka forward, a temporary port forward ([#165](https://github.com/jpalczewski/weglarka/pull/165))
+- one-off containers with `weglarka run` ([#157](https://github.com/jpalczewski/weglarka/pull/157))
+- *(core)* uid/gid for mounted secrets ([#150](https://github.com/jpalczewski/weglarka/pull/150))
+- *(ingress)* edge mode with nginx owning 80/443 ([#146](https://github.com/jpalczewski/weglarka/pull/146))
+
 ## [0.0.2](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.1...weglarka-podman-v0.0.2) - 2026-10-24
 
 ### Added

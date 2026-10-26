@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.2...weglarka-api-v0.0.3) - 2026-10-26
+
+### Added
+
+- *(core)* sites with environments and promotion ([#206](https://github.com/jpalczewski/weglarka/pull/206))
+- *(core)* allowlisted host mounts and group_add for log collectors ([#185](https://github.com/jpalczewski/weglarka/pull/185))
+- *(cli)* deploy a locally built image with weglarka push ([#163](https://github.com/jpalczewski/weglarka/pull/163))
+- *(cli)* weglarka forward, a temporary port forward ([#165](https://github.com/jpalczewski/weglarka/pull/165))
+- one-off containers with `weglarka run` ([#157](https://github.com/jpalczewski/weglarka/pull/157))
+
 ## [0.0.2](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.1...weglarka-api-v0.0.2) - 2026-10-24
 
 ### Added

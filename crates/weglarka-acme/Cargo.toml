@@ -1,7 +1,7 @@
 [package]
 name = "weglarka-acme"
 description = "Węglarka: ACME certificate issuance and renewal for the edge ingress (challenge solvers, cert store, renewal policy)"
-version = "0.0.2"
+version = "0.0.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
