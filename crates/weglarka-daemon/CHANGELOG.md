@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/jpalczewski/weglarka/compare/v0.0.2...v0.0.3) - 2026-10-26
+
+### Added
+
+- *(core)* sites with environments and promotion ([#206](https://github.com/jpalczewski/weglarka/pull/206))
+- *(core)* serve static sites from unpacked OCI releases (#48, #101, #102) ([#184](https://github.com/jpalczewski/weglarka/pull/184))
+- *(core)* allowlisted host mounts and group_add for log collectors ([#185](https://github.com/jpalczewski/weglarka/pull/185))
+- *(daemon)* refresh the Cloudflare ranges from the API ([#172](https://github.com/jpalczewski/weglarka/pull/172))
+- *(ingress)* trust the CDN's client address in edge mode ([ingress.cdn]) ([#171](https://github.com/jpalczewski/weglarka/pull/171))
+- *(ingress)* keep the real client address in edge mode ([#166](https://github.com/jpalczewski/weglarka/pull/166))
+- *(cli)* deploy a locally built image with weglarka push ([#163](https://github.com/jpalczewski/weglarka/pull/163))
+- *(cli)* weglarka forward, a temporary port forward ([#165](https://github.com/jpalczewski/weglarka/pull/165))
+- *(ingress)* serve wildcard certificates for the domains they cover ([#161](https://github.com/jpalczewski/weglarka/pull/161))
+- *(daemon)* wildcard certificates over DNS-01 ([acme.dns]) ([#160](https://github.com/jpalczewski/weglarka/pull/160))
+- one-off containers with `weglarka run` ([#157](https://github.com/jpalczewski/weglarka/pull/157))
+- *(daemon)* run an ACME worker for edge certificates ([#154](https://github.com/jpalczewski/weglarka/pull/154))
+- *(ingress)* edge mode with nginx owning 80/443 ([#146](https://github.com/jpalczewski/weglarka/pull/146))
+- *(core)* persist webhook delivery dedup across restarts ([#145](https://github.com/jpalczewski/weglarka/pull/145))
+
+### Fixed
+
+- *(acme)* wait for DNS-01 records before asking the CA to validate ([#202](https://github.com/jpalczewski/weglarka/pull/202))
+- *(daemon)* keep the edge forwarder across self-updates and log why nginx is recreated ([#194](https://github.com/jpalczewski/weglarka/pull/194))
+
+### Other
+
+- *(acme)* HTTP-01 behind the Cloudflare proxy and a doctor hint (acme.cdn) ([#175](https://github.com/jpalczewski/weglarka/pull/175))
+- speed up cargo test with mold, nextest and a shorter dependency gate in tests ([#170](https://github.com/jpalczewski/weglarka/pull/170))
+- translate the install guide to English and split it into topic guides ([#164](https://github.com/jpalczewski/weglarka/pull/164))
+- *(daemon)* share the integration test harness and unflake the shared-network test ([#151](https://github.com/jpalczewski/weglarka/pull/151))
+
 ## [0.0.2](https://github.com/jpalczewski/weglarka/compare/v0.0.1...v0.0.2) - 2026-10-24
 
 ### Added
