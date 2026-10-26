@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -131,6 +131,15 @@ fn site_environments_v13(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v13 → v14: identity provider integration (issue #42, ADR 0051/0052). `AppSpec::oidc`,
+/// `AppIngress::auth*` and `[oidc_clients]` in `apps.toml` are optional with defaults, so a v13 document
+/// needs no data transformation — the marker records that the file may carry them (every non-default
+/// value is still rejected by `identity::gate`). A no-op that must accept a hand-edited file which
+/// already has them.
+fn identity_v14(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -147,6 +156,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     ingress_streaming_paths_v11,
     static_sites_v12,
     site_environments_v13,
+    identity_v14,
 ];
 
 const _: () = assert!(
@@ -373,7 +383,15 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_ingress(name, spec)?;
     validate_strategy(name, spec)?;
     validate_iteration2(name, spec)?;
-    validate_static(name, spec)
+    validate_static(name, spec)?;
+    crate::identity::validate_app(name, spec)?;
+    crate::identity::gate::app(name, spec)
+}
+
+/// `apps.toml` invariants that span the file and are not about one instance.
+fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
+    crate::identity::validate_file(apps)?;
+    crate::identity::gate::file(apps)
 }
 
 /// A static site (ADR 0049) has no process: every field that configures one is a typo or a mistaken
@@ -403,6 +421,7 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         ("host_mounts", !spec.host_mounts.is_empty()),
         ("group_add", !spec.group_add.is_empty()),
         ("strategy", spec.strategy != defaults.strategy),
+        ("oidc", spec.oidc.is_some()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
         return Err(format!(
@@ -807,6 +826,7 @@ pub fn parse_apps(path: &Path, src: &str) -> Result<AppsFile, StateError> {
     for (name, spec) in &apps.apps {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
+    validate_apps_file(&apps).map_err(|r| invalid(path, r))?;
     crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
     crate::shared_volumes::validate(&apps).map_err(|r| invalid(path, r))?;
     crate::shared_networks::validate(&apps).map_err(|r| invalid(path, r))?;
@@ -824,6 +844,7 @@ pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
     for (name, spec) in &apps.apps {
         validate_app(name, spec).map_err(|r| invalid(path, r))?;
     }
+    validate_apps_file(apps).map_err(|r| invalid(path, r))?;
     crate::depends::validate(apps).map_err(|r| invalid(path, r))?;
     crate::shared_volumes::validate(apps).map_err(|r| invalid(path, r))?;
     crate::shared_networks::validate(apps).map_err(|r| invalid(path, r))?;

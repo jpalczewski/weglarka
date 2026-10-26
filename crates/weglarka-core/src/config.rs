@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::InstanceName;
 use crate::events::Severity;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,11 @@ pub struct HostConfig {
     /// provides `tls/<domain>.crt|key` (issue #96, `docs/decisions/0038`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<AcmeConfig>,
+    /// Identity provider that decides authentication for OIDC clients and forward auth (issue #88,
+    /// `docs/decisions/0051`); absent = off. Operator-owned: which container is trusted to authenticate
+    /// is the host's root of trust. Rejected in this release (`identity::gate::host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityConfig>,
 }
 
 impl HostConfig {
@@ -77,6 +83,45 @@ impl HostConfig {
                         .to_owned(),
                 );
             }
+        }
+        if let Some(identity) = &self.identity {
+            identity.validate()?;
+        }
+        crate::identity::gate::host(self)
+    }
+}
+
+/// `[identity]`: the identity provider (issue #88, ADR 0051). Lexical checks only; that the issuer host
+/// is one of the instance's domains and that its `command` loads the generated config are host-aware
+/// rules of a later stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// Adapter that renders the provider's config.
+    pub provider: IdentityProvider,
+    /// App instance in `apps.toml` that runs the provider.
+    pub instance: InstanceName,
+    /// Public URL of the provider (the OIDC issuer): `https://host[:port]`, no path.
+    pub issuer: String,
+    /// Address nginx uses to reach the provider on its network (`host:port`); unset = `<instance>:<port>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// Identity provider adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityProvider {
+    Authelia,
+}
+
+impl IdentityConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::identity::check_issuer(&self.issuer)
+            .map_err(|r| format!("[identity] issuer {:?}: {r}", self.issuer))?;
+        if let Some(upstream) = &self.upstream {
+            crate::identity::check_upstream(upstream)
+                .map_err(|r| format!("[identity] upstream {upstream:?}: {r}"))?;
         }
         Ok(())
     }

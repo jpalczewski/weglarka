@@ -211,6 +211,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         group_add: Vec::new(),
         reload_signal: None,
         strategy: Default::default(),
+        oidc: None,
         shared_networks: vec![],
         host_ports: Vec::new(),
         depends_on: Vec::new(),

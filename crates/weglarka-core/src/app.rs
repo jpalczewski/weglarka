@@ -1,6 +1,9 @@
 //! App model: `AppSpec` (an instance's desired state) and helper types.
 //! On-disk format: `[apps.<instance>]` sections in `apps.toml` (sole writer: the daemon).
 
+use crate::identity::{
+    AuthorizationPolicy, ClientId, ExternalClientSpec, IngressAuth, OidcClientSpec,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -804,6 +807,20 @@ pub struct AppIngress {
     /// `streaming = true`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_paths: Vec<String>,
+    /// Forward authentication in front of the app (#89, ADR 0052): `none` (default) or `forward`.
+    /// Changes nginx output only; outside the spec hash. Rejected in this release (`identity::gate`).
+    #[serde(default, skip_serializing_if = "IngressAuth::is_none")]
+    pub auth: IngressAuth,
+    /// Authorization policy applied to a forward-auth app; unset means `two_factor`. Needs `auth = "forward"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_policy: Option<AuthorizationPolicy>,
+    /// Groups of which the user must be in at least one. Needs `auth = "forward"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_groups: Vec<String>,
+    /// Paths that skip forward auth structurally (their location has no `auth_request`), for
+    /// non-browser clients with their own tokens. An entry ending in `/` is a prefix. Needs `auth = "forward"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_exempt_paths: Vec<String>,
 }
 
 impl Default for AppIngress {
@@ -815,6 +832,10 @@ impl Default for AppIngress {
             max_body_size: None,
             access_log_skip_paths: Vec::new(),
             streaming_paths: Vec::new(),
+            auth: IngressAuth::None,
+            auth_policy: None,
+            auth_groups: Vec::new(),
+            auth_exempt_paths: Vec::new(),
         }
     }
 }
@@ -1001,6 +1022,10 @@ pub struct AppSpec {
     /// Not part of the spec hash: it decides how a container is swapped, never what it is made of.
     #[serde(default, skip_serializing_if = "Strategy::is_default")]
     pub strategy: Strategy,
+    /// OIDC client for this app (#91, ADR 0051). Not part of the spec hash in this release, and
+    /// rejected outright until the pipeline that creates the client exists (`identity::gate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcClientSpec>,
 }
 
 /// Deploy strategy of an app.
@@ -1054,6 +1079,8 @@ pub struct AppsFile {
     /// Sites with environments (issue #205). Their environments are also present in `apps`, listed
     /// in `origins`.
     pub sites: BTreeMap<SiteName, SiteSpec>,
+    /// OIDC clients of apps Węglarka does not run (#91, ADR 0051). Rejected in this release.
+    pub oidc_clients: BTreeMap<ClientId, ExternalClientSpec>,
     /// Every instance, **including** the ones expanded from `sites`.
     pub apps: BTreeMap<InstanceName, AppSpec>,
     /// Instances of `apps` that come from `sites`. Not serialized; rebuilt by the load.
@@ -1107,6 +1134,8 @@ pub struct RawAppsFile {
     shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     sites: BTreeMap<SiteName, SiteSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    oidc_clients: BTreeMap<ClientId, ExternalClientSpec>,
     #[serde(default)]
     apps: BTreeMap<InstanceName, AppSpec>,
 }
@@ -1119,6 +1148,7 @@ impl TryFrom<RawAppsFile> for AppsFile {
             schema_version: raw.schema_version,
             shared_volumes: raw.shared_volumes,
             shared_networks: raw.shared_networks,
+            oidc_clients: raw.oidc_clients,
             apps: raw.apps,
             ..AppsFile::default()
         };
@@ -1135,6 +1165,7 @@ impl From<AppsFile> for RawAppsFile {
             shared_volumes: file.shared_volumes,
             shared_networks: file.shared_networks,
             sites: file.sites,
+            oidc_clients: file.oidc_clients,
             apps,
         }
     }
@@ -1627,7 +1658,7 @@ image = "x:1"
 
     #[test]
     fn a_file_without_sites_round_trips_byte_identically() {
-        let src = "schema_version = 13\n\n[apps.a]\nimage = \"x:1\"\nauto_update = true\n";
+        let src = "schema_version = 14\n\n[apps.a]\nimage = \"x:1\"\nauto_update = true\n";
         let parsed: AppsFile = toml::from_str(src).unwrap();
         let once = toml::to_string(&parsed).unwrap();
         let twice = toml::to_string(&toml::from_str::<AppsFile>(&once).unwrap()).unwrap();
