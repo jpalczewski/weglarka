@@ -80,7 +80,7 @@ and rolling back a daemon stays safe. `spec_hash` is untouched: retention never 
   upgrading ([the image retention guide](../guides/image-retention.md)).
 - Tests: the pure planner in `core/src/images.rs`, engine tests on `FakePodman` (three deploys keep two
   images; a deploy ignores another app's repository), the admin API + `doctor` in
-  `daemon/tests/images.rs`, and the libpod mapping in `weglarka-podman`.
+  `daemon/tests/it/images.rs`, and the libpod mapping in `weglarka-podman`.
 
 ## Known limitations (deliberate, follow-ups)
 

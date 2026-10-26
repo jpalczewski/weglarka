@@ -1,9 +1,7 @@
 //! `secrets remove` and `apps remove --purge-secrets` through the admin API (real unix socket,
 //! FakePodman), plus the `state.orphan_secrets` doctor check (issue #80).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};

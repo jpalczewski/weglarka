@@ -2,9 +2,7 @@
 //! real admin socket: declarations (`/v1/volumes`), member mounts, the purge/range-change guards and
 //! import/export through the app's volume endpoints.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::collections::BTreeMap;
 
 use hyper::StatusCode;

@@ -1,8 +1,6 @@
 //! Forgejo webhook flow on `FakePodman`: `/webhook/forgejo/{instance}` over TCP.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::net::SocketAddr;
 use std::time::Duration;
 

@@ -1,9 +1,7 @@
 //! `weglarka push` (issue #109): `PUT /v1/apps/{name}/image` and `POST /v1/apps/{name}/deploy` with an
 //! `image_ref`, over the real admin socket on `FakePodman`.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use hyper::StatusCode;
 use hyper::body::Bytes;
 use serde_json::{Value, json};

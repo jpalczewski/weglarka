@@ -2,9 +2,7 @@
 //! over the real admin socket: declaring a site, the instances it expands into, the guards that keep
 //! them out of `apps update/remove`, promotion errors and the doctor check.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};

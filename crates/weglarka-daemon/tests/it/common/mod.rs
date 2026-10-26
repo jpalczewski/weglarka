@@ -1,11 +1,9 @@
 //! Shared harness for the daemon's integration tests: the daemon runs for real (its admin unix
 //! socket answers) while Podman is a [`FakePodman`].
 //!
-//! Every `tests/*.rs` file is a crate of its own: the files that need the harness declare
-//! `mod common;` and pull the helpers in with `use common::*;`. Only part of this module is used by
-//! any single binary, hence the module-wide `dead_code` allowance below.
-
-#![allow(dead_code)]
+//! All integration tests live in one binary (`tests/it/main.rs`, one module per area), so the
+//! generic `Daemon<FakePodman>` and the HTTP stack are compiled and linked once instead of once per
+//! file. Modules pull the helpers in with `use crate::common::*;`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

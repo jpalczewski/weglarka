@@ -1,9 +1,7 @@
 //! Notifications (issue #38) on `FakePodman`: engine events reach a mock ntfy server through the
 //! durable outbox, and `notify test`/`notify status` answer over the admin API.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

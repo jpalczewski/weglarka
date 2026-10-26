@@ -1,9 +1,7 @@
 //! `depends_on` through the admin API (real unix socket, FakePodman): graph validation, the
 //! removal refusal, the deploy gate and the `doctor` check (issue #35).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};

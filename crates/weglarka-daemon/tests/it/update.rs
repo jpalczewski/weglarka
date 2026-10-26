@@ -1,8 +1,6 @@
 //! `apps update` and "waiting for secret" through the admin API (real unix socket, FakePodman).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use std::time::Duration;
 
 use hyper::StatusCode;
