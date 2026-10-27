@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.3...weglarka-model-v0.0.4) - 2026-10-27
+
+### Added
+
+- *(ingress)* forward auth via nginx auth_request in both modes ([#236](https://github.com/jpalczewski/weglarka/pull/236))
+- *(model)* SecretOps and OIDC client credentials ([#229](https://github.com/jpalczewski/weglarka/pull/229))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-core-v0.0.2...weglarka-core-v0.0.3) - 2026-10-26
 
 ### Added

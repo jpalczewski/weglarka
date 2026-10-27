@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-notify-v0.0.3...weglarka-notify-v0.0.4) - 2026-10-27
+
+### Added
+
+- *(http)* [**breaking**] shared HTTP client crate on reqwest; move notify onto it ([#230](https://github.com/jpalczewski/weglarka/pull/230))
+
+### Other
+
+- split weglarka-core into weglarka-model and weglarka-engine ([#228](https://github.com/jpalczewski/weglarka/pull/228))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-notify-v0.0.2...weglarka-notify-v0.0.3) - 2026-10-26
 
 ### Added
