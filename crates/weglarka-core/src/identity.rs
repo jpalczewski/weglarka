@@ -307,17 +307,28 @@ fn https_host(url: &str) -> Result<&str, &'static str> {
         Some((host, port)) => (host, Some(port)),
         None => (authority, None),
     };
-    if host.is_empty()
-        || !host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
-    {
-        return Err("host must be a non-empty DNS name ([A-Za-z0-9.-])");
+    if !valid_dns_name(host) {
+        return Err(
+            "host must be a DNS name of non-empty labels (at most 63 bytes of [A-Za-z0-9-], no leading or trailing '-')",
+        );
     }
     if port.is_some_and(|p| !valid_port(p)) {
         return Err("port must be a number in 1..=65535");
     }
     Ok(host)
+}
+
+fn valid_dns_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn valid_port(port: &str) -> bool {
@@ -514,17 +525,42 @@ fn validate_oidc(spec: &AppSpec, oidc: &OidcClientSpec) -> Result<(), String> {
                     "client_secret path must be an absolute path (no '..', ':' or ',')".to_owned(),
                 );
             }
-            let range = crate::uid_range::DEFAULT_RANGE_SIZE;
-            for (field, id) in [("uid", uid), ("gid", gid)] {
-                if id.is_some_and(|id| id >= range) {
-                    return Err(format!(
-                        "client_secret {field} must be in 0..={}",
-                        range - 1
-                    ));
-                }
+            crate::state::check_mount_owner(*uid, *gid)
+                .map_err(|e| format!("client_secret: {e}"))?;
+            if spec.secrets.iter().any(|b| {
+                matches!(&b.target, SecretTarget::Mount { path: p, .. }
+                    if p.trim_end_matches('/') == path.trim_end_matches('/'))
+            }) {
+                return Err(format!(
+                    "client_secret path {path:?} collides with a mounted secret of the app"
+                ));
             }
         }
         None => {}
+    }
+    // The injected names must not shadow what the app already sets.
+    let secret_var = match &oidc.client_secret {
+        Some(SecretTarget::Env { var }) => Some(("client_secret var", var.as_str())),
+        _ => None,
+    };
+    for (field, var) in [("client_id_env", client_id_env), ("issuer_env", issuer_env)]
+        .into_iter()
+        .chain(secret_var)
+    {
+        if spec.env.contains_key(var) {
+            return Err(format!(
+                "{field} {var:?} collides with a key of the app's env"
+            ));
+        }
+        if spec
+            .secrets
+            .iter()
+            .any(|b| matches!(&b.target, SecretTarget::Env { var: v } if v == var))
+        {
+            return Err(format!(
+                "{field} {var:?} collides with an environment secret of the app"
+            ));
+        }
     }
     Ok(())
 }
@@ -568,12 +604,14 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
     // The daemon's probe carries no session: a protected probe path would get a login redirect, fail
     // the gate and roll back every deploy.
     if let Some(probe) = &spec.health.http {
+        // nginx matches locations on the path alone.
+        let probe_path = probe.path.split('?').next().unwrap_or_default();
         let covered = ingress
             .auth_exempt_paths
             .iter()
             .any(|e| match e.strip_suffix('/') {
-                Some(prefix) => probe.path == prefix || probe.path.starts_with(e.as_str()),
-                None => probe.path == *e,
+                Some(prefix) => probe_path == prefix || probe_path.starts_with(e.as_str()),
+                None => probe_path == e,
             });
         if !covered {
             return Err(format!(
@@ -656,11 +694,9 @@ pub mod gate {
             || ingress.auth_policy.is_some()
             || !ingress.auth_groups.is_empty()
             || !ingress.auth_exempt_paths.is_empty();
-        (|| {
-            reject(spec.oidc.is_some(), "OIDC clients (`oidc`)")?; // lifted by P4
-            reject(auth_used, "forward auth (`ingress.auth*`)") // lifted by P5
-        })()
-        .map_err(|e| format!("{name}: {e}"))
+        reject(spec.oidc.is_some(), "OIDC clients (`oidc`)") // lifted by P4
+            .and_then(|()| reject(auth_used, "forward auth (`ingress.auth*`)")) // lifted by P5
+            .map_err(|e| format!("{name}: {e}"))
     }
 
     /// File-level `[oidc_clients]`.

@@ -360,23 +360,9 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         if !crate::secret_store::valid_secret_name(&b.secret) {
             return Err(format!("{name}: invalid secret name {:?}", b.secret));
         }
-        // A mounted secret's owner is a numeric id in the container's space; Podman maps it through
-        // the instance's uid/gid range, which is exactly `DEFAULT_RANGE_SIZE` ids wide (ADR 0009), so
-        // an id outside `0..DEFAULT_RANGE_SIZE` cannot be mapped. The bound is derived from the range
-        // size on purpose: a magic 65535 would silently stop matching if the range ever changed.
         if let SecretTarget::Mount { uid, gid, .. } = &b.target {
-            let range = crate::uid_range::DEFAULT_RANGE_SIZE;
-            for (field, id) in [("uid", uid), ("gid", gid)] {
-                if let Some(id) = id
-                    && *id >= range
-                {
-                    return Err(format!(
-                        "{name}: secret {:?}: {field} must be in 0..={} (the instance's uid/gid range is {range} ids wide, ADR 0009)",
-                        b.secret,
-                        range - 1
-                    ));
-                }
-            }
+            check_mount_owner(*uid, *gid)
+                .map_err(|e| format!("{name}: secret {:?}: {e}", b.secret))?;
         }
     }
     validate_depends_on(name, spec)?;
@@ -384,14 +370,35 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_strategy(name, spec)?;
     validate_iteration2(name, spec)?;
     validate_static(name, spec)?;
-    crate::identity::validate_app(name, spec)?;
-    crate::identity::gate::app(name, spec)
+    // A feature that is not enabled is refused as such, before its own rules.
+    crate::identity::gate::app(name, spec)?;
+    crate::identity::validate_app(name, spec)
 }
 
 /// `apps.toml` invariants that span the file and are not about one instance.
 fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
-    crate::identity::validate_file(apps)?;
-    crate::identity::gate::file(apps)
+    // A feature that is not enabled is refused as such, before its own rules.
+    crate::identity::gate::file(apps)?;
+    crate::identity::validate_file(apps)
+}
+
+/// A mounted secret's owner is a numeric id in the container's space; Podman maps it through
+/// the instance's uid/gid range, which is exactly `DEFAULT_RANGE_SIZE` ids wide (ADR 0009), so
+/// an id outside `0..DEFAULT_RANGE_SIZE` cannot be mapped. The bound is derived from the range
+/// size on purpose: a magic 65535 would silently stop matching if the range ever changed.
+pub(crate) fn check_mount_owner(uid: Option<u32>, gid: Option<u32>) -> Result<(), String> {
+    let range = crate::uid_range::DEFAULT_RANGE_SIZE;
+    for (field, id) in [("uid", uid), ("gid", gid)] {
+        if let Some(id) = id
+            && id >= range
+        {
+            return Err(format!(
+                "{field} must be in 0..={} (the instance's uid/gid range is {range} ids wide, ADR 0009)",
+                range - 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A static site (ADR 0049) has no process: every field that configures one is a typo or a mistaken

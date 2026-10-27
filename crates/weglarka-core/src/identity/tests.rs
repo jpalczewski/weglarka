@@ -407,6 +407,13 @@ fn issuer_is_https_without_a_path() {
         "https://auth.example.com#f",
         "auth.example.com",
         "https://",
+        "https://..",
+        "https://-",
+        "https://a..b",
+        "https://-x.example.com",
+        "https://x-.example.com",
+        "https://example.com.",
+        "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com",
     ] {
         assert!(check_issuer(bad).is_err(), "{bad}");
     }
@@ -542,6 +549,107 @@ fn static_sites_do_not_take_oidc() {
         "image = \"a.tar\"\nkind = \"static\"\ndomains = [\"app.example.com\"]\n{OIDC}"
     ))
     .unwrap();
+    // The static-site rule (state.rs) and the gate both refuse it; the gate speaks first.
     assert!(gated(&s).contains("oidc"), "{}", gated(&s));
-    assert!(gated(&s).contains("static"), "{}", gated(&s));
+}
+
+const BAD_HOSTS: &[&str] = &[
+    "https://..",
+    "https://-",
+    "https://a..b/cb",
+    "https://-x.example.com/cb",
+    "https://x-.example.com/cb",
+];
+
+#[test]
+fn malformed_dns_hosts_are_rejected_in_redirect_uris_and_audiences() {
+    for bad in BAD_HOSTS {
+        let mut c = external();
+        c.redirect_uris = vec![(*bad).into()];
+        assert!(
+            validate_external_client(&id("forge"), &c)
+                .unwrap_err()
+                .contains("host"),
+            "{bad}"
+        );
+        let mut c = external();
+        c.audience = vec![(*bad).into()];
+        assert!(
+            validate_external_client(&id("forge"), &c)
+                .unwrap_err()
+                .contains("host"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn injected_names_must_not_clash_with_the_apps_own_config() {
+    let with = |extra: &str, secret: &str| {
+        toml::from_str::<AppSpec>(&format!(
+            "image = \"i\"\ndomains = [\"app.example.com\"]\n{extra}\n[oidc]\nredirect_uris = [\"https://app.example.com/cb\"]\nclient_secret = {secret}\n"
+        ))
+        .unwrap()
+    };
+    let env_secret = "{ kind = \"env\", var = \"OIDC_CLIENT_SECRET\" }";
+    let mount_secret = "{ kind = \"mount\", path = \"/run/secrets/oidc\" }";
+    lexical(&with("", env_secret)).unwrap();
+    // The app's own env.
+    for key in ["OIDC_CLIENT_ID", "OIDC_ISSUER", "OIDC_CLIENT_SECRET"] {
+        let s = with(&format!("env = {{ {key} = \"x\" }}"), env_secret);
+        assert!(
+            lexical_err(&s).contains("env"),
+            "{key}: {}",
+            lexical_err(&s)
+        );
+    }
+    // The app's own env-secret bindings.
+    for var in ["OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"] {
+        let s = with(
+            &format!("secrets = [{{ secret = \"s\", kind = \"env\", var = \"{var}\" }}]"),
+            env_secret,
+        );
+        assert!(
+            lexical_err(&s).contains("environment secret"),
+            "{var}: {}",
+            lexical_err(&s)
+        );
+    }
+    // The app's own mounted secret at the same path.
+    let s = with(
+        "secrets = [{ secret = \"s\", kind = \"mount\", path = \"/run/secrets/oidc/\" }]",
+        mount_secret,
+    );
+    assert!(
+        lexical_err(&s).contains("mounted secret"),
+        "{}",
+        lexical_err(&s)
+    );
+    // A different path is fine.
+    lexical(&with(
+        "secrets = [{ secret = \"s\", kind = \"mount\", path = \"/run/secrets/other\" }]",
+        mount_secret,
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_probe_path_with_a_query_is_matched_on_its_path() {
+    let s = spec(
+        "[health.http]\npath = \"/healthz?full=1\"\n\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/healthz\"]",
+    );
+    lexical(&s).unwrap();
+}
+
+#[test]
+fn the_gate_speaks_before_the_lexical_rules() {
+    // Lexically invalid (a bad redirect URI) and not enabled: the answer is the gate's.
+    let s = spec(
+        "[oidc]\nredirect_uris = [\"http://x/cb\"]\nclient_secret = { kind = \"env\", var = \"S\" }",
+    );
+    assert!(
+        gated(&s).ends_with("is not enabled in this release"),
+        "{}",
+        gated(&s)
+    );
 }
