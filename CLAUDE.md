@@ -95,10 +95,17 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
   wystartowała, a nie ten, do którego później wchodzi (`create_worktree`, `working_directory`). Z głównego
   checkoutu `.agents/worktrees/*`, wspólne `.git` i `target/` są w granicach zapisu; sesja wystartowana
   w worktree ma główne `.git` i `target/` poza granicami (zapisy gita wymagają eskalacji).
-- Build z dowolnego checkoutu na jednym cache: `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"`; sesja
-  wystartowana w worktree używa `$PWD/target` (główny checkout jest wtedy poza sandboxem).
-- Wyjście: `cd` z powrotem do checkoutu (worktree i gałąź zostają). Po merge'u PR-a:
-  `git worktree remove .agents/worktrees/<name> && git branch -D <name>`, potem `git worktree prune`.
+- **Każdy checkout buduje we własnym `target/`** — nie dziel katalogu budowania między worktree (ani przez wspólny
+  `CARGO_TARGET_DIR`, ani przez wspólny `build.build-dir`; zmierzone 2026-10-27, #223). Ścieżki crate'ów workspace są
+  haszowane względem korzenia workspace, więc identyczne układy dają identyczne nazwy artefaktów, a świeżość to mtime:
+  jeśli twoja edycja jest starsza niż build innego worktree, cargo nie przebuduje nic i zlinkuje **jego** kod. Zależności
+  z crates.io i tak kompiluje raz sccache (`RUSTC_WRAPPER=sccache`), więc prywatny `target/` kosztuje dysk, nie czas.
+  `~/.cargo/config.toml` bywa ustawiony na globalny `target-dir` — przypnij go: `export CARGO_TARGET_DIR="$(scripts/worktree.sh target)"`.
+  Rozmiar: ok. 1,1 GB po `cargo build --workspace`, ≥2 GB z testami (`scripts/worktree.sh usage` pokazuje wszystkie + wolne miejsce).
+- Wyjście: `cd` z powrotem do checkoutu (worktree i gałąź zostają). Po merge'u PR-a usuń worktree **razem z jego
+  `target/`**: `scripts/worktree.sh remove .agents/worktrees/<name> --delete-branch` (to `rm -rf target`,
+  `git worktree remove`, `git worktree prune`, `git branch -D`). Zalegające `target/` czyści też okresowo
+  `scripts/worktree.sh sweep [dni]` (`cargo sweep --time 14` w każdym worktree; wymaga `cargo install cargo-sweep`).
   `.agents/worktrees/.gitignore` (`*`) trzyma pulę poza `git status`.
 - Agent Teams: narzędzie zmienia katalog tylko wywołującej sesji. Jeden pisarz = jedno worktree: albo Lead
   tworzy je przed spawnem teammate'ów, albo każdy członek tworzy własne i wpisuje je w `write_scopes` zadania;
@@ -259,15 +266,13 @@ Nowa zależność zewnętrzna: dodaj do `[workspace.dependencies]` w root `Cargo
   `tests/*.rs` (każda binarka generuje od nowa `Daemon<FakePodman>`). Jeden obszar:
   `cargo test -p weglarka-daemon --test it -- sites::`.
 - Środowiska z sandboxem (agent / CI w kontenerze): jeśli cargo nie może pisać do globalnego `target-dir`
-  (`Operation not permitted`), ustaw `CARGO_TARGET_DIR` na katalog zapisywalny w sandboxie. **Worktree nie buduje
-  własnego `target/`:** wskaż wspólny katalog głównego checkoutu — `CARGO_TARGET_DIR="$(scripts/shared-target.sh)"` —
-  żeby zależności z crates.io skompilowały się raz dla wszystkich worktree (skrypt zwraca ten sam katalog z głównego
-  checkoutu i z `git worktree`). Przy sesji, której workspace *jest* worktree, główny checkout bywa poza sandboxem —
-  wtedy zostaje `$PWD/target`.
-- **Wspólny `target/` potrafi skłamać** (zmierzone 2026-10-24): gdy pisze do niego równolegle inny proces (druga
-  sesja, świeży `git rebase`), cargo może zlinkować **stary** `libweglarka_{core,api}` i zgłosić błędy, których
-  w kodzie nie ma — np. `unresolved import weglarka_core::images`, `no field repo_digests on type ImageInfo`,
-  `ContainerSpec has no field command`. Nie „naprawiaj" wtedy kodu: powtórz na prywatnym katalogu
+  (`Operation not permitted`), ustaw `CARGO_TARGET_DIR` na katalog zapisywalny w sandboxie — dla worktree jego własny
+  `target/` (`CARGO_TARGET_DIR="$(scripts/worktree.sh target)"`); nie wskazuj `target/` innego checkoutu (patrz „Worktrees").
+- **Wspólny katalog budowania potrafi skłamać** (zmierzone 2026-10-24 i 2026-10-27): gdy dwa checkouty piszą do jednego
+  `target/` (albo `build.build-dir`), cargo może zlinkować **stary albo cudzy** `libweglarka_{core,api}` — albo
+  zgłosić błędy, których w kodzie nie ma (`unresolved import weglarka_core::images`, `no field repo_digests on type
+  ImageInfo`, `ContainerSpec has no field command`), albo — gorzej — zbudować bez błędu i bez rekompilacji (0 crate'ów)
+  binarkę z kodu drugiego worktree. Nie „naprawiaj" wtedy kodu: powtórz na prywatnym katalogu
   `CARGO_TARGET_DIR="$PWD/target" cargo test --workspace` (pełny rebuild, minuty, ale wiarygodny). Nie chowaj też
   werdyktu w potoku: `cargo test … > /tmp/log 2>&1; echo "EXIT: $?"` — `| tail` maskuje kod wyjścia.
 - Fake: `weglarka-core` z `features = ["testing"]` → `weglarka_core::testing::FakePodman`
