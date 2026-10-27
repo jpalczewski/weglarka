@@ -218,7 +218,7 @@ http {
         }
         location = /.well-known/oauth {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -228,7 +228,7 @@ http {
         }
         location = /health {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -238,7 +238,7 @@ http {
         }
         location = /mcp {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -248,7 +248,7 @@ http {
         }
         location ^~ /mcp/ {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";

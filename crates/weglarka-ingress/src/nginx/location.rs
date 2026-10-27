@@ -175,7 +175,7 @@ impl Backend<'_> {
             // `return 503` runs in the rewrite phase, before any access check, so a route that only
             // reserves a name needs none.
             if location.exempt {
-                c.block("if ($request_uri ~* \"(;|%3b|\\\\\\\\|%5c)\")", |c| {
+                c.block("if ($request_uri ~* \"(;|%3b|\\\\\\\\|%5c|%25)\")", |c| {
                     c.line("return 400;")
                 });
             }
