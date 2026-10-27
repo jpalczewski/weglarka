@@ -4136,6 +4136,80 @@ health = { attempts = 2, window_secs = 2 }
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_consumer_and_its_validation_run_mount_the_generated_directory_read_only() {
+        let g = TestGen::new(true);
+        let h = Harness::build_with(
+            IDP,
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        g.set("v2");
+        apply(&h, &g, false).await;
+
+        let dir = std::fs::canonicalize(h.rec.generated_dir(&name("idp"))).unwrap();
+        let wanted = |specs: Vec<weglarka_model::podman::ContainerSpec>| {
+            specs.into_iter().all(|s| {
+                s.mounts.iter().any(|m| {
+                    m.target == "/weglarka/generated"
+                        && m.source == dir.display().to_string()
+                        && m.read_only
+                })
+            })
+        };
+        let created = h.fake.created_specs();
+        assert!(created.len() >= 2, "{created:?}");
+        assert!(wanted(created), "the serving container and the validator");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_consumer_gets_the_extra_hash_input() {
+        let g = TestGen::new(false);
+        let h = Harness::build_with(
+            &format!(
+                "{IDP}\n[apps.other]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nport = 8086\n"
+            ),
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+        let d = digest('a');
+        let consumer = &apps.apps[&name("idp")];
+        let other = &apps.apps[&name("other")];
+        assert_eq!(
+            h.rec
+                .desired_hash(&name("idp"), consumer, &d)
+                .await
+                .unwrap(),
+            weglarka_model::hash::spec_hash_with_generated(
+                weglarka_model::hash::spec_hash(consumer, &d),
+                "/weglarka/generated"
+            )
+        );
+        assert_eq!(
+            h.rec.desired_hash(&name("other"), other, &d).await.unwrap(),
+            weglarka_model::hash::spec_hash(other, &d),
+            "an app that consumes nothing keeps the hash it had"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_app_that_is_not_a_consumer_gets_no_mount() {
+        let h = deployed().await;
+        assert!(
+            h.fake
+                .created_specs()
+                .iter()
+                .all(|s| s.mounts.iter().all(|m| m.target != "/weglarka/generated"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_health_failure_flips_current_back_once() {
         let h = deployed().await;
         let g = TestGen::new(true);

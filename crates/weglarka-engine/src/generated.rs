@@ -419,6 +419,40 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(())
     }
 
+    /// Whether a registered generator renders files for `instance`.
+    pub(crate) fn is_generated_consumer(&self, instance: &InstanceName) -> bool {
+        self.generated
+            .as_ref()
+            .is_some_and(|w| w.generators.iter().any(|g| g.consumer() == instance))
+    }
+
+    /// The read-only bind of a consumer's generated directory at [`MOUNT_TARGET`] (none for any
+    /// other app). The directory is created so the bind source exists before the first render; the
+    /// canonical path is what mounts, like every host-side mount (ADR 0028). Its parent — not a
+    /// single version — is mounted, so a new version and the `current` swap are visible live.
+    pub(crate) fn generated_mounts(
+        &self,
+        instance: &InstanceName,
+    ) -> Result<Vec<crate::config_mounts::Resolved>, EngineError> {
+        if !self.is_generated_consumer(instance) {
+            return Ok(vec![]);
+        }
+        let dir = self.generated_dir(instance);
+        let fail = |e: io::Error| EngineError::Generated {
+            consumer: instance.clone(),
+            message: format!("cannot prepare {}: {e}", dir.display()),
+        };
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(&dir)
+            .map_err(fail)?;
+        Ok(vec![crate::config_mounts::Resolved {
+            source: fs::canonicalize(&dir).map_err(fail)?,
+            target: MOUNT_TARGET.to_owned(),
+        }])
+    }
+
     /// `<state dir>/generated/<consumer>`.
     pub(crate) fn generated_dir(&self, consumer: &InstanceName) -> PathBuf {
         self.state_dir()

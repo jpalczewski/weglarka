@@ -343,13 +343,20 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
         digest: &Digest,
     ) -> Result<SpecHash, EngineError> {
-        match self.options.secret_change {
-            SecretChangePolicy::NextDeploy => Ok(spec_hash(spec, digest)),
+        let hash = match self.options.secret_change {
+            SecretChangePolicy::NextDeploy => spec_hash(spec, digest),
             SecretChangePolicy::Immediate => {
                 let fp = binding_fingerprints(&self.secrets, instance, spec).await?;
-                Ok(spec_hash_with_secrets(spec, digest, &fp))
+                spec_hash_with_secrets(spec, digest, &fp)
             }
-        }
+        };
+        // A consumer of generated config carries one more bind mount; only it gets the extra input,
+        // so every other app keeps the hash it had before the feature existed.
+        Ok(if self.is_generated_consumer(instance) {
+            weglarka_model::hash::spec_hash_with_generated(hash, crate::generated::MOUNT_TARGET)
+        } else {
+            hash
+        })
     }
 
     /// Pulls `reference` for `instance`, with its `registry-auth` credentials when it has any
@@ -496,7 +503,10 @@ impl<P: PodmanClient> Reconciler<P> {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
         // ADR 0028). The resolved canonical paths are what `launch` mounts.
-        let configs = self.resolve_mounts(spec)?;
+        let mut configs = self.resolve_mounts(spec)?;
+        // Shared by deploys and one-off runs (incl. the validation run), so a container of the
+        // consumer always sees the generated versions.
+        configs.extend(self.generated_mounts(instance)?);
         self.podman
             .network_create(&NetworkSpec {
                 name: labels::network_name(instance),

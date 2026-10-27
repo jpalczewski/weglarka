@@ -215,10 +215,32 @@ pub fn spec_hash_with_secrets(
     SpecHash(hex::encode(Sha256::digest(json)))
 }
 
+/// Mixes in "this container reads generated config files mounted at `target`" (#212). The mount
+/// itself is not part of the `AppSpec`, so it has to enter the hash separately: a running consumer
+/// without it is recreated once to gain the mount. Apply it **only** to a consumer — for every other
+/// app the hash stays [`spec_hash`] exactly, so upgrading recreates nothing.
+pub fn spec_hash_with_generated(base: SpecHash, target: &str) -> SpecHash {
+    let json = serde_json::to_vec(&(base.as_str(), "generated-config", target))
+        .expect("hash input is always serializable");
+    SpecHash(hex::encode(Sha256::digest(json)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::SecretTarget;
+
+    #[test]
+    fn the_generated_config_mount_changes_the_hash_and_is_deterministic() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let with = spec_hash_with_generated(base.clone(), "/weglarka/generated");
+        assert_ne!(base, with);
+        assert_eq!(
+            with,
+            spec_hash_with_generated(base.clone(), "/weglarka/generated")
+        );
+        assert_ne!(with, spec_hash_with_generated(base, "/other"));
+    }
 
     fn digest(c: char) -> Digest {
         Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
