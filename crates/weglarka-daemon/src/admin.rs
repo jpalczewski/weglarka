@@ -33,7 +33,8 @@ use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, LogChunk, LogSource, PodmanClient,
 };
 use weglarka_model::secret_store::{
-    SecretError, SecretStore, SecretValue, fingerprint, scoped_name, valid_secret_name,
+    SecretError, SecretStore, SecretValue, fingerprint, is_oidc_reserved, scoped_name,
+    valid_secret_name,
 };
 use weglarka_model::state::{self, AppState};
 
@@ -811,6 +812,18 @@ async fn list_secrets<P: PodmanClient + 'static>(
     Ok(json(ListSecretsResponse { secrets }))
 }
 
+/// The OIDC client credentials are minted as a pair by `SecretOps` (#213); `set` or `remove` of one
+/// half would split it, so both are refused.
+fn refuse_reserved(secret: &str) -> ApiResult<()> {
+    if is_oidc_reserved(secret) {
+        return Err(Fail::invalid(format!(
+            "secret {secret} is managed by Węglarka and cannot be set or removed directly; \
+             use `weglarka oidc rotate <app>` to replace it"
+        )));
+    }
+    Ok(())
+}
+
 async fn set_secret<P: PodmanClient + 'static>(
     State(d): Shared<P>,
     Path((raw, secret)): Path<(String, String)>,
@@ -820,6 +833,7 @@ async fn set_secret<P: PodmanClient + 'static>(
     if !valid_secret_name(&secret) {
         return Err(Fail::invalid("secret name must match [A-Za-z0-9_-]{1,64}"));
     }
+    refuse_reserved(&secret)?;
     let req: SetSecretRequest = parse_json(&body)?;
     if req.value.is_empty() {
         return Err(Fail::invalid("secret value must not be empty"));
@@ -864,6 +878,7 @@ async fn remove_secret<P: PodmanClient + 'static>(
     if !valid_secret_name(&secret) {
         return Err(Fail::invalid("secret name must match [A-Za-z0-9_-]{1,64}"));
     }
+    refuse_reserved(&secret)?;
     let force = volumes::flag(query.as_deref(), "force");
     mutating(d.engine.remove_secret(&name, &secret, force)).await?;
     d.changed();

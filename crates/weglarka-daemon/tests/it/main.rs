@@ -14,6 +14,7 @@ mod host_ports;
 mod images;
 mod ingress;
 mod notify;
+mod oidc_credentials;
 mod push;
 mod run;
 mod secrets;

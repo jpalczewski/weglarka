@@ -9,6 +9,7 @@ pub mod deploy;
 pub mod forward;
 pub mod host_mounts;
 pub mod images;
+pub mod oidc_credentials;
 pub mod platform;
 pub mod promote;
 pub mod push;
