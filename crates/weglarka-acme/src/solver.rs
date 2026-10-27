@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
-use weglarka_core::state::write_atomic;
+use weglarka_model::fsutil::write_atomic;
 
 use crate::cert::base_name;
 use crate::error::AcmeError;

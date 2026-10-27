@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use weglarka_core::config::HostConfig;
-use weglarka_core::state::StatePaths;
+use weglarka_model::config::HostConfig;
+use weglarka_model::state::StatePaths;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {

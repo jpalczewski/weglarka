@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use weglarka_core::podman::{
+use weglarka_model::podman::{
     ContainerFilter, ContainerState, EventFilter, HealthStatus, NetworkSpec, PodmanClient,
     PodmanError, PullEvent, RegistryAuth,
 };
@@ -151,7 +151,7 @@ async fn not_found_and_name_conflict() {
     assert!(
         matches!(client.container_inspect("nope").await, Err(PodmanError::NotFound(m)) if m.contains("no container"))
     );
-    let spec = weglarka_core::podman::ContainerSpec {
+    let spec = weglarka_model::podman::ContainerSpec {
         name: "x".into(),
         image: "i".into(),
         command: vec![],
@@ -162,7 +162,7 @@ async fn not_found_and_name_conflict() {
         network_aliases: Default::default(),
         secrets: vec![],
         publish: vec![],
-        restart: weglarka_core::podman::RestartPolicy::No,
+        restart: weglarka_model::podman::RestartPolicy::No,
         userns_auto: false,
         mounts: vec![],
         volumes: vec![],
@@ -467,7 +467,7 @@ async fn exec_runs_detached_and_returns_exit_code_and_disconnect_is_idempotent()
 
 #[tokio::test]
 async fn volume_calls_use_libpod_paths_and_map_results() {
-    use weglarka_core::podman::{VolumeFilter, VolumeSpec};
+    use weglarka_model::podman::{VolumeFilter, VolumeSpec};
     let mock = serve(vec![
         (
             "POST /v6.0.0/libpod/volumes/create",
@@ -531,7 +531,7 @@ async fn volume_calls_use_libpod_paths_and_map_results() {
 /// returns the exit code, whichever of libpod's two shapes it answers in.
 #[tokio::test]
 async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
-    use weglarka_core::podman::LogSource;
+    use weglarka_model::podman::LogSource;
     let mock = serve(vec![
         (
             "GET /v6.0.0/libpod/containers/job/logs",

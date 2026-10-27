@@ -9,10 +9,10 @@ use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
 use serde_json::json;
 use tokio::net::TcpStream;
-use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::forgejo::{
     DELIVERY_HEADER, EVENT_HEADER, EVENT_TYPE_HEADER, SIGNATURE_HEADER, sign,
 };
+use weglarka_engine::testing::{Call, FakePodman};
 
 const SECRET: &str = "hunter2-webhook";
 const IMAGE: &str = "git.example.eu/acme/shop:main";

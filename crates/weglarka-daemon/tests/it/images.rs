@@ -6,9 +6,9 @@ use crate::common::*;
 use futures_util::StreamExt;
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::app::Digest;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::testing::DEFAULT_IMAGE_SIZE_BYTES;
+use weglarka_engine::testing::DEFAULT_IMAGE_SIZE_BYTES;
+use weglarka_model::app::Digest;
+use weglarka_model::podman::PodmanClient;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 

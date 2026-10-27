@@ -109,7 +109,7 @@ jobs:
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
 
-  # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-core +
+  # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-model +
   # weglarka-ingress) and Docker. The debug cache is `check`'s, restored read-only; the example is built once up
   # front so the steps below (which call `cargo run`) only reuse it.
   nginx-e2e:
@@ -292,6 +292,8 @@ jobs:
       # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
       # so `--nocapture` shows that nothing was skipped.
       - run: cargo test -p weglarka-podman -- --nocapture
+      # The engine tests that drive the engine against this Podman (they skip without WEGLARKA_PODMAN_SOCKET).
+      - run: cargo test -p weglarka-engine --test volumes --test image_save --test ingress_identity -- --nocapture
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true

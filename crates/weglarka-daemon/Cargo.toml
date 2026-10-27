@@ -37,7 +37,8 @@ tracing-subscriber.workspace = true
 weglarka-acme.workspace = true
 weglarka-dns.workspace = true
 weglarka-api.workspace = true
-weglarka-core.workspace = true
+weglarka-engine.workspace = true
+weglarka-model.workspace = true
 weglarka-ingress.workspace = true
 weglarka-notify.workspace = true
 weglarka-podman.workspace = true
@@ -52,5 +53,5 @@ insta.workspace = true
 tempfile.workspace = true
 weglarka-acme = { workspace = true, features = ["testing"] }
 weglarka-dns = { workspace = true, features = ["testing"] }
-weglarka-core = { workspace = true, features = ["testing"] }
+weglarka-engine = { workspace = true, features = ["testing"] }
 weglarka-registry = { workspace = true, features = ["testing"] }

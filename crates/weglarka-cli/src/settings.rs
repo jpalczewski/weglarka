@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use weglarka_core::config::HostConfig;
+use weglarka_model::config::HostConfig;
 
 use crate::error::{CliError, Kind};
 

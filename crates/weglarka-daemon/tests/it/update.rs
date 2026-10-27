@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::podman::ContainerState;
-use weglarka_core::testing::{Call, FakePodman};
+use weglarka_engine::testing::{Call, FakePodman};
+use weglarka_model::podman::ContainerState;
 
 fn creates_of(fake: &FakePodman, container: &str) -> usize {
     fake.calls()

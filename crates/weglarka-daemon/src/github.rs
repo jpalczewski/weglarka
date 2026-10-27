@@ -5,8 +5,8 @@
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use weglarka_core::podman::image_repo;
-use weglarka_core::webhook::{
+use weglarka_model::podman::image_repo;
+use weglarka_model::webhook::{
     WebhookError, WebhookEvent, WebhookRequest, WebhookSource, valid_ref,
 };
 

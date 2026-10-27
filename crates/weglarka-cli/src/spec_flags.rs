@@ -3,7 +3,7 @@
 //! dependencies. Before these existed, they could only be set through `--spec <file.toml>`.
 
 use clap::Args;
-use weglarka_core::app::{
+use weglarka_model::app::{
     AppSpec, ConfigMount, CpuLimit, HostMount, HostPort, InstanceName, MemoryLimit,
     SharedNetworkName, SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount,
     normalize_signal, valid_config_source, valid_group_name, valid_host_source, valid_mount_target,
@@ -236,9 +236,9 @@ impl SpecFlags {
             None => {}
         }
         match self.strategy {
-            Some(StrategyFlag::Recreate) => spec.strategy = weglarka_core::app::Strategy::Recreate,
+            Some(StrategyFlag::Recreate) => spec.strategy = weglarka_model::app::Strategy::Recreate,
             Some(StrategyFlag::BlueGreen) => {
-                spec.strategy = weglarka_core::app::Strategy::BlueGreen
+                spec.strategy = weglarka_model::app::Strategy::BlueGreen
             }
             None => {}
         }

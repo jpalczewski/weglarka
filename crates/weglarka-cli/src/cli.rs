@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use weglarka_core::app::BodySizeLimit;
+use weglarka_model::app::BodySizeLimit;
 
 use crate::error::exit;
 

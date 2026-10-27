@@ -14,9 +14,9 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
-use weglarka_core::config::HostConfig;
-use weglarka_core::testing::FakePodman;
 use weglarka_daemon::{Running, Settings, start};
+use weglarka_engine::testing::FakePodman;
+use weglarka_model::config::HostConfig;
 
 /// The image reference most tests deploy; only its name matters to [`FakePodman`].
 pub const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";

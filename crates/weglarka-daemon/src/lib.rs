@@ -1,5 +1,5 @@
 //! The Węglarka daemon — wires everything together: admin API (unix socket), webhook listener (TCP),
-//! the `weglarka-core` reconcile loop, ingress (nginx + Traefik) and the systemd `Platform`.
+//! the `weglarka-engine` reconcile loop, ingress (nginx + Traefik) and the systemd `Platform`.
 //!
 //! The daemon is generic over `PodmanClient` (the trait is not dyn-compatible), so tests
 //! run it on `FakePodman` and the binary on `LibpodClient`.
@@ -39,17 +39,17 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use weglarka_core::webhook::WebhookSource;
+use weglarka_model::webhook::WebhookSource;
 
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use weglarka_core::config_mounts::ConfigError;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
-use weglarka_core::secret_store::SecretStore;
-use weglarka_core::secrets::FileSecretStore;
-use weglarka_core::state;
+use weglarka_engine::config_mounts::ConfigError;
+use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions};
+use weglarka_model::podman::PodmanClient;
+use weglarka_model::secret_store::SecretStore;
+use weglarka_model::secrets::FileSecretStore;
+use weglarka_model::state;
 
 pub use app::Daemon;
 pub use settings::{Paths, Settings, SettingsError};
@@ -61,10 +61,10 @@ pub enum StartError {
     #[error(transparent)]
     State(#[from] state::StateError),
     #[error(transparent)]
-    Secret(#[from] weglarka_core::secret_store::SecretError),
+    Secret(#[from] weglarka_model::secret_store::SecretError),
     /// `host_ports` that cannot work on this host (privileged ports, conflicts, the ingress bind).
     #[error(transparent)]
-    HostPorts(#[from] weglarka_core::host_ports::HostPortError),
+    HostPorts(#[from] weglarka_model::host_ports::HostPortError),
     /// `apps.toml` mounts a shared volume that is not declared in `[shared_volumes.<name>]`
     /// (issue #33).
     #[error("invalid shared volumes in apps.toml: {0}")]
@@ -201,14 +201,14 @@ pub async fn start<P: PodmanClient + 'static>(
     host.validate().map_err(StartError::Ingress)?;
     // Host-wide `host_ports` rules (privileged ports, two apps on one socket, the ingress bind)
     // stop the daemon instead of failing at container start (`docs/decisions/0013-host-ports.md`).
-    weglarka_core::host_ports::validate(&host, &apps)?;
+    weglarka_model::host_ports::validate(&host, &apps)?;
     // Shared-volume mounts must resolve to a declaration (issue #33). `load_apps` already enforces
     // it; kept here next to the host rules so a broken `apps.toml` is rejected at startup loudly.
-    weglarka_core::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
+    weglarka_model::shared_volumes::validate(&apps).map_err(StartError::SharedVolumes)?;
     // Host config mounts (issue #118): only the root's own preconditions stop the daemon — a single
     // missing/escaping source is refused by the engine at launch and reported by `doctor`, so that an
     // app added before its files exist does not keep the daemon from starting.
-    weglarka_core::config_mounts::validate_host(&host, &apps)?;
+    weglarka_engine::config_mounts::validate_host(&host, &apps)?;
 
     // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
     // stops the daemon instead of failing silently at the first deploy.
@@ -220,9 +220,9 @@ pub async fn start<P: PodmanClient + 'static>(
     let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
     // Self-update (issue #99): confirm which image this process really runs and resolve a switch the
     // host-side switcher requested, before anything reconciles against the old world.
-    let events: Arc<dyn weglarka_core::events::EventSink> = match &notifier {
+    let events: Arc<dyn weglarka_model::events::EventSink> = match &notifier {
         Some(notifier) => notifier.sink(),
-        None => Arc::new(weglarka_core::events::TracingSink),
+        None => Arc::new(weglarka_model::events::TracingSink),
     };
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
@@ -249,7 +249,7 @@ pub async fn start<P: PodmanClient + 'static>(
     .with_http_prober(Arc::new(health_probe::NginxProber::default_target()))
     // Crash-loop / unhealthy thresholds (`[monitor]`): the reconcile pass observes them and emits
     // events, so the notifications above deliver them and the log gets them even without a channel.
-    .with_monitor(weglarka_core::crash::Policy::from_config(&host.monitor));
+    .with_monitor(weglarka_engine::crash::Policy::from_config(&host.monitor));
     if let Some(notifier) = &notifier {
         // The engine emits into the durable pipeline instead of only into the log.
         reconciler = reconciler.with_events(notifier.sink());

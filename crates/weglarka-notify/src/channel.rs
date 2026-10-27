@@ -1,7 +1,7 @@
 //! Delivery channels: one trait behind which ntfy (now) and mail (later) live.
 //!
 //! `Channel` must be dyn-compatible (`Arc<dyn Channel>`), so the future is boxed — the same shape as
-//! `weglarka_core::limits::HttpProber`; native `async fn` in traits is not dyn-compatible
+//! `weglarka_model::limits::HttpProber`; native `async fn` in traits is not dyn-compatible
 //! (`docs/decisions/0001-async-traits.md`).
 
 use std::future::Future;

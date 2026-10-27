@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{AppsFile, Digest, InstanceName};
-use weglarka_core::events::{Event, Severity};
+use weglarka_model::app::{AppsFile, Digest, InstanceName};
+use weglarka_model::events::{Event, Severity};
 
 /// A ready-to-send notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

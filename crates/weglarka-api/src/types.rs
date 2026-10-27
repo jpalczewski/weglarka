@@ -1,11 +1,11 @@
 //! Admin API request/response types.
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
-use weglarka_core::environments::{EnvName, SiteName, SiteSpec};
-use weglarka_core::events::Severity;
-use weglarka_core::state::AppState;
-use weglarka_core::uid_range::UidRange;
+use weglarka_model::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
+use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
+use weglarka_model::events::Severity;
+use weglarka_model::state::AppState;
+use weglarka_model::uid_range::UidRange;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

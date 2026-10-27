@@ -10,7 +10,7 @@ Status: **MVP** — the daemon, CLI, Podman client, ingress and packaging are re
 
 ## Workspace
 
-`weglarka-core` (domain, traits, reconcile) · `weglarka-api` (admin API contract) ·
+`weglarka-model` (domain model, state files, traits) · `weglarka-engine` (reconcile, deploy, volumes) · `weglarka-api` (admin API contract) ·
 `weglarka-podman` (libpod v6 client) · `weglarka-ingress` (nginx config, `behind`/`edge`) ·
 `weglarka-notify` (events → severity → dedup → durable outbox → ntfy) ·
 `weglarka-daemon` (daemon) · `weglarka-cli` (the `weglarka` binary).

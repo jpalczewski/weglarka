@@ -1,6 +1,6 @@
 //! Backends and the `location`s rendered for them.
 
-use weglarka_core::app::AppIngress;
+use weglarka_model::app::AppIngress;
 
 use super::NginxOptions;
 use super::common::set_app;

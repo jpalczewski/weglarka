@@ -25,7 +25,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use weglarka_core::app::Digest;
+use weglarka_model::app::Digest;
 
 use crate::cosign::{MAX_PAYLOAD_BYTES, Signature};
 use crate::http::{self, HttpError};

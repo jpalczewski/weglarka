@@ -14,7 +14,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::UnixStream;
-use weglarka_core::podman::{PodmanError, Result, TarStream};
+use weglarka_model::podman::{PodmanError, Result, TarStream};
 
 /// API version in the path — forces v6 semantics regardless of the server's default version.
 pub(crate) const API_PREFIX: &str = "/v6.0.0/libpod";

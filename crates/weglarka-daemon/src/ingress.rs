@@ -21,18 +21,19 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, watch};
-use weglarka_core::app::{AppKind, AppSpec, InstanceName, Security};
-use weglarka_core::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
-use weglarka_core::labels;
-use weglarka_core::podman::{
+use weglarka_engine::reconcile::Reconciler;
+use weglarka_engine::volumes;
+use weglarka_ingress::{Domain, nginx, traefik};
+use weglarka_model::app::{AppKind, AppSpec, InstanceName, Security};
+use weglarka_model::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
+use weglarka_model::fsutil::write_atomic;
+use weglarka_model::labels;
+use weglarka_model::podman::{
     BindMount, ContainerFilter, ContainerSpec, ContainerState, NetworkSpec, PodmanClient,
     PodmanError, PortMapping, RestartPolicy,
 };
-use weglarka_core::reconcile::Reconciler;
-use weglarka_core::state::{self, write_atomic};
-use weglarka_core::uid_range::UidRange;
-use weglarka_core::volumes;
-use weglarka_ingress::{Domain, nginx, traefik};
+use weglarka_model::state;
+use weglarka_model::uid_range::UidRange;
 
 use crate::service::SERVICE_NAME;
 
@@ -77,7 +78,7 @@ pub enum IngressApplyError {
     #[error("podman: {0}")]
     Podman(#[from] PodmanError),
     #[error("uid range for nginx: {0}")]
-    Engine(#[from] weglarka_core::reconcile::EngineError),
+    Engine(#[from] weglarka_engine::reconcile::EngineError),
     #[error("i/o on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -562,7 +563,7 @@ impl<P: PodmanClient> IngressManager<P> {
     /// well-known name is the fallback.
     async fn own_container(
         podman: &P,
-    ) -> Result<weglarka_core::podman::ContainerInfo, IngressApplyError> {
+    ) -> Result<weglarka_model::podman::ContainerInfo, IngressApplyError> {
         let hostname = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
         let hostname = hostname.trim();
         if !hostname.is_empty()
@@ -1147,7 +1148,7 @@ fn forwarder_security() -> Security {
     }
 }
 
-/// Field order is part of the hash format (mirrors `weglarka_core::hash::HashInput`).
+/// Field order is part of the hash format (mirrors `weglarka_model::hash::HashInput`).
 #[derive(Serialize)]
 struct IngressHashInput<'a> {
     format: &'static str,
@@ -1202,7 +1203,7 @@ pub fn write_in_place(path: &Path, bytes: &[u8]) -> Result<bool, IngressApplyErr
 
 /// `[ingress.cdn]` as the generator's trust: the pinned ranges, else the provider's bundled list.
 pub(crate) fn cdn_trust(
-    host: &weglarka_core::config::HostConfig,
+    host: &weglarka_model::config::HostConfig,
     refreshed: Option<&crate::cdn::CdnRanges>,
 ) -> Result<Option<weglarka_ingress::CdnTrust>, weglarka_ingress::IngressError> {
     let Some(cdn) = host.ingress.cdn.as_ref() else {

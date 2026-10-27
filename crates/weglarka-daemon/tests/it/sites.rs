@@ -6,7 +6,7 @@ use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::state;
+use weglarka_model::state;
 
 fn blog() -> Value {
     json!({ "spec": {

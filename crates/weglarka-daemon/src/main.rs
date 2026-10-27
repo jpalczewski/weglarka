@@ -7,8 +7,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
-use weglarka_core::config::PlatformKind;
-use weglarka_core::platform::Platform;
 use weglarka_daemon::platform::{
     SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_SERVICE, WATCHDOG_TIMER,
     render, run_args,
@@ -17,6 +15,8 @@ use weglarka_daemon::service::{
     DEFAULT_IMAGE, SERVICE_NAME, SOCKET_ENV, host_socket, service_spec,
 };
 use weglarka_daemon::{Settings, start};
+use weglarka_engine::platform::Platform;
+use weglarka_model::config::PlatformKind;
 use weglarka_podman::LibpodClient;
 use weglarka_registry::HttpRegistry;
 
@@ -131,13 +131,13 @@ async fn run_self_update(settings: Settings, options: SelfUpdateArgs) -> Result<
         match settings.host.self_update.as_mut() {
             Some(config) => config.image = image.to_owned(),
             None => {
-                settings.host.self_update = Some(weglarka_core::config::SelfUpdateConfig {
+                settings.host.self_update = Some(weglarka_model::config::SelfUpdateConfig {
                     image: image.to_owned(),
                     enabled: true,
-                    interval_secs: weglarka_core::config::SelfUpdateConfig::DEFAULT_INTERVAL_SECS,
+                    interval_secs: weglarka_model::config::SelfUpdateConfig::DEFAULT_INTERVAL_SECS,
                     fallback: true,
                     fallback_timeout_secs:
-                        weglarka_core::self_update::FallbackPolicy::DEFAULT_TIMEOUT_SECS,
+                        weglarka_model::self_update::FallbackPolicy::DEFAULT_TIMEOUT_SECS,
                     public_key_file: None,
                 });
             }

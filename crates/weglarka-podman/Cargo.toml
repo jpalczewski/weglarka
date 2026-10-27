@@ -23,10 +23,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 tracing.workspace = true
-weglarka-core.workspace = true
+weglarka-model.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
-weglarka-core = { workspace = true, features = ["testing"] }

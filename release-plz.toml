@@ -30,7 +30,11 @@ name = "weglarka-api"
 git_tag_name = "{{ package }}-v{{ version }}"
 
 [[package]]
-name = "weglarka-core"
+name = "weglarka-model"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-engine"
 git_tag_name = "{{ package }}-v{{ version }}"
 
 [[package]]

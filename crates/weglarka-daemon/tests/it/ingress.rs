@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::config::HostConfig;
-use weglarka_core::podman::{PodmanClient, PodmanError};
-use weglarka_core::reconcile::{Reconciler, ReconcilerOptions};
-use weglarka_core::secrets::FileSecretStore;
-use weglarka_core::state::{self, StatePaths};
-use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::ingress::{ApplyReport, IngressManager, NginxAction};
+use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions};
+use weglarka_engine::testing::{Call, FakePodman};
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::config::HostConfig;
+use weglarka_model::podman::{PodmanClient, PodmanError};
+use weglarka_model::secrets::FileSecretStore;
+use weglarka_model::state::{self, StatePaths};
 
 fn spec(domain: &str) -> AppSpec {
     toml::from_str(&format!(
@@ -641,7 +641,7 @@ async fn edge_cdn_ranges_refresh_reloads_and_never_recreates() {
     ));
     let manager = IngressManager::new(engine, host, root.join("nginx"));
     let ranges = Arc::new(CdnRanges::load(
-        weglarka_core::config::CdnProvider::Cloudflare,
+        weglarka_model::config::CdnProvider::Cloudflare,
         root.join("cdn-ranges.toml"),
     ));
     manager.set_cdn_ranges(ranges.clone());

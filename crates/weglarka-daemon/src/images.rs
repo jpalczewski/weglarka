@@ -11,8 +11,8 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::routing::post;
 use weglarka_api::{ErrorCode, PruneImagesRequest, PruneImagesResponse, PrunedImage, endpoints};
-use weglarka_core::images::PruneReport;
-use weglarka_core::podman::{ImageInfo, PodmanClient};
+use weglarka_engine::images::PruneReport;
+use weglarka_model::podman::{ImageInfo, PodmanClient};
 
 use crate::admin::{Fail, mutating};
 use crate::app::Daemon;

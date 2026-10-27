@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use futures_core::Stream;
 use futures_util::stream;
 use hyper::Method;
-use weglarka_core::podman::{
+use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
     LoadedImage, LogStream, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError,
     PodmanEvent, PullEvent, RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo,

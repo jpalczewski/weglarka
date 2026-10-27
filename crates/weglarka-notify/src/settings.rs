@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use weglarka_core::config::{NotifyConfig, NtfyConfig};
-use weglarka_core::events::Severity;
+use weglarka_model::config::{NotifyConfig, NtfyConfig};
+use weglarka_model::events::Severity;
 
 use crate::channel::Channel;
 use crate::http::Endpoint;

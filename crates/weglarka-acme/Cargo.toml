@@ -27,7 +27,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 webpki-roots.workspace = true
-weglarka-core.workspace = true
+weglarka-model.workspace = true
 weglarka-dns.workspace = true
 x509-parser.workspace = true
 

@@ -59,3 +59,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0050](0050-site-environments.md) | Sites with environments and promotion |
 | [0051](0051-identity-provider-integration.md) | Identity provider integration |
 | [0052](0052-forward-auth.md) | Forward auth in nginx |
+| [0053](0053-model-engine-split.md) | Splitting `weglarka-core` into `weglarka-model` and `weglarka-engine` |

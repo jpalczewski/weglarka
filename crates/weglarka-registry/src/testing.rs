@@ -12,7 +12,7 @@ use base64::Engine as _;
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::json;
-use weglarka_core::app::Digest;
+use weglarka_model::app::Digest;
 
 use crate::cosign::Signature;
 use crate::image_ref::ImageRef;

@@ -16,11 +16,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use futures_util::future::join_all;
 use weglarka_api::{ErrorCode, ListSharedNetworksResponse, SharedNetworkSummary, endpoints};
-use weglarka_core::app::SharedNetworkName;
-use weglarka_core::labels;
-use weglarka_core::podman::{PodmanClient, PodmanError};
-use weglarka_core::shared_networks;
-use weglarka_core::state;
+use weglarka_model::app::SharedNetworkName;
+use weglarka_model::labels;
+use weglarka_model::podman::{PodmanClient, PodmanError};
+use weglarka_model::shared_networks;
+use weglarka_model::state;
 
 use crate::admin::{Fail, mutating};
 use crate::app::Daemon;

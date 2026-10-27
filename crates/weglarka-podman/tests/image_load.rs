@@ -16,7 +16,7 @@ use std::process::Command;
 
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use weglarka_core::podman::{ImageInfo, LoadedImage, PodmanClient, PodmanError, TarStream};
+use weglarka_model::podman::{ImageInfo, LoadedImage, PodmanClient, PodmanError, TarStream};
 use weglarka_podman::LibpodClient;
 
 const ALPINE: &str = "docker.io/library/alpine:3.20";

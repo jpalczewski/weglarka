@@ -5,8 +5,8 @@
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use weglarka_core::config::ForgejoWebhookConfig;
-use weglarka_core::webhook::{
+use weglarka_model::config::ForgejoWebhookConfig;
+use weglarka_model::webhook::{
     WebhookError, WebhookEvent, WebhookRequest, WebhookSource, valid_ref,
 };
 

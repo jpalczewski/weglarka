@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use weglarka_core::app::InstanceName;
+use weglarka_model::app::InstanceName;
 
 use super::NginxOptions;
 use super::common::*;

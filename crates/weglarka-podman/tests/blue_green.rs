@@ -10,9 +10,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use weglarka_core::app::Resources;
-use weglarka_core::labels;
-use weglarka_core::podman::{ContainerSpec, NetworkSpec, PodmanClient, RestartPolicy};
+use weglarka_model::app::Resources;
+use weglarka_model::labels;
+use weglarka_model::podman::{ContainerSpec, NetworkSpec, PodmanClient, RestartPolicy};
 use weglarka_podman::LibpodClient;
 
 const BUSYBOX: &str = "docker.io/library/busybox:latest";

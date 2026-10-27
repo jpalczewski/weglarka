@@ -11,11 +11,11 @@ use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use weglarka_core::config::HostConfig;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign};
 use weglarka_daemon::{Settings, start};
+use weglarka_engine::testing::{Call, FakePodman};
+use weglarka_model::config::HostConfig;
+use weglarka_model::podman::PodmanClient;
 
 const SECRET: &str = "hunter2-webhook";
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
@@ -609,7 +609,7 @@ async fn refuses_a_state_schema_from_a_newer_daemon() {
     std::fs::create_dir_all(root.join("state")).unwrap();
 
     // `state.toml` written by a newer schema stops the daemon before it binds anything.
-    let newer = weglarka_core::state::SCHEMA_VERSION + 1;
+    let newer = weglarka_model::state::SCHEMA_VERSION + 1;
     std::fs::write(
         root.join("state/state.toml"),
         format!("schema_version = {newer}\n"),

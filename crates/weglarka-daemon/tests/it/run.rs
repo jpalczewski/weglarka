@@ -6,8 +6,8 @@ use crate::common::*;
 use hyper::StatusCode;
 use serde_json::json;
 use weglarka_api::{RunFrame, RunFrameDecoder};
-use weglarka_core::podman::LogSource;
-use weglarka_core::testing::{Call, RunScript};
+use weglarka_engine::testing::{Call, RunScript};
+use weglarka_model::podman::LogSource;
 
 fn frames(body: &[u8]) -> Vec<RunFrame> {
     let mut decoder = RunFrameDecoder::default();
@@ -219,7 +219,7 @@ async fn a_daemon_start_sweeps_run_containers_an_earlier_daemon_left_behind() {
         ("weglarka.run-for".to_owned(), "ntfy".to_owned()),
     ]
     .into();
-    use weglarka_core::podman::PodmanClient as _;
+    use weglarka_model::podman::PodmanClient as _;
     h.fake.container_create(&stale).await.unwrap();
     assert_eq!(run_containers(&h), ["wg-run.ntfy.dead"]);
     // The engine's start-up sweep is what a restarted daemon runs.

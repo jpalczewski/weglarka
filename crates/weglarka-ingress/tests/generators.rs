@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use common::*;
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::config::IngressMode;
 use weglarka_ingress::nginx::{self, NginxOptions};
 use weglarka_ingress::traefik::{self, TraefikOptions};
 use weglarka_ingress::{Cidr, Domain, IngressError, Plan};
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::config::IngressMode;
 
 fn opts() -> NginxOptions {
     NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
@@ -1254,7 +1254,7 @@ fn edge_cdn_opts(pinned: &[&str]) -> NginxOptions {
     let pinned: Vec<String> = pinned.iter().map(|r| (*r).to_owned()).collect();
     o.cdn = Some(
         weglarka_ingress::CdnTrust::from_config(
-            weglarka_core::config::CdnProvider::Cloudflare,
+            weglarka_model::config::CdnProvider::Cloudflare,
             &pinned,
         )
         .unwrap(),

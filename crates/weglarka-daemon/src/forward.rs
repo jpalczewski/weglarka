@@ -12,8 +12,8 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc;
 use weglarka_api::{FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardRequest};
-use weglarka_core::forward::{ForwardOptions, ForwardOutcome};
-use weglarka_core::podman::PodmanClient;
+use weglarka_engine::forward::{ForwardOptions, ForwardOutcome};
+use weglarka_model::podman::PodmanClient;
 
 use crate::admin::{Fail, mutating, parse_json, parse_name};
 use crate::app::Daemon;

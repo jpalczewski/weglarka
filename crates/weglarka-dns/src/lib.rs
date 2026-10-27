@@ -2,10 +2,10 @@
 //!
 //! A [`DnsProvider`] publishes and removes the `_acme-challenge` TXT records that prove control of a
 //! domain; the ACME solver (crate `weglarka-acme`) drives it. [`Cloudflare`] is the first adapter. The
-//! API token is a secret: it only ever lives in a [`weglarka_core::secret_store::SecretValue`] and
+//! API token is a secret: it only ever lives in a [`weglarka_model::secret_store::SecretValue`] and
 //! never reaches `Debug`, logs or error messages.
 //!
-//! The crate depends on `weglarka-core` only, so adapters can be developed and tested without the
+//! The crate depends on `weglarka-model` only, so adapters can be developed and tested without the
 //! ACME machinery (`docs/decisions/0039-acme-dns01.md`).
 
 mod cloudflare;

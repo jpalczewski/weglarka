@@ -19,13 +19,13 @@ use weglarka_acme::{
     AcmeClient, AcmeError, CertId, CertInspector, CertSpec, DnsSolver, Http01Solver, InstantAcme,
     InstantAcmeSettings, Manager, Outcome, PassReport,
 };
-use weglarka_core::config::{
+use weglarka_dns::{Cloudflare, DnsError, DnsProvider, RecordHandle};
+use weglarka_model::config::{
     AcmeConfig, AcmeDnsConfig, DnsProviderKind, WILDCARD_CERT_PREFIX, wildcard_covers,
 };
-use weglarka_core::events::{Event, EventSink};
-use weglarka_core::secret_store::SecretValue;
-use weglarka_core::state;
-use weglarka_dns::{Cloudflare, DnsError, DnsProvider, RecordHandle};
+use weglarka_model::events::{Event, EventSink};
+use weglarka_model::secret_store::SecretValue;
+use weglarka_model::state;
 
 use crate::StartError;
 use crate::settings::Paths;
@@ -370,7 +370,7 @@ pub fn valid_covering_wildcard(
 /// `*` never reaches a file name, ADR 0038).
 fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
     CertSpec::new(
-        CertId::new(weglarka_core::config::wildcard_cert_stem(apex))?,
+        CertId::new(weglarka_model::config::wildcard_cert_stem(apex))?,
         vec![format!("*.{apex}"), apex.to_owned()],
     )
 }
@@ -416,7 +416,7 @@ fn days_left(now: SystemTime, not_after: SystemTime) -> u64 {
 /// The worker for the configured `[acme]` section, or `None` when it is absent or paused. An
 /// unusable `[acme.dns]` (unreadable or world-readable token file) is a startup error: wildcard
 /// certificates are opt-in, but once configured a silent skip would hide a broken deployment.
-pub fn build<P: weglarka_core::podman::PodmanClient + 'static>(
+pub fn build<P: weglarka_model::podman::PodmanClient + 'static>(
     config: Option<&AcmeConfig>,
     paths: &Paths,
     webhook_domain: &str,
@@ -465,8 +465,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use weglarka_acme::testing::FakeAcme;
-    use weglarka_core::events::VecSink;
     use weglarka_dns::testing::FakeDns;
+    use weglarka_model::events::VecSink;
 
     use super::*;
 
@@ -622,7 +622,7 @@ mod tests {
         ));
         assert_eq!(
             events[0].severity(),
-            weglarka_core::events::Severity::Critical
+            weglarka_model::events::Severity::Critical
         );
         assert_eq!(rig.applies.load(Ordering::SeqCst), 0);
         let status = rig.worker.status().snapshot();

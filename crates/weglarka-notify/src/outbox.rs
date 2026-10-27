@@ -1,6 +1,6 @@
 //! Durable queue of notifications that have not been delivered yet.
 //!
-//! The file is written with an atomic replace (`weglarka_core::state::write_atomic`, mode 0600) after
+//! The file is written with an atomic replace (`weglarka_model::fsutil::write_atomic`, mode 0600) after
 //! every mutation, so a notification that was accepted stays pending across a daemon restart — this is
 //! what makes "ntfy is being redeployed by Węglarka itself" harmless.
 //!
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use weglarka_core::events::Severity;
+use weglarka_model::events::Severity;
 
 use crate::message::Message;
 
@@ -104,7 +104,7 @@ impl Pending {
 
     /// RFC 3339 of the enqueue time (for `notify status`).
     pub fn created_at(&self) -> String {
-        weglarka_core::secrets::rfc3339_utc(time(self.created))
+        weglarka_model::secrets::rfc3339_utc(time(self.created))
     }
 }
 
@@ -329,7 +329,7 @@ impl Outbox {
             pending: self.pending.clone(),
         };
         let bytes = toml::to_string_pretty(&file)?;
-        weglarka_core::state::write_atomic(&self.path, bytes.as_bytes(), FILE_MODE).map_err(
+        weglarka_model::fsutil::write_atomic(&self.path, bytes.as_bytes(), FILE_MODE).map_err(
             |source| OutboxError::Write {
                 path: self.path.clone(),
                 source,

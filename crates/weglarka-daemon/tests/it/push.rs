@@ -5,7 +5,7 @@ use crate::common::*;
 use hyper::StatusCode;
 use hyper::body::Bytes;
 use serde_json::{Value, json};
-use weglarka_core::testing::Call;
+use weglarka_engine::testing::Call;
 
 const REPO: &str = "ghcr.io/jpalczewski/ntfy.zig";
 

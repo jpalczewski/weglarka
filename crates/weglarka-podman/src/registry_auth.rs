@@ -3,7 +3,7 @@
 
 use hyper::header::{HeaderName, HeaderValue};
 use serde::Serialize;
-use weglarka_core::podman::{PodmanError, RegistryAuth, Result};
+use weglarka_model::podman::{PodmanError, RegistryAuth, Result};
 
 const HEADER: &str = "x-registry-auth";
 

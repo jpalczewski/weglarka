@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 use hyper::StatusCode;
 use hyper::body::Bytes;
 use serde_json::{Value, json};
-use weglarka_core::app::{AppsFile, InstanceName, SharedVolumeName};
-use weglarka_core::labels;
-use weglarka_core::podman::{ContainerState, PodmanClient, VolumeSpec};
-use weglarka_core::state::{self, StateFile};
-use weglarka_core::testing::Call;
+use weglarka_engine::testing::Call;
+use weglarka_model::app::{AppsFile, InstanceName, SharedVolumeName};
+use weglarka_model::labels;
+use weglarka_model::podman::{ContainerState, PodmanClient, VolumeSpec};
+use weglarka_model::state::{self, StateFile};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 /// Declared name of the group used by the tests.

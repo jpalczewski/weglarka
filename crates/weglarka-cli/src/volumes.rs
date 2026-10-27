@@ -13,7 +13,7 @@ use hyper::body::Bytes;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use weglarka_api::{ListSharedVolumesResponse, ListVolumesResponse, endpoints};
-use weglarka_core::app::{InstanceName, SharedVolumeName, valid_volume_name};
+use weglarka_model::app::{InstanceName, SharedVolumeName, valid_volume_name};
 
 use crate::commands::{DryRun, client, instance};
 use crate::error::{CliError, Kind, exit};
@@ -620,7 +620,7 @@ mod tests {
     // ---------- shared volumes (issue #33) ----------
 
     use weglarka_api::{ApiError, ErrorCode, SharedVolumeSummary, VolumeSummary};
-    use weglarka_core::uid_range::UidRange;
+    use weglarka_model::uid_range::UidRange;
 
     fn leaked(s: String) -> &'static [u8] {
         Box::leak(s.into_bytes().into_boxed_slice())
