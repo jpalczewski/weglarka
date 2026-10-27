@@ -854,9 +854,10 @@ fn edge_serves_tls_only_for_domains_with_a_certificate() {
             );
         }
     }
-    assert!(
-        proxying >= 2,
-        "every routed app domain has a proxying server"
+    // blog.example.eu, www.blog.example.eu, example.eu (all `blog`) and nz.example.eu (`ntfy`).
+    assert_eq!(
+        proxying, 4,
+        "every routed app domain has one proxying server"
     );
 }
 

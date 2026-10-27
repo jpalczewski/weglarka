@@ -150,7 +150,11 @@ impl NginxOptions {
             .probe_socket
             .rsplit_once('/')
             .map_or("", |(dir, _)| dir);
-        if self.proxy_socket_dir.as_deref() == Some(probe_dir) {
+        let in_forwarder_dir = self
+            .proxy_socket_dir
+            .as_deref()
+            .is_some_and(|dir| probe_dir == dir || probe_dir.starts_with(&format!("{dir}/")));
+        if in_forwarder_dir {
             return Err(bad(
                 "probe_socket",
                 "must not live in proxy_socket_dir (the forwarder mounts that directory)",
