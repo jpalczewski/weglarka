@@ -111,6 +111,47 @@ jobs:
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
 
+  # The Authelia files weglarka-identity renders (#42 P3) must pass the provider's own validator: a renamed or
+  # misspelled field shows up here, not in production. The image tag is pinned exactly (with its digest), so a
+  # new Authelia release changes nothing until someone bumps it on purpose. The fixtures come from the same
+  # sample inputs as the snapshot tests; go-yaml has to accept the JSON-as-YAML output.
+  identity-config:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      AUTHELIA_IMAGE: docker.io/authelia/authelia:4.39.22@sha256:936134132eaf01bfa2faf85055afbc1e0cc1cc5ca4547e9c06408fd0dd784646
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-debug-toolchain
+        with:
+          shared-key: check
+          save-if: false
+      - name: Render fixtures and validate them
+        run: |
+          set -euo pipefail
+          conf="$RUNNER_TEMP/authelia"
+          mkdir -p "$conf"
+          cargo run -q -p weglarka-identity --example render -- "$conf"
+          cp .github/authelia/base.yml "$conf/base.yml"
+          echo 'users: {}' > "$conf/users.yml"
+          # The issuer's signing key is generated here; it never leaves the runner.
+          openssl genrsa -out "$conf/jwks.pem" 2048
+          { printf 'identity_providers:\n  oidc:\n    jwks:\n      - key: |\n'; sed 's/^/          /' "$conf/jwks.pem"; } > "$conf/jwks.yml"
+          rm "$conf/jwks.pem"
+          chmod -R a+rX "$conf"
+          validate() {
+            docker run --rm -v "$conf:/config:ro" "$AUTHELIA_IMAGE" \
+              authelia config validate --config /config/base.yml,/config/jwks.yml,"$1"
+          }
+          validate /config/oidc-clients.yml,/config/access-control.yml
+          # Negative control: a misspelled field must fail, or the validator would prove nothing.
+          sed 's/"claims_policy"/"claims_polcy"/' "$conf/oidc-clients.yml" > "$conf/broken.yml"
+          if validate /config/broken.yml,/config/access-control.yml; then
+            echo "::error::authelia accepted an unknown field; the validation step is not checking anything"
+            exit 1
+          fi
+
   # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-model +
   # weglarka-ingress) and Docker. The debug cache is `check`'s, restored read-only; the example is built once up
   # front so the steps below (which call `cargo run`) only reuse it.

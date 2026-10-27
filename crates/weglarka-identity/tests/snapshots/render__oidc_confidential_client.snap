@@ -1,0 +1,31 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: "clients_only(&[\"panel\"])"
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "claims_policies": {},
+      "clients": [
+        {
+          "client_id": "panel",
+          "client_name": "panel",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://admin.example.com/auth/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        }
+      ]
+    }
+  }
+}

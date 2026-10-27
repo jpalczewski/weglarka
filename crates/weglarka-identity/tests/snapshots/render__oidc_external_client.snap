@@ -1,0 +1,39 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: "clients_only(&[\"forge\"])"
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "claims_policies": {
+        "weglarka-forge": {
+          "id_token": [
+            "groups"
+          ]
+        }
+      },
+      "clients": [
+        {
+          "client_id": "forge",
+          "client_name": "Forge",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://git.example.com/user/oauth2/authelia/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email",
+            "groups"
+          ],
+          "authorization_policy": "one_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "claims_policy": "weglarka-forge",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        }
+      ]
+    }
+  }
+}

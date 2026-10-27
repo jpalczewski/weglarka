@@ -2114,6 +2114,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weglarka-identity"
+version = "0.0.0"
+dependencies = [
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+ "weglarka-model",
+]
+
+[[package]]
 name = "weglarka-ingress"
 version = "0.0.3"
 dependencies = [

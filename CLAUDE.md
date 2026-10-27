@@ -116,7 +116,7 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → model`; `podman → model`; `ingress → model`; `notify → model, http`; `registry → model, http`; `dns → model, http`; `acme → model`; `http → (nic z Węglarki)`; `engine → model`; `acme → dns`;
+Zależności: `api → model`; `podman → model`; `ingress → model`; `notify → model, http`; `registry → model, http`; `dns → model, http`; `acme → model`; `identity → model`; `http → (nic z Węglarki)`; `engine → model`; `acme → dns`;
 `cli → api, model, engine`; `daemon → wszystko`. Liście (api, ingress, notify, acme, podman, dns, registry) zależą **tylko od modelu** — nie dodawaj im zależności od `engine`.
 
 | Crate | Zawartość |
@@ -130,6 +130,7 @@ Zależności: `api → model`; `podman → model`; `ingress → model`; `notify 
 | `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); klient HTTP z `weglarka-http` (`Purpose::Registry`: ≤5 przekierowań, tylko https/loopback, bez tokena na obcy host), `FakeRegistry`/`TestSigner` (feature `testing`) |
 | `weglarka-acme` | silnik ACME dla trybu `edge` (#96, ADR 0038): `CertSpec`/`CertId` (certyfikat = lista nazw, plik z id), trait `ChallengeSolver` (`Http01Solver`, `DnsSolver` nad `weglarka-dns` = #97), `AcmeClient`/`CertInspector`, `CertStore` (klucz 0600 przed certem 0644, atomowo), czyste `renewal::decide`, `Manager::pass`; `InstantAcme` (klient na `instant-acme`, `ring`, `webpki-roots`), `FakeAcme` (feature `testing`); test na staging Let's Encrypt jest opt-in (`WEGLARKA_ACME_STAGING_DOMAIN`/`_WEBROOT`); worker w demonie (`daemon/src/acme.rs`, `[acme]`, zdarzenia, `doctor acme.*`) |
 | `weglarka-dns` | adaptery DNS dla ACME DNS-01: trait `DnsProvider` (`set_txt`/`remove_txt`, handle usuwa dokładnie swój rekord), adapter Cloudflare (API v4, klient HTTP z `weglarka-http` (`Purpose::Api`, bez przekierowań), token jako `SecretValue`), `FakeDns` (feature `testing`); ADR 0039 |
+| `weglarka-identity` | czyste renderery configu providera tożsamości (Authelia, #42 P3): `render_oidc_clients` → `oidc-clients.yml` (klienci OIDC apek i zewnętrzni + `claims_policies`, sekret tylko jako digest, #91) i `render_access_control` → `access-control.yml` (zawsze `default_policy: deny` + stała reguła `bypass` dla hosta issuera, #90); JSON w pliku `.yml`, wyjście deterministyczne, snapshoty; bez I/O i bez wiringu (trait `ConfigGenerator` = P2/P4); job CI `identity-config` waliduje fixtury `authelia config validate` na przypiętym obrazie |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
 | `weglarka-daemon` | demon: admin API (unix socket, w tym `GET /v1/health`), webhooki, zapis ingressu, `Platform` systemd (quadlet + timery samoaktualizacji i watchdoga), worker powiadomień, host-side `self-update` i `supervise` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |

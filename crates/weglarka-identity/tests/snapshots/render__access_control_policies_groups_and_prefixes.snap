@@ -1,0 +1,48 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: "render_access_control(ISSUER, &forward).unwrap()"
+---
+{
+  "access_control": {
+    "default_policy": "deny",
+    "rules": [
+      {
+        "domain": [
+          "auth.example.com"
+        ],
+        "policy": "bypass"
+      },
+      {
+        "domain": [
+          "tools.example.com"
+        ],
+        "policy": "two_factor",
+        "resources": [
+          "^/docs([/?].*)?$",
+          "^/v1\\.2/ref([/?].*)?$"
+        ]
+      },
+      {
+        "domain": [
+          "tools.example.com"
+        ],
+        "policy": "two_factor"
+      },
+      {
+        "domain": [
+          "admin.example.com",
+          "panel.example.com"
+        ],
+        "policy": "one_factor",
+        "subject": [
+          [
+            "group:weglarka-admins"
+          ],
+          [
+            "group:ops.team"
+          ]
+        ]
+      }
+    ]
+  }
+}

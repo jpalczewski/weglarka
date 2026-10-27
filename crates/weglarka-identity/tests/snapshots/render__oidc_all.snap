@@ -1,0 +1,126 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: text
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "claims_policies": {
+        "weglarka-api": {
+          "id_token": [
+            "groups"
+          ],
+          "access_token": [
+            "groups"
+          ]
+        },
+        "weglarka-forge": {
+          "id_token": [
+            "groups"
+          ]
+        }
+      },
+      "clients": [
+        {
+          "client_id": "api",
+          "client_name": "api",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://api.example.com/auth/callback",
+            "https://api.example.com/auth/silent"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email",
+            "groups",
+            "offline_access"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "audience": [
+            "https://api.example.com/v1/"
+          ],
+          "claims_policy": "weglarka-api",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256",
+          "access_token_signed_response_alg": "RS256"
+        },
+        {
+          "client_id": "forge",
+          "client_name": "Forge",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://git.example.com/user/oauth2/authelia/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email",
+            "groups"
+          ],
+          "authorization_policy": "one_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "claims_policy": "weglarka-forge",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        },
+        {
+          "client_id": "legacy",
+          "client_name": "legacy",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://legacy.example.com/cb"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "one_factor",
+          "token_endpoint_auth_method": "client_secret_post",
+          "require_pkce": false,
+          "pkce_challenge_method": "S256"
+        },
+        {
+          "client_id": "panel",
+          "client_name": "panel",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://admin.example.com/auth/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        },
+        {
+          "client_id": "spa",
+          "client_name": "spa",
+          "public": true,
+          "redirect_uris": [
+            "https://spa.example.com/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "none",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        }
+      ]
+    }
+  }
+}
