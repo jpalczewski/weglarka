@@ -34,6 +34,7 @@ pub enum HttpError {
 /// What a client is for. Each purpose fixes its timeouts and redirect policy; a new consumer adds
 /// a variant here rather than tuning a builder at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Purpose {
     /// Notification delivery (ntfy): a short exchange that may carry a bearer token, so redirects are
     /// never followed. Connections are not pooled (one request per connection, as before).

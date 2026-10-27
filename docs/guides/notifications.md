@@ -39,6 +39,10 @@ weglarka notify status    # channels, queue, dropped counter, last error and las
 
 **4. Repeats (flapping).** The first event of a given kind for a given app is sent immediately; later ones within `dedup_window_secs` are counted, and when the window closes a single summary arrives (for example `3 more: deploy failed: ntfy`). A success does not reset the failure window, so an app that alternates between starting and crashing still produces one report per window.
 
+## Upgrading from 0.0.3
+
+A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup (the daemon stops with `notifications: …`). Earlier releases accepted it and verified the certificate against `host`. Fix: put the real name in `url` (`url = "https://ntfy.example.com"`, no `host`), or use the plain-HTTP internal route (`url = "http://weglarka-nginx:8080"` with `host`). Rolling back to 0.0.3 needs no change.
+
 ## Rollback
 
 `weglarka.toml` has `deny_unknown_fields`, so **an older daemon will not start** with a `[notify]` section. Before a downgrade, remove the section from the configuration (or keep it in a backup) and restart the service. Notifications are not part of app state, so there is nothing else to clean up.

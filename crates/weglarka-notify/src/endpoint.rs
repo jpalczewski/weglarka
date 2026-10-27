@@ -60,8 +60,9 @@ fn valid_host(host: &str) -> Result<(), EndpointError> {
 }
 
 impl Endpoint {
-    /// Parses `url` (`scheme://host[:port][/base]`); `host_override` replaces the `Host` header and
-    /// the TLS server name, for an endpoint reached by service name (e.g. through the ingress).
+    /// Parses `url` (`scheme://host[:port][/base]`); `host_override` replaces the `Host` header
+    /// for an endpoint reached by service name (e.g. through the ingress). It is only allowed with
+    /// `http://`: over TLS the certificate is verified against the host in the URL.
     pub fn parse(url: &str, host_override: Option<&str>) -> Result<Self, EndpointError> {
         let url = url.trim();
         let (scheme, rest) = url.split_once("://").ok_or(EndpointError::Scheme)?;
@@ -104,11 +105,11 @@ impl Endpoint {
             }
             None => host,
         };
-        // The ntfy JSON publish endpoint is the server root; normalize to `/base/` with exactly one
-        // leading and trailing slash (`//x` must not reach the server as a network-path reference).
         if tls && host_override.is_some() {
             return Err(EndpointError::HostOverrideTls);
         }
+        // The ntfy JSON publish endpoint is the server root; normalize to `/base/` with exactly one
+        // leading and trailing slash (`//x` must not reach the server as a network-path reference).
         let path = match path.trim_matches('/') {
             "" => "/".to_owned(),
             base => format!("/{base}/"),

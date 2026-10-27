@@ -16,10 +16,10 @@ for banned in aws-lc-rs aws-lc-sys openssl-sys native-tls; do
   fi
 done
 
-# `cargo tree -i` exits non-zero when the package is not in the graph, which is what we want.
-if cli=$(cargo tree -p weglarka-cli -e normal -i reqwest 2>/dev/null); then
+cli_tree=$(cargo tree -p weglarka-cli -e normal --prefix none)
+if grep -q '^reqwest v' <<<"$cli_tree"; then
   echo "error: 'reqwest' is in the weglarka-cli dependency graph:" >&2
-  echo "$cli" >&2
+  cargo tree -p weglarka-cli -e normal -i reqwest >&2 || true
   status=1
 fi
 

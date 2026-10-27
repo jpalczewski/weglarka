@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use weglarka_http::reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
+use weglarka_http::reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 use weglarka_http::{HttpError, Purpose};
 
 use crate::channel::{Channel, ChannelError, SendFuture};
@@ -90,7 +90,7 @@ impl NtfyChannel {
             .post(self.endpoint.url())
             .header(HOST, self.endpoint.host.as_str())
             .header(CONTENT_TYPE, "application/json")
-            .header("Accept", "application/json")
+            .header(ACCEPT, "application/json")
             .body(body);
         if let Some(token) = &self.token {
             let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
@@ -312,12 +312,19 @@ mod tests {
             let (_stream, _) = listener.accept().await.unwrap();
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        let client = weglarka_http::client(Purpose::Notify).unwrap();
-        let channel = channel(&addr, None);
-        // The client's own total timeout is SEND_TIMEOUT; the worker's outer timeout bounds the test.
+        // A short total timeout keeps the suite fast; the test proves the client gives up by itself.
+        let client = weglarka_http::builder_with_roots(
+            Purpose::Notify,
+            tokio_rustls::rustls::RootCertStore::empty(),
+        )
+        .unwrap()
+        .timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
+        let endpoint = channel(&addr, None).endpoint;
         let outcome = tokio::time::timeout(
-            SEND_TIMEOUT + Duration::from_secs(2),
-            NtfyChannel::with_client(client, channel.endpoint.clone(), "wg", None).send(&message()),
+            Duration::from_secs(5),
+            NtfyChannel::with_client(client, endpoint, "wg", None).send(&message()),
         )
         .await
         .expect("the client must give up on its own");
