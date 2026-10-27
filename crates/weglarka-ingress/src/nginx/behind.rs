@@ -74,6 +74,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.blank();
             c.block("server", |c| {
                 listen(c, o.listen_port, false);
+                listen_probe(c, o, false);
                 c.line(&format!("server_name {};", join_domains(domains)));
                 // One app: known up front, so the redirect is attributed too. Several: each
                 // `location` sets its own and the redirect logs `-`.

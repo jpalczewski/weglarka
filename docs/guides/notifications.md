@@ -24,7 +24,7 @@ token_file = "/var/lib/weglarka/ntfy-token"   # optional; without it the topic i
 min_severity = "info"            # debug | info | warning | critical
 ```
 
-- **Address:** if the Węglarka container cannot reach the host's public domain (hairpin NAT / DNS inside the container), use the internal route through the ingress: `url = "http://weglarka-nginx:8080"` together with `host = "ntfy.example.com"` (the `Host` header and the SNI name; nginx routes by `Host`, just like `health.http`). The internal route is plain HTTP on the Podman network, so the token never leaves the host.
+- **Address:** if the Węglarka container cannot reach the host's public domain (hairpin NAT / DNS inside the container), use the internal route through the ingress: `url = "http://weglarka-nginx:8080"` together with `host = "ntfy.example.com"` (the `Host` header and the SNI name; nginx routes by `Host`). The internal route is plain HTTP on the Podman network, so the token never leaves the host. **This route works in `behind` only.** In `edge` that port answers every routed domain with a `301` to HTTPS, which the notifier does not follow, so use the public `https://` URL there; `health.http` no longer depends on this port (it uses the [probe socket](edge-mode.md)), but notifications do not use the socket yet.
 - **Validation at startup:** a bad URL, a bad topic, or an unreadable or too-permissive token file **stops the daemon** (`notifications: …` in the log). Once enabled, notifications must not silently stop working.
 - **Test:** after a restart (`systemctl --user restart weglarka`):
 

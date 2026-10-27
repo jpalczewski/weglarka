@@ -113,7 +113,7 @@ docker run -d --name wg-stream-sse --network "$net" --network-alias sse --networ
   -v "$work:/srv:ro" docker.io/library/python:3-alpine \
   python3 -u /srv/upstream.py >/dev/null
 docker run -d --name wg-stream-nginx --network "$net" -p 127.0.0.1:18098:8080 \
-  -v "$conf:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
+  -v /run/weglarka-probe -v "$conf:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
 
 # Readiness through nginx, so the upstream DNS aliases are already resolving when the assertions run.
 ready=0

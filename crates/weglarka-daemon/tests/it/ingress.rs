@@ -18,6 +18,36 @@ fn spec(domain: &str) -> AppSpec {
     .unwrap()
 }
 
+/// The probe socket skips TLS and authentication (docs/decisions/0054): its directory is mounted into
+/// nginx, writable, and into nothing else — above all not into the internet-facing forwarder.
+fn assert_probe_mount_only_in_nginx(f: &FakePodman) {
+    let nginx = f.container_spec("weglarka-nginx").expect("nginx container");
+    let probe: Vec<_> = nginx
+        .mounts
+        .iter()
+        .filter(|m| m.target == "/run/weglarka-probe")
+        .collect();
+    assert_eq!(probe.len(), 1, "{:?}", nginx.mounts);
+    assert!(!probe[0].read_only && probe[0].source.ends_with("/probe"));
+    assert!(
+        !nginx
+            .mounts
+            .iter()
+            .any(|m| m.source.ends_with("/run") && m.target.contains("probe")),
+        "the probe socket does not live in the forwarder's directory"
+    );
+    if let Some(forwarder) = f.container_spec("weglarka-forwarder") {
+        assert!(
+            forwarder
+                .mounts
+                .iter()
+                .all(|m| !m.source.ends_with("/probe")),
+            "{:?}",
+            forwarder.mounts
+        );
+    }
+}
+
 #[tokio::test]
 async fn nginx_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
@@ -71,6 +101,7 @@ async fn nginx_lifecycle() {
         );
         assert!(spec.security.no_new_privileges);
         assert!(spec.security.tmpfs.is_empty(), "libpod's /tmp suffices");
+        assert_probe_mount_only_in_nginx(f);
     };
 
     // Empty app set: nginx is created anyway (webhooks).
@@ -401,6 +432,13 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     let spec = id(&fake);
     // The forwarder owns the public sockets (issue #162); nginx publishes nothing.
     assert!(spec.publish.is_empty(), "{:?}", spec.publish);
+    assert_probe_mount_only_in_nginx(&fake);
+    let probe_dir = manager.conf_path().parent().unwrap().join("probe");
+    assert_eq!(
+        std::fs::metadata(&probe_dir).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the probe directory is the whole access control of the probe socket"
+    );
     let publishes: Vec<(u16, u16)> = fake
         .container_spec("weglarka-forwarder")
         .unwrap()

@@ -793,6 +793,20 @@ fn edge_plain_http_serves_acme_and_redirects_everything_else() {
     assert!(tls.contains("proxy_pass $upstream;"), "{tls}");
 }
 
+/// The server for `domain` that listens on the probe socket.
+fn probe_server(conf: &str, domain: &str) -> String {
+    let block = conf
+        .split("    server {\n")
+        .skip(1)
+        .find(|b| {
+            b.contains("listen unix:/run/weglarka-probe/probe.sock")
+                && b.lines()
+                    .any(|l| l.trim_start().starts_with("server_name ") && l.contains(domain))
+        })
+        .unwrap_or_else(|| panic!("no probe-socket server for {domain} in\n{conf}"));
+    block.split("\n    }").next().unwrap_or(block).to_owned()
+}
+
 #[test]
 fn edge_serves_tls_only_for_domains_with_a_certificate() {
     let conf = nginx::generate(
@@ -821,16 +835,76 @@ fn edge_serves_tls_only_for_domains_with_a_certificate() {
             "{domain}: plain HTTP must still redirect"
         );
     }
-    // Nothing silently proxies over plain HTTP.
+    // Nothing silently proxies over plain HTTP: a server that proxies listens on TCP or the forwarder's
+    // sockets only with TLS; its one plain listener is the daemon's probe socket.
+    let mut proxying = 0;
     for block in conf.split("    server {\n").skip(1) {
         let block = block.split("\n    }").next().unwrap_or(block);
-        if !block.contains(" ssl;") && !block.contains("ssl_reject_handshake") {
+        if !block.contains("proxy_pass") {
+            continue;
+        }
+        proxying += 1;
+        for listen in block
+            .lines()
+            .filter(|l| l.trim_start().starts_with("listen "))
+        {
             assert!(
-                !block.contains("proxy_pass"),
-                "plain-HTTP server proxies: {block}"
+                listen.contains(" ssl") || listen.contains("unix:/run/weglarka-probe/probe.sock;"),
+                "plain-HTTP listener on a proxying server: {listen}\n{block}"
             );
         }
     }
+    // blog.example.eu, www.blog.example.eu, example.eu (all `blog`) and nz.example.eu (`ntfy`).
+    assert_eq!(
+        proxying, 4,
+        "every routed app domain has one proxying server"
+    );
+}
+
+#[test]
+fn edge_probe_socket_serves_domains_without_a_certificate() {
+    let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();
+    let block = probe_server(&conf, "nz.example.eu");
+    assert!(block.contains("proxy_pass"), "{block}");
+    assert!(
+        !block.contains("ssl"),
+        "no certificate, no TLS listener: {block}"
+    );
+    // The redirect server stays: the probe's listener is the only plain path to the app.
+    assert!(server_block(&conf, "nz.example.eu").contains("return 301"));
+}
+
+#[test]
+fn probe_socket_is_a_plain_listener_without_proxy_protocol_on_every_app_server() {
+    let mut behind = NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+        .with_trusted_proxies(&["10.89.0.2".to_owned()])
+        .unwrap();
+    behind.probe_socket = "/run/probe/p.sock".to_owned();
+    let conf = nginx::generate(&host(), &apps(MANY_APPS), &behind).unwrap();
+    assert!(conf.contains("listen unix:/run/probe/p.sock default_server;"));
+    // Every server on the app port but the webhook one also listens on the socket.
+    for block in conf.split("    server {\n").skip(1) {
+        let block = block.split("\n    }").next().unwrap_or(block);
+        if block.contains("listen 8080") && !block.contains("weglarka.example.eu") {
+            assert!(block.contains("listen unix:/run/probe/p.sock"), "{block}");
+        }
+    }
+    assert!(!conf.contains("p.sock proxy_protocol"));
+    assert!(!conf.contains("p.sock ssl"));
+    assert!(
+        !server_block(&conf, "weglarka.example.eu").contains("p.sock"),
+        "the webhook server is not probed"
+    );
+}
+
+#[test]
+fn the_probe_socket_must_stay_out_of_the_forwarder_directory() {
+    let mut o = edge_opts(&[]);
+    o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
+    o.probe_socket = "/run/weglarka-ingress/probe.sock".to_owned();
+    assert!(nginx::generate(&edge_host(), &BTreeMap::new(), &o).is_err());
+    o.probe_socket = "relative.sock".to_owned();
+    assert!(nginx::generate(&edge_host(), &BTreeMap::new(), &o).is_err());
 }
 
 #[test]
@@ -1333,7 +1407,10 @@ fn edge_logs_the_proxy_protocol_address_for_requests_rejected_before_realip() {
     let mut o = edge_opts(&["app.example.eu", "weglarka.example.eu"]);
     o.proxy_socket_dir = Some("/run/weglarka-ingress".to_owned());
     let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &o).unwrap();
-    assert!(conf.contains("\"unix:\" $proxy_protocol_addr;"));
+    assert!(conf.contains("map \"$remote_addr|$proxy_protocol_addr\" $weglarka_peer {"));
+    // The probe socket has no PROXY header: its peer is the literal `unix:`, never empty.
+    assert!(conf.contains("\"unix:|\" \"unix:\";"));
+    assert!(conf.contains("\"~^unix:\\|(?<announced>.+)$\" $announced;"));
     assert!(conf.contains("\"remote_addr\":\"$weglarka_peer\""));
     // Without the forwarder socket there is nothing to fall back to.
     let conf = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();

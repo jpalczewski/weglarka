@@ -246,7 +246,9 @@ pub async fn start<P: PodmanClient + 'static>(
         paths.state.clone(),
         options,
     )
-    .with_http_prober(Arc::new(health_probe::NginxProber::default_target()))
+    .with_http_prober(Arc::new(health_probe::NginxProber::new(
+        ingress::probe_socket_path(&paths.nginx_conf_dir),
+    )))
     // Crash-loop / unhealthy thresholds (`[monitor]`): the reconcile pass observes them and emits
     // events, so the notifications above deliver them and the log gets them even without a channel.
     .with_monitor(weglarka_engine::crash::Policy::from_config(&host.monitor));

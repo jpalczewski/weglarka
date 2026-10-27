@@ -34,8 +34,9 @@ http {
         '' close;
     }
 
-    map $remote_addr $weglarka_peer {
-        "unix:" $proxy_protocol_addr;
+    map "$remote_addr|$proxy_protocol_addr" $weglarka_peer {
+        "unix:|" "unix:";
+        "~^unix:\|(?<announced>.+)$" $announced;
         default $remote_addr;
     }
     # App name for the access log; `-` unless a `server`/`location` sets it.
@@ -63,6 +64,7 @@ http {
     server {
         listen 8080 default_server;
         listen unix:/run/weglarka-ingress/http.sock default_server proxy_protocol;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;

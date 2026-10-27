@@ -146,11 +146,17 @@ impl ClientAddr {
 /// The connection's peer address in `edge` behind the forwarder. `$remote_addr` is replaced from the
 /// PROXY header only when the request is processed (`realip` runs after the headers are parsed), so a
 /// request nginx rejects earlier still has `unix:`; the PROXY header itself is available from the start.
+/// A connection on the probe socket has no PROXY header: its peer stays the literal `unix:` instead of
+/// the empty `$proxy_protocol_addr`.
 pub(super) fn write_peer_address(c: &mut Conf) {
-    c.block("map $remote_addr $weglarka_peer", |c| {
-        c.line("\"unix:\" $proxy_protocol_addr;");
-        c.line("default $remote_addr;");
-    });
+    c.block(
+        "map \"$remote_addr|$proxy_protocol_addr\" $weglarka_peer",
+        |c| {
+            c.line("\"unix:|\" \"unix:\";");
+            c.line("\"~^unix:\\|(?<announced>.+)$\" $announced;");
+            c.line("default $remote_addr;");
+        },
+    );
 }
 
 pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
@@ -226,8 +232,16 @@ pub(super) fn listen(c: &mut Conf, port: u16, default_server: bool) {
     c.line(&format!("listen {port}{suffix};"));
 }
 
-/// `listen` of an `edge` plain-HTTP server: the TCP port (the daemon's health probe, nothing is
-/// published on it any more) plus the forwarder's unix socket with `proxy_protocol`.
+/// The daemon's probe socket (docs/decisions/0054): plain HTTP, no `ssl`, no `proxy_protocol`, so
+/// `$remote_addr` stays `unix:` and no PROXY header is ever expected on it. The directory is `0700`
+/// and mounted into nginx only; that, not a config rule, keeps every other peer off it.
+pub(super) fn listen_probe(c: &mut Conf, o: &NginxOptions, default_server: bool) {
+    let suffix = default_server_suffix(default_server);
+    c.line(&format!("listen unix:{}{suffix};", o.probe_socket));
+}
+
+/// `listen` of an `edge` plain-HTTP server: the TCP port (only redirects and ACME; nothing is published
+/// on it, the daemon's probe has its own socket) plus the forwarder's unix socket with `proxy_protocol`.
 pub(super) fn listen_edge_plain(c: &mut Conf, o: &NginxOptions, default_server: bool) {
     listen(c, o.listen_port, default_server);
     if let Some(dir) = &o.proxy_socket_dir {
@@ -254,6 +268,7 @@ pub(super) fn listen_edge_tls(c: &mut Conf, o: &NginxOptions, default_server: bo
 pub(super) fn write_default_server(c: &mut Conf, o: &NginxOptions) {
     c.block("server", |c| {
         listen_edge_plain(c, o, true);
+        listen_probe(c, o, true);
         c.line("server_name _;");
         set_app(c, NO_APP);
         c.line("return 444;");

@@ -71,6 +71,12 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[ingress.cdn]` | [edge behind a CDN](edge-cdn.md) |
 | `weglarka.toml`, edge mode | set `mode = "behind"`, remove `https_bind`, restore `traefik_dynamic_file` | [edge mode](edge-mode.md) |
 
+**Upgrading to the release with the probe socket ([ADR 0054](../decisions/0054-health-probe-socket.md)):** the nginx
+container gets one more mount (`<nginx_conf_dir>/probe`), so the daemon recreates it **once**, in `behind` and `edge`
+alike (in `edge` the forwarder holds connections meanwhile). Nothing changes in `apps.toml`, `state.toml` or
+`weglarka.toml`, so there is no field to remove. On a downgrade the older daemon recreates nginx with the old mounts
+and the unused `probe/` directory stays in `<nginx_conf_dir>`; remove it if you like.
+
 Notes:
 
 - The order of the rows does not matter; the schema-versioned fields (those in `apps.toml` and `state.toml`) can

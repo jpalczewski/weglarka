@@ -14,6 +14,13 @@
 # must hold <domain>.crt/<domain>.key for the domains the config references; when it is omitted (or a
 # pair is missing) self-signed certificates (EC P-256, subjectAltName=DNS:<domain>, key 0600) are
 # generated into a temp dir.
+#
+# The daemon's health probe goes through the probe socket (docs/decisions/0054, issue #221): a plain-HTTP
+# `listen unix:` on every app server, which works for a domain without a certificate and is answered by
+# the upstream, never by the HTTPS redirect. The checks below pin that, and the behaviours the design
+# inferred from the nginx docs: a plain unix listener next to `listen 8443 ssl` in one server, `realip`
+# leaving `$remote_addr` as `unix:` on a listener without `proxy_protocol`, and HTTP/1.1 working on a
+# server that has `http2 on`.
 set -euo pipefail
 
 conf=${1:-}
@@ -185,9 +192,14 @@ echo "--- upstreams: ${ups[*]}"
 sock_dir=$work/run
 mkdir -p "$sock_dir"
 chmod 777 "$sock_dir"
+# The probe socket's directory (the default `/run/weglarka-probe`), kept out of `sock_dir`: the daemon
+# mounts it into nginx only, never into the forwarder's directory.
+probe_dir=$work/probe
+mkdir -p "$probe_dir"
+chmod 777 "$probe_dir"
 docker run -d --name wg-edge-nginx --network "$net" \
   -p "127.0.0.1:$http_port:8080" -p "127.0.0.1:$https_port:8443" \
-  -v "$sock_dir:/run/wg-ingress" \
+  -v "$sock_dir:/run/wg-ingress" -v "$probe_dir:/run/weglarka-probe" \
   -v "$conf:/etc/nginx/nginx.conf:ro" -v "$tls_dir:/etc/nginx/tls:ro" \
   -v "$acme_dir:/etc/nginx/acme:ro" docker.io/library/nginx:1-alpine >/dev/null
 
@@ -269,6 +281,50 @@ expect "https $tls_domain: status" "${out%% *}" "200"
 
 out=$(http_status "$plain_domain" /)
 expect "http redirect ($plain_domain, root)" "${out%% *}" "301"
+
+# ── (d2) the probe socket: the upstream's answer for any routed domain, certificate or not ──
+
+probe_status() { # domain path [curl args...] -> status code
+  local domain=$1 path=$2
+  shift 2
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --unix-socket "$probe_dir/probe.sock" \
+    -H "Host: $domain" "$@" "http://probe$path" 2>/dev/null || true
+}
+probe_body() { # domain path [curl args...] -> body
+  local domain=$1 path=$2
+  shift 2
+  curl -sS --max-time 10 --unix-socket "$probe_dir/probe.sock" -H "Host: $domain" "$@" \
+    "http://probe$path" 2>/dev/null
+}
+
+expect "probe socket ($plain_domain, no cert): the upstream, not the 301" \
+  "$(probe_status "$plain_domain" /)" "200"
+expect "probe socket ($tls_domain, has cert)" "$(probe_status "$tls_domain" /)" "200"
+# An unknown `Host` reaches the default server of the probe listener: dropped like on the other ports.
+case $(probe_status unknown.example.invalid /) in
+  000 | 444) echo "ok   probe socket: unknown Host dropped" ;;
+  *) echo "FAIL probe socket: unknown Host not dropped"; fail=1 ;;
+esac
+# `$remote_addr` stays the literal `unix:` (no PROXY header, realip does not rewrite it), and the
+# forwarded headers are rebuilt from it — a forged value does not survive.
+probe_forged=$(probe_body "$plain_domain" / -H 'X-Forwarded-For: 203.0.113.9' -H 'X-Forwarded-Proto: https' \
+  -H 'X-Real-IP: 203.0.113.9')
+body_contains "probe socket: X-Real-IP" "$probe_forged" "X-Real-Ip: unix:"
+body_contains "probe socket: X-Forwarded-For" "$probe_forged" "X-Forwarded-For: unix:"
+body_lacks_line "probe socket: forged X-Forwarded-For" "$probe_forged" "X-Forwarded-For: 203.0.113.9"
+body_contains "probe socket: scheme" "$probe_forged" "X-Forwarded-Proto: http"
+body_lacks_line "probe socket: forged X-Forwarded-Proto" "$probe_forged" "X-Forwarded-Proto: https"
+# `http2 on` is set on the same server: HTTP/1.1 on the plain unix listener must be undisturbed.
+expect "probe socket: HTTP/1.1 next to http2 on" \
+  "$(curl -sS -o /dev/null -w '%{http_version}' --max-time 10 --unix-socket "$probe_dir/probe.sock" \
+    -H "Host: $tls_domain" http://probe/ 2>/dev/null || true)" "1.1"
+# The access log shows the peer as `unix:` instead of an empty address.
+sleep 1
+if docker logs wg-edge-nginx 2>&1 | grep -F '"remote_addr":"unix:"' | grep -qF "\"host\":\"$plain_domain\""; then
+  echo "ok   probe socket: access log shows remote_addr unix:"
+else
+  echo "FAIL probe socket: no access log line with remote_addr unix: for $plain_domain"; fail=1
+fi
 
 # ── (e)/(f) unknown SNI and failed handshakes on the TLS publish ─────────────
 

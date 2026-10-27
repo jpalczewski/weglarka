@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use weglarka_model::app::InstanceName;
 use weglarka_model::config::{IngressMode, wildcard_cert_stem, wildcard_covers};
 
-use super::{ACME_CONTAINER_DIR, CERT_CONTAINER_DIR};
+use super::{ACME_CONTAINER_DIR, CERT_CONTAINER_DIR, PROBE_CONTAINER_DIR, PROBE_SOCKET};
 use crate::cdn::CdnTrust;
 use crate::plan::{Cidr, Domain, IngressError};
 
@@ -51,6 +51,11 @@ pub struct NginxOptions {
     /// in the PROXY header becomes `$remote_addr`. `None` = TCP listeners only (nginx's own address is
     /// then what a published port shows as the client).
     pub proxy_socket_dir: Option<String>,
+    /// Container path of the daemon's probe socket (docs/decisions/0054), both modes: a plain-HTTP
+    /// `listen unix:` on every app server and on the default server. Its directory must be mounted
+    /// into nginx only — never into [`Self::proxy_socket_dir`] (the forwarder's directory), because the
+    /// socket skips TLS and authentication. Default: `PROBE_CONTAINER_DIR/PROBE_SOCKET`.
+    pub probe_socket: String,
     /// `edge`: the peers that are a CDN and announce the visitor in a header (issue #159,
     /// docs/decisions/0044). Requires [`Self::proxy_socket_dir`]: only then `$remote_addr` is the
     /// real peer the ranges can be compared with.
@@ -91,6 +96,7 @@ impl NginxOptions {
             acme_webroot: ACME_CONTAINER_DIR.to_owned(),
             tls_fingerprint: None,
             proxy_socket_dir: None,
+            probe_socket: format!("{PROBE_CONTAINER_DIR}/{PROBE_SOCKET}"),
             cdn: None,
             unreleased: BTreeSet::new(),
         }
@@ -138,6 +144,21 @@ impl NginxOptions {
                     "expected '/'-delimited prefix of [A-Za-z0-9_.-]",
                 ));
             }
+        }
+        check_container_dir("probe_socket", &self.probe_socket)?;
+        let probe_dir = self
+            .probe_socket
+            .rsplit_once('/')
+            .map_or("", |(dir, _)| dir);
+        let in_forwarder_dir = self
+            .proxy_socket_dir
+            .as_deref()
+            .is_some_and(|dir| probe_dir == dir || probe_dir.starts_with(&format!("{dir}/")));
+        if in_forwarder_dir {
+            return Err(bad(
+                "probe_socket",
+                "must not live in proxy_socket_dir (the forwarder mounts that directory)",
+            ));
         }
         match mode {
             IngressMode::Behind => {

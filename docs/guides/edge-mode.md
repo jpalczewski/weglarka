@@ -37,7 +37,7 @@ OpenRC too. Decision and measurements: [ADR 0043](../decisions/0043-edge-client-
   so the public ports stay open. It is recreated — with the ports closed for about a second — only when `bind` or
   `https_bind` change or a release bumps its revision; `doctor` reports `ingress.client_ip`.
 - nginx is **reloaded** (no downtime) for config, certificate and app-network changes. It is **recreated** when
-  its identity changes: `[ingress] nginx_image`, `bind`/`https_bind`, the hardening profile, the ingress uid range
+  its identity changes (and once on the upgrade that introduced the probe socket): `[ingress] nginx_image`, `bind`/`https_bind`, the hardening profile, the ingress uid range
   or a release that changes the identity format. During a recreate the forwarder holds new connections for up to
   20 s until nginx listens again, so clients see a slow request rather than a refusal. Each recreate is logged as
   `nginx recreated (not reloaded)` with `reason` (the changed inputs) and the measured `gap_ms`
@@ -83,6 +83,23 @@ head -2 /var/lib/weglarka/nginx/nginx.conf        # "# tls material: fingerprint
 curl -k --resolve ntfy.example.com:443:127.0.0.1 https://ntfy.example.com/   # -k only for self-signed
 ```
 
+## Health probe (the probe socket)
+
+`health.http` (the deploy gate, the blue-green confirmation and the dependency gate) cannot use the plain HTTP
+port in `edge`: it only redirects. The daemon sends the probe over a **unix socket** that nginx listens on in
+addition, `<nginx_conf_dir>/probe/probe.sock`, on every app server (in `behind` too). It reaches the same
+`server`, `location` and upstream as real traffic, so the probe tests routing and the app, but not TLS or
+authentication. It also works for a domain that has no certificate yet, so the first deploy before ACME passes.
+Decision: [ADR 0054](../decisions/0054-health-probe-socket.md).
+
+- **Isolation:** the `probe/` directory is `0700` and mounted into the nginx container only — not into the
+  forwarder, which faces the internet. Nobody who cannot open that directory can use the socket.
+- **What an app sees:** a probe arrives with `X-Real-IP: unix:` and `X-Forwarded-For: unix:` (there is no client
+  address; it is deliberately not `127.0.0.1`) and, in `edge`, `X-Forwarded-Proto: http`. An app that redirects http→https on that header answers every probe with a 30x, so use a health path that does not redirect.
+- **Not on the socket yet:** the internal ntfy route (`url = "http://weglarka-nginx:8080"`, see
+  [notifications](notifications.md)) still uses the TCP port, so it gets the redirect in `edge`.
+- The socket path (`<nginx_conf_dir>/probe/probe.sock`) must be shorter than 108 bytes.
+
 ## Requirements and security
 
 - Ports < 1024 need a sysctl and `[runtime] allow_privileged_host_ports = true`; `doctor --preflight` has the
@@ -99,7 +116,8 @@ curl -k --resolve ntfy.example.com:443:127.0.0.1 https://ntfy.example.com/   # -
   the uid map does — the container root is the runtime user, the worker stays in the ingress range
   ([ADR 0036](../decisions/0036-edge-mode.md), [ADR 0009](../decisions/0009-volume-ownership.md)). Consequence:
   **nothing but `<nginx_conf_dir>` may be mounted into the nginx container** (no state directory, no
-  `config_root`, no Traefik file).
+  `config_root`, no Traefik file) — its subdirectories `run/` (forwarder sockets) and `probe/` (probe socket) are
+  the only ones mounted a second time, writable.
 - A custom `ingress.nginx_image` must have nginx >= 1.25.1 (`http2 on`, `ssl_reject_handshake`); the official
   `nginx:1-alpine` and the digest from [host configuration](../install.md#host-configuration) satisfy this, an
   older image fails `nginx -t`.

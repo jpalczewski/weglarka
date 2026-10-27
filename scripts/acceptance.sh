@@ -497,21 +497,19 @@ step_canary() {
     edge_ensure_cert "$CANARY_DOMAIN"
   fi
   wg apps remove --ignore-missing "$CANARY" >/dev/null
-  if [ -n "$HEALTH_WINDOW" ]; then
-    # Same spec as the flags below, plus a shortened health gate (the default window is 30 s).
-    cat >"$WORK/canary-spec.toml" <<EOF
+  # `health.http` makes the deploy gate go through the real prober and nginx's probe socket (issue #221):
+  # in `edge` the plain port only redirects, so before the socket this gate could never pass. The spec
+  # file is the only way to set it; a shortened health window (the default is 30 s) is optional.
+  cat >"$WORK/canary-spec.toml" <<EOF
 image = "$IMAGE"
 domains = ["$CANARY_DOMAIN"]
 port = 80
-
-[health]
-attempts = 2
-window_secs = $HEALTH_WINDOW
 EOF
-    wg apps add "$CANARY" --spec "$WORK/canary-spec.toml" >/dev/null
-  else
-    wg apps add "$CANARY" "$IMAGE" --domain "$CANARY_DOMAIN" --port 80 >/dev/null
+  if [ -n "$HEALTH_WINDOW" ]; then
+    printf '\n[health]\nattempts = 2\nwindow_secs = %s\n' "$HEALTH_WINDOW" >>"$WORK/canary-spec.toml"
   fi
+  printf '\n[health.http]\npath = "/"\n' >>"$WORK/canary-spec.toml"
+  wg apps add "$CANARY" --spec "$WORK/canary-spec.toml" >/dev/null
   out=$(wg --json deploy "$CANARY") || rc=$?
   [ "$rc" = 0 ] || die "deploy kanarka zakończył się kodem $rc: $out"
   outcome=$(printf '%s' "$out" | jq -r .outcome)

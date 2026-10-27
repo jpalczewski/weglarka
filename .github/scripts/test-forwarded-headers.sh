@@ -51,7 +51,7 @@ expect_status() { # label actual expected
 request() { # conf -> whoami body for a request carrying forged forwarded headers
   docker rm -f wg-fwd-nginx >/dev/null 2>&1 || true
   docker run -d --name wg-fwd-nginx --network "$net" -p 127.0.0.1:18099:8080 \
-    -v "$1:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
+    -v /run/weglarka-probe -v "$1:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
   for _ in $(seq 30); do
     curl -fsS -o /dev/null -H 'Host: blog.example.eu' http://127.0.0.1:18099/ 2>/dev/null && break
     sleep 1
@@ -94,7 +94,7 @@ expect_status 'untrusted + http (header ignored)' "$(status_of -H 'X-Forwarded-P
 # forwarded headers, while a neighbour in the same subnet cannot forge them (an app container on a shared network).
 peer_request() { # conf -> whoami body of a request sent from $PEER_IP
   docker rm -f wg-fwd-nginx >/dev/null 2>&1 || true
-  docker run -d --name wg-fwd-nginx --network "$net" -v "$1:/etc/nginx/nginx.conf:ro" \
+  docker run -d --name wg-fwd-nginx --network "$net" -v /run/weglarka-probe -v "$1:/etc/nginx/nginx.conf:ro" \
     docker.io/library/nginx:1-alpine >/dev/null
   for _ in $(seq 30); do
     docker run --rm --network "$net" --ip "$PEER_IP" docker.io/library/nginx:1-alpine \
