@@ -4068,6 +4068,36 @@ health = { attempts = 2, window_secs = 2 }
     }
 
     #[tokio::test(start_paused = true)]
+    async fn overlapping_secrets_are_masked_longest_first_before_the_cut() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"a\", kind = \"env\", var = \"A\" }}, {{ secret = \"b\", kind = \"env\", var = \"B\" }}]\n"
+        ));
+        h.store.set("idp.a", SecretValue::new("hunter2")).unwrap();
+        h.store
+            .set("idp.b", SecretValue::new("hunter2-long\n"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        // The secret sits right where a 16 KiB tail would cut it if masking came after the cut.
+        let text = format!("hunter2-long{}end", "y".repeat(16 * 1024 - 20));
+        h.fake.script_next_run(RunScript {
+            output: vec![(LogSource::Stderr, text.into_bytes())],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        assert!(
+            !output.contains("hunter2") && !output.contains("-long"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_health_failure_flips_current_back_once() {
         let h = deployed().await;
         let g = TestGen::new(true);

@@ -23,9 +23,7 @@ use weglarka_model::events::Event;
 use weglarka_model::generated::{
     CURRENT_LINK, ConfigGenerator, Fingerprint, GeneratedFile, RenderInput, VERSION_PREFIX,
 };
-use weglarka_model::generated_state::{
-    self, GeneratedState, GeneratorRecord, LastResult, OUTPUT_LIMIT, tail,
-};
+use weglarka_model::generated_state::{self, GeneratedState, GeneratorRecord, LastResult, tail};
 use weglarka_model::labels;
 use weglarka_model::podman::{ContainerState, PodmanClient, PodmanError};
 use weglarka_model::secret_ops::Pbkdf2Digest;
@@ -41,6 +39,12 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The part of the validator output that goes into the event, hence to external notification
 /// channels. The full tail stays in the 0600 state file and `doctor`.
 const EVENT_OUTPUT_LIMIT: usize = 1024;
+/// How much validator output is captured before masking and cutting it to [`OUTPUT_LIMIT`]. It is
+/// far above any secret's length, so a value is never cut in half by the capture window. Should the
+/// window cut one anyway, its leftover sits in the first bytes of the buffer, and the cut to
+/// [`generated_state::OUTPUT_LIMIT`] afterwards always drops all but the last 16 KiB of a full
+/// window — so a fragment at the window's edge can never reach the reported output.
+const CAPTURE_LIMIT: usize = 64 * 1024;
 const FILE_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
 
@@ -291,8 +295,8 @@ impl<P: PodmanClient> Reconciler<P> {
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = rx.recv().await {
                 buf.extend_from_slice(&chunk.data);
-                if buf.len() > OUTPUT_LIMIT {
-                    buf.drain(..buf.len() - OUTPUT_LIMIT);
+                if buf.len() > CAPTURE_LIMIT {
+                    buf.drain(..buf.len() - CAPTURE_LIMIT);
                 }
             }
             String::from_utf8_lossy(&buf).into_owned()
@@ -309,20 +313,30 @@ impl<P: PodmanClient> Reconciler<P> {
         }))
     }
 
-    /// Masks every value of the consumer's bound secrets (4+ bytes, so a one-character value does not
-    /// shred the text) in `output`. A secret that cannot be read masks nothing.
+    /// Masks the values of the consumer's bound secrets (4+ bytes, so a one-character value does not
+    /// shred the text) in `output`, longest first so a secret that contains another is not left half
+    /// visible; a value is also masked without its trailing whitespace. Runs on the captured output
+    /// *before* it is cut to the reported tail. A secret that cannot be read masks nothing, and
+    /// encodings of a value (JSON escapes, URL encoding) are not recognised.
     fn scrub_secrets(&self, consumer: &InstanceName, spec: &AppSpec, output: &str) -> String {
-        let mut text = output.to_owned();
+        let mut values = std::collections::BTreeSet::new();
         for binding in &spec.secrets {
             let name = weglarka_model::secret_store::scoped_name(consumer, &binding.secret);
             if let Ok(Some(value)) = self.secrets.get(&name)
                 && let Ok(plain) = std::str::from_utf8(value.expose())
-                && plain.len() >= 4
             {
-                text = text.replace(plain, "***");
+                for candidate in [plain, plain.trim_end()] {
+                    if candidate.len() >= 4 {
+                        values.insert(candidate.to_owned());
+                    }
+                }
             }
         }
-        text
+        let mut values: Vec<String> = values.into_iter().collect();
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        values
+            .iter()
+            .fold(output.to_owned(), |text, v| text.replace(v.as_str(), "***"))
     }
 
     /// A running consumer reloads (a signal or a restart, per its spec) and must pass the health
