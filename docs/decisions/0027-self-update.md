@@ -131,3 +131,13 @@ immediately).
   including credentials and platform resolution, and adds a second source of truth for "the digest of this tag".
 * **A webhook as the only trigger.** It needs an extra secret and inbound access to react faster than an hour;
   the timer covers the same need, and `self-update --force` is the manual lever.
+
+## Amendment: shared HTTP client (#219)
+
+The registry fetches (token, `.sig` manifest, payload blob) now go through the shared `weglarka-http` client
+(`Purpose::Registry`) instead of a hand-written HTTP/1.1 client. The guarantees are unchanged: bundled roots and
+`ring`, every body capped while it is read (token 8 KiB, manifest 1 MiB, payload 64 KiB), at most 5 redirects, each only
+to `https://` (or loopback in tests), a 30 s total timeout per request, and the bearer token is not forwarded to
+another host or port on a redirect (`reqwest` strips `Authorization`; a test pins it, including GHCR's blob → CDN
+shape). One difference: a redirect without a `Location` header is now reported as the 3xx status instead of a
+dedicated error.

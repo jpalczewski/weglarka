@@ -27,6 +27,8 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use weglarka_model::app::Digest;
 
+use weglarka_http::reqwest::Url;
+
 use crate::cosign::{MAX_PAYLOAD_BYTES, Signature};
 use crate::http::{self, HttpError};
 use crate::image_ref::ImageRef;
@@ -98,7 +100,7 @@ pub enum RegistryError {
     PayloadDigestMismatch { expected: String, actual: String },
 }
 
-/// [`Registry`] over plain HTTP/1.1 + TLS (see [`crate::http`]).
+/// [`Registry`] over the shared HTTP client (see [`crate::http`]).
 ///
 /// The anonymous Bearer token is cached in memory for the last registry+repository pair. The
 /// struct has no `Debug` field for the token: it must not end up in a log line.
@@ -131,7 +133,7 @@ impl HttpRegistry {
     /// `GET` a registry URL, answering one Bearer challenge and reusing the cached token.
     async fn authorized_get(
         &self,
-        url: &http::Url,
+        url: &Url,
         image: &ImageRef,
         accept: Option<&str>,
         max_body: usize,
@@ -174,7 +176,8 @@ impl HttpRegistry {
         image: &ImageRef,
     ) -> Result<String, RegistryError> {
         let challenge = response
-            .header("www-authenticate")
+            .challenge
+            .as_deref()
             .ok_or(RegistryError::AuthChallenge)?;
         let challenge = Challenge::parse(challenge)?;
         tracing::debug!(
@@ -192,7 +195,7 @@ impl HttpRegistry {
         query.push(format!("scope={}", http::percent_encode(&scope)));
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(&query.join("&"));
-        let url = http::Url::parse(&url)?;
+        let url = http::parse_url(&url)?;
         let response = self
             .client
             .get(&url, None, None, MAX_TOKEN_BYTES, "auth token")
@@ -237,7 +240,7 @@ impl Registry for HttpRegistry {
             tag = tag.as_str(),
             "fetching the cosign signature manifest"
         );
-        let url = http::Url::from_registry(
+        let url = http::registry_url(
             &image.registry,
             &format!("/v2/{}/manifests/{tag}", image.repository),
         )?;
@@ -272,7 +275,7 @@ impl Registry for HttpRegistry {
             )?;
             let signature = decode_signature(encoded)?;
             let expected = layer_digest(&layer.digest)?;
-            let url = http::Url::from_registry(
+            let url = http::registry_url(
                 &image.registry,
                 &format!("/v2/{}/blobs/{}", image.repository, layer.digest),
             )?;
@@ -639,7 +642,6 @@ mod tests {
 
     /// A loopback HTTP server; the handler receives each request and returns the response.
     struct TestServer {
-        addr: SocketAddr,
         requests: Arc<StdMutex<Vec<Request>>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -649,7 +651,6 @@ mod tests {
             listener: TcpListener,
             handler: impl Fn(&Request) -> ResponseSpec + Send + Sync + 'static,
         ) -> Self {
-            let addr = listener.local_addr().unwrap();
             let requests = Arc::new(StdMutex::new(Vec::new()));
             let recorded = Arc::clone(&requests);
             let handler = Arc::new(handler);
@@ -670,15 +671,7 @@ mod tests {
                     });
                 }
             });
-            Self {
-                addr,
-                requests,
-                task,
-            }
-        }
-
-        fn registry(&self) -> String {
-            self.addr.to_string()
+            Self { requests, task }
         }
 
         fn requests(&self) -> Vec<Request> {
@@ -887,11 +880,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redirect_to_another_port_drops_the_authorization_header() {
+        blob_redirect_drops_the_token("127.0.0.1").await;
+    }
+
+    /// Same IP, different *host name*: `localhost` is not `127.0.0.1` to the redirect policy.
+    #[tokio::test]
     async fn a_redirect_to_another_host_drops_the_authorization_header() {
+        blob_redirect_drops_the_token("localhost").await;
+    }
+
+    async fn blob_redirect_drops_the_token(cdn_host: &str) {
         let signer = TestSigner::generate().unwrap();
         let digest = digest('c');
         let (registry_listener, registry_addr) = loopback().await;
-        let (cdn_listener, _cdn_addr) = loopback().await;
+        let (cdn_listener, cdn_addr) = loopback().await;
         let image = ImageRef::parse(&format!(
             "127.0.0.1:{}/jpalczewski/weglarka:edge",
             registry_addr.port()
@@ -912,7 +915,7 @@ mod tests {
             );
             with_body(response(200), cdn_payload.clone())
         });
-        let redirect_to = format!("http://{}/blob", cdn.registry());
+        let redirect_to = format!("http://{cdn_host}:{}/blob", cdn_addr.port());
         let _registry = TestServer::start(registry_listener, move |request| {
             if request.path.starts_with("/token") {
                 return with_body(response(200), token_json("tok-456"));
@@ -932,7 +935,7 @@ mod tests {
             .unwrap();
         assert_eq!(signatures.len(), 1);
         crate::verify(&signatures[0], signer.public_key(), &image, &digest).unwrap();
-        assert_eq!(cdn.requests().len(), 1);
+        assert_eq!(cdn.requests().len(), 1, "the blob was fetched from the CDN");
     }
 
     #[tokio::test]
@@ -958,7 +961,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            matches!(error, RegistryError::Http(HttpError::NotHttps { .. })),
+            matches!(error, RegistryError::Http(HttpError::Redirect { .. })),
             "{error}"
         );
         // The manifest and the blob request (which answered with the redirect) were made; the
@@ -1130,7 +1133,7 @@ mod tests {
         let client = HttpRegistry::new().unwrap();
         let error = client.cosign_signatures(&image, &digest).await.unwrap_err();
         assert!(
-            matches!(error, RegistryError::Http(HttpError::TooManyRedirects(5))),
+            matches!(error, RegistryError::Http(HttpError::Redirect { .. })),
             "{error}"
         );
     }

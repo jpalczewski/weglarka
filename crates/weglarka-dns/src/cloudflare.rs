@@ -8,18 +8,18 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
 use weglarka_model::secret_store::SecretValue;
 
-use crate::http::{Base, Client, HttpError, Response};
+use weglarka_http::reqwest::Method;
+
+use crate::http::{Api, HttpError, Response};
 use crate::name::{valid_record_name, valid_txt_value};
 use crate::provider::{DnsError, DnsProvider, RecordHandle};
 
 const DEFAULT_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
-const TIMEOUT: Duration = Duration::from_secs(30);
 /// Challenge records live for seconds; 60 is the lowest TTL Cloudflare accepts outside Enterprise.
 const TTL: u32 = 60;
 /// Cloudflare error code for "record does not exist" on delete.
@@ -27,7 +27,7 @@ const RECORD_NOT_FOUND: i64 = 81044;
 const MAX_MESSAGE: usize = 300;
 
 pub struct Cloudflare {
-    client: Client,
+    api: Api,
     token: String,
     /// zone name → zone id; zones do not move, so one lookup per zone per daemon run.
     zones: Mutex<HashMap<String, String>>,
@@ -99,7 +99,7 @@ impl Cloudflare {
             return Err(HttpError::Token.into());
         }
         Ok(Self {
-            client: Client::new(Base::parse(base_url)?, TIMEOUT)?,
+            api: Api::new(base_url)?,
             token,
             zones: Mutex::new(HashMap::new()),
         })
@@ -107,12 +107,12 @@ impl Cloudflare {
 
     async fn call(
         &self,
-        method: &'static str,
+        method: Method,
         path: &str,
-        body: Option<&[u8]>,
+        body: Option<Vec<u8>>,
     ) -> Result<Response, DnsError> {
         Ok(self
-            .client
+            .api
             .request(method, path, Some(&self.token), body)
             .await?)
     }
@@ -131,7 +131,7 @@ impl Cloudflare {
         }
         for zone in candidates {
             let response = self
-                .call("GET", &format!("/zones?name={zone}&per_page=1"), None)
+                .call(Method::GET, &format!("/zones?name={zone}&per_page=1"), None)
                 .await?;
             let zones: Vec<Zone> = parse(&response)?.unwrap_or_default();
             let Some(found) = zones.into_iter().find(|z| z.name == zone) else {
@@ -179,8 +179,8 @@ pub async fn public_ips() -> Result<PublicIps, DnsError> {
 
 /// [`public_ips`] against another API root (tests use a loopback mock).
 pub async fn public_ips_from(base_url: &str) -> Result<PublicIps, DnsError> {
-    let client = Client::new(Base::parse(base_url)?, TIMEOUT)?.with_max_body(MAX_PUBLIC_IPS);
-    let response = client.request("GET", "/ips", None, None).await?;
+    let api = Api::new(base_url)?.with_max_body(MAX_PUBLIC_IPS);
+    let response = api.request(Method::GET, "/ips", None, None).await?;
     let result: IpsResult =
         parse(&response)?.ok_or_else(|| DnsError::Response("no result in the answer".into()))?;
     let mut cidrs = result.ipv4_cidrs;
@@ -229,7 +229,11 @@ impl DnsProvider for Cloudflare {
         let body = json!({ "type": "TXT", "name": name, "content": value, "ttl": TTL });
         let body = serde_json::to_vec(&body).map_err(|e| DnsError::Response(e.to_string()))?;
         let response = self
-            .call("POST", &format!("/zones/{zone}/dns_records"), Some(&body))
+            .call(
+                Method::POST,
+                &format!("/zones/{zone}/dns_records"),
+                Some(body),
+            )
             .await?;
         let record: Record = parse(&response)?
             .ok_or_else(|| DnsError::Response("no record in the answer".into()))?;
@@ -250,7 +254,7 @@ impl DnsProvider for Cloudflare {
             .ok_or_else(|| DnsError::InvalidHandle(handle.as_str().to_owned()))?;
         let response = self
             .call(
-                "DELETE",
+                Method::DELETE,
                 &format!("/zones/{zone}/dns_records/{record}"),
                 None,
             )
@@ -301,11 +305,11 @@ mod tests {
                     loop {
                         let n = stream.read(&mut chunk).await.unwrap();
                         raw.extend_from_slice(&chunk[..n]);
-                        let text = String::from_utf8_lossy(&raw);
+                        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
                         if let Some(end) = text.find("\r\n\r\n") {
                             let length = text
                                 .lines()
-                                .find_map(|l| l.strip_prefix("Content-Length: "))
+                                .find_map(|l| l.strip_prefix("content-length: "))
                                 .map_or(0, |l| l.trim().parse::<usize>().unwrap());
                             if raw.len() >= end + 4 + length {
                                 break;
@@ -359,7 +363,7 @@ mod tests {
         assert_eq!(ips.cidrs, ["103.21.244.0/22", "2400:cb00::/32"]);
         let request = &mock.requests()[0];
         assert!(request.starts_with("GET /client/v4/ips HTTP/1.1\r\n"));
-        assert!(!request.contains("Authorization"));
+        assert!(!request.to_ascii_lowercase().contains("authorization"));
     }
 
     #[tokio::test]
@@ -373,6 +377,19 @@ mod tests {
             matches!(err, DnsError::Http(HttpError::TooLarge { .. })),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_an_error_and_is_not_followed() {
+        // The token must not be handed to wherever a redirect points: the second answer is never asked.
+        let mock = Mock::serve(vec![(302, String::new()), ok("[]")]).await;
+        let err = mock
+            .adapter()
+            .set_txt("example.eu", VALUE)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DnsError::Api { status: 302, .. }), "{err}");
+        assert_eq!(mock.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -399,7 +416,7 @@ mod tests {
             "POST /client/v4/zones/{ZONE}/dns_records HTTP/1.1\r\n"
         )));
         for request in &requests {
-            assert!(request.contains(&format!("Authorization: Bearer {TOKEN}\r\n")));
+            assert!(request.contains(&format!("authorization: Bearer {TOKEN}\r\n")));
         }
         let body: serde_json::Value =
             serde_json::from_str(requests[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -445,7 +462,7 @@ mod tests {
         assert!(requests[0].starts_with(&format!(
             "DELETE /client/v4/zones/{ZONE}/dns_records/{RECORD} HTTP/1.1\r\n"
         )));
-        assert!(!requests[0].contains("Content-Length"));
+        assert!(!requests[0].to_ascii_lowercase().contains("content-length"));
     }
 
     #[tokio::test]

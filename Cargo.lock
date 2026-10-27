@@ -2069,14 +2069,12 @@ dependencies = [
 name = "weglarka-dns"
 version = "0.0.3"
 dependencies = [
- "rustls",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-rustls",
  "tracing",
- "webpki-roots",
+ "weglarka-http",
  "weglarka-model",
 ]
 
@@ -2187,15 +2185,13 @@ version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "ring",
- "rustls",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "tokio",
- "tokio-rustls",
  "tracing",
- "webpki-roots",
+ "weglarka-http",
  "weglarka-model",
 ]
 

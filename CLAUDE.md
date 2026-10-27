@@ -116,7 +116,7 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 
 ## Mapa crate'ów
 
-Zależności: `api → model`; `podman → model`; `ingress → model`; `notify → model, http`; `registry → model`; `acme → model`; `dns → model`; `http → (nic z Węglarki)`; `engine → model`; `acme → dns`;
+Zależności: `api → model`; `podman → model`; `ingress → model`; `notify → model, http`; `registry → model, http`; `dns → model, http`; `acme → model`; `http → (nic z Węglarki)`; `engine → model`; `acme → dns`;
 `cli → api, model, engine`; `daemon → wszystko`. Liście (api, ingress, notify, acme, podman, dns, registry) zależą **tylko od modelu** — nie dodawaj im zależności od `engine`.
 
 | Crate | Zawartość |
@@ -127,9 +127,9 @@ Zależności: `api → model`; `podman → model`; `ingress → model`; `notify 
 | `weglarka-ingress` | czyste generatory `nginx.conf` (`behind` i `edge`) i pliku dynamicznego Traefika (snapshoty) |
 | `weglarka-http` | wspólny klient HTTP (#219): `client(Purpose)` buduje `reqwest::Client` (http1, `rustls` + `ring` jawnie, `webpki-roots`, bez aws-lc/OpenSSL; `rustls-platform-verifier` jest w grafie, ale nieużywany) z timeoutami i polityką redirectów per cel; **zależy tylko od zewnętrznych crate'ów** (nic z Węglarki), więc `reqwest` trafia wyłącznie do crate'ów sieciowych (nie do cli/api/ingress); guard `.github/scripts/check-deps.sh` w jobie `check` |
 | `weglarka-notify` | powiadomienia: `Event` → `Severity` → komunikaty → dedup → trwała kolejka (outbox) → kanały (`ntfy`; mail = #113), klient HTTP z `weglarka-http`, `endpoint.rs` (parsowanie URL-a) |
-| `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); własny minimalny klient HTTP/TLS, `FakeRegistry`/`TestSigner` (feature `testing`) |
+| `weglarka-registry` | podpisy cosign z OCI (tag `.sig` + token GHCR) i weryfikacja kluczem statycznym ECDSA P-256 (`ring`); klient HTTP z `weglarka-http` (`Purpose::Registry`: ≤5 przekierowań, tylko https/loopback, bez tokena na obcy host), `FakeRegistry`/`TestSigner` (feature `testing`) |
 | `weglarka-acme` | silnik ACME dla trybu `edge` (#96, ADR 0038): `CertSpec`/`CertId` (certyfikat = lista nazw, plik z id), trait `ChallengeSolver` (`Http01Solver`, `DnsSolver` nad `weglarka-dns` = #97), `AcmeClient`/`CertInspector`, `CertStore` (klucz 0600 przed certem 0644, atomowo), czyste `renewal::decide`, `Manager::pass`; `InstantAcme` (klient na `instant-acme`, `ring`, `webpki-roots`), `FakeAcme` (feature `testing`); test na staging Let's Encrypt jest opt-in (`WEGLARKA_ACME_STAGING_DOMAIN`/`_WEBROOT`); worker w demonie (`daemon/src/acme.rs`, `[acme]`, zdarzenia, `doctor acme.*`) |
-| `weglarka-dns` | adaptery DNS dla ACME DNS-01: trait `DnsProvider` (`set_txt`/`remove_txt`, handle usuwa dokładnie swój rekord), adapter Cloudflare (API v4, własny minimalny klient HTTP/TLS, token jako `SecretValue`), `FakeDns` (feature `testing`); ADR 0039 |
+| `weglarka-dns` | adaptery DNS dla ACME DNS-01: trait `DnsProvider` (`set_txt`/`remove_txt`, handle usuwa dokładnie swój rekord), adapter Cloudflare (API v4, klient HTTP z `weglarka-http` (`Purpose::Api`, bez przekierowań), token jako `SecretValue`), `FakeDns` (feature `testing`); ADR 0039 |
 | `weglarka-api` | kontrakt admin API (typy, endpointy, kody błędów) |
 | `weglarka-daemon` | demon: admin API (unix socket, w tym `GET /v1/health`), webhooki, zapis ingressu, `Platform` systemd (quadlet + timery samoaktualizacji i watchdoga), worker powiadomień, host-side `self-update` i `supervise` |
 | `weglarka-cli` | CLI `weglarka`, `doctor --preflight` |
