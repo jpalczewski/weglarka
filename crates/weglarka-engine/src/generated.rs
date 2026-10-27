@@ -38,6 +38,9 @@ use crate::run::{RunOptions, RunOutcome};
 pub const MOUNT_TARGET: &str = "/weglarka/generated";
 /// The validator is a config parse, not a job: anything longer is a hang.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The part of the validator output that goes into the event, hence to external notification
+/// channels. The full tail stays in the 0600 state file and `doctor`.
+const EVENT_OUTPUT_LIMIT: usize = 1024;
 const FILE_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
 
@@ -160,7 +163,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await?
             {
                 Some(Err(output)) => {
-                    let output = tail(&output).to_owned();
+                    // The validator ran with the consumer's secrets bound: if it echoes a value
+                    // (a parse error quoting the offending line), it must not reach the state file,
+                    // the log or a notification channel.
+                    let output = tail(&self.scrub_secrets(&consumer, &spec, &output)).to_owned();
                     self.record_generated(&mut gstate, id, |r| {
                         r.attempted = Some(fp.to_string());
                         r.last_result = LastResult::Invalid;
@@ -169,7 +175,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     self.events.emit(Event::GeneratedConfigInvalid {
                         id: id.to_owned(),
                         consumer: consumer.clone(),
-                        output: output.clone(),
+                        output: tail_bytes(&output, EVENT_OUTPUT_LIMIT).to_owned(),
                     });
                     retain_versions(&root, &[live.as_deref(), Some(&want)]);
                     return Ok(GeneratedOutcome::Invalid { output });
@@ -303,6 +309,22 @@ impl<P: PodmanClient> Reconciler<P> {
         }))
     }
 
+    /// Masks every value of the consumer's bound secrets (4+ bytes, so a one-character value does not
+    /// shred the text) in `output`. A secret that cannot be read masks nothing.
+    fn scrub_secrets(&self, consumer: &InstanceName, spec: &AppSpec, output: &str) -> String {
+        let mut text = output.to_owned();
+        for binding in &spec.secrets {
+            let name = weglarka_model::secret_store::scoped_name(consumer, &binding.secret);
+            if let Ok(Some(value)) = self.secrets.get(&name)
+                && let Ok(plain) = std::str::from_utf8(value.expose())
+                && plain.len() >= 4
+            {
+                text = text.replace(plain, "***");
+            }
+        }
+        text
+    }
+
     /// A running consumer reloads (a signal or a restart, per its spec) and must pass the health
     /// gate; a stopped or never-deployed one counts as applied — the files are live and its next
     /// start reads them. Returns whether it reloaded, and the gate's verdict.
@@ -403,6 +425,15 @@ impl<P: PodmanClient> Reconciler<P> {
             tracing::warn!(generator = id, error = %e, "cannot persist the generated-config state");
         }
     }
+}
+
+/// The last `limit` bytes of `text`, cut on a character boundary.
+fn tail_bytes(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// The directory name `current` points at, if the link exists.

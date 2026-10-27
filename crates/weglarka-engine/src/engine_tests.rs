@@ -4031,6 +4031,43 @@ health = { attempts = 2, window_secs = 2 }
     }
 
     #[tokio::test(start_paused = true)]
+    async fn validator_output_never_leaks_a_bound_secret_or_a_long_tail_into_the_event() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"token\", kind = \"env\", var = \"TOKEN\" }}]\n"
+        ));
+        h.store
+            .set("idp.token", SecretValue::new("hunter2-secret"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        let noise = "x".repeat(4000);
+        h.fake.script_next_run(RunScript {
+            output: vec![(
+                LogSource::Stderr,
+                format!("{noise}\nline: password: hunter2-secret\n").into_bytes(),
+            )],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        assert!(output.contains("password: ***"), "{output}");
+        assert!(!output.contains("hunter2-secret"));
+        assert!(!record(&h).last_error.unwrap().contains("hunter2-secret"));
+        let Some(Event::GeneratedConfigInvalid { output: sent, .. }) = h.sink.events().pop() else {
+            panic!("expected the Invalid event");
+        };
+        assert!(
+            sent.len() <= 1024 && !sent.contains("hunter2-secret"),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_health_failure_flips_current_back_once() {
         let h = deployed().await;
         let g = TestGen::new(true);
