@@ -395,6 +395,10 @@ env = { B = "2", A = "1" }
             max_body_size: Some(crate::app::BodySizeLimit::UNLIMITED),
             access_log_skip_paths: vec!["/healthz".into()],
             streaming_paths: vec!["/user/events".into()],
+            auth: crate::identity::IngressAuth::Forward,
+            auth_policy: Some(crate::identity::AuthorizationPolicy::OneFactor),
+            auth_groups: vec!["admins".into()],
+            auth_exempt_paths: vec!["/mcp/".into()],
         };
         s.paths = vec!["/api".into()];
         assert_eq!(

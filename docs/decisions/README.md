@@ -57,3 +57,5 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0048](0048-edge-recreate-gap.md) | Edge mode: no refused connections while nginx or the forwarder is replaced |
 | [0049](0049-static-sites.md) | Static sites (`kind = "static"`) |
 | [0050](0050-site-environments.md) | Sites with environments and promotion |
+| [0051](0051-identity-provider-integration.md) | Identity provider integration |
+| [0052](0052-forward-auth.md) | Forward auth in nginx |

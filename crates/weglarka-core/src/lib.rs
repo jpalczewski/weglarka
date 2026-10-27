@@ -9,6 +9,7 @@ pub mod crash;
 pub mod events;
 pub mod hash;
 pub mod host_ports;
+pub mod identity;
 pub mod labels;
 pub mod platform;
 pub mod podman;

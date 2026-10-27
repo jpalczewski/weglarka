@@ -1193,6 +1193,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             max_body_size: None,
             access_log_skip_paths: Vec::new(),
             streaming_paths: Vec::new(),
+            ..AppIngress::default()
         };
         let s = apply_flags(custom.clone(), &args(&["--streaming"])).unwrap();
         assert_eq!(s.ingress, custom.ingress);
