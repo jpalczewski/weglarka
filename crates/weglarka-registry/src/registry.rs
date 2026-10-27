@@ -881,16 +881,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_redirect_to_another_port_drops_the_authorization_header() {
-        blob_redirect_drops_the_token("127.0.0.1").await;
+        let (result, cdn_requests) = blob_redirect("/blob").await;
+        result.unwrap();
+        assert_eq!(cdn_requests.len(), 1, "the blob was fetched from the CDN");
+        assert!(!cdn_requests[0].has_authorization(), "{cdn_requests:?}");
+        assert!(
+            cdn_requests[0].header("referer").is_none(),
+            "{cdn_requests:?}"
+        );
     }
 
-    /// Same IP, different *host name*: `localhost` is not `127.0.0.1` to the redirect policy.
+    /// registry → CDN `/a` → CDN `/b`: `reqwest` alone rebuilds the second hop from the original headers
+    /// and, seeing the same authority as the previous hop, would send the token to the CDN. The policy
+    /// refuses the chain instead; whatever the CDN did see carried no token.
     #[tokio::test]
-    async fn a_redirect_to_another_host_drops_the_authorization_header() {
-        blob_redirect_drops_the_token("localhost").await;
+    async fn a_second_hop_inside_the_cdn_never_gets_the_token() {
+        let (result, cdn_requests) = blob_redirect("/a").await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, RegistryError::Http(HttpError::Redirect { .. })),
+            "{error}"
+        );
+        assert!(!cdn_requests.is_empty());
+        assert!(
+            cdn_requests
+                .iter()
+                .all(|request| !request.has_authorization()),
+            "{cdn_requests:?}"
+        );
     }
 
-    async fn blob_redirect_drops_the_token(cdn_host: &str) {
+    /// Runs a signature fetch whose blob request is redirected to a CDN at `cdn_path`; `/a` there
+    /// redirects on to `/b`. Returns the outcome and every request the CDN received.
+    async fn blob_redirect(cdn_path: &str) -> (Result<(), RegistryError>, Vec<Request>) {
         let signer = TestSigner::generate().unwrap();
         let digest = digest('c');
         let (registry_listener, registry_addr) = loopback().await;
@@ -909,13 +932,12 @@ mod tests {
         );
         let cdn_payload = payload.clone();
         let cdn = TestServer::start(cdn_listener, move |request| {
-            assert!(
-                !request.has_authorization(),
-                "the token must not follow a cross-host redirect: {request:?}"
-            );
+            if request.path == "/a" {
+                return with_header(response(307), "Location", "/b");
+            }
             with_body(response(200), cdn_payload.clone())
         });
-        let redirect_to = format!("http://{cdn_host}:{}/blob", cdn_addr.port());
+        let redirect_to = format!("http://127.0.0.1:{}{cdn_path}", cdn_addr.port());
         let _registry = TestServer::start(registry_listener, move |request| {
             if request.path.starts_with("/token") {
                 return with_body(response(200), token_json("tok-456"));
@@ -929,13 +951,14 @@ mod tests {
             with_header(response(401), "WWW-Authenticate", &auth)
         });
         let client = HttpRegistry::new().unwrap();
-        let signatures = tokio::time::timeout(TIMEOUT, client.cosign_signatures(&image, &digest))
+        let result = tokio::time::timeout(TIMEOUT, client.cosign_signatures(&image, &digest))
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(signatures.len(), 1);
-        crate::verify(&signatures[0], signer.public_key(), &image, &digest).unwrap();
-        assert_eq!(cdn.requests().len(), 1, "the blob was fetched from the CDN");
+            .map(|signatures| {
+                assert_eq!(signatures.len(), 1);
+                crate::verify(&signatures[0], signer.public_key(), &image, &digest).unwrap();
+            });
+        (result, cdn.requests())
     }
 
     #[tokio::test]

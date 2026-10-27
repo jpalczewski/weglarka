@@ -2191,6 +2191,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "weglarka-http",
  "weglarka-model",
 ]

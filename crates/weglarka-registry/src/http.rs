@@ -73,12 +73,9 @@ pub(crate) fn parse_url(url: &str) -> Result<Url, HttpError> {
     if authority.is_empty() {
         return Err(HttpError::Url("missing host"));
     }
-    let parsed = Url::parse(url).map_err(|error| {
-        if error.to_string().contains("port") {
-            HttpError::Port
-        } else {
-            HttpError::Url("not a valid URL")
-        }
+    let parsed = Url::parse(url).map_err(|error| match error {
+        url::ParseError::InvalidPort => HttpError::Port,
+        _ => HttpError::Url("not a valid URL"),
     })?;
     if parsed.port() == Some(0) {
         return Err(HttpError::Port);
@@ -168,10 +165,7 @@ impl Client {
     ) -> Result<Response, HttpError> {
         let mut request = self.client.get(url.clone());
         if let Some(accept) = accept {
-            request = request.header(
-                ACCEPT,
-                HeaderValue::from_str(accept).map_err(|_| HttpError::Url("invalid Accept"))?,
-            );
+            request = request.header(ACCEPT, accept);
         }
         if let Some(token) = bearer {
             if !token.bytes().all(|b| b.is_ascii_graphic()) {

@@ -71,10 +71,23 @@ impl Purpose {
         match self {
             Self::Notify | Self::Api => Policy::none(),
             Self::Registry => Policy::custom(|attempt| {
-                if attempt.previous().len() > REGISTRY_MAX_REDIRECTS {
+                let previous = attempt.previous();
+                if previous.len() > REGISTRY_MAX_REDIRECTS {
                     attempt.error(RedirectRefused::TooMany(REGISTRY_MAX_REDIRECTS))
                 } else if !transport_allowed(attempt.url()) {
                     attempt.error(RedirectRefused::Insecure)
+                } else if previous
+                    .last()
+                    .zip(previous.first())
+                    .is_some_and(|(last, first)| {
+                        // `reqwest` rebuilds every hop from the original headers and strips `Authorization`
+                        // only when a hop changes authority relative to the *previous* one, so a second hop
+                        // within the CDN would get the token back. Leaving the original authority is
+                        // therefore allowed once, and only as the final hop.
+                        authority(last) != authority(first)
+                    })
+                {
+                    attempt.error(RedirectRefused::Chained)
                 } else {
                     attempt.follow()
                 }
@@ -96,6 +109,12 @@ enum RedirectRefused {
     TooMany(usize),
     #[error("redirect to a URL that is neither https nor loopback")]
     Insecure,
+    #[error("redirect from a host other than the original one (the token must not follow)")]
+    Chained,
+}
+
+fn authority(url: &Url) -> (Option<&str>, Option<u16>) {
+    (url.host_str(), url.port_or_known_default())
 }
 
 /// Whether credentials may travel to `url`: `https://`, or plain `http://` to a loopback address
@@ -105,11 +124,9 @@ pub fn transport_allowed(url: &Url) -> bool {
     match url.scheme() {
         "https" => true,
         "http" => url.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
         }),
         _ => false,
     }
@@ -172,6 +189,8 @@ pub fn builder_with_roots(
         .timeout(purpose.timeout())
         // Never route a bearer token through a proxy picked up from the environment by accident.
         .no_proxy()
+        // The default would tell a redirect target (a CDN) which registry URL the client came from.
+        .referer(false)
         .redirect(purpose.redirects());
     if !purpose.pooled() {
         builder = builder.pool_max_idle_per_host(0);
@@ -309,7 +328,7 @@ mod tests {
         for (url, allowed) in [
             ("https://ghcr.io/", true),
             ("http://127.0.0.1:5000/", true),
-            ("http://localhost/", true),
+            ("http://localhost/", false),
             ("http://[::1]:5000/", true),
             ("http://example.com/", false),
             ("http://10.0.0.1/", false),

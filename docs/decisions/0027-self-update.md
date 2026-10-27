@@ -135,9 +135,18 @@ immediately).
 ## Amendment: shared HTTP client (#219)
 
 The registry fetches (token, `.sig` manifest, payload blob) now go through the shared `weglarka-http` client
-(`Purpose::Registry`) instead of a hand-written HTTP/1.1 client. The guarantees are unchanged: bundled roots and
-`ring`, every body capped while it is read (token 8 KiB, manifest 1 MiB, payload 64 KiB), at most 5 redirects, each only
-to `https://` (or loopback in tests), a 30 s total timeout per request, and the bearer token is not forwarded to
-another host or port on a redirect (`reqwest` strips `Authorization`; a test pins it, including GHCR's blob → CDN
-shape). One difference: a redirect without a `Location` header is now reported as the 3xx status instead of a
-dedicated error.
+(`Purpose::Registry`) instead of a hand-written HTTP/1.1 client. Unchanged: bundled roots and `ring`, every body
+capped while it is read (token 8 KiB, manifest 1 MiB, payload 64 KiB), at most 5 redirects, each only to `https://`
+(or a loopback IP in tests), and the bearer token never reaching a host other than the registry.
+
+Not identical to the old client, and why:
+
+* **Token on redirects.** `reqwest` rebuilds each hop from the original headers and strips `Authorization` only when
+  a hop changes host or port *relative to the previous hop*, so `registry → cdn/a → cdn/b` would hand the token to the
+  CDN on the second hop. The redirect policy therefore allows leaving the original authority once, as the final hop; a
+  further hop is refused (the old client would have followed it without the token, GHCR does not need it). Tests cover
+  the single CDN hop and the two-hop chain, asserting on the requests the CDN received.
+* `Referer` is disabled on all clients, so a CDN is not told which registry URL the client came from.
+* The response head limit is now hyper's default (about 16 KiB of headers) instead of our own 16 KiB check, and the
+  total timeout (30 s) also covers reading the body.
+* A redirect without a `Location` header is reported as the 3xx status instead of a dedicated error.
