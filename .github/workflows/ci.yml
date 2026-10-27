@@ -135,7 +135,8 @@ jobs:
           cargo run -q -p weglarka-identity --example render -- "$conf"
           cp .github/authelia/base.yml "$conf/base.yml"
           echo 'users: {}' > "$conf/users.yml"
-          # The issuer's signing key is generated here; it never leaves the runner.
+          # The issuer's signing key is a throwaway generated here; it never leaves the runner, and it is made
+          # world-readable (chmod below) only so the container's non-root user can read it.
           openssl genrsa -out "$conf/jwks.pem" 2048
           { printf 'identity_providers:\n  oidc:\n    jwks:\n      - key: |\n'; sed 's/^/          /' "$conf/jwks.pem"; } > "$conf/jwks.yml"
           rm "$conf/jwks.pem"
@@ -144,11 +145,22 @@ jobs:
             docker run --rm -v "$conf:/config:ro" "$AUTHELIA_IMAGE" \
               authelia config validate --config /config/base.yml,/config/jwks.yml,"$1"
           }
-          validate /config/oidc-clients.yml,/config/access-control.yml
+          # Warnings are deprecations that "will become errors": treat them as failures too.
+          out=$(validate /config/oidc-clients.yml,/config/access-control.yml 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if grep -qi 'warn' <<< "$out"; then
+            echo "::error::authelia config validate printed warnings"
+            exit 1
+          fi
           # Negative control: a misspelled field must fail, or the validator would prove nothing.
           sed 's/"claims_policy"/"claims_polcy"/' "$conf/oidc-clients.yml" > "$conf/broken.yml"
-          if validate /config/broken.yml,/config/access-control.yml; then
-            echo "::error::authelia accepted an unknown field; the validation step is not checking anything"
+          if validate /config/broken.yml,/config/access-control.yml >/dev/null 2>&1; then
+            echo "::error::authelia accepted an unknown field in oidc-clients.yml; the validation step is not checking anything"
+            exit 1
+          fi
+          sed 's/"default_policy"/"default_polcy"/' "$conf/access-control.yml" > "$conf/broken-acl.yml"
+          if validate /config/oidc-clients.yml,/config/broken-acl.yml >/dev/null 2>&1; then
+            echo "::error::authelia accepted an unknown field in access-control.yml; the validation step is not checking anything"
             exit 1
           fi
 

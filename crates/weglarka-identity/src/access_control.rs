@@ -4,7 +4,9 @@
 
 use serde::Serialize;
 use weglarka_model::app::{InstanceName, check_path_prefix};
-use weglarka_model::identity::{AuthorizationPolicy, check_issuer, valid_auth_group};
+use weglarka_model::identity::{
+    AuthorizationPolicy, check_issuer, valid_auth_group, valid_dns_name,
+};
 
 use crate::{RenderError, to_text};
 
@@ -68,6 +70,11 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
         if let Some(d) = app.domains.iter().find(|d| !valid_domain(d)) {
             return Err(RenderError::InvalidDomain(name.to_owned(), d.clone()));
         }
+        // The portal's `bypass` rule comes first, so an app on the portal's host (or a wildcard over it)
+        // would be served without authentication.
+        if let Some(d) = app.domains.iter().find(|d| covers(d, &portal[0])) {
+            return Err(RenderError::PortalDomain(name.to_owned(), d.clone()));
+        }
         if let Some(g) = app.groups.iter().find(|g| !valid_auth_group(g)) {
             return Err(RenderError::InvalidGroup(name.to_owned(), g.clone()));
         }
@@ -92,10 +99,15 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
         if whole_domain {
             whole.push(rule);
         } else {
-            scoped.push(rule);
+            let longest = app.paths.iter().map(String::len).max().unwrap_or(0);
+            scoped.push((longest, rule));
         }
     }
 
+    // Most specific prefix first (stable, so ties stay in instance order): the first match wins, and `/docs`
+    // must not shadow `/docs/internal`.
+    scoped.sort_by_key(|(longest, _)| std::cmp::Reverse(*longest));
+    let scoped = scoped.into_iter().map(|(_, rule)| rule);
     let mut rules = vec![Rule {
         domain: &portal,
         policy: "bypass",
@@ -115,18 +127,15 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
 /// Domains land in the rule verbatim, so the alphabet is the hostname one (a leading `*.` wildcard is
 /// what Authelia understands too).
 fn valid_domain(domain: &str) -> bool {
-    let host = domain.strip_prefix("*.").unwrap_or(domain);
-    !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+    valid_dns_name(domain.strip_prefix("*.").unwrap_or(domain))
+}
+
+/// Whether a rule domain matches `host`: equal, or a `*.suffix` wildcard over it.
+fn covers(domain: &str, host: &str) -> bool {
+    domain == host
+        || domain
+            .strip_prefix('*')
+            .is_some_and(|suffix| host.ends_with(suffix))
 }
 
 /// `^/prefix([/?].*)?$`: the prefix itself, anything below it, or its query string — but not `/prefixx`.

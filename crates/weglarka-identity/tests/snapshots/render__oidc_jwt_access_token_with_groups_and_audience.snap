@@ -40,6 +40,13 @@ expression: "clients_only(&[\"api\"])"
           "claims_policy": "weglarka-api",
           "require_pkce": true,
           "pkce_challenge_method": "S256",
+          "response_types": [
+            "code"
+          ],
+          "grant_types": [
+            "authorization_code",
+            "refresh_token"
+          ],
           "access_token_signed_response_alg": "RS256"
         }
       ]

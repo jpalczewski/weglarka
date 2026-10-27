@@ -186,3 +186,72 @@ fn access_control_rejects_unsafe_input() {
     }
     assert!(render_access_control("https://auth.example.com/x", &[]).is_err());
 }
+
+#[test]
+fn oidc_pkce_off_renders_neither_pkce_field() {
+    let text = clients_only(&["legacy"]);
+    assert!(text.contains("\"require_pkce\": false"));
+    assert!(!text.contains("pkce_challenge_method"));
+}
+
+#[test]
+fn oidc_offline_access_gets_refresh_grants() {
+    let text = clients_only(&["api"]);
+    assert!(text.contains("\"refresh_token\""));
+    assert!(text.contains("\"response_types\""));
+    assert!(!clients_only(&["panel"]).contains("grant_types"));
+}
+
+#[test]
+fn oidc_rejects_groups_in_opaque_access_token() {
+    let spec = oidc(
+        r#"
+        redirect_uris = ["https://x.example.com/cb"]
+        scopes = ["openid", "groups"]
+        groups_in_access_token = true
+        client_secret = { kind = "env", var = "S" }
+        "#,
+    );
+    let n = name("x");
+    assert_eq!(
+        render_oidc_clients(
+            &[AppClient {
+                instance: &n,
+                spec: &spec,
+                secret_digest: Some(DIGEST)
+            }],
+            &Default::default()
+        ),
+        Err(RenderError::GroupsInOpaqueToken("x".into()))
+    );
+}
+
+#[test]
+fn access_control_rejects_app_on_the_portal_host() {
+    for domain in ["auth.example.com", "*.example.com"] {
+        let app = Forward::new(
+            "p",
+            &format!("image = \"x\"\ndomains = [\"{domain}\"]\npaths = [\"/admin\"]\n"),
+        );
+        assert!(matches!(
+            render_access_control(ISSUER, &[app.forward()]),
+            Err(RenderError::PortalDomain(..))
+        ));
+    }
+    let other = Forward::new("o", "image = \"x\"\ndomains = [\"*.example.org\"]\n");
+    assert!(render_access_control(ISSUER, &[other.forward()]).is_ok());
+}
+
+#[test]
+fn access_control_nested_prefixes_most_specific_first() {
+    let outer = Forward::new(
+        "a-outer",
+        "image = \"x\"\ndomains = [\"t.example.com\"]\npaths = [\"/docs\"]\n",
+    );
+    let inner = Forward::new(
+        "z-inner",
+        "image = \"x\"\ndomains = [\"t.example.com\"]\npaths = [\"/docs/internal\"]\n",
+    );
+    let text = render_access_control(ISSUER, &[outer.forward(), inner.forward()]).unwrap();
+    assert!(text.find("docs/internal").unwrap() < text.find("^/docs(").unwrap());
+}

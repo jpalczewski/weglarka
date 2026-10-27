@@ -61,7 +61,12 @@ struct Client<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     claims_policy: Option<String>,
     require_pkce: bool,
-    pkce_challenge_method: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pkce_challenge_method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    response_types: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    grant_types: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     access_token_signed_response_alg: Option<&'static str>,
 }
@@ -152,6 +157,17 @@ pub fn render_oidc_clients(
             (false, Some(d)) if valid_secret_digest(d) => Some(d),
             (false, Some(_)) => return Err(RenderError::InvalidDigest(id.to_owned())),
         };
+        if c.groups_in_access_token && c.access_token == AccessTokenFormat::Opaque {
+            return Err(RenderError::GroupsInOpaqueToken(id.to_owned()));
+        }
+        let scopes: Vec<&str> = match c.scopes {
+            Some(list) => list.iter().map(String::as_str).collect(),
+            None => DEFAULT_SCOPES.to_vec(),
+        };
+        // Refresh tokens need both lists; without them `offline_access` silently yields none.
+        let refresh = scopes.contains(&"offline_access");
+        // A public client cannot do without PKCE, whatever the spec says.
+        let require_pkce = c.public || c.pkce == Pkce::Required;
         let claims_policy = (c.groups_in_id_token || c.groups_in_access_token).then(|| {
             // Namespaced so the operator's own policies in the base config survive the merge.
             let policy = format!("weglarka-{id}");
@@ -170,10 +186,7 @@ pub fn render_oidc_clients(
             client_secret,
             public: c.public,
             redirect_uris: c.redirect_uris,
-            scopes: match c.scopes {
-                Some(list) => list.iter().map(String::as_str).collect(),
-                None => DEFAULT_SCOPES.to_vec(),
-            },
+            scopes,
             authorization_policy: match c.authorization_policy {
                 AuthorizationPolicy::OneFactor => "one_factor",
                 AuthorizationPolicy::TwoFactor => "two_factor",
@@ -185,9 +198,15 @@ pub fn render_oidc_clients(
             },
             audience: c.audience,
             claims_policy,
-            // A public client cannot do without PKCE, whatever the spec says.
-            require_pkce: c.public || c.pkce == Pkce::Required,
-            pkce_challenge_method: "S256",
+            require_pkce,
+            // Authelia treats any non-empty method as "PKCE required", so `pkce = "off"` omits it.
+            pkce_challenge_method: require_pkce.then_some("S256"),
+            response_types: if refresh { vec!["code"] } else { Vec::new() },
+            grant_types: if refresh {
+                vec!["authorization_code", "refresh_token"]
+            } else {
+                Vec::new()
+            },
             access_token_signed_response_alg: (c.access_token == AccessTokenFormat::Jwt)
                 .then_some("RS256"),
         });

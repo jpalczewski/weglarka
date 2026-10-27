@@ -37,6 +37,10 @@ pub enum RenderError {
     NoDomains(String),
     #[error("{0}: invalid domain {1:?}")]
     InvalidDomain(String, String),
+    #[error("{0}: domain {1:?} covers the portal host, which would make the app public")]
+    PortalDomain(String, String),
+    #[error("OIDC client {0:?}: groups_in_access_token needs access_token = \"jwt\"")]
+    GroupsInOpaqueToken(String),
     #[error("{0}: invalid auth group {1:?}")]
     InvalidGroup(String, String),
     #[error("{0}: invalid path prefix {1:?}: {2}")]
