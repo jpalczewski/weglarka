@@ -22,6 +22,8 @@ pub enum SecretError {
     /// A reserved secret whose value has the wrong shape. Never carries the value.
     #[error("secret {name} is malformed: {reason}")]
     Malformed { name: String, reason: &'static str },
+    #[error("invalid mint request: {0}")]
+    InvalidMint(&'static str),
     #[error("insecure permissions on {path}: {reason}")]
     Permissions { path: String, reason: String },
 }
@@ -63,6 +65,17 @@ pub fn fingerprint(value: &SecretValue) -> String {
 /// (`<instance>.registry-auth`, value `<username>:<password>`; docs/decisions/0026). The engine
 /// reads it on a pull; it is never bound to the container.
 pub const REGISTRY_AUTH_SECRET: &str = "registry-auth";
+
+/// Reserved app secrets of an OIDC client (#213): the 72-char client secret (injected into the app)
+/// and its PBKDF2 digest (what the identity provider stores). Written only by `SecretOps` minting,
+/// so `secrets set`/`remove` refuse them: one call must not split the pair.
+pub const OIDC_CLIENT_SECRET: &str = "oidc-client-secret";
+pub const OIDC_CLIENT_DIGEST: &str = "oidc-client-digest";
+
+/// Whether `name` (the `<name>` part) is one of the reserved OIDC credential secrets.
+pub fn is_oidc_reserved(name: &str) -> bool {
+    name == OIDC_CLIENT_SECRET || name == OIDC_CLIENT_DIGEST
+}
 
 /// Secret name in Podman and in the store: `<instance>.<name>` (a dot is not allowed in an
 /// instance name, so the composition is unambiguous).

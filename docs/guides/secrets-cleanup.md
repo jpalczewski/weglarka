@@ -35,3 +35,10 @@ The `state.orphan_secrets` check reports a `warn` with the list of secrets whose
 ## Compatibility
 
 The format of `secrets.toml`/`apps.toml`/`state.toml` is unchanged, so upgrading and rolling back the daemon are safe, and removing a secret changes neither the spec nor the `spec_hash` (only the value changes, not the binding). The file is still written atomically with 0600 permissions. A new CLI against **an older daemon** silently ignores `--purge-secrets` (the app is removed, the secrets stay) and gets 404 on `secrets remove`, so update the daemon first.
+
+## Reserved names
+
+`oidc-client-secret` and `oidc-client-digest` are minted as a pair by Węglarka (OIDC client credentials,
+issue #213) and cannot be set or removed with `weglarka secrets set` / `secrets remove`; the API answers 400 and
+points to `weglarka oidc rotate` (arrives with the identity rollout). `apps remove --purge-secrets` still clears
+both, because it removes the whole `<app>.*` scope. `secrets list` shows them like any other secret (metadata only).

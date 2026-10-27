@@ -1792,10 +1792,12 @@ dependencies = [
 name = "weglarka-model"
 version = "0.0.3"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "hex",
  "insta",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
