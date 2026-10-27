@@ -14,7 +14,7 @@
 //! * [`PublicKey`] strictly parses a PEM/DER SubjectPublicKeyInfo and accepts exactly one curve
 //!   (P-256); RSA, P-384 and malformed DER are distinct errors.
 //! * [`Registry`] fetches the signature manifest and the payload blobs (implemented by
-//!   [`HttpRegistry`] over a minimal HTTP/1.1 + rustls client, and by a fake for tests).
+//!   [`HttpRegistry`] over the shared `weglarka-http` client, and by a fake for tests).
 //! * [`verify`] parses the simple-signing payload, checks the type, the image digest and the
 //!   repository identity, and finally checks the signature over the exact payload bytes.
 //!

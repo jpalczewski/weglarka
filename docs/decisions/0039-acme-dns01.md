@@ -41,12 +41,11 @@ DNS-01 is a second `ChallengeSolver` next to HTTP-01.
 * `FakeDns` (feature `testing`) keeps the live records and a call log, with failure injection, for the ACME
   manager and daemon tests — the same pattern as `FakePodman` and `FakeRegistry`.
 
-**Cloudflare first.** API v4 over a small HTTP/1.1 + rustls client (`ring`, bundled `webpki-roots`; the daemon
-image is `scratch`), like `weglarka-registry` and `weglarka-notify`: one request per connection, bounded
-response head and body, no redirects, plain `http://` only for a loopback host (the tests) so the token can
-never travel unencrypted to a remote machine. A third copy of this client is a conscious cost: each crate
-keeps its own audited ~300 lines instead of a shared dependency or `reqwest`; folding them into one
-internal crate is a follow-up, not part of this decision.
+**Cloudflare first.** API v4 over the shared `weglarka-http` client (`reqwest` on `rustls`/`ring`, bundled
+`webpki-roots`; the daemon image is `scratch`): bounded response body, no redirects, plain `http://` only for
+a loopback host (the tests) so the token can never travel unencrypted to a remote machine. The token goes
+out as a sensitive `Authorization` header. (The first version carried its own ~300-line HTTP/1.1 client;
+it was replaced in #219, see ADR 0021's amendment.)
 
 * **Zone discovery** walks the name's suffixes (longest first, at least two labels) against
   `GET /zones?name=`. A token lists only the zones it may see, so a name outside them is

@@ -1,6 +1,6 @@
 //! The one place that builds outbound HTTP clients for Węglarka.
 //!
-//! Every network-facing crate (notifications, and later registry, DNS, ACME) gets its
+//! Every network-facing crate (notifications, registry, DNS, and later ACME) gets its
 //! `reqwest::Client` from here, so TLS and redirect policy are decided once:
 //!
 //! - **TLS**: `rustls` with the `ring` provider passed explicitly (the process-wide default provider
@@ -15,12 +15,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Url;
 use reqwest::redirect::Policy;
 use rustls::crypto::ring::default_provider;
 use rustls::{ClientConfig, RootCertStore};
 
 pub use reqwest;
 
+/// Redirect hops the [`Purpose::Registry`] client follows (GHCR uses one: blob → CDN).
+const REGISTRY_MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = concat!("weglarka/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, thiserror::Error)]
@@ -39,32 +42,124 @@ pub enum Purpose {
     /// Notification delivery (ntfy): a short exchange that may carry a bearer token, so redirects are
     /// never followed. Connections are not pooled (one request per connection, as before).
     Notify,
+    /// OCI registry reads (token endpoint, manifests, blobs). Redirects are followed up to
+    /// [`REGISTRY_MAX_REDIRECTS`] hops and only to `https://` (or loopback, for tests); `reqwest`
+    /// drops `Authorization` when a hop leaves the original host or port, which is what a GHCR blob
+    /// redirect to a CDN needs.
+    Registry,
+    /// A JSON API called with a bearer token (the DNS provider). The API root is fixed, so redirects
+    /// are never followed and the token cannot be handed to another host.
+    Api,
 }
 
 impl Purpose {
     fn connect_timeout(self) -> Duration {
         match self {
-            Self::Notify => Duration::from_secs(10),
+            Self::Notify | Self::Registry | Self::Api => Duration::from_secs(10),
         }
     }
 
+    /// Total time for one request, redirects and body included.
     fn timeout(self) -> Duration {
         match self {
             Self::Notify => Duration::from_secs(10),
+            Self::Registry | Self::Api => Duration::from_secs(30),
         }
     }
 
     fn redirects(self) -> Policy {
         match self {
-            Self::Notify => Policy::none(),
+            Self::Notify | Self::Api => Policy::none(),
+            Self::Registry => Policy::custom(|attempt| {
+                let previous = attempt.previous();
+                if previous.len() > REGISTRY_MAX_REDIRECTS {
+                    attempt.error(RedirectRefused::TooMany(REGISTRY_MAX_REDIRECTS))
+                } else if !transport_allowed(attempt.url()) {
+                    attempt.error(RedirectRefused::Insecure)
+                } else if previous
+                    .last()
+                    .zip(previous.first())
+                    .is_some_and(|(last, first)| {
+                        // `reqwest` rebuilds every hop from the original headers and strips `Authorization`
+                        // only when a hop changes authority relative to the *previous* one, so a second hop
+                        // within the CDN would get the token back. Leaving the original authority is
+                        // therefore allowed once, and only as the final hop.
+                        authority(last) != authority(first)
+                    })
+                {
+                    attempt.error(RedirectRefused::Chained)
+                } else {
+                    attempt.follow()
+                }
+            }),
         }
     }
 
     fn pooled(self) -> bool {
         match self {
-            Self::Notify => false,
+            Self::Notify | Self::Registry | Self::Api => false,
         }
     }
+}
+
+/// Why a redirect was not followed; the cause inside the `reqwest` error of the request.
+#[derive(Debug, thiserror::Error)]
+enum RedirectRefused {
+    #[error("more than {0} redirects")]
+    TooMany(usize),
+    #[error("redirect to a URL that is neither https nor loopback")]
+    Insecure,
+    #[error("redirect from a host other than the original one (the token must not follow)")]
+    Chained,
+}
+
+fn authority(url: &Url) -> (Option<&str>, Option<u16>) {
+    (url.host_str(), url.port_or_known_default())
+}
+
+/// Whether credentials may travel to `url`: `https://`, or plain `http://` to a loopback address
+/// (a test server). Callers check their own target URLs with this; the registry client applies it to
+/// every redirect hop.
+pub fn transport_allowed(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// The body of `response`, at most `limit` bytes. The limit is enforced while reading, so a lying
+/// `Content-Length` (or none, with a chunked stream) cannot make the daemon allocate more.
+pub async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, BodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(BodyError::TooLarge { limit });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(BodyError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BodyError {
+    #[error("the response body exceeds {limit} bytes")]
+    TooLarge { limit: usize },
+    #[error("cannot read the response body: {}", error_chain(.0))]
+    Read(#[from] reqwest::Error),
 }
 
 /// Client trusting the bundled Mozilla root store (`webpki-roots`).
@@ -94,6 +189,8 @@ pub fn builder_with_roots(
         .timeout(purpose.timeout())
         // Never route a bearer token through a proxy picked up from the environment by accident.
         .no_proxy()
+        // The default would tell a redirect target (a CDN) which registry URL the client came from.
+        .referer(false)
         .redirect(purpose.redirects());
     if !purpose.pooled() {
         builder = builder.pool_max_idle_per_host(0);
@@ -169,6 +266,118 @@ mod tests {
             .unwrap();
         let request = request.await.unwrap().to_ascii_lowercase();
         assert!(request.contains("\r\nuser-agent: weglarka/"), "{request}");
+    }
+
+    /// Serves `count` connections, each answering `302 → Location: <location>`.
+    async fn serve_redirects(location: String, count: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let reply = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn api_clients_do_not_follow_redirects() {
+        let addr = serve_redirects("http://127.0.0.1:1/".into(), 1).await;
+        let response = client(Purpose::Api)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+    }
+
+    #[tokio::test]
+    async fn registry_clients_cap_the_redirect_chain() {
+        let addr = serve_redirects("/again".into(), 16).await;
+        let error = client(Purpose::Registry)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_redirect(), "{}", error_chain(&error));
+        assert!(error_chain(&error).contains("more than 5 redirects"));
+    }
+
+    #[tokio::test]
+    async fn registry_clients_refuse_a_redirect_to_plain_http_on_a_remote_host() {
+        let addr = serve_redirects("http://example.com/blob".into(), 1).await;
+        let error = client(Purpose::Registry)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_redirect(), "{}", error_chain(&error));
+    }
+
+    #[test]
+    fn plain_http_is_allowed_to_loopback_only() {
+        for (url, allowed) in [
+            ("https://ghcr.io/", true),
+            ("http://127.0.0.1:5000/", true),
+            ("http://localhost/", false),
+            ("http://[::1]:5000/", true),
+            ("http://example.com/", false),
+            ("http://10.0.0.1/", false),
+            ("ftp://127.0.0.1/", false),
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(transport_allowed(&url), allowed, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bodies_are_read_up_to_the_cap() {
+        let (addr, _) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
+        let response = client(Purpose::Api)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(response, 5).await.unwrap(), b"hello");
+
+        // A declared length over the cap is refused before reading.
+        let (addr, _) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n").await;
+        let response = client(Purpose::Api)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_capped(response, 100).await,
+            Err(BodyError::TooLarge { limit: 100 })
+        ));
+
+        // A chunked body has no length to check: the cap is enforced while reading.
+        let (addr, _) = serve_once(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n8\r\n12345678\r\n0\r\n\r\n",
+        )
+        .await;
+        let response = client(Purpose::Api)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_capped(response, 10).await,
+            Err(BodyError::TooLarge { limit: 10 })
+        ));
     }
 
     #[test]

@@ -69,6 +69,8 @@ thiserror = "2"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# Only to name `url::ParseError` (the type behind `reqwest::Url`); already in the graph via reqwest.
+url = { version = "2", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "1"
 # No `attributes` (`#[instrument]`, pulls in syn 2): only the logging macros are used.
