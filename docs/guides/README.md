@@ -56,6 +56,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [ACME behind a CDN](acme-behind-cdn.md) | HTTP-01 through the Cloudflare proxy, `acme.cdn` |
 | [ACME certificates](acme.md) | HTTP-01 issuance and renewal (`[acme]`) |
 | [Wildcard certificates](wildcard-certificates.md) | DNS-01 (`[acme.dns]`) |
+| [Forward auth](forward-auth.md) | Login in front of an app via the identity provider (`ingress.auth`) |
 
 ## Operations
 

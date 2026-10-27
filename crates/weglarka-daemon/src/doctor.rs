@@ -70,6 +70,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
     acme(d, &mut checks);
+    identity_forward(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }
 }
@@ -1683,6 +1684,63 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                 Some("chmod 600"),
             )
         });
+    }
+}
+
+/// `identity.forward` (#89): for each domain with forward auth, ask the provider the question nginx
+/// asks, over the probe socket. 401 + `Location` is the healthy answer; 400 means the domain is not
+/// under any `session.cookies[].domain` of the provider (nginx would answer 500 for every request).
+async fn identity_forward<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Some(identity) = &d.host.identity else {
+        return;
+    };
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let mut domains: Vec<&str> = apps
+        .apps
+        .values()
+        .filter(|spec| spec.start && !spec.ingress.auth.is_none())
+        .flat_map(|spec| spec.domains.iter().map(String::as_str))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    if domains.is_empty() {
+        return;
+    }
+    let issuer_host = identity
+        .issuer
+        .strip_prefix("https://")
+        .unwrap_or(&identity.issuer);
+    let socket = crate::ingress::probe_socket_path(&d.paths.nginx_conf_dir);
+    for domain in domains {
+        let id = "identity.forward";
+        let url = format!("https://{domain}/");
+        out.push(
+            match crate::health_probe::authz_probe(&socket, issuer_host, &url).await {
+                Ok(a) if a.status == 401 && a.has_location => {
+                    ok(id, format!("{domain}: the provider asks for a login"))
+                }
+                Ok(a) if a.status == 400 => check(
+                    id,
+                    CheckStatus::Fail,
+                    format!("{domain}: the provider rejects the target URL (400)"),
+                    Some("the domain must lie under a session.cookies[].domain of the provider; until then every request to it fails with 500"),
+                ),
+                Ok(a) => check(
+                    id,
+                    CheckStatus::Fail,
+                    format!("{domain}: unexpected answer {} (location: {})", a.status, a.has_location),
+                    Some("expected 401 with a Location; check that the provider runs and is routed by ingress"),
+                ),
+                Err(e) => check(
+                    id,
+                    CheckStatus::Fail,
+                    format!("{domain}: {e}"),
+                    Some("the provider must run and have a domain routed by ingress; protected apps answer 500 meanwhile"),
+                ),
+            },
+        );
     }
 }
 

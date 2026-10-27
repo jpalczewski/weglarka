@@ -1,4 +1,4 @@
-//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...] [WILDCARD_APEX,...]|traefik`
+//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...] [WILDCARD_APEX,...]|nginx-forward [RESOLVER] [TRUSTED,...]|nginx-edge-forward [CERT_DOMAIN,...]|traefik`
 //! — prints a sample config (used in CI for `nginx -t`, the forwarded-header, streaming, body-size and
 //! edge tests). `nginx-edge` (issue #95) renders the `edge` sample: the domains passed as a comma
 //! list have a certificate under `/etc/nginx/tls`, the rest exercise the plain-HTTP-only branch; an
@@ -8,6 +8,9 @@
 //! buffered defaults, so `.github/scripts/test-streaming.sh` can use it as the negative control.
 //! `upload` (streamed, 256 MiB) and `capped` (not streamed, 8 MiB) carry `ingress.max_body_size`
 //! (ADR 0033) for `.github/scripts/test-body-size.sh`; `blog` is again the default-limit control.
+//! `nginx-forward` / `nginx-edge-forward` (#89) render the forward-auth sample for
+//! `.github/scripts/test-forward-auth.sh`: `panel` (`panel.example.eu`, forward auth, `/mcp/` exempt) and
+//! `open` (no auth) are upstreams on port 3000, the provider `authelia` answers on 9091.
 //! `landing` (the whole `landing.example.eu`) and `docs` (`blog.example.eu/docs`, next to the `blog` container
 //! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`.
 
@@ -97,6 +100,32 @@ domains = ["blog.example.eu"]
 paths = ["/docs"]
 "#;
 
+/// `[identity]` for the forward-auth samples; its instance is the `authelia` app below.
+const IDENTITY: &str = r#"
+[identity]
+provider = "authelia"
+instance = "authelia"
+issuer = "https://auth.example.eu"
+"#;
+
+const FORWARD_APPS: &str = r#"
+[apps.authelia]
+image = "ghcr.io/authelia/authelia:latest"
+domains = ["auth.example.eu"]
+port = 9091
+
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "forward", auth_exempt_paths = ["/mcp/"] }
+
+[apps.open]
+image = "ghcr.io/x/open:latest"
+domains = ["open.example.eu"]
+port = 3000
+"#;
+
 fn main() {
     let host = HostConfig::from_toml_str(HOST).expect("host");
     let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(APPS).expect("apps").apps;
@@ -141,9 +170,42 @@ fn main() {
             options.proxy_socket_dir = std::env::var("WEGLARKA_DUMP_PROXY_SOCKET_DIR").ok();
             nginx::generate(&host, &apps, &options)
         }
+        Some("nginx-forward") => {
+            let host = HostConfig::from_toml_str(&format!("{HOST}{IDENTITY}")).expect("host");
+            let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(FORWARD_APPS).expect("apps").apps;
+            let resolver = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "10.89.0.1".into());
+            let trusted: Vec<String> = std::env::args()
+                .nth(3)
+                .unwrap_or_else(|| "10.89.0.0/24".into())
+                .split(',')
+                .map(str::to_owned)
+                .collect();
+            let options = nginx::NginxOptions::new(vec![resolver.parse().expect("resolver")])
+                .with_trusted_proxies(&trusted)
+                .expect("trusted proxies");
+            nginx::generate(&host, &apps, &options)
+        }
+        Some("nginx-edge-forward") => {
+            let host = HostConfig::from_toml_str(&format!("{EDGE_HOST}{IDENTITY}")).expect("host");
+            let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(FORWARD_APPS).expect("apps").apps;
+            let mut options =
+                nginx::NginxOptions::new(vec!["10.89.0.1".parse().expect("resolver")]);
+            options.certificates = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "weglarka.example.eu".to_owned())
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(|d| Domain::new(d).expect("cert domain"))
+                .collect();
+            options.tls_fingerprint = Some("1a2b3c4d".to_owned());
+            options.proxy_socket_dir = std::env::var("WEGLARKA_DUMP_PROXY_SOCKET_DIR").ok();
+            nginx::generate(&host, &apps, &options)
+        }
         Some("traefik") => traefik::generate(&host, &apps, &traefik::TraefikOptions::default()),
         _ => {
-            eprintln!("usage: dump nginx|nginx-edge|traefik");
+            eprintln!("usage: dump nginx|nginx-edge|nginx-forward|nginx-edge-forward|traefik");
             std::process::exit(2);
         }
     };

@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use weglarka_model::app::{AppIngress, AppKind, AppSpec, InstanceName, check_path_prefix};
 use weglarka_model::config::{HostConfig, IngressMode};
+use weglarka_model::identity::{IngressAuth, check_issuer, check_upstream};
 
 /// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
 /// An app instance name must not equal it (it would shadow the webhook upstream).
@@ -40,6 +41,20 @@ pub enum IngressError {
     UnsupportedMode(IngressMode),
     #[error("invalid option {name}: {reason}")]
     InvalidOption { name: &'static str, reason: String },
+    #[error("app {0} uses forward auth, but weglarka.toml has no [identity] section")]
+    ForwardWithoutIdentity(InstanceName),
+    #[error(
+        "app {0} is the identity provider and cannot use forward auth (its login page would redirect to itself)"
+    )]
+    ForwardProvider(InstanceName),
+    #[error(
+        "app {app}: auth_exempt_paths entry {exempt:?} overlaps streaming path {streaming:?} (their locations would collide)"
+    )]
+    ExemptOverlap {
+        app: InstanceName,
+        exempt: String,
+        streaming: String,
+    },
 }
 
 /// Domain name after strict validation: lowercase ASCII, digits and `-`, ≥2 labels,
@@ -270,6 +285,36 @@ pub struct AppRoute<'a> {
     /// Per-app ingress behaviour (issue #64). Copied from the spec as-is: an app without a domain is
     /// not rendered at all, so the options never matter there.
     pub ingress: AppIngress,
+    /// `auth_exempt_paths` (#89), normalized: empty unless the app uses forward auth. Sorted, one
+    /// entry per path.
+    pub auth_exempt: Vec<ExemptPath>,
+}
+
+impl AppRoute<'_> {
+    /// Whether nginx asks the identity provider before serving this app.
+    pub fn forward_auth(&self) -> bool {
+        self.ingress.auth == IngressAuth::Forward
+    }
+}
+
+/// One `auth_exempt_paths` entry: `/x` is the exact path, `/x/` the exact `/x` plus everything below
+/// `/x/` (the pair `streaming_paths` renders, so `/x` itself is not left protected).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExemptPath {
+    /// The path without its trailing slash.
+    pub path: PathPrefix,
+    /// `true` when the entry also covers everything below `path/`.
+    pub prefix: bool,
+}
+
+/// The identity provider as the ingress needs it (docs/decisions/0052): where nginx sends the authz
+/// subrequests and where an unauthenticated browser goes when the provider gave no `Location`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRoute {
+    /// `host:port` on the app network (`[identity] upstream`, else `<instance>:<port>`).
+    pub upstream: String,
+    /// `https://host[:port]` of the provider's portal.
+    pub issuer: String,
 }
 
 /// One line of the effective route table (`doctor`, ADR 0031): a `(domain, path)` and where it goes.
@@ -299,9 +344,20 @@ pub struct Plan<'a> {
     pub bind: SocketAddr,
     pub apps: Vec<AppRoute<'a>>,
     pub webhook: WebhookRoute,
+    /// The identity provider; `Some` exactly when an app uses forward auth, so a config without such
+    /// an app renders no auth machinery at all.
+    pub identity: Option<IdentityRoute>,
 }
 
 impl<'a> Plan<'a> {
+    /// The provider, when an *active* app uses forward auth, i.e. when the config needs the authz
+    /// machinery at all (a `start = false` app renders no route).
+    pub fn forward_auth(&self) -> Option<&IdentityRoute> {
+        self.identity
+            .as_ref()
+            .filter(|_| self.apps.iter().any(|app| app.active && app.forward_auth()))
+    }
+
     /// Every `(domain, path)` of every app, sorted by domain then path.
     pub fn route_table(&self) -> Vec<RouteRow> {
         let mut rows: Vec<RouteRow> = self
@@ -381,6 +437,7 @@ impl<'a> Plan<'a> {
                 .iter()
                 .map(PathPrefix::new)
                 .collect::<Result<Vec<_>, _>>()?;
+            let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming)?;
             let mut domains = Vec::with_capacity(spec.domains.len());
             for raw in &spec.domains {
                 let domain = Domain::new(raw.clone())?;
@@ -388,7 +445,11 @@ impl<'a> Plan<'a> {
                     return Err(IngressError::DuplicateDomain(raw.clone()));
                 }
                 let others = claimed.entry(domain.clone()).or_default();
-                for path in paths.iter().chain(&streaming) {
+                for path in paths
+                    .iter()
+                    .chain(&streaming)
+                    .chain(auth_exempt.iter().map(|e| &e.path))
+                {
                     if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
                     {
                         // Two catch-alls are the pre-#130 "domain already taken" case.
@@ -408,6 +469,7 @@ impl<'a> Plan<'a> {
                     paths
                         .iter()
                         .chain(&streaming)
+                        .chain(auth_exempt.iter().map(|e| &e.path))
                         .map(|p| (instance, p.clone())),
                 );
                 domains.push(domain);
@@ -420,8 +482,11 @@ impl<'a> Plan<'a> {
                 paths,
                 active: spec.start,
                 ingress: spec.ingress.clone(),
+                auth_exempt,
             });
         }
+
+        let identity = identity_route(host, apps, &routes)?;
 
         Ok(Self {
             mode: host.ingress.mode,
@@ -431,6 +496,98 @@ impl<'a> Plan<'a> {
                 domain: webhook_domain,
                 upstream_port: host.webhook.listen.port(),
             },
+            identity,
         })
     }
+}
+
+/// Normalized `auth_exempt_paths` of an app that uses forward auth, checked against its streaming
+/// paths: both render `location = p` and `location ^~ p/`, so any overlap is a duplicate location or
+/// an ambiguous carve-out. Empty for an app without forward auth (the model rejects the field there).
+fn exempt_paths(
+    instance: &InstanceName,
+    ingress: &AppIngress,
+    streaming: &[PathPrefix],
+) -> Result<Vec<ExemptPath>, IngressError> {
+    if ingress.auth != IngressAuth::Forward {
+        return Ok(Vec::new());
+    }
+    let mut by_path: BTreeMap<PathPrefix, bool> = BTreeMap::new();
+    for raw in &ingress.auth_exempt_paths {
+        let (body, prefix) = match raw.strip_suffix('/') {
+            Some(body) => (body, true),
+            None => (raw.as_str(), false),
+        };
+        // `check_skip_path` (the model) already refuses `/`; `PathPrefix` would accept it.
+        if body.is_empty() {
+            return Err(IngressError::InvalidPath {
+                value: raw.clone(),
+                reason: "would exempt every request",
+            });
+        }
+        *by_path.entry(PathPrefix::new(body)?).or_default() |= prefix;
+    }
+    for path in by_path.keys() {
+        if let Some(streaming) = streaming.iter().find(|s| path.overlaps(s)) {
+            return Err(IngressError::ExemptOverlap {
+                app: instance.clone(),
+                exempt: path.to_string(),
+                streaming: streaming.to_string(),
+            });
+        }
+    }
+    Ok(by_path
+        .into_iter()
+        .map(|(path, prefix)| ExemptPath { path, prefix })
+        .collect())
+}
+
+/// The provider route, resolved only when an app asks for forward auth. Fail closed: a forward app
+/// without `[identity]` (or the provider itself behind forward auth) refuses the whole plan, so the
+/// last good `nginx.conf` stays instead of a config that serves the app unprotected.
+fn identity_route(
+    host: &HostConfig,
+    apps: &BTreeMap<InstanceName, AppSpec>,
+    routes: &[AppRoute<'_>],
+) -> Result<Option<IdentityRoute>, IngressError> {
+    let Some(first) = routes.iter().find(|r| r.forward_auth()) else {
+        return Ok(None);
+    };
+    let identity = host
+        .identity
+        .as_ref()
+        .ok_or_else(|| IngressError::ForwardWithoutIdentity(first.instance.clone()))?;
+    if apps
+        .get(&identity.instance)
+        .is_some_and(|provider| provider.ingress.auth == IngressAuth::Forward)
+    {
+        return Err(IngressError::ForwardProvider(identity.instance.clone()));
+    }
+    let bad = |name, reason: String| IngressError::InvalidOption { name, reason };
+    check_issuer(&identity.issuer).map_err(|r| bad("identity.issuer", r.to_owned()))?;
+    let upstream = match &identity.upstream {
+        Some(upstream) => {
+            check_upstream(upstream).map_err(|r| bad("identity.upstream", r.to_owned()))?;
+            upstream.clone()
+        }
+        None => {
+            let port = apps
+                .get(&identity.instance)
+                .and_then(|provider| provider.port)
+                .ok_or_else(|| {
+                    bad(
+                        "identity.upstream",
+                        format!(
+                            "unset, and instance {} has no port to default to",
+                            identity.instance
+                        ),
+                    )
+                })?;
+            format!("{}:{port}", identity.instance)
+        }
+    };
+    Ok(Some(IdentityRoute {
+        upstream,
+        issuer: identity.issuer.clone(),
+    }))
 }

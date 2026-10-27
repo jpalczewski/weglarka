@@ -15,6 +15,7 @@ pub(super) const EDGE_FORWARDED: Forwarded = Forwarded {
     xff: "$remote_addr",
     proto: "$scheme",
     fwd_host: "$host",
+    original_proto: "https",
 };
 
 /// `edge` behind a CDN: the client address is the one `$weglarka_client` resolves (see
@@ -24,6 +25,7 @@ pub(super) const EDGE_CDN_FORWARDED: Forwarded = Forwarded {
     xff: "$weglarka_client",
     proto: "$scheme",
     fwd_host: "$host",
+    original_proto: "https",
 };
 
 /// The visitor's address behind a CDN (issue #159): the CDN header for a peer inside the ranges,
@@ -93,8 +95,9 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         } else {
             &EDGE_FORWARDED
         };
-        write_proxy_headers(c, forwarded);
+        write_proxy_headers(c, forwarded, None);
         c.blank();
+        write_auth_maps(c, plan);
 
         write_default_server(c, o);
 
@@ -156,7 +159,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
                 }
                 c.line(&format!("server_name {domain};"));
                 set_app(c, app_name);
-                write_app_locations(c, o, &apps, shared);
+                write_app_locations(c, plan, o, forwarded, &apps, shared);
             });
         }
     });

@@ -60,7 +60,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
     let req: UpdateAppRequest =
         serde_json::from_slice(&body).map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
     state::validate_app(&name, &req.spec).map_err(invalid)?;
-    validate_config_mounts(&d, &req.spec)?;
+    validate_config_mounts(&d, &name, &req.spec)?;
 
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;

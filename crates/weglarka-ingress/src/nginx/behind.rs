@@ -15,6 +15,7 @@ pub(super) const BEHIND_FORWARDED: Forwarded = Forwarded {
     xff: "$weglarka_xff",
     proto: "$weglarka_proto",
     fwd_host: "$weglarka_fwd_host",
+    original_proto: "$weglarka_proto",
 };
 
 fn behind_redirect(c: &mut Conf) {
@@ -37,8 +38,9 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_log(c, ClientAddr::Direct, plan);
         c.blank();
-        write_proxy_headers(c, &BEHIND_FORWARDED);
+        write_proxy_headers(c, &BEHIND_FORWARDED, None);
         c.blank();
+        write_auth_maps(c, plan);
 
         write_default_server(c, o);
 
@@ -88,7 +90,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
                     },
                 );
                 behind_redirect(c);
-                write_app_locations(c, o, apps, shared);
+                write_app_locations(c, plan, o, &BEHIND_FORWARDED, apps, shared);
             });
         }
     });
