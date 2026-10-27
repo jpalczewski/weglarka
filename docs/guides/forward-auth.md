@@ -35,6 +35,8 @@ follow a login redirect. List them in `auth_exempt_paths`:
 - `/mcp/` exempts `/mcp` **and** everything below `/mcp/`; `/mcp` exempts only that exact path.
 - An exempt path is a full copy of the app's location (same upstream, body limit, streaming and timeouts) without the
   login check. It is structural, not an access rule: the path is simply not guarded.
+- Requests to an exempt path whose URI contains `;` or `\` (raw or percent-encoded) get `400`: nginx matches the normalized
+  path but the upstream receives the raw URI, and some servers read those characters as path syntax (`/mcp/..;/admin`).
 - Exempt paths must not overlap `streaming_paths`, and cannot be combined with `paths` (prefix routing).
 
 ## Not enabled yet

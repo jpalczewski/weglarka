@@ -184,6 +184,9 @@ http {
         }
         location = /.well-known/oauth {
             set $app "panel";
+            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+                return 400;
+            }
             set $upstream "http://panel:3000";
             proxy_pass $upstream;
             client_max_body_size 8388608;
@@ -191,6 +194,9 @@ http {
         }
         location = /health {
             set $app "panel";
+            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+                return 400;
+            }
             set $upstream "http://panel:3000";
             proxy_pass $upstream;
             client_max_body_size 8388608;
@@ -198,6 +204,9 @@ http {
         }
         location = /mcp {
             set $app "panel";
+            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+                return 400;
+            }
             set $upstream "http://panel:3000";
             proxy_pass $upstream;
             client_max_body_size 8388608;
@@ -205,6 +214,9 @@ http {
         }
         location ^~ /mcp/ {
             set $app "panel";
+            if ($request_uri ~* "(;|%3b|\\\\|%5c)") {
+                return 400;
+            }
             set $upstream "http://panel:3000";
             proxy_pass $upstream;
             client_max_body_size 8388608;

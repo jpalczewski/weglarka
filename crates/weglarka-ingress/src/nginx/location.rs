@@ -39,6 +39,10 @@ struct Location<'a> {
     /// without forward auth and for its `auth_exempt_paths` — those locations are the app's own
     /// minus the `auth_request`, so the exemption is structural, never a rule that could be misread.
     auth: bool,
+    /// An `auth_exempt_paths` location: nginx matches on the normalized path while the upstream
+    /// gets the raw request URI, so a request that only an upstream treating `;` or `\` as path
+    /// syntax would resolve elsewhere (`/mcp/..;/admin`) is refused instead of passed on unguarded.
+    exempt: bool,
 }
 
 /// The `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any other prefix
@@ -59,6 +63,7 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth,
+            exempt: false,
         }]
         .into_iter()
         .chain(streaming_locations(ingress, app, auth))
@@ -86,6 +91,7 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth,
+            exempt: false,
         },
         Location {
             header: format!("location ^~ {p}/"),
@@ -93,6 +99,7 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth,
+            exempt: false,
         },
     ]
 }
@@ -113,6 +120,7 @@ fn streaming_locations<'a>(
                 app,
                 long_lived: true,
                 auth,
+                exempt: false,
             })
     })
 }
@@ -135,6 +143,7 @@ fn exempt_locations<'a>(
                 app,
                 long_lived: false,
                 auth: false,
+                exempt: true,
             })
     })
 }
@@ -165,6 +174,11 @@ impl Backend<'_> {
             }
             // `return 503` runs in the rewrite phase, before any access check, so a route that only
             // reserves a name needs none.
+            if location.exempt {
+                c.block("if ($request_uri ~* \"(;|%3b|\\\\\\\\|%5c)\")", |c| {
+                    c.line("return 400;")
+                });
+            }
             if location.auth && !matches!(self, Backend::Unreleased) {
                 write_auth_request(c);
             }

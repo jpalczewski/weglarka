@@ -141,6 +141,10 @@ for path in /mcp /mcp/ /mcp/tools/list; do
   expect "exempt $path" "$out" 'X-Forwarded-Proto: https'
   expect "exempt $path" "$out" 'X-Forwarded-For: 203.0.113.9'
 done
+# An upstream may read `;` or `\` as path syntax (`/mcp/..;/admin`) while nginx matched the exempt prefix.
+for path in '/mcp/..;/admin' '/mcp/%3b/x' '/mcp/%5cx'; do
+  expect "exempt $path refused" "$(status_line "$(call panel.example.eu "$path")")" '400 '
+done
 out=$(call panel.example.eu /mcpx)
 expect 'sibling of an exempt path' "$(status_line "$out")" '302 '
 
