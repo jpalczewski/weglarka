@@ -274,6 +274,7 @@ fn auth_fields_need_forward() {
 #[test]
 fn auth_groups_and_exempt_paths_syntax() {
     let fwd = |extra: &str| spec(&format!("[ingress]\nauth = \"forward\"\n{extra}"));
+    lexical(&fwd("auth_exempt_paths = [\"/.well-known/\", \"/mcp/\"]")).unwrap();
     lexical(&fwd(
         "auth_groups = [\"weglarka-admins\", \"a.b_c\"]\nauth_exempt_paths = [\"/mcp\", \"/mcp/\"]",
     ))
