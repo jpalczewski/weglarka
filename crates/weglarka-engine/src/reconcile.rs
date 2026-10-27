@@ -39,6 +39,14 @@ pub enum EngineError {
     Podman(#[from] PodmanError),
     #[error("unknown instance: {0}")]
     UnknownInstance(InstanceName),
+    #[error(transparent)]
+    Render(#[from] weglarka_model::generated::RenderError),
+    /// The generated config pipeline (#212) could not write, swap or apply a version.
+    #[error("generated config for {consumer}: {message}")]
+    Generated {
+        consumer: InstanceName,
+        message: String,
+    },
     /// The registry refused the pull (401/403): the image may exist, but the podman user has no
     /// (valid) credentials for it. Fix `auth.json`, do not look for a missing image.
     #[error("cannot resolve image digest for {0}")]
@@ -555,6 +563,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) events: Arc<dyn EventSink>,
     pub(crate) http_prober: Option<Arc<dyn weglarka_model::limits::HttpProber>>,
     pub(crate) lock: tokio::sync::Mutex<()>,
+    /// Generators of config files for consumer apps (#212); `None` = the feature is off.
+    pub(crate) generated: Option<crate::generated::GeneratedWiring>,
     /// Free slots for one-off containers ([`crate::run::MAX_CONCURRENT_RUNS`]).
     pub(crate) runs: Arc<tokio::sync::Semaphore>,
     /// Free slots for forward relays ([`crate::forward::MAX_CONCURRENT_FORWARDS`]).
@@ -597,6 +607,7 @@ impl<P: PodmanClient> Reconciler<P> {
             events: Arc::new(TracingSink),
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
+            generated: None,
             runs: Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
             forwards: Arc::new(tokio::sync::Semaphore::new(
                 crate::forward::MAX_CONCURRENT_FORWARDS,
@@ -607,6 +618,12 @@ impl<P: PodmanClient> Reconciler<P> {
             monitor: crash::Policy::default(),
             watch: std::sync::Mutex::new(crash::Watcher::default()),
         }
+    }
+
+    /// Registers the generators whose files a consumer needs **before its first start** (bootstrap).
+    pub fn with_generated(mut self, wiring: crate::generated::GeneratedWiring) -> Self {
+        self.generated = Some(wiring);
+        self
     }
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {

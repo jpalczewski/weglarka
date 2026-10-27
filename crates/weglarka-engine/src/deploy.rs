@@ -460,6 +460,8 @@ impl<P: PodmanClient> Reconciler<P> {
         ),
         EngineError,
     > {
+        // Config files the app cannot start without exist before its first start (#212).
+        self.bootstrap_generated(instance).await?;
         let prepared = self.prepare_instance(instance, spec).await?;
         let name = labels::container_name(instance);
         match self
@@ -621,6 +623,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // Everything `launch` prepares, **without** touching the serving container.
+        self.bootstrap_generated(instance).await?;
         let (prepared, configs) = self.prepare_instance(instance, spec).await?;
         let range = prepared.range;
 
@@ -773,7 +776,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// and the daemon-side `health.http`. In one attempt every configured probe must pass; the first
     /// such attempt ends the gate in success and none after all attempts is a failure. With no probe
     /// at all, success = running for the whole window.
-    async fn health_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
+    pub(crate) async fn health_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
         let gate = &spec.health;
         let attempts = gate.attempts.max(1);
         let step = Duration::from_millis(gate.window_secs.max(1) * 1000 / u64::from(attempts));

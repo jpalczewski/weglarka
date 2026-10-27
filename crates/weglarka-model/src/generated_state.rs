@@ -31,6 +31,9 @@ pub enum LastResult {
     Invalid,
     /// The consumer failed its health gate and `current` went back to the previous version.
     RolledBack,
+    /// The new version went live but the consumer could not be reloaded or gated, and there was no
+    /// previous version to go back to.
+    Failed,
 }
 
 /// The pipeline's record for one generator id. Unknown fields are ignored (a newer daemon's file).
@@ -39,6 +42,9 @@ pub enum LastResult {
 pub struct GeneratorRecord {
     /// Fingerprint of the version the consumer is running (or will read on its next start).
     pub applied: Option<String>,
+    /// Fingerprint of the last render the pipeline tried to put live. A failed attempt of the same
+    /// render is not repeated (a restart loop) until the render changes or the operator forces it.
+    pub attempted: Option<String>,
     /// `false` when the version was applied without running the validator (bootstrap).
     pub validated: bool,
     pub last_result: LastResult,

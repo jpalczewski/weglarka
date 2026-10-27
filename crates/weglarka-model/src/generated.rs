@@ -117,8 +117,10 @@ pub trait ConfigGenerator: Send + Sync {
     /// Pure: the same input yields the same bytes (sorted maps, no timestamps).
     fn render(&self, input: &RenderInput<'_>) -> Result<Vec<GeneratedFile>, RenderError>;
 
-    /// Argv that validates `dir` (a path inside the consumer's mount) together with the consumer's
-    /// other config, derived from the consumer's own spec. `None` = nothing to run.
+    /// The full command line (program first) that validates `dir` (a path inside the consumer's
+    /// mount) together with the consumer's other config, derived from the consumer's own spec. The
+    /// engine runs it in a one-off container of the consumer with `argv[0]` as the entrypoint.
+    /// `None` = nothing to run.
     fn validate_argv(&self, consumer: &AppSpec, dir: &str) -> Option<Vec<String>>;
 }
 
