@@ -55,7 +55,7 @@ pub struct Pbkdf2Digest(String);
 
 impl Pbkdf2Digest {
     /// Derives the digest of `password` with an explicit salt (known-answer tests, minting).
-    pub fn derive(password: &[u8], salt: &[u8; SALT_LEN], iterations: u32) -> Self {
+    pub(crate) fn derive(password: &[u8], salt: &[u8; SALT_LEN], iterations: u32) -> Self {
         let iter = std::num::NonZeroU32::new(iterations).expect("iterations must be non-zero");
         let mut key = [0u8; KEY_LEN];
         pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA512, iter, salt, password, &mut key);
@@ -128,18 +128,16 @@ pub trait SecretOps: Send + Sync {
     fn mint_hashed(&self, name: &str, spec: &MintSpec) -> Result<Pbkdf2Digest, SecretError>;
     /// Replaces value and digest; returns the new digest.
     fn rotate_hashed(&self, name: &str, spec: &MintSpec) -> Result<Pbkdf2Digest, SecretError>;
-    /// The stored digest of a minted secret, `None` when it was not minted.
+    /// The stored digest of a minted secret, `None` when it was not minted. Reads the digest entry
+    /// only: a digest-only orphan (value removed out of band) still yields `Some`.
     fn digest(&self, name: &str) -> Result<Option<Pbkdf2Digest>, SecretError>;
 }
 
 /// Where the digest of `name` lives: `<scope>.<stem>-digest` for `<scope>.<stem>-secret`, else
 /// `<name>-digest`.
 fn digest_name(name: &str) -> Result<String, SecretError> {
-    let (_, local) = split_scoped(name)?;
-    let base = name
-        .strip_suffix("-secret")
-        .filter(|_| local.ends_with("-secret"))
-        .unwrap_or(name);
+    split_scoped(name)?;
+    let base = name.strip_suffix("-secret").unwrap_or(name);
     let digest = format!("{base}-digest");
     split_scoped(&digest)?;
     Ok(digest)
@@ -195,6 +193,12 @@ impl<S: SecretStore + ?Sized> SecretOps for S {
         let dname = digest_name(name)?;
         let value = draw(spec)?;
         let d = Pbkdf2Digest::mint(value.expose())?;
+        // Drop the old digest first: a crash after any later step leaves "value, no digest" (which
+        // `mint_hashed` repairs), never a new value next to a stale digest.
+        match self.remove(&dname) {
+            Ok(()) | Err(SecretError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
         self.set(name, value)?;
         self.set(&dname, SecretValue::new(d.to_string()))?;
         Ok(d)
@@ -247,7 +251,9 @@ mod tests {
     /// (not available when P1 was written); until then the vector above is the only evidence.
     #[test]
     #[ignore = "needs the Authelia-generated fixture (see TODO)"]
-    fn known_answer_authelia() {}
+    fn known_answer_authelia() {
+        todo!("commit the Authelia CLI vector (--iterations 310000) and assert re-derivation");
+    }
 
     #[test]
     fn mint_is_idempotent_and_shaped() {
@@ -300,6 +306,24 @@ mod tests {
             s.get("app.oidc-client-secret").unwrap().unwrap().expose(),
             b"x"
         );
+    }
+
+    #[test]
+    fn half_finished_rotation_is_repaired_by_mint() {
+        let (_d, s) = store();
+        s.mint_hashed("app.oidc-client-secret", &SPEC).unwrap();
+        // Crash after the new value landed: rotate has already dropped the old digest.
+        s.set("app.oidc-client-secret", SecretValue::new("other"))
+            .unwrap();
+        s.remove("app.oidc-client-digest").unwrap();
+        let d = s.mint_hashed("app.oidc-client-secret", &SPEC).unwrap();
+        let salt_b64 = d.to_string().split('$').nth(3).unwrap().replace('.', "+");
+        let salt: [u8; 16] = STANDARD_NO_PAD
+            .decode(salt_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(Pbkdf2Digest::derive(b"other", &salt, PBKDF2_ITERATIONS), d);
     }
 
     #[test]

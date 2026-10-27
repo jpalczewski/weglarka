@@ -5,22 +5,19 @@ use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::json;
-use std::os::unix::fs::PermissionsExt;
+use weglarka_model::secret_store::{SecretStore, SecretValue};
+use weglarka_model::secrets::FileSecretStore;
 
-/// What `weglarka oidc rotate` will write later (P4); seeded by hand because no API path may.
+/// What `weglarka oidc rotate` will write later (P4); seeded through the store because no API path may.
 fn seed_pair(h: &Harness, app: &str) {
     let path = h.root.join("state/secrets.toml");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let entry = |n: &str| {
-        format!("[secrets.\"{app}.{n}\"]\nvalue = \"x\"\nupdated_at = \"2026-10-27T00:00:00Z\"\n")
-    };
-    let text = format!(
-        "{}{}",
-        entry("oidc-client-secret"),
-        entry("oidc-client-digest")
-    );
-    std::fs::write(&path, text).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let store = FileSecretStore::new(path);
+    for n in ["oidc-client-secret", "oidc-client-digest"] {
+        store
+            .set(&format!("{app}.{n}"), SecretValue::new("x"))
+            .unwrap();
+    }
 }
 
 fn store(h: &Harness) -> String {
