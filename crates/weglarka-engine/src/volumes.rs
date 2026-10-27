@@ -318,7 +318,7 @@ impl<P: PodmanClient> Reconciler<P> {
         if let Some(r) = state::load_state(&self.paths.state)?.ingress_uid_range {
             return Ok(r);
         }
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut st = state::load_state(&self.paths.state)?;
         if let Some(r) = st.ingress_uid_range {
             return Ok(r);
@@ -496,7 +496,7 @@ impl<P: PodmanClient> Reconciler<P> {
         name: &InstanceName,
         options: RemoveAppOptions,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         crate::promote::ensure_unmanaged(&apps, name)?;
         // An app another app depends on cannot be removed (its `depends_on` would dangle, and with
@@ -581,7 +581,7 @@ impl<P: PodmanClient> Reconciler<P> {
         name: SharedVolumeName,
         group: Option<SharedVolumeName>,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         // A group equal to the volume's own name is the default, kept implicit in the file.
         let group = group.filter(|g| *g != name);
@@ -607,7 +607,7 @@ impl<P: PodmanClient> Reconciler<P> {
         name: &SharedVolumeName,
         purge: bool,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         if !apps.shared_volumes.contains_key(name) {
             return Err(EngineError::UnknownSharedVolume(name.clone()));
@@ -700,7 +700,7 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         new_spec: &AppSpec,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let new_label = match (
             state::load_apps(&self.paths.apps),
             state::load_state(&self.paths.state),
@@ -749,7 +749,7 @@ impl<P: PodmanClient> Reconciler<P> {
         lock_wait: Duration,
     ) -> Result<(), EngineError> {
         // Only the wait for the lock is bounded; the upload itself may take as long as it takes.
-        let _g = tokio::time::timeout(lock_wait, self.lock.lock())
+        let guard = tokio::time::timeout(lock_wait, self.acquire())
             .await
             .map_err(|_| EngineError::Busy)?;
         let apps = state::load_apps(&self.paths.apps)?;
@@ -863,7 +863,7 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         if was_running {
             if replace {
-                self.recreate_locked(instance, RecreateReason::Missing)
+                self.recreate_locked(&guard, instance, RecreateReason::Missing)
                     .await?;
             } else {
                 self.podman.container_start(&app_container).await?;

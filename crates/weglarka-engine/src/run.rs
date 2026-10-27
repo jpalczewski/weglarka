@@ -14,14 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
-use crate::deploy::{config_binds, instance_networks};
-use crate::reconcile::{EngineError, Reconciler};
+use crate::deploy::{app_container_base, instance_networks};
+use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use crate::secrets::materialize;
 use weglarka_model::app::InstanceName;
 use weglarka_model::labels;
-use weglarka_model::podman::{
-    ContainerFilter, ContainerSpec, LogChunk, PodmanClient, PodmanError, RestartPolicy,
-};
+use weglarka_model::podman::{ContainerFilter, ContainerSpec, LogChunk, PodmanClient, PodmanError};
 use weglarka_model::state;
 
 /// How many one-off containers may run at once, across all apps.
@@ -116,16 +114,26 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         options: &RunOptions,
     ) -> Result<PendingRun<P>, EngineError> {
+        let guard = self.acquire().await;
+        self.prepare_run_locked(&guard, instance, options).await
+    }
+
+    /// The body of [`Self::prepare_run`] for a caller that already holds the engine lock (the generated
+    /// config pipeline validates inside its own critical section). The returned [`PendingRun`] does not
+    /// hold the lock: drop the guard before driving it if the run is long.
+    pub(crate) async fn prepare_run_locked(
+        self: &Arc<Self>,
+        _held: &EngineGuard<'_>,
+        instance: &InstanceName,
+        options: &RunOptions,
+    ) -> Result<PendingRun<P>, EngineError> {
         options.validate()?;
         let slot = self
             .runs
             .clone()
             .try_acquire_owned()
             .map_err(|_| EngineError::RunLimit(MAX_CONCURRENT_RUNS))?;
-        let name = {
-            let _g = self.lock.lock().await;
-            self.create_run_container(instance, options).await?
-        };
+        let name = self.create_run_container(instance, options).await?;
         Ok(PendingRun {
             engine: self.clone(),
             instance: instance.clone(),
@@ -171,34 +179,23 @@ impl<P: PodmanClient> Reconciler<P> {
         let (networks, _) = instance_networks(instance, &spec);
         let name = labels::run_container_name(instance, &run_token());
 
-        let mut env = spec.env.clone();
-        env.extend(options.env.clone());
         let mut container = ContainerSpec {
-            name: name.clone(),
-            image,
             command: options.command.clone(),
             entrypoint: options.entrypoint.clone(),
-            labels: BTreeMap::from([
-                (labels::RUN.to_owned(), "true".to_owned()),
-                (labels::RUN_FOR.to_owned(), instance.to_string()),
-            ]),
-            env,
-            networks,
-            network_aliases: BTreeMap::new(),
-            secrets,
-            // Never the app's `host_ports`, never ingress routing (issue #106).
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: true,
-            mounts: config_binds(&configs),
-            keep_groups: !spec.group_add.is_empty(),
-            volumes: vec![],
-            resources: spec.resources.clone(),
-            // The image's own HEALTHCHECK would only add noise to a process that lives seconds.
-            healthcheck: None,
-            id_mapping: None,
-            security: spec.security.clone(),
+            ..app_container_base(
+                name.clone(),
+                image,
+                BTreeMap::from([
+                    (labels::RUN.to_owned(), "true".to_owned()),
+                    (labels::RUN_FOR.to_owned(), instance.to_string()),
+                ]),
+                &spec,
+                networks,
+                secrets,
+                &configs,
+            )
         };
+        container.env.extend(options.env.clone());
         prepared.apply(&mut container);
         self.podman.container_create(&container).await?;
         Ok(name)

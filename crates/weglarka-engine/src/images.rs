@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::deploy::normalize_image;
-use crate::reconcile::{EngineError, Reconciler};
+use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
@@ -191,13 +191,14 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Explicit prune (`POST /v1/images/prune`, `weglarka images prune`): every repository named in
     /// `apps.toml`. `dry_run` plans without removing anything.
     pub async fn prune_images(&self, dry_run: bool) -> Result<PruneReport, EngineError> {
-        let _g = self.lock.lock().await;
-        self.prune_images_locked(dry_run, None).await
+        let guard = self.acquire().await;
+        self.prune_images_locked(&guard, dry_run, None).await
     }
 
     /// The body of [`Self::prune_images`], under the engine lock.
     pub(crate) async fn prune_images_locked(
         &self,
+        _held: &EngineGuard<'_>,
         dry_run: bool,
         scope: Option<&str>,
     ) -> Result<PruneReport, EngineError> {
@@ -222,8 +223,8 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Best effort housekeeping after a successful deploy of `repo`: removes the app's images older
     /// than the current and the previous one. Never fails the deploy — a retention problem is logged.
-    pub(crate) async fn retain_images_locked(&self, repo: &str) {
-        match self.prune_images_locked(false, Some(repo)).await {
+    pub(crate) async fn retain_images_locked(&self, held: &EngineGuard<'_>, repo: &str) {
+        match self.prune_images_locked(held, false, Some(repo)).await {
             Ok(report) if report.removed.is_empty() => {
                 tracing::debug!(repo, "image retention: nothing to remove");
             }

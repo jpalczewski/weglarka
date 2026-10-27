@@ -540,6 +540,11 @@ impl Drop for ActivityGuard<'_> {
     }
 }
 
+/// Proof that the engine lock is held. The `*_locked` operations take it by reference, so calling
+/// one without the lock — or acquiring the (non-reentrant) lock a second time from inside one —
+/// is a compile-time error instead of a data race or a deadlock. Get it from [`Reconciler::acquire`].
+pub(crate) struct EngineGuard<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>);
+
 /// Engine: reconcile + deploy. One per daemon process; all mutating operations
 /// are serialized by `lock` (the sole state writer).
 pub struct Reconciler<P: PodmanClient> {
@@ -564,6 +569,14 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) monitor: crash::Policy,
     /// Per-instance observation state for that policy; in memory only, rebuilt after a restart.
     pub(crate) watch: std::sync::Mutex<crash::Watcher>,
+}
+
+impl<P: PodmanClient> Reconciler<P> {
+    /// Takes the engine lock (the sole state writer's mutex). Hold the guard for the whole operation
+    /// and pass it to every `*_locked` call; never call this again while holding it.
+    pub(crate) async fn acquire(&self) -> EngineGuard<'_> {
+        EngineGuard(self.lock.lock().await)
+    }
 }
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -651,7 +664,7 @@ impl<P: PodmanClient> Reconciler<P> {
     // Desired-state changes (API → daemon). Send [`Trigger::Changed`] after them.
 
     pub async fn upsert_app(&self, name: InstanceName, spec: AppSpec) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         crate::promote::ensure_unmanaged(&apps, &name)?;
         apps.apps.insert(name, spec);
@@ -678,7 +691,7 @@ impl<P: PodmanClient> Reconciler<P> {
         secret: &str,
         force: bool,
     ) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let apps = state::load_apps(&self.paths.apps)?;
         if !force {
             let bound = apps
@@ -700,7 +713,7 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// A single reconcile pass.
     pub async fn reconcile(&self) -> Result<ReconcileReport, EngineError> {
-        let _g = self.lock.lock().await;
+        let guard = self.acquire().await;
         let apps = state::load_apps(&self.paths.apps)?;
         let unranged = self.adopt_uid_ranges(&apps).await;
         let mut st = state::load_state(&self.paths.state)?;
@@ -820,7 +833,7 @@ impl<P: PodmanClient> Reconciler<P> {
             state::save_state(&self.paths.state, &st)?;
         }
         for action in plan(&targets, &observed) {
-            match self.execute(&apps, action.clone()).await {
+            match self.execute(&guard, &apps, action.clone()).await {
                 Ok(outcome) => report.actions.push(ActionReport {
                     action,
                     result: Ok(outcome),
@@ -908,13 +921,18 @@ impl<P: PodmanClient> Reconciler<P> {
         }
     }
 
-    async fn execute(&self, apps: &AppsFile, action: Action) -> Result<ActionOutcome, EngineError> {
+    async fn execute(
+        &self,
+        held: &EngineGuard<'_>,
+        apps: &AppsFile,
+        action: Action,
+    ) -> Result<ActionOutcome, EngineError> {
         match action {
             Action::Deploy { instance } => Ok(ActionOutcome::Deployed(
-                self.deploy_locked(&instance, false).await?,
+                self.deploy_locked(held, &instance, false).await?,
             )),
             Action::Recreate { instance, reason } => {
-                let outcome = self.recreate_locked(&instance, reason).await?;
+                let outcome = self.recreate_locked(held, &instance, reason).await?;
                 Ok(ActionOutcome::Recreated(outcome))
             }
             Action::Start { instance } => {
@@ -934,7 +952,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
                 Ok(ActionOutcome::Provisioned(
-                    self.provision_locked(&instance, spec).await?,
+                    self.provision_locked(held, &instance, spec).await?,
                 ))
             }
             Action::Remove { container } => {

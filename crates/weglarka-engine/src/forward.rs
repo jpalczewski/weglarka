@@ -124,7 +124,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .map_err(|_| EngineError::ForwardLimit(MAX_CONCURRENT_FORWARDS))?;
         self.ensure_relay_image(&options.image).await?;
         let (name, host_port) = {
-            let _g = self.lock.lock().await;
+            let _guard = self.acquire().await;
             self.start_relay(instance, options).await?
         };
         Ok(PendingForward {
