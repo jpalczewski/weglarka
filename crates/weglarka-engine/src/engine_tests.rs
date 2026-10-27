@@ -4098,6 +4098,44 @@ health = { attempts = 2, window_secs = 2 }
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_secret_cut_by_the_capture_window_leaves_no_fragment() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"token\", kind = \"env\", var = \"TOKEN\" }}]\n"
+        ));
+        h.store
+            .set("idp.token", SecretValue::new("hunter2-secret"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        // 70 KiB of nothing but the secret: the capture window starts in the middle of one, and
+        // masking shrinks what is left far below the reported size.
+        h.fake.script_next_run(RunScript {
+            output: vec![(
+                LogSource::Stderr,
+                "hunter2-secret".repeat(5000).into_bytes(),
+            )],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        let letters: String = output
+            .replace("***", "")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        // Only the header line of the failure remains; no byte of the secret does.
+        for piece in ["hunter", "ter2", "secret", "cret", "et"] {
+            assert!(!output.contains(piece), "{piece}: {output}");
+        }
+        assert!(letters.starts_with("validatorexitedwithcode"), "{letters}");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_health_failure_flips_current_back_once() {
         let h = deployed().await;
         let g = TestGen::new(true);

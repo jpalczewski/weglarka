@@ -40,11 +40,12 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// channels. The full tail stays in the 0600 state file and `doctor`.
 const EVENT_OUTPUT_LIMIT: usize = 1024;
 /// How much validator output is captured before masking and cutting it to [`OUTPUT_LIMIT`]. It is
-/// far above any secret's length, so a value is never cut in half by the capture window. Should the
-/// window cut one anyway, its leftover sits in the first bytes of the buffer, and the cut to
-/// [`generated_state::OUTPUT_LIMIT`] afterwards always drops all but the last 16 KiB of a full
-/// window — so a fragment at the window's edge can never reach the reported output.
+/// far above any secret's length. The leftover of a value the window did cut sits in the first bytes
+/// of the buffer; [`trim_edge`] drops them before masking.
 const CAPTURE_LIMIT: usize = 64 * 1024;
+/// Bytes dropped at the start of a capture window that cut the output, so that the leftover of a
+/// secret the cut went through is gone. Well above any secret.
+const SCRUB_MARGIN: usize = 4 * 1024;
 const FILE_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
 
@@ -167,10 +168,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await?
             {
                 Some(Err(output)) => {
-                    // The validator ran with the consumer's secrets bound: if it echoes a value
-                    // (a parse error quoting the offending line), it must not reach the state file,
-                    // the log or a notification channel.
-                    let output = tail(&self.scrub_secrets(&consumer, &spec, &output)).to_owned();
+                    // Already masked and edge-trimmed by `validate_generated`: the validator ran with
+                    // the consumer's secrets bound, so a value it echoes must not reach the state
+                    // file, the log or a notification channel.
+                    let output = tail(&output).to_owned();
                     self.record_generated(&mut gstate, id, |r| {
                         r.attempted = Some(fp.to_string());
                         r.last_result = LastResult::Invalid;
@@ -293,15 +294,22 @@ impl<P: PodmanClient> Reconciler<P> {
         let collect = async {
             // Only the end of the output is kept: that is where a validator names what is wrong.
             let mut buf: Vec<u8> = Vec::new();
+            let mut window_cut = false;
             while let Some(chunk) = rx.recv().await {
                 buf.extend_from_slice(&chunk.data);
                 if buf.len() > CAPTURE_LIMIT {
                     buf.drain(..buf.len() - CAPTURE_LIMIT);
+                    window_cut = true;
                 }
             }
-            String::from_utf8_lossy(&buf).into_owned()
+            (String::from_utf8_lossy(&buf).into_owned(), window_cut)
         };
-        let (outcome, output) = tokio::join!(pending.drive(tx), collect);
+        let (outcome, (output, window_cut)) = tokio::join!(pending.drive(tx), collect);
+        // Mask the whole capture, then drop the start the capture window may have cut through. The
+        // order matters: dropping first would leave a new, arbitrary start that can split a secret
+        // just as well, and a cut after masking cannot expose one.
+        let masked = self.scrub_secrets(consumer, spec, &output);
+        let output = trim_edge(&masked, window_cut);
         Ok(Some(match outcome? {
             RunOutcome::Exited(0) => Ok(()),
             RunOutcome::Exited(code) => Err(format!("validator exited with code {code}\n{output}")),
@@ -439,6 +447,20 @@ impl<P: PodmanClient> Reconciler<P> {
             tracing::warn!(generator = id, error = %e, "cannot persist the generated-config state");
         }
     }
+}
+
+/// Drops the first `SCRUB_MARGIN` bytes of already **masked** output when the capture window cut it:
+/// the start may be the tail of a secret that masking could not recognise. Masking only shrinks the
+/// text and leaves nothing to expose, so this is safe however much it shrank (possibly to nothing).
+fn trim_edge(output: &str, window_cut: bool) -> &str {
+    if !window_cut {
+        return output;
+    }
+    let mut start = SCRUB_MARGIN.min(output.len());
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    &output[start..]
 }
 
 /// The last `limit` bytes of `text`, cut on a character boundary.
