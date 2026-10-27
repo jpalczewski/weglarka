@@ -101,6 +101,8 @@ jobs:
         with:
           shared-key: check
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Dependency guards (no C crypto in the daemon, no reqwest in the CLI)
+        run: .github/scripts/check-deps.sh
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # nextest runs every test in its own process, in parallel across binaries; it does not run doc tests,

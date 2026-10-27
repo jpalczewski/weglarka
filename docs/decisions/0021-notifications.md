@@ -146,3 +146,12 @@ name in the outbox; `Severity` ordering is `debug < info < warning < critical`.
 - **Reacting to libpod events for crashes**: the action names need verification on a real Podman 6 host
   and `FakePodman` would have to script the stream; polling `RestartCount` is deterministic and testable
   (#112).
+
+## Amendment: shared HTTP client (#219)
+
+The hand-written client was replaced by `reqwest` through the shared `weglarka-http` crate (same
+`ring` provider passed explicitly, bundled `webpki-roots`, ALPN `http/1.1`, 10 s timeout, no redirects,
+no connection pooling). One behaviour changed: `host` is now accepted only with an `http://` URL.
+`reqwest` verifies the certificate against the host in the URL, so the former "SNI follows `host`"
+combination over TLS is rejected at configuration time instead of silently verifying a different name.
+The documented internal route (`http://weglarka-nginx:8080` + `host`) is plain HTTP and unaffected.

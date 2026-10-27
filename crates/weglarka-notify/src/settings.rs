@@ -10,13 +10,13 @@ use weglarka_model::config::{NotifyConfig, NtfyConfig};
 use weglarka_model::events::Severity;
 
 use crate::channel::Channel;
-use crate::http::Endpoint;
+use crate::endpoint::Endpoint;
 use crate::ntfy::NtfyChannel;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NotifySettingsError {
     #[error("[notify.ntfy] url: {0}")]
-    Url(#[from] crate::http::EndpointError),
+    Url(#[from] crate::endpoint::EndpointError),
     #[error("[notify.ntfy] topic {0:?}: expected [A-Za-z0-9_-]{{1,64}}")]
     Topic(String),
     #[error("cannot read the ntfy token file {path}: {source}")]

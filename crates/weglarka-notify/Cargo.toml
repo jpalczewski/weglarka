@@ -12,18 +12,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
-tokio-rustls.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
 toml.workspace = true
 tracing.workspace = true
-webpki-roots.workspace = true
+weglarka-http.workspace = true
 weglarka-model.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "io-util", "test-util", "rt-multi-thread"] }
+tokio-rustls.workspace = true
