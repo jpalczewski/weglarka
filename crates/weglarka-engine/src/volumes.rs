@@ -308,7 +308,16 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Range of the ingress nginx container; allocated and persisted on first use.
+    ///
+    /// Once allocated this is a plain read of `state.toml` and does not take the engine lock: a deploy
+    /// holds that lock through its health gate, and the gate may be probing through the very ingress
+    /// pass that calls this (issue #232). The state file is replaced atomically and the range never
+    /// changes once set, so the unlocked read cannot observe a torn or stale value; only the first
+    /// allocation is a write, and it still goes through the lock (the engine stays the single writer).
     pub async fn ensure_ingress_range(&self) -> Result<UidRange, EngineError> {
+        if let Some(r) = state::load_state(&self.paths.state)?.ingress_uid_range {
+            return Ok(r);
+        }
         let _g = self.lock.lock().await;
         let mut st = state::load_state(&self.paths.state)?;
         if let Some(r) = st.ingress_uid_range {

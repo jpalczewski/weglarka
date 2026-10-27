@@ -490,7 +490,7 @@ step_doctor() {
 }
 
 step_canary() {
-  local out outcome digest runtime rc=0
+  local out outcome digest runtime generation rc=0
   if [ "$EDGE" = 1 ]; then
     # The certificate must exist before the app is added: the ingress apply only renders a TLS server for
     # a routed domain that already has a cert pair (fail closed otherwise).
@@ -522,6 +522,12 @@ EOF
   [ "$runtime" = running ] || die "kanarek nie działa (runtime=$runtime)"
   case $digest in sha256:*) ;; *) die "brak digestu w apps show" ;; esac
   log "outcome=$outcome runtime=$runtime digest=$digest"
+  # The first deploy must pass its gate by itself (issue #232). A failed first attempt is recorded as a
+  # known-bad digest and `deploy` then force-retries, which lands in generation 2 and would still PASS
+  # the checks above; generation 1 is the proof that no DeployFailed preceded the pass.
+  generation=$(show_field "$CANARY" '.state.generation // empty')
+  [ "$generation" = 1 ] \
+    || die "pierwszy deploy kanarka nie przeszedł bramki za pierwszym razem (generation=$generation, oczekiwano 1): wcześniej było DeployFailed i dopiero ponowna próba się udała — bramka health.http nie widziała serwera w nginx (issue #232)"
   if [ "$EDGE" = 1 ]; then
     # The daemon rerenders nginx.conf and reloads it (nginx -t + SIGHUP, no container recreate) on an
     # ingress change; a TLS server for the canary domain proves both the certificate rescan and the reload.

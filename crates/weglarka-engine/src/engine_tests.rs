@@ -3736,3 +3736,38 @@ domains = ["example.com"]
         assert!(matches!(e, EngineError::PromoteInvalid(_)), "{e:?}");
     }
 }
+
+/// Prober that stands in for the ingress pass: while the gate is being probed, the pass needs the
+/// ingress range. It must not wait for the engine lock the deploy is holding (issue #232).
+struct IngressPassProber {
+    rec: Mutex<Option<Arc<Reconciler<FakePodman>>>>,
+}
+
+impl HttpProber for IngressPassProber {
+    fn probe<'a>(&'a self, _host: &'a str, _probe: &'a HttpProbe) -> ProbeFuture<'a> {
+        let rec = self.rec.lock().unwrap().clone().expect("wired");
+        Box::pin(async move {
+            match tokio::time::timeout(Duration::from_secs(1), rec.ensure_ingress_range()).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err("ingress pass blocked on the engine lock".into()),
+            }
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ingress_range_is_readable_while_a_deploy_holds_the_lock_through_its_gate() {
+    let mut h = Harness::new(WHOAMI);
+    // The ingress worker's startup pass allocates the range long before the first app is deployed.
+    h.rec.ensure_ingress_range().await.unwrap();
+    let prober = Arc::new(IngressPassProber {
+        rec: Mutex::new(None),
+    });
+    Arc::get_mut(&mut h.rec).expect("sole owner").http_prober = Some(prober.clone());
+    *prober.rec.lock().unwrap() = Some(h.rec.clone());
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("who", [HealthStatus::Healthy]);
+    let out = h.rec.deploy(&name("who"), false).await.unwrap();
+    assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+    *prober.rec.lock().unwrap() = None; // break the Arc cycle
+}
