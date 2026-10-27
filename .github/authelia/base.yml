@@ -1,0 +1,30 @@
+# Minimal Authelia base config for the `identity-config` CI job: just enough for `authelia config validate`
+# to accept it, next to the files weglarka-identity renders (oidc-clients.yml, access-control.yml). The
+# values are placeholders for validation only; nothing here runs a provider. The JWKS key is generated in
+# the job. No `access_control` and no OIDC `clients` here on purpose: Węglarka owns both (docs: #88, #90).
+theme: auto
+server:
+  address: 'tcp://:9091'
+log:
+  level: info
+identity_validation:
+  reset_password:
+    jwt_secret: 'ci-validation-only-jwt-secret-not-used-anywhere'
+authentication_backend:
+  file:
+    path: /config/users.yml
+session:
+  secret: 'ci-validation-only-session-secret-not-used'
+  cookies:
+    - domain: example.com
+      authelia_url: https://auth.example.com
+storage:
+  encryption_key: 'ci-validation-only-encryption-key-not-used'
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notification.txt
+identity_providers:
+  oidc:
+    hmac_secret: 'ci-validation-only-hmac-secret-not-used-anywhere'

@@ -251,6 +251,7 @@ struct ClientCommon<'a> {
     audience: &'a [String],
     groups_in_id_token: bool,
     groups_in_access_token: bool,
+    access_token: AccessTokenFormat,
     pkce: Pkce,
     public: bool,
 }
@@ -264,6 +265,7 @@ impl<'a> From<&'a OidcClientSpec> for ClientCommon<'a> {
             audience: &c.audience,
             groups_in_id_token: c.groups_in_id_token,
             groups_in_access_token: c.groups_in_access_token,
+            access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
         }
@@ -279,6 +281,7 @@ impl<'a> From<&'a ExternalClientSpec> for ClientCommon<'a> {
             audience: &c.audience,
             groups_in_id_token: c.groups_in_id_token,
             groups_in_access_token: c.groups_in_access_token,
+            access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
         }
@@ -319,7 +322,8 @@ fn https_host(url: &str) -> Result<&str, &'static str> {
     Ok(host)
 }
 
-fn valid_dns_name(host: &str) -> bool {
+/// A DNS name of non-empty labels (at most 63 bytes of `[A-Za-z0-9-]`, no leading or trailing `-`).
+pub fn valid_dns_name(host: &str) -> bool {
     !host.is_empty()
         && host.split('.').all(|label| {
             !label.is_empty()
@@ -443,6 +447,12 @@ fn check_common(c: &ClientCommon<'_>) -> Result<(), String> {
     if (c.groups_in_id_token || c.groups_in_access_token) && !seen.contains("groups") {
         return Err(
             "groups_in_id_token / groups_in_access_token need the \"groups\" scope".to_owned(),
+        );
+    }
+    if c.groups_in_access_token && c.access_token == AccessTokenFormat::Opaque {
+        return Err(
+            "groups_in_access_token needs access_token = \"jwt\": an opaque token carries no claims"
+                .to_owned(),
         );
     }
     for aud in c.audience {

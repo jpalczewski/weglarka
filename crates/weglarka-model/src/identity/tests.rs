@@ -176,13 +176,20 @@ fn scopes_come_from_the_allowlist() {
 fn groups_claims_need_the_groups_scope() {
     let with = |scopes: &str, claim: &str| {
         spec(&format!(
-            "[oidc]\nscopes = {scopes}\n{claim} = true\nredirect_uris = [\"https://app.example.com/cb\"]\nclient_secret = {{ kind = \"env\", var = \"S\" }}"
+            "[oidc]\naccess_token = \"jwt\"\nscopes = {scopes}\n{claim} = true\nredirect_uris = [\"https://app.example.com/cb\"]\nclient_secret = {{ kind = \"env\", var = \"S\" }}"
         ))
     };
     for claim in ["groups_in_id_token", "groups_in_access_token"] {
         assert!(lexical_err(&with("[\"openid\"]", claim)).contains("groups"));
         lexical(&with("[\"openid\", \"groups\"]", claim)).unwrap();
     }
+}
+
+#[test]
+fn groups_in_access_token_needs_a_jwt() {
+    let text = "[oidc]\nscopes = [\"openid\", \"groups\"]\ngroups_in_access_token = true\nredirect_uris = [\"https://app.example.com/cb\"]\nclient_secret = { kind = \"env\", var = \"S\" }";
+    assert!(lexical_err(&spec(text)).contains("jwt"));
+    lexical(&spec(&format!("{text}\naccess_token = \"jwt\""))).unwrap();
 }
 
 #[test]

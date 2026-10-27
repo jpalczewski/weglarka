@@ -1,0 +1,12 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: "render_oidc_clients(&[], &Default::default()).unwrap()"
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "claims_policies": {},
+      "clients": []
+    }
+  }
+}
