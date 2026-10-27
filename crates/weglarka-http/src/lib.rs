@@ -91,6 +91,8 @@ pub fn builder_with_roots(
         .user_agent(USER_AGENT)
         .connect_timeout(purpose.connect_timeout())
         .timeout(purpose.timeout())
+        // Never route a bearer token through a proxy picked up from the environment by accident.
+        .no_proxy()
         .redirect(purpose.redirects());
     if !purpose.pooled() {
         builder = builder.pool_max_idle_per_host(0);
