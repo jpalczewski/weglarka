@@ -98,6 +98,9 @@ where
         }
         head.extend_from_slice(&buf[..n]);
     }
+    if head.is_empty() {
+        return Err("no response (connection closed; no server for this Host yet?)".to_owned());
+    }
     parse_status(&head).ok_or_else(|| "malformed HTTP response".to_owned())
 }
 

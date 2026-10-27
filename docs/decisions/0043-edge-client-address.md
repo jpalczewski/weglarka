@@ -47,7 +47,7 @@ Not measured: ports < 1024 handed over by a system-level `.socket`, and the quad
   so it can open the `0700` directory), only the socket directory mounted.
 * nginx in `edge` publishes nothing. Its generator (`NginxOptions::proxy_socket_dir`) adds
   `listen unix:/run/weglarka-ingress/{http,https}.sock [ssl] proxy_protocol;` next to the TCP listeners
-  (8080 stays for the daemon's health probe) and, in the `http` block, `set_real_ip_from unix:;
+  (8080 stays for the daemon's health probe; superseded by 0054) and, in the `http` block, `set_real_ip_from unix:;
   real_ip_header proxy_protocol;`. Only the unix peer is trusted to announce a client; TCP peers keep their
   own `$remote_addr`, so `X-Forwarded-*` are still rebuilt from the connection and never from the client
   (ADR 0007). `behind` is untouched (the option is rejected there).

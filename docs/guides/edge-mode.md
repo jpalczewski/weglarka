@@ -95,7 +95,7 @@ Decision: [ADR 0054](../decisions/0054-health-probe-socket.md).
 - **Isolation:** the `probe/` directory is `0700` and mounted into the nginx container only — not into the
   forwarder, which faces the internet. Nobody who cannot open that directory can use the socket.
 - **What an app sees:** a probe arrives with `X-Real-IP: unix:` and `X-Forwarded-For: unix:` (there is no client
-  address; it is deliberately not `127.0.0.1`) and, in `edge`, `X-Forwarded-Proto: http`.
+  address; it is deliberately not `127.0.0.1`) and, in `edge`, `X-Forwarded-Proto: http`. An app that redirects http→https on that header answers every probe with a 30x, so use a health path that does not redirect.
 - **Not on the socket yet:** the internal ntfy route (`url = "http://weglarka-nginx:8080"`, see
   [notifications](notifications.md)) still uses the TCP port, so it gets the redirect in `edge`.
 - The socket path (`<nginx_conf_dir>/probe/probe.sock`) must be shorter than 108 bytes.
