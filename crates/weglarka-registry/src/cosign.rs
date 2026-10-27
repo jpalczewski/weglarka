@@ -12,7 +12,7 @@
 use std::fmt;
 
 use serde_json::{Map, Value};
-use weglarka_core::app::Digest;
+use weglarka_model::app::Digest;
 
 use crate::image_ref::ImageRef;
 use crate::key::PublicKey;

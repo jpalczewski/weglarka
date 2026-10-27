@@ -14,7 +14,7 @@ pub mod testing;
 use std::path::PathBuf;
 
 use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
-use weglarka_core::config::{HostConfig, PlatformKind, RuntimeConfig};
+use weglarka_model::config::{HostConfig, PlatformKind, RuntimeConfig};
 
 pub use host::{Host, RealHost};
 

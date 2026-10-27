@@ -5,7 +5,7 @@
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use weglarka_api::{ListSharedNetworksResponse, endpoints};
-use weglarka_core::app::SharedNetworkName;
+use weglarka_model::app::SharedNetworkName;
 
 use crate::commands::{DryRun, client};
 use crate::error::{CliError, Kind, exit};
@@ -149,7 +149,7 @@ async fn remove(json: bool, o: &Overrides, a: NetworkArgs) -> Result<i32, CliErr
 mod tests {
     use super::*;
     use weglarka_api::SharedNetworkSummary;
-    use weglarka_core::app::InstanceName;
+    use weglarka_model::app::InstanceName;
 
     #[test]
     fn table_renders_members_and_existence() {

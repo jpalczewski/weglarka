@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use weglarka_api::DoctorCheck;
-use weglarka_core::config::{IngressMode, PlatformKind};
+use weglarka_model::config::{IngressMode, PlatformKind};
 
 use super::host::{CmdOutput, FileKind, Host};
 use super::parse::{
@@ -672,7 +672,7 @@ impl Check for IngressTls {
         let tls = cx.nginx_conf_dir().join("tls");
         let mut domains = vec![host.webhook.domain.clone()];
         match cx.host.read_to_string(&cx.apps_path) {
-            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
+            Ok(src) => match weglarka_model::state::parse_apps(&cx.apps_path, &src) {
                 Ok(apps) => {
                     for spec in apps.apps.values() {
                         domains.extend(spec.domains.iter().cloned());
@@ -722,7 +722,7 @@ impl Check for IngressTls {
             .filter_map(|acme| acme.dns.as_ref())
             .flat_map(|dns| &dns.wildcards)
             .filter(|apex| {
-                let stem = weglarka_core::config::wildcard_cert_stem(apex);
+                let stem = weglarka_model::config::wildcard_cert_stem(apex);
                 readable(&tls.join(format!("{stem}.crt")))
                     && readable(&tls.join(format!("{stem}.key")))
             })
@@ -752,7 +752,7 @@ impl Check for IngressTls {
                 && !unreadable.iter().any(|u| u.contains(domain))
                 && !wildcards
                     .iter()
-                    .any(|apex| weglarka_core::config::wildcard_covers(apex, domain))
+                    .any(|apex| weglarka_model::config::wildcard_covers(apex, domain))
             {
                 missing.push(domain.clone());
             }
@@ -1059,11 +1059,11 @@ impl Check for TraefikSync {
             );
         };
         let apps = match cx.host.read_to_string(&cx.apps_path) {
-            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
+            Ok(src) => match weglarka_model::state::parse_apps(&cx.apps_path, &src) {
                 Ok(a) => a,
                 Err(e) => {
                     let hint = match &e {
-                        weglarka_core::state::StateError::SchemaTooNew { .. } => {
+                        weglarka_model::state::StateError::SchemaTooNew { .. } => {
                             "apps.toml was written by a newer Węglarka: roll forward, or restore it \
                              from before the upgrade"
                         }
@@ -1121,7 +1121,7 @@ fn allowed_domains(policy_json: &str) -> Option<Vec<String>> {
 }
 
 /// Ports published directly on the host (`host_ports`, issue #34). Two layers: the declaration must
-/// pass [`weglarka_core::host_ports::validate`] (privileged ports, two apps on one socket, the
+/// pass [`weglarka_model::host_ports::validate`] (privileged ports, two apps on one socket, the
 /// ingress bind) and the port must not be held by someone else's process. Like `ingress.bind_free`,
 /// the socket owner comes from `/proc/net/tcp*`: sockets of the runtime user belong to Węglarka
 /// (rootlessport forwarding an already running app), so they are not a collision.
@@ -1137,11 +1137,11 @@ impl Check for HostPortsFree {
         let id = self.id();
         let host = cx.config.as_ref().expect("applies");
         let apps = match cx.host.read_to_string(&cx.apps_path) {
-            Ok(src) => match weglarka_core::state::parse_apps(&cx.apps_path, &src) {
+            Ok(src) => match weglarka_model::state::parse_apps(&cx.apps_path, &src) {
                 Ok(apps) => apps,
                 Err(e) => {
                     let hint = match &e {
-                        weglarka_core::state::StateError::SchemaTooNew { .. } => {
+                        weglarka_model::state::StateError::SchemaTooNew { .. } => {
                             "apps.toml was written by a newer Węglarka: roll forward, or restore it \
                              from before the upgrade"
                         }
@@ -1170,11 +1170,11 @@ impl Check for HostPortsFree {
         if let Err(e) = apps
             .apps
             .iter()
-            .try_for_each(|(name, spec)| weglarka_core::state::validate_app(name, spec))
+            .try_for_each(|(name, spec)| weglarka_model::state::validate_app(name, spec))
         {
             return fail(id, e, "fix apps.toml; the daemon rejects the whole file");
         }
-        if let Err(e) = weglarka_core::host_ports::validate(host, &apps) {
+        if let Err(e) = weglarka_model::host_ports::validate(host, &apps) {
             return fail(
                 id,
                 e.to_string(),

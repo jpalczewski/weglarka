@@ -13,9 +13,9 @@
 
 use std::collections::BTreeMap;
 
-use weglarka_core::app::AppsFile;
-use weglarka_core::config::HostConfig;
 use weglarka_ingress::{Domain, nginx, traefik};
+use weglarka_model::app::AppsFile;
+use weglarka_model::config::HostConfig;
 
 const HOST: &str = r#"
 [ingress]

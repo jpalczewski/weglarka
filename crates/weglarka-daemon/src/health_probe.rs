@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use weglarka_core::app::HttpProbe;
-use weglarka_core::limits::{HttpProber, ProbeFuture};
+use weglarka_model::app::HttpProbe;
+use weglarka_model::limits::{HttpProber, ProbeFuture};
 
 use crate::ingress::NGINX_CONTAINER;
 

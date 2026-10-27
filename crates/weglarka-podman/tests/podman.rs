@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use tokio::time::timeout;
-use weglarka_core::app::SecretTarget;
-use weglarka_core::podman::{
+use weglarka_model::app::SecretTarget;
+use weglarka_model::podman::{
     ContainerFilter, ContainerSpec, ContainerState, EventFilter, EventKind, HealthStatus,
     LogSource, NetworkSpec, PodmanClient, PodmanError, PortMapping, PullEvent, RestartPolicy,
     SecretAttachment,
@@ -508,7 +508,7 @@ async fn hardened_container_starts_with_read_only_root_dropped_caps_and_no_new_p
         images: vec![],
     };
     let mut s = spec(&name, BTreeMap::new());
-    s.security = weglarka_core::app::Security {
+    s.security = weglarka_model::app::Security {
         read_only: true,
         tmpfs: vec!["/cache".into()],
         cap_drop: vec!["ALL".into()],
@@ -661,7 +661,7 @@ async fn one_off_container_streams_its_output_and_reports_the_exit_code() {
     ));
 }
 
-/// libpod reports `RestartCount` in `GET /containers/{name}/json`; `weglarka-core`'s crash-loop detector
+/// libpod reports `RestartCount` in `GET /containers/{name}/json`; `weglarka-engine`'s crash-loop detector
 /// reads exactly that field. A fixture cannot prove the field name — a missing field silently reads 0 —
 /// so this test makes a real container crash and waits for the counter to move.
 #[tokio::test]

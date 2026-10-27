@@ -5,7 +5,7 @@
 //! data: this module owns the bundled snapshot per provider and the validated [`CdnTrust`] the
 //! nginx generator renders.
 
-use weglarka_core::config::CdnProvider;
+use weglarka_model::config::CdnProvider;
 
 use crate::plan::{Cidr, IngressError};
 

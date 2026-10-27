@@ -6,7 +6,7 @@ use crate::common::*;
 use hyper::StatusCode;
 use serde_json::json;
 use weglarka_api::{ForwardFrame, ForwardFrameDecoder};
-use weglarka_core::testing::{Call, RunScript};
+use weglarka_engine::testing::{Call, RunScript};
 
 fn frames(body: &[u8]) -> Vec<ForwardFrame> {
     let mut decoder = ForwardFrameDecoder::default();

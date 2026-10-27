@@ -1,13 +1,13 @@
 //! libpod v6 wire models: only the used fields, `#[serde(default)]`, unknown fields ignored.
-//! Conversions to the `weglarka_core::podman` domain types.
+//! Conversions to the `weglarka_model::podman` domain types.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use weglarka_core::app::{Digest, Resources, SecretTarget};
-use weglarka_core::podman::{
+use weglarka_model::app::{Digest, Resources, SecretTarget};
+use weglarka_model::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
     IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError,
     PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec, image_repo,
@@ -555,7 +555,7 @@ impl InspectContainer {
             .filter_map(|(key, bindings)| Some((key.split('/').next()?.parse().ok()?, bindings?)))
             .flat_map(|(container_port, bindings): (u16, Vec<InspectBinding>)| {
                 bindings.into_iter().filter_map(move |b| {
-                    Some(weglarka_core::podman::PortMapping {
+                    Some(weglarka_model::podman::PortMapping {
                         host_ip: (!b.host_ip.is_empty()).then(|| b.host_ip.clone()),
                         host_port: b.host_port.parse().ok()?,
                         container_port,
@@ -997,7 +997,7 @@ pub(crate) fn parse_wait(body: &[u8]) -> Result<i32, PodmanError> {
 
 #[cfg(test)]
 mod tests {
-    use weglarka_core::podman::{PortMapping as DomainPort, SecretAttachment};
+    use weglarka_model::podman::{PortMapping as DomainPort, SecretAttachment};
 
     use super::*;
 
@@ -1060,7 +1060,7 @@ mod tests {
             "9090/tcp":null,
             "53/udp":[{"HostIp":"","HostPort":"5353"}]}}}"#;
         let info = decode::<InspectContainer>(json).unwrap().into_domain();
-        let mapping = |ip: Option<&str>, host, container| weglarka_core::podman::PortMapping {
+        let mapping = |ip: Option<&str>, host, container| weglarka_model::podman::PortMapping {
             host_ip: ip.map(str::to_owned),
             host_port: host,
             container_port: container,
@@ -1486,7 +1486,7 @@ mod tests {
         ] {
             assert!(plain.get(key).is_none(), "{key} omitted when unset");
         }
-        spec.security = weglarka_core::app::Security {
+        spec.security = weglarka_model::app::Security {
             read_only: true,
             tmpfs: vec!["/cache".into()],
             cap_drop: vec!["ALL".into()],
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn create_container_volumes_and_explicit_id_mapping() {
-        use weglarka_core::podman::{IdMapping, VolumeAttachment};
+        use weglarka_model::podman::{IdMapping, VolumeAttachment};
         let range = IdRange {
             container_id: 0,
             host_id: 65_537,
@@ -1600,8 +1600,8 @@ mod tests {
 
     #[test]
     fn create_container_limits_and_healthcheck() {
-        use weglarka_core::app::{CpuLimit, MemoryLimit};
-        use weglarka_core::podman::ContainerHealthcheck;
+        use weglarka_model::app::{CpuLimit, MemoryLimit};
+        use weglarka_model::podman::ContainerHealthcheck;
         let spec = ContainerSpec {
             name: "a".into(),
             image: "i".into(),
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn partial_limits_send_only_what_is_set() {
-        use weglarka_core::app::MemoryLimit;
+        use weglarka_model::app::MemoryLimit;
         let r = Resources {
             memory: Some(MemoryLimit::parse("1g").unwrap()),
             ..Default::default()

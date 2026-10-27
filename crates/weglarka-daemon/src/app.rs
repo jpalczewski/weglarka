@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use weglarka_core::config::HostConfig;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::reconcile::{Reconciler, Trigger};
-use weglarka_core::secrets::FileSecretStore;
-use weglarka_core::webhook::WebhookSource;
+use weglarka_engine::reconcile::{Reconciler, Trigger};
+use weglarka_model::config::HostConfig;
+use weglarka_model::podman::PodmanClient;
+use weglarka_model::secrets::FileSecretStore;
+use weglarka_model::webhook::WebhookSource;
 use weglarka_notify::NotifyHandle;
 
 use crate::ingress::IngressManager;

@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde_json::Value;
-use weglarka_core::app::{CpuLimit, MemoryLimit, Resources};
-use weglarka_core::limits::container_healthcheck;
-use weglarka_core::podman::{ContainerSpec, HealthStatus, PodmanClient, RestartPolicy};
+use weglarka_model::app::{CpuLimit, MemoryLimit, Resources};
+use weglarka_model::limits::container_healthcheck;
+use weglarka_model::podman::{ContainerSpec, HealthStatus, PodmanClient, RestartPolicy};
 use weglarka_podman::LibpodClient;
 
 /// The pause image has no HEALTHCHECK of its own; `/pause -v` prints its version and exits 0.
@@ -180,7 +180,7 @@ async fn health_command_overrides_the_image_and_drives_healthcheck_run() {
         (&bad, vec!["/weglarka-no-such-binary"], false),
     ] {
         let mut s = spec(name);
-        let gate = weglarka_core::app::HealthGate {
+        let gate = weglarka_model::app::HealthGate {
             command: Some(cmd.iter().map(ToString::to_string).collect()),
             ..Default::default()
         };

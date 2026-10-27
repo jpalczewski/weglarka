@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use std::collections::BTreeMap;
 
-use weglarka_core::app::{AppSpec, AppsFile, InstanceName};
-use weglarka_core::config::HostConfig;
+use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
+use weglarka_model::config::HostConfig;
 
 pub const HOST: &str = r#"
 [ingress]

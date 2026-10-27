@@ -22,10 +22,11 @@ all = { level = "warn", priority = -1 }
 # release of the contract releases its consumers (`weglarka-cli`, `weglarka-daemon`).
 weglarka-acme = { path = "crates/weglarka-acme", version = "0.0" }
 weglarka-api = { path = "crates/weglarka-api", version = "0.0.3" }
-weglarka-core = { path = "crates/weglarka-core", version = "0.0" }
 weglarka-dns = { path = "crates/weglarka-dns", version = "0.0" }
+weglarka-engine = { path = "crates/weglarka-engine", version = "0.0" }
 weglarka-podman = { path = "crates/weglarka-podman", version = "0.0" }
 weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0" }
+weglarka-model = { path = "crates/weglarka-model", version = "0.0" }
 weglarka-notify = { path = "crates/weglarka-notify", version = "0.0" }
 weglarka-registry = { path = "crates/weglarka-registry", version = "0.0" }
 

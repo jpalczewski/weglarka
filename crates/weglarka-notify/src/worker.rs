@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, watch};
-use weglarka_core::app::AppsFile;
-use weglarka_core::config::NotifyConfig;
-use weglarka_core::events::{Event, EventSink, Severity};
-use weglarka_core::state;
+use weglarka_model::app::AppsFile;
+use weglarka_model::config::NotifyConfig;
+use weglarka_model::events::{Event, EventSink, Severity};
+use weglarka_model::state;
 
 use crate::dedup::Windows;
 use crate::message::{self, Message};
@@ -114,7 +114,7 @@ impl NotifyHandle {
             last_error: shared.last_error.clone(),
             last_delivered_at: shared
                 .last_delivered_at
-                .map(weglarka_core::secrets::rfc3339_utc),
+                .map(weglarka_model::secrets::rfc3339_utc),
         }
     }
 
@@ -400,7 +400,7 @@ mod tests {
     use super::*;
     use crate::channel::{Channel, ChannelError};
     use crate::settings::ChannelSpec;
-    use weglarka_core::app::{Digest, InstanceName};
+    use weglarka_model::app::{Digest, InstanceName};
 
     fn instance() -> InstanceName {
         InstanceName::new("ntfy").unwrap()

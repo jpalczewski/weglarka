@@ -7,8 +7,8 @@ use std::path::Path;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::testing::{Call, FakePodman};
 use weglarka_daemon::{Running, StartError, start};
+use weglarka_engine::testing::{Call, FakePodman};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/prometheus:latest";
 const CONFIG_SOURCE: &str = "prometheus/prometheus.yml";
@@ -381,7 +381,7 @@ async fn reload_recreate_recreates_from_the_pinned_digest() {
         ),
     )
     .await;
-    let created_containers = |h: &Harness| -> Vec<weglarka_core::podman::ContainerSpec> {
+    let created_containers = |h: &Harness| -> Vec<weglarka_model::podman::ContainerSpec> {
         h.fake
             .created_specs()
             .into_iter()
@@ -418,7 +418,7 @@ async fn reload_recreate_recreates_from_the_pinned_digest() {
             .find(|c| c.name == "prometheus")
             .expect("container back")
             .state,
-        weglarka_core::podman::ContainerState::Running
+        weglarka_model::podman::ContainerState::Running
     );
     assert_eq!(
         current_digest(&h, "prometheus").await.as_deref(),

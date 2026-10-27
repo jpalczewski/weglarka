@@ -124,7 +124,7 @@ impl Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weglarka_core::events::Severity;
+    use weglarka_model::events::Severity;
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

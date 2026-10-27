@@ -6,18 +6,18 @@
 //! timer `weglarka-watchdog.timer` (every minute, installed by `platform install`): it takes the
 //! host-side state lock, asks the admin API for `GET /v1/health` over the unix socket, and hands the
 //! observation to [`crate::self_update::watch`], which turns the pure decision of
-//! `weglarka_core::self_update::supervise` into a pinned rollback — the previous digest restored in
+//! `weglarka_model::self_update::supervise` into a pinned rollback — the previous digest restored in
 //! the service definition and the service restarted.
 //!
-//! Everything that needs a decision is in `weglarka-core` (pure, injected clock); this module is the
+//! Everything that needs a decision is in `weglarka-model` (`self_update`; pure, injected clock); this module is the
 //! thin host-side I/O around it: lock, probe and the two commands the fallback needs.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use weglarka_api::endpoints;
-use weglarka_core::platform::Platform;
-use weglarka_core::podman::PodmanClient;
+use weglarka_engine::platform::Platform;
+use weglarka_model::podman::PodmanClient;
 
 use crate::self_update::{self, WatchReport};
 use crate::settings::Settings;

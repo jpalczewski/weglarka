@@ -17,8 +17,8 @@ use weglarka_api::{
     ReloadAction, ReloadResponse, RuntimeState, SetSecretRequest, ShowAppResponse,
     UpdateAppResponse, endpoints,
 };
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::config::HostConfig;
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::config::HostConfig;
 
 use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, SecretRemoveArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
@@ -489,7 +489,7 @@ fn preflight_broken_host() {
 fn preflight_reports_a_newer_apps_schema_instead_of_an_unknown_field() {
     // The host-port check reads apps.toml itself; a file written by a newer Węglarka must be
     // reported as a schema mismatch, not as a typo (ADR 0023).
-    let newer = weglarka_core::state::SCHEMA_VERSION + 1;
+    let newer = weglarka_model::state::SCHEMA_VERSION + 1;
     let h = FakeHost::healthy().file(
         "/etc/weglarka/apps.toml",
         &format!("schema_version = {newer}\n[apps.a]\nimage = \"x:1\"\nfuture_field = 1\n"),
@@ -944,7 +944,7 @@ fn add_accepts_streaming() {
     assert!(spec.ingress.streaming);
     assert_eq!(
         spec.ingress.stream_timeout_secs,
-        weglarka_core::app::AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+        weglarka_model::app::AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
     );
     // Without the flag the whole table stays out of the spec (and out of apps.toml).
     assert!(build_spec(&add_args(&[])).unwrap().ingress.is_default());

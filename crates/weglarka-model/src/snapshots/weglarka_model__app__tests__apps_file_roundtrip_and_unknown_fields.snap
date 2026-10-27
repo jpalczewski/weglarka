@@ -1,0 +1,30 @@
+---
+source: crates/weglarka-model/src/app.rs
+expression: parsed
+---
+{
+  "apps": {
+    "ntfy": {
+      "image": "ghcr.io/jpalczewski/ntfy.zig:latest",
+      "domains": [
+        "nz.example.eu"
+      ],
+      "port": 8085,
+      "env": {
+        "CONFIG_FILE": "/config.json"
+      },
+      "secrets": [
+        {
+          "secret": "config",
+          "kind": "mount",
+          "path": "/config.json"
+        }
+      ],
+      "health": {
+        "attempts": 5,
+        "window_secs": 30
+      },
+      "auto_update": true
+    }
+  }
+}

@@ -1,6 +1,6 @@
 //! Notifications: engine events -> message -> dedup -> durable outbox -> channels (ntfy).
 //!
-//! The daemon installs [`worker::Sink`] as the engine's [`EventSink`](weglarka_core::events::EventSink).
+//! The daemon installs [`worker::Sink`] as the engine's [`EventSink`](weglarka_model::events::EventSink).
 //! `emit` runs while the engine mutex is held, so the sink only forwards the event to the worker
 //! (a bounded channel; it never does I/O). The worker renders each event into a [`Message`],
 //! suppresses flapping ([`dedup`]), appends the accepted messages to a durable outbox for every

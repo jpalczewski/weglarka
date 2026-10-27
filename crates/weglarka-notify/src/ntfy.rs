@@ -120,7 +120,7 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use weglarka_core::events::Severity;
+    use weglarka_model::events::Severity;
 
     fn message() -> Message {
         Message {

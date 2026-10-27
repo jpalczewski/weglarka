@@ -15,7 +15,7 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-weglarka-core.workspace = true
+weglarka-model.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

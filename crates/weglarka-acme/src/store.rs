@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use weglarka_core::state::write_atomic;
+use weglarka_model::fsutil::write_atomic;
 
 use crate::cert::{CertId, Issued};
 use crate::error::AcmeError;

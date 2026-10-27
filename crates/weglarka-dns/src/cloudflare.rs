@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
-use weglarka_core::secret_store::SecretValue;
+use weglarka_model::secret_store::SecretValue;
 
 use crate::http::{Base, Client, HttpError, Response};
 use crate::name::{valid_record_name, valid_txt_value};

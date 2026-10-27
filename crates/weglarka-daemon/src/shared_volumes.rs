@@ -20,11 +20,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use futures_util::future::join_all;
 use weglarka_api::{ErrorCode, ListSharedVolumesResponse, SharedVolumeSummary, endpoints};
-use weglarka_core::app::SharedVolumeName;
-use weglarka_core::labels;
-use weglarka_core::podman::{PodmanClient, PodmanError};
-use weglarka_core::shared_volumes;
-use weglarka_core::state;
+use weglarka_model::app::SharedVolumeName;
+use weglarka_model::labels;
+use weglarka_model::podman::{PodmanClient, PodmanError};
+use weglarka_model::shared_volumes;
+use weglarka_model::state;
 
 use crate::admin::{Fail, mutating};
 use crate::app::Daemon;

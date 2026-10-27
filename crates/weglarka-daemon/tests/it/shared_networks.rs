@@ -7,10 +7,10 @@ use std::collections::BTreeMap;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::app::{AppsFile, SharedNetworkName};
-use weglarka_core::labels;
-use weglarka_core::podman::{NetworkSpec, PodmanClient};
-use weglarka_core::state;
+use weglarka_model::app::{AppsFile, SharedNetworkName};
+use weglarka_model::labels;
+use weglarka_model::podman::{NetworkSpec, PodmanClient};
+use weglarka_model::state;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 /// Declared name of the group used by the tests.

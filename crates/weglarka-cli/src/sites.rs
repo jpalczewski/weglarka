@@ -9,8 +9,8 @@ use serde::Serialize;
 use weglarka_api::{
     DeclareSiteRequest, ListSitesResponse, PromoteRequest, PromoteResponse, SiteSummary, endpoints,
 };
-use weglarka_core::app::Digest;
-use weglarka_core::environments::{EnvName, SiteName, SiteSpec};
+use weglarka_model::app::Digest;
+use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
 
 use crate::commands::{DryRun, client, report_deploy};
 use crate::error::{CliError, Kind, exit};
@@ -289,7 +289,7 @@ fn dry_run_text(site: &SiteName, env: &EnvName, r: &PromoteResponse) -> String {
 mod tests {
     use super::*;
     use weglarka_api::SiteEnvSummary;
-    use weglarka_core::app::InstanceName;
+    use weglarka_model::app::InstanceName;
 
     #[test]
     fn table_shows_the_source_and_digests_of_each_environment() {

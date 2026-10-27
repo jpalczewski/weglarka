@@ -1,0 +1,35 @@
+---
+source: crates/weglarka-model/src/config.rs
+expression: "HostConfig::from_toml_str(SAMPLE).unwrap()"
+---
+{
+  "runtime": {
+    "user": "weglarka",
+    "reconcile_interval_secs": 60,
+    "allow_privileged_host_ports": false
+  },
+  "ingress": {
+    "mode": "behind",
+    "bind": "172.17.0.1:8080",
+    "traefik_dynamic_file": "/data/coolify/proxy/dynamic/weglarka.yml",
+    "nginx_image": "docker.io/library/nginx:1-alpine"
+  },
+  "admin": {
+    "socket": "/run/user/1001/weglarka/admin.sock"
+  },
+  "webhook": {
+    "listen": "0.0.0.0:9180",
+    "domain": "weglarka.example.com"
+  },
+  "platform": {
+    "kind": "systemd",
+    "memory": "128M",
+    "pids_limit": 256
+  },
+  "state": {},
+  "monitor": {
+    "crash_loop_restarts": 3,
+    "crash_loop_window_secs": 600,
+    "unhealthy_observations": 2
+  }
+}

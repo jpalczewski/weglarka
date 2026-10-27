@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use weglarka_core::platform::{Hardening, Platform, Result, ServiceSpec};
+use weglarka_engine::platform::{Hardening, Platform, Result, ServiceSpec};
 
 use crate::ingress::WEBHOOK_NETWORK;
 use crate::settings::Settings;
@@ -97,7 +97,7 @@ pub async fn host_socket<P: Platform>(settings: &Settings, platform: &P) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weglarka_core::config::HostConfig;
+    use weglarka_model::config::HostConfig;
 
     const HOST: &str = r#"
 [ingress]

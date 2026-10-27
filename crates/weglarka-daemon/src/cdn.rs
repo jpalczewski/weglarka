@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use weglarka_core::config::CdnProvider;
-use weglarka_core::state::write_atomic;
 use weglarka_ingress::{CdnTrust, IngressError};
+use weglarka_model::config::CdnProvider;
+use weglarka_model::fsutil::write_atomic;
 
 /// Refresh cadence; Cloudflare says the ranges "do not change frequently".
 const REFRESH_EVERY: Duration = Duration::from_secs(24 * 3600);

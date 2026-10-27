@@ -1,0 +1,20 @@
+---
+source: crates/weglarka-model/src/state.rs
+expression: "fs::read_to_string(&paths.state).unwrap()"
+---
+[apps.ntfy]
+generation = 3
+current = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+previous = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[apps.ntfy.failed]
+digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+reason = "unhealthy"
+
+[apps.ntfy.uid_range]
+start = 1
+size = 65536
+
+[apps.ntfy.effective_uid_range]
+start = 1
+size = 65536

@@ -15,7 +15,7 @@
 //!   range and volumes and removes any container — and the outcome is in the response.
 //!
 //! "Waiting for secret": the engine records `AppState::waiting_for_secrets` (see
-//! `weglarka_core::waiting`); this module only renders it (`RuntimeState::WaitingForSecret`, doctor).
+//! `weglarka_engine::waiting`); this module only renders it (`RuntimeState::WaitingForSecret`, doctor).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -27,12 +27,12 @@ use weglarka_api::{
     CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, ErrorCode, RuntimeState,
     ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use weglarka_core::app::InstanceName;
-use weglarka_core::deploy::DeployOutcome as CoreOutcome;
-use weglarka_core::labels;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::reconcile::EngineError;
-use weglarka_core::state::{self, AppState};
+use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
+use weglarka_engine::reconcile::EngineError;
+use weglarka_model::app::InstanceName;
+use weglarka_model::labels;
+use weglarka_model::podman::PodmanClient;
+use weglarka_model::state::{self, AppState};
 
 use crate::admin::{Fail, runtime_state_for, validate_config_mounts};
 use crate::app::{Daemon, MUTATION_TIMEOUT};
@@ -78,12 +78,12 @@ pub async fn update_app<P: PodmanClient + 'static>(
         // Shared volumes (issue #33): a mount of an undeclared volume is rejected here with the
         // `weglarka volumes add` hint, and a uid-range change with existing volume data is refused
         // before anything is persisted — the old container and its files stay untouched.
-        weglarka_core::shared_volumes::validate(&apps).map_err(invalid)?;
+        weglarka_model::shared_volumes::validate(&apps).map_err(invalid)?;
         // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
         // by another app), as in `add`. Both see the candidate app set.
-        weglarka_core::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
+        weglarka_model::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
         // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
-        weglarka_core::depends::validate(&apps).map_err(invalid)?;
+        weglarka_model::depends::validate(&apps).map_err(invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;
         d.engine.check_range_change(&name, &req.spec).await?;
         match tokio::time::timeout(

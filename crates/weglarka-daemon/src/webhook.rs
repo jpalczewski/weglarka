@@ -10,12 +10,12 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use weglarka_core::app::InstanceName;
-use weglarka_core::deploy::instances_tracking;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::secret_store::{SecretStore, scoped_name};
-use weglarka_core::state;
-use weglarka_core::webhook::{WebhookError, WebhookRequest, WebhookSource};
+use weglarka_engine::deploy::instances_tracking;
+use weglarka_model::app::InstanceName;
+use weglarka_model::podman::PodmanClient;
+use weglarka_model::secret_store::{SecretStore, scoped_name};
+use weglarka_model::state;
+use weglarka_model::webhook::{WebhookError, WebhookRequest, WebhookSource};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 

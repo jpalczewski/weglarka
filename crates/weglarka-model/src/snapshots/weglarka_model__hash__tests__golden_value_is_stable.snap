@@ -1,0 +1,5 @@
+---
+source: crates/weglarka-model/src/hash.rs
+expression: "spec_hash(&spec(), &digest('a'))"
+---
+c069bb512ac12d1059097a0c373d4546c6fcbf4f9b54edf5c36a124c60fc7c57

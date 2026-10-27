@@ -11,11 +11,11 @@ use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
 use serde_json::Value;
 use tokio::net::UnixStream;
-use weglarka_core::app::Digest;
-use weglarka_core::podman::PodmanClient;
-use weglarka_core::self_update::{self, SelfUpdateState};
-use weglarka_core::testing::FakePodman;
 use weglarka_daemon::{Running, Settings, start};
+use weglarka_engine::testing::FakePodman;
+use weglarka_model::app::Digest;
+use weglarka_model::podman::PodmanClient;
+use weglarka_model::self_update::{self, SelfUpdateState};
 
 const IMAGE: &str = "ghcr.io/jpalczewski/weglarka:latest";
 const SELF_UPDATE: &str = r#"

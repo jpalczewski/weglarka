@@ -21,21 +21,21 @@ use weglarka_api::{
     ReloadResponse, RunFrame, RunRequest, RuntimeState, SecretInfo, SetSecretRequest,
     ShowAppResponse, StatusResponse, endpoints,
 };
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::config_mounts::{self, MountStatus, MountView};
-use weglarka_core::deploy::DeployOutcome as CoreOutcome;
-use weglarka_core::deploy::ReloadOutcome;
-use weglarka_core::labels;
-use weglarka_core::podman::{
+use weglarka_engine::config_mounts::{self, MountStatus, MountView};
+use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
+use weglarka_engine::deploy::ReloadOutcome;
+use weglarka_engine::reconcile::EngineError;
+use weglarka_engine::run::{RunOptions, RunOutcome};
+use weglarka_engine::volumes::RemoveAppOptions;
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::labels;
+use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, LogChunk, LogSource, PodmanClient,
 };
-use weglarka_core::reconcile::EngineError;
-use weglarka_core::run::{RunOptions, RunOutcome};
-use weglarka_core::secret_store::{
+use weglarka_model::secret_store::{
     SecretError, SecretStore, SecretValue, fingerprint, scoped_name, valid_secret_name,
 };
-use weglarka_core::state::{self, AppState};
-use weglarka_core::volumes::RemoveAppOptions;
+use weglarka_model::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::doctor;
@@ -441,7 +441,7 @@ fn config_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<Co
 
 /// Declared host mounts of `spec` (issue #178) against the allowlist; `None` when there are none.
 fn host_mount_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Vec<HostMountView>> {
-    use weglarka_core::host_mounts::{self, HostMountStatus as S};
+    use weglarka_engine::host_mounts::{self, HostMountStatus as S};
     (!spec.host_mounts.is_empty()).then(|| {
         host_mounts::describe(&d.host.runtime.host_mounts, spec)
             .into_iter()
@@ -472,9 +472,9 @@ pub(crate) fn validate_config_mounts<P: PodmanClient>(
 ) -> ApiResult<()> {
     // Host mounts (issue #178): the source must be an exact entry of the operator's allowlist, so a
     // bad one is a 400 now instead of a blocked app later.
-    weglarka_core::host_mounts::check_allowed(&d.host.runtime.host_mounts, spec)
+    weglarka_engine::host_mounts::check_allowed(&d.host.runtime.host_mounts, spec)
         .map_err(|e| Fail::invalid(e.to_string()))?;
-    weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec)
+    weglarka_engine::host_mounts::check_groups(&d.host.runtime.group_add, spec)
         .map_err(|e| Fail::invalid(e.to_string()))?;
     if spec.configs.is_empty() || d.paths.config_root.is_some() {
         return Ok(());
@@ -507,15 +507,15 @@ async fn add_app<P: PodmanClient + 'static>(
         apps.apps.insert(req.name.clone(), req.spec.clone());
         // Every shared-volume mount must name a declared volume (issue #33): a typo would silently
         // create a second empty volume. Cross-app rule, so it sees the candidate app set.
-        weglarka_core::shared_volumes::validate(&apps).map_err(Fail::invalid)?;
+        weglarka_model::shared_volumes::validate(&apps).map_err(Fail::invalid)?;
         // Same for a shared-network membership (issue #128), plus the alias rules.
-        weglarka_core::shared_networks::validate(&apps).map_err(Fail::invalid)?;
+        weglarka_model::shared_networks::validate(&apps).map_err(Fail::invalid)?;
         // Host-wide `host_ports` rules first (privileged ports, another app on the same socket, the
         // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
-        weglarka_core::host_ports::validate(&d.host, &apps)
+        weglarka_model::host_ports::validate(&d.host, &apps)
             .map_err(|e| Fail::invalid(e.to_string()))?;
         // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
-        weglarka_core::depends::validate(&apps).map_err(Fail::invalid)?;
+        weglarka_model::depends::validate(&apps).map_err(Fail::invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps)
             .map_err(|e| Fail::invalid(e.to_string()))?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;

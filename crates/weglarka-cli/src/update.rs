@@ -14,11 +14,11 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
 };
-use weglarka_core::app::{
+use weglarka_model::app::{
     AppIngress, AppSpec, BodySizeLimit, InstanceName, SecretBinding, SecretTarget,
     SharedVolumeName, valid_volume_name,
 };
-use weglarka_core::state::AppState;
+use weglarka_model::state::AppState;
 
 use crate::cli::{StartStopArgs, parse_pair};
 use crate::client::expand_path;
@@ -648,7 +648,7 @@ mod tests {
     use crate::tests::mock;
     use clap::Parser;
     use weglarka_api::DeployResponse;
-    use weglarka_core::app::{InstanceName, SharedVolumeRef, VolumeMount};
+    use weglarka_model::app::{InstanceName, SharedVolumeRef, VolumeMount};
 
     fn args(extra: &[&str]) -> UpdateArgs {
         #[derive(Parser)]

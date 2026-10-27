@@ -6,10 +6,10 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use weglarka_core::config::PlatformKind;
-use weglarka_core::platform::{Platform, PlatformError, Result, ServiceSpec, ServiceStatus};
+use weglarka_engine::platform::{Platform, PlatformError, Result, ServiceSpec, ServiceStatus};
+use weglarka_model::config::PlatformKind;
 
-pub use weglarka_core::platform::UnitFile;
+pub use weglarka_engine::platform::UnitFile;
 
 /// Wykonuje polecenia (`systemctl --user …`); podmieniany w testach.
 pub trait CommandRunner: Send + Sync {
@@ -568,7 +568,7 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
 mod tests {
     use super::*;
     use crate::service::SERVICE_NAME;
-    use weglarka_core::platform::Hardening;
+    use weglarka_engine::platform::Hardening;
 
     fn spec() -> ServiceSpec {
         ServiceSpec {

@@ -38,7 +38,7 @@ FROM ${BIN_SOURCE} AS bin
 FROM scratch
 ARG VERSION=dev
 ARG REVISION=unknown
-# The state schema this image writes (crates/weglarka-core/src/schema.rs). The self-updater compares
+# The state schema this image writes (crates/weglarka-model/src/state.rs). The self-updater compares
 # the label with the running daemon's schema before replacing the image (docs/decisions/0023).
 ARG STATE_SCHEMA=14
 LABEL org.opencontainers.image.title="weglarka" \

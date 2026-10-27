@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::Response;
 use axum::routing::put;
 use weglarka_api::endpoints;
-use weglarka_core::podman::PodmanClient;
+use weglarka_model::podman::PodmanClient;
 
 use crate::admin::{Fail, deploy_response, parse_name};
 use crate::app::Daemon;

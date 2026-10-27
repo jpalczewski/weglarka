@@ -10,7 +10,7 @@ It lets an older daemon refuse a file that is newer than it understands instead 
   unchanged, and the first ordinary write stamps `schema_version = 14`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
-  number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-core/src/state.rs`); a compile-time assert
+  number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-model/src/state.rs`); a compile-time assert
   keeps the number of steps equal to `SCHEMA_VERSION - 1`.
 - **An older daemon refuses to start** when a file has a newer version than it understands:
 

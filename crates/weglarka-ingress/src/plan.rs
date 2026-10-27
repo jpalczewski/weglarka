@@ -5,8 +5,8 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use weglarka_core::app::{AppIngress, AppKind, AppSpec, InstanceName, check_path_prefix};
-use weglarka_core::config::{HostConfig, IngressMode};
+use weglarka_model::app::{AppIngress, AppKind, AppSpec, InstanceName, check_path_prefix};
+use weglarka_model::config::{HostConfig, IngressMode};
 
 /// DNS name of Węglarka's container on the `net-weglarka` network (the `proxy_pass` target for webhooks).
 /// An app instance name must not equal it (it would shadow the webhook upstream).
@@ -99,7 +99,7 @@ impl fmt::Display for Domain {
 }
 
 /// Path prefix of a route (ADR 0031): `/` or `/seg[/seg…]`, validated by
-/// [`weglarka_core::app::check_path_prefix`] because it lands in `nginx.conf`.
+/// [`weglarka_model::app::check_path_prefix`] because it lands in `nginx.conf`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PathPrefix(String);
 

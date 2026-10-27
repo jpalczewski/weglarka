@@ -34,8 +34,8 @@ mod options;
 
 use std::collections::BTreeMap;
 
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::config::{HostConfig, IngressMode};
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::config::{HostConfig, IngressMode};
 
 use crate::plan::{IngressError, Plan};
 

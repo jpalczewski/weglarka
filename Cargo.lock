@@ -1668,8 +1668,8 @@ dependencies = [
  "tokio",
  "tracing",
  "webpki-roots",
- "weglarka-core",
  "weglarka-dns",
+ "weglarka-model",
  "x509-parser",
 ]
 
@@ -1681,7 +1681,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "weglarka-core",
+ "weglarka-model",
 ]
 
 [[package]]
@@ -1700,29 +1700,8 @@ dependencies = [
  "tokio",
  "toml",
  "weglarka-api",
- "weglarka-core",
-]
-
-[[package]]
-name = "weglarka-core"
-version = "0.0.3"
-dependencies = [
- "bytes",
- "flate2",
- "futures-core",
- "futures-util",
- "hex",
- "insta",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "weglarka-core",
+ "weglarka-engine",
+ "weglarka-model",
 ]
 
 [[package]]
@@ -1751,9 +1730,10 @@ dependencies = [
  "tracing-subscriber",
  "weglarka-acme",
  "weglarka-api",
- "weglarka-core",
  "weglarka-dns",
+ "weglarka-engine",
  "weglarka-ingress",
+ "weglarka-model",
  "weglarka-notify",
  "weglarka-podman",
  "weglarka-registry",
@@ -1771,7 +1751,31 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "webpki-roots",
- "weglarka-core",
+ "weglarka-model",
+]
+
+[[package]]
+name = "weglarka-engine"
+version = "0.0.3"
+dependencies = [
+ "bytes",
+ "flate2",
+ "futures-core",
+ "futures-util",
+ "hex",
+ "insta",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "weglarka-engine",
+ "weglarka-model",
+ "weglarka-podman",
 ]
 
 [[package]]
@@ -1781,7 +1785,24 @@ dependencies = [
  "insta",
  "thiserror",
  "toml",
- "weglarka-core",
+ "weglarka-model",
+]
+
+[[package]]
+name = "weglarka-model"
+version = "0.0.3"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "hex",
+ "insta",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1799,7 +1820,7 @@ dependencies = [
  "toml",
  "tracing",
  "webpki-roots",
- "weglarka-core",
+ "weglarka-model",
 ]
 
 [[package]]
@@ -1819,7 +1840,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "weglarka-core",
+ "weglarka-model",
 ]
 
 [[package]]
@@ -1837,7 +1858,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "webpki-roots",
- "weglarka-core",
+ "weglarka-model",
 ]
 
 [[package]]

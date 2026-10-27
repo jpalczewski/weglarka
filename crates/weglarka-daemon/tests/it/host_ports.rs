@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
-use weglarka_core::testing::FakePodman;
 use weglarka_daemon::start;
+use weglarka_engine::testing::FakePodman;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
 

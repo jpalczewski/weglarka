@@ -26,11 +26,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
 use weglarka_api::{ErrorCode, ListVolumesResponse, VolumeSummary, endpoints};
-use weglarka_core::app::{AppSpec, InstanceName};
-use weglarka_core::labels;
-use weglarka_core::podman::{PodmanClient, PodmanError, TarStream};
-use weglarka_core::state;
-use weglarka_core::volumes::ImportMode;
+use weglarka_engine::volumes::ImportMode;
+use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::labels;
+use weglarka_model::podman::{PodmanClient, PodmanError, TarStream};
+use weglarka_model::state;
 
 use crate::admin::Fail;
 use crate::app::{Daemon, MUTATION_TIMEOUT};

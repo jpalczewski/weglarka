@@ -5,17 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 
 use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
-use weglarka_core::app::{AppSpec, AppsFile, InstanceName};
-use weglarka_core::config::IngressMode;
-use weglarka_core::config_mounts::{self, MountStatus};
-use weglarka_core::labels;
-use weglarka_core::podman::{
+use weglarka_engine::config_mounts::{self, MountStatus};
+use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
+use weglarka_model::config::IngressMode;
+use weglarka_model::labels;
+use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
 };
-use weglarka_core::secret_store::{SecretStore, scoped_name, split_scoped};
-use weglarka_core::shared_networks;
-use weglarka_core::shared_volumes;
-use weglarka_core::state::{self, StateFile};
+use weglarka_model::secret_store::{SecretStore, scoped_name, split_scoped};
+use weglarka_model::shared_networks;
+use weglarka_model::shared_volumes;
+use weglarka_model::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
@@ -88,8 +88,8 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         out.push(ok("self_update", "paused by [self_update] enabled = false"));
         return;
     }
-    let state_path = weglarka_core::self_update::path(&d.paths.state_dir);
-    let state = match weglarka_core::self_update::load(&d.paths.state_dir) {
+    let state_path = weglarka_model::self_update::path(&d.paths.state_dir);
+    let state = match weglarka_model::self_update::load(&d.paths.state_dir) {
         Ok(state) => state,
         Err(e) => {
             out.push(check(
@@ -110,7 +110,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Some(digest) => parts.push(format!("previous {} (--rollback)", short(digest))),
         None => parts.push("no previous image yet".to_owned()),
     }
-    let now = weglarka_core::self_update::secs(std::time::SystemTime::now());
+    let now = weglarka_model::self_update::secs(std::time::SystemTime::now());
     if let Some(pending) = &state.pending {
         let age = state.pending_at.map_or(0, |at| now.saturating_sub(at));
         parts.push(format!("pending {} for {age}s", short(pending)));
@@ -187,7 +187,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 }
 
 /// First 12 hex digits of a digest, for a readable check.
-fn short(digest: &weglarka_core::app::Digest) -> &str {
+fn short(digest: &weglarka_model::app::Digest) -> &str {
     &digest.as_str()[7..19]
 }
 
@@ -369,7 +369,7 @@ async fn image_retention<P: PodmanClient>(
     let Ok(images) = d.engine.podman().image_list().await else {
         return; // missing Podman already reported by `runtime.socket`
     };
-    let plan = weglarka_core::images::plan(
+    let plan = weglarka_engine::images::plan(
         &images,
         &observed.containers,
         &observed.apps,
@@ -389,7 +389,7 @@ async fn image_retention<P: PodmanClient>(
         format!(
             "{} unused image(s) from earlier deploys ({} at most)",
             plan.remove.len(),
-            weglarka_core::images::human_bytes(plan.reclaimable_bytes())
+            weglarka_engine::images::human_bytes(plan.reclaimable_bytes())
         ),
         Some("`weglarka images prune` removes them (`--dry-run` first to see the list)"),
     ));
@@ -511,7 +511,7 @@ fn sites<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 }
 
 fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
-    use weglarka_core::host_mounts::{HostMountStatus, describe};
+    use weglarka_engine::host_mounts::{HostMountStatus, describe};
     let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
         return; // reported by `state.apps_file`
     };
@@ -534,7 +534,8 @@ fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             continue;
         }
         used.push(format!("{name}: groups {}", spec.group_add.join(",")));
-        if let Err(e) = weglarka_core::host_mounts::check_groups(&d.host.runtime.group_add, spec) {
+        if let Err(e) = weglarka_engine::host_mounts::check_groups(&d.host.runtime.group_add, spec)
+        {
             broken.push(format!("{name}: {e}"));
         }
     }
@@ -1084,7 +1085,7 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ));
         return;
     }
-    let staging = config.directory_url == weglarka_core::config::AcmeConfig::LETS_ENCRYPT_STAGING;
+    let staging = config.directory_url == weglarka_model::config::AcmeConfig::LETS_ENCRYPT_STAGING;
     out.push(check(
         "acme.config",
         if staging {
@@ -1225,8 +1226,8 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 /// yet, so a missing one is a warning like a missing domain certificate.
 fn acme_dns<P: PodmanClient>(
     d: &Daemon<P>,
-    config: &weglarka_core::config::AcmeConfig,
-    dns: &weglarka_core::config::AcmeDnsConfig,
+    config: &weglarka_model::config::AcmeConfig,
+    dns: &weglarka_model::config::AcmeDnsConfig,
     out: &mut Vec<DoctorCheck>,
 ) {
     let token = &dns.token_file;
@@ -1341,7 +1342,7 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                 && tls.join(format!("{domain}.key")).is_file();
             !own && !wildcards
                 .iter()
-                .any(|apex| weglarka_core::config::wildcard_covers(apex, domain))
+                .any(|apex| weglarka_model::config::wildcard_covers(apex, domain))
         })
         .map(String::as_str)
         .collect();
@@ -1474,7 +1475,7 @@ async fn acme_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     for domain in domains {
         if wildcards
             .iter()
-            .any(|apex| weglarka_core::config::wildcard_covers(apex, &domain))
+            .any(|apex| weglarka_model::config::wildcard_covers(apex, &domain))
         {
             continue;
         }
@@ -1540,11 +1541,11 @@ fn wildcard_apexes_on_disk(tls: &std::path::Path) -> Vec<String> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let apex = name
                 .strip_suffix(".crt")?
-                .strip_prefix(weglarka_core::config::WILDCARD_CERT_PREFIX)?
+                .strip_prefix(weglarka_model::config::WILDCARD_CERT_PREFIX)?
                 .to_owned();
             let key = tls.join(format!(
                 "{}{apex}.key",
-                weglarka_core::config::WILDCARD_CERT_PREFIX
+                weglarka_model::config::WILDCARD_CERT_PREFIX
             ));
             (entry.path().is_file() && key.is_file()).then_some(apex)
         })

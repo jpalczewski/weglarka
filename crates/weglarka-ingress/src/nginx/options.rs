@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
-use weglarka_core::app::InstanceName;
-use weglarka_core::config::{IngressMode, wildcard_cert_stem, wildcard_covers};
+use weglarka_model::app::InstanceName;
+use weglarka_model::config::{IngressMode, wildcard_cert_stem, wildcard_covers};
 
 use super::{ACME_CONTAINER_DIR, CERT_CONTAINER_DIR};
 use crate::cdn::CdnTrust;

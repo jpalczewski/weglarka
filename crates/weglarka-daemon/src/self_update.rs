@@ -16,7 +16,7 @@
 //! run the pinned digest, `doctor` and a `SelfUpdatePending` event say so instead of silently
 //! pretending the update happened. The automatic fallback to the previous digest (issue #100,
 //! `docs/decisions/0034`) lives here too: [`watch`] turns the pure `supervise()` decision of
-//! `weglarka-core` into a pinned rollback, and `--rollback` stays the manual lever.
+//! `weglarka-model` into a pinned rollback, and `--rollback` stays the manual lever.
 //!
 //! The whole procedure is a function over three traits (`PodmanClient`, `Registry`, `Platform`), so
 //! the tests drive it end to end without Podman, a registry or systemd.
@@ -25,16 +25,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
-use weglarka_core::app::Digest;
-use weglarka_core::config::SelfUpdateConfig;
-use weglarka_core::events::{Event, EventSink};
-use weglarka_core::platform::Platform;
-use weglarka_core::podman::{PodmanClient, PodmanError, PullEvent};
-use weglarka_core::self_update::{
+use weglarka_engine::platform::Platform;
+use weglarka_model::app::Digest;
+use weglarka_model::config::SelfUpdateConfig;
+use weglarka_model::events::{Event, EventSink};
+use weglarka_model::podman::{PodmanClient, PodmanError, PullEvent};
+use weglarka_model::self_update::{
     self as state, Confirmation, Decision, FallbackPolicy, SelfUpdateState, SelfUpdateStateError,
     Supervision, Switch, secs,
 };
-use weglarka_core::state as state_files;
+use weglarka_model::state as state_files;
 use weglarka_registry::{
     DEFAULT_PUBLIC_KEY_PEM, ImageRef, KeyError, PublicKey, Registry, RegistryError, Signature,
     verify,
@@ -98,7 +98,7 @@ pub enum Error {
     #[error(transparent)]
     Key(#[from] KeyError),
     #[error(transparent)]
-    Platform(#[from] weglarka_core::platform::PlatformError),
+    Platform(#[from] weglarka_engine::platform::PlatformError),
     #[error("cannot read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -472,7 +472,7 @@ async fn check_signature(
 }
 
 /// The user units of the timer, rendered for this binary and configuration.
-pub fn units(settings: &Settings) -> Result<Vec<weglarka_core::platform::UnitFile>, Error> {
+pub fn units(settings: &Settings) -> Result<Vec<weglarka_engine::platform::UnitFile>, Error> {
     let binary = std::env::current_exe().map_err(|source| Error::Read {
         path: PathBuf::from("current executable"),
         source,
@@ -486,7 +486,7 @@ pub fn units(settings: &Settings) -> Result<Vec<weglarka_core::platform::UnitFil
 /// The user units of the watchdog (issue #100), rendered for this binary and configuration.
 pub fn watchdog_units(
     settings: &Settings,
-) -> Result<Vec<weglarka_core::platform::UnitFile>, Error> {
+) -> Result<Vec<weglarka_engine::platform::UnitFile>, Error> {
     let binary = std::env::current_exe().map_err(|source| Error::Read {
         path: PathBuf::from("current executable"),
         source,
@@ -630,7 +630,7 @@ impl std::fmt::Display for WatchReport {
 }
 
 /// One watchdog run (issue #100, `docs/decisions/0034`): `healthy` is the host-side probe of
-/// `GET /v1/health`, and the decision itself is `weglarka_core::self_update::supervise`.
+/// `GET /v1/health`, and the decision itself is `weglarka_model::self_update::supervise`.
 ///
 /// The fallback reuses the manual rollback's guarantees — no registry access, the image must be in the
 /// local store, and the state-schema gate applies — plus `reset_failed`, because the failed image has
@@ -814,9 +814,9 @@ impl std::fmt::Display for Report {
 mod tests {
     use std::sync::Mutex;
 
-    use weglarka_core::config::{HostConfig, PlatformKind};
-    use weglarka_core::platform::{PlatformError, ServiceStatus, UnitFile};
-    use weglarka_core::testing::FakePodman;
+    use weglarka_engine::platform::{PlatformError, ServiceStatus, UnitFile};
+    use weglarka_engine::testing::FakePodman;
+    use weglarka_model::config::{HostConfig, PlatformKind};
     use weglarka_registry::ImageRef;
     use weglarka_registry::testing::{FakeRegistry, TestSigner};
 
@@ -855,7 +855,7 @@ mod tests {
         }
         async fn install_service(
             &self,
-            spec: &weglarka_core::platform::ServiceSpec,
+            spec: &weglarka_engine::platform::ServiceSpec,
         ) -> Result<(), PlatformError> {
             self.installed.lock().unwrap().push(spec.image.clone());
             Ok(())
@@ -940,7 +940,7 @@ dir = "{root}/state"
             // A current image publishes the schema it writes; without the label the gate assumes the
             // pre-versioning schema and refuses it against a newer state (ADR 0023).
             let podman = FakePodman::new();
-            let schema = weglarka_core::state::SCHEMA_VERSION.to_string();
+            let schema = weglarka_model::state::SCHEMA_VERSION.to_string();
             podman.set_pull_labels(IMAGE, &[(SCHEMA_LABEL, schema.as_str())]);
             Self {
                 _dir: dir,
@@ -1166,7 +1166,7 @@ dir = "{root}/state"
             Report::Refused { reason } => {
                 assert!(reason.contains("schema 0"), "{reason}");
                 assert!(
-                    reason.contains(&format!("schema {}", weglarka_core::state::SCHEMA_VERSION)),
+                    reason.contains(&format!("schema {}", weglarka_model::state::SCHEMA_VERSION)),
                     "{reason}"
                 );
                 assert!(reason.contains("--force"), "{reason}");
@@ -1304,7 +1304,7 @@ dir = "{root}/state"
 
     #[tokio::test]
     async fn startup_confirmation_tracks_current_and_previous() {
-        use weglarka_core::events::VecSink;
+        use weglarka_model::events::VecSink;
 
         let ctx = Ctx::new(true);
         let running = digest_of('a');
@@ -1440,10 +1440,10 @@ dir = "{root}/state"
         );
         assert_eq!(
             state.last_fallback(),
-            Some(weglarka_core::self_update::Fallback {
+            Some(weglarka_model::self_update::Fallback {
                 from: failed.clone(),
                 to: before.clone(),
-                at: weglarka_core::self_update::secs(ctx.now),
+                at: weglarka_model::self_update::secs(ctx.now),
             })
         );
         // The failed digest is recorded, so the next switcher run refuses to re-pin it.
@@ -1559,7 +1559,7 @@ dir = "{root}/state"
 
     #[tokio::test]
     async fn a_fallback_confirmation_is_reported_and_keeps_the_failed_image_off_the_rollback() {
-        use weglarka_core::events::VecSink;
+        use weglarka_model::events::VecSink;
 
         let ctx = Ctx::new(true);
         let restored = digest_of('a');

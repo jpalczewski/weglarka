@@ -27,7 +27,8 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "io-std", "fs", "macros", "time", "process", "signal"] }
 toml.workspace = true
 weglarka-api.workspace = true
-weglarka-core.workspace = true
+weglarka-engine.workspace = true
+weglarka-model.workspace = true
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["server"] }
