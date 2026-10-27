@@ -41,7 +41,7 @@ weglarka notify status    # channels, queue, dropped counter, last error and las
 
 ## Upgrading from 0.0.3
 
-A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup (the daemon stops with `notifications: …`). Earlier releases accepted it and verified the certificate against `host`. Fix: put the real name in `url` (`url = "https://ntfy.example.com"`, no `host`), or use the plain-HTTP internal route (`url = "http://weglarka-nginx:8080"` with `host`). Rolling back to 0.0.3 needs no change.
+A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup (the daemon stops with `notifications: …`). Earlier releases accepted it and verified the certificate against `host`. Fix: put the real name in `url` (`url = "https://ntfy.example.com"`, no `host`), or use the plain-HTTP internal route (`url = "http://weglarka-nginx:8080"` with `host`; in `behind` mode only, since in `edge` that port answers with a redirect). Rolling back to 0.0.3 needs no change.
 
 ## Rollback
 
