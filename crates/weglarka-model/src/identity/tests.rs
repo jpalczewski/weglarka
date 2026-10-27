@@ -291,21 +291,53 @@ fn auth_groups_and_exempt_paths_syntax() {
 }
 
 #[test]
-fn a_probed_path_must_be_exempt() {
-    let fwd = |extra: &str| {
-        spec(&format!(
-            "[health.http]\npath = \"/healthz\"\n\n[ingress]\nauth = \"forward\"\n{extra}"
-        ))
-    };
-    assert!(lexical_err(&fwd("")).contains("health.http"));
-    assert!(lexical_err(&fwd("auth_exempt_paths = [\"/other/\"]")).contains("health.http"));
-    lexical(&fwd("auth_exempt_paths = [\"/healthz\"]")).unwrap();
-    lexical(&fwd("auth_exempt_paths = [\"/healthz/\"]")).unwrap();
-    // A prefix entry covers paths below it.
+fn a_probed_path_needs_no_exemption() {
+    // The daemon probes over the probe socket, which the authz location lets through.
     lexical(&spec(
-        "[health.http]\npath = \"/internal/ping\"\n\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/internal/\"]",
+        "[health.http]\npath = \"/healthz\"\n\n[ingress]\nauth = \"forward\"",
     ))
     .unwrap();
+}
+
+#[test]
+fn exempt_paths_do_not_combine_with_path_prefixes() {
+    let s = spec("paths = [\"/p\"]\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/x/\"]");
+    assert!(lexical_err(&s).contains("auth_exempt_paths"));
+    lexical(&spec("paths = [\"/p\"]\n[ingress]\nauth = \"forward\"")).unwrap();
+}
+
+#[test]
+fn forward_auth_needs_identity_domains_and_a_different_instance() {
+    use crate::config::HostConfig;
+    let host = |identity: &str| {
+        HostConfig::from_toml_str(&format!(
+            "[ingress]\nmode = \"behind\"\nbind = \"127.0.0.1:8080\"\ntraefik_dynamic_file = \"/d.yml\"\n\
+             [admin]\nsocket = \"/a.sock\"\n[webhook]\nlisten = \"127.0.0.1:9180\"\ndomain = \"hook.example.com\"\n{identity}"
+        ))
+        .unwrap()
+    };
+    let identity = "[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"\n";
+    let forward = spec("[ingress]\nauth = \"forward\"");
+    let check = |h: &HostConfig, n: &str, s: &AppSpec| validate_host_app(h, &name(n), s);
+    check(&host(""), "a", &spec("")).unwrap();
+    assert!(
+        check(&host(""), "a", &forward)
+            .unwrap_err()
+            .contains("[identity]")
+    );
+    check(&host(identity), "a", &forward).unwrap();
+    let mut no_domains = forward.clone();
+    no_domains.domains.clear();
+    assert!(
+        check(&host(identity), "a", &no_domains)
+            .unwrap_err()
+            .contains("domains")
+    );
+    assert!(
+        check(&host(identity), "authelia", &forward)
+            .unwrap_err()
+            .contains("provider")
+    );
 }
 
 // --- external clients --------------------------------------------------------------------------
@@ -453,33 +485,25 @@ fn the_gate_rejects_oidc() {
 }
 
 #[test]
-fn the_gate_rejects_every_auth_field() {
-    // Each is valid on its own lexically (with forward) and still refused; the ones that are lexically
-    // invalid without `forward` are refused too, just earlier.
+fn forward_auth_and_exempt_paths_are_not_gated() {
     for extra in [
         "auth = \"forward\"",
-        "auth_policy = \"one_factor\"",
-        "auth_groups = [\"g\"]",
-        "auth_exempt_paths = [\"/p/\"]",
+        "auth = \"forward\"\nauth_exempt_paths = [\"/p/\"]",
     ] {
         let s = spec(&format!("[ingress]\n{extra}"));
-        assert!(state::validate_app(&name("a"), &s).is_err(), "{extra}");
+        state::validate_app(&name("a"), &s).unwrap();
+        gate::app(&name("a"), &s).unwrap();
     }
-    let forward_only = spec("[ingress]\nauth = \"forward\"");
-    lexical(&forward_only).unwrap();
-    assert!(gated(&forward_only).contains("forward auth"));
-    assert!(gated(&forward_only).ends_with("is not enabled in this release"));
-    // And the gate itself, independent of the lexical rules.
-    let mut s = spec("");
-    s.ingress.auth_policy = Some(AuthorizationPolicy::OneFactor);
-    assert!(gate::app(&name("a"), &s).is_err());
-    let mut s = spec("");
-    s.ingress.auth_groups = vec!["g".into()];
-    assert!(gate::app(&name("a"), &s).is_err());
-    let mut s = spec("");
-    s.ingress.auth_exempt_paths = vec!["/p/".into()];
-    assert!(gate::app(&name("a"), &s).is_err());
-    gate::app(&name("a"), &spec("")).unwrap();
+}
+
+#[test]
+fn the_gate_still_rejects_policy_and_groups_until_the_provider_enforces_them() {
+    for extra in ["auth_policy = \"one_factor\"", "auth_groups = [\"g\"]"] {
+        let s = spec(&format!("[ingress]\nauth = \"forward\"\n{extra}"));
+        let err = gated(&s);
+        assert!(err.contains("access control"), "{err}");
+        assert!(err.ends_with("is not enabled in this release"), "{err}");
+    }
 }
 
 #[test]
@@ -634,14 +658,6 @@ fn injected_names_must_not_clash_with_the_apps_own_config() {
 }
 
 #[test]
-fn a_probe_path_with_a_query_is_matched_on_its_path() {
-    let s = spec(
-        "[health.http]\npath = \"/healthz?full=1\"\n\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/healthz\"]",
-    );
-    lexical(&s).unwrap();
-}
-
-#[test]
 fn the_gate_speaks_before_the_lexical_rules() {
     // Lexically invalid (a bad redirect URI) and not enabled: the answer is the gate's.
     let s = spec(
@@ -652,4 +668,10 @@ fn the_gate_speaks_before_the_lexical_rules() {
         "{}",
         gated(&s)
     );
+}
+
+#[test]
+fn static_sites_do_not_take_forward_auth() {
+    let s = spec("kind = \"static\"\n[ingress]\nauth = \"forward\"");
+    assert!(lexical_err(&s).contains("static"), "{}", lexical_err(&s));
 }

@@ -12,6 +12,6 @@ pub mod traefik;
 
 pub use cdn::{CLOUDFLARE_ETAG, CLOUDFLARE_RANGES, CdnTrust, MAX_REFRESHED_RANGES, RangeSource};
 pub use plan::{
-    AppRoute, Cidr, Domain, IngressError, PathPrefix, Plan, RouteBackend, RouteRow,
-    SITES_CONTAINER_DIR, WEBHOOK_UPSTREAM_HOST, WebhookRoute,
+    AppRoute, Cidr, Domain, ExemptPath, IdentityRoute, IngressError, PathPrefix, Plan,
+    RouteBackend, RouteRow, SITES_CONTAINER_DIR, WEBHOOK_UPSTREAM_HOST, WebhookRoute,
 };

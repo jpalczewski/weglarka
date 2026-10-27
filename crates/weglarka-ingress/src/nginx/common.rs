@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use super::conf::Conf;
 use super::{NginxOptions, PLAIN_SOCKET, TLS_SOCKET};
-use crate::plan::{Cidr, Domain, Plan, WEBHOOK_UPSTREAM_HOST};
+use crate::plan::{Cidr, Domain, IdentityRoute, Plan, WEBHOOK_UPSTREAM_HOST};
 
 /// The three expressions the shared proxy headers are built from. `behind` reuses the trust maps
 /// (ADR 0007/0032); `edge` has no trusted peer, so the values are nginx's own.
@@ -15,7 +15,28 @@ pub(super) struct Forwarded {
     pub(super) xff: &'static str,
     pub(super) proto: &'static str,
     pub(super) fwd_host: &'static str,
+    /// The scheme of the client's request as the provider must see it (`X-Original-URL`): the
+    /// trusted-proxy scheme in `behind`, always `https` in `edge`. Never `$scheme`: behind Traefik
+    /// nginx listens on plain HTTP, and Authelia answers 400 to a non-`https` target.
+    pub(super) original_proto: &'static str,
 }
+
+/// Where a protected location's `Remote-*` values come from: the variables its `auth_request_set`
+/// lines fill from the authz response. Everywhere else the same headers are stripped.
+pub(super) struct AuthVars;
+
+impl AuthVars {
+    /// `(request header, variable)`; the provider's own response headers are the lower-case
+    /// `$upstream_http_remote_*` counterparts (see [`write_auth_request`]).
+    const HEADERS: [(&'static str, &'static str); 4] = [
+        ("Remote-User", "$wg_user"),
+        ("Remote-Groups", "$wg_groups"),
+        ("Remote-Name", "$wg_name"),
+        ("Remote-Email", "$wg_email"),
+    ];
+}
+
+pub(super) use crate::plan::AUTHZ_PATH as AUTHZ_LOCATION;
 
 /// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
 /// end up in logs); `upstream_response_time` is a string (`-` or a list on retry).
@@ -184,7 +205,12 @@ pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
     }
 }
 
-pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded) {
+/// The full proxy header set. At `http {}` level (`auth: None`) the `Remote-*` identity headers are
+/// set to the empty string, which removes whatever a client sent (same discipline as `X-Forwarded-*`,
+/// ADR 0007) in every location, static sites and the webhook included. nginx's `proxy_set_header`
+/// replaces *all* inherited headers at the first use on a level, so a protected location calls this
+/// again with `Some(AuthVars)` and gets the whole set back, `Remote-*` taken from the authz result.
+pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded, auth: Option<AuthVars>) {
     c.line("proxy_http_version 1.1;");
     c.line("proxy_set_header Host $host;");
     c.line(&format!(
@@ -206,7 +232,78 @@ pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded) {
     c.line("proxy_set_header X-Request-Id $request_id;");
     c.line("proxy_set_header Upgrade $http_upgrade;");
     c.line("proxy_set_header Connection $connection_upgrade;");
+    for (header, variable) in AuthVars::HEADERS {
+        let value = if auth.is_some() { variable } else { "\"\"" };
+        c.line(&format!("proxy_set_header {header} {value};"));
+    }
     c.line("add_header X-Request-Id $request_id always;");
+}
+
+/// `http {}` pieces of forward auth, present only when an active app uses it: the probe-socket test
+/// and the redirect target of a 401 that carries no `Location` (a bad `Authorization` header, say —
+/// a 302 with an empty `Location` would be broken).
+pub(super) fn write_auth_maps(c: &mut Conf, plan: &Plan<'_>) {
+    let Some(identity) = plan.forward_auth() else {
+        return;
+    };
+    c.line("# Forward auth (docs/decisions/0052).");
+    // The probe socket is the only listener without PROXY header or real_ip, so `$remote_addr` stays
+    // `unix:` there and nowhere else: the daemon is exempt structurally, with no address list.
+    c.block("map $remote_addr $weglarka_probe", |c| {
+        c.line("\"unix:\" 1;");
+        c.line("default 0;");
+    });
+    c.block("map $wg_redirect $wg_redirect_or_portal", |c| {
+        c.line(&format!("\"\" \"{}/\";", identity.issuer));
+        c.line("default $wg_redirect;");
+    });
+    c.blank();
+}
+
+/// The `auth_request` of a protected location and what it reads from the answer. A 401 goes to the
+/// provider's login (its `Location`, else the portal); 403 and a failed subrequest (500) stay errors.
+pub(super) fn write_auth_request(c: &mut Conf) {
+    c.line(&format!("auth_request {AUTHZ_LOCATION};"));
+    for (variable, header) in [
+        ("$wg_user", "remote_user"),
+        ("$wg_groups", "remote_groups"),
+        ("$wg_name", "remote_name"),
+        ("$wg_email", "remote_email"),
+        ("$wg_redirect", "location"),
+    ] {
+        c.line(&format!(
+            "auth_request_set {variable} $upstream_http_{header};"
+        ));
+    }
+    c.line("error_page 401 =302 $wg_redirect_or_portal;");
+}
+
+/// The internal location a `server` with protected apps carries once. The provider is a *variable*
+/// upstream resolved at request time, so a provider that is not running never fails `nginx -t` and
+/// never blocks reloads of other apps (its absence fails closed with a 500 instead).
+pub(super) fn write_authz_location(c: &mut Conf, identity: &IdentityRoute, forwarded: &Forwarded) {
+    c.block(&format!("location = {AUTHZ_LOCATION}"), |c| {
+        c.line("internal;");
+        c.block("if ($weglarka_probe)", |c| c.line("return 200;"));
+        c.line(&format!("set $wg_idp \"http://{}\";", identity.upstream));
+        c.line("proxy_pass $wg_idp/api/authz/auth-request;");
+        c.line("proxy_pass_request_body off;");
+        c.line("proxy_set_header Content-Length \"\";");
+        c.line("proxy_set_header Connection \"\";");
+        // The provider must not see identity headers a client made up either.
+        for (header, _) in AuthVars::HEADERS {
+            c.line(&format!("proxy_set_header {header} \"\";"));
+        }
+        c.line("proxy_set_header X-Original-Method $request_method;");
+        c.line(&format!(
+            "proxy_set_header X-Original-URL {}://$host$request_uri;",
+            forwarded.original_proto
+        ));
+        c.line(&format!(
+            "proxy_set_header X-Forwarded-For {};",
+            forwarded.xff
+        ));
+    });
 }
 
 /// The `$app` value of a server that hosts no single app (several apps, or none).

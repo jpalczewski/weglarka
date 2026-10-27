@@ -1683,3 +1683,358 @@ fn a_static_site_without_a_release_answers_503() {
         "{conf}"
     );
 }
+
+// --- Forward auth (#89, ADR 0052): nginx `auth_request` in both modes -------------------------------
+
+const IDENTITY: &str = r#"
+[identity]
+provider = "authelia"
+instance = "authelia"
+issuer = "https://auth.example.eu"
+"#;
+
+fn identity_host(base: &str) -> weglarka_model::config::HostConfig {
+    weglarka_model::config::HostConfig::from_toml_str(&format!("{base}{IDENTITY}")).unwrap()
+}
+
+/// The provider, a forward app with an exempt `/mcp/` that shares its domain with an unprotected
+/// prefix app, a forward prefix app with `strip_prefix`, and an app without forward auth.
+const FORWARD_APPS: &str = r#"
+[apps.authelia]
+image = "ghcr.io/authelia/authelia:latest"
+domains = ["auth.example.eu"]
+port = 9091
+
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "forward", auth_exempt_paths = ["/mcp/", "/.well-known/oauth", "/health"], max_body_size = "8m" }
+
+[apps.docs]
+image = "ghcr.io/x/docs:latest"
+domains = ["panel.example.eu"]
+paths = ["/docs"]
+port = 3001
+
+[apps.wiki]
+image = "ghcr.io/x/wiki:latest"
+domains = ["wiki.example.eu"]
+paths = ["/wiki"]
+port = 3002
+ingress = { auth = "forward", strip_prefix = true }
+
+[apps.plain]
+image = "ghcr.io/x/plain:latest"
+domains = ["plain.example.eu"]
+port = 3003
+"#;
+
+const FORWARD_DOMAINS: &[&str] = &[
+    "auth.example.eu",
+    "panel.example.eu",
+    "wiki.example.eu",
+    "plain.example.eu",
+    "weglarka.example.eu",
+];
+
+#[test]
+fn forward_auth_snapshots_in_both_modes() {
+    let a = apps(FORWARD_APPS);
+    let behind = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_forward_auth", behind);
+    let edge = nginx::generate(&identity_host(EDGE_HOST), &a, &edge_opts(FORWARD_DOMAINS)).unwrap();
+    insta::assert_snapshot!("nginx_edge_forward_auth", edge);
+}
+
+/// Cuts the `location` block that starts with `header` out of a server block.
+fn location_block<'a>(server: &'a str, header: &str) -> &'a str {
+    let start = server
+        .find(header)
+        .unwrap_or_else(|| panic!("{header}: {server}"));
+    let rest = &server[start..];
+    &rest[..rest.find("\n        }").expect("location end") + 10]
+}
+
+#[test]
+fn forward_auth_protects_by_location_and_exempts_structurally() {
+    let a = apps(FORWARD_APPS);
+    let behind = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    let edge = nginx::generate(&identity_host(EDGE_HOST), &a, &edge_opts(FORWARD_DOMAINS)).unwrap();
+    for (conf, edge) in [(behind, false), (edge, true)] {
+        // `edge` has a plain-HTTP redirect server per domain next to the app server.
+        let server_block = |conf: &str, domain: &str| {
+            if edge {
+                tls_server(conf, domain)
+            } else {
+                server_block(conf, domain)
+            }
+        };
+        // The identity headers are stripped for everyone at `http {}` level.
+        for header in ["User", "Groups", "Name", "Email"] {
+            assert!(
+                conf.contains(&format!("proxy_set_header Remote-{header} \"\";")),
+                "{conf}"
+            );
+        }
+        let panel = server_block(&conf, "panel.example.eu");
+        assert_eq!(
+            panel
+                .matches("location = /internal/weglarka/authz {")
+                .count(),
+            1
+        );
+        let root = location_block(&panel, "location / {");
+        assert!(
+            root.contains("auth_request /internal/weglarka/authz;"),
+            "{root}"
+        );
+        // A protected location re-emits the whole header set with the authz result.
+        assert!(
+            root.contains("proxy_set_header Remote-User $wg_user;"),
+            "{root}"
+        );
+        assert!(root.contains("proxy_set_header Host $host;"), "{root}");
+        assert!(
+            root.contains("proxy_set_header X-Forwarded-Proto"),
+            "{root}"
+        );
+        assert!(
+            root.contains("proxy_set_header Upgrade $http_upgrade;"),
+            "{root}"
+        );
+        assert!(
+            root.contains("error_page 401 =302 $wg_redirect_or_portal;"),
+            "{root}"
+        );
+        // The exempt paths are the app's own locations minus `auth_request` (and without `Remote-*`
+        // values), exact + prefix for an entry ending in `/`.
+        for header in [
+            "location = /mcp {",
+            "location ^~ /mcp/ {",
+            "location = /.well-known/oauth {",
+            "location = /health {",
+        ] {
+            let exempt = location_block(&panel, header);
+            assert!(!exempt.contains("auth_request"), "{exempt}");
+            assert!(!exempt.contains("$wg_"), "{exempt}");
+            assert!(exempt.contains("proxy_pass $upstream;"), "{exempt}");
+            assert!(exempt.contains("client_max_body_size 8388608;"), "{exempt}");
+        }
+        assert!(!panel.contains("location ^~ /health/"), "{panel}");
+        assert!(
+            !panel.contains("location ^~ /.well-known/oauth/"),
+            "{panel}"
+        );
+        // The unprotected app on the same server carries none of it.
+        let docs = location_block(&panel, "location ^~ /docs/ {");
+        assert!(!docs.contains("auth_request"), "{docs}");
+        let plain = server_block(&conf, "plain.example.eu");
+        assert!(!plain.contains("auth_request"), "{plain}");
+        assert!(!plain.contains("internal/weglarka"), "{plain}");
+        // A prefix app protects both of its locations and keeps its rewrite.
+        let wiki = server_block(&conf, "wiki.example.eu");
+        assert_eq!(
+            wiki.matches("auth_request /internal/weglarka/authz;")
+                .count(),
+            2,
+            "{wiki}"
+        );
+        assert!(wiki.contains("rewrite ^/wiki/(.*)$ /$1 break;"), "{wiki}");
+        // The provider's own server is plain.
+        let idp = server_block(&conf, "auth.example.eu");
+        assert!(!idp.contains("auth_request"), "{idp}");
+    }
+}
+
+#[test]
+fn the_authz_subrequest_names_the_scheme_the_client_used() {
+    let a = apps(FORWARD_APPS);
+    let behind = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    let panel = server_block(&behind, "panel.example.eu");
+    // `$scheme` would be `http` behind Traefik, and the provider answers 400 to that.
+    assert!(
+        panel.contains("proxy_set_header X-Original-URL $weglarka_proto://$host$request_uri;"),
+        "{panel}"
+    );
+    assert!(
+        panel.contains("proxy_set_header X-Forwarded-For $weglarka_xff;"),
+        "{panel}"
+    );
+    assert!(!panel.contains("X-Original-URL $scheme"), "{panel}");
+    assert!(
+        panel.contains("set $wg_idp \"http://authelia:9091\";"),
+        "{panel}"
+    );
+    assert!(
+        panel.contains("proxy_pass $wg_idp/api/authz/auth-request;"),
+        "{panel}"
+    );
+    assert!(
+        behind.contains("\"\" \"https://auth.example.eu/\";"),
+        "{behind}"
+    );
+    assert!(behind.contains("\"unix:\" 1;"), "{behind}");
+
+    let edge = nginx::generate(&identity_host(EDGE_HOST), &a, &edge_opts(FORWARD_DOMAINS)).unwrap();
+    let panel = tls_server(&edge, "panel.example.eu");
+    assert!(
+        panel.contains("proxy_set_header X-Original-URL https://$host$request_uri;"),
+        "{panel}"
+    );
+    assert!(
+        panel.contains("proxy_set_header X-Forwarded-For $remote_addr;"),
+        "{panel}"
+    );
+}
+
+#[test]
+fn the_probe_socket_listens_on_the_forward_app_and_the_authz_location_lets_it_through() {
+    let a = apps(FORWARD_APPS);
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    let panel = server_block(&conf, "panel.example.eu");
+    assert!(
+        panel.contains("listen unix:/run/weglarka-probe/probe.sock;"),
+        "{panel}"
+    );
+    let authz = location_block(&panel, "location = /internal/weglarka/authz {");
+    let skip = authz
+        .find("if ($weglarka_probe) {")
+        .expect("probe exemption");
+    // The exemption comes before the upstream is even chosen.
+    assert!(skip < authz.find("proxy_pass").unwrap(), "{authz}");
+}
+
+#[test]
+fn without_a_forward_app_only_the_four_strip_lines_appear() {
+    let plain = apps(MANY_APPS);
+    let without = nginx::generate(&host(), &plain, &opts()).unwrap();
+    // `[identity]` alone changes nothing: the machinery is rendered for forward apps only.
+    let with = nginx::generate(&identity_host(HOST), &plain, &opts()).unwrap();
+    assert_eq!(without, with);
+    for noise in ["auth_request", "weglarka_probe", "wg_", "internal/weglarka"] {
+        assert!(!without.contains(noise), "{noise}");
+    }
+    assert_eq!(without.matches("Remote-").count(), 4);
+    // A forward app that is not started renders no route and therefore no machinery either.
+    let mut stopped_forward = apps(FORWARD_APPS);
+    for spec in stopped_forward.values_mut() {
+        spec.start = false;
+    }
+    let conf = nginx::generate(&identity_host(HOST), &stopped_forward, &opts()).unwrap();
+    assert!(
+        !conf.contains("auth_request") && !conf.contains("wg_"),
+        "{conf}"
+    );
+}
+
+#[test]
+fn forward_auth_fails_closed_without_a_usable_provider() {
+    let a = apps(FORWARD_APPS);
+    // No `[identity]`: refuse the plan instead of serving the app open.
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::ForwardWithoutIdentity(_))
+    ));
+    // The provider behind its own forward auth would redirect to itself.
+    let mut looped = apps(FORWARD_APPS);
+    looped
+        .get_mut(&InstanceName::new("authelia").unwrap())
+        .unwrap()
+        .ingress
+        .auth = weglarka_model::identity::IngressAuth::Forward;
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &looped, &opts()),
+        Err(IngressError::ForwardProvider(_))
+    ));
+    // No port to default the upstream to, and none configured.
+    let mut no_port = apps(FORWARD_APPS);
+    let provider = no_port
+        .get_mut(&InstanceName::new("authelia").unwrap())
+        .unwrap();
+    // Without domains the provider is not routed, so only the upstream default can notice.
+    provider.port = None;
+    provider.domains.clear();
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &no_port, &opts()),
+        Err(IngressError::InvalidOption {
+            name: "identity.upstream",
+            ..
+        })
+    ));
+    // An explicit upstream wins and is validated.
+    let explicit = format!("{IDENTITY}upstream = \"idp.internal:9091\"\n");
+    let host_with =
+        weglarka_model::config::HostConfig::from_toml_str(&format!("{HOST}{explicit}")).unwrap();
+    let conf = nginx::generate(&host_with, &no_port, &opts()).unwrap();
+    assert!(
+        conf.contains("set $wg_idp \"http://idp.internal:9091\";"),
+        "{conf}"
+    );
+}
+
+#[test]
+fn exempt_paths_must_not_collide_with_streaming_paths_or_other_apps() {
+    let with = |ingress: &str, extra: &str| {
+        apps(&format!(
+            "[apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\nport = 3000\n\
+             ingress = {{ auth = \"forward\", {ingress} }}\n{extra}\n\
+             [apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n"
+        ))
+    };
+    let gen_ =
+        |a: &BTreeMap<InstanceName, AppSpec>| nginx::generate(&identity_host(HOST), a, &opts());
+    // `/mcp` and `/mcp/` are one entry, not two duplicate locations.
+    let conf = gen_(&with("auth_exempt_paths = [\"/mcp\", \"/mcp/\"]", "")).unwrap();
+    assert_eq!(conf.matches("location = /mcp {").count(), 1, "{conf}");
+    assert_eq!(conf.matches("location ^~ /mcp/ {").count(), 1, "{conf}");
+    // Same path, or an ancestor/descendant, as a streaming path.
+    for (exempt, streaming) in [
+        ("/mcp/", "/mcp"),
+        ("/mcp", "/mcp/events"),
+        ("/mcp/events/", "/mcp"),
+    ] {
+        let a = with(
+            &format!("auth_exempt_paths = [\"{exempt}\"], streaming_paths = [\"{streaming}\"]"),
+            "",
+        );
+        assert!(
+            matches!(gen_(&a), Err(IngressError::ExemptOverlap { .. })),
+            "{exempt} vs {streaming}"
+        );
+    }
+    // Another app already owns that prefix on the domain.
+    let a = with(
+        "auth_exempt_paths = [\"/api/\"]",
+        "[apps.api]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/api\"]\nport = 3001\n",
+    );
+    assert!(matches!(gen_(&a), Err(IngressError::PathConflict { .. })));
+}
+
+#[test]
+fn the_authz_path_is_reserved_and_the_authz_subrequest_drops_client_identity() {
+    let a = apps(
+        r#"
+[apps.panel]
+image = "i"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "forward", auth_exempt_paths = ["/internal/weglarka/authz"] }
+[apps.authelia]
+image = "i"
+domains = ["auth.example.eu"]
+port = 9091
+"#,
+    );
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &a, &opts()),
+        Err(IngressError::InvalidPath { .. })
+    ));
+    let conf = nginx::generate(&identity_host(HOST), &apps(FORWARD_APPS), &opts()).unwrap();
+    let panel = server_block(&conf, "panel.example.eu");
+    let authz = location_block(&panel, "location = /internal/weglarka/authz {");
+    assert!(
+        authz.contains("proxy_set_header Remote-User \"\";"),
+        "{authz}"
+    );
+}

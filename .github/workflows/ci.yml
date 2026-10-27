@@ -207,6 +207,30 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.201 > "$RUNNER_TEMP/neighbor.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf" \
             "$RUNNER_TEMP/peer.conf" "$RUNNER_TEMP/neighbor.conf"
+      # Forward auth (#89, docs/decisions/0052): both modes must pass `nginx -t` without the identity provider
+      # running (its upstream is a variable resolved per request), and in `behind` a stub provider drives every
+      # outcome of the `auth_request` contract — redirect, deny, identity headers, exempt paths, the probe
+      # socket and fail-closed behaviour.
+      - name: Forward auth through nginx
+        run: |
+          set -euo pipefail
+          cargo run -q -p weglarka-ingress --example dump -- nginx-forward 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/forward.conf"
+          docker run --rm -i -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
+            sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/forward.conf"
+          mkdir -p "$RUNNER_TEMP/forward-certs" "$RUNNER_TEMP/forward-run"
+          chmod 777 "$RUNNER_TEMP/forward-run"
+          for d in panel.example.eu weglarka.example.eu; do
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 -nodes -days 2 \
+              -keyout "$RUNNER_TEMP/forward-certs/$d.key" -out "$RUNNER_TEMP/forward-certs/$d.crt" \
+              -subj "/CN=$d" -addext "subjectAltName=DNS:$d"
+            chmod 600 "$RUNNER_TEMP/forward-certs/$d.key"
+          done
+          WEGLARKA_DUMP_PROXY_SOCKET_DIR=/run/wg-ingress \
+            cargo run -q -p weglarka-ingress --example dump -- nginx-edge-forward panel.example.eu,weglarka.example.eu > "$RUNNER_TEMP/edge-forward.conf"
+          docker run --rm -i -v "$RUNNER_TEMP/forward-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/forward-run:/run/wg-ingress" \
+            -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
+            sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-forward.conf"
+          .github/scripts/test-forward-auth.sh "$RUNNER_TEMP/forward.conf"
       # The two long nginx end-to-end tests run concurrently: they share nothing (own Docker network,
       # container names, host port and temp dir each), and each is dominated by an intentional wait.
       #  - Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream

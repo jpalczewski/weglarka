@@ -2,9 +2,10 @@
 //! `AppSpec.oidc`, `[oidc_clients]` and `AppIngress.auth*`, their lexical validation, and the gate
 //! that rejects every non-default value until the stage that enforces it.
 //!
-//! **No behaviour lives here.** Nothing reads these fields yet, so accepting one would leave the app
-//! public (forward auth) or without a client (OIDC); [`gate`] therefore refuses all of them. The
-//! gate is the one place a later stage edits to switch a feature on. `[identity]` itself
+//! **Little behaviour lives here.** Forward auth is enforced by the ingress generator (P5), so its
+//! fields are accepted; nothing reads the OIDC fields yet, so accepting one would leave the app
+//! without a client, and [`gate`] still refuses them. The gate is the one place a later stage edits
+//! to switch a feature on. `[identity]` itself
 //! ([`crate::config::IdentityConfig`]) stays in `config.rs` next to the other host sections.
 //!
 //! None of these fields is part of `spec_hash`.
@@ -601,24 +602,20 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
             ));
         }
     }
-    // The daemon's probe carries no session: a protected probe path would get a login redirect, fail
-    // the gate and roll back every deploy.
-    if let Some(probe) = &spec.health.http {
-        // nginx matches locations on the path alone.
-        let probe_path = probe.path.split('?').next().unwrap_or_default();
-        let covered = ingress
-            .auth_exempt_paths
-            .iter()
-            .any(|e| match e.strip_suffix('/') {
-                Some(prefix) => probe_path == prefix || probe_path.starts_with(e.as_str()),
-                None => probe_path == e,
-            });
-        if !covered {
-            return Err(format!(
-                "health.http path {:?} must be covered by ingress.auth_exempt_paths: the daemon's probe has no session and would be redirected to the login page",
-                probe.path
-            ));
-        }
+    // A static site's files are served by nginx itself; there is no upstream to attach identity to
+    // and no provider-aware location for it, so the combination is refused rather than half-supported.
+    if spec.kind == crate::app::AppKind::Static {
+        return Err(
+            "ingress.auth = \"forward\" is not supported on `kind = \"static\"` apps".to_owned(),
+        );
+    }
+    // Like `streaming_paths`, exempt locations are carved out of the app's own catch-all; a prefix app
+    // would need them nested below each of its prefixes. The health probe needs no entry here: it
+    // arrives on the probe socket, which the authz location lets through (docs/decisions/0054).
+    if !ingress.auth_exempt_paths.is_empty() && !spec.paths.is_empty() {
+        return Err(
+            "ingress.auth_exempt_paths cannot be combined with path prefixes in `paths`".to_owned(),
+        );
     }
     Ok(())
 }
@@ -671,6 +668,43 @@ pub fn validate_file(file: &AppsFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Host-aware rules of forward auth (docs/decisions/0052): an app with `ingress.auth = "forward"`
+/// needs `[identity]` (whose provider answers the authz subrequests) and domains (nothing to protect
+/// otherwise), and the provider's own instance can never be one — its login page would redirect to
+/// itself. Run on every write (`app` only) and at startup (`apps`).
+pub fn validate_host_app(
+    host: &crate::config::HostConfig,
+    name: &InstanceName,
+    spec: &AppSpec,
+) -> Result<(), String> {
+    if spec.ingress.auth.is_none() {
+        return Ok(());
+    }
+    let Some(identity) = &host.identity else {
+        return Err(format!(
+            "{name}: ingress.auth = \"forward\" needs an `[identity]` section in weglarka.toml"
+        ));
+    };
+    if spec.domains.is_empty() {
+        return Err(format!(
+            "{name}: ingress.auth = \"forward\" needs `domains`: there is nothing to protect otherwise"
+        ));
+    }
+    if &identity.instance == name {
+        return Err(format!(
+            "{name}: the identity provider instance cannot use ingress.auth = \"forward\" (its login page would redirect to itself)"
+        ));
+    }
+    Ok(())
+}
+
+/// [`validate_host_app`] for every app of `apps.toml`.
+pub fn validate_host(host: &crate::config::HostConfig, apps: &AppsFile) -> Result<(), String> {
+    apps.apps
+        .iter()
+        .try_for_each(|(name, spec)| validate_host_app(host, name, spec))
+}
+
 /// The feature gate (#42 B4). A field that is accepted but not enforced leaves apps public, so until
 /// the stage that implements a feature lands, any non-default value is an error. **To switch a
 /// feature on, delete its line below** (and its test); nothing else gates these fields.
@@ -687,15 +721,20 @@ pub mod gate {
         }
     }
 
-    /// Per-app fields (`AppSpec.oidc`, `AppSpec.ingress.auth*`).
+    /// Per-app fields (`AppSpec.oidc`, `ingress.auth_policy`/`auth_groups`; `auth` and `auth_exempt_paths` were lifted by P5).
     pub fn app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         let ingress = &spec.ingress;
-        let auth_used = !ingress.auth.is_none()
-            || ingress.auth_policy.is_some()
-            || !ingress.auth_groups.is_empty()
-            || !ingress.auth_exempt_paths.is_empty();
+        // nginx enforces only *who is logged in*; the policy and groups become the provider's access
+        // rules in #90. Until then accepting them would leave an app that asks for `two_factor` or a
+        // group open to every authenticated user.
+        let access_control = ingress.auth_policy.is_some() || !ingress.auth_groups.is_empty();
         reject(spec.oidc.is_some(), "OIDC clients (`oidc`)") // lifted by P4
-            .and_then(|()| reject(auth_used, "forward auth (`ingress.auth*`)")) // lifted by P5
+            .and_then(|()| {
+                reject(
+                    access_control,
+                    "forward auth access control (`ingress.auth_policy`, `ingress.auth_groups`)",
+                )
+            }) // lifted by #90
             .map_err(|e| format!("{name}: {e}"))
     }
 

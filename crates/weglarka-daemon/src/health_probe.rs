@@ -104,6 +104,62 @@ where
     parse_status(&head).ok_or_else(|| "malformed HTTP response".to_owned())
 }
 
+/// What the identity provider answered an authz request with (`doctor identity.forward`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthzAnswer {
+    pub status: u16,
+    pub has_location: bool,
+}
+
+/// Asks the provider's `/api/authz/auth-request` for `original_url` over the probe socket, with the
+/// issuer's host as `Host` — the way nginx's own subrequest does, minus the session. No cookie: a
+/// healthy, correctly scoped provider answers 401 with a `Location`.
+pub async fn authz_probe(
+    socket: &std::path::Path,
+    issuer_host: &str,
+    original_url: &str,
+) -> Result<AuthzAnswer, String> {
+    if !token_ok(issuer_host) || !token_ok(original_url) {
+        return Err("invalid host or URL for an authz probe".into());
+    }
+    let timeout = Duration::from_secs(5);
+    tokio::time::timeout(timeout, async {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+        let request = format!(
+            "GET /api/authz/auth-request HTTP/1.1\r\nHost: {issuer_host}\r\n\
+             User-Agent: weglarka-doctor\r\nX-Original-URL: {original_url}\r\n\
+             X-Original-Method: GET\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while head.len() < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read failed: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..n]);
+        }
+        let status = parse_status(&head).ok_or("malformed or empty HTTP response")?;
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let has_location = text.lines().any(|l| l.starts_with("location:"));
+        Ok(AuthzAnswer {
+            status,
+            has_location,
+        })
+    })
+    .await
+    .map_err(|_| "no answer within 5s".to_owned())?
+}
+
 fn parse_status(head: &[u8]) -> Option<u16> {
     let line = head.split(|b| *b == b'\n').next()?;
     let line = std::str::from_utf8(line).ok()?;
@@ -193,6 +249,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no answer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn authz_probe_reports_status_and_location() {
+        let (_dir, sock) = socket();
+        let req = serve_once(
+            &sock,
+            "HTTP/1.1 401 Unauthorized\r\nLocation: https://auth.example.com/\r\n\r\n",
+        );
+        let answer = authz_probe(&sock, "auth.example.com", "https://app.example.com/")
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            AuthzAnswer {
+                status: 401,
+                has_location: true
+            }
+        );
+        let req = req.await.unwrap();
+        assert!(
+            req.starts_with("GET /api/authz/auth-request HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("\r\nHost: auth.example.com\r\n"), "{req}");
+        assert!(
+            req.contains("\r\nX-Original-URL: https://app.example.com/\r\n"),
+            "{req}"
+        );
     }
 
     /// `get_status` is transport-generic: the same request goes over TCP.

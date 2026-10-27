@@ -209,6 +209,9 @@ pub async fn start<P: PodmanClient + 'static>(
     // missing/escaping source is refused by the engine at launch and reported by `doctor`, so that an
     // app added before its files exist does not keep the daemon from starting.
     weglarka_engine::config_mounts::validate_host(&host, &apps)?;
+    // Forward auth needs `[identity]`; the ingress generator refuses such an app without it anyway,
+    // but the daemon should say why at startup instead of at the first `apply`.
+    weglarka_model::identity::validate_host(&host, &apps).map_err(StartError::Ingress)?;
 
     // Notifications (issue #38): validated before anything is bound, so a broken `[notify]` section
     // stops the daemon instead of failing silently at the first deploy.
