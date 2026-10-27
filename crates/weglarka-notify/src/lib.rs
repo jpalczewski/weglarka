@@ -11,7 +11,7 @@
 
 pub mod channel;
 pub mod dedup;
-pub mod http;
+pub mod endpoint;
 pub mod message;
 pub mod ntfy;
 pub mod outbox;

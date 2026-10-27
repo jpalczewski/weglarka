@@ -60,7 +60,7 @@ worker: render -> severity filter -> dedup window -> outbox (per channel) -> cha
 4. **ntfy via its JSON publish API** — `POST <base>/` with
    `{topic, title, message, priority, tags, click}`, `Authorization: Bearer <token>` when configured.
    Not the header form: `Title:`/`Message:` header values must be ASCII and a UTF-8 title would need
-   escaping. `[notify.ntfy]` takes `url`, an optional `host` (= `Host` header **and TLS server name**)
+   escaping. `[notify.ntfy]` takes `url`, an optional `host` (= `Host` header; `http://` URLs only, see the amendment)
    for the internal route `url = "http://weglarka-nginx:8080"` + `host = "ntfy.example.com"`, `topic`,
    optional `token_file` and `min_severity`. A minimal HTTP/1.1 client (one `POST` per connection,
    `Connection: close`, 10 s timeout, no redirects) speaks to it; status 2xx = delivered,
@@ -70,8 +70,8 @@ worker: render -> severity filter -> dedup window -> outbox (per channel) -> cha
 5. **TLS with `rustls` (provider `ring`) and `webpki-roots`.** The `scratch` image has no `/etc/ssl`, so
    system roots are not an option, and bundling Mozilla's roots keeps the daemon self-contained. The
    provider is passed explicitly (`builder_with_provider`) so nothing installs a process-wide default;
-   ALPN is pinned to `http/1.1`; hostname verification is on and SNI follows `host` (not the connect
-   address). `rustls`/`ring` are pure Rust + C with no OpenSSL; the binary grows by ~1–2 MB.
+   ALPN is pinned to `http/1.1`; hostname verification is on against the host in the URL (see the amendment: `host` over
+   TLS is no longer accepted). `rustls`/`ring` are pure Rust + C with no OpenSSL; the binary grows by ~1–2 MB.
 
 6. **Severity routing per channel** (`min_severity`, default `info`): messages below it are dropped
    **before** dedup, so the debug events can be opted into but never open windows otherwise. ntfy
@@ -146,3 +146,12 @@ name in the outbox; `Severity` ordering is `debug < info < warning < critical`.
 - **Reacting to libpod events for crashes**: the action names need verification on a real Podman 6 host
   and `FakePodman` would have to script the stream; polling `RestartCount` is deterministic and testable
   (#112).
+
+## Amendment: shared HTTP client (#219)
+
+The hand-written client was replaced by `reqwest` through the shared `weglarka-http` crate (same
+`ring` provider passed explicitly, bundled `webpki-roots`, ALPN `http/1.1`, 10 s timeout, no redirects,
+no connection pooling). The response-head bound moved from 8 KiB to hyper's ~408 KiB. One behaviour changed (**breaking** for configs that used it): `host` is now accepted only with an `http://` URL.
+`reqwest` verifies the certificate against the host in the URL, so the former "SNI follows `host`"
+combination over TLS is rejected at configuration time instead of silently verifying a different name.
+The documented internal route (`http://weglarka-nginx:8080` + `host`) is plain HTTP and unaffected.

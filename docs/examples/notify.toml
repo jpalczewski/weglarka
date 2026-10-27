@@ -24,8 +24,8 @@ dedup_window_secs = 300
 # use the internal route below instead.
 url = "https://nz.example.com"
 #
-# Internal route through the ingress container (plain HTTP inside `net-weglarka`; `host` is both the
-# `Host` header and the TLS server name, so it must be the ntfy app's domain):
+# Internal route through the ingress container (plain HTTP inside `net-weglarka`; `host` is the
+# `Host` header, so it must be the ntfy app's domain; it is accepted only with an `http://` URL):
 # url = "http://weglarka-nginx:8080"   # `behind` only: in `edge` this port just redirects to HTTPS
 # host = "nz.example.com"
 

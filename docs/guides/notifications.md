@@ -24,7 +24,7 @@ token_file = "/var/lib/weglarka/ntfy-token"   # optional; without it the topic i
 min_severity = "info"            # debug | info | warning | critical
 ```
 
-- **Address:** if the Węglarka container cannot reach the host's public domain (hairpin NAT / DNS inside the container), use the internal route through the ingress: `url = "http://weglarka-nginx:8080"` together with `host = "ntfy.example.com"` (the `Host` header and the SNI name; nginx routes by `Host`). The internal route is plain HTTP on the Podman network, so the token never leaves the host. **This route works in `behind` only.** In `edge` that port answers every routed domain with a `301` to HTTPS, which the notifier does not follow, so use the public `https://` URL there; `health.http` no longer depends on this port (it uses the [probe socket](edge-mode.md)), but notifications do not use the socket yet.
+- **Address:** if the Węglarka container cannot reach the host's public domain (hairpin NAT / DNS inside the container), use the internal route through the ingress: `url = "http://weglarka-nginx:8080"` together with `host = "ntfy.example.com"` (the `Host` header; nginx routes by `Host`). `host` is only accepted together with an `http://` URL; for `https://` put the real name in `url`. The internal route is plain HTTP on the Podman network, so the token never leaves the host. **This route works in `behind` only.** In `edge` that port answers every routed domain with a `301` to HTTPS, which the notifier does not follow, so use the public `https://` URL there; `health.http` no longer depends on this port (it uses the [probe socket](edge-mode.md)), but notifications do not use the socket yet.
 - **Validation at startup:** a bad URL, a bad topic, or an unreadable or too-permissive token file **stops the daemon** (`notifications: …` in the log). Once enabled, notifications must not silently stop working.
 - **Test:** after a restart (`systemctl --user restart weglarka`):
 
@@ -38,6 +38,10 @@ weglarka notify status    # channels, queue, dropped counter, last error and las
 **3. What happens when ntfy does not respond.** Every notification first goes to the durable queue `/var/lib/weglarka/notifications.toml` (0600) and only then is sent. A failed attempt stays in the queue and is retried with backoff 30 s → 1 min → … → 30 min, at most 12 times (about 3.5 h); the queue is also capped at 200 entries and 7 days (the oldest fall out, and the `dropped` counter shows in `notify status`). So a deploy of ntfy, which is exactly when notifications matter most, does not lose them. The queue survives a daemon restart; the dedup windows (below) are in memory only.
 
 **4. Repeats (flapping).** The first event of a given kind for a given app is sent immediately; later ones within `dedup_window_secs` are counted, and when the window closes a single summary arrives (for example `3 more: deploy failed: ntfy`). A success does not reset the failure window, so an app that alternates between starting and crashing still produces one report per window.
+
+## Upgrading from 0.0.3
+
+A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup (the daemon stops with `notifications: …`). Earlier releases accepted it and verified the certificate against `host`. Fix: put the real name in `url` (`url = "https://ntfy.example.com"`, no `host`), or use the plain-HTTP internal route (`url = "http://weglarka-nginx:8080"` with `host`; in `behind` mode only, since in `edge` that port answers with a redirect). Rolling back to 0.0.3 needs no change.
 
 ## Rollback
 
