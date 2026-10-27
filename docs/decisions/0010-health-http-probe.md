@@ -1,6 +1,6 @@
 # 0010 — `health.http`: probe through nginx, resource limits, `health.command`
 
-Status: accepted (iteration 2, session 2).
+Status: accepted (iteration 2, session 2). Amended by [0054](0054-health-probe-socket.md): the probe goes over the ingress probe socket, not `weglarka-nginx:8080`.
 
 ## Decision
 

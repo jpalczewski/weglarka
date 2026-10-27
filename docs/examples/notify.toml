@@ -26,7 +26,7 @@ url = "https://nz.example.com"
 #
 # Internal route through the ingress container (plain HTTP inside `net-weglarka`; `host` is both the
 # `Host` header and the TLS server name, so it must be the ntfy app's domain):
-# url = "http://weglarka-nginx:8080"
+# url = "http://weglarka-nginx:8080"   # `behind` only: in `edge` this port just redirects to HTTPS
 # host = "nz.example.com"
 
 # ntfy topic to publish to ([A-Za-z0-9_-], 1–64 characters).

@@ -125,8 +125,9 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             });
         }
 
-        // One pair of servers per routed domain: plain HTTP (redirect + ACME) and, when the domain
-        // has a certificate, TLS. `start = false` apps are not routed at all here.
+        // Per routed domain: a plain-HTTP server (redirect + ACME) and one app server that always
+        // listens on the probe socket and on the TLS ports only when the domain has a certificate.
+        // `start = false` apps are not routed at all here.
         let mut by_domain: BTreeMap<&Domain, Vec<&AppRoute<'_>>> = BTreeMap::new();
         for app in plan.apps.iter().filter(|app| app.active) {
             for domain in &app.domains {
@@ -147,12 +148,12 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
                 set_app(c, app_name);
                 write_plain_http_body(c, o);
             });
-            let Some(stem) = o.certificate_stem(domain) else {
-                continue;
-            };
             c.blank();
             c.block("server", |c| {
-                write_tls_listener(c, o, &stem);
+                listen_probe(c, o, false);
+                if let Some(stem) = o.certificate_stem(domain) {
+                    write_tls_listener(c, o, &stem);
+                }
                 c.line(&format!("server_name {domain};"));
                 set_app(c, app_name);
                 write_app_locations(c, o, &apps, shared);

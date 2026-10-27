@@ -76,6 +76,7 @@ http {
 
     server {
         listen 8080 default_server;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;
@@ -103,6 +104,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name buffered.example.eu;
         set $app "buffered";
         if ($weglarka_redirect_https) {
@@ -117,6 +119,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name sse.example.eu;
         set $app "sse";
         if ($weglarka_redirect_https) {

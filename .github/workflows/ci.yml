@@ -125,12 +125,13 @@ jobs:
           save-if: false
       - run: cargo build -q -p weglarka-ingress --example dump
       # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
-      # (IngressConfig::default_nginx_image; docs/decisions/0006).
+      # (IngressConfig::default_nginx_image; docs/decisions/0006). Every config listens on the probe socket
+      # (docs/decisions/0054), so its directory is mounted like the daemon does (an anonymous volume here).
       - name: nginx -t
         run: |
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
-          docker run --rm -i docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+          docker run --rm -i -v /run/weglarka-probe docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
       # Edge mode (issue #95): nginx owns the public web ports and terminates TLS. The same image must accept
       # the generated config with the TLS material mounted where the daemon puts it (<nginx_conf_dir>/tls),
       # and the containers below exercise redirects, the ACME webroot, TLS and the fail-closed paths.
@@ -149,6 +150,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/edge-run"
           chmod 777 "$RUNNER_TEMP/edge-run"
           docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-run:/run/wg-ingress" \
+            -v /run/weglarka-probe \
             docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge.conf"
           .github/scripts/test-edge.sh "$RUNNER_TEMP/edge.conf" "$RUNNER_TEMP/edge-certs"
@@ -173,10 +175,10 @@ jobs:
             -subj "/CN=example.eu" -addext "subjectAltName=DNS:example.eu,DNS:*.example.eu"
           chmod 600 "$certs/_wildcard.example.eu.key"
           cargo run -q -p weglarka-ingress --example dump -- nginx-edge "" example.eu > "$RUNNER_TEMP/edge-wildcard.conf"
-          docker run --rm -i -v "$certs:/etc/nginx/tls:ro" docker.io/library/nginx:1-alpine \
+          docker run --rm -i -v "$certs:/etc/nginx/tls:ro" -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-wildcard.conf"
           docker run -d --name wg-edge-wildcard -p 127.0.0.1:18447:8443 \
-            -v "$certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-wildcard.conf:/etc/nginx/nginx.conf:ro" \
+            -v /run/weglarka-probe -v "$certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-wildcard.conf:/etc/nginx/nginx.conf:ro" \
             docker.io/library/nginx:1-alpine
           trap 'docker rm -f wg-edge-wildcard >/dev/null 2>&1 || true' EXIT
           sleep 3

@@ -34,8 +34,9 @@ http {
         '' close;
     }
 
-    map $remote_addr $weglarka_peer {
-        "unix:" $proxy_protocol_addr;
+    map "$remote_addr|$proxy_protocol_addr" $weglarka_peer {
+        "unix:|" "unix:";
+        "~^unix:\|(?<announced>.+)$" $announced;
         default $remote_addr;
     }
     # App name for the access log; `-` unless a `server`/`location` sets it.
@@ -94,6 +95,7 @@ http {
     server {
         listen 8080 default_server;
         listen unix:/run/weglarka-ingress/http.sock default_server proxy_protocol;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;
@@ -159,6 +161,17 @@ http {
         }
         location / {
             return 301 https://$host$request_uri;
+        }
+    }
+
+    server {
+        listen unix:/run/weglarka-probe/probe.sock;
+        server_name nz.example.eu;
+        set $app "ntfy";
+        client_max_body_size 67108864;
+        location / {
+            set $upstream "http://ntfy:8085";
+            proxy_pass $upstream;
         }
     }
 }

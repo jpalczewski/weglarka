@@ -76,6 +76,7 @@ http {
 
     server {
         listen 8080 default_server;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;

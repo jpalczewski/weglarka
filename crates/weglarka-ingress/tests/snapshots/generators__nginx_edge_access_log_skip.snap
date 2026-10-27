@@ -66,6 +66,7 @@ http {
 
     server {
         listen 8080 default_server;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;
@@ -111,6 +112,7 @@ http {
     }
 
     server {
+        listen unix:/run/weglarka-probe/probe.sock;
         listen 8443 ssl;
         http2 on;
         ssl_certificate /etc/nginx/tls/git.example.eu.crt;
@@ -141,6 +143,17 @@ http {
     }
 
     server {
+        listen unix:/run/weglarka-probe/probe.sock;
+        server_name plain.example.eu;
+        set $app "plain";
+        client_max_body_size 67108864;
+        location / {
+            set $upstream "http://plain:3001";
+            proxy_pass $upstream;
+        }
+    }
+
+    server {
         listen 8080;
         server_name shared.example.eu;
         set $app "-";
@@ -153,6 +166,28 @@ http {
         }
         location / {
             return 301 https://$host$request_uri;
+        }
+    }
+
+    server {
+        listen unix:/run/weglarka-probe/probe.sock;
+        server_name shared.example.eu;
+        set $app "-";
+        client_max_body_size 67108864;
+        location / {
+            set $app "web";
+            set $upstream "http://web:3003";
+            proxy_pass $upstream;
+        }
+        location = /v1 {
+            set $app "v1";
+            set $upstream "http://v1:3002";
+            proxy_pass $upstream;
+        }
+        location ^~ /v1/ {
+            set $app "v1";
+            set $upstream "http://v1:3002";
+            proxy_pass $upstream;
         }
     }
 }

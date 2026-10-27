@@ -1,6 +1,6 @@
 # 0036 — Edge mode: nginx owns 80/443 (TLS, ACME webroot, certificate reload)
 
-Status: accepted (2026-10-24, issue #95). The nginx half was measured locally and in the `check` job (Docker);
+Status: accepted (2026-10-24, issue #95; amended by [0054](0054-health-probe-socket.md): the health probe uses a unix probe socket, the plain-HTTP listener only redirects). The nginx half was measured locally and in the `check` job (Docker);
 the uid-map half has no local rootless Podman 6, so it was measured by `integration-podman`
 (`crates/weglarka-podman/tests/ingress_identity.rs`, green on the PR) — see “Verification”.
 

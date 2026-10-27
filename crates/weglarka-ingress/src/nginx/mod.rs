@@ -21,6 +21,11 @@
 //!   `$host`. A domain without a certificate gets no TLS server and its TLS handshake is rejected —
 //!   fail closed.
 //!
+//! Both modes also give every app `server` (and the default server) a third `listen`, the unix probe
+//! socket [`PROBE_SOCKET`] (docs/decisions/0054): plain HTTP for the daemon's `health.http` probe, reaching
+//! the same `location`/`$upstream` as real traffic without TLS, the HTTPS redirect or (later) forward
+//! auth. Its directory is mounted into nginx only, which is the whole access control.
+//!
 //! Extension points: [`Backend`] (a proxy to a container or a directory served by nginx itself, ADR 0049)
 //! and the two renderers, which share the location/log/scaffolding helpers, so a third mode
 //! only has to write its own `server` blocks.
@@ -50,6 +55,10 @@ pub const ACME_CONTAINER_DIR: &str = "/etc/nginx/acme";
 /// Socket files (in [`NginxOptions::proxy_socket_dir`]) the port forwarder connects to: plain HTTP and TLS.
 pub const PLAIN_SOCKET: &str = "http.sock";
 pub const TLS_SOCKET: &str = "https.sock";
+/// The daemon's health-probe socket (docs/decisions/0054): a plain-HTTP `listen` on every app server of both
+/// modes, in a directory mounted into nginx only. Its file name and the container directory it lives in.
+pub const PROBE_SOCKET: &str = "probe.sock";
+pub const PROBE_CONTAINER_DIR: &str = "/run/weglarka-probe";
 /// ACME HTTP-01 prefix, reserved on the plain-HTTP listener and exempt from the HTTPS redirect.
 pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 

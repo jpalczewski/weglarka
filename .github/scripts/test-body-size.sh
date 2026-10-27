@@ -108,7 +108,7 @@ docker run -d --name wg-body-up --network "$net" \
   -v "$work:/srv:ro" docker.io/library/python:3-alpine python3 -u /srv/upstream.py >/dev/null
 # Same hardening as the real ingress container: read-only root, a small writable /tmp.
 docker run -d --name wg-body-nginx --network "$net" -p 127.0.0.1:18097:8080 \
-  --read-only --tmpfs /tmp:rw,size=16m -v "$conf:/etc/nginx/nginx.conf:ro" \
+  --read-only --tmpfs /tmp:rw,size=16m -v /run/weglarka-probe -v "$conf:/etc/nginx/nginx.conf:ro" \
   docker.io/library/nginx:1-alpine >/dev/null
 
 ready=0

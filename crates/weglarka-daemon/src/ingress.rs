@@ -61,6 +61,10 @@ const SOCKET_CONTAINER_DIR: &str = "/run/weglarka-ingress";
 const FORWARDER_HTTP_PORT: u16 = 8080;
 const FORWARDER_HTTPS_PORT: u16 = 8443;
 
+/// `<nginx_conf_dir>/probe` (`0700`): the daemon's health-probe socket (docs/decisions/0054). Mounted writable into
+/// nginx **only** — not into [`SOCKET_SUBDIR`], which the internet-facing forwarder mounts: the probe socket
+/// skips TLS and forward auth, so the mounts are what isolate it. The daemon reaches it by the host path.
+const PROBE_SUBDIR: &str = "probe";
 /// `<nginx_conf_dir>` subdirectories (issue #95): TLS material and the ACME HTTP-01 webroot. Both sit
 /// inside the directory mounted at `/etc/nginx`, so `edge` needs no extra mount and no hash entry
 /// for mounts: the nginx container already sees them.
@@ -276,6 +280,7 @@ impl<P: PodmanClient> IngressManager<P> {
         if self.host.ingress.mode == IngressMode::Edge {
             self.ensure_socket_dir()?;
         }
+        self.ensure_probe_dir()?;
 
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
         // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
@@ -419,6 +424,18 @@ impl<P: PodmanClient> IngressManager<P> {
         self.conf_dir.join(SOCKET_SUBDIR)
     }
 
+    fn probe_dir(&self) -> PathBuf {
+        probe_dir(&self.conf_dir)
+    }
+
+    /// The `0700` directory of nginx's probe socket, in both modes; the mode is re-applied on every
+    /// pass like the forwarder's, because it is what keeps other local users off the socket.
+    fn ensure_probe_dir(&self) -> Result<(), IngressApplyError> {
+        let dir = self.probe_dir();
+        fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(io_err(&dir))
+    }
+
     /// The `0700` directory of nginx's forwarder sockets. The mode is the whole protection against a
     /// local user forging a PROXY header, so it is re-applied on every pass.
     fn ensure_socket_dir(&self) -> Result<(), IngressApplyError> {
@@ -430,8 +447,13 @@ impl<P: PodmanClient> IngressManager<P> {
     /// nginx does not unlink a socket file a killed predecessor left behind (`bind() … Address already
     /// in use`), so the files go before every start of the container.
     fn remove_stale_sockets(&self) -> Result<(), IngressApplyError> {
-        for name in [nginx::PLAIN_SOCKET, nginx::TLS_SOCKET] {
-            let path = self.socket_dir().join(name);
+        let sockets = [
+            (self.socket_dir(), nginx::PLAIN_SOCKET),
+            (self.socket_dir(), nginx::TLS_SOCKET),
+            (self.probe_dir(), nginx::PROBE_SOCKET),
+        ];
+        for (dir, name) in sockets {
+            let path = dir.join(name);
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -751,7 +773,6 @@ impl<P: PodmanClient> IngressManager<P> {
             https_listen_port,
             range,
             &nginx_security(),
-            self.host.ingress.mode == IngressMode::Edge,
         );
 
         let existing = podman
@@ -862,7 +883,6 @@ impl<P: PodmanClient> IngressManager<P> {
                 target: SOCKET_CONTAINER_DIR.to_owned(),
                 read_only: false,
             });
-            self.remove_stale_sockets()?;
         } else {
             publish.push(PortMapping {
                 host_ip: Some(bind.ip().to_string()),
@@ -870,6 +890,12 @@ impl<P: PodmanClient> IngressManager<P> {
                 container_port: listen_port,
             });
         }
+        // Both modes: the probe socket's directory, isolated from the forwarder's (docs/decisions/0054).
+        mounts.push(BindMount {
+            source: self.probe_dir().display().to_string(),
+            target: nginx::PROBE_CONTAINER_DIR.to_owned(),
+            read_only: false,
+        });
         let _ = https_listen_port;
         self.ensure_image(image).await?;
         // Everything slow (the image pull) is done: from here to the start below nothing serves.
@@ -884,6 +910,8 @@ impl<P: PodmanClient> IngressManager<P> {
             }
             podman.container_remove(NGINX_CONTAINER, true).await?;
         }
+        // nginx does not unlink the socket a killed predecessor left behind.
+        self.remove_stale_sockets()?;
         podman
             .container_create(&ContainerSpec {
                 name: NGINX_CONTAINER.to_owned(),
@@ -945,11 +973,11 @@ impl<P: PodmanClient> IngressManager<P> {
 }
 
 /// Version of the ingress hash input; bump when its shape changes (recreates every nginx container).
-/// v3 (issue #95): the mode and the second publish are part of the identity.
-const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v3";
-/// v4 (issue #162): `edge` nginx publishes nothing and listens on the forwarder's unix sockets. Only
-/// `edge` hashes with it, so `behind` keeps its v3 identity and is not recreated by the upgrade.
-const INGRESS_HASH_FORMAT_SOCKETS: &str = "weglarka.ingress-hash/v4";
+/// v3 (issue #95): the mode and the second publish are part of the identity. v4 (issue #162): `edge`
+/// nginx publishes nothing and listens on the forwarder's unix sockets. v5 (issue #221,
+/// docs/decisions/0054): both modes mount the probe directory, so an nginx created without it must be
+/// recreated once — `nginx -t` on a config that listens on the probe socket would fail forever otherwise.
+const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v5";
 
 /// Hardened profile of the nginx container — ours to choose, unlike an app's `security`, so it is always
 /// on (docs/decisions/0014): read-only root with libpod's writable `/tmp`, `/var/tmp` and `/run` tmpfs
@@ -1007,6 +1035,16 @@ fn default_trusted(own_addresses: &[IpAddr], bootstrap_subnets: &[String]) -> Ve
     }
 }
 
+/// Host path of the probe socket under `conf_dir` (`<nginx_conf_dir>/probe/probe.sock`): what the
+/// daemon's health prober dials.
+pub fn probe_socket_path(conf_dir: &Path) -> PathBuf {
+    probe_dir(conf_dir).join(nginx::PROBE_SOCKET)
+}
+
+fn probe_dir(conf_dir: &Path) -> PathBuf {
+    conf_dir.join(PROBE_SUBDIR)
+}
+
 pub(crate) fn nginx_security() -> Security {
     Security {
         read_only: true,
@@ -1030,14 +1068,9 @@ fn ingress_identity(
     https_listen_port: u16,
     range: UidRange,
     security: &Security,
-    proxy_sockets: bool,
 ) -> (String, String) {
     let input = IngressHashInput {
-        format: if proxy_sockets {
-            INGRESS_HASH_FORMAT_SOCKETS
-        } else {
-            INGRESS_HASH_FORMAT
-        },
+        format: INGRESS_HASH_FORMAT,
         image,
         bind: bind.to_string(),
         https_bind: https_bind.map(|b| b.to_string()),
@@ -1090,7 +1123,6 @@ fn ingress_hash(
     https_listen_port: u16,
     range: UidRange,
     security: &Security,
-    proxy_sockets: bool,
 ) -> String {
     ingress_identity(
         image,
@@ -1100,7 +1132,6 @@ fn ingress_hash(
         https_listen_port,
         range,
         security,
-        proxy_sockets,
     )
     .0
 }
@@ -1252,17 +1283,7 @@ mod tests {
             size: 65_536,
         };
         let spec = |image: &str, bind: &str| {
-            ingress_identity(
-                image,
-                bind.parse().unwrap(),
-                None,
-                8080,
-                8443,
-                range,
-                &sec,
-                true,
-            )
-            .1
+            ingress_identity(image, bind.parse().unwrap(), None, 8080, 8443, range, &sec).1
         };
         let old = spec("nginx:1", "127.0.0.1:80");
         assert_eq!(
@@ -1316,9 +1337,9 @@ mod tests {
         };
         let sec = nginx_security();
         let bind = "127.0.0.1:18080".parse().unwrap();
-        let a = ingress_hash("i", bind, None, 8080, 8443, r, &sec, false);
-        assert_eq!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec, false));
-        assert_ne!(a, ingress_hash("j", bind, None, 8080, 8443, r, &sec, false));
+        let a = ingress_hash("i", bind, None, 8080, 8443, r, &sec);
+        assert_eq!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
+        assert_ne!(a, ingress_hash("j", bind, None, 8080, 8443, r, &sec));
         assert_ne!(
             a,
             ingress_hash(
@@ -1329,10 +1350,9 @@ mod tests {
                 8443,
                 r,
                 &sec,
-                false
             )
         );
-        assert_ne!(a, ingress_hash("i", bind, None, 8081, 8443, r, &sec, false));
+        assert_ne!(a, ingress_hash("i", bind, None, 8081, 8443, r, &sec));
         assert_ne!(
             a,
             ingress_hash(
@@ -1346,7 +1366,6 @@ mod tests {
                     size: 4096
                 },
                 &sec,
-                false
             )
         );
     }
@@ -1362,11 +1381,8 @@ mod tests {
         let sec = nginx_security();
         let bind = "0.0.0.0:80".parse().unwrap();
         let https = "0.0.0.0:443".parse().unwrap();
-        let a = ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec, false);
-        assert_eq!(
-            a,
-            ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec, false)
-        );
+        let a = ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec);
+        assert_eq!(a, ingress_hash("i", bind, Some(https), 8080, 8443, r, &sec));
         assert_ne!(
             a,
             ingress_hash(
@@ -1377,14 +1393,39 @@ mod tests {
                 8443,
                 r,
                 &sec,
-                false
             )
         );
-        assert_ne!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec, false));
-        assert_ne!(
-            a,
-            ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec, false)
+        assert_ne!(a, ingress_hash("i", bind, None, 8080, 8443, r, &sec));
+        assert_ne!(a, ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec));
+    }
+
+    /// docs/decisions/0054: both modes mount the probe directory from v5 on, so a container created
+    /// by an older daemon (v3 `behind`, v4 `edge`) has a different identity and is recreated once.
+    #[test]
+    fn hash_format_v5_recreates_nginx_created_without_the_probe_mount() {
+        let r = UidRange {
+            start: 1,
+            size: 4096,
+        };
+        let (_, spec) = ingress_identity(
+            "i",
+            "127.0.0.1:18080".parse().unwrap(),
+            None,
+            8080,
+            8443,
+            r,
+            &nginx_security(),
         );
+        assert!(spec.contains("weglarka.ingress-hash/v5"), "{spec}");
+        for old in ["v3", "v4"] {
+            let old_spec = spec.replace("v5", old);
+            assert_ne!(
+                recreate_reason(Some(&old_spec), &spec),
+                "changed: ",
+                "{old} must differ"
+            );
+            assert!(recreate_reason(Some(&old_spec), &spec).contains("format"));
+        }
     }
 
     /// Upgrading from a build without hardening must recreate nginx: the profile is in the hash.
@@ -1398,15 +1439,15 @@ mod tests {
         let hardened = nginx_security();
         let unhardened = Security::default();
         assert_ne!(
-            ingress_hash("i", bind, None, 8080, 8443, r, &hardened, false),
-            ingress_hash("i", bind, None, 8080, 8443, r, &unhardened, false),
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &unhardened),
             "a profile change must not leave the old container in place"
         );
         let mut no_nnp = hardened.clone();
         no_nnp.no_new_privileges = false;
         assert_ne!(
-            ingress_hash("i", bind, None, 8080, 8443, r, &hardened, false),
-            ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp, false)
+            ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
+            ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp)
         );
     }
 }

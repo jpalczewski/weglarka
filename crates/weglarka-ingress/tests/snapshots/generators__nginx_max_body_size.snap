@@ -76,6 +76,7 @@ http {
 
     server {
         listen 8080 default_server;
+        listen unix:/run/weglarka-probe/probe.sock default_server;
         server_name _;
         set $app "-";
         return 444;
@@ -103,6 +104,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name capped.example.eu;
         set $app "capped";
         if ($weglarka_redirect_https) {
@@ -119,6 +121,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name git.example.eu;
         set $app "git";
         if ($weglarka_redirect_https) {
@@ -138,6 +141,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name open.example.eu;
         set $app "open";
         if ($weglarka_redirect_https) {
@@ -154,6 +158,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name plain.example.eu;
         set $app "plain";
         if ($weglarka_redirect_https) {
@@ -168,6 +173,7 @@ http {
 
     server {
         listen 8080;
+        listen unix:/run/weglarka-probe/probe.sock;
         server_name shared.example.eu;
         set $app "-";
         if ($weglarka_redirect_https) {
