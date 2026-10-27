@@ -184,6 +184,10 @@ http {
             proxy_pass_request_body off;
             proxy_set_header Content-Length "";
             proxy_set_header Connection "";
+            proxy_set_header Remote-User "";
+            proxy_set_header Remote-Groups "";
+            proxy_set_header Remote-Name "";
+            proxy_set_header Remote-Email "";
             proxy_set_header X-Original-Method $request_method;
             proxy_set_header X-Original-URL https://$host$request_uri;
             proxy_set_header X-Forwarded-For $remote_addr;
@@ -218,7 +222,7 @@ http {
         }
         location = /.well-known/oauth {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -228,7 +232,7 @@ http {
         }
         location = /health {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -238,7 +242,7 @@ http {
         }
         location = /mcp {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -248,7 +252,7 @@ http {
         }
         location ^~ /mcp/ {
             set $app "panel";
-            if ($request_uri ~* "(;|%3b|\\\\|%5c|%25)") {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25)") {
                 return 400;
             }
             set $upstream "http://panel:3000";
@@ -334,6 +338,10 @@ http {
             proxy_pass_request_body off;
             proxy_set_header Content-Length "";
             proxy_set_header Connection "";
+            proxy_set_header Remote-User "";
+            proxy_set_header Remote-Groups "";
+            proxy_set_header Remote-Name "";
+            proxy_set_header Remote-Email "";
             proxy_set_header X-Original-Method $request_method;
             proxy_set_header X-Original-URL https://$host$request_uri;
             proxy_set_header X-Forwarded-For $remote_addr;

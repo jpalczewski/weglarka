@@ -13,6 +13,9 @@ use weglarka_model::identity::{IngressAuth, check_issuer, check_upstream};
 /// An app instance name must not equal it (it would shadow the webhook upstream).
 pub const WEBHOOK_UPSTREAM_HOST: &str = "weglarka";
 
+/// The internal location every protected location asks (docs/decisions/0052); no app path may be it.
+pub(crate) const AUTHZ_PATH: &str = "/internal/weglarka/authz";
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IngressError {
     #[error("invalid domain {value:?}: {reason}")]
@@ -437,6 +440,12 @@ impl<'a> Plan<'a> {
                 .iter()
                 .map(PathPrefix::new)
                 .collect::<Result<Vec<_>, _>>()?;
+            if spec.ingress.streaming_paths.iter().any(|p| p == AUTHZ_PATH) {
+                return Err(IngressError::InvalidPath {
+                    value: AUTHZ_PATH.to_owned(),
+                    reason: "is reserved for the forward-auth subrequest",
+                });
+            }
             let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming)?;
             let mut domains = Vec::with_capacity(spec.domains.len());
             for raw in &spec.domains {
@@ -523,6 +532,12 @@ fn exempt_paths(
             return Err(IngressError::InvalidPath {
                 value: raw.clone(),
                 reason: "would exempt every request",
+            });
+        }
+        if body == AUTHZ_PATH {
+            return Err(IngressError::InvalidPath {
+                value: raw.clone(),
+                reason: "is reserved for the forward-auth subrequest",
             });
         }
         *by_path.entry(PathPrefix::new(body)?).or_default() |= prefix;

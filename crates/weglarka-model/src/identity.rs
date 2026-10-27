@@ -602,6 +602,13 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
             ));
         }
     }
+    // A static site's files are served by nginx itself; there is no upstream to attach identity to
+    // and no provider-aware location for it, so the combination is refused rather than half-supported.
+    if spec.kind == crate::app::AppKind::Static {
+        return Err(
+            "ingress.auth = \"forward\" is not supported on `kind = \"static\"` apps".to_owned(),
+        );
+    }
     // Like `streaming_paths`, exempt locations are carved out of the app's own catch-all; a prefix app
     // would need them nested below each of its prefixes. The health probe needs no entry here: it
     // arrives on the probe socket, which the authz location lets through (docs/decisions/0054).

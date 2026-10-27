@@ -2010,3 +2010,31 @@ fn exempt_paths_must_not_collide_with_streaming_paths_or_other_apps() {
     );
     assert!(matches!(gen_(&a), Err(IngressError::PathConflict { .. })));
 }
+
+#[test]
+fn the_authz_path_is_reserved_and_the_authz_subrequest_drops_client_identity() {
+    let a = apps(
+        r#"
+[apps.panel]
+image = "i"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "forward", auth_exempt_paths = ["/internal/weglarka/authz"] }
+[apps.authelia]
+image = "i"
+domains = ["auth.example.eu"]
+port = 9091
+"#,
+    );
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &a, &opts()),
+        Err(IngressError::InvalidPath { .. })
+    ));
+    let conf = nginx::generate(&identity_host(HOST), &apps(FORWARD_APPS), &opts()).unwrap();
+    let panel = server_block(&conf, "panel.example.eu");
+    let authz = location_block(&panel, "location = /internal/weglarka/authz {");
+    assert!(
+        authz.contains("proxy_set_header Remote-User \"\";"),
+        "{authz}"
+    );
+}

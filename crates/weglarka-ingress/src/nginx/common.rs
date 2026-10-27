@@ -36,8 +36,7 @@ impl AuthVars {
     ];
 }
 
-/// The internal location every protected location asks (docs/decisions/0052).
-pub(super) const AUTHZ_LOCATION: &str = "/internal/weglarka/authz";
+pub(super) use crate::plan::AUTHZ_PATH as AUTHZ_LOCATION;
 
 /// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
 /// end up in logs); `upstream_response_time` is a string (`-` or a list on retry).
@@ -291,6 +290,10 @@ pub(super) fn write_authz_location(c: &mut Conf, identity: &IdentityRoute, forwa
         c.line("proxy_pass_request_body off;");
         c.line("proxy_set_header Content-Length \"\";");
         c.line("proxy_set_header Connection \"\";");
+        // The provider must not see identity headers a client made up either.
+        for (header, _) in AuthVars::HEADERS {
+            c.line(&format!("proxy_set_header {header} \"\";"));
+        }
         c.line("proxy_set_header X-Original-Method $request_method;");
         c.line(&format!(
             "proxy_set_header X-Original-URL {}://$host$request_uri;",

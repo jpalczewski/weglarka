@@ -467,7 +467,7 @@ fn host_mount_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Ve
 /// sources themselves are not checked here — a file that does not exist yet must not block adding
 /// the app; reconcile blocks the instance and `doctor` warns until the source appears. The lexical
 /// rules (`relative`, no `..`, unique `target`) are already enforced by `state::validate_app`.
-pub(crate) fn validate_config_mounts<P: PodmanClient>(
+pub(crate) fn validate_host_rules<P: PodmanClient>(
     d: &Daemon<P>,
     name: &InstanceName,
     spec: &AppSpec,
@@ -498,7 +498,7 @@ async fn add_app<P: PodmanClient + 'static>(
 ) -> ApiResult<Response> {
     let req: AddAppRequest = parse_json(&body)?;
     state::validate_app(&req.name, &req.spec).map_err(Fail::invalid)?;
-    validate_config_mounts(&d, &req.name, &req.spec)?;
+    validate_host_rules(&d, &req.name, &req.spec)?;
     {
         let _g = d.desired_lock.lock().await;
         let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;

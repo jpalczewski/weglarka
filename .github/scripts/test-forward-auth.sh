@@ -145,8 +145,14 @@ done
 for path in '/mcp/..;/admin' '/mcp/%3b/x' '/mcp/%5cx' '/mcp/%252e%252e/admin'; do
   expect "exempt $path refused" "$(status_line "$(call panel.example.eu "$path")")" '400 '
 done
+# The guard looks at the path only: a query string with `%25` or `;` is an ordinary OAuth/MCP request.
+expect 'exempt, query with %25' "$(status_line "$(call panel.example.eu '/mcp/x?a=100%25&b=c;d')")" '200 '
 out=$(call panel.example.eu /mcpx)
 expect 'sibling of an exempt path' "$(status_line "$out")" '302 '
+
+# A body-carrying request is guarded like a GET: no session, no upstream.
+expect 'POST, no session' "$(status_line "$(call panel.example.eu /api -X POST -d x=1)")" '302 '
+expect 'POST, exempt' "$(status_line "$(call panel.example.eu /mcp/x -X POST -d x=1)")" '200 '
 
 # An app without forward auth never asks and never passes an injected identity on.
 out=$(call open.example.eu / "${forged[@]}")

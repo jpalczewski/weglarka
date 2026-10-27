@@ -1708,10 +1708,8 @@ async fn identity_forward<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCh
     if domains.is_empty() {
         return;
     }
-    let issuer_host = identity
-        .issuer
-        .strip_prefix("https://")
-        .unwrap_or(&identity.issuer);
+    // `IdentityConfig::validate` guarantees the `https://` prefix.
+    let issuer_host = identity.issuer.trim_start_matches("https://");
     let socket = crate::ingress::probe_socket_path(&d.paths.nginx_conf_dir);
     for domain in domains {
         let id = "identity.forward";

@@ -29,6 +29,11 @@ The contracts live in the comments on #89 (forward auth), #90 (access control) a
   lifts the gate for `auth` and `auth_exempt_paths`; `auth_policy` and `auth_groups` stay gated until #90 turns
   them into provider access rules.
 
+- `auth_policy` and `auth_groups` stay gated after P5: nginx cannot enforce them, and an accepted-but-unenforced
+  restriction would be worse than a refusal. They are lifted when the provider's access rules are rendered (#90).
+- The `unix:` probe exemption relies on the probe socket's `0700` directory being mounted only into nginx (the
+  forwarder's socket directory is a different one), so nothing else can speak on that listener.
+
 ## Consequences
 
 - `apps.toml` gains the four `ingress` fields (schema 14); see ADR 0051 for compatibility and rollback.

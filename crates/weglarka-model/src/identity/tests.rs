@@ -669,3 +669,9 @@ fn the_gate_speaks_before_the_lexical_rules() {
         gated(&s)
     );
 }
+
+#[test]
+fn static_sites_do_not_take_forward_auth() {
+    let s = spec("kind = \"static\"\n[ingress]\nauth = \"forward\"");
+    assert!(lexical_err(&s).contains("static"), "{}", lexical_err(&s));
+}

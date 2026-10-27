@@ -36,8 +36,11 @@ follow a login redirect. List them in `auth_exempt_paths`:
 - An exempt path is a full copy of the app's location (same upstream, body limit, streaming and timeouts) without the
   login check. It is structural, not an access rule: the path is simply not guarded.
 - Requests to an exempt path whose URI contains `;`, `\` (raw or percent-encoded) or an encoded `%` (`%25`) get `400`: nginx matches the normalized
-  path but the upstream receives the raw URI, and some servers read those characters as path syntax (`/mcp/..;/admin`).
-- Exempt paths must not overlap `streaming_paths`, and cannot be combined with `paths` (prefix routing).
+  path but the upstream receives the raw URI, and some servers read those characters as path syntax (`/mcp/..;/admin`). Only the path is checked, not the query string.
+- The guard is a denylist of the common ways a path is read differently by nginx and an upstream. It assumes the upstream
+  does not resolve dot-segments from overlong or non-ASCII input and does not Unicode-normalize paths; exempt only paths
+  that the app protects by itself (tokens), never ones that rely on the path layout.
+- `kind = "static"` apps cannot use forward auth. Exempt paths must not overlap `streaming_paths`, and cannot be combined with `paths` (prefix routing).
 
 ## Not enabled yet
 
@@ -54,7 +57,7 @@ the probe socket. A `401` with a `Location` is healthy; a `400` means the domain
 ## Rollback
 
 The nginx change is output only: removing `auth`/`auth_exempt_paths` from an app and reconciling restores the previous
-config. Going back to a Węglarka that predates this stage keeps the fields in `apps.toml` accepted but **unenforced** on
-versions that already know them, and unparsable on older ones (`deny_unknown_fields`): remove `ingress.auth` and
-`ingress.auth_exempt_paths` from `apps.toml` first, or the app is either served openly or the daemon refuses to start. See
-[the state schema](state-schema.md) and [verify and rollback](verify-and-rollback.md).
+config. A Węglarka from before this stage **refuses to start** while `apps.toml` still holds `ingress.auth` or
+`ingress.auth_exempt_paths` (the P0 gate, and `deny_unknown_fields` on older ones); it never serves such an app unenforced.
+Remove both fields from `apps.toml` (the apps are then public again), or restore the files from before the upgrade, before
+downgrading. See [the state schema](state-schema.md) and [verify and rollback](verify-and-rollback.md).
