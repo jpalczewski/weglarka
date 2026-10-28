@@ -112,6 +112,49 @@ pub const DEFAULT_CLIENT_ID_ENV: &str = "OIDC_CLIENT_ID";
 /// Default `issuer_env` of [`OidcClientSpec`].
 pub const DEFAULT_ISSUER_ENV: &str = "OIDC_ISSUER";
 
+/// Where the provider's command must load the generated directory from, as its **last** `--config`
+/// (#88): the provider merges sources in order, the last wins for scalars and replaces lists
+/// wholesale, so anything loaded after ours could re-open `access_control.default_policy`.
+pub const GENERATED_CONFIG: &str = "/weglarka/generated/current";
+
+/// Every `--config` source of `command`, in load order. Understands the forms a `StringSlice` flag
+/// accepts: `--config=a,b`, `--config a`, `-c a`, `-c=a` and `-ca`. Anything after a bare `--`
+/// is a positional argument, not a source.
+pub fn config_sources(command: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == "--" {
+            break;
+        } else if let Some(v) = arg.strip_prefix("--config=") {
+            v
+        } else if arg == "--config" || arg == "-c" {
+            match args.next() {
+                Some(v) => v,
+                None => break,
+            }
+        } else if let Some(v) = arg.strip_prefix("-c")
+            && !arg.starts_with("--")
+        {
+            v.strip_prefix('=').unwrap_or(v)
+        } else {
+            continue;
+        };
+        out.extend(
+            value
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    out
+}
+
+/// Whether `command` loads [`GENERATED_CONFIG`] as its last config source.
+pub fn loads_generated_last(command: &[String]) -> bool {
+    config_sources(command).last().map(String::as_str) == Some(GENERATED_CONFIG)
+}
+
 /// The spec as the container sees it: the app's own spec plus what the identity integration injects
 /// (#91) — `<client_id_env>=<instance>`, `<issuer_env>=<issuer>` and a binding of
 /// `<instance>.oidc-client-secret` at the declared target. The one place that overlay is computed;
@@ -728,6 +771,11 @@ pub fn validate_host_app(
     name: &InstanceName,
     spec: &AppSpec,
 ) -> Result<(), String> {
+    if spec.oidc.is_some() && host.identity.is_none() {
+        return Err(format!(
+            "{name}: `oidc` needs an `[identity]` section in weglarka.toml"
+        ));
+    }
     if spec.ingress.auth.is_none() {
         return Ok(());
     }
@@ -749,18 +797,59 @@ pub fn validate_host_app(
     Ok(())
 }
 
-/// [`validate_host_app`] for every app of `apps.toml`.
+/// [`validate_host_app`] for every app of `apps.toml`, plus the file-level `[oidc_clients]` rule.
 pub fn validate_host(host: &crate::config::HostConfig, apps: &AppsFile) -> Result<(), String> {
+    if !apps.oidc_clients.is_empty() && host.identity.is_none() {
+        return Err("`[oidc_clients]` needs an `[identity]` section in weglarka.toml".to_owned());
+    }
     apps.apps
         .iter()
         .try_for_each(|(name, spec)| validate_host_app(host, name, spec))
+}
+
+/// Rules for the spec of the provider instance itself (`[identity].instance`, #88); `Ok` for any
+/// other instance. Run on every write of that instance. At daemon start the same rules are only
+/// *reported* (`doctor identity.provider`): a wrong provider degrades the integration, but the
+/// admin API has to stay up to repair it.
+pub fn validate_provider(
+    host: &crate::config::HostConfig,
+    name: &InstanceName,
+    spec: &AppSpec,
+) -> Result<(), String> {
+    let Some(identity) = host.identity.as_ref().filter(|i| &i.instance == name) else {
+        return Ok(());
+    };
+    if spec.auto_update {
+        return Err(format!(
+            "{name}: the identity provider must set `auto_update = false`; it is updated deliberately, never from a webhook"
+        ));
+    }
+    // `IdentityConfig::validate` guarantees `https://host[:port]`.
+    let issuer_host = identity
+        .issuer
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if !spec.domains.iter().any(|d| d == issuer_host) {
+        return Err(format!(
+            "{name}: the issuer host {issuer_host:?} must be one of the provider's `domains`"
+        ));
+    }
+    if !loads_generated_last(&spec.command) {
+        return Err(format!(
+            "{name}: the provider's `command` must load `--config={GENERATED_CONFIG}` as its last config source \
+             (the generated access rules and OIDC clients replace anything a later file sets)"
+        ));
+    }
+    Ok(())
 }
 
 /// The feature gate (#42 B4). A field that is accepted but not enforced leaves apps public, so until
 /// the stage that implements a feature lands, any non-default value is an error. **To switch a
 /// feature on, delete its line below** (and its test); nothing else gates these fields.
 pub mod gate {
-    use super::{AppSpec, AppsFile, InstanceName};
+    use super::{AppSpec, InstanceName};
 
     const SUFFIX: &str = "is not enabled in this release";
 
@@ -772,31 +861,18 @@ pub mod gate {
         }
     }
 
-    /// Per-app fields (`AppSpec.oidc`, `ingress.auth_policy`/`auth_groups`; `auth` and `auth_exempt_paths` were lifted by P5).
+    /// Per-app fields (`ingress.auth_policy`/`auth_groups`; `oidc` was lifted by P4, `auth` and `auth_exempt_paths` by P5).
     pub fn app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         let ingress = &spec.ingress;
         // nginx enforces only *who is logged in*; the policy and groups become the provider's access
         // rules in #90. Until then accepting them would leave an app that asks for `two_factor` or a
         // group open to every authenticated user.
         let access_control = ingress.auth_policy.is_some() || !ingress.auth_groups.is_empty();
-        reject(spec.oidc.is_some(), "OIDC clients (`oidc`)") // lifted by P4
-            .and_then(|()| {
-                reject(
-                    access_control,
-                    "forward auth access control (`ingress.auth_policy`, `ingress.auth_groups`)",
-                )
-            }) // lifted by #90
-            .map_err(|e| format!("{name}: {e}"))
-    }
-
-    /// File-level `[oidc_clients]`.
-    pub fn file(file: &AppsFile) -> Result<(), String> {
-        reject(!file.oidc_clients.is_empty(), "`[oidc_clients]`") // lifted by P4
-    }
-
-    /// Host-level `[identity]`.
-    pub fn host(host: &crate::config::HostConfig) -> Result<(), String> {
-        reject(host.identity.is_some(), "`[identity]`") // lifted by P4
+        reject(
+            access_control,
+            "forward auth access control (`ingress.auth_policy`, `ingress.auth_groups`)",
+        ) // lifted by #90
+        .map_err(|e| format!("{name}: {e}"))
     }
 }
 

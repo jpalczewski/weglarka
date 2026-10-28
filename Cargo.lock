@@ -2058,6 +2058,7 @@ dependencies = [
  "weglarka-api",
  "weglarka-dns",
  "weglarka-engine",
+ "weglarka-identity",
  "weglarka-ingress",
  "weglarka-model",
  "weglarka-notify",

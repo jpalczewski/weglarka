@@ -350,8 +350,6 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
 
 /// `apps.toml` invariants that span the file and are not about one instance.
 fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
-    // A feature that is not enabled is refused as such, before its own rules.
-    crate::identity::gate::file(apps)?;
     crate::identity::validate_file(apps)
 }
 

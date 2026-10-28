@@ -38,6 +38,7 @@ weglarka-acme.workspace = true
 weglarka-dns.workspace = true
 weglarka-api.workspace = true
 weglarka-engine.workspace = true
+weglarka-identity.workspace = true
 weglarka-model.workspace = true
 weglarka-ingress.workspace = true
 weglarka-notify.workspace = true

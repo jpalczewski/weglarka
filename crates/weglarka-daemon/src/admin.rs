@@ -480,6 +480,8 @@ pub(crate) fn validate_host_rules<P: PodmanClient>(
         .map_err(|e| Fail::invalid(e.to_string()))?;
     // Forward auth needs `[identity]` and domains, and the provider cannot protect itself.
     weglarka_model::identity::validate_host_app(&d.host, name, spec).map_err(Fail::invalid)?;
+    // The provider's own spec: issuer host, generated config loaded last, no auto-update (#88).
+    weglarka_model::identity::validate_provider(&d.host, name, spec).map_err(Fail::invalid)?;
     if spec.configs.is_empty() || d.paths.config_root.is_some() {
         return Ok(());
     }

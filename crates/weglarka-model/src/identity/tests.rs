@@ -482,13 +482,12 @@ fn gated(spec: &AppSpec) -> String {
 }
 
 #[test]
-fn the_gate_rejects_oidc() {
-    assert!(
-        gated(&oidc("")).ends_with("is not enabled in this release"),
-        "{}",
-        gated(&oidc(""))
+fn oidc_is_accepted_and_still_validated_lexically() {
+    state::validate_app(&name("a"), &oidc("")).unwrap();
+    let bad = spec(
+        "[oidc]\nredirect_uris = [\"http://x/cb\"]\nclient_secret = { kind = \"env\", var = \"S\" }",
     );
-    assert!(gated(&oidc("")).contains("OIDC"));
+    assert!(state::validate_app(&name("a"), &bad).is_err());
 }
 
 #[test]
@@ -514,41 +513,29 @@ fn the_gate_still_rejects_policy_and_groups_until_the_provider_enforces_them() {
 }
 
 #[test]
-fn the_gate_rejects_oidc_clients_on_load_and_save() {
+fn oidc_clients_load_and_save() {
     let src = format!(
         "schema_version = {SCHEMA_VERSION}\n[oidc_clients.forge]\nname = \"Forge\"\nredirect_uris = [\"https://git.example.com/cb\"]\nsecret_digest = \"$pbkdf2-sha512$310000$c2FsdA$aGFzaA\"\n"
     );
-    let path = Path::new("apps.toml");
-    let err = state::parse_apps(path, &src).unwrap_err().to_string();
-    assert!(
-        err.contains("`[oidc_clients]` is not enabled in this release"),
-        "{err}"
-    );
-
-    let mut file = AppsFile::default();
-    file.oidc_clients.insert(id("forge"), external());
-    let dir = std::env::temp_dir().join(format!("weglarka-identity-gate-{}", std::process::id()));
+    let parsed = state::parse_apps(Path::new("apps.toml"), &src).unwrap();
+    assert!(parsed.oidc_clients.contains_key(&id("forge")));
+    let dir = std::env::temp_dir().join(format!("weglarka-identity-save-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let err = state::save_apps(&dir.join("apps.toml"), &file)
-        .unwrap_err()
-        .to_string();
+    let saved = state::save_apps(&dir.join("apps.toml"), &parsed);
     std::fs::remove_dir_all(&dir).unwrap();
-    assert!(err.contains("not enabled in this release"), "{err}");
+    saved.unwrap();
 }
 
 #[test]
-fn the_gate_rejects_oidc_apps_on_load() {
+fn oidc_apps_load() {
     let src = format!(
         "schema_version = {SCHEMA_VERSION}\n[apps.a]\nimage = \"x:1\"\ndomains = [\"app.example.com\"]\n[apps.a.oidc]\nredirect_uris = [\"https://app.example.com/cb\"]\npublic = true\n"
     );
-    let err = state::parse_apps(Path::new("apps.toml"), &src)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("not enabled in this release"), "{err}");
+    state::parse_apps(Path::new("apps.toml"), &src).unwrap();
 }
 
 #[test]
-fn the_gate_rejects_identity_in_the_host_config() {
+fn identity_in_the_host_config_is_accepted_and_closed() {
     let base = r#"
 [ingress]
 mode = "behind"
@@ -562,9 +549,7 @@ domain = "weglarka.example.com"
     HostConfig::from_toml_str(base).unwrap().validate().unwrap();
     let with = |identity: &str| HostConfig::from_toml_str(&format!("{base}\n{identity}")).unwrap();
     let ok = "[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"\n";
-    let err = with(ok).validate().unwrap_err();
-    assert_eq!(err, "`[identity]` is not enabled in this release");
-    // Lexical errors come first.
+    with(ok).validate().unwrap();
     let err = with(&ok.replace("https://auth.example.com", "http://auth.example.com"))
         .validate()
         .unwrap_err();
@@ -665,16 +650,75 @@ fn injected_names_must_not_clash_with_the_apps_own_config() {
 }
 
 #[test]
-fn the_gate_speaks_before_the_lexical_rules() {
-    // Lexically invalid (a bad redirect URI) and not enabled: the answer is the gate's.
-    let s = spec(
-        "[oidc]\nredirect_uris = [\"http://x/cb\"]\nclient_secret = { kind = \"env\", var = \"S\" }",
-    );
+fn host_rules_for_oidc_and_the_provider() {
+    let with_identity = |s: &str| {
+        let mut host = HostConfig::from_toml_str(
+            "[ingress]\nmode = \"behind\"\nbind = \"172.17.0.1:8080\"\n[admin]\nsocket = \"/run/a.sock\"\n[webhook]\nlisten = \"0.0.0.0:9180\"\ndomain = \"w.example.com\"\n",
+        )
+        .unwrap();
+        host.identity = Some(toml::from_str(s).unwrap());
+        host
+    };
+    let cfg =
+        "provider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"";
+    let host = with_identity(cfg);
+    let bare = HostConfig::from_toml_str(
+        "[ingress]\nmode = \"behind\"\nbind = \"172.17.0.1:8080\"\n[admin]\nsocket = \"/run/a.sock\"\n[webhook]\nlisten = \"0.0.0.0:9180\"\ndomain = \"w.example.com\"\n",
+    )
+    .unwrap();
+    // `oidc` needs `[identity]`.
     assert!(
-        gated(&s).ends_with("is not enabled in this release"),
-        "{}",
-        gated(&s)
+        validate_host_app(&bare, &name("a"), &oidc(""))
+            .unwrap_err()
+            .contains("[identity]")
     );
+    validate_host_app(&host, &name("a"), &oidc("")).unwrap();
+    // The provider: issuer host among its domains, generated config last, no auto-update.
+    let prov = |extra: &str| -> AppSpec {
+        toml::from_str(&format!(
+            "image = \"authelia\"\nauto_update = false\ndomains = [\"auth.example.com\"]\ncommand = [\"authelia\", \"--config=/c.yml\", \"--config={GENERATED_CONFIG}\"]\n{extra}"
+        ))
+        .unwrap()
+    };
+    validate_provider(&host, &name("authelia"), &prov("")).unwrap();
+    // Other instances are not the provider.
+    validate_provider(&host, &name("other"), &spec("")).unwrap();
+    assert!(
+        validate_provider(&host, &name("authelia"), &{
+            let mut s = prov("");
+            s.auto_update = true;
+            s
+        })
+        .unwrap_err()
+        .contains("auto_update")
+    );
+    let wrong_domain: AppSpec = toml::from_str(&format!(
+        "image = \"a\"\ndomains = [\"x.example.com\"]\nauto_update = false\ncommand = [\"--config={GENERATED_CONFIG}\"]"
+    ))
+    .unwrap();
+    assert!(
+        validate_provider(&host, &name("authelia"), &wrong_domain)
+            .unwrap_err()
+            .contains("issuer host")
+    );
+    let misordered: AppSpec = toml::from_str(&format!(
+        "image = \"a\"\ndomains = [\"auth.example.com\"]\nauto_update = false\ncommand = [\"--config={GENERATED_CONFIG}\", \"--config=/late.yml\"]"
+    ))
+    .unwrap();
+    assert!(
+        validate_provider(&host, &name("authelia"), &misordered)
+            .unwrap_err()
+            .contains("last config source")
+    );
+    // `[oidc_clients]` need the section too.
+    let mut file = AppsFile::default();
+    file.oidc_clients.insert(id("forge"), external());
+    assert!(
+        validate_host(&bare, &file)
+            .unwrap_err()
+            .contains("[identity]")
+    );
+    validate_host(&host, &file).unwrap();
 }
 
 #[test]
@@ -723,4 +767,44 @@ fn effective_spec_injects_id_issuer_and_the_secret() {
     assert!(s.env.is_empty() && s.secrets.is_empty());
     let digest = crate::app::Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
     assert_ne!(spec_hash(&s, &digest), spec_hash(&eff, &digest));
+}
+
+// --- --config parsing ---------------------------------------------------------------------------
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| (*s).to_owned()).collect()
+}
+
+#[test]
+fn config_sources_understand_every_flag_form() {
+    for (parts, want) in [
+        (&["authelia", "--config=/a"][..], &["/a"][..]),
+        (&["--config", "/a"], &["/a"]),
+        (&["-c", "/a"], &["/a"]),
+        (&["-c=/a"], &["/a"]),
+        (&["-c/a"], &["/a"]),
+        (&["--config=/a,/b", "--config", "/c"], &["/a", "/b", "/c"]),
+        (&["--config=/a", "--", "--config=/b"], &["/a"]),
+        (&["--other", "x"], &[]),
+    ] {
+        assert_eq!(config_sources(&argv(parts)), want, "{parts:?}");
+    }
+}
+
+#[test]
+fn the_generated_directory_must_come_last() {
+    let g = GENERATED_CONFIG;
+    assert!(loads_generated_last(&argv(&[
+        "--config=/base.yml",
+        &format!("--config={g}")
+    ])));
+    assert!(loads_generated_last(&argv(&[&format!(
+        "--config=/base.yml,{g}"
+    )])));
+    assert!(!loads_generated_last(&argv(&[
+        &format!("--config={g}"),
+        "--config=/base.yml"
+    ])));
+    assert!(!loads_generated_last(&argv(&["--config=/base.yml"])));
+    assert!(!loads_generated_last(&argv(&[])));
 }
