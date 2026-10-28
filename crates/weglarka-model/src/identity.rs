@@ -1,14 +1,12 @@
-//! Identity provider integration, stage P0 (issue #42, ADR 0051/0052): the serde types of
-//! `AppSpec.oidc`, `[oidc_clients]` and `AppIngress.auth*`, their lexical validation, and the gate
-//! that rejects every non-default value until the stage that enforces it.
+//! Identity provider integration (issue #42, ADR 0051/0052): the serde types of `AppSpec.oidc`,
+//! `[oidc_clients]` and `AppIngress.auth*`, their validation, [`effective_spec`] (what the integration
+//! injects into an app) and the gate that still rejects `ingress.auth_policy` / `auth_groups` until the
+//! provider enforces them (#90). The gate is the one place a later stage edits to switch a feature on.
+//! `[identity]` itself ([`crate::config::IdentityConfig`]) stays in `config.rs` next to the other host
+//! sections.
 //!
-//! **Little behaviour lives here.** Forward auth is enforced by the ingress generator (P5), so its
-//! fields are accepted; nothing reads the OIDC fields yet, so accepting one would leave the app
-//! without a client, and [`gate`] still refuses them. The gate is the one place a later stage edits
-//! to switch a feature on. `[identity]` itself
-//! ([`crate::config::IdentityConfig`]) stays in `config.rs` next to the other host sections.
-//!
-//! None of these fields is part of `spec_hash`.
+//! The `oidc` and `auth*` fields are not part of `spec_hash`; what `oidc` injects is, through
+//! [`effective_spec`].
 
 use std::collections::BTreeSet;
 use std::fmt;
