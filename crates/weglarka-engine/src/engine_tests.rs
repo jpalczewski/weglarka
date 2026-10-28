@@ -3791,7 +3791,7 @@ mod generated {
     };
     use crate::testing::RunScript;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use weglarka_model::app::AppSpec;
+    use weglarka_model::app::{AppSpec, AppsFile};
     use weglarka_model::generated::{
         ConfigGenerator, FileName, Fingerprint, GeneratedFile, RenderError, RenderInput,
     };
@@ -3887,7 +3887,8 @@ health = { attempts = 2, window_secs = 2 }
         // A deadlock (re-locking inside the pipeline) would hang here; paused time makes it a failure.
         tokio::time::timeout(
             Duration::from_secs(120),
-            h.rec.apply_generated(&**g, &BTreeMap::new(), force),
+            h.rec
+                .apply_generated(&**g, &|_: &AppsFile| BTreeMap::new(), force),
         )
         .await
         .expect("apply_generated must not deadlock")

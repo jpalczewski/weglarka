@@ -70,6 +70,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
     acme(d, &mut checks);
+    generated(d, &mut checks);
     identity_forward(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }
@@ -1073,6 +1074,80 @@ fn routed_domains<P: PodmanClient>(d: &Daemon<P>) -> Option<Vec<String>> {
 /// `acme.certs` is a failure only for a certificate that has already expired; a missing one or one
 /// inside the renewal window is a warning (the worker is expected to deal with it on its next pass),
 /// and so is a failure the last pass recorded.
+/// Generated config (#212), one check per generator: the live and the applied version, whether the
+/// version was applied without validation (a first start), and what the last failed attempt said.
+fn generated<P: PodmanClient + 'static>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_model::generated_state::{FILE_NAME, GeneratedState, LastResult};
+    let Some(worker) = &d.generated else {
+        return;
+    };
+    let recorded = GeneratedState::load(&d.paths.state_dir.join(FILE_NAME));
+    let short = |fingerprint: &str| fingerprint.chars().take(12).collect::<String>();
+    for generator in worker.generators() {
+        let id = format!("generated.{}", generator.id());
+        let consumer = generator.consumer();
+        let live = d.engine.generated_live_version(consumer);
+        let Some(record) = recorded.get(generator.id()) else {
+            out.push(check(
+                &id,
+                CheckStatus::Info,
+                format!("nothing rendered yet for {consumer}"),
+                None,
+            ));
+            continue;
+        };
+        let applied = record.applied.as_deref().map(short);
+        let state = format!(
+            "{consumer}: live {}, applied {}",
+            live.as_deref().unwrap_or("none"),
+            applied
+                .as_deref()
+                .map_or("none".to_owned(), |a| format!("v-{a}")),
+        );
+        let failed = matches!(
+            record.last_result,
+            LastResult::Invalid | LastResult::RolledBack | LastResult::Failed
+        );
+        if failed {
+            let what = match record.last_result {
+                LastResult::Invalid => "the validator rejected the last render",
+                LastResult::RolledBack => "the consumer failed its health gate on the last render",
+                _ => "the last render could not be applied",
+            };
+            out.push(check(
+                &id,
+                CheckStatus::Warn,
+                format!(
+                    "{state}; {what}: {}",
+                    record.last_error.as_deref().unwrap_or("no output")
+                ),
+                Some(
+                    "the previous version is still live; the render is tried again when it \
+                     changes",
+                ),
+            ));
+        } else if live.as_deref() != applied.map(|a| format!("v-{a}")).as_deref() {
+            out.push(check(
+                &id,
+                CheckStatus::Warn,
+                format!("{state}; the live version is not the applied one"),
+                Some("the next pass applies it; if this persists, check the daemon log"),
+            ));
+        } else if !record.validated {
+            out.push(check(
+                &id,
+                CheckStatus::Info,
+                format!(
+                    "{state}; unvalidated (applied before the consumer could run the validator)"
+                ),
+                None,
+            ));
+        } else {
+            out.push(ok(&id, state));
+        }
+    }
+}
+
 fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Some(config) = &d.host.acme else {
         return;

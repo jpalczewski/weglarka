@@ -34,6 +34,8 @@ pub struct Daemon<P: PodmanClient> {
     pub notify: Option<Arc<NotifyHandle>>,
     /// What the ACME worker found on its last pass; `None` when `[acme]` is absent or paused.
     pub acme: Option<Arc<crate::acme::AcmeStatus>>,
+    /// Keeps generated config files current (#212); `None` when no generator is registered.
+    pub generated: Option<Arc<crate::generated::GeneratedWorker<P>>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).
     pub desired_lock: tokio::sync::Mutex<()>,
     /// When the process started: reported by `GET /v1/health`, the readiness probe the host-side
@@ -50,6 +52,9 @@ impl<P: PodmanClient + 'static> Daemon<P> {
         // A full channel means a reconcile is already scheduled.
         let _ = self.triggers.try_send(Trigger::Changed);
         self.ingress.request_apply();
+        if let Some(generated) = &self.generated {
+            generated.request_apply();
+        }
     }
 
     /// Spawns a background task tracked for the duration of graceful shutdown.

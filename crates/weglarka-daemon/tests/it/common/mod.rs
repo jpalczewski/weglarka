@@ -14,9 +14,10 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
-use weglarka_daemon::{Running, Settings, start};
+use weglarka_daemon::{Running, Settings, start_with};
 use weglarka_engine::testing::FakePodman;
 use weglarka_model::config::HostConfig;
+use weglarka_model::generated::ConfigGenerator;
 
 /// The image reference most tests deploy; only its name matters to [`FakePodman`].
 pub const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
@@ -86,6 +87,7 @@ pub struct Builder {
     top_level: String,
     sections: String,
     apps: Option<String>,
+    generators: Vec<std::sync::Arc<dyn ConfigGenerator>>,
 }
 
 impl Default for Builder {
@@ -104,6 +106,7 @@ impl Builder {
             top_level: String::new(),
             sections: String::new(),
             apps: None,
+            generators: Vec::new(),
         }
     }
 
@@ -129,15 +132,22 @@ impl Builder {
         self
     }
 
+    /// Config generators (#212) run next to the built-in ones.
+    pub fn generator(mut self, generator: std::sync::Arc<dyn ConfigGenerator>) -> Self {
+        self.generators.push(generator);
+        self
+    }
+
     pub async fn build(self) -> Harness {
         if let Some(apps) = &self.apps {
             std::fs::create_dir_all(self.root.join("state")).unwrap();
             std::fs::write(self.root.join("state/apps.toml"), apps).unwrap();
         }
         let fake = FakePodman::new();
-        let running = start(
+        let running = start_with(
             settings(&self.root, &self.top_level, &self.sections),
             fake.clone(),
+            self.generators,
         )
         .await
         .unwrap();

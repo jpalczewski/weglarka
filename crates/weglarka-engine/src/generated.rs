@@ -84,12 +84,14 @@ pub enum GeneratedOutcome {
 }
 
 impl<P: PodmanClient> Reconciler<P> {
-    /// Renders `generator` and, when the output changed, puts it live in the consumer. `digests` are
-    /// the credential digests the render may use. `force` retries a render that failed before.
+    /// Renders `generator` and, when the output changed, puts it live in the consumer. `digests`
+    /// yields the credential digests (#213) the render may use; it runs **under the engine lock**,
+    /// so minting a missing credential cannot race another writer of the secret store. `force`
+    /// retries a render that failed before.
     pub async fn apply_generated(
         self: &Arc<Self>,
         generator: &dyn ConfigGenerator,
-        digests: &BTreeMap<InstanceName, Pbkdf2Digest>,
+        digests: &DigestProvider,
         force: bool,
     ) -> Result<GeneratedOutcome, EngineError> {
         let guard = self.acquire().await;
@@ -101,7 +103,7 @@ impl<P: PodmanClient> Reconciler<P> {
         self: &Arc<Self>,
         guard: &EngineGuard<'_>,
         generator: &dyn ConfigGenerator,
-        digests: &BTreeMap<InstanceName, Pbkdf2Digest>,
+        digests: &DigestProvider,
         force: bool,
     ) -> Result<GeneratedOutcome, EngineError> {
         let id = generator.id();
@@ -118,9 +120,10 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(consumer.clone()))?;
 
         // 1. Render. Equal to what is applied (and live) = nothing to do.
+        let digests = digests(&apps);
         let files = generator.render(&RenderInput {
             apps: &apps,
-            digests,
+            digests: &digests,
         })?;
         let fp = Fingerprint::of(id, &files)?;
         let want = fp.version_dir();
@@ -453,8 +456,13 @@ impl<P: PodmanClient> Reconciler<P> {
         }])
     }
 
+    /// The version directory `current` points at for `consumer` (`v-<fingerprint12>`), for `doctor`.
+    pub fn generated_live_version(&self, consumer: &InstanceName) -> Option<String> {
+        current_target(&self.generated_dir(consumer))
+    }
+
     /// `<state dir>/generated/<consumer>`.
-    pub(crate) fn generated_dir(&self, consumer: &InstanceName) -> PathBuf {
+    pub fn generated_dir(&self, consumer: &InstanceName) -> PathBuf {
         self.state_dir()
             .join("generated")
             .join(consumer.to_string())

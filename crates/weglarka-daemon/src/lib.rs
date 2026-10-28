@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod forgejo;
 pub mod forward;
 pub mod forwarder;
+pub mod generated;
 pub mod github;
 pub mod health_probe;
 pub mod images;
@@ -47,6 +48,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use weglarka_engine::config_mounts::ConfigError;
 use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions};
 use weglarka_model::podman::PodmanClient;
+use weglarka_model::secret_ops::SecretOps;
 use weglarka_model::secret_store::SecretStore;
 use weglarka_model::secrets::FileSecretStore;
 use weglarka_model::state;
@@ -135,6 +137,8 @@ pub struct Running<P: PodmanClient + 'static> {
     acme: Option<JoinHandle<()>>,
     /// CDN range refresh (`[ingress.cdn]` without a pin).
     cdn: Option<JoinHandle<()>>,
+    /// Generated config worker (#212); `None` when no generator is registered.
+    generated: Option<JoinHandle<()>>,
 }
 
 fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
@@ -178,6 +182,16 @@ fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
 pub async fn start<P: PodmanClient + 'static>(
     settings: Settings,
     podman: P,
+) -> Result<Running<P>, StartError> {
+    start_with(settings, podman, Vec::new()).await
+}
+
+/// [`start`] with extra config generators (#212) next to the built-in ones — how the integration
+/// tests run the pipeline without the identity provider.
+pub async fn start_with<P: PodmanClient + 'static>(
+    settings: Settings,
+    podman: P,
+    extra_generators: Vec<Arc<dyn weglarka_model::generated::ConfigGenerator>>,
 ) -> Result<Running<P>, StartError> {
     let Settings { host, paths, .. } = settings;
     ensure_dir(&paths.state_dir, 0o755)?;
@@ -259,7 +273,26 @@ pub async fn start<P: PodmanClient + 'static>(
         // The engine emits into the durable pipeline instead of only into the log.
         reconciler = reconciler.with_events(notifier.sink());
     }
+    // Generated config (#212): the engine bootstraps a consumer's files before its first start; the
+    // worker below keeps them current. With no generator registered the feature is off entirely.
+    let mut generators = generated::registered(&host);
+    generators.extend(extra_generators);
+    let digests = generated::credential_digests(secrets.clone() as Arc<dyn SecretOps>);
+    if !generators.is_empty() {
+        reconciler = reconciler.with_generated(weglarka_engine::generated::GeneratedWiring {
+            generators: generators.clone(),
+            digests: digests.clone(),
+        });
+    }
     let engine = Arc::new(reconciler);
+    let generated_worker = (!generators.is_empty()).then(|| {
+        Arc::new(generated::GeneratedWorker::new(
+            engine.clone(),
+            generators,
+            digests,
+            generated::DEBOUNCE,
+        ))
+    });
     // A daemon that died in the middle of `weglarka run` left its one-off container behind; this
     // process has no run yet, so every one found is stale (issue #106). Podman being down is not a
     // reason to refuse to start: the reconcile loop reports it.
@@ -314,6 +347,7 @@ pub async fn start<P: PodmanClient + 'static>(
         webhook_sources,
         notify: notify.clone(),
         acme: acme_worker.as_ref().map(acme::AcmeWorker::status),
+        generated: generated_worker.clone(),
         desired_lock: tokio::sync::Mutex::new(()),
         started: std::time::Instant::now(),
         triggers: trigger_tx,
@@ -373,6 +407,10 @@ pub async fn start<P: PodmanClient + 'static>(
         let rx = shutdown_rx.clone();
         tokio::spawn(async move { worker.run(rx).await })
     });
+    let generated_task = generated_worker.map(|worker| {
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move { worker.run(rx).await })
+    });
     let cdn_task = cdn_ranges.map(|ranges| {
         let rx = shutdown_rx.clone();
         let ingress = ingress.clone();
@@ -404,6 +442,7 @@ pub async fn start<P: PodmanClient + 'static>(
         notify: notify_task,
         acme: acme_task,
         cdn: cdn_task,
+        generated: generated_task,
     })
 }
 
@@ -421,6 +460,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             notify,
             acme,
             cdn,
+            generated,
             admin_socket,
             ..
         } = self;
@@ -446,6 +486,13 @@ impl<P: PodmanClient + 'static> Running<P> {
                 .is_err()
         {
             tracing::warn!("CDN ranges refresh did not stop in time");
+        }
+        if let Some(handle) = generated
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("generated config worker did not stop in time");
         }
         if let Some(handle) = acme
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
