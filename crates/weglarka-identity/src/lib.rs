@@ -7,6 +7,7 @@
 //! - [`render_access_control`] → `access-control.yml` (the whole `access_control` section, #90).
 //!
 //! No I/O, no engine: the caller (the config pipeline, #212) passes model types in and writes the text.
+//! [`AutheliaGenerator`] is the adapter that plugs both renderers into that pipeline.
 //! Output is deterministic (clients sorted by id, rules by instance) so the pipeline's fingerprint is
 //! stable. Client secrets appear only as the stored digest, never as plaintext.
 //!
@@ -14,9 +15,11 @@
 //! must be loaded last (`--config=/weglarka/generated/current`, #88); that is checked elsewhere.
 
 mod access_control;
+mod generator;
 mod oidc;
 
 pub use access_control::{ForwardApp, render_access_control};
+pub use generator::AutheliaGenerator;
 pub use oidc::{AppClient, render_oidc_clients};
 
 /// Why a file could not be rendered. Every case is an input the model validation should have kept out,

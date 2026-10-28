@@ -207,6 +207,27 @@ pub const IMAGES_PRUNE: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/images/prune",
 };
+/// `POST` with no body → [`OidcRotateResponse`](crate::OidcRotateResponse): replaces the app's OIDC
+/// client secret, re-renders the provider's clients, then recreates the app (#213).
+pub const OIDC_ROTATE: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/apps/{name}/oidc/rotate",
+};
+/// `GET` → [`ListOidcClientsResponse`](crate::ListOidcClientsResponse): the external clients.
+pub const OIDC_CLIENTS_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/oidc-clients",
+};
+/// `PUT` [`PutOidcClientRequest`](crate::PutOidcClientRequest) → 204; replaces a client of that id.
+pub const OIDC_CLIENT_PUT: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/oidc-clients/{id}",
+};
+/// `DELETE` → 204.
+pub const OIDC_CLIENT_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
+    path: "/v1/oidc-clients/{id}",
+};
 /// `GET` → [`NotifyStatusResponse`](crate::NotifyStatusResponse): configured channels, the pending
 /// outbox and the last delivery error (issue #38).
 pub const NOTIFICATIONS_STATUS: Endpoint = Endpoint {
@@ -254,4 +275,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     IMAGES_PRUNE,
     NOTIFICATIONS_STATUS,
     NOTIFICATIONS_TEST,
+    OIDC_ROTATE,
+    OIDC_CLIENTS_LIST,
+    OIDC_CLIENT_PUT,
+    OIDC_CLIENT_REMOVE,
 ];

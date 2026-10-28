@@ -59,6 +59,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
         Command::Networks(c) => crate::networks::run(json, &overrides, c).await,
+        Command::Oidc(c) => crate::oidc::run(json, &overrides, c).await,
         Command::Sites(c) => crate::sites::run(json, &overrides, c).await,
         Command::Promote(a) => crate::sites::promote(json, &overrides, a).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,

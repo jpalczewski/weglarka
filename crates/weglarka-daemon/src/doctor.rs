@@ -71,6 +71,8 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     ingress(d, &mut checks).await;
     acme(d, &mut checks);
     generated(d, &mut checks);
+    identity_provider(d, &mut checks).await;
+    oidc_credentials(d, &mut checks);
     identity_forward(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }
@@ -1760,6 +1762,115 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             )
         });
     }
+}
+
+/// `identity.provider` (#88): the instance `[identity]` names exists, satisfies the provider rules
+/// (issuer host among its domains, generated config loaded last, no auto-update), runs, and answers
+/// its health endpoint over the probe socket. A wrong provider degrades the integration instead of
+/// stopping the daemon, so this is where the operator hears about it.
+async fn identity_provider<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_model::podman::ContainerState;
+    let Some(identity) = &d.host.identity else {
+        return;
+    };
+    let id = "identity.provider";
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let name = &identity.instance;
+    let Some(spec) = apps.apps.get(name) else {
+        out.push(check(
+            id,
+            CheckStatus::Fail,
+            format!("[identity] names {name}, which is not in apps.toml"),
+            Some("add the provider as an ordinary app; protected apps are refused meanwhile"),
+        ));
+        return;
+    };
+    if let Err(message) = weglarka_model::identity::validate_provider(&d.host, name, spec) {
+        out.push(check(
+            id,
+            CheckStatus::Fail,
+            message,
+            Some("see docs/guides/identity-provider.md"),
+        ));
+        return;
+    }
+    let running = matches!(
+        d.engine
+            .podman()
+            .container_inspect(&weglarka_model::labels::container_name(name))
+            .await,
+        Ok(info) if info.state == ContainerState::Running
+    );
+    if !running {
+        out.push(check(
+            id,
+            CheckStatus::Fail,
+            format!("{name} is not running"),
+            Some("`weglarka apps start` it; apps that depend on it wait and forward-auth apps answer 500"),
+        ));
+        return;
+    }
+    let issuer_host = identity
+        .issuer
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let socket = crate::ingress::probe_socket_path(&d.paths.nginx_conf_dir);
+    out.push(
+        match crate::health_probe::get_over_probe(&socket, issuer_host, "/api/health").await {
+            Ok(200) => ok(id, format!("{name} runs and answers /api/health")),
+            Ok(status) => check(
+                id,
+                CheckStatus::Fail,
+                format!("{name}: /api/health answered {status}"),
+                Some("check the provider's logs; it must be routed by ingress on the issuer host"),
+            ),
+            Err(e) => check(
+                id,
+                CheckStatus::Fail,
+                format!("{name}: {e}"),
+                Some("the provider must run and have the issuer host routed by ingress"),
+            ),
+        },
+    );
+}
+
+/// `oidc.credentials` (#213): an app with a confidential `oidc` client needs both halves of its
+/// credential (the secret and the digest the provider's file is rendered from); one without the other
+/// means a hand edit of the store that `weglarka oidc rotate <app>` repairs.
+fn oidc_credentials<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_model::secret_store::{OIDC_CLIENT_DIGEST, OIDC_CLIENT_SECRET, scoped_name};
+    if d.host.identity.is_none() {
+        return;
+    }
+    let (Ok(apps), Ok(list)) = (state::load_apps(&d.paths.state.apps), d.secrets.list()) else {
+        return;
+    };
+    let has = |name: String| list.iter().any(|m| m.name == name);
+    let broken: Vec<String> = apps
+        .apps
+        .iter()
+        .filter(|(_, spec)| spec.oidc.as_ref().is_some_and(|o| !o.public))
+        .filter(|(name, _)| {
+            has(scoped_name(name, OIDC_CLIENT_SECRET)) != has(scoped_name(name, OIDC_CLIENT_DIGEST))
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if broken.is_empty() {
+        return;
+    }
+    out.push(check(
+        "oidc.credentials",
+        CheckStatus::Fail,
+        format!(
+            "secret and digest of the OIDC client do not match for: {}",
+            broken.join(", ")
+        ),
+        Some("`weglarka oidc rotate <app>` mints a fresh pair"),
+    ));
 }
 
 /// `identity.forward` (#89): for each domain with forward auth, ask the provider the question nginx

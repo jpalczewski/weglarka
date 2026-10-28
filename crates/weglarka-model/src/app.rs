@@ -808,7 +808,7 @@ pub struct AppIngress {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_paths: Vec<String>,
     /// Forward authentication in front of the app (#89, ADR 0052): `none` (default) or `forward`.
-    /// Changes nginx output only; outside the spec hash. Rejected in this release (`identity::gate`).
+    /// Changes nginx output only; outside the spec hash. The policy and groups are still rejected in this release (`identity::gate`, until #90).
     #[serde(default, skip_serializing_if = "IngressAuth::is_none")]
     pub auth: IngressAuth,
     /// Authorization policy applied to a forward-auth app; unset means `two_factor`. Needs `auth = "forward"`.
@@ -1022,8 +1022,9 @@ pub struct AppSpec {
     /// Not part of the spec hash: it decides how a container is swapped, never what it is made of.
     #[serde(default, skip_serializing_if = "Strategy::is_default")]
     pub strategy: Strategy,
-    /// OIDC client for this app (#91, ADR 0051). Not part of the spec hash in this release, and
-    /// rejected outright until the pipeline that creates the client exists (`identity::gate`).
+    /// OIDC client for this app (#91, ADR 0051). The section itself is render-only (the provider
+    /// restarts, the app does not); what it injects into the container (client id, issuer, secret) enters
+    /// the hash through `identity::effective_spec`. Needs `[identity]` in `weglarka.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcClientSpec>,
 }
@@ -1079,7 +1080,7 @@ pub struct AppsFile {
     /// Sites with environments (issue #205). Their environments are also present in `apps`, listed
     /// in `origins`.
     pub sites: BTreeMap<SiteName, SiteSpec>,
-    /// OIDC clients of apps Węglarka does not run (#91, ADR 0051). Rejected in this release.
+    /// OIDC clients of apps Węglarka does not run (#91, ADR 0051); they need `[identity]`.
     pub oidc_clients: BTreeMap<ClientId, ExternalClientSpec>,
     /// Every instance, **including** the ones expanded from `sites`.
     pub apps: BTreeMap<InstanceName, AppSpec>,

@@ -69,6 +69,9 @@ pub enum Command {
     /// version of one static site).
     #[command(subcommand)]
     Sites(crate::sites::SitesCommand),
+    /// OIDC clients: rotate an app's client secret, manage the clients of apps Węglarka does not run.
+    #[command(subcommand)]
+    Oidc(crate::oidc::OidcCommand),
     /// Promote the digest one environment of a site runs into another: `weglarka promote blog prod`.
     Promote(crate::sites::PromoteArgs),
     /// Local images: remove the ones older than each app's current and previous image.

@@ -6,6 +6,7 @@ mod commands;
 mod error;
 mod forward;
 mod networks;
+mod oidc;
 mod output;
 mod preflight;
 mod push;

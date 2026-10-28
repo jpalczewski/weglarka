@@ -24,10 +24,18 @@ use weglarka_model::state;
 /// How long a change waits for more changes before the pipeline runs.
 pub const DEBOUNCE: Duration = Duration::from_secs(2);
 
-/// The generators this daemon runs. The identity provider's renderer is added here when the identity
-/// feature is wired (#42); until then no app has a generated config and the worker is not started.
-pub fn registered(_host: &HostConfig) -> Vec<Arc<dyn ConfigGenerator>> {
-    Vec::new()
+/// The generators this daemon runs: the identity provider's (#42) when `[identity]` is configured.
+/// With none registered no app has a generated config and the worker is not started.
+pub fn registered(host: &HostConfig) -> Vec<Arc<dyn ConfigGenerator>> {
+    host.identity
+        .iter()
+        .map(|identity| {
+            Arc::new(weglarka_identity::AutheliaGenerator::new(
+                identity.instance.clone(),
+                identity.issuer.clone(),
+            )) as Arc<dyn ConfigGenerator>
+        })
+        .collect()
 }
 
 /// Credential digests for the apps that need one (#213): mints the OIDC client secret of every app

@@ -541,3 +541,27 @@ mod tests {
         insta::assert_json_snapshot!(list);
     }
 }
+
+/// `POST /v1/apps/{name}/oidc/rotate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcRotateResponse {
+    pub name: InstanceName,
+    /// The app was recreated to pick up the new secret; `false` when it is not running (it reads the
+    /// new secret at its next start).
+    pub recreated: bool,
+}
+
+/// `GET /v1/oidc-clients`: clients of apps Węglarka does not run (`[oidc_clients.<id>]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListOidcClientsResponse {
+    pub clients: std::collections::BTreeMap<
+        weglarka_model::identity::ClientId,
+        weglarka_model::identity::ExternalClientSpec,
+    >,
+}
+
+/// `PUT /v1/oidc-clients/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutOidcClientRequest {
+    pub spec: weglarka_model::identity::ExternalClientSpec,
+}

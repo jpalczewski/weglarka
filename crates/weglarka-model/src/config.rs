@@ -41,7 +41,7 @@ pub struct HostConfig {
     pub acme: Option<AcmeConfig>,
     /// Identity provider that decides authentication for OIDC clients and forward auth (issue #88,
     /// `docs/decisions/0051`); absent = off. Operator-owned: which container is trusted to authenticate
-    /// is the host's root of trust. Rejected in this release (`identity::gate::host`).
+    /// is the host's root of trust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
 }
@@ -87,7 +87,7 @@ impl HostConfig {
         if let Some(identity) = &self.identity {
             identity.validate()?;
         }
-        crate::identity::gate::host(self)
+        Ok(())
     }
 }
 

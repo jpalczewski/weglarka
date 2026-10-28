@@ -1,0 +1,190 @@
+//! The identity integration end to end (#91, #88): an `oidc` app gets its client in the provider's
+//! generated files and its credentials in the container, removal drops the client, rotation changes
+//! the digest, external clients live in `apps.toml`, and the provider is guarded.
+
+use crate::common::*;
+
+use hyper::StatusCode;
+use serde_json::{Value, json};
+
+const IDENTITY: &str = "[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"\n";
+
+fn provider() -> Value {
+    let mut s = spec("auth.example.com");
+    s["auto_update"] = json!(false);
+    s["command"] = json!([
+        "authelia",
+        "--config=/config/configuration.yml",
+        "--config=/weglarka/generated/current"
+    ]);
+    s
+}
+
+fn panel() -> Value {
+    let mut s = spec("app.example.com");
+    s["oidc"] = json!({
+        "redirect_uris": ["https://app.example.com/mcp/callback"],
+        "audience": ["https://app.example.com/mcp/"],
+        "client_secret": { "kind": "env", "var": "OIDC_CLIENT_SECRET" }
+    });
+    s
+}
+
+fn clients_file(h: &Harness) -> String {
+    read(
+        &h.root
+            .join("state/generated/authelia/current/oidc-clients.yml"),
+    )
+}
+
+async fn with_provider() -> Harness {
+    let h = Builder::new().sections(IDENTITY).build().await;
+    add(&h, "authelia", provider()).await;
+    deployed(&h, "authelia").await;
+    h
+}
+
+#[tokio::test]
+async fn an_oidc_app_gets_a_client_credentials_and_loses_the_client_on_removal() {
+    let h = with_provider().await;
+    add(&h, "panel", panel()).await;
+    deployed(&h, "panel").await;
+
+    // The container carries the client id, the issuer and the secret binding.
+    let specs = h.fake.created_specs();
+    let container = specs
+        .iter()
+        .find(|s| s.env.contains_key("OIDC_CLIENT_ID"))
+        .expect("the oidc app's container");
+    assert_eq!(container.env["OIDC_CLIENT_ID"], "panel");
+    assert_eq!(container.env["OIDC_ISSUER"], "https://auth.example.com");
+    assert!(
+        !container.secrets.is_empty(),
+        "the client secret is attached"
+    );
+
+    // The provider's file has the client with the audience, the digest and no plaintext.
+    eventually("the client in the generated file", || async {
+        clients_file(&h).contains("\"panel\"")
+    })
+    .await;
+    let file = clients_file(&h);
+    assert!(file.contains("https://app.example.com/mcp/"), "{file}");
+    assert!(file.contains("$pbkdf2-sha512$"), "{file}");
+    let store = weglarka_model::secrets::FileSecretStore::new(h.root.join("state/secrets.toml"));
+    let secret = weglarka_model::secret_store::SecretStore::get(&store, "panel.oidc-client-secret")
+        .unwrap()
+        .expect("the minted secret");
+    let plain = std::str::from_utf8(secret.expose()).unwrap();
+    assert!(
+        !file.contains(plain),
+        "the plain secret never reaches the file"
+    );
+
+    // Removing the app removes its client at the next apply.
+    let (s, v) = admin(&h, "DELETE", "/v1/apps/panel", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    eventually("the client gone from the generated file", || async {
+        !clients_file(&h).contains("\"panel\"")
+    })
+    .await;
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn rotation_changes_the_digest_and_recreates_the_app() {
+    let h = with_provider().await;
+    add(&h, "panel", panel()).await;
+    deployed(&h, "panel").await;
+    eventually("the client in the generated file", || async {
+        clients_file(&h).contains("\"panel\"")
+    })
+    .await;
+    let before = clients_file(&h);
+    let creates = h.fake.created_specs().len();
+
+    let (s, v) = admin(&h, "POST", "/v1/apps/panel/oidc/rotate", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["recreated"], true, "{v}");
+    // The provider's files were applied before the response, not after a debounce.
+    assert_ne!(clients_file(&h), before);
+    assert!(
+        h.fake.created_specs().len() > creates,
+        "the app was recreated"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn external_clients_live_in_apps_toml_and_the_list_survives_app_churn() {
+    let h = with_provider().await;
+    let client = json!({ "spec": {
+        "name": "Forge",
+        "redirect_uris": ["https://git.example.com/user/oauth2/authelia/callback"],
+        "secret_digest": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNo"
+    }});
+    let (s, v) = admin(&h, "PUT", "/v1/oidc-clients/forge", Some(client)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    let (_, list) = admin(&h, "GET", "/v1/oidc-clients", None).await;
+    assert!(list["clients"]["forge"].is_object(), "{list}");
+    eventually("the external client in the generated file", || async {
+        clients_file(&h).contains("\"forge\"")
+    })
+    .await;
+
+    add(&h, "panel", panel()).await;
+    let (s, _) = admin(&h, "DELETE", "/v1/apps/panel", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(clients_file(&h).contains("\"forge\""));
+
+    let (s, _) = admin(&h, "DELETE", "/v1/oidc-clients/forge", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = admin(&h, "DELETE", "/v1/oidc-clients/forge", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn the_provider_cannot_be_removed_or_misconfigured() {
+    let h = with_provider().await;
+    let (s, v) = admin(&h, "DELETE", "/v1/apps/authelia", None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+
+    // Generated config not last is refused on a write of the provider itself.
+    let mut bad = provider();
+    bad["command"] = json!([
+        "authelia",
+        "--config=/weglarka/generated/current",
+        "--config=/late.yml"
+    ]);
+    let (s, v) = admin(&h, "PUT", "/v1/apps/authelia", Some(json!({ "spec": bad }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("last config source"),
+        "{v}"
+    );
+    // ... and so is the default `auto_update = true`.
+    let mut auto = provider();
+    auto["auto_update"] = json!(true);
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/authelia",
+        Some(json!({ "spec": auto })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn oidc_needs_the_identity_section() {
+    let h = harness().await;
+    let (s, v) = post_app(&h, "panel", panel()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("[identity]"), "{v}");
+    h.running.stop().await;
+}

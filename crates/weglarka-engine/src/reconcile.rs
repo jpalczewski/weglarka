@@ -139,6 +139,18 @@ pub enum EngineError {
         instance: InstanceName,
         pending: Vec<(InstanceName, String)>,
     },
+    /// A request about the identity integration that cannot be honoured (no `[identity]`, an app
+    /// without `oidc`, a client the file rules reject).
+    #[error("{0}")]
+    IdentityInvalid(String),
+    #[error("unknown OIDC client: {0}")]
+    UnknownOidcClient(String),
+    /// `apps remove` of the instance `[identity]` names: every OIDC and forward-auth app would lose
+    /// its provider (#88).
+    #[error(
+        "app {0} is the identity provider named in weglarka.toml `[identity]`; remove that section first"
+    )]
+    IdentityProviderInUse(InstanceName),
     /// `apps remove` of an app that another app lists in `depends_on` (issue #35).
     #[error(
         "app {name} is a dependency of: {}; remove those depends_on entries first",
@@ -565,6 +577,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) lock: tokio::sync::Mutex<()>,
     /// Generators of config files for consumer apps (#212); `None` = the feature is off.
     pub(crate) generated: Option<crate::generated::GeneratedWiring>,
+    /// `[identity]` of the host: what an `oidc` app gets injected (see [`Self::effective`]).
+    pub(crate) identity: Option<weglarka_model::config::IdentityConfig>,
     /// Free slots for one-off containers ([`crate::run::MAX_CONCURRENT_RUNS`]).
     pub(crate) runs: Arc<tokio::sync::Semaphore>,
     /// Free slots for forward relays ([`crate::forward::MAX_CONCURRENT_FORWARDS`]).
@@ -608,6 +622,7 @@ impl<P: PodmanClient> Reconciler<P> {
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             generated: None,
+            identity: None,
             runs: Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
             forwards: Arc::new(tokio::sync::Semaphore::new(
                 crate::forward::MAX_CONCURRENT_FORWARDS,
@@ -624,6 +639,44 @@ impl<P: PodmanClient> Reconciler<P> {
     pub fn with_generated(mut self, wiring: crate::generated::GeneratedWiring) -> Self {
         self.generated = Some(wiring);
         self
+    }
+
+    /// The host's `[identity]` section; without it no app gets OIDC credentials injected.
+    pub fn with_identity(
+        mut self,
+        identity: Option<weglarka_model::config::IdentityConfig>,
+    ) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// `spec` as the container sees it: the injected OIDC env and secret included (#91). Every
+    /// reader of `spec.env`/`spec.secrets` at launch time goes through this one overlay.
+    pub(crate) fn effective<'a>(
+        &self,
+        instance: &InstanceName,
+        spec: &'a AppSpec,
+    ) -> std::borrow::Cow<'a, AppSpec> {
+        weglarka_model::identity::effective_spec(instance, spec, self.identity.as_ref())
+    }
+
+    /// Mints the OIDC client secret of an `oidc` app when it is absent (#213), so the secret exists
+    /// before anything reads it: the waiting check, the hash and the container creation. Idempotent;
+    /// the caller holds the engine lock because minting is a read-then-write on the store. A public
+    /// client has no secret, and without `[identity]` the injection is off.
+    pub(crate) async fn ensure_oidc_credential(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+    ) -> Result<(), EngineError> {
+        if self.identity.is_none() || !spec.oidc.as_ref().is_some_and(|o| !o.public) {
+            return Ok(());
+        }
+        let instance = instance.clone();
+        crate::secrets::blocking(&self.secrets, move |store| {
+            crate::oidc_credentials::ensure(store, &instance).map(drop)
+        })
+        .await
     }
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
@@ -786,8 +839,15 @@ impl<P: PodmanClient> Reconciler<P> {
                 continue;
             }
             // `start = false` needs no secrets: nothing is deployed until `apps start`.
+            // A store that cannot mint must not abort the pass for every other app: the secret then
+            // reads as missing below, so this app waits and the others carry on.
+            if spec.start
+                && let Err(error) = self.ensure_oidc_credential(name, spec).await
+            {
+                tracing::warn!(instance = %name, %error, "cannot ensure the OIDC client credential");
+            }
             let missing = if spec.start {
-                missing_secrets(&self.secrets, name, spec).await?
+                missing_secrets(&self.secrets, name, &self.effective(name, spec)).await?
             } else {
                 Vec::new()
             };
@@ -841,7 +901,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 blocked,
                 uid_range,
                 start: spec.start,
-                depends_on: spec.depends_on.clone(),
+                depends_on: self.effective(name, spec).depends_on.clone(),
                 is_static: false,
             });
         }
@@ -957,7 +1017,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     .apps
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
-                self.dependency_gate(&instance, spec).await?;
+                self.dependency_gate(&instance, &self.effective(&instance, spec))
+                    .await?;
                 self.podman
                     .container_start(&labels::container_name(&instance))
                     .await?;

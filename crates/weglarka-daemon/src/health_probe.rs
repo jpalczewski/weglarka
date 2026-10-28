@@ -104,6 +104,18 @@ where
     parse_status(&head).ok_or_else(|| "malformed HTTP response".to_owned())
 }
 
+/// One `GET` of `path` with `Host: host` over the probe socket; the status of the answer (5 s budget).
+/// `doctor identity.provider` asks the provider's health endpoint this way.
+pub async fn get_over_probe(
+    socket: &std::path::Path,
+    host: &str,
+    path: &str,
+) -> Result<u16, String> {
+    tokio::time::timeout(Duration::from_secs(5), probe_once(socket, host, path))
+        .await
+        .map_err(|_| "no answer within 5s".to_owned())?
+}
+
 /// What the identity provider answered an authz request with (`doctor identity.forward`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct AuthzAnswer {
