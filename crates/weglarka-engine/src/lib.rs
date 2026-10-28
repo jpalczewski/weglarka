@@ -2,6 +2,7 @@
 //! host through [`weglarka_model::podman::PodmanClient`]. The domain model it works on lives in
 //! `weglarka-model`; model-only consumers must not depend on this crate.
 
+pub mod admin_token;
 pub mod config_mounts;
 pub mod crash;
 pub mod depends;

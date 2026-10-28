@@ -74,6 +74,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     identity_provider(d, &mut checks).await;
     oidc_credentials(d, &mut checks);
     identity_forward(d, &mut checks).await;
+    admin_http(d, &mut checks).await;
     webhook(d, &mut checks).await;
     DoctorReport { checks }
 }
@@ -1837,6 +1838,80 @@ async fn identity_provider<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
             ),
         },
     );
+}
+
+/// `admin.http` (ADR 0056): the token listener runs, its clients exist, and the provider's signing keys
+/// can be fetched over the probe socket — the three things a token holder would otherwise discover as
+/// a bare 401.
+async fn admin_http<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let (Some(http), Some(identity)) = (&d.host.admin.http, &d.host.identity) else {
+        return;
+    };
+    let id = "admin.http";
+    if !d.paths.admin_token_socket().exists() {
+        out.push(check(
+            id,
+            CheckStatus::Fail,
+            format!(
+                "the token socket {} does not exist",
+                d.paths.admin_token_socket().display()
+            ),
+            Some("restart the daemon: [admin.http] is read at startup"),
+        ));
+        return;
+    }
+    if let Ok(apps) = state::load_apps(&d.paths.state.apps) {
+        let missing: Vec<String> = http
+            .clients
+            .iter()
+            .filter(|c| !apps.apps.contains_key(*c))
+            .map(ToString::to_string)
+            .collect();
+        if !missing.is_empty() {
+            out.push(check(
+                id,
+                CheckStatus::Warn,
+                format!(
+                    "[admin.http] clients not in apps.toml: {}",
+                    missing.join(", ")
+                ),
+                Some("add the apps or drop them from `clients`; none of them gets the socket"),
+            ));
+        }
+    }
+    let Ok(issuer_host) = weglarka_model::identity::issuer_host(&identity.issuer) else {
+        return; // `[identity]` validation already refused this
+    };
+    let fetcher = crate::admin_token::ProbeJwks {
+        socket: crate::ingress::probe_socket_path(&d.paths.nginx_conf_dir),
+        issuer_host: issuer_host.to_owned(),
+    };
+    let fetched = crate::admin_token::JwksFetcher::fetch(&fetcher)
+        .await
+        .and_then(|body| {
+            weglarka_model::admin_auth::JwkSet::from_json(&body).map_err(|e| e.to_string())
+        });
+    out.push(match fetched {
+        Ok(keys) if !keys.is_empty() => ok(
+            id,
+            format!(
+                "token listener up; the provider publishes signing keys; {} client(s) get the socket",
+                http.clients.len()
+            ),
+        ),
+        Ok(_) => check(
+            id,
+            CheckStatus::Fail,
+            "the provider's JWKS has no RS256 or ES256 signing key".to_owned(),
+            Some("every token would be refused; see docs/guides/admin-api-tokens.md"),
+        ),
+        Err(e) => check(
+            id,
+            CheckStatus::Fail,
+            format!("cannot fetch the provider's JWKS: {e}"),
+            Some("the provider must run and have the issuer host routed by ingress"),
+        ),
+    });
 }
 
 /// `oidc.credentials` (#213): an app with a confidential `oidc` client needs both halves of its

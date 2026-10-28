@@ -225,10 +225,35 @@ pub fn spec_hash_with_generated(base: SpecHash, target: &str) -> SpecHash {
     SpecHash(hex::encode(Sha256::digest(json)))
 }
 
+/// `base` plus the token admin API socket mount of an `[admin.http] clients` instance (ADR 0056).
+/// The mount is host policy, not part of the `AppSpec`, so it enters the hash separately: a running
+/// client is recreated once to gain it, and for every other app the hash stays [`spec_hash`] exactly.
+pub fn spec_hash_with_admin_token(base: SpecHash, target: &str) -> SpecHash {
+    let json = serde_json::to_vec(&(base.as_str(), "admin-token-socket", target))
+        .expect("hash input is always serializable");
+    SpecHash(hex::encode(Sha256::digest(json)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::SecretTarget;
+
+    #[test]
+    fn the_admin_token_mount_changes_the_hash_and_is_independent_of_generated_config() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let with = spec_hash_with_admin_token(base.clone(), "/run/weglarka-admin");
+        assert_ne!(base, with);
+        assert_eq!(
+            with,
+            spec_hash_with_admin_token(base.clone(), "/run/weglarka-admin")
+        );
+        assert_ne!(
+            with,
+            spec_hash_with_generated(base, "/run/weglarka-admin"),
+            "the two host mounts must not collide"
+        );
+    }
 
     #[test]
     fn the_generated_config_mount_changes_the_hash_and_is_deterministic() {

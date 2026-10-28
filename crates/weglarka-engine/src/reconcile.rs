@@ -292,6 +292,8 @@ pub struct ReconcilerOptions {
     /// Directory the static sites' releases are unpacked into (`<nginx_conf_dir>/sites`, ADR 0049).
     /// `None` = the daemon serves no static sites: deploying one fails with a clear error.
     pub sites_root: Option<PathBuf>,
+    /// The token admin API socket and the instances that get it (`[admin.http]`, ADR 0056).
+    pub admin_token: Option<crate::admin_token::AdminTokenMount>,
 }
 
 impl Default for ReconcilerOptions {
@@ -305,6 +307,7 @@ impl Default for ReconcilerOptions {
             group_add: Vec::new(),
             switch_drain: Duration::from_secs(3),
             sites_root: None,
+            admin_token: None,
         }
     }
 }

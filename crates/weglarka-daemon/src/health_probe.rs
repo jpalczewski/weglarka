@@ -56,10 +56,14 @@ fn token_ok(s: &str) -> bool {
 async fn probe_once(socket: &std::path::Path, host: &str, path: &str) -> Result<u16, String> {
     // Validated before connecting, so a bad request never reaches nginx (`get_status` checks again).
     check_request(host, path)?;
-    let mut stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    let mut stream = connect(socket).await?;
     get_status(&mut stream, host, path).await
+}
+
+async fn connect(socket: &std::path::Path) -> Result<UnixStream, String> {
+    UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))
 }
 
 fn check_request(host: &str, path: &str) -> Result<(), String> {
@@ -70,38 +74,133 @@ fn check_request(host: &str, path: &str) -> Result<(), String> {
     }
 }
 
-/// One `GET` on a fresh connection (`Connection: close`); returns the status of the response.
-/// Redirects are not followed and the body is not read.
-async fn get_status<S>(stream: &mut S, host: &str, path: &str) -> Result<u16, String>
+/// What the probe socket answered: the status, the header names (lowercased) with their values, and
+/// the body (empty unless the caller asked for one).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ProbeResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl ProbeResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Longest response head read; nginx's own default `large_client_header_buffers` is of this order.
+const MAX_HEAD: usize = 16 * 1024;
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// One `GET` on a fresh connection (`Connection: close`) with `headers` added. Returns the head and,
+/// when `max_body > 0`, the body read until the peer closes (an answer longer than `max_body` is an
+/// error). A body is requested over `HTTP/1.0` so nginx answers without chunked framing; a status-only
+/// probe uses `HTTP/1.1`. Redirects are not followed.
+async fn exchange<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    user_agent: &str,
+    headers: &[(&str, &str)],
+    max_body: usize,
+) -> Result<ProbeResponse, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     check_request(host, path)?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: weglarka-health-probe\r\n\
-         Accept: */*\r\nConnection: close\r\n\r\n"
+    if headers
+        .iter()
+        .any(|(n, v)| !token_ok(n) || n.contains(':') || v.bytes().any(|b| b.is_ascii_control()))
+    {
+        return Err("invalid header for a probe".into());
+    }
+    let version = if max_body > 0 { "1.0" } else { "1.1" };
+    let mut request = format!(
+        "GET {path} HTTP/{version}\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n\
+         Accept: */*\r\nConnection: close\r\n"
     );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
     stream
         .write_all(request.as_bytes())
         .await
         .map_err(|e| format!("write failed: {e}"))?;
-    // The status line fits well within 64 bytes: "HTTP/1.1 200 ".
-    let mut head = Vec::with_capacity(64);
-    let mut buf = [0u8; 64];
-    while head.len() < 12 && !head.contains(&b'\n') {
+
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break Some(i + 4);
+        }
+        // A bare status line ends the head too (some peers close right after it).
+        if buf.len() >= MAX_HEAD {
+            return Err("response head too large".into());
+        }
         let n = stream
-            .read(&mut buf)
+            .read(&mut chunk)
             .await
             .map_err(|e| format!("read failed: {e}"))?;
         if n == 0 {
-            break;
+            break None;
         }
-        head.extend_from_slice(&buf[..n]);
-    }
-    if head.is_empty() {
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    if buf.is_empty() {
         return Err("no response (connection closed; no server for this Host yet?)".to_owned());
     }
-    parse_status(&head).ok_or_else(|| "malformed HTTP response".to_owned())
+    let status = parse_status(&buf).ok_or_else(|| "malformed HTTP response".to_owned())?;
+    let Some(head_end) = head_end else {
+        return Ok(ProbeResponse {
+            status,
+            ..ProbeResponse::default()
+        });
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        .collect();
+    let mut body = buf[head_end..].to_vec();
+    if max_body > 0 {
+        while body.len() <= max_body {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read failed: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        if body.len() > max_body {
+            return Err(format!("response body longer than {max_body} bytes"));
+        }
+    } else {
+        body.clear();
+    }
+    Ok(ProbeResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// One `GET` on a fresh connection; returns the status of the response. The body is not read.
+async fn get_status<S>(stream: &mut S, host: &str, path: &str) -> Result<u16, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    exchange(stream, host, path, "weglarka-health-probe", &[], 0)
+        .await
+        .map(|r| r.status)
 }
 
 /// One `GET` of `path` with `Host: host` over the probe socket; the status of the answer (5 s budget).
@@ -111,9 +210,34 @@ pub async fn get_over_probe(
     host: &str,
     path: &str,
 ) -> Result<u16, String> {
-    tokio::time::timeout(Duration::from_secs(5), probe_once(socket, host, path))
+    tokio::time::timeout(PROBE_BUDGET, probe_once(socket, host, path))
         .await
         .map_err(|_| "no answer within 5s".to_owned())?
+}
+
+/// One `GET` of `path` with `Host: host` over the probe socket, returning the head and a body of at
+/// most `max_body` bytes (5 s budget). The token listener fetches the provider's JWKS this way.
+pub async fn probe_get(
+    socket: &std::path::Path,
+    host: &str,
+    path: &str,
+    max_body: usize,
+) -> Result<ProbeResponse, String> {
+    check_request(host, path)?;
+    tokio::time::timeout(PROBE_BUDGET, async {
+        let mut stream = connect(socket).await?;
+        exchange(
+            &mut stream,
+            host,
+            path,
+            "weglarka-daemon",
+            &[],
+            max_body.max(1),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| "no answer within 5s".to_owned())?
 }
 
 /// What the identity provider answered an authz request with (`doctor identity.forward`).
@@ -134,38 +258,23 @@ pub async fn authz_probe(
     if !token_ok(issuer_host) || !token_ok(original_url) {
         return Err("invalid host or URL for an authz probe".into());
     }
-    let timeout = Duration::from_secs(5);
-    tokio::time::timeout(timeout, async {
-        let mut stream = UnixStream::connect(socket)
-            .await
-            .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
-        let request = format!(
-            "GET /api/authz/auth-request HTTP/1.1\r\nHost: {issuer_host}\r\n\
-             User-Agent: weglarka-doctor\r\nX-Original-URL: {original_url}\r\n\
-             X-Original-Method: GET\r\nConnection: close\r\n\r\n"
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| format!("write failed: {e}"))?;
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while head.len() < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = stream
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("read failed: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            head.extend_from_slice(&buf[..n]);
-        }
-        let status = parse_status(&head).ok_or("malformed or empty HTTP response")?;
-        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
-        let has_location = text.lines().any(|l| l.starts_with("location:"));
+    tokio::time::timeout(PROBE_BUDGET, async {
+        let mut stream = connect(socket).await?;
+        let answer = exchange(
+            &mut stream,
+            issuer_host,
+            "/api/authz/auth-request",
+            "weglarka-doctor",
+            &[
+                ("X-Original-URL", original_url),
+                ("X-Original-Method", "GET"),
+            ],
+            0,
+        )
+        .await?;
         Ok(AuthzAnswer {
-            status,
-            has_location,
+            status: answer.status,
+            has_location: answer.header("location").is_some(),
         })
     })
     .await
@@ -318,6 +427,32 @@ mod tests {
             let err = p.probe(host, &probe(path, 200, 1)).await.unwrap_err();
             assert!(err.contains("invalid"), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn probe_get_returns_headers_and_a_bounded_body() {
+        let (_dir, sock) = socket();
+        let req = serve_once(
+            &sock,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"keys\":[]}",
+        );
+        let got = probe_get(&sock, "auth.example.com", "/jwks.json", 1024)
+            .await
+            .unwrap();
+        assert_eq!(got.status, 200);
+        assert_eq!(got.header("content-type"), Some("application/json"));
+        assert_eq!(got.body, br#"{"keys":[]}"#);
+        let req = req.await.unwrap();
+        // HTTP/1.0 so nginx does not chunk the body; the Host still routes to the provider.
+        assert!(req.starts_with("GET /jwks.json HTTP/1.0\r\n"), "{req}");
+        assert!(req.contains("\r\nHost: auth.example.com\r\n"), "{req}");
+
+        let (_dir, sock) = socket();
+        let _served = serve_once(&sock, "HTTP/1.1 200 OK\r\n\r\n0123456789");
+        let err = probe_get(&sock, "auth.example.com", "/x", 4)
+            .await
+            .unwrap_err();
+        assert!(err.contains("longer than 4 bytes"), "{err}");
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub enum ErrorCode {
     /// The engine is busy with another mutation (e.g. a deploy behind the health gate). Transient:
     /// the CLI retries the same request for a while before giving up.
     Busy,
+    /// Token listener only (docs/decisions/0056): no valid bearer token.
+    Unauthorized,
+    /// Token listener only: a valid token whose scopes do not allow the endpoint.
+    Forbidden,
     Internal,
 }
 
@@ -27,6 +31,8 @@ impl ErrorCode {
             Self::AlreadyExists | Self::Conflict => 409,
             Self::InvalidRequest => 400,
             Self::Busy => 503,
+            Self::Unauthorized => 401,
+            Self::Forbidden => 403,
             Self::Internal => 500,
         }
     }

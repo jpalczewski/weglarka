@@ -1,0 +1,323 @@
+//! The token admin listener end to end (ADR 0056): the unix socket stays unauthenticated, the token
+//! socket needs a bearer whose groups map to `read`/`admin`, and the provider's JWKS is fetched over
+//! the ingress probe socket (served here by a stand-in).
+
+use crate::common::*;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::{Request, StatusCode};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use weglarka_api::ENDPOINTS;
+use weglarka_api::endpoints::Method;
+use weglarka_model::admin_auth::Scope;
+use weglarka_model::admin_auth::testing::{AUDIENCE, ISSUER, TestIssuer};
+
+const SECTIONS: &str = r#"
+[identity]
+provider = "authelia"
+instance = "authelia"
+issuer = "https://auth.example.com"
+
+[admin.http]
+clients = ["panel"]
+audience = "https://admin.example.com/api/"
+read_groups = ["viewers"]
+admin_groups = ["admins"]
+"#;
+
+struct Setup {
+    h: Harness,
+    issuer: TestIssuer,
+    token_socket: PathBuf,
+    jwks_fetches: Arc<AtomicUsize>,
+}
+
+/// Stands in for nginx's probe socket: answers every request with the JWKS and counts them. The
+/// ingress manager owns that directory and may clear the socket while it applies, so the stand-in
+/// binds it again whenever it is gone.
+fn serve_jwks(socket: PathBuf, jwks: String) -> Arc<AtomicUsize> {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counter = fetches.clone();
+    tokio::spawn(async move {
+        let mut listener: Option<UnixListener> = None;
+        loop {
+            if listener.is_none() || !socket.exists() {
+                if let Some(dir) = socket.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::remove_file(&socket);
+                listener = UnixListener::bind(&socket).ok();
+            }
+            let Some(l) = &listener else {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            };
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_millis(10), l.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                continue;
+            };
+            let (jwks, counter) = (jwks.clone(), counter.clone());
+            tokio::spawn(async move {
+                let mut request = vec![0u8; 2048];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                if request.starts_with("GET /jwks.json ")
+                    && request.contains("\r\nHost: auth.example.com\r\n")
+                {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{jwks}",
+                                jwks.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                } else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                        .await;
+                }
+            });
+        }
+    });
+    fetches
+}
+
+async fn setup() -> Setup {
+    let h = Builder::new().sections(SECTIONS).build().await;
+    let issuer = TestIssuer::new("k1");
+    let probe = weglarka_daemon::ingress::probe_socket_path(&h.root.join("state/nginx"));
+    let jwks_fetches = serve_jwks(probe, issuer.jwks_json());
+    let token_socket = h
+        .running
+        .admin_token_socket
+        .clone()
+        .expect("[admin.http] starts the token listener");
+    Setup {
+        h,
+        issuer,
+        token_socket,
+        jwks_fetches,
+    }
+}
+
+async fn call(
+    socket: &PathBuf,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, hyper::HeaderMap, Value) {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "weglarka");
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let req = req
+        .body(Full::new(Bytes::from(
+            body.map(|b| b.to_string()).unwrap_or_default(),
+        )))
+        .unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let resp = sender.send_request(req).await.unwrap();
+    let (status, headers) = (resp.status(), resp.headers().clone());
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, headers, value)
+}
+
+/// `/v1/apps/{name}` → `/v1/apps/x`: a request that reaches the handler of that route.
+fn concrete(template: &str) -> String {
+    let mut out = String::new();
+    let mut in_param = false;
+    for c in template.chars() {
+        match c {
+            '{' => {
+                in_param = true;
+                out.push('x');
+            }
+            '}' => in_param = false,
+            _ if !in_param => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn the_token_socket_demands_a_valid_bearer_and_only_health_is_open() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+
+    let (status, headers, body) = call(sock, "GET", "/v1/health", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(headers.get("www-authenticate").is_none());
+
+    for token in [None, Some("garbage"), Some("a.b.c")] {
+        let (status, headers, body) = call(sock, "GET", "/v1/apps", token, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?} {body}");
+        assert_eq!(headers["www-authenticate"], "Bearer");
+        assert_eq!(body["code"], "unauthorized");
+    }
+    // An unknown path does not leak that it is unknown to someone without a token.
+    let (status, ..) = call(sock, "GET", "/v1/nope", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A token for another audience, one signed by a stranger, one without a mapped group.
+    let wrong_aud = s.issuer.sign(&json!({
+        "iss": ISSUER, "aud": "https://elsewhere.example.com", "sub": "a",
+        "exp": 4_000_000_000u64, "groups": ["admins"]
+    }));
+    let stranger = TestIssuer::new("k1").token("a", &["admins"]);
+    let no_group = s.issuer.token("a", &["interns"]);
+    for token in [wrong_aud, stranger, no_group] {
+        let (status, ..) = call(sock, "GET", "/v1/apps", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn scopes_decide_what_a_token_may_do() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+    let reader = s.issuer.token("rita", &["viewers"]);
+    let admin_token = s.issuer.token("adam", &["admins"]);
+
+    let (status, _, body) = call(sock, "GET", "/v1/apps", Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = call(
+        sock,
+        "POST",
+        "/v1/apps",
+        Some(&reader),
+        Some(json!({"name": "x", "spec": spec("x.example.com")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
+
+    let (status, _, body) = call(
+        sock,
+        "POST",
+        "/v1/apps",
+        Some(&admin_token),
+        Some(json!({"name": "x", "spec": spec("x.example.com")})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The change is the daemon's, whichever door it came through.
+    let (status, body) = admin(&s.h, "GET", "/v1/apps/x", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // `admin` includes `read`.
+    let (status, ..) = call(sock, "GET", "/v1/apps/x", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // One JWKS fetch served every request above.
+    assert_eq!(s.jwks_fetches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn every_declared_endpoint_is_routed_and_enforces_its_scope() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+    let reader = s.issuer.token("rita", &["viewers"]);
+    for e in ENDPOINTS {
+        let method = e.method.as_str();
+        let path = concrete(e.path);
+        let (status, _, body) = call(sock, method, &path, Some(&reader), None).await;
+        let what = format!("{method} {} -> {status} {body}", e.path);
+        match e.scope {
+            None => {}
+            Some(Scope::Admin) => assert_eq!(status, StatusCode::FORBIDDEN, "{what}"),
+            Some(Scope::Read) => {
+                assert!(
+                    status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                    "{what}"
+                );
+                // Routed: the handler answered, not the router's fallback.
+                assert_ne!(body["message"], "no such endpoint", "{what}");
+            }
+        }
+        // And without any token everything but health is refused.
+        let (status, ..) = call(sock, method, &path, None, None).await;
+        let open = e.scope.is_none();
+        assert_eq!(status != StatusCode::UNAUTHORIZED, open, "{}", e.path);
+        assert!(matches!(
+            e.method,
+            Method::Get | Method::Post | Method::Put | Method::Delete
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_valid_token_on_an_unknown_route_gets_404_and_the_unix_socket_stays_open() {
+    let s = setup().await;
+    let admin_token = s.issuer.token("adam", &["admins"]);
+    let (status, ..) = call(&s.token_socket, "GET", "/v1/nope", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // No token anywhere on the break-glass socket, and it keeps full access.
+    let (status, body) = admin(&s.h, "GET", "/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_app(&s.h, "y", spec("y.example.com")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn doctor_reports_the_listener_and_the_providers_keys() {
+    let s = setup().await;
+    let (status, report) = admin(&s.h, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let checks: Vec<&Value> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"] == "admin.http")
+        .collect();
+    // `panel` is a configured client that is not in apps.toml yet: a warning, and the keys are fine.
+    let says = |status: &str, needle: &str| {
+        checks.iter().any(|c| {
+            c["status"] == status && c["message"].as_str().unwrap_or_default().contains(needle)
+        })
+    };
+    assert!(says("warn", "panel"), "{checks:?}");
+    assert!(says("ok", "signing keys"), "{checks:?}");
+}
+
+#[tokio::test]
+async fn without_admin_http_there_is_no_token_listener() {
+    let h = harness().await;
+    assert!(h.running.admin_token_socket.is_none());
+    assert!(!h.root.join("state/run/admin-token").exists());
+}
+
+#[test]
+fn audience_constant_matches_the_configured_audience() {
+    // The fixtures above rely on the test issuer's audience being the one in `SECTIONS`.
+    assert!(SECTIONS.contains(&format!("audience = \"{AUDIENCE}\"")));
+}

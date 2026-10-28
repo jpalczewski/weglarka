@@ -33,9 +33,18 @@ pub struct Paths {
     /// Host directory with the apps' config files/directories (issue #118), resolved from
     /// `weglarka.toml`'s `config_root`. `None` = config mounts are off.
     pub config_root: Option<PathBuf>,
+    /// Directory of the token admin listener's socket (`[admin.http]`, docs/decisions/0056); mounted
+    /// only into the configured clients.
+    pub admin_token_dir: PathBuf,
 }
 
 impl Paths {
+    /// The token listener's socket inside [`Self::admin_token_dir`].
+    pub fn admin_token_socket(&self) -> PathBuf {
+        self.admin_token_dir
+            .join(weglarka_model::admin_auth::SOCKET_NAME)
+    }
+
     pub fn resolve(host: &HostConfig, config_path: &Path) -> Self {
         let config_dir = config_path
             .parent()
@@ -63,6 +72,7 @@ impl Paths {
             acme_account_key: state_dir.join("acme").join("account.key"),
             cdn_ranges: state_dir.join("cdn-ranges.toml"),
             config_root,
+            admin_token_dir: state_dir.join(weglarka_model::admin_auth::SOCKET_SUBDIR),
             state_dir,
         }
     }

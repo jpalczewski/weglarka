@@ -56,4 +56,5 @@ tokio = { workspace = true, features = ["test-util"] }
 weglarka-acme = { workspace = true, features = ["testing"] }
 weglarka-dns = { workspace = true, features = ["testing"] }
 weglarka-engine = { workspace = true, features = ["testing"] }
+weglarka-model = { workspace = true, features = ["testing"] }
 weglarka-registry = { workspace = true, features = ["testing"] }

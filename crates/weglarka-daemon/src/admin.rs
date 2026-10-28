@@ -182,7 +182,16 @@ pub(crate) async fn mutating<T>(fut: impl Future<Output = Result<T, EngineError>
     }
 }
 
+/// The full-trust admin API on the unix socket (`admin.socket`): no authentication, the socket's
+/// permissions are the access control (break-glass, docs/decisions/0056).
 pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
+    api_routes::<P>().with_state(daemon)
+}
+
+/// Every route of the admin API, still waiting for its state. Both listeners serve this one table
+/// (the token listener wraps it in [`crate::admin_token::token_router`]), so the token listener can
+/// never grow an endpoint the socket does not have.
+pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> {
     Router::new()
         .route(endpoints::STATUS.path, get(status::<P>))
         .route(endpoints::HEALTH.path, get(health::<P>))
@@ -221,7 +230,6 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .merge(crate::identity::routes())
         .merge(images::routes())
         .merge(push::routes()) // a streamed archive, like the volume tars
-        .with_state(daemon)
 }
 
 // ── Notifications (issue #38) ────────────────────────────────────────────────
