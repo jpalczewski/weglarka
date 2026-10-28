@@ -10,6 +10,7 @@ mod daemon;
 mod depends_on;
 mod forgejo;
 mod forward;
+mod generated;
 mod host_ports;
 mod images;
 mod ingress;

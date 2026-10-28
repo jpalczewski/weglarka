@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use crate::reconcile::{ActivityKind, EngineError, Reconciler, RecreateReason, SecretChangePolicy};
+use crate::reconcile::{
+    ActivityKind, EngineError, EngineGuard, Reconciler, RecreateReason, SecretChangePolicy,
+};
 use crate::secrets::{binding_fingerprints, materialize, registry_auth};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName, normalize_signal};
 use weglarka_model::events::Event;
@@ -134,8 +136,48 @@ pub struct WebhookOutcome {
     pub results: Vec<(InstanceName, Result<DeployOutcome, EngineError>)>,
 }
 
-/// The libpod spec of an app container: what `launch` and the blue-green challenger share. The caller
-/// decides the name, the networks and the labels; volumes are added by `Prepared::apply`.
+/// What every container that runs *as the app* shares — deploy, blue-green challenger and one-off
+/// run: the env, networks, secrets, user namespace, config binds, groups, resources and security
+/// profile. Everything specific to a long-lived serving container (published ports, restart policy,
+/// DNS aliases, healthcheck) or to a one-off run (command, entrypoint) starts at its inert default, so
+/// a field added here reaches all of them while a deploy-only field cannot leak into a run. The
+/// caller decides the name, the labels and the networks; volumes are added by `Prepared::apply`.
+pub(crate) fn app_container_base(
+    name: String,
+    image: String,
+    labels: BTreeMap<String, String>,
+    spec: &AppSpec,
+    networks: Vec<String>,
+    secrets: Vec<weglarka_model::podman::SecretAttachment>,
+    configs: &[crate::config_mounts::Resolved],
+) -> ContainerSpec {
+    ContainerSpec {
+        name,
+        image,
+        command: vec![],
+        entrypoint: None,
+        labels,
+        env: spec.env.clone(),
+        networks,
+        network_aliases: BTreeMap::new(),
+        secrets,
+        publish: vec![],
+        restart: RestartPolicy::No,
+        userns_auto: true,
+        // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
+        // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
+        mounts: config_binds(configs),
+        keep_groups: !spec.group_add.is_empty(),
+        volumes: vec![],
+        resources: spec.resources.clone(),
+        healthcheck: None,
+        id_mapping: None,
+        security: spec.security.clone(),
+    }
+}
+
+/// The libpod spec of a serving app container: what `launch` and the blue-green challenger share.
+/// The caller decides the name, the networks and the labels; volumes are added by `Prepared::apply`.
 #[allow(clippy::too_many_arguments)]
 fn container_spec(
     name: String,
@@ -148,15 +190,8 @@ fn container_spec(
     configs: &[crate::config_mounts::Resolved],
 ) -> ContainerSpec {
     ContainerSpec {
-        name,
-        image,
         command: spec.command.clone(),
-        entrypoint: None,
-        labels,
-        env: spec.env.clone(),
-        networks,
         network_aliases,
-        secrets,
         publish: spec
             .host_ports
             .iter()
@@ -168,16 +203,8 @@ fn container_spec(
             })
             .collect(),
         restart: RestartPolicy::Always,
-        userns_auto: true,
-        // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
-        // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
-        mounts: config_binds(configs),
-        keep_groups: !spec.group_add.is_empty(),
-        volumes: vec![],
-        resources: spec.resources.clone(),
         healthcheck: weglarka_model::limits::container_healthcheck(&spec.health),
-        id_mapping: None,
-        security: spec.security.clone(),
+        ..app_container_base(name, image, labels, spec, networks, secrets, configs)
     }
 }
 
@@ -217,8 +244,8 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
-        let _g = self.lock.lock().await;
-        self.deploy_locked(instance, force).await
+        let guard = self.acquire().await;
+        self.deploy_locked(&guard, instance, force).await
     }
 
     /// `apps reload` (issue #118): make a **running** app re-read its config without recreating the
@@ -226,7 +253,16 @@ impl<P: PodmanClient> Reconciler<P> {
     /// (stop + start). Takes the engine lock, writes neither `apps.toml` nor `state.toml` and emits no
     /// event; a container that is not running is refused with [`EngineError::ReloadNotRunning`].
     pub async fn reload(&self, instance: &InstanceName) -> Result<ReloadOutcome, EngineError> {
-        let _g = self.lock.lock().await;
+        let guard = self.acquire().await;
+        self.reload_locked(&guard, instance).await
+    }
+
+    /// The body of [`Self::reload`] for a caller that already holds the engine lock.
+    pub(crate) async fn reload_locked(
+        &self,
+        _held: &EngineGuard<'_>,
+        instance: &InstanceName,
+    ) -> Result<ReloadOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
         // Same precondition as a deploy: a config that cannot be mounted is not reloadable either.
         self.resolve_mounts(&spec)?;
@@ -307,13 +343,20 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
         digest: &Digest,
     ) -> Result<SpecHash, EngineError> {
-        match self.options.secret_change {
-            SecretChangePolicy::NextDeploy => Ok(spec_hash(spec, digest)),
+        let hash = match self.options.secret_change {
+            SecretChangePolicy::NextDeploy => spec_hash(spec, digest),
             SecretChangePolicy::Immediate => {
                 let fp = binding_fingerprints(&self.secrets, instance, spec).await?;
-                Ok(spec_hash_with_secrets(spec, digest, &fp))
+                spec_hash_with_secrets(spec, digest, &fp)
             }
-        }
+        };
+        // A consumer of generated config carries one more bind mount; only it gets the extra input,
+        // so every other app keeps the hash it had before the feature existed.
+        Ok(if self.is_generated_consumer(instance) {
+            weglarka_model::hash::spec_hash_with_generated(hash, crate::generated::MOUNT_TARGET)
+        } else {
+            hash
+        })
     }
 
     /// Pulls `reference` for `instance`, with its `registry-auth` credentials when it has any
@@ -424,6 +467,8 @@ impl<P: PodmanClient> Reconciler<P> {
         ),
         EngineError,
     > {
+        // Config files the app cannot start without exist before its first start (#212).
+        self.bootstrap_generated(instance).await?;
         let prepared = self.prepare_instance(instance, spec).await?;
         let name = labels::container_name(instance);
         match self
@@ -458,7 +503,10 @@ impl<P: PodmanClient> Reconciler<P> {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
         // ADR 0028). The resolved canonical paths are what `launch` mounts.
-        let configs = self.resolve_mounts(spec)?;
+        let mut configs = self.resolve_mounts(spec)?;
+        // Shared by deploys and one-off runs (incl. the validation run), so a container of the
+        // consumer always sees the generated versions.
+        configs.extend(self.generated_mounts(instance)?);
         self.podman
             .network_create(&NetworkSpec {
                 name: labels::network_name(instance),
@@ -585,6 +633,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // Everything `launch` prepares, **without** touching the serving container.
+        self.bootstrap_generated(instance).await?;
         let (prepared, configs) = self.prepare_instance(instance, spec).await?;
         let range = prepared.range;
 
@@ -737,7 +786,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// and the daemon-side `health.http`. In one attempt every configured probe must pass; the first
     /// such attempt ends the gate in success and none after all attempts is a failure. With no probe
     /// at all, success = running for the whole window.
-    async fn health_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
+    pub(crate) async fn health_gate(&self, name: &str, spec: &AppSpec) -> Result<(), String> {
         let gate = &spec.health;
         let attempts = gate.attempts.max(1);
         let step = Duration::from_millis(gate.window_secs.max(1) * 1000 / u64::from(attempts));
@@ -803,16 +852,18 @@ impl<P: PodmanClient> Reconciler<P> {
 
     pub(crate) async fn deploy_locked(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
-        self.deploy_locked_from(instance, force, DigestSource::Tag)
+        self.deploy_locked_from(held, instance, force, DigestSource::Tag)
             .await
     }
 
     /// [`Self::deploy_locked`] with the digest taken from `source` instead of the tag.
     pub(crate) async fn deploy_locked_from(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         force: bool,
         source: DigestSource<'_>,
@@ -829,12 +880,12 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         if spec.kind == AppKind::Static {
             return self
-                .deploy_static_from(instance, &spec, force, source)
+                .deploy_static_from(held, instance, &spec, force, source)
                 .await;
         }
         // `start = false` — provision only (no container, no secrets, no health gate).
         if !spec.start {
-            return self.provision_from(instance, &spec, source).await;
+            return self.provision_from(held, instance, &spec, source).await;
         }
         // A deploy starts a container: every app in `depends_on` has to be running/healthy first
         // (issue #35). Not a failure — the start is retried once the dependency is up.
@@ -909,7 +960,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
                 // Retention of 1 (issue #40): with `current` and `previous` saved, the older images
                 // of this repository are dead weight. Best effort — never fails the deploy.
-                self.retain_images_locked(image_repo(&spec.image)).await;
+                self.retain_images_locked(held, image_repo(&spec.image))
+                    .await;
                 return Ok(DeployOutcome::Deployed { digest, generation });
             }
             Err(reason) => reason,
@@ -976,7 +1028,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
                 // The failed image is neither `current` nor `previous` now; it goes away unless it
                 // still holds the tag named by the spec (issue #40).
-                self.retain_images_locked(image_repo(&spec.image)).await;
+                self.retain_images_locked(held, image_repo(&spec.image))
+                    .await;
                 Ok(DeployOutcome::RolledBack {
                     failed: digest,
                     restored: prev,
@@ -1011,15 +1064,18 @@ impl<P: PodmanClient> Reconciler<P> {
     /// flipped while it ran) is stopped and removed. `start = false` means "no container".
     pub(crate) async fn provision_locked(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<DeployOutcome, EngineError> {
-        self.provision_from(instance, spec, DigestSource::Tag).await
+        self.provision_from(held, instance, spec, DigestSource::Tag)
+            .await
     }
 
     /// [`Self::provision_locked`] with the digest taken from `source` instead of the tag.
     pub(crate) async fn provision_from(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         source: DigestSource<'_>,
@@ -1055,7 +1111,8 @@ impl<P: PodmanClient> Reconciler<P> {
             instance: instance.clone(),
             digest: digest.clone(),
         });
-        self.retain_images_locked(image_repo(&spec.image)).await;
+        self.retain_images_locked(held, image_repo(&spec.image))
+            .await;
         Ok(DeployOutcome::Provisioned { digest })
     }
 
@@ -1081,6 +1138,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// the digest is already considered good, and the old container does not exist or has a bad spec.
     pub(crate) async fn recreate_locked(
         &self,
+        _held: &EngineGuard<'_>,
         instance: &InstanceName,
         reason: RecreateReason,
     ) -> Result<DeployOutcome, EngineError> {

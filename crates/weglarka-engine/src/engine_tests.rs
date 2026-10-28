@@ -71,6 +71,15 @@ impl Harness {
     }
 
     fn build(apps_toml: &str, options: ReconcilerOptions, monitor: crash::Policy) -> Self {
+        Self::build_with(apps_toml, options, monitor, None)
+    }
+
+    fn build_with(
+        apps_toml: &str,
+        options: ReconcilerOptions,
+        monitor: crash::Policy,
+        generated: Option<crate::generated::GeneratedWiring>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, apps_toml).unwrap();
@@ -78,11 +87,13 @@ impl Harness {
         let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
         let sink = Arc::new(VecSink::default());
         let secrets: Arc<dyn SecretStore> = store.clone();
-        let rec = Arc::new(
-            Reconciler::new(fake.clone(), secrets, paths, options)
-                .with_events(sink.clone())
-                .with_monitor(monitor),
-        );
+        let mut rec = Reconciler::new(fake.clone(), secrets, paths, options)
+            .with_events(sink.clone())
+            .with_monitor(monitor);
+        if let Some(wiring) = generated {
+            rec = rec.with_generated(wiring);
+        }
+        let rec = Arc::new(rec);
         Self {
             dir,
             fake,
@@ -3770,4 +3781,618 @@ async fn ingress_range_is_readable_while_a_deploy_holds_the_lock_through_its_gat
     let out = h.rec.deploy(&name("who"), false).await.unwrap();
     assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
     *prober.rec.lock().unwrap() = None; // break the Arc cycle
+}
+
+/// The generated config pipeline (#212) against a fake generator and `FakePodman`.
+mod generated {
+    use super::*;
+    use crate::generated::{
+        GeneratedOutcome, GeneratedWiring, current_target, swap_current, write_version,
+    };
+    use crate::testing::RunScript;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use weglarka_model::app::{AppSpec, AppsFile};
+    use weglarka_model::generated::{
+        ConfigGenerator, FileName, Fingerprint, GeneratedFile, RenderError, RenderInput,
+    };
+    use weglarka_model::generated_state::{GeneratedState, LastResult};
+    use weglarka_model::podman::{LogSource, PodmanClient};
+
+    const IDP: &str = r#"
+[apps.idp]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+command = ["--config=/etc/base.yml"]
+health = { attempts = 2, window_secs = 2 }
+"#;
+
+    struct TestGen {
+        consumer: InstanceName,
+        content: Mutex<String>,
+        validator: bool,
+        fail: AtomicBool,
+    }
+
+    impl TestGen {
+        fn new(validator: bool) -> Arc<Self> {
+            Arc::new(Self {
+                consumer: name("idp"),
+                content: Mutex::new("v1".into()),
+                validator,
+                fail: AtomicBool::new(false),
+            })
+        }
+
+        fn set(&self, content: &str) {
+            *self.content.lock().unwrap() = content.into();
+        }
+
+        fn files(&self) -> Vec<GeneratedFile> {
+            vec![GeneratedFile::new(
+                FileName::new("rules.yml").unwrap(),
+                self.content.lock().unwrap().clone().into_bytes(),
+            )]
+        }
+
+        fn fingerprint(&self) -> Fingerprint {
+            Fingerprint::of("test", &self.files()).unwrap()
+        }
+    }
+
+    impl ConfigGenerator for TestGen {
+        fn id(&self) -> &'static str {
+            "test"
+        }
+
+        fn consumer(&self) -> &InstanceName {
+            &self.consumer
+        }
+
+        fn render(&self, _: &RenderInput<'_>) -> Result<Vec<GeneratedFile>, RenderError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(RenderError::Failed {
+                    id: "test",
+                    reason: "boom".into(),
+                });
+            }
+            Ok(self.files())
+        }
+
+        fn validate_argv(&self, consumer: &AppSpec, dir: &str) -> Option<Vec<String>> {
+            self.validator.then(|| {
+                let mut argv = vec!["checker".to_owned(), "validate".to_owned()];
+                argv.extend(consumer.command.iter().cloned());
+                argv.push(format!("--config={dir}"));
+                argv
+            })
+        }
+    }
+
+    fn wiring(gen_: &Arc<TestGen>) -> GeneratedWiring {
+        GeneratedWiring {
+            generators: vec![gen_.clone()],
+            digests: Arc::new(|_| BTreeMap::new()),
+        }
+    }
+
+    async fn deployed() -> Harness {
+        let h = Harness::new(IDP);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    async fn apply(h: &Harness, g: &Arc<TestGen>, force: bool) -> GeneratedOutcome {
+        // A deadlock (re-locking inside the pipeline) would hang here; paused time makes it a failure.
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            h.rec
+                .apply_generated(&**g, &|_: &AppsFile| BTreeMap::new(), force),
+        )
+        .await
+        .expect("apply_generated must not deadlock")
+        .unwrap()
+    }
+
+    fn live(h: &Harness) -> Option<String> {
+        current_target(&h.rec.generated_dir(&name("idp")))
+    }
+
+    fn stops(h: &Harness) -> usize {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| **c == Call::ContainerStop("idp".into()))
+            .count()
+    }
+
+    fn run_specs(h: &Harness) -> Vec<weglarka_model::podman::ContainerSpec> {
+        h.fake
+            .created_specs()
+            .into_iter()
+            .filter(|s| s.labels.contains_key(labels::RUN))
+            .collect()
+    }
+
+    fn record(h: &Harness) -> weglarka_model::generated_state::GeneratorRecord {
+        GeneratedState::load(&h.dir.path().join("generated.toml"))
+            .get("test")
+            .cloned()
+            .expect("a record")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_valid_render_is_validated_swapped_and_the_consumer_restarted() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        let stops_before = stops(&h);
+        let out = apply(&h, &g, false).await;
+        let fp = g.fingerprint();
+        assert_eq!(
+            out,
+            GeneratedOutcome::Applied {
+                fingerprint: fp.clone(),
+                validated: true,
+                reloaded: true
+            }
+        );
+        assert_eq!(live(&h), Some(fp.version_dir()));
+        let file = h
+            .rec
+            .generated_dir(&name("idp"))
+            .join("current")
+            .join("rules.yml");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "v1");
+        assert_eq!(stops(&h), stops_before + 1);
+        assert_eq!(record(&h).applied.as_deref(), Some(fp.as_str()));
+        assert!(record(&h).validated);
+        assert!(h.sink.events().contains(&Event::GeneratedConfigApplied {
+            id: "test".into(),
+            consumer: name("idp"),
+            fingerprint: fp.to_string(),
+            validated: true,
+        }));
+
+        // The validator ran in a one-off container with the consumer's own base config kept and the
+        // new version appended; argv[0] is the entrypoint.
+        let runs = run_specs(&h);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].entrypoint, Some(vec!["checker".to_owned()]));
+        assert_eq!(
+            runs[0].command,
+            [
+                "validate".to_owned(),
+                "--config=/etc/base.yml".to_owned(),
+                format!("--config=/weglarka/generated/{}", fp.version_dir()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_render_touches_nothing() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        apply(&h, &g, false).await;
+        let calls = h.fake.calls().len();
+        let events = h.sink.events().len();
+        assert_eq!(apply(&h, &g, false).await, GeneratedOutcome::Unchanged);
+        assert_eq!(h.fake.calls().len(), calls);
+        assert_eq!(h.sink.events().len(), events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalid_render_leaves_current_untouched_and_is_not_retried() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        apply(&h, &g, false).await;
+        let good = live(&h);
+        let stops_before = stops(&h);
+
+        g.set("v2-bad");
+        h.fake.script_next_run(RunScript {
+            output: vec![(LogSource::Stderr, b"key 'rules[0]' is wrong\n".to_vec())],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        assert!(output.contains("key 'rules[0]' is wrong"), "{output}");
+        assert!(output.contains("exited with code 1"), "{output}");
+        assert_eq!(live(&h), good);
+        assert_eq!(stops(&h), stops_before);
+        // The rejected version stays on disk for inspection.
+        assert!(
+            h.rec
+                .generated_dir(&name("idp"))
+                .join(g.fingerprint().version_dir())
+                .is_dir()
+        );
+        assert_eq!(record(&h).last_result, LastResult::Invalid);
+        assert!(matches!(
+            h.sink.events().last(),
+            Some(Event::GeneratedConfigInvalid { .. })
+        ));
+
+        // The same render is not validated again every trigger — until forced.
+        let runs = run_specs(&h).len();
+        assert_eq!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Skipped {
+                last: LastResult::Invalid
+            }
+        );
+        assert_eq!(run_specs(&h).len(), runs);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        assert!(matches!(
+            apply(&h, &g, true).await,
+            GeneratedOutcome::Applied { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn validator_output_never_leaks_a_bound_secret_or_a_long_tail_into_the_event() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"token\", kind = \"env\", var = \"TOKEN\" }}]\n"
+        ));
+        h.store
+            .set("idp.token", SecretValue::new("hunter2-secret"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        let noise = "x".repeat(4000);
+        h.fake.script_next_run(RunScript {
+            output: vec![(
+                LogSource::Stderr,
+                format!("{noise}\nline: password: hunter2-secret\n").into_bytes(),
+            )],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        assert!(output.contains("password: ***"), "{output}");
+        assert!(!output.contains("hunter2-secret"));
+        assert!(!record(&h).last_error.unwrap().contains("hunter2-secret"));
+        let Some(Event::GeneratedConfigInvalid { output: sent, .. }) = h.sink.events().pop() else {
+            panic!("expected the Invalid event");
+        };
+        assert!(
+            sent.len() <= 1024 && !sent.contains("hunter2-secret"),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_secrets_are_masked_longest_first_before_the_cut() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"a\", kind = \"env\", var = \"A\" }}, {{ secret = \"b\", kind = \"env\", var = \"B\" }}]\n"
+        ));
+        h.store.set("idp.a", SecretValue::new("hunter2")).unwrap();
+        h.store
+            .set("idp.b", SecretValue::new("hunter2-long\n"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        // The secret sits right where a 16 KiB tail would cut it if masking came after the cut.
+        let text = format!("hunter2-long{}end", "y".repeat(16 * 1024 - 20));
+        h.fake.script_next_run(RunScript {
+            output: vec![(LogSource::Stderr, text.into_bytes())],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        assert!(
+            !output.contains("hunter2") && !output.contains("-long"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_secret_cut_by_the_capture_window_leaves_no_fragment() {
+        let h = Harness::new(&format!(
+            "{IDP}secrets = [{{ secret = \"token\", kind = \"env\", var = \"TOKEN\" }}]\n"
+        ));
+        h.store
+            .set("idp.token", SecretValue::new("hunter2-secret"))
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let g = TestGen::new(true);
+        g.set("bad");
+        // 70 KiB of nothing but the secret: the capture window starts in the middle of one, and
+        // masking shrinks what is left far below the reported size.
+        h.fake.script_next_run(RunScript {
+            output: vec![(
+                LogSource::Stderr,
+                "hunter2-secret".repeat(5000).into_bytes(),
+            )],
+            exit_code: 1,
+            hang: false,
+        });
+        let GeneratedOutcome::Invalid { output } = apply(&h, &g, false).await else {
+            panic!("expected Invalid");
+        };
+        let letters: String = output
+            .replace("***", "")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        // Only the header line of the failure remains; no byte of the secret does.
+        for piece in ["hunter", "ter2", "secret", "cret", "et"] {
+            assert!(!output.contains(piece), "{piece}: {output}");
+        }
+        assert!(letters.starts_with("validatorexitedwithcode"), "{letters}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_consumer_and_its_validation_run_mount_the_generated_directory_read_only() {
+        let g = TestGen::new(true);
+        let h = Harness::build_with(
+            IDP,
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        g.set("v2");
+        apply(&h, &g, false).await;
+
+        let dir = std::fs::canonicalize(h.rec.generated_dir(&name("idp"))).unwrap();
+        let wanted = |specs: Vec<weglarka_model::podman::ContainerSpec>| {
+            specs.into_iter().all(|s| {
+                s.mounts.iter().any(|m| {
+                    m.target == "/weglarka/generated"
+                        && m.source == dir.display().to_string()
+                        && m.read_only
+                })
+            })
+        };
+        let created = h.fake.created_specs();
+        assert!(created.len() >= 2, "{created:?}");
+        assert!(wanted(created), "the serving container and the validator");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_consumer_gets_the_extra_hash_input() {
+        let g = TestGen::new(false);
+        let h = Harness::build_with(
+            &format!(
+                "{IDP}\n[apps.other]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nport = 8086\n"
+            ),
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+        let d = digest('a');
+        let consumer = &apps.apps[&name("idp")];
+        let other = &apps.apps[&name("other")];
+        assert_eq!(
+            h.rec
+                .desired_hash(&name("idp"), consumer, &d)
+                .await
+                .unwrap(),
+            weglarka_model::hash::spec_hash_with_generated(
+                weglarka_model::hash::spec_hash(consumer, &d),
+                "/weglarka/generated"
+            )
+        );
+        assert_eq!(
+            h.rec.desired_hash(&name("other"), other, &d).await.unwrap(),
+            weglarka_model::hash::spec_hash(other, &d),
+            "an app that consumes nothing keeps the hash it had"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_app_that_is_not_a_consumer_gets_no_mount() {
+        let h = deployed().await;
+        assert!(
+            h.fake
+                .created_specs()
+                .iter()
+                .all(|s| s.mounts.iter().all(|m| m.target != "/weglarka/generated"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_health_failure_flips_current_back_once() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        apply(&h, &g, false).await;
+        let good = live(&h);
+        let good_fp = g.fingerprint();
+        let stops_before = stops(&h);
+
+        g.set("v2");
+        // Two unhealthy attempts on the new version, then healthy after the way back.
+        h.fake.script_health(
+            "idp",
+            [
+                HealthStatus::Unhealthy,
+                HealthStatus::Unhealthy,
+                HealthStatus::Healthy,
+            ],
+        );
+        let out = apply(&h, &g, false).await;
+        assert!(
+            matches!(&out, GeneratedOutcome::RolledBack { fingerprint, .. } if *fingerprint == g.fingerprint()),
+            "{out:?}"
+        );
+        assert_eq!(live(&h), good);
+        // One restart to try the new version, one to return: no loop.
+        assert_eq!(stops(&h), stops_before + 2);
+        let rec = record(&h);
+        assert_eq!(rec.applied.as_deref(), Some(good_fp.as_str()));
+        assert_eq!(rec.last_result, LastResult::RolledBack);
+        assert!(matches!(
+            h.sink.events().last(),
+            Some(Event::GeneratedConfigRolledBack { .. })
+        ));
+        assert_eq!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Skipped {
+                last: LastResult::RolledBack
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_the_daemon_never_applied_is_applied_on_the_next_pass() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        apply(&h, &g, false).await;
+
+        // The daemon died after the swap and before the apply/record.
+        g.set("v2");
+        let root = h.rec.generated_dir(&name("idp"));
+        let version = g.fingerprint().version_dir();
+        write_version(&root, &version, &g.files()).unwrap();
+        swap_current(&root, &version).unwrap();
+        let runs = run_specs(&h).len();
+        let stops_before = stops(&h);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+
+        assert_eq!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Applied {
+                fingerprint: g.fingerprint(),
+                validated: false,
+                reloaded: true
+            }
+        );
+        assert_eq!(stops(&h), stops_before + 1);
+        assert_eq!(run_specs(&h).len(), runs, "already swapped: no validation");
+        assert_eq!(
+            record(&h).applied.as_deref(),
+            Some(g.fingerprint().as_str())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_consumer_gets_the_files_but_no_restart() {
+        let h = deployed().await;
+        h.fake.container_stop("idp", 1).await.unwrap();
+        let g = TestGen::new(true);
+        let starts = h
+            .fake
+            .calls()
+            .iter()
+            .filter(|c| **c == Call::ContainerStart("idp".into()))
+            .count();
+        let out = apply(&h, &g, false).await;
+        assert_eq!(
+            out,
+            GeneratedOutcome::Applied {
+                fingerprint: g.fingerprint(),
+                validated: true,
+                reloaded: false
+            }
+        );
+        assert_eq!(live(&h), Some(g.fingerprint().version_dir()));
+        let starts_after = h
+            .fake
+            .calls()
+            .iter()
+            .filter(|c| **c == Call::ContainerStart("idp".into()))
+            .count();
+        assert_eq!(starts, starts_after);
+        assert_ne!(record(&h).last_result, LastResult::RolledBack);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_that_was_never_deployed_skips_validation() {
+        let h = Harness::new(IDP);
+        let g = TestGen::new(true);
+        let out = apply(&h, &g, false).await;
+        assert_eq!(
+            out,
+            GeneratedOutcome::Applied {
+                fingerprint: g.fingerprint(),
+                validated: false,
+                reloaded: false
+            }
+        );
+        assert!(run_specs(&h).is_empty());
+        assert!(live(&h).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_live_and_the_previous_version_are_kept() {
+        let h = deployed().await;
+        let g = TestGen::new(false);
+        for v in ["v1", "v2", "v3"] {
+            g.set(v);
+            h.fake.script_health("idp", [HealthStatus::Healthy]);
+            apply(&h, &g, false).await;
+        }
+        let root = h.rec.generated_dir(&name("idp"));
+        let mut dirs: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        dirs.sort();
+        assert_eq!(dirs.len(), 3, "{dirs:?}"); // current + two versions
+        assert!(dirs.contains(&"current".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_renders_before_the_first_launch_without_validation() {
+        let g = TestGen::new(true);
+        let h = Harness::build_with(
+            IDP,
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+
+        assert_eq!(live(&h), Some(g.fingerprint().version_dir()));
+        assert!(run_specs(&h).is_empty(), "nothing to validate with yet");
+        let rec = record(&h);
+        assert!(!rec.validated);
+        assert_eq!(rec.last_result, LastResult::Applied);
+        assert!(h.sink.events().contains(&Event::GeneratedConfigApplied {
+            id: "test".into(),
+            consumer: name("idp"),
+            fingerprint: g.fingerprint().to_string(),
+            validated: false,
+        }));
+        // The version was there when the container was created, and the next pass finds it applied.
+        assert_eq!(apply(&h, &g, false).await, GeneratedOutcome::Unchanged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_render_that_fails_at_bootstrap_stops_the_first_launch() {
+        let g = TestGen::new(true);
+        g.fail.store(true, Ordering::SeqCst);
+        let h = Harness::build_with(
+            IDP,
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(&g)),
+        );
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(!report.is_clean(), "{report:?}");
+        assert!(h.fake.containers().is_empty());
+        assert!(live(&h).is_none());
+    }
 }

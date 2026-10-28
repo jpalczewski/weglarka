@@ -60,6 +60,9 @@ fn instance_of(event: &Event) -> Option<&InstanceName> {
         | Event::CrashLooping { instance, .. }
         | Event::Unhealthy { instance }
         | Event::Recovered { instance } => Some(instance),
+        Event::GeneratedConfigApplied { consumer, .. }
+        | Event::GeneratedConfigInvalid { consumer, .. }
+        | Event::GeneratedConfigRolledBack { consumer, .. } => Some(consumer),
         Event::Pruned { .. }
         | Event::WebhookDuplicate { .. }
         | Event::SelfUpdated { .. }
@@ -230,6 +233,38 @@ pub fn build(event: &Event) -> Message {
                 short(to)
             ),
             tag("warning"),
+        ),
+        Event::GeneratedConfigApplied {
+            id,
+            consumer,
+            fingerprint,
+            validated,
+        } => (
+            format!("generated:{id}"),
+            format!("config {id} applied to {consumer}"),
+            format!(
+                "{}{}",
+                fingerprint.chars().take(12).collect::<String>(),
+                if *validated { "" } else { " · not validated (first start)" }
+            ),
+            tag("gear"),
+        ),
+        Event::GeneratedConfigInvalid {
+            id,
+            consumer,
+            output,
+        } => (
+            format!("generated:{id}"),
+            format!("config {id} for {consumer} failed validation"),
+            format!("the previous version stays live. {output}"),
+            tag("warning"),
+        ),
+        Event::GeneratedConfigRolledBack { id, consumer } => (
+            format!("generated:{id}"),
+            format!("config {id} rolled back on {consumer}"),
+            "the consumer failed its health gate on the new version; the previous one is live again"
+                .to_owned(),
+            tag("rewind"),
         ),
         // Issue #96: certificates belong to the host, not to an app.
         Event::CertificateIssued {

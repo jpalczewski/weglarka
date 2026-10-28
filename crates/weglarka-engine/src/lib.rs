@@ -7,6 +7,7 @@ pub mod crash;
 pub mod depends;
 pub mod deploy;
 pub mod forward;
+pub mod generated;
 pub mod host_mounts;
 pub mod images;
 pub mod oidc_credentials;

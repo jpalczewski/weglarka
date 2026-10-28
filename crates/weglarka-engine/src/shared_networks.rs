@@ -15,7 +15,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Declares a shared network (idempotent, issue #128). Apps join it through `shared_networks`;
     /// the Podman network is created lazily by the first member's deploy.
     pub async fn declare_shared_network(&self, name: SharedNetworkName) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         if apps.shared_networks.contains_key(&name) {
             return Ok(());
@@ -28,7 +28,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Podman network goes with it when nothing is attached; otherwise reconcile removes the empty
     /// network once the last container is gone (best effort, like per-app networks).
     pub async fn remove_shared_network(&self, name: &SharedNetworkName) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         if !apps.shared_networks.contains_key(name) {
             return Err(EngineError::UnknownSharedNetwork(name.clone()));

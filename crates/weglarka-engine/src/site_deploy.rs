@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 
 use crate::deploy::{DeployOutcome, DigestSource, pinned_ref};
-use crate::reconcile::{ActivityKind, EngineError, Reconciler};
+use crate::reconcile::{ActivityKind, EngineError, EngineGuard, Reconciler};
 use crate::sites::{ExtractLimits, extract_release};
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::events::Event;
@@ -44,6 +44,7 @@ impl<P: PodmanClient> Reconciler<P> {
 
     pub(crate) async fn deploy_static_from(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         force: bool,
@@ -113,7 +114,8 @@ impl<P: PodmanClient> Reconciler<P> {
         });
         prune_releases(&site_dir, &keep).await;
         // The files are on disk now; the image only has to stay while it is `current`/`previous`.
-        self.retain_images_locked(image_repo(&spec.image)).await;
+        self.retain_images_locked(held, image_repo(&spec.image))
+            .await;
         Ok(DeployOutcome::Deployed { digest, generation })
     }
 

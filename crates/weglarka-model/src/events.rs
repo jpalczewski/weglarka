@@ -86,6 +86,23 @@ pub enum Event {
         renewed: bool,
         expires_in_days: u64,
     },
+    /// A generated config version was applied to its consumer (#212). `validated` is `false` when
+    /// the bootstrap applied it before the consumer could run the validator.
+    GeneratedConfigApplied {
+        id: String,
+        consumer: InstanceName,
+        fingerprint: String,
+        validated: bool,
+    },
+    /// The validator rejected a render; the live version is unchanged. `output` is the tail of the
+    /// validator's output (it names keys, not values).
+    GeneratedConfigInvalid {
+        id: String,
+        consumer: InstanceName,
+        output: String,
+    },
+    /// The consumer failed its health gate on the new version and the previous one is back.
+    GeneratedConfigRolledBack { id: String, consumer: InstanceName },
     /// Issuing or renewing a certificate failed. `expires_in_days` is the remaining validity of the
     /// certificate still on disk (`None` when there is none, `Some(0)` once it has expired).
     CertificateRenewalFailed {
@@ -145,7 +162,9 @@ impl Event {
             | Self::RolledBack { .. }
             | Self::Unhealthy { .. }
             | Self::SelfUpdatePending { .. }
-            | Self::SelfUpdateFellBack { .. } => Severity::Warning,
+            | Self::SelfUpdateFellBack { .. }
+            | Self::GeneratedConfigInvalid { .. }
+            | Self::GeneratedConfigRolledBack { .. } => Severity::Warning,
             Self::Pruned { .. }
             | Self::WaitingForDependency { .. }
             | Self::WebhookDuplicate { .. } => Severity::Debug,
@@ -155,7 +174,8 @@ impl Event {
             | Self::WaitingForSecret { .. }
             | Self::Recovered { .. }
             | Self::SelfUpdated { .. }
-            | Self::CertificateIssued { .. } => Severity::Info,
+            | Self::CertificateIssued { .. }
+            | Self::GeneratedConfigApplied { .. } => Severity::Info,
         }
     }
 }
@@ -209,6 +229,30 @@ mod tests {
     #[test]
     fn severity_is_classified_per_event() {
         let cases = [
+            (
+                Event::GeneratedConfigApplied {
+                    id: "identity".into(),
+                    consumer: name("a"),
+                    fingerprint: "f".into(),
+                    validated: true,
+                },
+                Severity::Info,
+            ),
+            (
+                Event::GeneratedConfigInvalid {
+                    id: "identity".into(),
+                    consumer: name("a"),
+                    output: "x".into(),
+                },
+                Severity::Warning,
+            ),
+            (
+                Event::GeneratedConfigRolledBack {
+                    id: "identity".into(),
+                    consumer: name("a"),
+                },
+                Severity::Warning,
+            ),
             (
                 Event::DeployOk {
                     instance: name("a"),

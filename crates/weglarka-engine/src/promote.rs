@@ -56,7 +56,7 @@ impl<P: PodmanClient> Reconciler<P> {
         source: PromoteSource,
         dry_run: bool,
     ) -> Result<PromoteReport, EngineError> {
-        let _g = self.lock.lock().await;
+        let guard = self.acquire().await;
         let apps = state::load_apps(&self.paths.apps)?;
         let label = format!("{site}/{env}");
         let target =
@@ -130,12 +130,12 @@ impl<P: PodmanClient> Reconciler<P> {
         // explicit digest of a pruned release pulls, with the target's registry credentials.
         self.ensure_image(&target, &spec, &digest, None).await?;
         let mut outcome = self
-            .deploy_locked_from(&target, false, DigestSource::Local(&digest))
+            .deploy_locked_from(&guard, &target, false, DigestSource::Local(&digest))
             .await?;
         // An explicit promotion is the operator's will: retry a digest that failed here before.
         if matches!(outcome, DeployOutcome::KnownBad { .. }) {
             outcome = self
-                .deploy_locked_from(&target, true, DigestSource::Local(&digest))
+                .deploy_locked_from(&guard, &target, true, DigestSource::Local(&digest))
                 .await?;
         }
         Ok(PromoteReport {
@@ -162,7 +162,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// replaced site are dropped from the desired state like a removed app (their releases and state
     /// entries stay until pruned, as for `apps remove`).
     pub async fn declare_site(&self, site: SiteName, spec: SiteSpec) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
         sites.insert(site, spec);
@@ -177,7 +177,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Removes `site` (`DELETE /v1/sites/{site}`). Refused while any of its environments has a release
     /// unless `purge`, which also forgets their state entries.
     pub async fn remove_site(&self, site: &SiteName, purge: bool) -> Result<(), EngineError> {
-        let _g = self.lock.lock().await;
+        let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         if !apps.sites.contains_key(site) {
             return Err(EngineError::UnknownSite(site.to_string()));

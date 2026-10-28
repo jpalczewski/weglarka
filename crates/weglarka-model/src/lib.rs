@@ -12,6 +12,8 @@ pub mod depends;
 pub mod environments;
 pub mod events;
 pub mod fsutil;
+pub mod generated;
+pub mod generated_state;
 pub mod hash;
 pub mod host_ports;
 pub mod identity;

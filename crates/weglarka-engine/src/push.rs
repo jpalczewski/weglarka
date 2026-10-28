@@ -88,15 +88,19 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
-        let _g = self.lock.lock().await;
+        let guard = self.acquire().await;
         // A promote-only environment changes only through `weglarka promote` (issue #205).
         if state::load_apps(&self.paths.apps)?.is_promote_only(instance) {
             return Err(EngineError::PromoteOnly(instance.clone()));
         }
-        let outcome = self.deploy_locked_from(instance, false, source).await?;
+        let outcome = self
+            .deploy_locked_from(&guard, instance, false, source)
+            .await?;
         // A manual push is the operator's explicit will: retry a known-bad digest, as `apps deploy`.
         if matches!(outcome, DeployOutcome::KnownBad { .. }) {
-            return self.deploy_locked_from(instance, true, source).await;
+            return self
+                .deploy_locked_from(&guard, instance, true, source)
+                .await;
         }
         Ok(outcome)
     }
