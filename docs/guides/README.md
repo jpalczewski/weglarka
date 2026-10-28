@@ -32,6 +32,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [App dependencies](dependencies.md) | `depends_on` start order and health gate |
 | [Blue-green deploys](blue-green.md) | `strategy = "blue_green"`: deploys without the restart outage for stateless apps |
 | [Container command](container-command.md) | `command` (argv) |
+| [Generated config](generated-config.md) | Files rendered from `apps.toml` for an app (identity provider): versions, validation, apply and rollback |
 | [Container hardening](container-hardening.md) | `security` for apps, the always-hardened ingress container |
 | [Image retention](image-retention.md) | Which images stay, `images prune` |
 | [One-off commands](one-off-commands.md) | `weglarka run` |
