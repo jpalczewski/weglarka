@@ -1,6 +1,8 @@
 //! `access-control.yml` (#90): the whole `access_control` section. Whatever the number of forward apps
 //! the shape is the same — `default_policy: deny` and a constant first rule that lets the portal itself
-//! through — so no policy flips with the app count and the rule list is never empty.
+//! through — so no policy flips with the app count and the rule list is never empty. A rule that
+//! names groups is followed by a `deny` for the same domain and resources, because the provider
+//! skips it for non-members instead of stopping there.
 
 use serde::Serialize;
 use weglarka_model::app::{InstanceName, check_path_prefix};
@@ -111,8 +113,19 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
         subject: Vec::new(),
         resources: Vec::new(),
     }];
-    rules.extend(scoped);
-    rules.extend(whole);
+    for rule in scoped.chain(whole) {
+        // Authelia skips a rule whose `subject` does not match the user and carries on with the next
+        // one, so a later, laxer rule (another app on the same domain) would admit a non-member.
+        // Closing each group rule with a `deny` over the same domain and resources makes it final.
+        let closing = (!rule.subject.is_empty()).then(|| Rule {
+            domain: rule.domain,
+            policy: "deny",
+            subject: Vec::new(),
+            resources: rule.resources.clone(),
+        });
+        rules.push(rule);
+        rules.extend(closing);
+    }
     Ok(to_text(&Document {
         access_control: AccessControl {
             default_policy: "deny",

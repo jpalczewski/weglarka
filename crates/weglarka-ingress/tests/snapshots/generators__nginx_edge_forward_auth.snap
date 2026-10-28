@@ -194,6 +194,9 @@ http {
         }
         location / {
             set $app "panel";
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25|%2e|%2f|/\.\.?(/|\?|$))") {
+                return 400;
+            }
             auth_request /internal/weglarka/authz;
             auth_request_set $wg_user $upstream_http_remote_user;
             auth_request_set $wg_groups $upstream_http_remote_groups;
@@ -347,6 +350,9 @@ http {
             proxy_set_header X-Forwarded-For $remote_addr;
         }
         location = /wiki {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25|%2e|%2f|/\.\.?(/|\?|$))") {
+                return 400;
+            }
             auth_request /internal/weglarka/authz;
             auth_request_set $wg_user $upstream_http_remote_user;
             auth_request_set $wg_groups $upstream_http_remote_groups;
@@ -373,6 +379,9 @@ http {
             add_header X-Request-Id $request_id always;
         }
         location ^~ /wiki/ {
+            if ($request_uri ~* "^[^?]*(;|%3b|\\\\|%5c|%25|%2e|%2f|/\.\.?(/|\?|$))") {
+                return 400;
+            }
             auth_request /internal/weglarka/authz;
             auth_request_set $wg_user $upstream_http_remote_user;
             auth_request_set $wg_groups $upstream_http_remote_groups;

@@ -1,7 +1,7 @@
 //! Identity provider integration (issue #42, ADR 0051/0052): the serde types of `AppSpec.oidc`,
 //! `[oidc_clients]` and `AppIngress.auth*`, their validation, [`effective_spec`] (what the integration
-//! injects into an app). `[identity]` itself ([`crate::config::IdentityConfig`]) stays in `config.rs` next to the other host
-//! sections.
+//! injects into an app). `[identity]` itself ([`crate::config::IdentityConfig`]) stays in `config.rs`
+//! next to the other host sections.
 //!
 //! The `oidc` and `auth*` fields are not part of `spec_hash`; what `oidc` injects is, through
 //! [`effective_spec`].

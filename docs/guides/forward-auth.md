@@ -29,6 +29,13 @@ auth_exempt_paths = ["/mcp/", "/.well-known/"]   # optional
 The daemon's `health.http` probe arrives on the ingress probe socket ([ADR 0054](../decisions/0054-health-probe-socket.md)),
 which the authorization location lets through, so `/` can stay protected while it is probed. No exemption is needed.
 
+## Unusual paths are refused
+
+The provider matches its rules against the URL as the client wrote it, while nginx routes on the normalized path. So every
+protected location answers `400` when the path contains `;`, a backslash, a dot segment (`/./`, `/../`) or an encoded dot,
+slash, backslash, semicolon or percent sign (`%2e`, `%2f`, `%5c`, `%3b`, `%25`), before any request reaches the provider. The
+query string is not checked. A path such as `/files/a%2fb` therefore does not work behind forward auth.
+
 ## Exempt paths
 
 Paths for non-browser clients with their own tokens (OAuth-protected APIs, MCP endpoints, discovery documents) cannot
@@ -58,6 +65,8 @@ clients; see [identity provider](identity-provider.md) and [generated config](ge
   provider authenticates may enter. Only groups are supported, not individual users: manage membership in the provider's
   user database.
 - Apps routed by `paths` get a rule per prefix, anchored so `/p` does not match `/pp`.
+- A rule that names groups is followed by a `deny` for the same domain and paths. The provider skips a group rule for a
+  user outside the groups and tries the next one, so without that `deny` another app on the same domain could admit them.
 - Exempt paths need no rule: nginx never asks the provider about them.
 - Węglarka owns the whole `access_control` section. The provider replaces lists as a whole, so `rules` and
   `default_policy` from your own base configuration are dropped; keep them out of it.

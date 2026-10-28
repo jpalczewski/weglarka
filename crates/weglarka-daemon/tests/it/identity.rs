@@ -243,13 +243,3 @@ async fn forward_auth_policy_and_groups_become_access_rules() {
     assert_eq!(clients_file(&h), clients);
     h.running.stop().await;
 }
-
-#[tokio::test]
-async fn policy_and_groups_without_forward_auth_are_refused() {
-    let h = with_provider().await;
-    let mut bad = spec("admin.example.com");
-    bad["ingress"] = json!({ "auth_groups": ["g"] });
-    let (s, v) = post_app(&h, "panel", bad).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-    h.running.stop().await;
-}

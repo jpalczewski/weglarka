@@ -1124,9 +1124,9 @@ fn generated<P: PodmanClient + 'static>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
                     record.last_error.as_deref().unwrap_or("no output")
                 ),
                 Some(
-                    "the previous version is still live, so access rules and OIDC clients of an \
-                     earlier state stay in force (a tightened `auth_groups` is not enforced yet); \
-                     the render is tried again when it changes",
+                    "the previous version is still live, so what it contains (OIDC clients, access \
+                     rules: a tightened `auth_groups` is not enforced until a render applies) stays \
+                     as it was; the render is tried again when it changes",
                 ),
             ));
         } else if live.as_deref() != applied.map(|a| format!("v-{a}")).as_deref() {

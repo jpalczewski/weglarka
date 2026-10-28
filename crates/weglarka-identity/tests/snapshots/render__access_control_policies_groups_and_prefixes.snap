@@ -42,6 +42,13 @@ expression: "render_access_control(ISSUER, &forward).unwrap()"
             "group:ops.team"
           ]
         ]
+      },
+      {
+        "domain": [
+          "admin.example.com",
+          "panel.example.com"
+        ],
+        "policy": "deny"
       }
     ]
   }
