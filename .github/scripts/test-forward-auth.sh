@@ -145,6 +145,14 @@ done
 for path in '/mcp/..;/admin' '/mcp/%3b/x' '/mcp/%5cx' '/mcp/%252e%252e/admin'; do
   expect "exempt $path refused" "$(status_line "$(call panel.example.eu "$path")")" '400 '
 done
+# Protected locations: the provider judges the raw URI while nginx routes on the normalized path, so dot-segments
+# and encoded dots/slashes are refused before any authz request (curl must not normalize them away).
+for path in '/a/../b' '/a/./b' '/..' '/a/%2e%2e/b' '/a%2fb' '/a;b' '//a' '/a//b'; do
+  expect "protected $path refused" "$(status_line "$(call panel.example.eu "$path" --path-as-is)")" '400 '
+done
+# Dots inside a segment and in the query are ordinary.
+expect 'protected, dotted name' "$(status_line "$(call panel.example.eu '/a.b/c..d' --path-as-is)")" '302 '
+expect 'protected, query with dots' "$(status_line "$(call panel.example.eu '/a?next=../b' --path-as-is)")" '302 '
 # The guard looks at the path only: a query string with `%25` or `;` is an ordinary OAuth/MCP request.
 expect 'exempt, query with %25' "$(status_line "$(call panel.example.eu '/mcp/x?a=100%25&b=c;d')")" '200 '
 out=$(call panel.example.eu /mcpx)

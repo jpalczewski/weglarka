@@ -153,9 +153,35 @@ fn access_control_never_opens_a_domain_by_accident() {
     let tools: Vec<_> = rules
         .iter()
         .filter(|r| r["domain"] == serde_json::json!(["tools.example.com"]))
+        .filter(|r| r["policy"] != "deny")
         .collect();
     assert!(tools[0].get("resources").is_some());
     assert!(tools[1].get("resources").is_none());
+}
+
+/// The provider skips a rule whose `subject` the user does not match and tries the next one, so every
+/// group rule must be followed at once by a `deny` over the same domain and resources.
+#[test]
+fn access_control_group_rules_are_closed_by_a_deny() {
+    let apps = forward_apps();
+    let forward: Vec<_> = apps.iter().map(Forward::forward).collect();
+    let text = render_access_control(ISSUER, &forward).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let rules = doc["access_control"]["rules"].as_array().unwrap();
+    let mut with_groups = 0;
+    for (i, rule) in rules.iter().enumerate() {
+        if rule.get("subject").is_some() {
+            with_groups += 1;
+            let next = &rules[i + 1];
+            assert_eq!(next["policy"], "deny", "{rule}");
+            assert!(next.get("subject").is_none(), "{next}");
+            assert_eq!(next["domain"], rule["domain"]);
+            assert_eq!(next.get("resources"), rule.get("resources"));
+        }
+    }
+    assert!(with_groups > 0, "the fixture has no group rule");
+    let denies = rules.iter().filter(|r| r["policy"] == "deny").count();
+    assert_eq!(denies, with_groups, "a deny without a group rule before it");
 }
 
 #[test]

@@ -133,9 +133,8 @@ fn site_environments_v13(_: &mut toml::Table) -> Result<(), String> {
 
 /// v13 → v14: identity provider integration (issue #42, ADR 0051/0052). `AppSpec::oidc`,
 /// `AppIngress::auth*` and `[oidc_clients]` in `apps.toml` are optional with defaults, so a v13 document
-/// needs no data transformation — the marker records that the file may carry them (`ingress.auth_policy` and
-/// `auth_groups` are still rejected by `identity::gate`). A no-op that must accept a hand-edited file which
-/// already has them.
+/// needs no data transformation — the marker records that the file may carry them. A no-op that must accept
+/// a hand-edited file which already has them.
 fn identity_v14(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
@@ -343,8 +342,6 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_strategy(name, spec)?;
     validate_iteration2(name, spec)?;
     validate_static(name, spec)?;
-    // A feature that is not enabled is refused as such, before its own rules.
-    crate::identity::gate::app(name, spec)?;
     crate::identity::validate_app(name, spec)
 }
 

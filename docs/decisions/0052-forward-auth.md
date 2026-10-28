@@ -26,11 +26,16 @@ The contracts live in the comments on #89 (forward auth), #90 (access control) a
   number of forward apps (#90).
 - **P0 adds only the fields, their lexical validation and the schema bump, and rejects `auth = "forward"` and
   every `auth_*` value** ("forward auth is not enabled in this release"). The nginx work landed in P5, which
-  lifts the gate for `auth` and `auth_exempt_paths`; `auth_policy` and `auth_groups` stay gated until #90 turns
-  them into provider access rules.
-
-- `auth_policy` and `auth_groups` stay gated after P5: nginx cannot enforce them, and an accepted-but-unenforced
-  restriction would be worse than a refusal. They are lifted when the provider's access rules are rendered (#90).
+  lifts the gate for `auth` and `auth_exempt_paths`.
+- `auth_policy` and `auth_groups` stayed gated after P5: nginx cannot enforce them, and an accepted-but-unenforced
+  restriction would be worse than a refusal. P6 (#90) lifted the last line and removed the gate module, because the
+  generated `access-control.yml` now enforces them. While a new render is not applied (validation failed), the previous
+  rules stay in force; a tightened restriction therefore waits for a valid render, which `doctor generated.identity`
+  reports.
+- The provider skips a rule whose `subject` does not match and tries the next, so each group rule is followed by a
+  `deny` over the same domain and resources. It also matches against the raw `X-Original-URL` while nginx routes on the
+  normalized path, so protected locations refuse paths that could be read differently (dot segments, `//`, encoded `.`, `/`,
+  `\`, `;`, `%`) with `400`.
 - The `unix:` probe exemption relies on the probe socket's `0700` directory being mounted only into nginx (the
   forwarder's socket directory is a different one), so nothing else can speak on that listener.
 

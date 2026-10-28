@@ -1,9 +1,7 @@
 //! Identity provider integration (issue #42, ADR 0051/0052): the serde types of `AppSpec.oidc`,
 //! `[oidc_clients]` and `AppIngress.auth*`, their validation, [`effective_spec`] (what the integration
-//! injects into an app) and the gate that still rejects `ingress.auth_policy` / `auth_groups` until the
-//! provider enforces them (#90). The gate is the one place a later stage edits to switch a feature on.
-//! `[identity]` itself ([`crate::config::IdentityConfig`]) stays in `config.rs` next to the other host
-//! sections.
+//! injects into an app). `[identity]` itself ([`crate::config::IdentityConfig`]) stays in `config.rs`
+//! next to the other host sections.
 //!
 //! The `oidc` and `auth*` fields are not part of `spec_hash`; what `oidc` injects is, through
 //! [`effective_spec`].
@@ -441,11 +439,16 @@ fn valid_port(port: &str) -> bool {
 
 /// `https://host[:port]` with nothing after it — the shape of `[identity].issuer`.
 pub fn check_issuer(issuer: &str) -> Result<(), &'static str> {
-    https_host(issuer)?;
+    issuer_host(issuer).map(drop)
+}
+
+/// The host (without port) of a valid `[identity].issuer`: the domain the portal answers on.
+pub fn issuer_host(issuer: &str) -> Result<&str, &'static str> {
+    let host = https_host(issuer)?;
     if issuer["https://".len()..].contains(['/', '?']) {
         return Err("must not have a path, query or trailing slash");
     }
-    Ok(())
+    Ok(host)
 }
 
 /// `host:port` of `[identity].upstream`. It lands in `nginx.conf`, so the alphabet is strict.
@@ -858,37 +861,6 @@ pub fn validate_provider(
         ));
     }
     Ok(())
-}
-
-/// The feature gate (#42 B4). A field that is accepted but not enforced leaves apps public, so until
-/// the stage that implements a feature lands, any non-default value is an error. **To switch a
-/// feature on, delete its line below** (and its test); nothing else gates these fields.
-pub mod gate {
-    use super::{AppSpec, InstanceName};
-
-    const SUFFIX: &str = "is not enabled in this release";
-
-    fn reject(used: bool, feature: &str) -> Result<(), String> {
-        if used {
-            Err(format!("{feature} {SUFFIX}"))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Per-app fields (`ingress.auth_policy`/`auth_groups`; `oidc` was lifted by P4, `auth` and `auth_exempt_paths` by P5).
-    pub fn app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
-        let ingress = &spec.ingress;
-        // nginx enforces only *who is logged in*; the policy and groups become the provider's access
-        // rules in #90. Until then accepting them would leave an app that asks for `two_factor` or a
-        // group open to every authenticated user.
-        let access_control = ingress.auth_policy.is_some() || !ingress.auth_groups.is_empty();
-        reject(
-            access_control,
-            "forward auth access control (`ingress.auth_policy`, `ingress.auth_groups`)",
-        ) // lifted by #90
-        .map_err(|e| format!("{name}: {e}"))
-    }
 }
 
 #[cfg(test)]
