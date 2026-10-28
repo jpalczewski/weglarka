@@ -32,7 +32,7 @@ which the authorization location lets through, so `/` can stay protected while i
 ## Unusual paths are refused
 
 The provider matches its rules against the URL as the client wrote it, while nginx routes on the normalized path. So every
-protected location answers `400` when the path contains `;`, a backslash, a dot segment (`/./`, `/../`) or an encoded dot,
+protected location answers `400` when the path contains `;`, a backslash, a dot segment (`/./`, `/../`), an empty segment (`//`) or an encoded dot,
 slash, backslash, semicolon or percent sign (`%2e`, `%2f`, `%5c`, `%3b`, `%25`), before any request reaches the provider. The
 query string is not checked. A path such as `/files/a%2fb` therefore does not work behind forward auth.
 

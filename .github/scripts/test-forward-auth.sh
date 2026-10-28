@@ -147,7 +147,7 @@ for path in '/mcp/..;/admin' '/mcp/%3b/x' '/mcp/%5cx' '/mcp/%252e%252e/admin'; d
 done
 # Protected locations: the provider judges the raw URI while nginx routes on the normalized path, so dot-segments
 # and encoded dots/slashes are refused before any authz request (curl must not normalize them away).
-for path in '/a/../b' '/a/./b' '/..' '/a/%2e%2e/b' '/a%2fb' '/a;b'; do
+for path in '/a/../b' '/a/./b' '/..' '/a/%2e%2e/b' '/a%2fb' '/a;b' '//a' '/a//b'; do
   expect "protected $path refused" "$(status_line "$(call panel.example.eu "$path" --path-as-is)")" '400 '
 done
 # Dots inside a segment and in the query are ordinary.

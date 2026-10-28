@@ -34,7 +34,7 @@ The contracts live in the comments on #89 (forward auth), #90 (access control) a
   reports.
 - The provider skips a rule whose `subject` does not match and tries the next, so each group rule is followed by a
   `deny` over the same domain and resources. It also matches against the raw `X-Original-URL` while nginx routes on the
-  normalized path, so protected locations refuse paths that could be read differently (dot segments, encoded `.`, `/`,
+  normalized path, so protected locations refuse paths that could be read differently (dot segments, `//`, encoded `.`, `/`,
   `\`, `;`, `%`) with `400`.
 - The `unix:` probe exemption relies on the probe socket's `0700` directory being mounted only into nginx (the
   forwarder's socket directory is a different one), so nothing else can speak on that listener.

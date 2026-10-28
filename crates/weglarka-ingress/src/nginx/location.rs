@@ -182,10 +182,10 @@ impl Backend<'_> {
             }
             if location.auth && !matches!(self, Backend::Unreleased) {
                 // The provider matches its access rules against the raw `X-Original-URL`, while nginx
-                // routes on the normalized path: `/open/../admin` would be judged as `/open/...` but
+                // routes on the normalized path: `/open/../admin` or `//admin` would be judged as written but
                 // served by the `/admin` location. Refuse the ways of writing a path differently.
                 c.block(
-                    "if ($request_uri ~* \"^[^?]*(;|%3b|\\\\\\\\|%5c|%25|%2e|%2f|/\\.\\.?(/|\\?|$))\")",
+                    "if ($request_uri ~* \"^[^?]*(;|%3b|\\\\\\\\|%5c|%25|%2e|%2f|//|/\\.\\.?(/|\\?|$))\")",
                     |c| c.line("return 400;"),
                 );
                 write_auth_request(c);
