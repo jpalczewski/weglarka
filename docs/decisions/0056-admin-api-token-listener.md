@@ -68,7 +68,7 @@ Constraints: security first, then one implementation for both listeners (traits 
    scopes to keep in sync.
 7. **Every endpoint declares its scope.** `weglarka_api::Endpoint` carries `scope: Option<Scope>` (`None` only for
    `GET /v1/health`, the readiness probe the host watchdog uses). Reads are `read`; every mutation is `admin`, as is
-   everything that exports data or runs code (`volumes export`/`import`, `run`, `forward`, `push`). The layer looks the
+   everything that exports data, returns a credential or runs code (`volumes export`/`import`, `run`, `forward`, `push`, and the OIDC client list, whose entries carry secret digests). The layer looks the
    endpoint up by method and matched route template and **fails closed**: a route that is not in `ENDPOINTS` is refused
    even to an admin. Tests assert that every declared endpoint is routed, that only health is open, and that mutations
    need `admin`.

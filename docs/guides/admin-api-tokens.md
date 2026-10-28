@@ -43,7 +43,7 @@ revoked before it expires.
 | Scope | Allowed |
 |---|---|
 | none (no token, or a token that maps to no scope) | `GET /v1/health` only; everything else is `401` |
-| `read` | every `GET` except exports: status, apps, doctor, volumes, sites, secrets *names*, notifications |
+| `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
 A token whose scopes are too small gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is

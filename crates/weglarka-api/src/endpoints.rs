@@ -275,7 +275,8 @@ pub const OIDC_ROTATE: Endpoint = Endpoint {
 pub const OIDC_CLIENTS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/oidc-clients",
-    scope: Some(Scope::Read),
+    // The answer carries each client's `secret_digest`: a credential, so `admin` only.
+    scope: Some(Scope::Admin),
 };
 /// `PUT` [`PutOidcClientRequest`](crate::PutOidcClientRequest) → 204; replaces a client of that id.
 pub const OIDC_CLIENT_PUT: Endpoint = Endpoint {
@@ -367,6 +368,15 @@ mod tests {
                     e.path
                 );
             }
+        }
+    }
+
+    /// GETs whose answer carries a credential or the data of an app: never `read`. Add an endpoint
+    /// here whenever a response type gains such a field.
+    #[test]
+    fn credential_bearing_reads_need_admin() {
+        for e in [VOLUMES_EXPORT, OIDC_CLIENTS_LIST] {
+            assert_eq!(e.scope, Some(Scope::Admin), "{}", e.path);
         }
     }
 
