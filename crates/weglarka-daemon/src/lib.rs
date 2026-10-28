@@ -270,7 +270,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
     // Crash-loop / unhealthy thresholds (`[monitor]`): the reconcile pass observes them and emits
     // events, so the notifications above deliver them and the log gets them even without a channel.
     .with_monitor(weglarka_engine::crash::Policy::from_config(&host.monitor))
-    // What an `oidc` app gets injected (#91); inert while the identity gate is closed.
+    // What an `oidc` app gets injected (#91); inert without `[identity]`.
     .with_identity(host.identity.clone());
     if let Some(notifier) = &notifier {
         // The engine emits into the durable pipeline instead of only into the log.

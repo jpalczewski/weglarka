@@ -2,7 +2,8 @@
 //! minted into the store and never returned; callers get the PBKDF2 digest the identity provider
 //! stores. Nothing here takes a `SecretStore`, so a vault-backed `SecretOps` (#200) drops in.
 //!
-//! Not wired into deploy yet (P4): no app can carry `oidc` while the identity gate is closed.
+//! Called by the engine before an `oidc` app is reconciled, deployed or run (`ensure_oidc_credential`),
+//! and by the generated config pipeline for the digests it renders.
 //! Callers must hold the engine mutex — minting is a read-then-write on the store.
 
 use weglarka_model::app::InstanceName;

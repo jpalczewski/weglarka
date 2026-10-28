@@ -839,8 +839,12 @@ impl<P: PodmanClient> Reconciler<P> {
                 continue;
             }
             // `start = false` needs no secrets: nothing is deployed until `apps start`.
-            if spec.start {
-                self.ensure_oidc_credential(name, spec).await?;
+            // A store that cannot mint must not abort the pass for every other app: the secret then
+            // reads as missing below, so this app waits and the others carry on.
+            if spec.start
+                && let Err(error) = self.ensure_oidc_credential(name, spec).await
+            {
+                tracing::warn!(instance = %name, %error, "cannot ensure the OIDC client credential");
             }
             let missing = if spec.start {
                 missing_secrets(&self.secrets, name, &self.effective(name, spec)).await?
