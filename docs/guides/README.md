@@ -58,6 +58,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [ACME certificates](acme.md) | HTTP-01 issuance and renewal (`[acme]`) |
 | [Wildcard certificates](wildcard-certificates.md) | DNS-01 (`[acme.dns]`) |
 | [Forward auth](forward-auth.md) | Login in front of an app via the identity provider (`ingress.auth`) |
+| [Identity provider](identity-provider.md) | Authelia as a managed app, OIDC clients per app, external clients, secret rotation (`oidc`, `[identity]`) |
 
 ## Operations
 

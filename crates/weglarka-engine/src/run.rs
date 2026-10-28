@@ -164,6 +164,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .remove(instance)
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         // A run must see the same injected OIDC env and secret as the serving container.
+        self.ensure_oidc_credential(instance, &spec).await?;
         let spec = self.effective(instance, &spec).into_owned();
         let digest = state::load_state(&self.paths.state)?
             .apps

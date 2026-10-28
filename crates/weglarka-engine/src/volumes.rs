@@ -502,6 +502,9 @@ impl<P: PodmanClient> Reconciler<P> {
         // An app another app depends on cannot be removed (its `depends_on` would dangle, and with
         // `--purge-volumes` its data may still be in use). Nothing is modified on refusal.
         crate::depends::ensure_not_depended_on(&apps, name)?;
+        if self.identity.as_ref().is_some_and(|i| &i.instance == name) {
+            return Err(EngineError::IdentityProviderInUse(name.clone()));
+        }
         let Some(spec) = apps.apps.get(name).cloned() else {
             return Err(EngineError::UnknownInstance(name.clone()));
         };

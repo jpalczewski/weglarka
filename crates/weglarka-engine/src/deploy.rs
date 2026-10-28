@@ -556,6 +556,7 @@ impl<P: PodmanClient> Reconciler<P> {
         local_id: Option<&str>,
     ) -> Result<Launched, EngineError> {
         let spec = &*self.effective(instance, spec);
+        self.ensure_oidc_credential(instance, spec).await?;
         let image = self.ensure_image(instance, spec, digest, local_id).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
@@ -632,6 +633,7 @@ impl<P: PodmanClient> Reconciler<P> {
         generation: u64,
     ) -> Result<Launched, EngineError> {
         let spec = &*self.effective(instance, spec);
+        self.ensure_oidc_credential(instance, spec).await?;
         let image = self.ensure_image(instance, spec, digest, None).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
@@ -892,7 +894,8 @@ impl<P: PodmanClient> Reconciler<P> {
         }
         // A deploy starts a container: every app in `depends_on` has to be running/healthy first
         // (issue #35). Not a failure — the start is retried once the dependency is up.
-        self.dependency_gate(instance, &spec).await?;
+        self.dependency_gate(instance, &self.effective(instance, &spec))
+            .await?;
         // `state.toml` is written only after the health gate, so until then the instance is
         // "in flight": `doctor` must not read the lagging state as drift.
         let _activity = self.begin_activity(instance, ActivityKind::Deploy);
@@ -1149,7 +1152,8 @@ impl<P: PodmanClient> Reconciler<P> {
         // Recreating a **missing** container is a start, so the dependencies must be up first.
         // Replacing a container that is already running (`SpecDrift`) is not gated.
         if reason == RecreateReason::Missing {
-            self.dependency_gate(instance, &spec).await?;
+            self.dependency_gate(instance, &self.effective(instance, &spec))
+                .await?;
         }
         let _activity = self.begin_activity(instance, ActivityKind::Recreate);
         self.assign_range(instance, &spec).await?; // before `st` is loaded: it writes state.toml

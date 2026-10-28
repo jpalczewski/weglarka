@@ -109,6 +109,9 @@ impl From<EngineError> for Fail {
             ),
             // Removing an app another one depends on: nothing was deleted.
             e @ EngineError::DependencyInUse { .. } => Fail(ErrorCode::Conflict, e.to_string()),
+            e @ EngineError::IdentityProviderInUse(_) => Fail(ErrorCode::Conflict, e.to_string()),
+            EngineError::IdentityInvalid(m) => Fail::invalid(m),
+            e @ EngineError::UnknownOidcClient(_) => Fail::not_found(e.to_string()),
             // `secrets remove` (issue #80): an absent secret is a 404, a spec-bound one a 409
             // unless the request forces it.
             EngineError::Secret(SecretError::NotFound(m)) => Fail::not_found(m),
@@ -215,6 +218,7 @@ pub fn router<P: PodmanClient + 'static>(daemon: Arc<Daemon<P>>) -> Router {
         .merge(shared_volumes::routes())
         .merge(shared_networks::routes())
         .merge(sites::routes())
+        .merge(crate::identity::routes())
         .merge(images::routes())
         .merge(push::routes()) // a streamed archive, like the volume tars
         .with_state(daemon)

@@ -15,6 +15,7 @@ pub mod forwarder;
 pub mod generated;
 pub mod github;
 pub mod health_probe;
+pub mod identity;
 pub mod images;
 pub mod ingress;
 pub mod platform;

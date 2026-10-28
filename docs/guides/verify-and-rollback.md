@@ -57,7 +57,8 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `apps.toml` | the `[sites.<site>]` sections (declare the environments as plain `kind = "static"` apps if the sites must keep running) | [site environments](site-environments.md) |
 | `apps.toml`, apps | `ingress.auth`, `ingress.auth_exempt_paths` (enforced by nginx since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
-| `apps.toml`, apps | `oidc`, `ingress.auth_policy`, `ingress.auth_groups`; the `[oidc_clients.<id>]` sections (every non-default value is rejected in this release, so a file that has them was written by a later one) | [ADR 0051](../decisions/0051-identity-provider-integration.md) (not enabled yet) |
+| `apps.toml`, apps | `oidc`; the `[oidc_clients.<id>]` sections | [identity provider](identity-provider.md) |
+| `apps.toml`, apps | `ingress.auth_policy`, `ingress.auth_groups` (refused in this release, so a file that has them was written by a later one) | [ADR 0051](../decisions/0051-identity-provider-integration.md) (not enabled yet) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |
@@ -66,7 +67,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[runtime] host_mounts`, `[runtime] group_add` | [host mounts](host-mounts.md) |
 | `weglarka.toml` | `config_root` | [host configs](host-configs.md) |
 | `weglarka.toml` | `[webhook.forgejo]` | [webhooks](webhooks.md) |
-| `weglarka.toml` | `[identity]` | [ADR 0051](../decisions/0051-identity-provider-integration.md) (not enabled yet) |
+| `weglarka.toml` | `[identity]` | [identity provider](identity-provider.md) |
 | `weglarka.toml` | `[acme]` (or set `enabled = false` before rolling back to a release that knows it) | [ACME certificates](acme.md) |
 | `weglarka.toml` | `[acme.dns]` | [wildcard certificates](wildcard-certificates.md) |
 | `weglarka.toml` | `[ingress.cdn]` | [edge behind a CDN](edge-cdn.md) |

@@ -12,6 +12,7 @@ mod forgejo;
 mod forward;
 mod generated;
 mod host_ports;
+mod identity;
 mod images;
 mod ingress;
 mod notify;

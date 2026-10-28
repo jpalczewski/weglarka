@@ -159,8 +159,9 @@ pub fn loads_generated_last(command: &[String]) -> bool {
 /// (#91) — `<client_id_env>=<instance>`, `<issuer_env>=<issuer>` and a binding of
 /// `<instance>.oidc-client-secret` at the declared target. The one place that overlay is computed;
 /// the hash, secret materialisation, container creation and `weglarka run` all read the result, so
-/// none of them can miss an injected value. Borrowed (identical hash) for an app without `oidc`,
-/// or when the host has no `[identity]`. The overlay is never written back into `apps.toml`.
+/// none of them can miss an injected value. It also adds the implicit `depends_on` on the provider.
+/// Borrowed (identical hash) for an app without `oidc`,
+/// or when the host has no `[identity]` (and, for an app without `oidc`, no forward auth). The overlay is never written back into `apps.toml`.
 pub fn effective_spec<'a>(
     instance: &InstanceName,
     spec: &'a AppSpec,
@@ -169,10 +170,26 @@ pub fn effective_spec<'a>(
     use crate::app::SecretBinding;
     use std::borrow::Cow;
 
-    let (Some(oidc), Some(identity)) = (&spec.oidc, identity) else {
+    let Some(identity) = identity else {
         return Cow::Borrowed(spec);
     };
+    // An app that relies on the provider starts after it (`depends_on` is a start order only and
+    // outside the hash, so the implicit entry recreates nothing). The provider itself never waits.
+    let needs_provider = (spec.oidc.is_some() || spec.ingress.auth == IngressAuth::Forward)
+        && &identity.instance != instance
+        && !spec.depends_on.contains(&identity.instance);
+    let Some(oidc) = &spec.oidc else {
+        if !needs_provider {
+            return Cow::Borrowed(spec);
+        }
+        let mut out = spec.clone();
+        out.depends_on.push(identity.instance.clone());
+        return Cow::Owned(out);
+    };
     let mut out = spec.clone();
+    if needs_provider {
+        out.depends_on.push(identity.instance.clone());
+    }
     out.env.insert(
         oidc.client_id_env
             .clone()

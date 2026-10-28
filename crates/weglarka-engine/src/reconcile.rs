@@ -139,6 +139,18 @@ pub enum EngineError {
         instance: InstanceName,
         pending: Vec<(InstanceName, String)>,
     },
+    /// A request about the identity integration that cannot be honoured (no `[identity]`, an app
+    /// without `oidc`, a client the file rules reject).
+    #[error("{0}")]
+    IdentityInvalid(String),
+    #[error("unknown OIDC client: {0}")]
+    UnknownOidcClient(String),
+    /// `apps remove` of the instance `[identity]` names: every OIDC and forward-auth app would lose
+    /// its provider (#88).
+    #[error(
+        "app {0} is the identity provider named in weglarka.toml `[identity]`; remove that section first"
+    )]
+    IdentityProviderInUse(InstanceName),
     /// `apps remove` of an app that another app lists in `depends_on` (issue #35).
     #[error(
         "app {name} is a dependency of: {}; remove those depends_on entries first",
@@ -648,6 +660,25 @@ impl<P: PodmanClient> Reconciler<P> {
         weglarka_model::identity::effective_spec(instance, spec, self.identity.as_ref())
     }
 
+    /// Mints the OIDC client secret of an `oidc` app when it is absent (#213), so the secret exists
+    /// before anything reads it: the waiting check, the hash and the container creation. Idempotent;
+    /// the caller holds the engine lock because minting is a read-then-write on the store. A public
+    /// client has no secret, and without `[identity]` the injection is off.
+    pub(crate) async fn ensure_oidc_credential(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+    ) -> Result<(), EngineError> {
+        if self.identity.is_none() || !spec.oidc.as_ref().is_some_and(|o| !o.public) {
+            return Ok(());
+        }
+        let instance = instance.clone();
+        crate::secrets::blocking(&self.secrets, move |store| {
+            crate::oidc_credentials::ensure(store, &instance).map(drop)
+        })
+        .await
+    }
+
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
         self
@@ -808,6 +839,9 @@ impl<P: PodmanClient> Reconciler<P> {
                 continue;
             }
             // `start = false` needs no secrets: nothing is deployed until `apps start`.
+            if spec.start {
+                self.ensure_oidc_credential(name, spec).await?;
+            }
             let missing = if spec.start {
                 missing_secrets(&self.secrets, name, &self.effective(name, spec)).await?
             } else {
@@ -863,7 +897,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 blocked,
                 uid_range,
                 start: spec.start,
-                depends_on: spec.depends_on.clone(),
+                depends_on: self.effective(name, spec).depends_on.clone(),
                 is_static: false,
             });
         }
@@ -979,7 +1013,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     .apps
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
-                self.dependency_gate(&instance, spec).await?;
+                self.dependency_gate(&instance, &self.effective(&instance, spec))
+                    .await?;
                 self.podman
                     .container_start(&labels::container_name(&instance))
                     .await?;
