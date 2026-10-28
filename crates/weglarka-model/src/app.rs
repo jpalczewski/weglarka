@@ -808,7 +808,7 @@ pub struct AppIngress {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_paths: Vec<String>,
     /// Forward authentication in front of the app (#89, ADR 0052): `none` (default) or `forward`.
-    /// Changes nginx output only; outside the spec hash. The policy and groups are still rejected in this release (`identity::gate`, until #90).
+    /// Changes nginx output only; outside the spec hash.
     #[serde(default, skip_serializing_if = "IngressAuth::is_none")]
     pub auth: IngressAuth,
     /// Authorization policy applied to a forward-auth app; unset means `two_factor`. Needs `auth = "forward"`.

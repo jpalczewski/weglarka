@@ -475,9 +475,9 @@ fn upstream_is_host_and_port() {
     }
 }
 
-// --- the gate: one test per field ---------------------------------------------------------------
+// --- app fields -----------------------------------------------------------------------------------
 
-fn gated(spec: &AppSpec) -> String {
+fn invalid(spec: &AppSpec) -> String {
     state::validate_app(&name("a"), spec).unwrap_err()
 }
 
@@ -491,24 +491,14 @@ fn oidc_is_accepted_and_still_validated_lexically() {
 }
 
 #[test]
-fn forward_auth_and_exempt_paths_are_not_gated() {
+fn forward_auth_with_exempt_paths_policy_and_groups_is_accepted() {
     for extra in [
         "auth = \"forward\"",
         "auth = \"forward\"\nauth_exempt_paths = [\"/p/\"]",
+        "auth = \"forward\"\nauth_policy = \"one_factor\"",
+        "auth = \"forward\"\nauth_groups = [\"admins\", \"ops\"]",
     ] {
-        let s = spec(&format!("[ingress]\n{extra}"));
-        state::validate_app(&name("a"), &s).unwrap();
-        gate::app(&name("a"), &s).unwrap();
-    }
-}
-
-#[test]
-fn the_gate_still_rejects_policy_and_groups_until_the_provider_enforces_them() {
-    for extra in ["auth_policy = \"one_factor\"", "auth_groups = [\"g\"]"] {
-        let s = spec(&format!("[ingress]\nauth = \"forward\"\n{extra}"));
-        let err = gated(&s);
-        assert!(err.contains("access control"), "{err}");
-        assert!(err.ends_with("is not enabled in this release"), "{err}");
+        state::validate_app(&name("a"), &spec(&format!("[ingress]\n{extra}"))).unwrap();
     }
 }
 
@@ -565,8 +555,8 @@ fn static_sites_do_not_take_oidc() {
         "image = \"a.tar\"\nkind = \"static\"\ndomains = [\"app.example.com\"]\n{OIDC}"
     ))
     .unwrap();
-    // The static-site rule (state.rs) and the gate both refuse it; the gate speaks first.
-    assert!(gated(&s).contains("oidc"), "{}", gated(&s));
+    // The static-site rule (state.rs) refuses it.
+    assert!(invalid(&s).contains("oidc"), "{}", invalid(&s));
 }
 
 const BAD_HOSTS: &[&str] = &[
@@ -807,4 +797,23 @@ fn the_generated_directory_must_come_last() {
     ])));
     assert!(!loads_generated_last(&argv(&["--config=/base.yml"])));
     assert!(!loads_generated_last(&argv(&[])));
+}
+
+#[test]
+fn issuer_host_is_the_host_without_port() {
+    assert_eq!(
+        issuer_host("https://auth.example.com"),
+        Ok("auth.example.com")
+    );
+    assert_eq!(
+        issuer_host("https://auth.example.com:9091"),
+        Ok("auth.example.com")
+    );
+    for bad in [
+        "https://auth.example.com/",
+        "http://auth.example.com",
+        "https://a@b.example.com",
+    ] {
+        assert!(issuer_host(bad).is_err(), "{bad}");
+    }
 }

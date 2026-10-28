@@ -5,7 +5,7 @@
 use serde::Serialize;
 use weglarka_model::app::{InstanceName, check_path_prefix};
 use weglarka_model::identity::{
-    AuthorizationPolicy, check_issuer, valid_auth_group, valid_dns_name,
+    AuthorizationPolicy, issuer_host, valid_auth_group, valid_dns_name,
 };
 
 use crate::{RenderError, to_text};
@@ -49,12 +49,9 @@ struct Rule<'a> {
 /// (Authelia takes the first match, so a prefix app wins over an app on `/` of the same domain), each
 /// group sorted by instance.
 pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<String, RenderError> {
-    check_issuer(issuer).map_err(|e| RenderError::Issuer(issuer.to_owned(), e))?;
     let portal = vec![
-        issuer["https://".len()..]
-            .split(':')
-            .next()
-            .unwrap()
+        issuer_host(issuer)
+            .map_err(|e| RenderError::Issuer(issuer.to_owned(), e))?
             .to_owned(),
     ];
 

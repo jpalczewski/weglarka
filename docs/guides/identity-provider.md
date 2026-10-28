@@ -141,10 +141,10 @@ A client id must not equal any app name.
 
 Removing the provider while `[identity]` names it returns `409`.
 
-## Not yet
+## Access rules
 
-`ingress.auth_policy` and `ingress.auth_groups` stay refused until the access-rule stage lands; forward auth lets every
-logged-in user in meanwhile, and the guide for it says so.
+The pipeline also writes `access-control.yml` from `ingress.auth_policy` and `ingress.auth_groups` of the forward apps
+(always `default_policy: deny`); [forward auth](forward-auth.md) describes the rules and their pitfalls.
 
 ## Rollback
 

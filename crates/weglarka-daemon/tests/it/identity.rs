@@ -188,3 +188,68 @@ async fn oidc_needs_the_identity_section() {
     assert!(v["message"].as_str().unwrap().contains("[identity]"), "{v}");
     h.running.stop().await;
 }
+
+fn acl_file(h: &Harness) -> String {
+    read(
+        &h.root
+            .join("state/generated/authelia/current/access-control.yml"),
+    )
+}
+
+fn forward_app(groups: &[&str]) -> Value {
+    let mut s = spec("admin.example.com");
+    s["ingress"] = json!({ "auth": "forward", "auth_policy": "one_factor", "auth_groups": groups });
+    s
+}
+
+#[tokio::test]
+async fn forward_auth_policy_and_groups_become_access_rules() {
+    let h = with_provider().await;
+    // Before any forward app the file is the constant portal rule under a default deny.
+    eventually("the access rules file", || async {
+        acl_file(&h).contains("auth.example.com")
+    })
+    .await;
+    let empty = acl_file(&h);
+    assert!(empty.contains("\"default_policy\": \"deny\""), "{empty}");
+    assert!(!empty.contains("admin.example.com"), "{empty}");
+
+    add(&h, "panel", forward_app(&["weglarka-admins"])).await;
+    deployed(&h, "panel").await;
+    eventually("the app's rule", || async {
+        acl_file(&h).contains("admin.example.com")
+    })
+    .await;
+    let file = acl_file(&h);
+    assert!(file.contains("group:weglarka-admins"), "{file}");
+    assert!(file.contains("\"one_factor\""), "{file}");
+
+    // Tightening the groups re-renders the rules and leaves the OIDC clients file alone.
+    let clients = clients_file(&h);
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/panel",
+        Some(json!({ "spec": forward_app(&["ops"]) })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    eventually("the tightened rule", || async {
+        acl_file(&h).contains("group:ops")
+    })
+    .await;
+    let file = acl_file(&h);
+    assert!(!file.contains("weglarka-admins"), "{file}");
+    assert_eq!(clients_file(&h), clients);
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn policy_and_groups_without_forward_auth_are_refused() {
+    let h = with_provider().await;
+    let mut bad = spec("admin.example.com");
+    bad["ingress"] = json!({ "auth_groups": ["g"] });
+    let (s, v) = post_app(&h, "panel", bad).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    h.running.stop().await;
+}
