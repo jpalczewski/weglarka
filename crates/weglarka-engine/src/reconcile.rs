@@ -565,6 +565,8 @@ pub struct Reconciler<P: PodmanClient> {
     pub(crate) lock: tokio::sync::Mutex<()>,
     /// Generators of config files for consumer apps (#212); `None` = the feature is off.
     pub(crate) generated: Option<crate::generated::GeneratedWiring>,
+    /// `[identity]` of the host: what an `oidc` app gets injected (see [`Self::effective`]).
+    pub(crate) identity: Option<weglarka_model::config::IdentityConfig>,
     /// Free slots for one-off containers ([`crate::run::MAX_CONCURRENT_RUNS`]).
     pub(crate) runs: Arc<tokio::sync::Semaphore>,
     /// Free slots for forward relays ([`crate::forward::MAX_CONCURRENT_FORWARDS`]).
@@ -608,6 +610,7 @@ impl<P: PodmanClient> Reconciler<P> {
             http_prober: None,
             lock: tokio::sync::Mutex::new(()),
             generated: None,
+            identity: None,
             runs: Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
             forwards: Arc::new(tokio::sync::Semaphore::new(
                 crate::forward::MAX_CONCURRENT_FORWARDS,
@@ -624,6 +627,25 @@ impl<P: PodmanClient> Reconciler<P> {
     pub fn with_generated(mut self, wiring: crate::generated::GeneratedWiring) -> Self {
         self.generated = Some(wiring);
         self
+    }
+
+    /// The host's `[identity]` section; without it no app gets OIDC credentials injected.
+    pub fn with_identity(
+        mut self,
+        identity: Option<weglarka_model::config::IdentityConfig>,
+    ) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// `spec` as the container sees it: the injected OIDC env and secret included (#91). Every
+    /// reader of `spec.env`/`spec.secrets` at launch time goes through this one overlay.
+    pub(crate) fn effective<'a>(
+        &self,
+        instance: &InstanceName,
+        spec: &'a AppSpec,
+    ) -> std::borrow::Cow<'a, AppSpec> {
+        weglarka_model::identity::effective_spec(instance, spec, self.identity.as_ref())
     }
 
     pub fn with_events(mut self, events: Arc<dyn EventSink>) -> Self {
@@ -787,7 +809,7 @@ impl<P: PodmanClient> Reconciler<P> {
             }
             // `start = false` needs no secrets: nothing is deployed until `apps start`.
             let missing = if spec.start {
-                missing_secrets(&self.secrets, name, spec).await?
+                missing_secrets(&self.secrets, name, &self.effective(name, spec)).await?
             } else {
                 Vec::new()
             };

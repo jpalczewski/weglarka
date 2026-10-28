@@ -343,6 +343,7 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
         digest: &Digest,
     ) -> Result<SpecHash, EngineError> {
+        let spec = &*self.effective(instance, spec);
         let hash = match self.options.secret_change {
             SecretChangePolicy::NextDeploy => spec_hash(spec, digest),
             SecretChangePolicy::Immediate => {
@@ -554,6 +555,7 @@ impl<P: PodmanClient> Reconciler<P> {
         generation: u64,
         local_id: Option<&str>,
     ) -> Result<Launched, EngineError> {
+        let spec = &*self.effective(instance, spec);
         let image = self.ensure_image(instance, spec, digest, local_id).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
@@ -629,6 +631,7 @@ impl<P: PodmanClient> Reconciler<P> {
         digest: &Digest,
         generation: u64,
     ) -> Result<Launched, EngineError> {
+        let spec = &*self.effective(instance, spec);
         let image = self.ensure_image(instance, spec, digest, None).await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;

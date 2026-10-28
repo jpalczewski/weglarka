@@ -682,3 +682,45 @@ fn static_sites_do_not_take_forward_auth() {
     let s = spec("kind = \"static\"\n[ingress]\nauth = \"forward\"");
     assert!(lexical_err(&s).contains("static"), "{}", lexical_err(&s));
 }
+
+// --- effective_spec -----------------------------------------------------------------------------
+
+fn identity_cfg() -> crate::config::IdentityConfig {
+    toml::from_str(
+        "provider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"",
+    )
+    .unwrap()
+}
+
+#[test]
+fn effective_spec_is_borrowed_without_oidc_or_identity() {
+    let cfg = identity_cfg();
+    let plain = spec("");
+    assert!(matches!(
+        effective_spec(&name("a"), &plain, Some(&cfg)),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    let with_oidc = oidc("");
+    assert!(matches!(
+        effective_spec(&name("a"), &with_oidc, None),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[test]
+fn effective_spec_injects_id_issuer_and_the_secret() {
+    let cfg = identity_cfg();
+    let s = oidc("");
+    let eff = effective_spec(&name("blog"), &s, Some(&cfg));
+    assert_eq!(eff.env["OIDC_CLIENT_ID"], "blog");
+    assert_eq!(eff.env["OIDC_ISSUER"], "https://auth.example.com");
+    assert!(eff.secrets.iter().any(|b| b.secret == "oidc-client-secret"
+        && b.target
+            == SecretTarget::Env {
+                var: "OIDC_CLIENT_SECRET".into()
+            }));
+    // The stored spec is untouched, and the hash differs from the plain one.
+    assert!(s.env.is_empty() && s.secrets.is_empty());
+    let digest = crate::app::Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+    assert_ne!(spec_hash(&s, &digest), spec_hash(&eff, &digest));
+}

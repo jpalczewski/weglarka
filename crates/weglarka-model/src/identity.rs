@@ -112,6 +112,47 @@ pub const DEFAULT_CLIENT_ID_ENV: &str = "OIDC_CLIENT_ID";
 /// Default `issuer_env` of [`OidcClientSpec`].
 pub const DEFAULT_ISSUER_ENV: &str = "OIDC_ISSUER";
 
+/// The spec as the container sees it: the app's own spec plus what the identity integration injects
+/// (#91) — `<client_id_env>=<instance>`, `<issuer_env>=<issuer>` and a binding of
+/// `<instance>.oidc-client-secret` at the declared target. The one place that overlay is computed;
+/// the hash, secret materialisation, container creation and `weglarka run` all read the result, so
+/// none of them can miss an injected value. Borrowed (identical hash) for an app without `oidc`,
+/// or when the host has no `[identity]`. The overlay is never written back into `apps.toml`.
+pub fn effective_spec<'a>(
+    instance: &InstanceName,
+    spec: &'a AppSpec,
+    identity: Option<&crate::config::IdentityConfig>,
+) -> std::borrow::Cow<'a, AppSpec> {
+    use crate::app::SecretBinding;
+    use std::borrow::Cow;
+
+    let (Some(oidc), Some(identity)) = (&spec.oidc, identity) else {
+        return Cow::Borrowed(spec);
+    };
+    let mut out = spec.clone();
+    out.env.insert(
+        oidc.client_id_env
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLIENT_ID_ENV.to_owned()),
+        instance.to_string(),
+    );
+    out.env.insert(
+        oidc.issuer_env
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ISSUER_ENV.to_owned()),
+        identity.issuer.clone(),
+    );
+    if let Some(target) = &oidc.client_secret {
+        out.secrets
+            .retain(|b| b.secret != crate::secret_store::OIDC_CLIENT_SECRET);
+        out.secrets.push(SecretBinding {
+            secret: crate::secret_store::OIDC_CLIENT_SECRET.to_owned(),
+            target: target.clone(),
+        });
+    }
+    Cow::Owned(out)
+}
+
 fn scopes_or_default(scopes: &Option<Vec<String>>) -> Vec<&str> {
     match scopes {
         Some(list) => list.iter().map(String::as_str).collect(),
