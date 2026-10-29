@@ -1,6 +1,7 @@
 name: Release
 
-# main → ghcr.io/jpalczewski/weglarka:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
+# main → ghcr.io/jpalczewski/weglarka{,-panel}:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
+# One tag publishes two images: the daemon's and the panel's (docs/decisions/0057), both at the daemon's version.
 # Decisions: docs/decisions/0006-pakowanie-obrazy-i-release.md
 
 on:
@@ -13,19 +14,33 @@ on:
       - "*.md"
       - "**/*.md"
       - ".gitignore"
+    # `v[0-9]*` is the daemon's tag only (release-plz.toml). The glob is anchored at the start of the tag name, so
+    # the per-crate tags (`weglarka-panel-vX.Y.Z`, `weglarka-cli-vX.Y.Z`, ...) never start this workflow.
     tags: ["v[0-9]*"]
 
 env:
-  IMAGE: ghcr.io/jpalczewski/weglarka
   # Same as ci.yml: RUSTFLAGS is part of rust-cache's key, so the linux leg below only shares the
   # `musl-release` entry with the CI `musl` job when the value is identical.
   RUSTFLAGS: -D warnings
 
 jobs:
   # The image is assembled from the binaries built once in `binaries` below (also the release assets):
-  # what is published is exactly what was built there, and the image job compiles nothing.
+  # what is published is exactly what was built there, and the image job compiles nothing. One leg per image;
+  # both are signed and attested the same way and carry the same version tag.
   image:
     needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: weglarka
+            image: ghcr.io/jpalczewski/weglarka
+            file: Containerfile
+          - name: weglarka-panel
+            image: ghcr.io/jpalczewski/weglarka-panel
+            file: Containerfile.panel
+    env:
+      IMAGE: ${{ matrix.image }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -61,7 +76,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: Containerfile
+          file: ${{ matrix.file }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -107,7 +122,7 @@ jobs:
   binaries:
     strategy:
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon","files":"weglarka weglarka-daemon"},{"os":"macos-15","target":"aarch64-apple-darwin","packages":"-p weglarka-cli","files":"weglarka"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon","files":"weglarka weglarka-daemon"}]') }}
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon -p weglarka-panel","files":"weglarka weglarka-daemon weglarka-panel"},{"os":"macos-15","target":"aarch64-apple-darwin","packages":"-p weglarka-cli","files":"weglarka"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon -p weglarka-panel","files":"weglarka weglarka-daemon weglarka-panel"}]') }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -134,6 +149,7 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/weglarka
             target/${{ matrix.target }}/release/weglarka-daemon
+            target/${{ matrix.target }}/release/weglarka-panel
           if-no-files-found: error
           retention-days: 1
       - if: startsWith(github.ref, 'refs/tags/v')

@@ -1,0 +1,53 @@
+# Węglarka admin panel image: one static binary (musl) on `scratch` — no shell, no libc, no system CA store.
+# The panel's outbound HTTPS (the OIDC provider) trusts the roots bundled by `webpki-roots`, not `/etc/ssl`.
+# Decisions: docs/decisions/0057 (the panel), docs/decisions/0006 (packaging), docs/decisions/0008 (CI builds).
+#
+#   podman build -t weglarka-panel -f Containerfile.panel .                                  # from source (local)
+#   podman build -t weglarka-panel -f Containerfile.panel --build-arg BIN_SOURCE=prebuilt .  # CI/release: bin/weglarka-panel
+#
+# `prebuilt` copies the already-built static binary from ./bin instead of compiling it, so the image CI and
+# release publish contains exactly the binary that was tested (same pattern as `Containerfile`).
+#
+# Listens on 8080 (`PANEL_LISTEN`, default 0.0.0.0:8080); `GET /healthz` is the unauthenticated health endpoint.
+# The configuration is environment only (`OIDC_*`, `PANEL_*`, `WEGLARKA_PANEL_SOCKET`; the daemon injects the
+# OIDC ones for an app with `oidc`). The image has no STATE_SCHEMA label: it touches no state file.
+#
+# Unlike the daemon image this one sets a numeric non-root `USER`. The daemon needs the container's root (the
+# runtime user in rootless Podman) to open the Podman socket and the state directory; the panel only dials
+# the admin API token socket, which is `0666` on purpose because its clients' uids map to other host uids
+# (docs/decisions/0056), and it reads no file but an optional mounted client-secret file (give it a mode and
+# owner this uid can read, or inject the secret as the environment variable). It writes nothing, so it runs
+# with a read-only root filesystem, all capabilities dropped and no-new-privileges (docs/decisions/0014).
+
+ARG RUST_IMAGE=docker.io/library/rust:1.99.1-alpine
+ARG BIN_SOURCE=build
+
+FROM ${RUST_IMAGE} AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# The base image is Alpine (musl), so a build without --target is static for the build architecture.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p weglarka-panel \
+ && install -D -t /out target/release/weglarka-panel
+
+FROM scratch AS prebuilt
+COPY --chmod=0755 bin/weglarka-panel /out/
+
+FROM ${BIN_SOURCE} AS bin
+
+FROM scratch
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="weglarka-panel" \
+      org.opencontainers.image.description="Węglarka admin panel" \
+      org.opencontainers.image.source="https://github.com/jpalczewski/weglarka" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+COPY --from=bin /out/weglarka-panel /usr/local/bin/
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/weglarka-panel"]
