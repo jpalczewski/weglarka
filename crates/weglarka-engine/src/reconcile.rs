@@ -1094,6 +1094,7 @@ mod tests {
             exit_code: None,
             health: None,
             restarts: 0,
+            started_at: None,
             networks: vec![],
             addresses: vec![],
             published_ports: vec![],

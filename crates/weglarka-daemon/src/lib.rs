@@ -8,6 +8,7 @@ pub mod acme;
 pub mod admin;
 pub mod admin_token;
 pub mod app;
+mod app_view;
 pub mod cdn;
 pub mod doctor;
 pub mod forgejo;

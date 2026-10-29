@@ -298,6 +298,9 @@ pub struct ContainerInfo {
     /// How many times Podman restarted the container (libpod `RestartCount`); `0` until the first restart.
     /// Crash-loop detection compares it across reconcile passes (`crate::crash`).
     pub restarts: u32,
+    /// When the container last started, RFC 3339 as libpod reports it (`State.StartedAt`); `None` for a
+    /// container that never started. Kept as text: nothing here does time arithmetic with it.
+    pub started_at: Option<String>,
     /// Names of the networks the container is currently attached to (sorted).
     pub networks: Vec<String>,
     /// The container's own addresses on those networks (sorted, deduplicated); empty when it is not

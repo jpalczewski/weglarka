@@ -1306,6 +1306,9 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             runtime: RuntimeState::Running,
             configs: None,
             host_mounts: None,
+            restarts: None,
+            health: None,
+            started_at: None,
         })
         .unwrap()
     }

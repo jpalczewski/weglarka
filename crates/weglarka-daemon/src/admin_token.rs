@@ -215,7 +215,7 @@ fn deny(code: ErrorCode, message: &str) -> Response {
 
 async fn authenticate(
     State(verifier): State<Arc<dyn TokenVerifier>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let method = request.method().as_str().to_owned();
@@ -276,7 +276,10 @@ async fn authenticate(
     }
 
     let audited = required == Some(Scope::Admin);
-    let sub = principal.sub;
+    let sub = principal.sub.clone();
+    // Handlers that answer with app data decide what this caller may see (`app_view::Access`); the
+    // unix socket never inserts one, so it stays full trust.
+    request.extensions_mut().insert(principal);
     let response = next.run(request).await;
     if audited {
         // The audit trail of everything done with `admin`: every mutation, and the reads that return

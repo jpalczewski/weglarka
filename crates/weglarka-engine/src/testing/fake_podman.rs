@@ -93,6 +93,9 @@ pub struct RunScript {
     pub hang: bool,
 }
 
+/// `ContainerInfo::started_at` of every container the fake has started.
+pub const FAKE_STARTED_AT: &str = "2026-01-01T00:00:00Z";
+
 #[derive(Default)]
 struct State {
     /// Scripts waiting for a container to start.
@@ -238,6 +241,7 @@ impl FakePodman {
                 addresses: Vec::new(),
                 published_ports: Vec::new(),
                 restarts: 0,
+                started_at: None,
             },
         );
     }
@@ -546,6 +550,7 @@ impl PodmanClient for FakePodman {
                 exit_code: None,
                 health,
                 restarts: 0,
+                started_at: None,
                 networks: Vec::new(),
                 addresses: Vec::new(),
                 published_ports: spec.publish.clone(),
@@ -561,6 +566,8 @@ impl PodmanClient for FakePodman {
         let base = 40_000 + (s.next_id as u16 % 20_000);
         let container = s.container_mut(name)?;
         container.state = ContainerState::Running;
+        // The fake has no clock: a fixed instant is enough to tell "started" from "never started".
+        container.started_at = Some(FAKE_STARTED_AT.to_owned());
         for (offset, p) in container.published_ports.iter_mut().enumerate() {
             if p.host_port == 0 {
                 p.host_port = base + offset as u16;
