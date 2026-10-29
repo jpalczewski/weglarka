@@ -223,8 +223,9 @@ struct Claims {
     // Only id-token callers read these; a badly typed value must not reject an access token.
     #[serde(default, deserialize_with = "string_or_none")]
     nonce: Option<String>,
-    #[serde(default, deserialize_with = "string_or_none")]
-    azp: Option<String>,
+    // Kept untyped so an id-token check can tell a wrongly typed `azp` from an absent one.
+    #[serde(default)]
+    azp: Option<serde_json::Value>,
 }
 
 fn string_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -407,8 +408,8 @@ pub fn verify(
             return Err(AuthError::NonceMismatch);
         }
         let several = matches!(&claims.aud, Some(Audience::Many(list)) if list.len() > 1);
-        match claims.azp.as_deref() {
-            Some(azp) if azp == client_id => {}
+        match &claims.azp {
+            Some(serde_json::Value::String(azp)) if azp == client_id => {}
             None if !several => {}
             _ => return Err(AuthError::WrongAuthorizedParty),
         }
@@ -422,7 +423,7 @@ pub fn verify(
         sub,
         exp,
         nonce: claims.nonce,
-        azp: claims.azp,
+        azp: claims.azp.and_then(|v| v.as_str().map(str::to_owned)),
         groups: claims.groups,
     })
 }
@@ -839,6 +840,9 @@ mod tests {
         c.as_object_mut().unwrap().remove("azp");
         assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
         c["azp"] = json!(["panel"]);
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        // A wrongly typed `azp` is not "absent" for a single audience either.
+        c["aud"] = json!(AUDIENCE);
         assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
     }
 
