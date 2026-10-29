@@ -435,6 +435,11 @@ async fn id_tokens_that_do_not_verify_are_refused() {
             }),
         ),
         ("no id token", Box::new(|b| b.omit_id_token = true)),
+        (
+            "wrong issuer",
+            Box::new(|b| b.id_iss = Some("https://other.example.com".into())),
+        ),
+        ("expired", Box::new(|b| b.id_expired = true)),
     ];
     for (name, tweak) in cases {
         let s = setup().await;
@@ -605,6 +610,18 @@ async fn state_changing_requests_need_the_csrf_token() {
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{what}");
         assert!(!*ended.borrow(), "{what}");
     }
+    // A JSON body is not a form, so without the header there is no token to find.
+    let json = b
+        .send_with(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/logout")
+                .header(header::CONTENT_TYPE, "application/json"),
+            Body::from(format!(r#"{{"_csrf":"{csrf}"}}"#)),
+        )
+        .await;
+    assert_eq!(json.status, StatusCode::FORBIDDEN, "json body, no header");
+    assert!(!*ended.borrow());
     // Logging out by GET is not a thing.
     assert_eq!(
         b.get("/auth/logout").await.status,
@@ -723,13 +740,9 @@ async fn a_provider_outage_does_not_log_out_a_token_that_still_works() {
     assert!(s.state.sessions.is_empty());
 }
 
-#[tokio::test]
-async fn a_daemon_401_ends_nothing_but_asks_to_sign_in_again() {
-    let s = setup().await;
-    let mut b = Browser::new(&s.app);
-    b.login().await;
-    // The fake daemon now refuses the token (revoked group, rotated audience...).
-    let daemon = mock(|_, _| (401, r#"{"code":"unauthorized","message":"no"}"#.into())).await;
+/// A panel whose daemon answers every request with `status` and `body`.
+async fn setup_refusing_daemon(s: &Setup, status: u16, body: &'static str) -> (AppState, Router) {
+    let daemon = mock(move |_, _| (status, body.into())).await;
     let config = PanelConfig::from_lookup(|var| match var {
         ENV_CLIENT_ID => Some("panel".into()),
         ENV_CLIENT_SECRET => Some(CLIENT_SECRET.into()),
@@ -741,11 +754,220 @@ async fn a_daemon_401_ends_nothing_but_asks_to_sign_in_again() {
     })
     .unwrap();
     let state = AppState::with_clock(config, s.clock.clone()).unwrap();
-    let mut b = Browser::new(&router(state));
-    b.login().await;
-    let r = b.get("/").await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-    assert!(r.body.contains("Sign in"));
+    // The mock's socket lives as long as its handle; leak it for the test's duration.
+    std::mem::forget(daemon);
+    let app = router(state.clone());
+    (state, app)
+}
+
+#[tokio::test]
+async fn a_daemon_that_gives_the_user_no_access_ends_the_session() {
+    for (status, body) in [
+        (401, r#"{"code":"unauthorized","message":"no"}"#),
+        (403, r#"{"code":"forbidden","message":"no scope"}"#),
+    ] {
+        let s = setup().await;
+        let (state, app) = setup_refusing_daemon(&s, status, body).await;
+        let mut b = Browser::new(&app);
+        b.login().await;
+        assert_eq!(state.sessions.len(), 1);
+        let r = b.get("/").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{status}");
+        assert!(r.body.contains("Sign in"));
+        assert!(
+            state.sessions.is_empty(),
+            "{status}: a user the daemon refuses holds no session"
+        );
+        assert!(b.cookie(SESSION).is_none(), "the cookie is cleared");
+    }
+}
+
+#[tokio::test]
+async fn an_anonymous_flood_of_logins_blocks_nobody() {
+    let s = setup().await;
+    // Far past any old table size: starting a login stores nothing on the server.
+    for _ in 0..3000 {
+        let r = Browser::new(&s.app).get("/auth/login").await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER);
+    }
+    let mut b = Browser::new(&s.app);
+    let done = b.login().await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    assert!(b.cookie(SESSION).is_some());
+    assert_eq!(s.state.logins.used_len(), 1);
+}
+
+#[tokio::test]
+async fn a_replayed_callback_with_its_cookie_is_refused() {
+    let s = setup().await;
+    let mut b = Browser::new(&s.app);
+    let start = b.get("/auth/login").await;
+    let login_cookie = start
+        .set_cookies()
+        .into_iter()
+        .find(|c| c.starts_with(LOGIN))
+        .unwrap();
+    let login_value = login_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_owned();
+    let callback = b
+        .provider_client
+        .get(start.location())
+        .send()
+        .await
+        .unwrap()
+        .headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .replacen(PUBLIC, "", 1);
+    assert_eq!(b.get(&callback).await.status, StatusCode::SEE_OTHER);
+
+    // A browser (or attacker) that kept the login cookie replays the same answer.
+    let mut replay = Browser::new(&s.app);
+    replay.jar.insert(LOGIN.into(), login_value.clone());
+    assert_eq!(replay.get(&callback).await.status, StatusCode::BAD_REQUEST);
+    assert!(replay.cookie(SESSION).is_none());
+    assert_eq!(s.state.sessions.len(), 1);
+
+    // A cookie the panel did not seal is just as useless.
+    let mut forger = Browser::new(&s.app);
+    forger.jar.insert(LOGIN.into(), "A".repeat(200));
+    assert_eq!(forger.get(&callback).await.status, StatusCode::BAD_REQUEST);
+
+    // And one that outlived its ten minutes.
+    let mut late = Browser::new(&s.app);
+    let start = late.get("/auth/login").await;
+    let callback = late
+        .provider_client
+        .get(start.location())
+        .send()
+        .await
+        .unwrap()
+        .headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .replacen(PUBLIC, "", 1);
+    s.clock.advance(Duration::from_secs(601));
+    assert_eq!(late.get(&callback).await.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn one_identity_cannot_fill_the_session_table() {
+    let s = setup().await;
+    let mut first = Browser::new(&s.app);
+    first.login().await;
+    let first_id = first.cookie(SESSION).unwrap().to_owned();
+    // The same account signing in again and again without ever sending its old cookie.
+    for _ in 0..20 {
+        let done = Browser::new(&s.app).login().await;
+        assert_eq!(done.status, StatusCode::SEE_OTHER);
+    }
+    assert_eq!(
+        s.state.sessions.len(),
+        weglarka_panel::session::MAX_SESSIONS_PER_SUB
+    );
+    assert!(
+        s.state.sessions.get(&first_id).is_none(),
+        "the oldest session made room"
+    );
+}
+
+#[tokio::test]
+async fn the_jwks_is_refetched_after_an_hour_even_for_a_known_kid() {
+    let s = setup().await;
+    let mut b = Browser::new(&s.app);
+    assert_eq!(b.login().await.status, StatusCode::SEE_OTHER);
+    assert_eq!(s.provider.requests("/jwks").len(), 1);
+
+    // The provider drops its key (k1) but is still seen signing with it: a revoked key.
+    let mut old = None;
+    s.provider.set(|p| old = Some(p.signer.clone()));
+    s.provider.set(|p| {
+        p.signer = Arc::new(weglarka_model::admin_auth::testing::TestIssuer::new("k2"));
+        p.id_signer = old.take();
+    });
+    s.clock.advance(Duration::from_secs(40 * 60));
+    assert_eq!(
+        b.login().await.status,
+        StatusCode::SEE_OTHER,
+        "within the hour the cached key still counts"
+    );
+    assert_eq!(s.provider.requests("/jwks").len(), 1);
+
+    s.clock.advance(Duration::from_secs(21 * 60));
+    assert_eq!(b.login().await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(s.provider.requests("/jwks").len(), 2);
+
+    // A provider that is down at that moment does not take the cached keys away.
+    s.provider.set(|p| p.id_signer = None);
+    assert_eq!(b.login().await.status, StatusCode::SEE_OTHER);
+    s.provider.set(|p| p.jwks_down = true);
+    s.clock.advance(Duration::from_secs(61 * 60));
+    assert_eq!(b.login().await.status, StatusCode::SEE_OTHER);
+    assert!(s.provider.requests("/jwks").len() >= 3, "it tried");
+}
+
+#[tokio::test]
+async fn a_failed_discovery_is_not_retried_for_ten_seconds() {
+    let s = setup().await;
+    s.provider
+        .set(|p| p.discovery_issuer = Some("http://127.0.0.1:1".into()));
+    for _ in 0..5 {
+        assert_eq!(
+            Browser::new(&s.app).get("/auth/login").await.status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+    assert_eq!(
+        s.provider
+            .requests("/.well-known/openid-configuration")
+            .len(),
+        1
+    );
+
+    // Recovered provider, but the failure is remembered until the pause is over.
+    s.provider.set(|p| p.discovery_issuer = None);
+    assert_eq!(
+        Browser::new(&s.app).get("/auth/login").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+    s.clock.advance(Duration::from_secs(11));
+    assert_eq!(
+        Browser::new(&s.app).get("/auth/login").await.status,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        s.provider
+            .requests("/.well-known/openid-configuration")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn the_token_endpoint_must_stay_on_the_issuers_host() {
+    // A poisoned discovery document points the token endpoint (and with it the client secret) elsewhere.
+    let s = setup().await;
+    s.provider
+        .set(|p| p.token_endpoint = Some("http://127.0.0.2:9/token".into()));
+    assert_eq!(
+        Browser::new(&s.app).get("/auth/login").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+
+    // The operator can name the extra host explicitly.
+    let s = setup_with(&[(weglarka_panel::config::ENV_ENDPOINT_HOSTS, "127.0.0.2")]).await;
+    s.provider
+        .set(|p| p.token_endpoint = Some("http://127.0.0.2:9/token".into()));
+    assert_eq!(
+        Browser::new(&s.app).get("/auth/login").await.status,
+        StatusCode::SEE_OTHER
+    );
 }
 
 /// A tracing sink that collects what is logged, to search it for secrets.
@@ -784,6 +1006,7 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
 
     let mut locations = Vec::new();
     let start = b.get("/auth/login?return_to=%2Fapps").await;
+    let mut login_cookies = vec![b.cookie(LOGIN).unwrap().to_owned()];
     locations.push(start.location());
     let answer = b
         .provider_client
@@ -799,6 +1022,7 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
     locations.push(done.location());
     // Failures too: a bad state, a refused refresh, a bad id token.
     let bad = b.approve("/").await;
+    login_cookies.push(b.cookie(LOGIN).unwrap().to_owned());
     b.get(&bad.replacen("state=", "state=x", 1)).await;
     let session = s.state.sessions.get(b.cookie(SESSION).unwrap()).unwrap();
     let csrf = session.csrf.clone();
@@ -816,6 +1040,27 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
     let mut secrets = s.provider.secrets();
     secrets.extend([CLIENT_SECRET.to_owned(), csrf, session_id]);
     assert!(secrets.len() >= 8, "{secrets:?}");
+
+    // The panel's own per-login values: `state` and `nonce` from what the provider was asked (the
+    // authorization redirect legitimately carries them, so it is not swept), the PKCE verifier from
+    // the code exchange, and the sealed login cookie that holds all three.
+    let mut own = Vec::new();
+    for asked in s.provider.requests("/authorize") {
+        let q: BTreeMap<String, String> = url::form_urlencoded::parse(asked.query.as_bytes())
+            .into_owned()
+            .collect();
+        own.extend([q["state"].clone(), q["nonce"].clone()]);
+    }
+    for exchange in s.provider.requests("/token") {
+        let form: BTreeMap<String, String> = url::form_urlencoded::parse(exchange.body.as_bytes())
+            .into_owned()
+            .collect();
+        if let Some(verifier) = form.get("code_verifier") {
+            own.push(verifier.clone());
+        }
+    }
+    own.extend(login_cookies);
+    assert!(own.len() >= 6, "{own:?}");
     let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(log.contains("WARN"), "the failures were logged: {log}");
     let debug = format!("{view_debug} {:?}", s.state.config);
@@ -834,6 +1079,21 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
                 "{secret} in {location}"
             );
         }
+    }
+    for value in &own {
+        assert!(
+            !log.contains(value.as_str()),
+            "a login value is in the logs: {value}"
+        );
+        assert!(
+            !debug.contains(value.as_str()),
+            "a login value is in Debug output: {value}"
+        );
+        // The callback redirect carries none of them either.
+        assert!(
+            !locations[1].contains(value.as_str()),
+            "{value} in the callback redirect"
+        );
     }
     // Neither the PKCE verifier nor the state travel in the callback redirect.
     assert_eq!(locations[1], "/apps");

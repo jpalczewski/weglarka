@@ -41,6 +41,11 @@ pub struct Behaviour {
     pub id_aud: String,
     pub id_nonce: Option<String>,
     pub id_azp: Option<String>,
+    /// Overrides the id token's `iss`.
+    pub id_iss: Option<String>,
+    /// Issues an id token that expired an hour ago.
+    pub id_expired: bool,
+    pub token_endpoint: Option<String>,
     pub omit_id_token: bool,
     pub expires_in: u64,
     pub refresh_expires_in: u64,
@@ -92,6 +97,9 @@ impl Provider {
                 id_aud: CLIENT_ID.to_owned(),
                 id_nonce: None,
                 id_azp: None,
+                id_iss: None,
+                id_expired: false,
+                token_endpoint: None,
                 omit_id_token: false,
                 expires_in: 3600,
                 refresh_expires_in: 3600,
@@ -156,7 +164,8 @@ async fn discovery(State(inner): State<Arc<Inner>>, uri: Uri, headers: HeaderMap
         "issuer": b.discovery_issuer.clone().unwrap_or_else(|| inner.issuer.clone()),
         "authorization_endpoint": b.authorization_endpoint.clone()
             .unwrap_or_else(|| format!("{}/authorize", inner.issuer)),
-        "token_endpoint": format!("{}/token", inner.issuer),
+        "token_endpoint": b.token_endpoint.clone()
+            .unwrap_or_else(|| format!("{}/token", inner.issuer)),
         "jwks_uri": format!("{}/jwks", inner.issuer),
     }))
     .into_response()
@@ -265,8 +274,10 @@ async fn token(
                 .unwrap()
                 .as_secs();
             let mut claims = json!({
-                "iss": inner.issuer, "aud": b.id_aud, "sub": "alice-sub",
-                "name": "Alice Example", "iat": now, "exp": now + 600,
+                "iss": b.id_iss.clone().unwrap_or_else(|| inner.issuer.clone()),
+                "aud": b.id_aud, "sub": "alice-sub",
+                "name": "Alice Example", "iat": now - 7200,
+                "exp": if b.id_expired { now - 3600 } else { now + 600 },
                 "nonce": b.id_nonce.clone().unwrap_or(grant.nonce),
             });
             if let Some(azp) = &b.id_azp {

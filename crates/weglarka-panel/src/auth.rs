@@ -20,6 +20,12 @@ use crate::pages::ErrorPage;
 use crate::secure::constant_time_eq;
 use crate::session::{PendingLogin, Session, SessionView, Tokens, User};
 
+/// A response extension a handler sets when the daemon refused the user's token for want of any
+/// access (`401`, or `403` on the lowest-scope call): [`require_session`] then ends the session and
+/// clears the cookie, so an identity the daemon does not accept holds nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct EndSession;
+
 pub const SESSION_COOKIE: &str = "__Host-weglarka-session";
 pub const LOGIN_COOKIE: &str = "__Host-weglarka-login";
 /// The access token is refreshed when it has less than this left.
@@ -107,21 +113,14 @@ pub async fn login(State(state): State<AppState>, uri: Uri) -> Response {
             );
         }
     };
-    let pending = PendingLogin::new(
-        request.state,
-        request.nonce,
-        request.verifier,
+    // The pending login rides in the (sealed) cookie: nothing is stored here, so there is no table
+    // an anonymous visitor could fill.
+    let id = state.logins.seal(&PendingLogin {
+        state: request.state,
+        nonce: request.nonce,
+        verifier: request.verifier,
         return_to,
-        state.clock.now(),
-    );
-    let Ok(id) = state.logins.insert(pending) else {
-        tracing::warn!("too many logins in progress");
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Busy",
-            "Too many sign-ins are in progress. Try again in a few minutes.",
-        );
-    };
+    });
     let mut response = Redirect::to(&request.redirect).into_response();
     response.headers_mut().append(
         SET_COOKIE,
@@ -137,7 +136,7 @@ pub async fn login(State(state): State<AppState>, uri: Uri) -> Response {
 /// `GET /auth/callback`: the provider's answer. Every failure ends here with a generic page; the
 /// reason goes to the log (never the code, the state, a token or the secret).
 pub async fn callback(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
-    let pending = cookie_value(&headers, LOGIN_COOKIE).and_then(|id| state.logins.take(&id));
+    let pending = cookie_value(&headers, LOGIN_COOKIE).and_then(|id| state.logins.open(&id));
     let mut response = callback_inner(&state, &uri, &headers, pending).await;
     // The login cookie has done its job, whatever the outcome.
     response
@@ -284,7 +283,7 @@ pub async fn require_session(
     let Some(id) = cookie_value(request.headers(), SESSION_COOKIE) else {
         return signed_out(&request, false);
     };
-    let Some(session) = state.sessions.get(&id) else {
+    let Some(session) = state.sessions.peek(&id) else {
         return signed_out(&request, true);
     };
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
@@ -293,6 +292,8 @@ pub async fn require_session(
             Err(response) => return *response,
         };
     }
+    // Only a request that passed the CSRF check counts as activity.
+    state.sessions.touch(&session);
     let Some(token) = fresh_token(&state, &session).await else {
         state.sessions.remove(&id);
         return signed_out(&request, true);
@@ -302,14 +303,27 @@ pub async fn require_session(
         csrf: session.csrf.clone(),
         user: session.user.clone(),
     });
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if response.extensions().get::<EndSession>().is_some() {
+        state.sessions.remove(&id);
+        response
+            .headers_mut()
+            .append(SET_COOKIE, clear_cookie(SESSION_COOKIE));
+    }
+    response
 }
 
 /// The session's access token, refreshed first when it is within [`REFRESH_MARGIN`] of expiry.
 /// `None` ends the session: the grant was refused, or the token expired and cannot be renewed.
-/// The tokens' lock is held across the refresh, so concurrent requests share one refresh.
+/// The tokens' lock is held across the refresh and everything is re-checked once it is taken, so
+/// N queued requests make one provider call.
 async fn fresh_token(state: &AppState, session: &Session) -> Option<Arc<Secret>> {
     let mut tokens = session.tokens.lock().await;
+    // Requests queued behind a refresh find the session ended (the grant was refused: do not retry
+    // a dead refresh token) or the token already renewed (the check below returns it).
+    if session.is_ended() {
+        return None;
+    }
     let now = state.clock.now();
     if tokens.access_expires.saturating_duration_since(now) > REFRESH_MARGIN {
         return Some(tokens.access.clone());

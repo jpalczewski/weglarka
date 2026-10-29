@@ -27,6 +27,12 @@ use crate::session::Clock;
 /// Largest discovery document, JWKS or token response read.
 const MAX_BODY: usize = 256 * 1024;
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
+/// The cached JWKS is refetched after this long even when every `kid` is known, so a key the
+/// provider revoked stops verifying; the same lifetime as discovery.
+const JWKS_MAX_AGE: Duration = DISCOVERY_TTL;
+/// A failed discovery is not retried for this long, so a provider outage is not hammered by every
+/// anonymous `GET /auth/login`.
+const DISCOVERY_RETRY_AFTER: Duration = Duration::from_secs(10);
 /// Unknown `kid`s trigger a JWKS fetch at most this often (a forged `kid` cannot make us hammer the provider).
 const JWKS_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const SCOPE: &str = "openid profile groups offline_access";
@@ -128,14 +134,21 @@ struct RawTokens {
 #[derive(Default)]
 struct JwksCache {
     keys: Option<JwkSet>,
+    fetched_at: Option<Instant>,
     last_attempt: Option<Instant>,
+}
+
+#[derive(Default)]
+struct DiscoveryCache {
+    found: Option<(Instant, Arc<Endpoints>)>,
+    failed_at: Option<Instant>,
 }
 
 pub struct OidcClient {
     config: Arc<PanelConfig>,
     http: reqwest::Client,
     clock: Clock,
-    discovery: Mutex<Option<(Instant, Arc<Endpoints>)>>,
+    discovery: Mutex<DiscoveryCache>,
     jwks: Mutex<JwksCache>,
 }
 
@@ -145,7 +158,7 @@ impl OidcClient {
             config,
             http,
             clock,
-            discovery: Mutex::new(None),
+            discovery: Mutex::new(DiscoveryCache::default()),
             jwks: Mutex::new(JwksCache::default()),
         }
     }
@@ -168,16 +181,54 @@ impl OidcClient {
             && url.fragment().is_none()
     }
 
+    /// `url` is on the issuer's host and port, or on a host the operator listed.
+    fn host_allowed(&self, url: &Url) -> bool {
+        let Ok(issuer) = Url::parse(&self.config.oidc.issuer) else {
+            return false;
+        };
+        let origin = |u: &Url| {
+            (
+                u.host_str().map(str::to_ascii_lowercase),
+                u.port_or_known_default(),
+            )
+        };
+        origin(url) == origin(&issuer)
+            || url.host_str().is_some_and(|h| {
+                self.config
+                    .oidc
+                    .extra_endpoint_hosts
+                    .iter()
+                    .any(|extra| extra.eq_ignore_ascii_case(h))
+            })
+    }
+
     pub async fn endpoints(&self) -> Result<Arc<Endpoints>, OidcError> {
         let mut cached = self.discovery.lock().await;
-        if let Some((at, endpoints)) = cached.as_ref()
-            && self.clock.now().saturating_duration_since(*at) < DISCOVERY_TTL
+        let now = self.clock.now();
+        if let Some((at, endpoints)) = cached.found.as_ref()
+            && now.saturating_duration_since(*at) < DISCOVERY_TTL
         {
             return Ok(endpoints.clone());
         }
-        let endpoints = Arc::new(self.discover().await?);
-        *cached = Some((self.clock.now(), endpoints.clone()));
-        Ok(endpoints)
+        if let Some(at) = cached.failed_at
+            && now.saturating_duration_since(at) < DISCOVERY_RETRY_AFTER
+        {
+            return Err(OidcError::Discovery(
+                "the last attempt failed; not retrying yet".into(),
+            ));
+        }
+        match self.discover().await {
+            Ok(endpoints) => {
+                let endpoints = Arc::new(endpoints);
+                cached.found = Some((self.clock.now(), endpoints.clone()));
+                cached.failed_at = None;
+                Ok(endpoints)
+            }
+            Err(e) => {
+                cached.failed_at = Some(self.clock.now());
+                Err(e)
+            }
+        }
     }
 
     async fn discover(&self) -> Result<Endpoints, OidcError> {
@@ -201,10 +252,24 @@ impl OidcClient {
                 .filter(|u| self.endpoint_allowed(u))
                 .ok_or_else(|| fail(&format!("{what} is missing or not an https URL")))
         };
+        // The token endpoint receives the client secret and the JWKS decides who is trusted, so
+        // both stay on the issuer's host unless the operator lists others.
+        let same_host = |url: Url, what: &str| {
+            if self.host_allowed(&url) {
+                Ok(url)
+            } else {
+                Err(fail(&format!(
+                    "{what} is on a host other than the issuer's (see OIDC_ENDPOINT_HOSTS)"
+                )))
+            }
+        };
         Ok(Endpoints {
             authorization: parse(&doc.authorization_endpoint, "authorization_endpoint")?,
-            token: parse(&doc.token_endpoint, "token_endpoint")?,
-            jwks: parse(&doc.jwks_uri, "jwks_uri")?,
+            token: same_host(
+                parse(&doc.token_endpoint, "token_endpoint")?,
+                "token_endpoint",
+            )?,
+            jwks: same_host(parse(&doc.jwks_uri, "jwks_uri")?, "jwks_uri")?,
         })
     }
 
@@ -375,12 +440,18 @@ impl OidcClient {
     /// a failed fetch keeps the old keys.
     async fn jwks(&self, refetch: bool) -> Result<JwkSet, OidcError> {
         let mut cache = self.jwks.lock().await;
-        if let (Some(keys), Some(at)) = (&cache.keys, cache.last_attempt)
-            && (!refetch || self.clock.now().saturating_duration_since(at) < JWKS_MIN_INTERVAL)
+        let now = self.clock.now();
+        if let (Some(keys), Some(fetched), Some(attempt)) =
+            (&cache.keys, cache.fetched_at, cache.last_attempt)
         {
-            return Ok(keys.clone());
+            let stale = now.saturating_duration_since(fetched) >= JWKS_MAX_AGE;
+            let recent = now.saturating_duration_since(attempt) < JWKS_MIN_INTERVAL;
+            // Stale keys are replaced, but a provider that keeps failing is tried once per interval.
+            if !(refetch || stale) || recent {
+                return Ok(keys.clone());
+            }
         }
-        cache.last_attempt = Some(self.clock.now());
+        cache.last_attempt = Some(now);
         let fetched = async {
             let endpoints = self.endpoints().await?;
             let body = self.get(&endpoints.jwks).await?;
@@ -395,6 +466,7 @@ impl OidcClient {
         match (fetched, cache.keys.clone()) {
             (Ok(keys), _) => {
                 cache.keys = Some(keys.clone());
+                cache.fetched_at = Some(self.clock.now());
                 Ok(keys)
             }
             (Err(e), Some(old)) => {

@@ -6,23 +6,32 @@
 //!
 //! - [`SessionStore`]: id → session, bounded, with an absolute and an idle lifetime;
 //! - [`PendingLogins`]: the `state`/`nonce`/PKCE verifier of logins that were started and not yet
-//!   completed, keyed by a short-lived cookie and deleted at the callback;
+//!   completed. They live in the browser, in a short-lived cookie sealed with an AEAD key that exists
+//!   only in this process, so an anonymous `GET /auth/login` costs the server no memory;
 //! - [`Clock`]: `Instant::now()` plus an adjustable skew, so tests can age sessions without sleeping.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::config::Secret;
 use crate::secure::random_token;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// Sessions held at once; a login beyond it is refused rather than evicting somebody.
 pub const MAX_SESSIONS: usize = 1024;
-/// Logins started and not completed.
-pub const MAX_PENDING_LOGINS: usize = 1024;
+/// Sessions one identity may hold; a further login evicts that identity's oldest, so one account
+/// looping through the login flow without a cookie cannot fill the table for everybody else.
+pub const MAX_SESSIONS_PER_SUB: usize = 5;
+/// Login states remembered as used (see [`PendingLogins`]).
+pub const MAX_USED_STATES: usize = 4096;
 /// How long a started login may take (the user types a password and maybe a second factor).
 pub const PENDING_LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 /// How often dead sessions are swept even when nobody logs in.
@@ -36,7 +45,20 @@ pub struct Clock {
 
 impl Clock {
     pub fn now(&self) -> Instant {
-        Instant::now() + Duration::from_millis(self.skew_millis.load(Ordering::Relaxed))
+        Instant::now() + self.skew()
+    }
+
+    /// Wall-clock seconds since the Unix epoch, moved by the same skew; for values that leave the
+    /// process (the login cookie's expiry).
+    pub fn unix_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            + self.skew().as_secs()
+    }
+
+    fn skew(&self) -> Duration {
+        Duration::from_millis(self.skew_millis.load(Ordering::Relaxed))
     }
 
     /// Moves every reader of this clock forward. For tests.
@@ -181,6 +203,21 @@ impl SessionStore {
         if map.len() >= self.capacity {
             Self::drop_dead(&mut map, now, self.idle, self.max);
         }
+        // The identity's own oldest sessions make room for the new one.
+        let sub = session.user.sub.clone();
+        let mut mine: Vec<(Instant, String)> = map
+            .iter()
+            .filter(|(_, s)| s.user.sub == sub)
+            .map(|(id, s)| (s.created, id.clone()))
+            .collect();
+        if mine.len() >= MAX_SESSIONS_PER_SUB {
+            mine.sort();
+            for (_, id) in mine.drain(..mine.len() + 1 - MAX_SESSIONS_PER_SUB) {
+                if let Some(old) = map.remove(&id) {
+                    old.end();
+                }
+            }
+        }
         if map.len() >= self.capacity {
             return Err(Full);
         }
@@ -191,6 +228,14 @@ impl SessionStore {
 
     /// The live session for `id`, with its idle timer reset. An expired one is ended and removed.
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
+        let session = self.peek(id)?;
+        self.touch(&session);
+        Some(session)
+    }
+
+    /// Like [`SessionStore::get`] but leaves the idle timer alone: a request that has not proved
+    /// itself (CSRF) must not keep a session alive. Call [`SessionStore::touch`] once it has.
+    pub fn peek(&self, id: &str) -> Option<Arc<Session>> {
         let now = self.clock.now();
         let mut map = self.lock();
         let session = map.get(id)?.clone();
@@ -199,8 +244,11 @@ impl SessionStore {
             session.end();
             return None;
         }
-        session.touch(now);
         Some(session)
+    }
+
+    pub fn touch(&self, session: &Session) {
+        session.touch(self.clock.now());
     }
 
     /// Ends and forgets the session.
@@ -265,72 +313,126 @@ pub struct PendingLogin {
     pub verifier: Secret,
     /// A local absolute path, already validated.
     pub return_to: String,
-    created: Instant,
 }
 
-impl PendingLogin {
-    pub fn new(
-        state: String,
-        nonce: String,
-        verifier: Secret,
-        return_to: String,
-        now: Instant,
-    ) -> Self {
-        Self {
-            state,
-            nonce,
-            verifier,
-            return_to,
-            created: now,
-        }
-    }
+/// Wire form of [`PendingLogin`] inside the sealed cookie. `Secret` has no `Serialize` (by design),
+/// so the verifier crosses as a plain string here and never leaves this module in that form.
+#[derive(Serialize, Deserialize)]
+struct Sealed {
+    state: String,
+    nonce: String,
+    verifier: String,
+    return_to: String,
+    /// Unix seconds.
+    exp: u64,
 }
 
+const LOGIN_AAD: &[u8] = b"weglarka-panel login cookie v1";
+
+/// Pending logins without server-side storage (#292). `/auth/login` seals the login into the cookie
+/// value with ChaCha20-Poly1305 under a key drawn at start-up and never written anywhere: the
+/// browser can neither read nor change it, and a restart invalidates logins in flight, exactly as
+/// it ends every session (those are in memory too). A random per-process key was chosen over one
+/// derived from the client secret (HKDF) because it couples nothing to the secret's rotation and
+/// there is no second process that would need to open the same cookie.
+///
+/// Single use is kept by remembering the `state` of every cookie that reached the callback until
+/// it would have expired anyway. That set only grows from cookies this process sealed (a forged
+/// cookie does not open), and when a flood of genuine ones fills it the entry closest to expiry is
+/// dropped instead of refusing logins: replay protection degrades first, availability does not. The
+/// authorization code is single use at the provider, so a replay needs more than the cookie.
 pub struct PendingLogins {
-    map: Mutex<HashMap<String, PendingLogin>>,
-    capacity: usize,
+    key: LessSafeKey,
+    used: Mutex<HashMap<String, u64>>,
     clock: Clock,
 }
 
 impl PendingLogins {
     pub fn new(clock: Clock) -> Self {
+        let mut key = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut key)
+            .expect("the operating system cannot provide random bytes");
+        let key = UnboundKey::new(&CHACHA20_POLY1305, &key).expect("a 32-byte ChaCha20 key");
         Self {
-            map: Mutex::new(HashMap::new()),
-            capacity: MAX_PENDING_LOGINS,
+            key: LessSafeKey::new(key),
+            used: Mutex::new(HashMap::new()),
             clock,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingLogin>> {
-        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    /// The cookie value for a started login (base64url: nonce, ciphertext and tag).
+    pub fn seal(&self, login: &PendingLogin) -> String {
+        let plain = serde_json::to_vec(&Sealed {
+            state: login.state.clone(),
+            nonce: login.nonce.clone(),
+            verifier: login.verifier.expose().to_owned(),
+            return_to: login.return_to.clone(),
+            exp: self.clock.unix_secs() + PENDING_LOGIN_TTL.as_secs(),
+        })
+        .expect("a login serializes");
+        let mut nonce = [0u8; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .expect("the operating system cannot provide random bytes");
+        let mut buf = plain;
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(LOGIN_AAD),
+                &mut buf,
+            )
+            .expect("sealing cannot fail");
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&buf);
+        URL_SAFE_NO_PAD.encode(out)
     }
 
-    /// Stores a started login and returns the id for its cookie.
-    pub fn insert(&self, login: PendingLogin) -> Result<String, Full> {
-        let now = self.clock.now();
-        let mut map = self.lock();
-        map.retain(|_, l| now.saturating_duration_since(l.created) < PENDING_LOGIN_TTL);
-        if map.len() >= self.capacity {
-            return Err(Full);
+    /// Opens a cookie and consumes it: `None` if it is forged, expired or already used. A login
+    /// answers once, whatever its outcome.
+    pub fn open(&self, cookie: &str) -> Option<PendingLogin> {
+        let raw = URL_SAFE_NO_PAD.decode(cookie).ok()?;
+        if raw.len() <= NONCE_LEN {
+            return None;
         }
-        let id = random_token();
-        map.insert(id.clone(), login);
-        Ok(id)
+        let (nonce, sealed) = raw.split_at(NONCE_LEN);
+        let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
+        let mut buf = sealed.to_vec();
+        let plain = self
+            .key
+            .open_in_place(nonce, Aad::from(LOGIN_AAD), &mut buf)
+            .ok()?;
+        let sealed: Sealed = serde_json::from_slice(plain).ok()?;
+        let now = self.clock.unix_secs();
+        if sealed.exp <= now {
+            return None;
+        }
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        if used.len() >= MAX_USED_STATES {
+            used.retain(|_, exp| *exp > now);
+        }
+        if used.len() >= MAX_USED_STATES
+            && let Some(oldest) = used
+                .iter()
+                .min_by_key(|(_, exp)| **exp)
+                .map(|(k, _)| k.clone())
+        {
+            used.remove(&oldest);
+        }
+        if used.insert(sealed.state.clone(), sealed.exp).is_some() {
+            return None;
+        }
+        Some(PendingLogin {
+            state: sealed.state,
+            nonce: sealed.nonce,
+            verifier: Secret::new(sealed.verifier),
+            return_to: sealed.return_to,
+        })
     }
 
-    /// Removes and returns the login: one answer per started login, whatever its outcome.
-    pub fn take(&self, id: &str) -> Option<PendingLogin> {
-        let login = self.lock().remove(id)?;
-        let age = self.clock.now().saturating_duration_since(login.created);
-        (age < PENDING_LOGIN_TTL).then_some(login)
-    }
-
-    pub fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// States remembered as used.
+    pub fn used_len(&self) -> usize {
+        self.used.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -412,27 +514,99 @@ mod tests {
         assert!(*rx2.borrow());
     }
 
+    fn login(n: &str) -> PendingLogin {
+        PendingLogin {
+            state: format!("state-{n}"),
+            nonce: format!("nonce-{n}"),
+            verifier: Secret::new(format!("verifier-{n}")),
+            return_to: "/apps".into(),
+        }
+    }
+
     #[test]
     fn pending_logins_are_single_use_and_expire() {
         let clock = Clock::default();
         let logins = PendingLogins::new(clock.clone());
-        let new = |clock: &Clock| {
-            PendingLogin::new(
-                "s".into(),
-                "n".into(),
-                Secret::new("v"),
-                "/".into(),
-                clock.now(),
-            )
-        };
-        let id = logins.insert(new(&clock)).unwrap();
-        assert!(logins.take(&id).is_some());
-        assert!(logins.take(&id).is_none());
+        let cookie = logins.seal(&login("a"));
+        let opened = logins.open(&cookie).unwrap();
+        assert_eq!(opened.state, "state-a");
+        assert_eq!(opened.nonce, "nonce-a");
+        assert_eq!(opened.verifier.expose(), "verifier-a");
+        assert_eq!(opened.return_to, "/apps");
+        assert!(logins.open(&cookie).is_none(), "a replay");
 
-        let id = logins.insert(new(&clock)).unwrap();
+        let cookie = logins.seal(&login("b"));
         clock.advance(PENDING_LOGIN_TTL);
-        assert!(logins.take(&id).is_none());
-        assert!(logins.is_empty());
+        assert!(logins.open(&cookie).is_none(), "expired");
+    }
+
+    #[test]
+    fn pending_login_cookies_cannot_be_forged_or_moved() {
+        let clock = Clock::default();
+        let logins = PendingLogins::new(clock.clone());
+        let cookie = logins.seal(&login("a"));
+        // Any flipped byte fails authentication.
+        let mut raw = URL_SAFE_NO_PAD.decode(&cookie).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        assert!(logins.open(&URL_SAFE_NO_PAD.encode(raw)).is_none());
+        for junk in ["", "x", "not base64!", &random_token()] {
+            assert!(logins.open(junk).is_none(), "{junk:?}");
+        }
+        // Another process (another key) cannot open it, and neither contains the verifier in clear.
+        assert!(PendingLogins::new(clock).open(&cookie).is_none());
+        assert!(!cookie.contains("verifier-a"));
+        // The failed attempts did not consume it.
+        assert!(logins.open(&cookie).is_some());
+    }
+
+    #[test]
+    fn a_flood_of_logins_costs_no_memory_and_blocks_nobody() {
+        let clock = Clock::default();
+        let logins = PendingLogins::new(clock.clone());
+        // Starting logins stores nothing, however many.
+        let cookies: Vec<String> = (0..MAX_USED_STATES + 10)
+            .map(|n| logins.seal(&login(&n.to_string())))
+            .collect();
+        assert_eq!(logins.used_len(), 0);
+        // Completing them past the bound evicts the used-set, never refuses.
+        for cookie in &cookies {
+            assert!(logins.open(cookie).is_some());
+        }
+        assert_eq!(logins.used_len(), MAX_USED_STATES);
+        let fresh = logins.seal(&login("legit"));
+        assert!(logins.open(&fresh).is_some());
+        assert!(logins.open(&fresh).is_none());
+    }
+
+    #[test]
+    fn one_identity_holds_a_bounded_number_of_sessions() {
+        let clock = Clock::default();
+        let store = SessionStore::with_capacity(
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            clock.clone(),
+            100,
+        );
+        let ids: Vec<String> = (0..MAX_SESSIONS_PER_SUB + 3)
+            .map(|_| {
+                clock.advance(Duration::from_millis(5));
+                store.insert(session(&clock)).unwrap()
+            })
+            .collect();
+        assert_eq!(store.len(), MAX_SESSIONS_PER_SUB);
+        // The oldest were evicted (and ended), the newest remain.
+        for id in &ids[..3] {
+            assert!(store.get(id).is_none());
+        }
+        for id in &ids[3..] {
+            assert!(store.get(id).is_some());
+        }
+        // Somebody else is unaffected.
+        let mut other = session(&clock);
+        other.user.sub = "bob".into();
+        store.insert(other).unwrap();
+        assert_eq!(store.len(), MAX_SESSIONS_PER_SUB + 1);
     }
 
     #[test]
