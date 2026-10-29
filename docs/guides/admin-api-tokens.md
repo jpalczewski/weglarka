@@ -47,9 +47,11 @@ revoked before it expires.
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
-`GET /v1/apps/{name}` is open to `read` but redacted: for a token without `admin` the values of `env` are blank (the keys
-stay), in every response that carries an app spec. Put connection strings and other credentials in secrets, not in `env`,
-and do not put them in `command` or `health.command` either, which are shown as written. The same answer also reports the
+`GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. For a token
+without `admin`: the values of `env` are blank (the keys stay); `command` and `health.command` keep only their first
+element and show `<redacted>` for every other argument (the count stays); `health.http.path` loses its query string; and
+the engine's failure text in `state.failed.reason` is replaced by a fixed marker (the failed `digest` stays). Put
+connection strings and other credentials in secrets, not in `env` or command arguments. The same answer also reports the
 container's `restarts`, its raw `health` (`starting`, `healthy` or `unhealthy`) and `started_at` (RFC 3339). The unix socket
 and `admin` tokens see the real values. The notification status (`GET /v1/notifications`) is safe at `read`: its
 `last_error` holds the daemon's own wording of the failure, never the server URL or the access token.

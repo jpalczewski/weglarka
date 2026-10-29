@@ -285,6 +285,77 @@ async fn a_read_token_sees_env_keys_without_values_and_the_runtime_detail() {
 }
 
 #[tokio::test]
+async fn a_read_token_does_not_see_argv_or_failure_text() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+    let reader = s.issuer.token("rita", &["viewers"]);
+    let admin_token = s.issuer.token("adam", &["admins"]);
+
+    let mut app = spec("y.example.com");
+    app["command"] = json!(["serve", "--password=hunter2"]);
+    add(&s.h, "y", app).await;
+    deployed(&s.h, "y").await;
+
+    // The probes would need a real container and ingress to pass the deploy gate, so they are
+    // declared on the stored spec afterwards.
+    let apps_path = s.h.root.join("state/apps.toml");
+    let mut apps = weglarka_model::state::load_apps(&apps_path).unwrap();
+    let name = weglarka_model::app::InstanceName::new("y").unwrap();
+    let health = &mut apps.apps.get_mut(&name).expect("spec of y").health;
+    health.command = Some(vec!["check".into(), "--token=t0k3n".into()]);
+    health.http = Some(weglarka_model::app::HttpProbe {
+        path: "/ready?key=s3cret".into(),
+        ..Default::default()
+    });
+    weglarka_model::state::save_apps(&apps_path, &apps).unwrap();
+
+    // The engine records a failed deploy with free-form text.
+    let state_path = s.h.root.join("state/state.toml");
+    let mut st = weglarka_model::state::load_state(&state_path).unwrap();
+    let entry = st.apps.get_mut(&name).expect("state of y");
+    let digest = entry.current.clone().expect("current digest");
+    entry.failed = Some(weglarka_model::state::FailedDeploy {
+        digest: digest.clone(),
+        reason: "pull failed: password=hunter2".into(),
+    });
+    weglarka_model::state::save_state(&state_path, &st).unwrap();
+
+    let (status, _, body) = call(sock, "GET", "/v1/apps/y", Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["command"],
+        json!(["serve", "<redacted>"]),
+        "{body}"
+    );
+    assert_eq!(
+        body["spec"]["health"]["command"],
+        json!(["check", "<redacted>"])
+    );
+    assert_eq!(body["spec"]["health"]["http"]["path"], "/ready");
+    assert_eq!(body["state"]["failed"]["digest"], json!(digest), "{body}");
+    assert_eq!(
+        body["state"]["failed"]["reason"],
+        "deploy failed (details withheld)"
+    );
+    let text = body.to_string();
+    for secret in ["hunter2", "t0k3n", "s3cret"] {
+        assert!(!text.contains(secret), "{secret} leaked: {body}");
+    }
+
+    let (status, _, body) = call(sock, "GET", "/v1/apps/y", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["command"][1], "--password=hunter2");
+    assert_eq!(body["spec"]["health"]["command"][1], "--token=t0k3n");
+    assert_eq!(body["spec"]["health"]["http"]["path"], "/ready?key=s3cret");
+    assert_eq!(
+        body["state"]["failed"]["reason"],
+        "pull failed: password=hunter2"
+    );
+    let body = show(&s.h, "y").await;
+    assert_eq!(body["spec"]["command"][1], "--password=hunter2");
+}
+
+#[tokio::test]
 async fn every_declared_endpoint_is_routed_and_enforces_its_scope() {
     let s = setup().await;
     let sock = &s.token_socket;
