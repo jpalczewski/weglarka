@@ -593,3 +593,48 @@ pub struct ListOidcClientsResponse {
 pub struct PutOidcClientRequest {
     pub spec: weglarka_model::identity::ExternalClientSpec,
 }
+
+/// Query of `GET /v1/events`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsQuery {
+    /// Return only events with a `seq` greater than this (the `next_seq` of the previous answer).
+    /// Absent = everything retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+}
+
+/// One domain event as `GET /v1/events` shows it. Flat and deliberately independent of the engine's
+/// `Event` enum, so that enum can change without breaking clients (docs/decisions/0057).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRecord {
+    /// Monotonic within one daemon process, starting at 1; a restart starts over (compare `next_seq`).
+    pub seq: u64,
+    /// UTC wall-clock time the daemon recorded the event, RFC 3339 (`2026-10-29T12:00:00Z`).
+    pub ts: String,
+    pub severity: Severity,
+    /// Stable snake_case name of the event type, e.g. `deploy_failed`.
+    pub kind: String,
+    /// The instance the event is about, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<InstanceName>,
+    /// One-line summary.
+    pub message: String,
+    /// Further detail (may be empty); capped in length.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// `GET /v1/events`: the retained events newer than the query's `since`, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub events: Vec<EventRecord>,
+    /// Pass as `since` next time. Equals the highest `seq` assigned so far, also when `events` is empty
+    /// (0 = nothing emitted yet). A cursor above it means the daemon restarted: start over without one.
+    pub next_seq: u64,
+    /// `seq` of the oldest retained event; absent while the history is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+    /// Events after `since` were evicted before this answer: the history is a bounded ring.
+    #[serde(default)]
+    pub dropped: bool,
+}

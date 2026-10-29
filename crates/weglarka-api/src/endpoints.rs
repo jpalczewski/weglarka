@@ -250,6 +250,13 @@ pub const SITES_PROMOTE: Endpoint = Endpoint {
     path: "/v1/sites/{site}/envs/{env}/promote",
     scope: Some(Scope::Admin),
 };
+/// `GET` → [`EventsResponse`](crate::EventsResponse). Query [`EventsQuery`](crate::EventsQuery):
+/// recent domain events from a bounded in-memory history (docs/decisions/0057), newer than `since`.
+pub const EVENTS_RECENT: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/events",
+    scope: Some(Scope::Read),
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -335,6 +342,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SITES_DECLARE,
     SITES_REMOVE,
     SITES_PROMOTE,
+    EVENTS_RECENT,
     DOCTOR,
     IMAGES_PRUNE,
     NOTIFICATIONS_STATUS,

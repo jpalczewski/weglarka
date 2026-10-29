@@ -180,6 +180,63 @@ impl Event {
     }
 }
 
+impl Event {
+    /// Stable snake_case name of the variant. Part of the admin API contract (`GET /v1/events`):
+    /// renaming a variant must not change it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::DeployOk { .. } => "deploy_ok",
+            Self::Provisioned { .. } => "provisioned",
+            Self::DeployFailed { .. } => "deploy_failed",
+            Self::RolledBack { .. } => "rolled_back",
+            Self::RollbackFailed { .. } => "rollback_failed",
+            Self::Recreated { .. } => "recreated",
+            Self::Pruned { .. } => "pruned",
+            Self::WaitingForSecret { .. } => "waiting_for_secret",
+            Self::WaitingForDependency { .. } => "waiting_for_dependency",
+            Self::WebhookDuplicate { .. } => "webhook_duplicate",
+            Self::CrashLooping { .. } => "crash_looping",
+            Self::Unhealthy { .. } => "unhealthy",
+            Self::Recovered { .. } => "recovered",
+            Self::SelfUpdated { .. } => "self_updated",
+            Self::SelfUpdatePending { .. } => "self_update_pending",
+            Self::SelfUpdateFellBack { .. } => "self_update_fell_back",
+            Self::CertificateIssued { .. } => "certificate_issued",
+            Self::CertificateRenewalFailed { .. } => "certificate_renewal_failed",
+            Self::GeneratedConfigApplied { .. } => "generated_config_applied",
+            Self::GeneratedConfigInvalid { .. } => "generated_config_invalid",
+            Self::GeneratedConfigRolledBack { .. } => "generated_config_rolled_back",
+        }
+    }
+
+    /// The instance an event is about, when it names one.
+    pub fn instance(&self) -> Option<&InstanceName> {
+        match self {
+            Self::DeployOk { instance, .. }
+            | Self::Provisioned { instance, .. }
+            | Self::DeployFailed { instance, .. }
+            | Self::RolledBack { instance, .. }
+            | Self::RollbackFailed { instance, .. }
+            | Self::Recreated { instance, .. }
+            | Self::WaitingForSecret { instance, .. }
+            | Self::WaitingForDependency { instance, .. }
+            | Self::CrashLooping { instance, .. }
+            | Self::Unhealthy { instance }
+            | Self::Recovered { instance } => Some(instance),
+            Self::GeneratedConfigApplied { consumer, .. }
+            | Self::GeneratedConfigInvalid { consumer, .. }
+            | Self::GeneratedConfigRolledBack { consumer, .. } => Some(consumer),
+            Self::Pruned { .. }
+            | Self::WebhookDuplicate { .. }
+            | Self::SelfUpdated { .. }
+            | Self::SelfUpdatePending { .. }
+            | Self::SelfUpdateFellBack { .. }
+            | Self::CertificateIssued { .. }
+            | Self::CertificateRenewalFailed { .. } => None,
+        }
+    }
+}
+
 /// Event sink; synchronous and dyn-compatible (a future journal appends to a file).
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: Event);

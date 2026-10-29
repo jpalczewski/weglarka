@@ -11,6 +11,7 @@ pub mod app;
 mod app_view;
 pub mod cdn;
 pub mod doctor;
+pub mod events;
 pub mod forgejo;
 pub mod forward;
 pub mod forwarder;
@@ -280,10 +281,18 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let notify = notifier.as_ref().map(weglarka_notify::Notifier::handle);
     // Self-update (issue #99): confirm which image this process really runs and resolve a switch the
     // host-side switcher requested, before anything reconciles against the old world.
-    let events: Arc<dyn weglarka_model::events::EventSink> = match &notifier {
+    // Every producer (engine, ACME, self-update) emits into one fan-out: the delivery sink the daemon
+    // had before (the notifier or the log) plus the bounded history behind `GET /v1/events`.
+    let history = Arc::new(weglarka_model::history::EventHistory::default());
+    let delivery: Arc<dyn weglarka_model::events::EventSink> = match &notifier {
         Some(notifier) => notifier.sink(),
         None => Arc::new(weglarka_model::events::TracingSink),
     };
+    let events: Arc<dyn weglarka_model::events::EventSink> =
+        Arc::new(weglarka_model::history::FanOut::new(vec![
+            delivery,
+            history.clone(),
+        ]));
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
@@ -320,11 +329,9 @@ pub async fn start_with<P: PodmanClient + 'static>(
     // events, so the notifications above deliver them and the log gets them even without a channel.
     .with_monitor(weglarka_engine::crash::Policy::from_config(&host.monitor))
     // What an `oidc` app gets injected (#91); inert without `[identity]`.
-    .with_identity(host.identity.clone());
-    if let Some(notifier) = &notifier {
-        // The engine emits into the durable pipeline instead of only into the log.
-        reconciler = reconciler.with_events(notifier.sink());
-    }
+    .with_identity(host.identity.clone())
+    // The engine emits into the durable pipeline (when configured), the log and the history.
+    .with_events(events.clone());
     // Generated config (#212): the engine bootstraps a consumer's files before its first start; the
     // worker below keeps them current. With no generator registered the feature is off entirely.
     let mut generators = generated::registered(&host);
@@ -398,6 +405,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         ingress: ingress.clone(),
         webhook_sources,
         notify: notify.clone(),
+        events: history,
         acme: acme_worker.as_ref().map(acme::AcmeWorker::status),
         generated: generated_worker.clone(),
         desired_lock: tokio::sync::Mutex::new(()),

@@ -31,11 +31,11 @@ read_groups = ["viewers"]
 admin_groups = ["admins"]
 "#;
 
-struct Setup {
-    h: Harness,
-    issuer: TestIssuer,
-    token_socket: PathBuf,
-    jwks_fetches: Arc<AtomicUsize>,
+pub(crate) struct Setup {
+    pub(crate) h: Harness,
+    pub(crate) issuer: TestIssuer,
+    pub(crate) token_socket: PathBuf,
+    pub(crate) jwks_fetches: Arc<AtomicUsize>,
 }
 
 /// Stands in for nginx's probe socket: answers every request with the JWKS and counts them. The
@@ -93,7 +93,7 @@ fn serve_jwks(socket: PathBuf, jwks: String) -> Arc<AtomicUsize> {
     fetches
 }
 
-async fn setup() -> Setup {
+pub(crate) async fn setup() -> Setup {
     let h = Builder::new().sections(SECTIONS).build().await;
     let issuer = TestIssuer::new("k1");
     let probe = weglarka_daemon::ingress::probe_socket_path(&h.root.join("state/nginx"));
@@ -111,7 +111,7 @@ async fn setup() -> Setup {
     }
 }
 
-async fn call(
+pub(crate) async fn call(
     socket: &PathBuf,
     method: &str,
     path: &str,

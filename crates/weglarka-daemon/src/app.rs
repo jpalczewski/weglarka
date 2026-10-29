@@ -32,6 +32,8 @@ pub struct Daemon<P: PodmanClient> {
     pub webhook_sources: Vec<Box<dyn WebhookSource>>,
     /// `None` when `weglarka.toml` configures no notification channel.
     pub notify: Option<Arc<NotifyHandle>>,
+    /// Recent domain events, served by `GET /v1/events`.
+    pub events: Arc<weglarka_model::history::EventHistory>,
     /// What the ACME worker found on its last pass; `None` when `[acme]` is absent or paused.
     pub acme: Option<Arc<crate::acme::AcmeStatus>>,
     /// Keeps generated config files current (#212); `None` when no generator is registered.

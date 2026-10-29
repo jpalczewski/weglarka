@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use weglarka_model::app::{AppsFile, Digest, InstanceName};
+use weglarka_model::app::{AppsFile, Digest};
 use weglarka_model::events::{Event, Severity};
 
 /// A ready-to-send notification.
@@ -46,39 +46,13 @@ fn tags(tags: &[&str]) -> Vec<String> {
     tags.iter().map(|t| (*t).to_owned()).collect()
 }
 
-/// The instance an event is about, when it names one.
-fn instance_of(event: &Event) -> Option<&InstanceName> {
-    match event {
-        Event::DeployOk { instance, .. }
-        | Event::Provisioned { instance, .. }
-        | Event::DeployFailed { instance, .. }
-        | Event::RolledBack { instance, .. }
-        | Event::RollbackFailed { instance, .. }
-        | Event::Recreated { instance, .. }
-        | Event::WaitingForSecret { instance, .. }
-        | Event::WaitingForDependency { instance, .. }
-        | Event::CrashLooping { instance, .. }
-        | Event::Unhealthy { instance }
-        | Event::Recovered { instance } => Some(instance),
-        Event::GeneratedConfigApplied { consumer, .. }
-        | Event::GeneratedConfigInvalid { consumer, .. }
-        | Event::GeneratedConfigRolledBack { consumer, .. } => Some(consumer),
-        Event::Pruned { .. }
-        | Event::WebhookDuplicate { .. }
-        | Event::SelfUpdated { .. }
-        | Event::SelfUpdatePending { .. }
-        | Event::SelfUpdateFellBack { .. }
-        | Event::CertificateIssued { .. }
-        | Event::CertificateRenewalFailed { .. } => None,
-    }
-}
-
 /// Renders an event; `apps` only supplies the click-through link (the app's first domain) and may be
 /// stale — a notification must never be dropped because `apps.toml` cannot be read.
 pub fn render(event: &Event, apps: &AppsFile) -> Message {
     let mut message = build(event);
     if message.click.is_none() {
-        message.click = instance_of(event)
+        message.click = event
+            .instance()
             .and_then(|instance| apps.apps.get(instance))
             .and_then(|spec| spec.domains.first())
             .map(|domain| format!("https://{domain}"));
@@ -342,6 +316,7 @@ pub fn test_message(label: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weglarka_model::app::InstanceName;
 
     fn instance() -> InstanceName {
         InstanceName::new("ntfy").unwrap()

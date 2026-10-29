@@ -44,7 +44,7 @@ revoked before it expires.
 |---|---|
 | none (no token) | `GET /v1/health` only; everything else is `401` |
 | a valid token whose groups map to no scope | nothing: `403` |
-| `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
+| `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
 `GET /v1/apps/{name}` is open to `read` but redacted: for a token without `admin` the values of `env` are blank (the keys
@@ -53,6 +53,12 @@ and do not put them in `command` or `health.command` either, which are shown as 
 container's `restarts`, its raw `health` (`starting`, `healthy` or `unhealthy`) and `started_at` (RFC 3339). The unix socket
 and `admin` tokens see the real values. The notification status (`GET /v1/notifications`) is safe at `read`: its
 `last_error` holds the daemon's own wording of the failure, never the server URL or the access token.
+
+`GET /v1/events?since=<seq>` (`read`) returns the daemon's recent domain events (deploys, rollbacks, crash loops,
+certificate and self-update events) from a bounded in-memory history of the last 256: each record has a `seq`, a UTC
+timestamp, a severity, a stable `kind`, the app and a one-line message with capped detail (the text a notification
+carries; it never contains secret values). Pass the answer's `next_seq` as `since` to get only newer events; `dropped`
+is `true` when events after `since` were evicted. The history is not persisted: a restart begins again at `seq` 1.
 
 A token whose scopes are too small, or whose groups map to no scope, gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
 not declared with a scope is refused even to an admin.

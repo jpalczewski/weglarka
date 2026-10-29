@@ -16,6 +16,7 @@ pub mod fsutil;
 pub mod generated;
 pub mod generated_state;
 pub mod hash;
+pub mod history;
 pub mod host_ports;
 pub mod identity;
 pub mod labels;
