@@ -4,17 +4,30 @@ use std::io;
 
 use axum::Router;
 use tokio::net::TcpListener;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
-/// Resolves on the first SIGTERM or SIGINT.
-pub async fn shutdown_signal() -> io::Result<()> {
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    tokio::select! {
-        _ = term.recv() => tracing::info!("SIGTERM received, shutting down"),
-        _ = int.recv() => tracing::info!("SIGINT received, shutting down"),
+/// SIGTERM and SIGINT handlers. Installing them is separate from waiting, so a failure to install
+/// stops startup instead of looking like a shutdown request.
+pub struct Shutdown {
+    term: Signal,
+    int: Signal,
+}
+
+impl Shutdown {
+    pub fn install() -> io::Result<Self> {
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
     }
-    Ok(())
+
+    /// Resolves on the first SIGTERM or SIGINT.
+    pub async fn wait(mut self) {
+        tokio::select! {
+            _ = self.term.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = self.int.recv() => tracing::info!("SIGINT received, shutting down"),
+        }
+    }
 }
 
 /// Serves `app` until `stop` resolves; in-flight requests finish first.

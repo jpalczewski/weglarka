@@ -65,6 +65,8 @@ pub struct Call {
     endpoint: &'static Endpoint,
     params: Vec<(&'static str, String)>,
     query: Vec<(&'static str, String)>,
+    /// `None` = the client's default deadline; `Some(None)` = no deadline.
+    timeout: Option<Option<Duration>>,
 }
 
 impl Call {
@@ -73,7 +75,16 @@ impl Call {
             endpoint,
             params: Vec::new(),
             query: Vec::new(),
+            timeout: None,
         }
+    }
+
+    /// Overrides the client's deadline for this call; `None` waits without a limit. For operations
+    /// that legitimately take long (a deploy behind the health gate): dropping the connection
+    /// mid-operation would leave the user told "failed" while the daemon may still be working.
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Fills `{name}` in the endpoint's path.
@@ -140,7 +151,7 @@ impl DaemonClient {
     /// `timeout` bounds every exchange after connecting (connecting has its own limit).
     pub fn new(socket: impl Into<std::path::PathBuf>, timeout: Duration) -> Self {
         Self {
-            http: UnixClient::new(socket).with_head_timeout(Some(timeout)),
+            http: UnixClient::new(socket),
             timeout,
         }
     }
@@ -149,7 +160,8 @@ impl DaemonClient {
         Self::new(config.socket.clone(), config.request_timeout)
     }
 
-    /// Sends `call` with `token` and decodes a JSON success body as `R`.
+    /// Sends `call` with `token` and decodes a JSON success body as `R`. For endpoints that answer
+    /// `204 No Content` use [`Self::send_empty`].
     pub async fn send<R: DeserializeOwned>(
         &self,
         token: &Secret,
@@ -160,6 +172,11 @@ impl DaemonClient {
             line: e.line(),
             column: e.column(),
         })
+    }
+
+    /// Sends `call` and ignores the success body (`204 No Content` endpoints).
+    pub async fn send_empty(&self, token: &Secret, call: &Call) -> Result<(), DaemonError> {
+        self.send_raw(token, call).await.map(drop)
     }
 
     /// Like [`Self::send`] but returns the raw success body.
@@ -178,7 +195,9 @@ impl DaemonClient {
             .body(Empty::<Bytes>::new())
             .map_err(|_| DaemonError::InvalidRequest("malformed request".into()))?;
 
-        let reply = self.http.buffered(request, Some(self.timeout)).await?;
+        let deadline = call.timeout.unwrap_or(Some(self.timeout));
+        let http = self.http.clone().with_head_timeout(deadline);
+        let reply = http.buffered(request, deadline).await?;
         let status = reply.status.as_u16();
         if reply.status.is_success() {
             Ok(reply.body)

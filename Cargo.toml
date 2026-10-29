@@ -38,7 +38,7 @@ weglarka-unix-http = { path = "crates/weglarka-unix-http", version = "0.0" }
 anyhow = "1"
 # Panel templates (docs/decisions/0057): compile-time checked, auto-escaping HTML, no runtime template parsing. Exact pin.
 askama = { version = "=0.16.1", default-features = false, features = ["derive", "std"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "matched-path", "query", "form"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "matched-path"] }
 base64 = "0.22"
 # No `color` (anstream and friends): plain help output is enough for a CLI run over SSH.
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }

@@ -9,6 +9,10 @@ use axum::http::header::{
 use axum::middleware::Next;
 use axum::response::Response;
 
+/// `form-action 'self'` also applies to the redirects a form submission is answered with (Chromium),
+/// so a POST (logout) must not answer 302 to the identity provider: end the local session and
+/// give the browser a GET link or `HX-Redirect` instead.
+///
 /// ADR 0057, decision 2: no inline script or style, no eval, no framing, forms and `<base>` pinned.
 pub const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'";
 

@@ -152,3 +152,31 @@ async fn a_token_that_is_not_a_header_value_never_leaves_the_process() {
     assert!(!err.to_string().contains("break"));
     assert!(daemon.seen.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn no_content_is_success_for_send_empty() {
+    let daemon = mock(|_, _| (204, String::new())).await;
+    client(&daemon)
+        .send_empty(&Secret::new(TOKEN), &Call::new(&APPS_LIST))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_call_can_override_the_deadline() {
+    let daemon =
+        mock_with(|_, _| Reply::new(200, "{}").head_delay(Duration::from_millis(400))).await;
+    let short = DaemonClient::new(&*daemon, Duration::from_millis(100));
+    let token = Secret::new(TOKEN);
+    let slow = Call::new(&APPS_LIST);
+    assert!(matches!(
+        short.send::<serde_json::Value>(&token, &slow).await,
+        Err(DaemonError::Timeout)
+    ));
+    // The same client waits for a call that opts out of the deadline.
+    let patient = Call::new(&APPS_LIST).timeout(None);
+    short
+        .send::<serde_json::Value>(&token, &patient)
+        .await
+        .unwrap();
+}

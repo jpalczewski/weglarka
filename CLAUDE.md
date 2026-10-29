@@ -117,7 +117,7 @@ robi `fetch`, więc worktree powstaje **przed** pierwszą edycją.
 ## Mapa crate'ów
 
 Zależności: `api → model`; `podman → model`; `ingress → model`; `notify → model, http`; `registry → model, http`; `dns → model, http`; `acme → model`; `identity → model`; `http → (nic z Węglarki)`; `unix-http → (nic z Węglarki)`; `engine → model`; `acme → dns`;
-`cli → api, model, engine, unix-http`; `panel → api, model, http, unix-http`; `daemon → wszystko` (poza `panel`). Liście (api, ingress, notify, acme, podman, dns, registry, panel) nie zależą od `engine` — nie dodawaj im jej (większość zależy **tylko od modelu**); od `panel` nie zależy żaden crate (ADR 0057).
+`cli → api, model, engine, unix-http`; `panel → api, unix-http` (OIDC doda `http`); `daemon → wszystko` (poza `panel`). Liście (api, ingress, notify, acme, podman, dns, registry, panel) nie zależą od `engine` — nie dodawaj im jej (większość zależy **tylko od modelu**); od `panel` nie zależy żaden crate (ADR 0057).
 
 | Crate | Zawartość |
 |---|---|

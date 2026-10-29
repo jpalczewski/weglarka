@@ -41,14 +41,14 @@ for banned in aws-lc-rs aws-lc-sys openssl-sys native-tls weglarka-engine; do
   fi
 done
 
-# Nothing may depend on the panel: it is a leaf binary, and the daemon works with it gone.
-for crate in $(cargo metadata --format-version 1 --no-deps | grep -o '"name":"weglarka-[a-z-]*"' | cut -d'"' -f4); do
-  [ "$crate" = weglarka-panel ] && continue
-  if cargo tree -p "$crate" -e normal --prefix none | grep -q '^weglarka-panel v'; then
-    echo "error: '$crate' depends on weglarka-panel" >&2
-    status=1
-  fi
-done
+# Nothing may depend on the panel: it is a leaf binary, and the daemon works with it gone. `-i` lists
+# the panel and everything that reaches it; the panel alone is the passing answer.
+dependents=$(cargo tree --workspace -i weglarka-panel -e normal --prefix none | grep -v '^weglarka-panel v' || true)
+if [ -n "$dependents" ]; then
+  echo "error: these crates depend on weglarka-panel:" >&2
+  echo "$dependents" >&2
+  status=1
+fi
 
 [ "$status" -eq 0 ] && echo "dependency guards passed"
 exit "$status"

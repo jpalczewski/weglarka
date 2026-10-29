@@ -26,9 +26,8 @@ pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_TIMEOUT_SECS: u64 = 120;
 
-/// A secret string. `Debug` never shows it and there is no `Display`, `Serialize` or `Clone`
-/// into a loggable form: the only way out is [`Secret::expose`].
-#[derive(Clone, PartialEq, Eq)]
+/// A secret string. `Debug` never shows it; there is no `Display`, `Serialize`, `Clone` or `==`
+/// (a derived comparison is not constant-time): the only way out is [`Secret::expose`].
 pub struct Secret(String);
 
 impl Secret {
@@ -64,15 +63,17 @@ fn invalid(var: &'static str, reason: impl Into<String>) -> ConfigError {
 }
 
 /// The OIDC confidential client the panel logs users in with (docs/decisions/0057, decision 4).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OidcConfig {
     pub client_id: String,
     pub client_secret: Secret,
-    /// The provider's public https URL, without a trailing slash.
-    pub issuer: Url,
+    /// The provider's public https URL exactly as configured (whitespace trimmed, nothing else):
+    /// the issuer identifier is compared byte for byte with the token's `iss`, so it is never
+    /// normalized.
+    pub issuer: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PanelConfig {
     pub listen: SocketAddr,
     /// The panel's own public origin; the login redirect URI is derived from it.
@@ -96,7 +97,8 @@ impl PanelConfig {
             .map_err(|_| invalid(ENV_LISTEN, "expected <address>:<port>"))?;
 
         let public_url = parse_url(ENV_PUBLIC_URL, &required(ENV_PUBLIC_URL)?, true)?;
-        let issuer = parse_url(ENV_ISSUER, &required(ENV_ISSUER)?, false)?;
+        let issuer = required(ENV_ISSUER)?.trim().to_owned();
+        parse_url(ENV_ISSUER, &issuer, false)?;
 
         let socket = get(ENV_SOCKET).unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
         if !socket.starts_with('/') {
@@ -130,7 +132,8 @@ impl PanelConfig {
     }
 }
 
-/// An absolute `https` URL with no credentials, query or fragment and no trailing slash.
+/// An absolute `https` URL with no credentials, query or fragment; a trailing slash on the path
+/// is dropped (a host-only URL still prints with its `/`, as [`Url`] always does).
 /// `allow_loopback_http` additionally accepts plain `http` for a loopback host (local development).
 fn parse_url(var: &'static str, raw: &str, allow_loopback_http: bool) -> Result<Url, ConfigError> {
     let mut url = Url::parse(raw.trim()).map_err(|_| invalid(var, "not a valid URL"))?;
@@ -182,6 +185,17 @@ mod tests {
         assert_eq!(c.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(c.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(c.public_url.as_str(), "https://panel.example.com/");
+    }
+
+    #[test]
+    fn the_issuer_is_kept_exactly_as_configured() {
+        for raw in [
+            "https://auth.example.com",
+            "https://auth.example.com/tenant/",
+        ] {
+            let c = PanelConfig::from_lookup(env(&[(ENV_ISSUER, &format!(" {raw}\n"))])).unwrap();
+            assert_eq!(c.oidc.issuer, raw);
+        }
     }
 
     #[test]

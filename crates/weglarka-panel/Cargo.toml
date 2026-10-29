@@ -33,8 +33,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 weglarka-api.workspace = true
-weglarka-http.workspace = true
-weglarka-model.workspace = true
 weglarka-unix-http.workspace = true
 
 [dev-dependencies]
