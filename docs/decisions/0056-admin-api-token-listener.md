@@ -59,9 +59,11 @@ Constraints: security first, then one implementation for both listeners (traits 
    - Lifetime: tokens are short (Authelia `lifespans.access_token`, at most 15 minutes), because a JWT cannot be revoked
      mid-life. **Introspection** (`/api/oidc/introspection`) would give real revocation at the price of a provider call
      per request and a daemon client; it is the documented fallback if revocation ever matters more than that dependency.
-   - **Not yet verified against a real provider:** that Authelia stamps `typ: at+jwt` on its JWT access tokens. The check
-     follows RFC 9068, and a mismatch would show as every token refused with `typ is not at+jwt` in the daemon log. The
-     first real deployment must confirm it, and this line comes out when it has.
+   - **Verified against a real provider** (2026-10-29, `authelia/authelia:4.39.22`, authorization-code flow, confidential
+     client with `access_token_signed_response_alg: RS256` and a claims policy putting `groups` into the access token): the
+     JWT access token's header is `{alg: RS256, kid, typ: at+jwt}`, its claims include `iss`, `aud` (the configured
+     audience only, not the client id), `exp`, `sub` and `groups`, and `kid` matches the key in `jwks.json`. A different
+     Authelia version should be re-checked; a mismatch would show as every token refused with `typ is not at+jwt`.
 6. **Groups become scopes.** There are two scopes, `read` and `admin` (`admin` includes `read`). The client's claims
    policy puts the `groups` claim into the access token (`groups_in_access_token`, ADR 0051); `[admin.http] read_groups`
    and `admin_groups` map groups to scopes. A genuine token whose groups map to nothing is authenticated but not authorized: `403`, not `401`. There are no custom provider
