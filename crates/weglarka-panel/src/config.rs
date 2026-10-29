@@ -19,6 +19,7 @@ pub const ENV_LISTEN: &str = "PANEL_LISTEN";
 pub const ENV_SOCKET: &str = "WEGLARKA_PANEL_SOCKET";
 pub const ENV_TIMEOUT_SECS: &str = "PANEL_REQUEST_TIMEOUT_SECS";
 pub const ENV_CLIENT_SECRET_FILE: &str = "OIDC_CLIENT_SECRET_FILE";
+pub const ENV_ENDPOINT_HOSTS: &str = "OIDC_ENDPOINT_HOSTS";
 pub const ENV_API_AUDIENCE: &str = "PANEL_API_AUDIENCE";
 pub const ENV_SESSION_IDLE_SECS: &str = "PANEL_SESSION_IDLE_SECS";
 pub const ENV_SESSION_MAX_SECS: &str = "PANEL_SESSION_MAX_SECS";
@@ -86,6 +87,10 @@ pub struct OidcConfig {
     /// The `aud` the daemon expects of an access token (`[admin.http] audience`); sent in the
     /// authorization request so the provider mints tokens the daemon accepts.
     pub audience: String,
+    /// Hosts, besides the issuer's own, that the discovery document may name for `token_endpoint`
+    /// and `jwks_uri` (`OIDC_ENDPOINT_HOSTS`). Empty by default: the client secret is sent to the
+    /// token endpoint, so a discovery document must not be able to point it at another host.
+    pub extra_endpoint_hosts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -135,6 +140,7 @@ impl PanelConfig {
                 "expected a short single-line identifier",
             ));
         }
+        let extra_endpoint_hosts = endpoint_hosts(get(ENV_ENDPOINT_HOSTS))?;
         let client_secret = client_secret(&get)?;
 
         let socket = get(ENV_SOCKET).unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
@@ -186,9 +192,35 @@ impl PanelConfig {
                 client_secret,
                 issuer,
                 audience,
+                extra_endpoint_hosts,
             },
         })
     }
+}
+
+/// `OIDC_ENDPOINT_HOSTS`: comma-separated host names (no scheme, port or path), lower-cased.
+fn endpoint_hosts(raw: Option<String>) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(|host| {
+            let host = host.trim().to_ascii_lowercase();
+            let ok = !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+            if ok {
+                Ok(host)
+            } else {
+                Err(invalid(
+                    ENV_ENDPOINT_HOSTS,
+                    "expected comma-separated host names",
+                ))
+            }
+        })
+        .collect()
 }
 
 /// The client secret: `OIDC_CLIENT_SECRET`, or the first line of the file `OIDC_CLIENT_SECRET_FILE`
@@ -364,6 +396,32 @@ mod tests {
         }
         // `localhost` is a name: the OIDC client would refuse it, so startup does too.
         assert!(PanelConfig::from_lookup(env(&[(ENV_ISSUER, "http://localhost:9091")])).is_err());
+    }
+
+    #[test]
+    fn extra_endpoint_hosts_are_host_names_only() {
+        let with = |hosts: &str| {
+            let hosts = hosts.to_owned();
+            PanelConfig::from_lookup(move |var| match var {
+                ENV_ENDPOINT_HOSTS => Some(hosts.clone()),
+                ENV_CLIENT_ID => Some("panel".into()),
+                ENV_CLIENT_SECRET => Some("s".into()),
+                ENV_ISSUER => Some("https://auth.example.com".into()),
+                ENV_PUBLIC_URL => Some("https://panel.example.com".into()),
+                ENV_API_AUDIENCE => Some("https://admin.example.com/api/".into()),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            with("Tokens.Example.org, keys.example.org")
+                .unwrap()
+                .oidc
+                .extra_endpoint_hosts,
+            ["tokens.example.org", "keys.example.org"]
+        );
+        for bad in ["https://x.example.org", "x.example.org:443", "a,,b", "x/y"] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ http-body-util.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net"] }
 tracing.workspace = true

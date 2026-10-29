@@ -2,11 +2,8 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-// ring marks this deprecated ("not intended for external use") but offers no replacement; it is its
-// constant-time slice comparison, and what the CSRF/state checks need.
-#[allow(deprecated)]
-use ring::constant_time::verify_slices_are_equal;
 use ring::rand::{SecureRandom, SystemRandom};
+use subtle::ConstantTimeEq;
 
 /// `bytes` random bytes from the OS, base64url without padding. The system generator failing means
 /// the host cannot give out randomness at all; nothing safe can continue, so this panics.
@@ -24,9 +21,8 @@ pub fn random_token() -> String {
 }
 
 /// Equality that does not stop at the first differing byte (the length is not secret).
-#[allow(deprecated)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 #[cfg(test)]

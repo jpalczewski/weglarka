@@ -69,6 +69,7 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+subtle = { version = "2", default-features = false }
 thiserror = "2"
 # No `xattr` (pulls in rustix): extraction never restores extended attributes.
 tar = { version = "0.4", default-features = false }

@@ -109,13 +109,17 @@ async fn index(
         .await
     {
         Ok(list) => format!("The daemon answers: {} app(s).", list.apps.len()),
-        Err(DaemonError::Unauthorized) => {
-            return ErrorPage {
+        // The listing needs the lowest scope: refused here means the daemon gives this identity
+        // no access at all (no group, or a token it no longer accepts), so the session ends.
+        Err(DaemonError::Unauthorized | DaemonError::Forbidden) => {
+            let mut response = ErrorPage {
                 title: "Sign-in required",
-                message: "The daemon no longer accepts your session.",
+                message: "The daemon does not accept your session.",
                 sign_in: Some("/auth/login"),
             }
             .respond(StatusCode::UNAUTHORIZED);
+            response.extensions_mut().insert(auth::EndSession);
+            return response;
         }
         Err(e) => format!("The daemon says: {e}."),
     };
