@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.4...weglarka-podman-v0.0.5) - 2026-10-29
+
+### Added
+
+- *(daemon)* app logs stream ([#287](https://github.com/jpalczewski/weglarka/pull/287))
+- *(api)* redacted app view and runtime detail ([#252](https://github.com/jpalczewski/weglarka/pull/252))
+
+### Fixed
+
+- *(daemon)* logs stream review follow-ups ([#304](https://github.com/jpalczewski/weglarka/pull/304))
+
 ## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.3...weglarka-podman-v0.0.4) - 2026-10-29
 
 ### Other
