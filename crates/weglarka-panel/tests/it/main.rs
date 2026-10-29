@@ -2,3 +2,5 @@
 
 mod app;
 mod daemon;
+mod harness;
+mod process;
