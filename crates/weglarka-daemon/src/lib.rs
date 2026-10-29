@@ -21,6 +21,7 @@ pub mod health_probe;
 pub mod identity;
 pub mod images;
 pub mod ingress;
+pub mod logs;
 pub mod platform;
 /// `PUT /v1/apps/{name}/image`: deploy an image archive built elsewhere (issue #109).
 pub mod push;
@@ -32,6 +33,7 @@ pub mod settings;
 pub mod shared_networks;
 pub mod shared_volumes;
 pub mod sites;
+mod stream;
 /// Host-side watchdog of a switch in flight: the automatic fallback of issue #100
 /// (`docs/decisions/0034`).
 pub mod supervise;

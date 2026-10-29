@@ -19,7 +19,9 @@ use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use crate::secrets::materialize;
 use weglarka_model::app::InstanceName;
 use weglarka_model::labels;
-use weglarka_model::podman::{ContainerFilter, ContainerSpec, LogChunk, PodmanClient, PodmanError};
+use weglarka_model::podman::{
+    ContainerFilter, ContainerSpec, LogChunk, LogOptions, PodmanClient, PodmanError,
+};
 use weglarka_model::state;
 
 /// How many one-off containers may run at once, across all apps.
@@ -212,7 +214,16 @@ impl<P: PodmanClient> Reconciler<P> {
         out: &mpsc::Sender<LogChunk>,
     ) -> Result<RunOutcome, EngineError> {
         self.podman.container_start(name).await?;
-        let mut logs = self.podman.container_logs(name, true).await?;
+        let mut logs = self
+            .podman
+            .container_logs(
+                name,
+                &LogOptions {
+                    follow: true,
+                    ..LogOptions::default()
+                },
+            )
+            .await?;
         let wait = self.podman.container_wait(name);
         tokio::pin!(wait);
         let deadline = tokio::time::sleep(timeout);

@@ -531,7 +531,7 @@ async fn volume_calls_use_libpod_paths_and_map_results() {
 /// returns the exit code, whichever of libpod's two shapes it answers in.
 #[tokio::test]
 async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
-    use weglarka_model::podman::LogSource;
+    use weglarka_model::podman::{LogOptions, LogSource};
     let mock = serve(vec![
         (
             "GET /v6.0.0/libpod/containers/job/logs",
@@ -546,7 +546,16 @@ async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
         ),
     ]);
     let client = LibpodClient::new(&mock.socket);
-    let mut logs = client.container_logs("job", true).await.unwrap();
+    let mut logs = client
+        .container_logs(
+            "job",
+            &LogOptions {
+                follow: true,
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
     let mut got = Vec::new();
     while let Some(chunk) = logs.next().await {
         let chunk = chunk.unwrap();
@@ -579,5 +588,20 @@ async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
             .iter()
             .any(|r| r.contains("wait?condition=stopped&condition=exited")),
         "{requests:?}"
+    );
+
+    let selective = LogOptions {
+        follow: false,
+        tail: Some(50),
+        since: Some(std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 500_000_000)),
+        timestamps: true,
+    };
+    let _ = client.container_logs("job", &selective).await.unwrap();
+    assert!(
+        mock.requests().iter().any(|r| r.contains(
+            "logs?stdout=true&stderr=true&follow=false&tail=50&since=1700000000.500000000&timestamps=true"
+        )),
+        "{:?}",
+        mock.requests()
     );
 }

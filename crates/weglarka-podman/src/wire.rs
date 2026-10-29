@@ -989,6 +989,17 @@ impl LogDemux {
     }
 }
 
+/// An instant as libpod's `since` takes it: fractional unix seconds (`1700000000.250000000`);
+/// before the epoch it is `0`.
+pub(crate) fn unix_seconds(at: std::time::SystemTime) -> String {
+    let since_epoch = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!(
+        "{}.{:09}",
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos()
+    )
+}
+
 /// `POST /containers/{name}/wait` answers with the bare exit code (libpod) or `{"StatusCode": n}`
 /// (the Docker-compatible shape); accept both.
 pub(crate) fn parse_wait(body: &[u8]) -> Result<i32, PodmanError> {
@@ -1008,6 +1019,20 @@ mod tests {
     use weglarka_model::podman::{PortMapping as DomainPort, SecretAttachment};
 
     use super::*;
+
+    #[test]
+    fn since_is_fractional_unix_seconds() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000)),
+            "1700000000.250000000"
+        );
+        assert_eq!(unix_seconds(UNIX_EPOCH), "0.000000000");
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH - Duration::from_secs(5)),
+            "0.000000000"
+        );
+    }
 
     macro_rules! fixture {
         ($name:literal) => {

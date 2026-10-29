@@ -1,13 +1,13 @@
 //! `POST /v1/apps/{name}/forward` (issue #108, ADR 0041): the request and the framed response stream.
 //!
-//! Same framing as a run stream (`kind (u8) | length (u32 BE) | payload`) with its own kinds. Errors that
+//! Same framing as a run stream ([`crate::frame`]) with its own kinds. Errors that
 //! happen before the relay starts are ordinary JSON [`ApiError`](crate::ApiError)s with an HTTP status;
 //! once the stream has begun the status is already sent, so the end is always a final frame — or the
 //! client hanging up, which is how a forward normally ends.
 
 use serde::{Deserialize, Serialize};
 
-use crate::run::{FrameError, MAX_FRAME_PAYLOAD};
+use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
 
 /// `Content-Type` of a forward response stream.
 pub const FORWARD_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.forward-stream";
@@ -32,6 +32,9 @@ pub enum ForwardFrame {
     Keepalive,
     /// The forward ended after `timeout_secs`; the last frame.
     TimedOut,
+    /// The token that opened the stream expired and the relay was removed; the last frame (only on the
+    /// token listener).
+    TokenExpired,
     /// The relay failed after the stream had started; the last frame.
     Error(String),
 }
@@ -40,65 +43,47 @@ const READY: u8 = 1;
 const KEEPALIVE: u8 = 2;
 const TIMED_OUT: u8 = 3;
 const ERROR: u8 = 4;
+const TOKEN_EXPIRED: u8 = 5;
 
 impl ForwardFrame {
+    /// `kind (1 byte) | payload length (u32, big endian) | payload`.
     pub fn encode(&self) -> Vec<u8> {
-        let (kind, payload): (u8, Vec<u8>) = match self {
+        let (kind, payload) = self.parts();
+        encode_frame(kind, &payload)
+    }
+}
+
+impl FrameKind for ForwardFrame {
+    fn parts(&self) -> (u8, Vec<u8>) {
+        match self {
             Self::Ready { host_port } => (READY, host_port.to_be_bytes().to_vec()),
             Self::Keepalive => (KEEPALIVE, Vec::new()),
             Self::TimedOut => (TIMED_OUT, Vec::new()),
+            Self::TokenExpired => (TOKEN_EXPIRED, Vec::new()),
             Self::Error(message) => (ERROR, message.clone().into_bytes()),
-        };
-        let mut out = Vec::with_capacity(5 + payload.len());
-        out.push(kind);
-        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        out.extend_from_slice(&payload);
-        out
+        }
+    }
+
+    fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError> {
+        Ok(match kind {
+            READY => Self::Ready {
+                host_port: u16::from_be_bytes(
+                    payload
+                        .try_into()
+                        .map_err(|_| FrameError::Malformed("ready"))?,
+                ),
+            },
+            KEEPALIVE => Self::Keepalive,
+            TIMED_OUT => Self::TimedOut,
+            TOKEN_EXPIRED => Self::TokenExpired,
+            ERROR => Self::Error(String::from_utf8_lossy(&payload).into_owned()),
+            other => return Err(FrameError::UnknownKind(other)),
+        })
     }
 }
 
 /// Reassembles [`ForwardFrame`]s from a byte stream cut anywhere.
-#[derive(Debug, Default)]
-pub struct ForwardFrameDecoder {
-    buf: Vec<u8>,
-}
-
-impl ForwardFrameDecoder {
-    pub fn push(&mut self, data: &[u8]) -> Result<Vec<ForwardFrame>, FrameError> {
-        self.buf.extend_from_slice(data);
-        let mut frames = Vec::new();
-        while let Some(&[kind, a, b, c, d]) = self.buf.first_chunk::<5>() {
-            let len = u32::from_be_bytes([a, b, c, d]) as usize;
-            if len > MAX_FRAME_PAYLOAD {
-                return Err(FrameError::TooLarge(len));
-            }
-            if self.buf.len() < 5 + len {
-                break;
-            }
-            let payload = self.buf[5..5 + len].to_vec();
-            self.buf.drain(..5 + len);
-            frames.push(match kind {
-                READY => ForwardFrame::Ready {
-                    host_port: u16::from_be_bytes(
-                        payload
-                            .try_into()
-                            .map_err(|_| FrameError::Malformed("ready"))?,
-                    ),
-                },
-                KEEPALIVE => ForwardFrame::Keepalive,
-                TIMED_OUT => ForwardFrame::TimedOut,
-                ERROR => ForwardFrame::Error(String::from_utf8_lossy(&payload).into_owned()),
-                other => return Err(FrameError::UnknownKind(other)),
-            });
-        }
-        Ok(frames)
-    }
-
-    /// The stream ended inside a frame.
-    pub fn is_clean(&self) -> bool {
-        self.buf.is_empty()
-    }
-}
+pub type ForwardFrameDecoder = FrameDecoder<ForwardFrame>;
 
 #[cfg(test)]
 mod tests {
@@ -109,6 +94,7 @@ mod tests {
             ForwardFrame::Ready { host_port: 43211 },
             ForwardFrame::Keepalive,
             ForwardFrame::TimedOut,
+            ForwardFrame::TokenExpired,
             ForwardFrame::Error("cannot start relay".into()),
         ]
     }

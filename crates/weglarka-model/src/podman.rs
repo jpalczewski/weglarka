@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::IpAddr;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -266,6 +267,22 @@ pub struct LogChunk {
 
 pub type LogStream = BoxStream<'static, Result<LogChunk>>;
 
+/// What [`PodmanClient::container_logs`] returns; the default is the whole log so far, without
+/// timestamps (what `weglarka run` reads).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogOptions {
+    /// Keep the stream open and deliver new output until the container exits or the stream is dropped.
+    pub follow: bool,
+    /// Only the last this many lines; `None` = all.
+    pub tail: Option<u32>,
+    /// Only output written at or after this instant (inclusive, so a reconnect that passes the time of
+    /// the last line it saw gets that line again: delivery across reconnects is at-least-once);
+    /// `None` = from the beginning.
+    pub since: Option<SystemTime>,
+    /// Prefix every line with its RFC 3339 timestamp (part of the delivered bytes).
+    pub timestamps: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
     Created,
@@ -458,13 +475,13 @@ pub trait PodmanClient: Send + Sync {
         name: &str,
         cmd: &[String],
     ) -> impl Future<Output = Result<i32>> + Send;
-    /// The container's output from the beginning; with `follow` the stream stays open until the
-    /// container exits (one-off `weglarka run`). Containers here have no TTY, so stdout and stderr
-    /// arrive separated.
+    /// The container's output as selected by `options`; with `follow` the stream stays open until the
+    /// container exits or the stream is dropped (one-off `weglarka run`, the admin logs stream).
+    /// Containers here have no TTY, so stdout and stderr arrive separated.
     fn container_logs(
         &self,
         name: &str,
-        follow: bool,
+        options: &LogOptions,
     ) -> impl Future<Output = Result<LogStream>> + Send;
     /// Blocks until the container has stopped and returns its exit code. `NotFound` if missing.
     fn container_wait(&self, name: &str) -> impl Future<Output = Result<i32>> + Send;
