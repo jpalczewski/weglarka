@@ -11,8 +11,8 @@ use tokio::time::timeout;
 use weglarka_model::app::SecretTarget;
 use weglarka_model::podman::{
     ContainerFilter, ContainerSpec, ContainerState, EventFilter, EventKind, HealthStatus,
-    LogSource, NetworkSpec, PodmanClient, PodmanError, PortMapping, PullEvent, RestartPolicy,
-    SecretAttachment,
+    LogOptions, LogSource, NetworkSpec, PodmanClient, PodmanError, PortMapping, PullEvent,
+    RestartPolicy, SecretAttachment,
 };
 use weglarka_podman::LibpodClient;
 
@@ -632,10 +632,19 @@ async fn one_off_container_streams_its_output_and_reports_the_exit_code() {
     client.container_create(&s).await.unwrap();
     client.container_start(&name).await.unwrap();
 
-    let mut logs = timeout(STEP, client.container_logs(&name, true))
-        .await
-        .unwrap()
-        .unwrap();
+    let mut logs = timeout(
+        STEP,
+        client.container_logs(
+            &name,
+            &LogOptions {
+                follow: true,
+                ..LogOptions::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let (mut stdout, mut stderr) = (String::new(), String::new());
     while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
         let chunk = chunk.unwrap();
@@ -653,6 +662,55 @@ async fn one_off_container_streams_its_output_and_reports_the_exit_code() {
             .unwrap(),
         3
     );
+
+    // The admin logs stream hands `tail`, `since` and `timestamps` to libpod as they are.
+    async fn collect(client: &LibpodClient, name: &str, options: LogOptions) -> String {
+        let mut logs = timeout(STEP, client.container_logs(name, &options))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
+            text.push_str(std::str::from_utf8(&chunk.unwrap().data).unwrap());
+        }
+        text
+    }
+    let tail = collect(
+        &client,
+        &name,
+        LogOptions {
+            tail: Some(1),
+            ..LogOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(tail.lines().count(), 1, "{tail:?}");
+    let stamped = collect(
+        &client,
+        &name,
+        LogOptions {
+            timestamps: true,
+            ..LogOptions::default()
+        },
+    )
+    .await;
+    // `2026-01-01T00:00:00.000000000Z out`
+    assert!(
+        stamped
+            .lines()
+            .all(|l| l.split_once(' ').is_some_and(|(ts, _)| ts.contains('T'))),
+        "{stamped:?}"
+    );
+    let future = collect(
+        &client,
+        &name,
+        LogOptions {
+            since: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+            ..LogOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(future, "");
 
     client.container_remove(&name, true).await.unwrap();
     assert!(matches!(

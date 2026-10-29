@@ -229,6 +229,7 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         .merge(shared_networks::routes())
         .merge(sites::routes())
         .merge(crate::events::routes())
+        .merge(crate::logs::routes())
         .merge(crate::identity::routes())
         .merge(images::routes())
         .merge(push::routes()) // a streamed archive, like the volume tars
@@ -787,19 +788,10 @@ async fn run_app<P: PodmanClient + 'static>(
         }
     });
 
-    let stream = futures_util::stream::unfold(frames_rx, |mut rx| async move {
-        rx.recv()
-            .await
-            .map(|frame| (Ok::<_, std::convert::Infallible>(frame), rx))
-    });
-    Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            weglarka_api::RUN_STREAM_CONTENT_TYPE,
-        )],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response())
+    Ok(crate::stream::stream_response(
+        weglarka_api::RUN_STREAM_CONTENT_TYPE,
+        frames_rx,
+    ))
 }
 
 // ── Secrets ──────────────────────────────────────────────────────────────────

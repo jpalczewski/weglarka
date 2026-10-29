@@ -3,17 +3,19 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use futures_core::Stream;
+use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use sha2::{Digest as _, Sha256};
 
 use weglarka_model::app::Digest;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, LoadedImage, LogChunk, LogSource, LogStream, NetworkInfo, NetworkSpec,
+    ImageInfo, LoadedImage, LogChunk, LogOptions, LogSource, LogStream, NetworkInfo, NetworkSpec,
     NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result,
     TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
@@ -67,7 +69,7 @@ pub enum Call {
     },
     ContainerLogs {
         name: String,
-        follow: bool,
+        options: LogOptions,
     },
     ContainerWait(String),
     SecretCreate(String),
@@ -93,6 +95,31 @@ pub struct RunScript {
     pub hang: bool,
 }
 
+/// What a running container's log holds, scripted with [`FakePodman::script_logs`]; unlike a
+/// [`RunScript`] it is not consumed by `container_start`.
+#[derive(Debug, Clone, Default)]
+pub struct LogScript {
+    pub output: Vec<(LogSource, Vec<u8>)>,
+    /// A `follow` stream stays open (and silent) after the output, until the consumer drops it.
+    pub hold_open: bool,
+}
+
+/// Counts a held-open log stream while it is alive.
+struct OpenLogStream(Arc<AtomicUsize>);
+
+impl OpenLogStream {
+    fn new(open: Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::SeqCst);
+        Self(open)
+    }
+}
+
+impl Drop for OpenLogStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// `ContainerInfo::started_at` of every container the fake has started.
 pub const FAKE_STARTED_AT: &str = "2026-01-01T00:00:00Z";
 
@@ -102,6 +129,10 @@ struct State {
     run_queue: VecDeque<RunScript>,
     /// Script of each started container.
     run_scripts: BTreeMap<String, RunScript>,
+    /// Logs scripted per container name ([`FakePodman::script_logs`]).
+    log_scripts: BTreeMap<String, LogScript>,
+    /// Held-open follow streams that have not been dropped yet.
+    open_log_streams: Arc<AtomicUsize>,
     containers: BTreeMap<String, ContainerInfo>,
     /// reference → image
     images: BTreeMap<String, ImageInfo>,
@@ -293,6 +324,18 @@ impl FakePodman {
     /// (reported by `container_wait`); without a script it exits 0 silently.
     pub fn script_next_run(&self, script: RunScript) {
         self.lock().run_queue.push_back(script);
+    }
+
+    /// What the log of the (running) container `name` holds, for `container_logs`; replaces an earlier
+    /// script and is not consumed by reading.
+    pub fn script_logs(&self, name: &str, script: LogScript) {
+        self.lock().log_scripts.insert(name.to_owned(), script);
+    }
+
+    /// How many held-open `follow` log streams ([`LogScript::hold_open`]) are alive: a consumer that
+    /// went away must bring this back to 0.
+    pub fn open_log_streams(&self) -> usize {
+        self.lock().open_log_streams.load(Ordering::SeqCst)
     }
 
     /// The next `image_load` names its image `names` (as the archive would); without a script the
@@ -638,19 +681,21 @@ impl PodmanClient for FakePodman {
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
     }
 
-    async fn container_logs(&self, name: &str, follow: bool) -> Result<LogStream> {
+    async fn container_logs(&self, name: &str, options: &LogOptions) -> Result<LogStream> {
         let mut s = self.lock();
         s.calls.push(Call::ContainerLogs {
             name: name.to_owned(),
-            follow,
+            options: *options,
         });
         s.container_mut(name)?;
-        let chunks: Vec<Result<LogChunk>> = s
-            .run_scripts
-            .get(name)
-            .map(|script| {
-                script
-                    .output
+        // A log scripted for the container wins over what a one-off run printed.
+        let output = match s.log_scripts.get(name) {
+            Some(script) => Some(&script.output),
+            None => s.run_scripts.get(name).map(|script| &script.output),
+        };
+        let chunks: Vec<Result<LogChunk>> = output
+            .map(|output| {
+                output
                     .iter()
                     .map(|(source, data)| {
                         Ok(LogChunk {
@@ -661,7 +706,25 @@ impl PodmanClient for FakePodman {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(stream::iter(chunks).boxed())
+        let hold = options.follow
+            && s.log_scripts
+                .get(name)
+                .is_some_and(|script| script.hold_open);
+        let open = Arc::clone(&s.open_log_streams);
+        drop(s);
+        let tail: BoxStream<'static, Result<LogChunk>> = if hold {
+            // Like a follow stream of a running container: silent after the scripted output, and
+            // alive until the consumer drops it.
+            let guard = OpenLogStream::new(open);
+            stream::pending()
+                .inspect(move |_: &Result<LogChunk>| {
+                    let _ = &guard;
+                })
+                .boxed()
+        } else {
+            stream::empty().boxed()
+        };
+        Ok(stream::iter(chunks).chain(tail).boxed())
     }
 
     async fn container_wait(&self, name: &str) -> Result<i32> {

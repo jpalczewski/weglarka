@@ -9,11 +9,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+
 /// `Content-Type` of a run response stream.
 pub const RUN_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.run-stream";
-
-/// Longest payload of one frame the decoder accepts; the daemon sends far smaller ones.
-pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// `POST /v1/apps/{name}/run`: run a command once in a fresh container of the app.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,73 +55,40 @@ const ERROR: u8 = 5;
 impl RunFrame {
     /// `kind (1 byte) | payload length (u32, big endian) | payload`.
     pub fn encode(&self) -> Vec<u8> {
-        let (kind, payload): (u8, Vec<u8>) = match self {
+        let (kind, payload) = self.parts();
+        encode_frame(kind, &payload)
+    }
+}
+
+impl FrameKind for RunFrame {
+    fn parts(&self) -> (u8, Vec<u8>) {
+        match self {
             Self::Stdout(data) => (STDOUT, data.clone()),
             Self::Stderr(data) => (STDERR, data.clone()),
             Self::Exit(code) => (EXIT, code.to_be_bytes().to_vec()),
             Self::TimedOut => (TIMED_OUT, Vec::new()),
             Self::Error(message) => (ERROR, message.clone().into_bytes()),
-        };
-        let mut out = Vec::with_capacity(5 + payload.len());
-        out.push(kind);
-        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        out.extend_from_slice(&payload);
-        out
+        }
     }
-}
 
-/// A run stream that cannot be decoded.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum FrameError {
-    #[error("run stream frame of {0} bytes exceeds the limit")]
-    TooLarge(usize),
-    #[error("run stream has an unknown frame kind {0}")]
-    UnknownKind(u8),
-    #[error("run stream has a malformed {0} frame")]
-    Malformed(&'static str),
+    fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError> {
+        Ok(match kind {
+            STDOUT => Self::Stdout(payload),
+            STDERR => Self::Stderr(payload),
+            EXIT => Self::Exit(i32::from_be_bytes(
+                payload
+                    .try_into()
+                    .map_err(|_| FrameError::Malformed("exit"))?,
+            )),
+            TIMED_OUT => Self::TimedOut,
+            ERROR => Self::Error(String::from_utf8_lossy(&payload).into_owned()),
+            other => return Err(FrameError::UnknownKind(other)),
+        })
+    }
 }
 
 /// Reassembles [`RunFrame`]s from a byte stream cut anywhere.
-#[derive(Debug, Default)]
-pub struct RunFrameDecoder {
-    buf: Vec<u8>,
-}
-
-impl RunFrameDecoder {
-    pub fn push(&mut self, data: &[u8]) -> Result<Vec<RunFrame>, FrameError> {
-        self.buf.extend_from_slice(data);
-        let mut frames = Vec::new();
-        while let Some(&[kind, a, b, c, d]) = self.buf.first_chunk::<5>() {
-            let len = u32::from_be_bytes([a, b, c, d]) as usize;
-            if len > MAX_FRAME_PAYLOAD {
-                return Err(FrameError::TooLarge(len));
-            }
-            if self.buf.len() < 5 + len {
-                break;
-            }
-            let payload = self.buf[5..5 + len].to_vec();
-            self.buf.drain(..5 + len);
-            frames.push(match kind {
-                STDOUT => RunFrame::Stdout(payload),
-                STDERR => RunFrame::Stderr(payload),
-                EXIT => RunFrame::Exit(i32::from_be_bytes(
-                    payload
-                        .try_into()
-                        .map_err(|_| FrameError::Malformed("exit"))?,
-                )),
-                TIMED_OUT => RunFrame::TimedOut,
-                ERROR => RunFrame::Error(String::from_utf8_lossy(&payload).into_owned()),
-                other => return Err(FrameError::UnknownKind(other)),
-            });
-        }
-        Ok(frames)
-    }
-
-    /// The stream ended inside a frame.
-    pub fn is_clean(&self) -> bool {
-        self.buf.is_empty()
-    }
-}
+pub type RunFrameDecoder = FrameDecoder<RunFrame>;
 
 #[cfg(test)]
 mod tests {

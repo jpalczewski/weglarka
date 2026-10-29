@@ -589,6 +589,77 @@ mod tests {
     }
 
     #[test]
+    fn logs_query_defaults_and_roundtrip() {
+        assert_eq!(LogsQuery::parse(None).unwrap(), LogsQuery::default());
+        assert_eq!(LogsQuery::parse(Some("")).unwrap(), LogsQuery::default());
+        let q = LogsQuery::parse(Some(
+            "follow=true&tail=100&since=1700000000.25&timestamps=false",
+        ))
+        .unwrap();
+        assert_eq!(
+            q,
+            LogsQuery {
+                follow: true,
+                tail: Some(100),
+                since: Some(std::time::Duration::new(1_700_000_000, 250_000_000)),
+                timestamps: false,
+            }
+        );
+        assert_eq!(LogsQuery::parse(Some(&q.to_query_string())).unwrap(), q);
+        assert_eq!(LogsQuery::default().to_query_string(), "");
+        assert_eq!(
+            LogsQuery::parse(Some("tail=10000")).unwrap().tail,
+            Some(MAX_LOGS_TAIL)
+        );
+        assert_eq!(
+            LogsQuery::parse(Some("since=5")).unwrap().since_time(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn logs_query_refuses_anything_that_could_reach_libpod_as_a_parameter() {
+        for bad in [
+            "x=1",
+            "stdout=false",
+            "follow",
+            "follow=",
+            "follow=1",
+            "follow=TRUE",
+            "follow=true&follow=false",
+            "tail=",
+            "tail=-1",
+            "tail=+5",
+            "tail=1.5",
+            "tail=10001",
+            "tail=99999999999",
+            "tail=5&until=1",
+            "tail=5%26until%3D1",
+            "tail=5=6",
+            "tail=5 ",
+            "tail=5\n",
+            "since=",
+            "since=.5",
+            "since=1.",
+            "since=1.2.3",
+            "since=-1",
+            "since=1e9",
+            "since=1%2e5",
+            "since=1&until=2",
+            "since=123456789012",
+            "since=1\n&follow=true",
+            "since=1 follow=true",
+            "timestamps=true%26tail%3D1",
+            "timestamps=yes",
+        ] {
+            assert!(LogsQuery::parse(Some(bad)).is_err(), "{bad:?}");
+        }
+        // The message does not echo control characters.
+        let err = LogsQuery::parse(Some("bad\nkey=1")).unwrap_err();
+        assert!(!err.contains('\n'), "{err:?}");
+    }
+
+    #[test]
     fn endpoints_snapshot() {
         let list: Vec<String> = crate::ENDPOINTS
             .iter()
@@ -667,6 +738,132 @@ impl EventsQuery {
         }
         Ok(query)
     }
+}
+
+/// Highest `tail` of [`LogsQuery`].
+pub const MAX_LOGS_TAIL: u32 = 10_000;
+
+/// Query of `GET /v1/apps/{name}/logs`.
+///
+/// The values go into the query string of the libpod request, so [`LogsQuery::parse`] is the guard
+/// against injecting parameters there: it accepts nothing but the four known keys, once each, with
+/// values that are plain digits or `true`/`false` (no `&`, `=`, `%`, whitespace or sign survives).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogsQuery {
+    /// Keep the stream open for new output (default: end at the end of the log).
+    pub follow: bool,
+    /// Only the last this many lines, at most [`MAX_LOGS_TAIL`] (default: the whole log).
+    pub tail: Option<u32>,
+    /// Only output from this instant on, as a duration since the unix epoch.
+    pub since: Option<std::time::Duration>,
+    /// Prefix every line with its RFC 3339 timestamp.
+    pub timestamps: bool,
+}
+
+impl LogsQuery {
+    /// Parses a raw query string (`follow=true&tail=100&since=1700000000.25`). Unknown or repeated
+    /// keys and malformed values are errors (the message is safe to show to the client).
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let mut query = Self::default();
+        let mut seen = Vec::new();
+        for kv in raw
+            .unwrap_or_default()
+            .split('&')
+            .filter(|kv| !kv.is_empty())
+        {
+            let (key, value) = kv.split_once('=').unwrap_or((kv, ""));
+            if seen.contains(&key) {
+                return Err(format!("`{}` is given twice", printable(key)));
+            }
+            seen.push(key);
+            match key {
+                "follow" => query.follow = parse_bool("follow", value)?,
+                "timestamps" => query.timestamps = parse_bool("timestamps", value)?,
+                "tail" => {
+                    let ok = !value.is_empty()
+                        && value.len() <= 5
+                        && value.bytes().all(|b| b.is_ascii_digit());
+                    let tail = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|t| ok && *t <= MAX_LOGS_TAIL);
+                    query.tail = Some(tail.ok_or_else(|| {
+                        format!("`tail` must be a number from 0 to {MAX_LOGS_TAIL}")
+                    })?);
+                }
+                "since" => query.since = Some(parse_since(value)?),
+                other => return Err(format!("unknown query parameter `{}`", printable(other))),
+            }
+        }
+        Ok(query)
+    }
+
+    /// The query string a client sends for this query (parses back to `self`); empty when all default.
+    pub fn to_query_string(&self) -> String {
+        let mut parts = Vec::new();
+        if self.follow {
+            parts.push("follow=true".to_owned());
+        }
+        if let Some(tail) = self.tail {
+            parts.push(format!("tail={tail}"));
+        }
+        if let Some(since) = self.since {
+            parts.push(format!(
+                "since={}.{:09}",
+                since.as_secs(),
+                since.subsec_nanos()
+            ));
+        }
+        if self.timestamps {
+            parts.push("timestamps=true".to_owned());
+        }
+        parts.join("&")
+    }
+
+    /// `since` as an instant; `None` when absent.
+    pub fn since_time(&self) -> Option<std::time::SystemTime> {
+        self.since
+            .and_then(|d| std::time::UNIX_EPOCH.checked_add(d))
+    }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("`{key}` must be `true` or `false`")),
+    }
+}
+
+/// `1700000000` or `1700000000.25`: seconds since the epoch, at most 11 digits (year 5138), with an
+/// optional fraction.
+fn parse_since(value: &str) -> Result<std::time::Duration, String> {
+    let bad = || "`since` must be unix seconds, like `1700000000` or `1700000000.25`".to_owned();
+    let (secs, frac) = value.split_once('.').unwrap_or((value, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if secs.is_empty() || secs.len() > 11 || !digits(secs) || !digits(frac) {
+        return Err(bad());
+    }
+    if value.contains('.') && frac.is_empty() {
+        return Err(bad());
+    }
+    // Nanosecond resolution: further digits are dropped.
+    let mut nanos = frac.chars().take(9).collect::<String>();
+    while nanos.len() < 9 {
+        nanos.push('0');
+    }
+    Ok(std::time::Duration::new(
+        secs.parse().map_err(|_| bad())?,
+        nanos.parse().map_err(|_| bad())?,
+    ))
+}
+
+/// A client-supplied token for an error message: short and without control characters.
+fn printable(text: &str) -> String {
+    text.chars()
+        .take(32)
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect()
 }
 
 /// One domain event as `GET /v1/events` shows it. Flat and deliberately independent of the engine's

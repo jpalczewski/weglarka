@@ -157,6 +157,18 @@ pub const APPS_FORWARD: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `GET` → a stream of [`LogFrame`](crate::LogFrame)s (`application/vnd.weglarka.logs-stream`): the
+/// output of the app's running container. Query [`LogsQuery`](crate::LogsQuery): `follow`, `tail`,
+/// `since`, `timestamps`. 404 before the stream starts when the app or its container does not exist.
+/// `admin` only, although it only reads: logs can hold secrets the app printed, and unlike a spec
+/// they cannot be redacted ([`Body::Credential`], docs/decisions/0057). Over the token listener the
+/// stream ends with a `TokenExpired` frame when the token does; the client reconnects with `since`.
+pub const APPS_LOGS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/apps/{name}/logs",
+    scope: Some(Scope::Admin),
+    body: Body::Credential,
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -379,6 +391,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_RELOAD,
     APPS_RUN,
     APPS_FORWARD,
+    APPS_LOGS,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

@@ -7,13 +7,14 @@ use futures_util::stream;
 use hyper::Method;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
-    LoadedImage, LogStream, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient, PodmanError,
-    PodmanEvent, PullEvent, RegistryAuth, Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo,
-    VolumeSpec,
+    LoadedImage, LogOptions, LogStream, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient,
+    PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream, VersionInfo,
+    VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 use crate::registry_auth;
 use crate::transport::{Lines, Transport, encode_component, name_conflict, path_name};
+use crate::wire::unix_seconds;
 use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
@@ -155,11 +156,22 @@ impl PodmanClient for LibpodClient {
         )))
     }
 
-    async fn container_logs(&self, name: &str, follow: bool) -> Result<LogStream> {
-        let path = format!(
-            "/containers/{}/logs?stdout=true&stderr=true&follow={follow}",
-            path_name(name)?
+    async fn container_logs(&self, name: &str, options: &LogOptions) -> Result<LogStream> {
+        let mut path = format!(
+            "/containers/{}/logs?stdout=true&stderr=true&follow={}",
+            path_name(name)?,
+            options.follow
         );
+        // Every value is a number or a boolean formatted here, never caller text.
+        if let Some(tail) = options.tail {
+            path.push_str(&format!("&tail={tail}"));
+        }
+        if let Some(since) = options.since {
+            path.push_str(&format!("&since={}", unix_seconds(since)));
+        }
+        if options.timestamps {
+            path.push_str("&timestamps=true");
+        }
         let raw = self.transport.bytes_stream(Method::GET, &path).await?;
         let state = (raw, LogDemux::default(), std::collections::VecDeque::new());
         Ok(Box::pin(stream::unfold(

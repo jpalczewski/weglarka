@@ -45,7 +45,14 @@ revoked before it expires.
 | none (no token) | `GET /v1/health` only; everything else is `401` |
 | a valid token whose groups map to no scope | nothing: `403` |
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
-| `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
+| `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push`, app logs and OIDC clients |
+
+App logs (`GET /v1/apps/{name}/logs`) need `admin`, although they only read: logs can hold anything the app printed,
+secrets included, and unlike a spec they cannot be redacted. The answer is a stream that ends with the token: when it
+expires the daemon sends a final `TokenExpired` frame and closes, and the client reconnects with a fresh token and
+`since=` (unix seconds) set to where it stopped. `forward` streams end at the token's expiry the same way; `run` does not,
+because cutting a command off halfway can be destructive (it has its own `timeout_secs`). On the unix socket there is
+no token, so no deadline.
 
 `GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. The `read`
 view is an allowlist projection: the daemon rebuilds it field by field, so a field added in a later release does not
@@ -86,7 +93,7 @@ The daemon reaches the provider's `jwks.json` over the ingress probe socket (it 
 the keys cached, refetches when it sees an unknown key id (at most every 30 s) and at least hourly, and keeps using the old
 keys while the provider is down.
 
-Every call that needs `admin` (all changes, plus exports and the OIDC client list) is logged with the token's `sub`, the route and the result; refusals are
+Every call that needs `admin` (all changes, plus exports, the OIDC client list and app logs) is logged with the token's `sub`, the route and the result; a logs stream adds a line when it ends (`sub`, app, `follow`, `tail`, `since`, frames, bytes, duration and why it ended — never the content); refusals are
 logged with their reason. Tokens themselves are never logged.
 
 ## Checks
