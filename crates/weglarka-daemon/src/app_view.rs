@@ -58,10 +58,14 @@ pub(crate) const REDACTED_ARG: &str = "<redacted>";
 /// Stands in for the engine's failure text of a redacted deploy failure.
 pub(crate) const REDACTED_REASON: &str = "deploy failed (details withheld)";
 
-/// Keeps `argv[0]` and the number of arguments, so the shape of the command stays useful.
+/// Keeps `argv[0]` and the number of arguments, so the shape of the command stays useful. `command`
+/// replaces the image's `CMD`, so `argv[0]` is not always a program name: one that looks like a
+/// flag or an assignment (`--token=x`, `KEY=x`) is redacted too.
 fn redact_argv(argv: &mut [String]) {
-    for arg in argv.iter_mut().skip(1) {
-        *arg = REDACTED_ARG.to_owned();
+    for (i, arg) in argv.iter_mut().enumerate() {
+        if i > 0 || arg.starts_with('-') || arg.contains('=') {
+            *arg = REDACTED_ARG.to_owned();
+        }
     }
 }
 
@@ -208,6 +212,16 @@ mod tests {
         assert_eq!(shown.spec.health.command, Some(vec!["check".into(), r]));
         assert!(!format!("{shown:?}").contains("hunter2"));
         assert!(!format!("{shown:?}").contains("t0k3n"));
+    }
+
+    #[test]
+    fn redaction_hides_an_argv0_that_is_a_flag_or_an_assignment() {
+        let mut spec = spec();
+        spec.command = vec!["--api-key=k".into(), "x".into()];
+        spec.health.command = Some(vec!["TOKEN=t".into()]);
+        let shown = show_response(Access::Redacted, name(), spec, None, None);
+        assert_eq!(shown.spec.command, [REDACTED_ARG, REDACTED_ARG]);
+        assert_eq!(shown.spec.health.command, Some(vec![REDACTED_ARG.into()]));
     }
 
     #[test]
