@@ -8,6 +8,7 @@ mod common;
 mod configs;
 mod daemon;
 mod depends_on;
+mod events;
 mod forgejo;
 mod forward;
 mod generated;

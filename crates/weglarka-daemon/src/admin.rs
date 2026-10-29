@@ -228,6 +228,7 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         .merge(shared_volumes::routes())
         .merge(shared_networks::routes())
         .merge(sites::routes())
+        .merge(crate::events::routes())
         .merge(crate::identity::routes())
         .merge(images::routes())
         .merge(push::routes()) // a streamed archive, like the volume tars
