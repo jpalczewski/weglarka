@@ -39,7 +39,7 @@ Status: accepted (packaging session, 2026-10-23).
   attestation index).
 - GitHub Release assets (only for `v*`): `weglarka-<version>-x86_64-unknown-linux-musl.tar.gz` (CLI + daemon),
   `weglarka-<version>-aarch64-apple-darwin.tar.gz` (CLI), `SHA256SUMS` (+ the cosign signature
-  `SHA256SUMS.sig`/`.pem`).
+  `SHA256SUMS.sigstore.json` bundle).
 - Verifying the image signature: `docs/install.md`.
 
 **CI.** The image is built from the prebuilt binaries of the `musl` job, and the smoke test

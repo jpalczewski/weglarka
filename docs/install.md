@@ -246,7 +246,7 @@ cosign verify --key cosign.pub ghcr.io/jpalczewski/weglarka:latest
 cosign verify-attestation --type spdxjson <as above> ghcr.io/jpalczewski/weglarka:latest | jq -r .payload | base64 -d | jq .predicate | head
 
 # SHA256SUMS from the release:
-cosign verify-blob --signature SHA256SUMS.sig --certificate SHA256SUMS.pem <identity flags as above> SHA256SUMS
+cosign verify-blob --bundle SHA256SUMS.sigstore.json <identity flags as above> SHA256SUMS
 ```
 
 ## CLI from a laptop
