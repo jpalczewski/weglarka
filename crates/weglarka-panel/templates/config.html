@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block title %}Host configuration · Węglarka{% endblock %}
+{% block content %}
+    <h1>Host configuration</h1>
+    <p class="muted">A read-only projection of <code>weglarka.toml</code>; secrets and paths to secrets are never shown.</p>
+{% for s in sections %}    <section>
+      <h2>{{ s.title }}</h2>
+      {{ m::fields(&s.fields) }}
+    </section>
+{% endfor %}{% endblock %}

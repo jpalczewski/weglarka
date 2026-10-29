@@ -2234,6 +2234,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "futures-util",
  "http-body-util",
  "insta",
  "ring",

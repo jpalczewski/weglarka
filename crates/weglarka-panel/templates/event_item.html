@@ -1,0 +1,2 @@
+{% import "macros.html" as m -%}
+<li class="event"><time datetime="{{ e.ts }}">{{ e.ts }}</time> {{ m::badge(&e.severity) }} <strong>{{ e.kind }}</strong>{% if !e.app.is_empty() %} · <a href="/apps/{{ e.app }}">{{ e.app }}</a>{% endif %} — {{ e.message }}{% if !e.detail.is_empty() %} <span class="detail">({{ e.detail }})</span>{% endif %}</li>

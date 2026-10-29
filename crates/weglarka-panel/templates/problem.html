@@ -1,0 +1,7 @@
+{% extends "layout.html" %}
+{% block title %}{{ title }} · Węglarka{% endblock %}
+{% block content %}
+    <h1>{{ title }}</h1>
+    <p>{{ message }}</p>
+{% if let Some(href) = retry %}    <p><a class="button" href="{{ href }}">Try again</a></p>
+{% endif %}{% endblock %}

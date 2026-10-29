@@ -9,22 +9,20 @@
 
 use std::sync::Arc;
 
-use axum::Extension;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{get, post};
-use weglarka_api::ListAppsResponse;
-use weglarka_api::endpoints::APPS_LIST;
 use weglarka_http::{HttpError, Purpose};
 
 use crate::config::PanelConfig;
-use crate::daemon::{Call, DaemonClient, DaemonError};
+use crate::daemon::DaemonClient;
+use crate::live::StreamSlots;
 use crate::oidc::OidcClient;
-use crate::pages::{ErrorPage, IndexPage};
-use crate::session::{Clock, PendingLogins, SessionStore, SessionView};
-use crate::{assets, auth, headers};
+use crate::pages::ErrorPage;
+use crate::session::{Clock, PendingLogins, SessionStore};
+use crate::{assets, auth, headers, live, routes};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +32,10 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub logins: Arc<PendingLogins>,
     pub clock: Clock,
+    /// Live streams held per session.
+    pub streams: Arc<StreamSlots>,
+    /// How often the events stream asks the daemon for news.
+    pub stream_poll: std::time::Duration,
 }
 
 impl AppState {
@@ -58,6 +60,8 @@ impl AppState {
             daemon,
             config,
             clock,
+            streams: Arc::new(StreamSlots::default()),
+            stream_poll: std::time::Duration::from_secs(3),
         })
     }
 }
@@ -67,7 +71,19 @@ pub fn router(state: AppState) -> Router {
     // wraps what exists at that point. The fallback is wrapped too, so an unknown path is refused
     // the same way as a known one.
     let protected = Router::new()
-        .route("/", get(index))
+        .route("/", get(routes::dashboard))
+        .route("/apps", get(routes::apps))
+        .route("/apps/{name}", get(routes::app))
+        .route("/apps/{name}/logs/stream", get(live::logs_stream))
+        .route("/doctor", get(routes::doctor))
+        .route("/volumes", get(routes::volumes))
+        .route("/networks", get(routes::networks))
+        .route("/sites", get(routes::sites))
+        .route("/notifications", get(routes::notifications))
+        .route("/certificates", get(routes::certificates))
+        .route("/events", get(routes::events))
+        .route("/events/stream", get(live::events_stream))
+        .route("/config", get(routes::config))
         .route("/auth/logout", post(auth::logout))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
@@ -96,37 +112,4 @@ async fn not_found() -> Response {
         sign_in: None,
     }
     .respond(StatusCode::NOT_FOUND)
-}
-
-/// The signed-in placeholder; the real pages replace it.
-async fn index(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    Extension(view): Extension<SessionView>,
-) -> Response {
-    let daemon = match state
-        .daemon
-        .send::<ListAppsResponse>(&view.token, &Call::new(&APPS_LIST))
-        .await
-    {
-        Ok(list) => format!("The daemon answers: {} app(s).", list.apps.len()),
-        // The listing needs the lowest scope: refused here means the daemon gives this identity
-        // no access at all (no group, or a token it no longer accepts), so the session ends.
-        Err(DaemonError::Unauthorized | DaemonError::Forbidden) => {
-            let mut response = ErrorPage {
-                title: "Sign-in required",
-                message: "The daemon does not accept your session.",
-                sign_in: Some("/auth/login"),
-            }
-            .respond(StatusCode::UNAUTHORIZED);
-            response.extensions_mut().insert(auth::EndSession);
-            return response;
-        }
-        Err(e) => format!("The daemon says: {e}."),
-    };
-    IndexPage {
-        user: &view.user.name,
-        csrf: &view.csrf,
-        daemon: &daemon,
-    }
-    .respond()
 }

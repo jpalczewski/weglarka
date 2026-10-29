@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block title %}Doctor · Węglarka{% endblock %}
+{% block content %}
+    <h1>Doctor</h1>
+{% if groups.is_empty() %}    <p>The daemon reported no checks.</p>
+{% endif %}{% for g in groups %}    <section>
+      <h2>{{ m::badge(&g.badge) }} <span class="muted">({{ g.checks.len() }})</span></h2>
+      <ul class="plain">
+{% for c in g.checks %}        <li><code>{{ c.id }}</code> — {{ c.message }}{% if !c.hint.is_empty() %}<br><span class="muted">Hint: {{ c.hint }}</span>{% endif %}</li>
+{% endfor %}      </ul>
+    </section>
+{% endfor %}{% endblock %}

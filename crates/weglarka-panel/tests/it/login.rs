@@ -185,7 +185,7 @@ impl Browser {
 
     /// The CSRF token from the signed-in page.
     async fn csrf(&mut self) -> String {
-        let page = self.get("/").await;
+        let page = self.get("/apps").await;
         assert_eq!(page.status, StatusCode::OK, "{}", page.body);
         let marker = "name=\"_csrf\" value=\"";
         let start = page.body.find(marker).unwrap() + marker.len();
@@ -279,13 +279,9 @@ async fn the_full_login_flow() {
         "the secret is in the header only"
     );
 
-    let page = b.get("/").await;
+    let page = b.get("/apps").await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(
-        page.body.contains("Signed in as Alice Example"),
-        "{}",
-        page.body
-    );
+    assert!(page.body.contains("Alice Example"), "{}", page.body);
     // The daemon was called with the user's own access token.
     assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"]);
 
@@ -452,7 +448,7 @@ async fn id_tokens_that_do_not_verify_are_refused() {
             "{name}: {}",
             done.body
         );
-        let after = b.get("/").await;
+        let after = b.get("/apps").await;
         assert_eq!(after.status, StatusCode::UNAUTHORIZED, "{name}");
     }
 }
@@ -555,12 +551,12 @@ async fn sessions_end_when_idle_or_too_old() {
     // Activity keeps it alive past the idle limit...
     for _ in 0..5 {
         s.clock.advance(Duration::from_secs(100));
-        assert_eq!(b.get("/").await.status, StatusCode::OK);
+        assert_eq!(b.get("/apps").await.status, StatusCode::OK);
     }
     assert!(!*ended.borrow());
     // ...but never past the absolute one.
     s.clock.advance(Duration::from_secs(101));
-    let late = b.get("/").await;
+    let late = b.get("/apps").await;
     assert_eq!(late.status, StatusCode::UNAUTHORIZED);
     assert!(*ended.borrow());
     assert!(b.cookie(SESSION).is_none(), "the dead cookie is cleared");
@@ -574,7 +570,7 @@ async fn sessions_end_when_idle_or_too_old() {
         .unwrap()
         .ended();
     s.clock.advance(Duration::from_secs(121));
-    assert_eq!(b.get("/").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
     assert!(*ended.borrow());
 }
 
@@ -628,7 +624,7 @@ async fn state_changing_requests_need_the_csrf_token() {
         StatusCode::METHOD_NOT_ALLOWED
     );
     assert!(!*ended.borrow());
-    assert_eq!(b.get("/").await.status, StatusCode::OK);
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
 
     // The form field works; so does the header.
     let done = b
@@ -638,7 +634,7 @@ async fn state_changing_requests_need_the_csrf_token() {
     assert_eq!(done.location(), "/");
     assert!(*ended.borrow());
     assert!(b.cookie(SESSION).is_none());
-    assert_eq!(b.get("/").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
 
     b.login().await;
     let csrf = b.csrf().await;
@@ -657,7 +653,7 @@ async fn a_logged_out_cookie_is_useless_even_if_replayed() {
     b.post_logout(Some(("header", &csrf)), None).await;
     let mut thief = Browser::new(&s.app);
     thief.jar.insert(SESSION.into(), stolen);
-    assert_eq!(thief.get("/").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(thief.get("/apps").await.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -672,7 +668,7 @@ async fn the_access_token_is_refreshed_once_and_the_daemon_sees_the_new_one() {
     let one = || {
         let mut browser = Browser::new(&s.app);
         browser.jar = b.jar.clone();
-        async move { browser.get("/").await.status }
+        async move { browser.get("/apps").await.status }
     };
     let statuses = tokio::join!(one(), one(), one(), one(), one());
     let statuses = [statuses.0, statuses.1, statuses.2, statuses.3, statuses.4];
@@ -710,14 +706,14 @@ async fn a_refused_refresh_ends_the_session() {
         .ended();
     s.provider.set(|p| p.refresh = Refresh::Revoked);
 
-    let r = b.get("/").await;
+    let r = b.get("/apps").await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     assert!(
         *ended.borrow(),
         "ended() flips so streams tied to the session close"
     );
     assert!(s.state.sessions.is_empty());
-    assert_eq!(b.get("/").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
     // Nothing reached the daemon with the dead session.
     assert!(s.daemon.seen.lock().unwrap().is_empty());
 }
@@ -731,12 +727,12 @@ async fn a_provider_outage_does_not_log_out_a_token_that_still_works() {
     s.provider.set(|p| p.refresh = Refresh::Down);
 
     // Valid for 30 s more: keep going on the current token, retry next time.
-    assert_eq!(b.get("/").await.status, StatusCode::OK);
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
     assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"]);
 
     // Once it has expired and cannot be renewed, the session ends.
     s.clock.advance(Duration::from_secs(31));
-    assert_eq!(b.get("/").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
     assert!(s.state.sessions.is_empty());
 }
 
@@ -771,7 +767,7 @@ async fn a_daemon_that_gives_the_user_no_access_ends_the_session() {
         let mut b = Browser::new(&app);
         b.login().await;
         assert_eq!(state.sessions.len(), 1);
-        let r = b.get("/").await;
+        let r = b.get("/apps").await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{status}");
         assert!(r.body.contains("Sign in"));
         assert!(
@@ -1031,9 +1027,9 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
         let tokens = session.tokens.lock().await;
         format!("{session:?} {tokens:?}")
     };
-    b.get("/").await; // refreshes
+    b.get("/apps").await; // refreshes
     s.provider.set(|p| p.refresh = Refresh::Revoked);
-    b.get("/").await; // refresh refused
+    b.get("/apps").await; // refresh refused
     s.provider.set(|p| p.id_nonce = Some("x".into()));
     b.login().await;
 

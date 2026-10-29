@@ -105,7 +105,7 @@ async fn everything_else_is_denied_by_default() {
 #[tokio::test]
 async fn embedded_assets_are_public_and_cacheable() {
     let (app, _daemon) = app().await;
-    let css = call(&app, Method::GET, "/static/panel.css").await;
+    let css = call(&app, Method::GET, "/static/app.css").await;
     assert_eq!(css.status(), StatusCode::OK);
     assert_eq!(
         css.headers()[header::CONTENT_TYPE],
@@ -130,7 +130,7 @@ async fn no_response_lacks_the_security_headers() {
         (Method::GET, "/healthz"),
         (Method::HEAD, "/healthz"),
         (Method::POST, "/healthz"),
-        (Method::GET, "/static/panel.css"),
+        (Method::GET, "/static/app.css"),
         (Method::GET, "/static/favicon.svg"),
         (Method::GET, "/static/missing"),
         (Method::GET, "/"),

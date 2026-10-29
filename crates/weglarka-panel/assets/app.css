@@ -1,0 +1,203 @@
+/* The panel's stylesheet. Plain CSS, no inline styles anywhere: the Content-Security-Policy allows
+   only same-origin stylesheets. Light and dark follow the browser; every status is also a word. */
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --fg: #1b1d1f;
+  --muted: #5b6168;
+  --line: #d6d9dc;
+  --panel: #ffffff;
+  --accent: #0b5cad;
+  --ok: #17692f;
+  --info: #0b5cad;
+  --warn: #8a5300;
+  --fail: #a4161a;
+  --ok-bg: #e3f4e8;
+  --info-bg: #e3eefb;
+  --warn-bg: #fdf0d5;
+  --fail-bg: #fde6e6;
+  --muted-bg: #eceef0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e6e8ea;
+    --muted: #9aa1a9;
+    --line: #353a41;
+    --panel: #1c1f24;
+    --accent: #7db4f0;
+    --ok: #7fd49a;
+    --info: #8fbcf2;
+    --warn: #f0c26b;
+    --fail: #ff9a9d;
+    --ok-bg: #173323;
+    --info-bg: #17283d;
+    --warn-bg: #3b2d12;
+    --fail-bg: #43191b;
+    --muted-bg: #272b31;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+a { color: var(--accent); }
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+.log:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.skip {
+  position: absolute;
+  left: -999px;
+  top: 0;
+  background: var(--panel);
+  padding: 0.5rem 1rem;
+}
+.skip:focus { left: 0; z-index: 10; }
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; text-decoration: none; color: var(--fg); }
+.top nav { flex: 1 1 18rem; }
+.top ul { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; list-style: none; margin: 0; padding: 0; }
+.top nav a { text-decoration: none; padding: 0.25rem 0; border-bottom: 2px solid transparent; }
+.top nav a[aria-current="page"] { border-bottom-color: var(--accent); font-weight: 600; }
+.who { display: flex; align-items: center; gap: 0.75rem; margin: 0; }
+
+main {
+  max-width: 64rem;
+  margin: 1.5rem auto;
+  padding: 0 1rem;
+}
+
+h1 { font-size: 1.6rem; margin: 0 0 1rem; }
+h2 { font-size: 1.15rem; margin: 1.5rem 0 0.5rem; }
+
+button,
+.button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  padding: 0.3rem 0.8rem;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+button:hover,
+.button:hover { border-color: var(--accent); }
+
+.muted { color: var(--muted); }
+.crumb { margin: 0 0 0.5rem; }
+.plain { list-style: none; padding: 0; margin: 0; }
+.plain li { padding: 0.15rem 0; }
+
+code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
+
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; background: var(--panel); }
+th, td { text-align: left; padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { font-size: 0.85rem; color: var(--muted); }
+
+.fields {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) 1fr;
+  gap: 0.3rem 1rem;
+  margin: 0;
+}
+.fields dt { color: var(--muted); }
+.fields dd { margin: 0; overflow-wrap: anywhere; }
+
+@media (max-width: 36rem) {
+  .fields { grid-template-columns: 1fr; gap: 0; }
+  .fields dd { margin-bottom: 0.5rem; }
+}
+
+/* Status badges: a symbol, a word, and a colour. Never colour alone. */
+.badge {
+  display: inline-block;
+  padding: 0 0.5rem;
+  border-radius: 0.8rem;
+  border: 1px solid currentcolor;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge::before { margin-right: 0.3em; }
+.badge-ok { color: var(--ok); background: var(--ok-bg); }
+.badge-ok::before { content: "\2713"; }
+.badge-info { color: var(--info); background: var(--info-bg); }
+.badge-info::before { content: "\2139"; }
+.badge-warn { color: var(--warn); background: var(--warn-bg); }
+.badge-warn::before { content: "\25B2"; }
+.badge-fail { color: var(--fail); background: var(--fail-bg); }
+.badge-fail::before { content: "\2716"; }
+.badge-muted { color: var(--muted); background: var(--muted-bg); }
+.badge-muted::before { content: "\2022"; }
+
+.notice {
+  border: 1px solid var(--warn);
+  background: var(--warn-bg);
+  border-radius: 0.35rem;
+  padding: 0.6rem 0.9rem;
+}
+
+.events { list-style: none; padding: 0; margin: 0; }
+.event { padding: 0.45rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.event time { color: var(--muted); font-size: 0.85rem; margin-right: 0.4rem; }
+.event .detail { color: var(--muted); }
+.event.notice { border: 0; }
+
+.check { display: inline-flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; }
+
+/* The log viewer: monospace, scrollable, lines wrap only on request. */
+.log {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  padding: 0.5rem;
+  max-height: 28rem;
+  overflow: auto;
+  white-space: pre;
+}
+.log[data-wrap="true"] { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log .line { min-height: 1.2em; }
+.log .stderr { color: var(--fail); }
+.log .tag { font-weight: 700; }
+
+/* htmx request indicators (htmx is configured not to inject its own <style>). */
+.htmx-indicator { opacity: 0; }
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator { opacity: 1; }

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block body %}  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <a class="brand" href="/">Węglarka</a>
+    <nav aria-label="Main">
+      <ul>
+{% for item in shell.nav %}        <li><a href="{{ item.1 }}"{% if item.0 == shell.active %} aria-current="page"{% endif %}>{{ item.2 }}</a></li>
+{% endfor %}      </ul>
+    </nav>
+    <form class="who" method="post" action="/auth/logout">
+      <span>{{ shell.user }}</span>
+      <input type="hidden" name="_csrf" value="{{ shell.csrf }}">
+      <button type="submit">Sign out</button>
+    </form>
+  </header>
+  <main id="main">
+{% block content %}{% endblock %}
+  </main>
+{% endblock %}

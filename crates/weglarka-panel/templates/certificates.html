@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block title %}Certificates · Węglarka{% endblock %}
+{% block content %}
+    <h1>Certificates</h1>
+{% if !acme_enabled %}    <p>ACME is not enabled on this host.</p>
+{% else %}    {{ m::fields(&summary) }}
+{% if certs.is_empty() %}    <p>No managed certificates.</p>
+{% else %}    <div class="scroll"><table>
+      <caption class="sr">Certificates</caption>
+      <thead><tr><th scope="col">Names</th><th scope="col">Status</th><th scope="col">Expires</th><th scope="col">Days left</th><th scope="col">Notes</th></tr></thead>
+      <tbody>
+{% for c in certs %}        <tr><th scope="row">{{ c.names }}</th><td>{{ m::badge(&c.status) }}</td><td>{{ c.expires }}</td><td>{{ c.days_left }}</td><td>{{ c.coverage }}</td></tr>
+{% endfor %}      </tbody>
+    </table></div>
+{% endif %}{% endif %}{% endblock %}

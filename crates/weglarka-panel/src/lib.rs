@@ -21,11 +21,14 @@ pub mod config;
 pub mod csrf;
 pub mod daemon;
 pub mod headers;
+pub mod live;
 pub mod oidc;
 pub mod pages;
+pub mod routes;
 pub mod secure;
 pub mod server;
 pub mod session;
+pub mod views;
 
 pub use app::{AppState, router};
 pub use config::{ConfigError, PanelConfig, Secret};

@@ -48,7 +48,7 @@ fn clear_cookie(name: &str) -> HeaderValue {
 }
 
 /// The value of cookie `name`; a name that appears twice is ambiguous and counts as absent.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let mut found = None;
     for header in headers.get_all(COOKIE) {
         for pair in header.to_str().ok()?.split(';') {
@@ -247,7 +247,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 /// The answer for a request with no usable session. A `GET` page carries a link that returns to it.
-fn signed_out(request: &Request, clear: bool) -> Response {
+pub(crate) fn signed_out(request: &Request, clear: bool) -> Response {
     let href;
     let sign_in = if matches!(*request.method(), Method::GET | Method::HEAD) {
         let target = request.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -270,6 +270,10 @@ fn signed_out(request: &Request, clear: bool) -> Response {
     }
     response
 }
+
+/// The session behind a [`SessionView`], for handlers that outlive one request (SSE streams).
+#[derive(Clone)]
+pub struct LiveSession(pub Arc<Session>);
 
 /// The single authentication point (default-deny): resolves the session cookie, enforces the idle
 /// and absolute lifetimes, checks CSRF on state-changing requests, refreshes the access token when
@@ -303,6 +307,8 @@ pub async fn require_session(
         csrf: session.csrf.clone(),
         user: session.user.clone(),
     });
+    // Long-lived streams need the session itself (to see it end and to refresh its token).
+    request.extensions_mut().insert(LiveSession(session));
     let mut response = next.run(request).await;
     if response.extensions().get::<EndSession>().is_some() {
         state.sessions.remove(&id);
@@ -317,7 +323,7 @@ pub async fn require_session(
 /// `None` ends the session: the grant was refused, or the token expired and cannot be renewed.
 /// The tokens' lock is held across the refresh and everything is re-checked once it is taken, so
 /// N queued requests make one provider call.
-async fn fresh_token(state: &AppState, session: &Session) -> Option<Arc<Secret>> {
+pub(crate) async fn fresh_token(state: &AppState, session: &Session) -> Option<Arc<Secret>> {
     let mut tokens = session.tokens.lock().await;
     // Requests queued behind a refresh find the session ended (the grant was refused: do not retry
     // a dead refresh token) or the token already renewed (the check below returns it).

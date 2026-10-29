@@ -4,5 +4,6 @@ mod app;
 mod daemon;
 mod harness;
 mod login;
+mod pages;
 mod process;
 mod provider;
