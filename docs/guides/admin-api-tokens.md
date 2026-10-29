@@ -96,6 +96,8 @@ keys while the provider is down.
 Every call that needs `admin` (all changes, plus exports, the OIDC client list and app logs) is logged with the token's `sub`, the route and the result; a logs stream adds a line when it ends (`sub`, app, `follow`, `tail`, `since`, frames, bytes, duration and why it ended — never the content); refusals are
 logged with their reason. Tokens themselves are never logged.
 
+There is no cap on concurrent `follow` log streams: each holds one Podman connection and an 8-frame queue until it ends (at the token's expiry at the latest), and starting one needs `admin` scope.
+
 ## Checks
 
 `weglarka doctor` reports `admin.http`: whether the token socket exists, whether every `clients` entry is in `apps.toml`,

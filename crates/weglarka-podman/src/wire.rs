@@ -989,14 +989,16 @@ impl LogDemux {
     }
 }
 
-/// An instant as libpod's `since` takes it: fractional unix seconds (`1700000000.250000000`);
-/// before the epoch it is `0`.
+/// An instant as libpod's `since` takes it: fractional unix seconds (`1700000000.250000`); before
+/// the epoch it is `0`. libpod parses the value as a float, whose step near 1.7e9 s is ~240 ns, so a
+/// finer value could round *forward* past the line it names; the fraction is floored to microseconds
+/// instead (a coarser value only re-delivers, never skips).
 pub(crate) fn unix_seconds(at: std::time::SystemTime) -> String {
     let since_epoch = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!(
-        "{}.{:09}",
+        "{}.{:06}",
         since_epoch.as_secs(),
-        since_epoch.subsec_nanos()
+        since_epoch.subsec_micros()
     )
 }
 
@@ -1025,12 +1027,25 @@ mod tests {
         use std::time::{Duration, UNIX_EPOCH};
         assert_eq!(
             unix_seconds(UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000)),
-            "1700000000.250000000"
+            "1700000000.250000"
         );
-        assert_eq!(unix_seconds(UNIX_EPOCH), "0.000000000");
+        assert_eq!(unix_seconds(UNIX_EPOCH), "0.000000");
         assert_eq!(
             unix_seconds(UNIX_EPOCH - Duration::from_secs(5)),
-            "0.000000000"
+            "0.000000"
+        );
+    }
+
+    #[test]
+    fn since_is_floored_to_microseconds_never_rounded_up() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999)),
+            "1700000000.999999"
+        );
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH + Duration::new(1_700_000_000, 1_999)),
+            "1700000000.000001"
         );
     }
 

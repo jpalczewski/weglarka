@@ -89,7 +89,9 @@ pub(crate) async fn forward_app<P: PodmanClient + 'static>(
             ))),
         };
         if let Some(frame) = last {
-            let _ = frames_tx.send(Bytes::from(frame.encode())).await;
+            // Not awaited, as in logs: a client that is not reading must not hold the task (and
+            // the connection) past the token; it sees a stream that just ends and reconnects.
+            let _ = frames_tx.try_send(Bytes::from(frame.encode()));
         }
     });
 

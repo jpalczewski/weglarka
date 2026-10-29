@@ -69,7 +69,8 @@ Threats, in priority order:
      endpoint answers `read` with `redacted: true`.
    - **A stream ends with its token.** The token layer verifies once at the start of a request, so the verified
      principal carries the token's `exp` and a streaming handler stops when it passes; the panel reconnects with a
-     refreshed token, resuming by sequence number. The panel's own stream to the browser ends when the session does
+     refreshed token, resuming by sequence number (events) or by `since=` (logs: wall clock, inclusive, so
+     at-least-once, because log lines carry no sequence number). The panel's own stream to the browser ends when the session does
      (logout, idle timeout, absolute lifetime or a failed refresh), so a logged-out browser stops receiving logs.
 9. **Deployment.** The panel is an ordinary app: an image from the same release, an entry in `[admin.http] clients`, an
    OIDC registration and `ingress.auth_policy` per ADR 0056/0052 (its `health.http` path in `auth_exempt_paths`). It runs

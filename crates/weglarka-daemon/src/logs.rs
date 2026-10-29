@@ -26,7 +26,7 @@ use axum::routing::get;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use weglarka_api::{ErrorCode, LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, endpoints};
+use weglarka_api::{LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, endpoints};
 use weglarka_model::app::InstanceName;
 use weglarka_model::labels;
 use weglarka_model::podman::{LogOptions, LogSource, LogStream, PodmanClient, PodmanError};
@@ -58,7 +58,7 @@ async fn app_logs<P: PodmanClient + 'static>(
         .apps
         .contains_key(&name);
     if !known {
-        return Err(not_found(format!("unknown app: {name}")));
+        return Err(Fail::not_found(format!("unknown app: {name}")));
     }
     let container = labels::container_name(&name);
     let podman = d.engine.podman();
@@ -87,14 +87,10 @@ async fn app_logs<P: PodmanClient + 'static>(
     Ok(stream_response(LOGS_STREAM_CONTENT_TYPE, frames_rx))
 }
 
-fn not_found(message: String) -> Fail {
-    Fail(ErrorCode::NotFound, message)
-}
-
 /// A missing container is a 404; any other Podman failure is logged and answered without its text.
 fn podman_failure(name: &InstanceName, error: PodmanError) -> Fail {
     match error {
-        PodmanError::NotFound(_) => not_found(format!("app {name} has no container")),
+        PodmanError::NotFound(_) => Fail::not_found(format!("app {name} has no container")),
         other => {
             tracing::warn!(app = %name, error = %other, "reading container logs failed");
             Fail::internal("could not read the container's logs")
@@ -176,16 +172,16 @@ fn unix_secs(at: SystemTime) -> u64 {
 
 /// Copies `logs` into `frames_tx` as [`LogFrame`]s until the log ends, the client goes away or the
 /// token expires — whichever is first — then writes the audit line. Returns by dropping `logs`, which
-/// closes the Podman connection.
+/// closes the Podman connection. The result is what the audit line says (for the tests).
 async fn pump(
     mut logs: LogStream,
     frames_tx: mpsc::Sender<Bytes>,
     deadline: StreamDeadline,
     mut audit: Audit,
-) {
+) -> (Ended, Audit) {
     let expiry = deadline.reached();
     tokio::pin!(expiry);
-    let ended = loop {
+    let mut ended = loop {
         let next = tokio::select! {
             biased;
             // At the expiry itself, not a leeway later: the token's authority is over.
@@ -193,10 +189,11 @@ async fn pump(
             () = frames_tx.closed() => break Ended::ClientClosed,
             next = logs.next() => next,
         };
+        let sent_bytes;
         let frame = match next {
             None => break Ended::Eof,
             Some(Ok(chunk)) => {
-                audit.bytes += chunk.data.len() as u64;
+                sent_bytes = chunk.data.len() as u64;
                 match chunk.source {
                     LogSource::Stdout => LogFrame::Stdout(chunk.data.to_vec()),
                     LogSource::Stderr => LogFrame::Stderr(chunk.data.to_vec()),
@@ -216,7 +213,9 @@ async fn pump(
         if sent.is_err() {
             break Ended::ClientClosed;
         }
+        // Counted once delivered: a frame lost to a hang-up or the token is not output the client got.
         audit.frames += 1;
+        audit.bytes += sent_bytes;
     };
     let last = match ended {
         Ended::Eof => Some(LogFrame::End),
@@ -231,7 +230,11 @@ async fn pump(
             // interruption and re-read the log from the start); wait for room, but not past the token.
             Ended::Eof | Ended::Error => tokio::select! {
                 biased;
-                () = &mut expiry => false,
+                () = &mut expiry => {
+                    // The token ran out while the closing frame waited for room: that ended the stream.
+                    ended = Ended::TokenExpired;
+                    false
+                }
                 sent = frames_tx.send(bytes) => sent.is_ok(),
             },
             // Not awaited: a client that is not reading gets a stream that just ends, which it treats
@@ -244,6 +247,7 @@ async fn pump(
     }
     drop(logs);
     audit.finish(ended);
+    (ended, audit)
 }
 
 #[cfg(test)]
@@ -371,6 +375,28 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), pump(logs, tx, deadline, audit()))
             .await
             .expect("the pump must end at exp, not wait for the client");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bytes_and_frames_count_only_what_was_delivered() {
+        let deadline = StreamDeadline(Some(SystemTime::now() + Duration::from_secs(5)));
+        let logs = stream::repeat_with(|| chunk(LogSource::Stdout, "x\n")).boxed();
+        // Room for one frame and nobody reading: the second chunk blocks in `send` until exp.
+        let (tx, _rx) = mpsc::channel(1);
+        let (ended, got) = pump(logs, tx, deadline, audit()).await;
+        assert_eq!(ended, Ended::TokenExpired);
+        assert_eq!((got.frames, got.bytes), (1, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closing_frame_cut_off_by_the_token_is_audited_as_token_expired() {
+        let deadline = StreamDeadline(Some(SystemTime::now() + Duration::from_secs(5)));
+        // The log ends, but `End` finds the queue full and nobody reading.
+        let logs = stream::iter(vec![chunk(LogSource::Stdout, "x\n")]).boxed();
+        let (tx, _rx) = mpsc::channel(1);
+        let (ended, got) = pump(logs, tx, deadline, audit()).await;
+        assert_eq!(ended, Ended::TokenExpired);
+        assert_eq!((got.frames, got.bytes), (1, 2));
     }
 
     #[tokio::test(start_paused = true)]

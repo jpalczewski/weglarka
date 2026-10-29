@@ -599,7 +599,7 @@ async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
     let _ = client.container_logs("job", &selective).await.unwrap();
     assert!(
         mock.requests().iter().any(|r| r.contains(
-            "logs?stdout=true&stderr=true&follow=false&tail=50&since=1700000000.500000000&timestamps=true"
+            "logs?stdout=true&stderr=true&follow=false&tail=50&since=1700000000.500000&timestamps=true"
         )),
         "{:?}",
         mock.requests()
