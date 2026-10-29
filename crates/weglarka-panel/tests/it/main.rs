@@ -1,4 +1,4 @@
-//! One test binary: a module per area (see CLAUDE.md, "Testy").
+//! One test binary: a module per area (see .claude/rules/testing.md).
 
 mod app;
 mod daemon;

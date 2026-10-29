@@ -2,7 +2,7 @@
 
 How larger changes are split across parallel agent sessions (cloud and local) and reviewed before they merge. The
 admin panel series ([ADR 0057](../decisions/0057-admin-panel-architecture.md)) was built this way. Conventions that
-apply to every change (checks, Conventional Commits, language) stay in [CLAUDE.md](../../CLAUDE.md); issue labels and
+apply to every change (checks, Conventional Commits, language) stay in [CLAUDE.md](../../CLAUDE.md) and [commits and PRs](../../.claude/rules/commits-and-prs.md); issue labels and
 the roadmap project are in [issues and project](issues-and-project.md).
 
 ## Stages
@@ -37,14 +37,14 @@ Files that tend to collide, and so need an explicit order in the plan:
 - `crates/weglarka-api/src/endpoints.rs` (every new endpoint starts here)
 - `crates/weglarka-daemon/src/admin.rs` (the routes for those endpoints)
 - `Cargo.lock` (regenerate after a rebase with cargo; never merge it by hand)
-- `CLAUDE.md` (one PR at a time, and only for a real convention change)
+- `CLAUDE.md` and `.claude/rules/` (one PR at a time, and only for a real convention change)
 
 Rules for branches:
 
 - Start from a fresh `origin/main` (`git fetch origin && git rebase origin/main`); the PR must be on the current `main`.
 - Do not rewrite a branch someone else pushes to; merge `main` into it instead.
 - One task, one checkout. Never share a `target/` between checkouts: a shared build directory can link another
-  checkout's code without rebuilding. See the worktree section of [CLAUDE.md](../../CLAUDE.md) for the commands.
+  checkout's code without rebuilding. See [worktrees](../../.claude/rules/worktrees.md) for the commands.
 
 ## Brief template
 

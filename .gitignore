@@ -4,3 +4,7 @@
 /bin
 # Local agent/tool state (Serena project config and caches are per-machine).
 .serena/
+# Claude Code: session worktrees and personal overrides (rules in .claude/rules/ are tracked).
+.claude/worktrees/
+.claude/settings.local.json
+CLAUDE.local.md

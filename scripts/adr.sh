@@ -205,6 +205,7 @@ cmd_lint() {
   lint_doc_links || problems=$((problems + 1))
   lint_no_section_signs || problems=$((problems + 1))
   check_index || problems=$((problems + 1))
+  bash "$(dirname "$0")/claude-md-lint.sh" || problems=$((problems + 1))
   if [ "$problems" -gt 0 ]; then
     printf '\n%d problem group(s); see above.\n' "$problems" >&2
     return 1

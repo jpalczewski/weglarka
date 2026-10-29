@@ -47,7 +47,7 @@ Export the values first and restore them afterwards; see the lessons in [agent w
 
 Every PR links its issue with `Closes #NN` in the body so the issue closes on merge. A PR that only partly covers an
 issue uses `Refs #NN` instead, and the remainder stays open. Titles follow Conventional Commits (see
-[CLAUDE.md](../../CLAUDE.md)).
+[commits and PRs](../../.claude/rules/commits-and-prs.md)).
 
 ## Filing an issue an agent can pick up
 

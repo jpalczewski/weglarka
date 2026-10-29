@@ -58,7 +58,7 @@ jobs:
           fi
 
   # The squashed commit on `main` takes the PR title, so the title must already be a Conventional
-  # Commit (CLAUDE.md -> "Commity i PR-y"). Runs for every PR, including docs-only ones.
+  # Commit (.claude/rules/commits-and-prs.md). Runs for every PR, including docs-only ones.
   pr-title:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
