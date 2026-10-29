@@ -2232,9 +2232,11 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64 0.22.1",
  "clap",
  "http-body-util",
  "insta",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",
@@ -2244,6 +2246,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "weglarka-api",
+ "weglarka-http",
+ "weglarka-model",
  "weglarka-unix-http",
 ]
 

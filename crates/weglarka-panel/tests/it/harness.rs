@@ -10,7 +10,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use weglarka_panel::config::{
-    ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_LISTEN, ENV_PUBLIC_URL, ENV_SOCKET,
+    ENV_API_AUDIENCE, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_LISTEN, ENV_PUBLIC_URL,
+    ENV_SOCKET,
 };
 
 /// Recognizable, so a test can search the output for it.
@@ -56,6 +57,7 @@ pub fn command(addr: SocketAddr, socket: &Path) -> Command {
         .env(ENV_CLIENT_SECRET, FAKE_SECRET)
         .env(ENV_ISSUER, "https://auth.example.com")
         .env(ENV_PUBLIC_URL, "https://panel.example.com")
+        .env(ENV_API_AUDIENCE, "https://admin.example.com/api/")
         .env(ENV_SOCKET, socket)
         .env(ENV_LISTEN, addr.to_string())
         .stdin(Stdio::null())

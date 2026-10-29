@@ -18,6 +18,10 @@ pub const ENV_PUBLIC_URL: &str = "PANEL_PUBLIC_URL";
 pub const ENV_LISTEN: &str = "PANEL_LISTEN";
 pub const ENV_SOCKET: &str = "WEGLARKA_PANEL_SOCKET";
 pub const ENV_TIMEOUT_SECS: &str = "PANEL_REQUEST_TIMEOUT_SECS";
+pub const ENV_CLIENT_SECRET_FILE: &str = "OIDC_CLIENT_SECRET_FILE";
+pub const ENV_API_AUDIENCE: &str = "PANEL_API_AUDIENCE";
+pub const ENV_SESSION_IDLE_SECS: &str = "PANEL_SESSION_IDLE_SECS";
+pub const ENV_SESSION_MAX_SECS: &str = "PANEL_SESSION_MAX_SECS";
 
 /// Where the token listener's directory is mounted in a client (docs/decisions/0056, decision 2).
 pub const DEFAULT_SOCKET: &str = "/run/weglarka-admin/api.sock";
@@ -25,6 +29,14 @@ pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 /// How long the daemon may take to answer the head of a response.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// A session ends after this long without a request, and after [`DEFAULT_SESSION_MAX`] regardless.
+pub const DEFAULT_SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_SESSION_MAX: Duration = Duration::from_secs(8 * 60 * 60);
+const SESSION_IDLE_BOUNDS: std::ops::RangeInclusive<u64> = 60..=24 * 60 * 60;
+const SESSION_MAX_BOUNDS: std::ops::RangeInclusive<u64> = 300..=7 * 24 * 60 * 60;
+/// A client secret file is a few dozen bytes; anything bigger is the wrong file.
+const MAX_SECRET_FILE_BYTES: u64 = 4096;
+const MAX_AUDIENCE_BYTES: usize = 512;
 
 /// A secret string. `Debug` never shows it; there is no `Display`, `Serialize`, `Clone` or `==`
 /// (a derived comparison is not constant-time): the only way out is [`Secret::expose`].
@@ -71,6 +83,9 @@ pub struct OidcConfig {
     /// the issuer identifier is compared byte for byte with the token's `iss`, so it is never
     /// normalized.
     pub issuer: String,
+    /// The `aud` the daemon expects of an access token (`[admin.http] audience`); sent in the
+    /// authorization request so the provider mints tokens the daemon accepts.
+    pub audience: String,
 }
 
 #[derive(Debug)]
@@ -82,6 +97,10 @@ pub struct PanelConfig {
     pub socket: PathBuf,
     /// Bounds how long the daemon may take to answer a request.
     pub request_timeout: Duration,
+    /// A session with no request for this long ends.
+    pub session_idle: Duration,
+    /// A session ends this long after login, however active.
+    pub session_max: Duration,
     pub oidc: OidcConfig,
 }
 
@@ -98,11 +117,48 @@ impl PanelConfig {
 
         let public_url = parse_url(ENV_PUBLIC_URL, &required(ENV_PUBLIC_URL)?, true)?;
         let issuer = required(ENV_ISSUER)?.trim().to_owned();
-        parse_url(ENV_ISSUER, &issuer, false)?;
+        // A loopback `http://` issuer is allowed for a test provider; everything else is https.
+        let issuer_url = parse_url(ENV_ISSUER, &issuer, true)?;
+        // The same rule the OIDC client applies to every endpoint: plain http only to a loopback IP
+        // (`localhost` is a name, not an address, and would only fail later at discovery).
+        if issuer_url.scheme() == "http" && !weglarka_http::transport_allowed(&issuer_url) {
+            return Err(invalid(
+                ENV_ISSUER,
+                "plain http is only allowed to a loopback IP address",
+            ));
+        }
+
+        let audience = required(ENV_API_AUDIENCE)?.trim().to_owned();
+        if audience.len() > MAX_AUDIENCE_BYTES || audience.chars().any(|c| c.is_control()) {
+            return Err(invalid(
+                ENV_API_AUDIENCE,
+                "expected a short single-line identifier",
+            ));
+        }
+        let client_secret = client_secret(&get)?;
 
         let socket = get(ENV_SOCKET).unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
         if !socket.starts_with('/') {
             return Err(invalid(ENV_SOCKET, "expected an absolute path"));
+        }
+
+        let session_idle = seconds(
+            get(ENV_SESSION_IDLE_SECS),
+            ENV_SESSION_IDLE_SECS,
+            SESSION_IDLE_BOUNDS,
+            DEFAULT_SESSION_IDLE,
+        )?;
+        let session_max = seconds(
+            get(ENV_SESSION_MAX_SECS),
+            ENV_SESSION_MAX_SECS,
+            SESSION_MAX_BOUNDS,
+            DEFAULT_SESSION_MAX,
+        )?;
+        if session_idle > session_max {
+            return Err(invalid(
+                ENV_SESSION_IDLE_SECS,
+                format!("must not exceed {ENV_SESSION_MAX_SECS}"),
+            ));
         }
 
         let request_timeout = match get(ENV_TIMEOUT_SECS) {
@@ -123,12 +179,75 @@ impl PanelConfig {
             public_url,
             socket: socket.into(),
             request_timeout,
+            session_idle,
+            session_max,
             oidc: OidcConfig {
                 client_id: required(ENV_CLIENT_ID)?,
-                client_secret: Secret::new(required(ENV_CLIENT_SECRET)?),
+                client_secret,
                 issuer,
+                audience,
             },
         })
+    }
+}
+
+/// The client secret: `OIDC_CLIENT_SECRET`, or the first line of the file `OIDC_CLIENT_SECRET_FILE`
+/// names (a mounted secret). Setting both is ambiguous, so it is refused. Errors never carry the value.
+fn client_secret(get: &impl Fn(&'static str) -> Option<String>) -> Result<Secret, ConfigError> {
+    match (get(ENV_CLIENT_SECRET), get(ENV_CLIENT_SECRET_FILE)) {
+        (Some(_), Some(_)) => Err(invalid(
+            ENV_CLIENT_SECRET_FILE,
+            format!("set either {ENV_CLIENT_SECRET} or this, not both"),
+        )),
+        (Some(value), None) => secret(&value, ENV_CLIENT_SECRET),
+        (None, None) => Err(ConfigError::Missing(ENV_CLIENT_SECRET)),
+        (None, Some(path)) => {
+            let unreadable = || invalid(ENV_CLIENT_SECRET_FILE, "cannot read the file");
+            let file = std::fs::File::open(&path).map_err(|_| unreadable())?;
+            let mut text = String::new();
+            std::io::Read::read_to_string(
+                &mut std::io::Read::take(file, MAX_SECRET_FILE_BYTES + 1),
+                &mut text,
+            )
+            .map_err(|_| unreadable())?;
+            if text.len() as u64 > MAX_SECRET_FILE_BYTES {
+                return Err(invalid(ENV_CLIENT_SECRET_FILE, "the file is too large"));
+            }
+            let value = text.lines().next().unwrap_or("").trim();
+            if value.is_empty() {
+                return Err(invalid(ENV_CLIENT_SECRET_FILE, "the file is empty"));
+            }
+            secret(value, ENV_CLIENT_SECRET_FILE)
+        }
+    }
+}
+
+/// A secret is one line of printable characters: anything else is a mangled mount or a pasted file.
+fn secret(value: &str, var: &'static str) -> Result<Secret, ConfigError> {
+    if value.chars().any(|c| c.is_control()) {
+        return Err(invalid(
+            var,
+            "must be a single line without control characters",
+        ));
+    }
+    Ok(Secret::new(value))
+}
+
+fn seconds(
+    raw: Option<String>,
+    var: &'static str,
+    bounds: std::ops::RangeInclusive<u64>,
+    default: Duration,
+) -> Result<Duration, ConfigError> {
+    match raw {
+        None => Ok(default),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(s) if bounds.contains(&s) => Ok(Duration::from_secs(s)),
+            _ => Err(invalid(
+                var,
+                format!("expected {}..={} seconds", bounds.start(), bounds.end()),
+            )),
+        },
     }
 }
 
@@ -167,6 +286,7 @@ mod tests {
             (ENV_CLIENT_SECRET, "s3cr3t-value"),
             (ENV_ISSUER, "https://auth.example.com"),
             (ENV_PUBLIC_URL, "https://panel.example.com/"),
+            (ENV_API_AUDIENCE, "https://admin.example.com/api/"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -218,7 +338,8 @@ mod tests {
     fn urls_must_be_https_without_extras() {
         for (var, bad) in [
             (ENV_ISSUER, "http://auth.example.com"),
-            (ENV_ISSUER, "http://localhost:9091"),
+            (ENV_ISSUER, "http://auth.example.com:9091"),
+            (ENV_ISSUER, "http://127.0.0.1.example.com"),
             (ENV_ISSUER, "https://user:pw@auth.example.com"),
             (ENV_PUBLIC_URL, "http://panel.example.com"),
             (ENV_PUBLIC_URL, "https://panel.example.com/?x=1"),
@@ -233,6 +354,97 @@ mod tests {
         }
         // plain http is only for the panel's own origin on loopback
         PanelConfig::from_lookup(env(&[(ENV_PUBLIC_URL, "http://localhost:8080")])).unwrap();
+    }
+
+    #[test]
+    fn a_loopback_http_issuer_is_allowed_everything_else_stays_https() {
+        for ok in ["http://127.0.0.1:9091", "http://[::1]:9091"] {
+            let c = PanelConfig::from_lookup(env(&[(ENV_ISSUER, ok)])).unwrap();
+            assert_eq!(c.oidc.issuer, ok);
+        }
+        // `localhost` is a name: the OIDC client would refuse it, so startup does too.
+        assert!(PanelConfig::from_lookup(env(&[(ENV_ISSUER, "http://localhost:9091")])).is_err());
+    }
+
+    #[test]
+    fn the_api_audience_is_required_and_a_single_line() {
+        let err = PanelConfig::from_lookup(|k| env(&[])(k).filter(|_| k != ENV_API_AUDIENCE))
+            .unwrap_err();
+        assert_eq!(err, ConfigError::Missing(ENV_API_AUDIENCE));
+        let c = PanelConfig::from_lookup(env(&[])).unwrap();
+        assert_eq!(c.oidc.audience, "https://admin.example.com/api/");
+        for bad in ["two\nlines", &"a".repeat(600)] {
+            assert!(PanelConfig::from_lookup(env(&[(ENV_API_AUDIENCE, bad)])).is_err());
+        }
+    }
+
+    #[test]
+    fn session_lifetimes_have_defaults_and_bounds() {
+        let c = PanelConfig::from_lookup(env(&[])).unwrap();
+        assert_eq!(c.session_idle, DEFAULT_SESSION_IDLE);
+        assert_eq!(c.session_max, DEFAULT_SESSION_MAX);
+        let c = PanelConfig::from_lookup(env(&[
+            (ENV_SESSION_IDLE_SECS, "120"),
+            (ENV_SESSION_MAX_SECS, "600"),
+        ]))
+        .unwrap();
+        assert_eq!(c.session_idle, Duration::from_secs(120));
+        assert_eq!(c.session_max, Duration::from_secs(600));
+        for (var, bad) in [
+            (ENV_SESSION_IDLE_SECS, "5"),
+            (ENV_SESSION_IDLE_SECS, "999999999"),
+            (ENV_SESSION_IDLE_SECS, "soon"),
+            (ENV_SESSION_MAX_SECS, "10"),
+            (ENV_SESSION_MAX_SECS, "99999999"),
+            // idle may not exceed max
+            (ENV_SESSION_MAX_SECS, "600"),
+        ] {
+            let mut extra = vec![(var, bad)];
+            if bad == "600" {
+                extra.push((ENV_SESSION_IDLE_SECS, "1200"));
+            }
+            assert!(
+                PanelConfig::from_lookup(env(&extra)).is_err(),
+                "{var}={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_secret_comes_from_a_variable_or_a_file_never_both_and_never_leaks() {
+        let dir = std::env::temp_dir().join(format!("wgl-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("secret");
+        std::fs::write(&file, "from-the-file\n").unwrap();
+        let file_arg = file.display().to_string();
+        let only_file = |k: &str| match k {
+            ENV_CLIENT_SECRET => None,
+            ENV_CLIENT_SECRET_FILE => Some(file_arg.clone()),
+            other => env(&[])(other),
+        };
+        let c = PanelConfig::from_lookup(only_file).unwrap();
+        assert_eq!(c.oidc.client_secret.expose(), "from-the-file");
+
+        let both = PanelConfig::from_lookup(env(&[(ENV_CLIENT_SECRET_FILE, &file_arg)]));
+        assert!(matches!(both, Err(ConfigError::Invalid { .. })));
+
+        let missing = |k: &str| match k {
+            ENV_CLIENT_SECRET => None,
+            ENV_CLIENT_SECRET_FILE => Some("/nonexistent/secret".to_owned()),
+            other => env(&[])(other),
+        };
+        let err = PanelConfig::from_lookup(missing).unwrap_err().to_string();
+        assert!(err.contains(ENV_CLIENT_SECRET_FILE), "{err}");
+
+        std::fs::write(&file, "  \n").unwrap();
+        assert!(PanelConfig::from_lookup(only_file).is_err());
+
+        // A secret with a control character is refused without quoting it.
+        let err = PanelConfig::from_lookup(env(&[(ENV_CLIENT_SECRET, "top\u{7}-secret")]))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("top"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

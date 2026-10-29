@@ -6,12 +6,36 @@ use askama::Template;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// The signed-in placeholder: who you are, what the daemon says, and a logout form. The real pages
+/// extend `base.html` the same way.
+#[derive(Template)]
+#[template(path = "index.html")]
+pub struct IndexPage<'a> {
+    pub user: &'a str,
+    pub csrf: &'a str,
+    pub daemon: &'a str,
+}
+
+impl IndexPage<'_> {
+    pub fn respond(&self) -> Response {
+        match self.render() {
+            Ok(html) => axum::response::Html(html).into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "rendering the index page failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+}
+
 /// A bare page for a status: sign-in required, not found, daemon trouble.
 #[derive(Template)]
 #[template(path = "error.html")]
 pub struct ErrorPage<'a> {
     pub title: &'a str,
     pub message: &'a str,
+    /// Where the "Sign in" link goes, if the page offers one.
+    pub sign_in: Option<&'a str>,
 }
 
 impl ErrorPage<'_> {
@@ -36,6 +60,7 @@ mod tests {
         let html = ErrorPage {
             title: "<script>alert(1)</script>",
             message: "a & b",
+            sign_in: None,
         }
         .render()
         .unwrap();
