@@ -275,7 +275,9 @@ pub struct LogOptions {
     pub follow: bool,
     /// Only the last this many lines; `None` = all.
     pub tail: Option<u32>,
-    /// Only output written at or after this instant; `None` = from the beginning.
+    /// Only output written at or after this instant (inclusive, so a reconnect that passes the time of
+    /// the last line it saw gets that line again: delivery across reconnects is at-least-once);
+    /// `None` = from the beginning.
     pub since: Option<SystemTime>,
     /// Prefix every line with its RFC 3339 timestamp (part of the delivered bytes).
     pub timestamps: bool,

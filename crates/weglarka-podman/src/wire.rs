@@ -989,8 +989,6 @@ impl LogDemux {
     }
 }
 
-/// `POST /containers/{name}/wait` answers with the bare exit code (libpod) or `{"StatusCode": n}`
-/// (the Docker-compatible shape); accept both.
 /// An instant as libpod's `since` takes it: fractional unix seconds (`1700000000.250000000`);
 /// before the epoch it is `0`.
 pub(crate) fn unix_seconds(at: std::time::SystemTime) -> String {
@@ -1002,6 +1000,8 @@ pub(crate) fn unix_seconds(at: std::time::SystemTime) -> String {
     )
 }
 
+/// `POST /containers/{name}/wait` answers with the bare exit code (libpod) or `{"StatusCode": n}`
+/// (the Docker-compatible shape); accept both.
 pub(crate) fn parse_wait(body: &[u8]) -> Result<i32, PodmanError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]

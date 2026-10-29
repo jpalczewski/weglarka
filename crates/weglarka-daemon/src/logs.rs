@@ -225,9 +225,20 @@ async fn pump(
         Ended::ClientClosed => None,
     };
     if let Some(frame) = last {
-        // Not awaited: a client that is not reading gets a stream that just ends, which it treats as
-        // an interruption and reconnects from; waiting here would keep the stream past the token.
-        if frames_tx.try_send(Bytes::from(frame.encode())).is_ok() {
+        let bytes = Bytes::from(frame.encode());
+        let delivered = match ended {
+            // The log's own end must not be lost to a full queue (a slow client would take it for an
+            // interruption and re-read the log from the start); wait for room, but not past the token.
+            Ended::Eof | Ended::Error => tokio::select! {
+                biased;
+                () = &mut expiry => false,
+                sent = frames_tx.send(bytes) => sent.is_ok(),
+            },
+            // Not awaited: a client that is not reading gets a stream that just ends, which it treats
+            // as an interruption and reconnects from; waiting here would keep the stream past the token.
+            Ended::TokenExpired | Ended::ClientClosed => frames_tx.try_send(bytes).is_ok(),
+        };
+        if delivered {
             audit.frames += 1;
         }
     }
@@ -288,6 +299,24 @@ mod tests {
                 LogFrame::End
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_log_is_not_lost_when_the_queue_is_full() {
+        let logs = stream::iter(vec![
+            chunk(LogSource::Stdout, "a\n"),
+            chunk(LogSource::Stdout, "b\n"),
+            chunk(LogSource::Stdout, "c\n"),
+        ])
+        .boxed();
+        // A queue of one and a reader that arrives late: `End` has to wait for room.
+        let (tx, rx) = mpsc::channel(1);
+        let pump = tokio::spawn(pump(logs, tx, StreamDeadline(None), audit()));
+        tokio::task::yield_now().await;
+        let frames = drain(rx).await;
+        pump.await.unwrap();
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[3], LogFrame::End);
     }
 
     #[tokio::test]
