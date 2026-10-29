@@ -71,8 +71,9 @@ logged with their reason. Tokens themselves are never logged.
 and whether the provider's signing keys can be fetched. A `401` for a token you believe is valid usually shows up there or
 in the daemon log (`typ is not at+jwt`, `audience`, `issuer`, `unknown key`).
 
-> The `typ: at+jwt` header is what RFC 9068 requires and what the daemon insists on. It has not yet been confirmed against
-> a running Authelia; if every token is refused with `typ is not at+jwt`, that is the reason, so please report it.
+> The `typ: at+jwt` header is what RFC 9068 requires and what the daemon insists on. Authelia 4.39.22 issues it for JWT
+> access tokens; if every token is refused with `typ is not at+jwt` after a provider upgrade, that is the reason, so
+> please report it.
 
 ## Rollback
 

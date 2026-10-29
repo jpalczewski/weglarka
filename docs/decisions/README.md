@@ -63,3 +63,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0054](0054-health-probe-socket.md) | Health probe over the ingress probe socket |
 | [0055](0055-generated-config-pipeline.md) | Generated config pipeline |
 | [0056](0056-admin-api-token-listener.md) | Admin API beyond the unix socket: a token listener |
+| [0057](0057-admin-panel-architecture.md) | Admin panel: a server-rendered BFF with htmx and Alpine |
