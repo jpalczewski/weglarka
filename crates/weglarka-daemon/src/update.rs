@@ -25,7 +25,7 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use weglarka_api::{
     CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, ErrorCode, RuntimeState,
-    ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
+    UpdateAppRequest, UpdateAppResponse,
 };
 use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
 use weglarka_engine::reconcile::EngineError;
@@ -34,8 +34,9 @@ use weglarka_model::labels;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state::{self, AppState};
 
-use crate::admin::{Fail, runtime_state_for, validate_host_rules};
+use crate::admin::{Fail, validate_host_rules};
 use crate::app::{Daemon, MUTATION_TIMEOUT};
+use crate::app_view::{Access, show_response};
 
 /// Runtime state with "waiting for secret" taking the place of `Missing`: there is no container
 /// because the bound secrets are not set yet. (With a running container the app keeps `Running`;
@@ -50,8 +51,9 @@ pub(crate) fn with_waiting(runtime: RuntimeState, state: Option<&AppState>) -> R
 }
 
 /// `PUT /v1/apps/{name}`.
-pub async fn update_app<P: PodmanClient + 'static>(
+pub(crate) async fn update_app<P: PodmanClient + 'static>(
     State(d): State<Arc<Daemon<P>>>,
+    access: Access,
     Path(raw): Path<String>,
     body: Bytes,
 ) -> Result<Response, Fail> {
@@ -119,18 +121,7 @@ pub async fn update_app<P: PodmanClient + 'static>(
         .await
         .ok();
     let app_state = st.apps.get(&name);
-    let app = ShowAppResponse {
-        runtime: with_waiting(
-            runtime_state_for(&req.spec, app_state, container.as_ref()),
-            app_state,
-        ),
-        state: app_state.cloned().unwrap_or_default(),
-        // Only `GET /v1/apps/{name}` resolves the mounts: update never touches `config_root`.
-        configs: None,
-        host_mounts: None,
-        name,
-        spec: req.spec,
-    };
+    let app = show_response(access, name, req.spec, app_state, container.as_ref());
     Ok(axum::Json(UpdateAppResponse { app, deploy }).into_response())
 }
 

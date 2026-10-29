@@ -245,6 +245,46 @@ async fn scopes_decide_what_a_token_may_do() {
 }
 
 #[tokio::test]
+async fn a_read_token_sees_env_keys_without_values_and_the_runtime_detail() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+    let reader = s.issuer.token("rita", &["viewers"]);
+    let admin_token = s.issuer.token("adam", &["admins"]);
+
+    let mut app = spec("x.example.com");
+    app["env"] = json!({ "DATABASE_URL": "postgres://u:hunter2@db/x", "MODE": "prod" });
+    add(&s.h, "x", app).await;
+    deployed(&s.h, "x").await;
+
+    // Read scope: the keys, never the values — and nothing of them anywhere in the answer.
+    let (status, _, body) = call(sock, "GET", "/v1/apps/x", Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["env"],
+        json!({ "DATABASE_URL": "", "MODE": "" })
+    );
+    assert!(!body.to_string().contains("hunter2"), "{body}");
+    // The runtime detail is there for the panel.
+    assert_eq!(body["restarts"], 0, "{body}");
+    assert!(body["started_at"].is_string(), "{body}");
+
+    // Admin scope and the unix socket keep the real values.
+    let (status, _, body) = call(sock, "GET", "/v1/apps/x", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["env"]["DATABASE_URL"],
+        "postgres://u:hunter2@db/x"
+    );
+    let body = show(&s.h, "x").await;
+    assert_eq!(
+        body["spec"]["env"]["DATABASE_URL"],
+        "postgres://u:hunter2@db/x"
+    );
+    assert_eq!(body["spec"]["env"]["MODE"], "prod");
+    assert_eq!(body["restarts"], 0, "{body}");
+}
+
+#[tokio::test]
 async fn every_declared_endpoint_is_routed_and_enforces_its_scope() {
     let s = setup().await;
     let sock = &s.token_socket;

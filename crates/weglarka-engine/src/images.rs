@@ -327,6 +327,7 @@ mod tests {
             exit_code: None,
             health: None,
             restarts: 0,
+            started_at: None,
             networks: Vec::new(),
             addresses: Vec::new(),
             published_ports: Vec::new(),

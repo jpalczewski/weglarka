@@ -380,6 +380,16 @@ mod tests {
         }
     }
 
+    /// `GET /v1/apps/{name}` is `read` only because the daemon blanks `env` values for a caller
+    /// without `admin` (`weglarka-daemon`, `app_view`; test `token_api.rs`). Any other GET that
+    /// returns a whole `AppSpec` must either do the same or move to `admin`.
+    #[test]
+    fn the_read_scope_app_view_is_the_redacted_one() {
+        assert_eq!(APPS_SHOW.scope, Some(Scope::Read));
+        assert_eq!(APPS_UPDATE.scope, Some(Scope::Admin));
+        assert_eq!(APPS_ADD.scope, Some(Scope::Admin));
+    }
+
     #[test]
     fn lookup_finds_by_method_and_template() {
         assert_eq!(Endpoint::lookup("GET", "/v1/apps/{name}"), Some(&APPS_SHOW));

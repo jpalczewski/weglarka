@@ -509,12 +509,19 @@ struct InspectState {
     exit_code: i32,
     #[serde(alias = "Healthcheck")]
     health: Option<InspectHealth>,
+    /// RFC 3339; libpod reports the zero time (`0001-01-01T00:00:00Z`) for a container that never ran.
+    started_at: String,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "PascalCase")]
 struct InspectHealth {
     status: String,
+}
+
+/// `State.StartedAt` as text, or `None` when empty or the zero time of a container that never started.
+fn started_at(raw: &str) -> Option<String> {
+    (!raw.is_empty() && !raw.starts_with("0001-01-01")).then(|| raw.to_owned())
 }
 
 fn container_state(status: &str) -> ContainerState {
@@ -574,6 +581,7 @@ impl InspectContainer {
             state,
             health: self.state.health.and_then(|h| health_status(&h.status)),
             restarts: self.restart_count,
+            started_at: started_at(&self.state.started_at),
             networks: networks.keys().cloned().collect(),
             addresses: addresses.into_iter().collect(),
             published_ports,
@@ -1031,6 +1039,23 @@ mod tests {
             info.restarts, 3,
             "libpod `RestartCount` maps to `ContainerInfo::restarts`"
         );
+        assert_eq!(info.started_at.as_deref(), Some("2026-10-23T10:00:01Z"));
+    }
+
+    #[test]
+    fn started_at_is_text_and_the_zero_time_means_never() {
+        assert_eq!(
+            started_at("2026-10-29T08:15:30.123456789+01:00").as_deref(),
+            Some("2026-10-29T08:15:30.123456789+01:00")
+        );
+        assert_eq!(started_at("0001-01-01T00:00:00Z"), None);
+        assert_eq!(started_at(""), None);
+        let info = decode::<InspectContainer>(
+            br#"{"Id":"1","Name":"n","State":{"Status":"running","StartedAt":"2026-10-29T08:15:30Z"}}"#,
+        )
+        .unwrap()
+        .into_domain();
+        assert_eq!(info.started_at.as_deref(), Some("2026-10-29T08:15:30Z"));
     }
 
     #[test]

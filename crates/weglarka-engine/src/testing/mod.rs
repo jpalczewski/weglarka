@@ -2,7 +2,9 @@
 
 mod fake_podman;
 
-pub use fake_podman::{Call, DEFAULT_IMAGE_SIZE_BYTES, DEFAULT_SUBUID_POOL, FakePodman, RunScript};
+pub use fake_podman::{
+    Call, DEFAULT_IMAGE_SIZE_BYTES, DEFAULT_SUBUID_POOL, FAKE_STARTED_AT, FakePodman, RunScript,
+};
 
 #[cfg(test)]
 mod fake_podman_tests;

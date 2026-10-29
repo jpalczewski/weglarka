@@ -39,6 +39,7 @@ use weglarka_model::secret_store::{
 use weglarka_model::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
+use crate::app_view::{Access, show_response};
 use crate::doctor;
 use crate::images;
 use crate::push;
@@ -389,6 +390,7 @@ async fn list_apps<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<
 
 async fn show_app<P: PodmanClient + 'static>(
     State(d): Shared<P>,
+    access: Access,
     Path(raw): Path<String>,
 ) -> ApiResult<Response> {
     let name = parse_name(&raw)?;
@@ -400,17 +402,13 @@ async fn show_app<P: PodmanClient + 'static>(
         .container_inspect(&labels::container_name(&name))
         .await
         .ok();
+    let configs = config_views(&d, &spec);
+    let host_mounts = host_mount_views(&d, &spec);
     let app_state = st.apps.get(&name);
     Ok(json(ShowAppResponse {
-        state: app_state.cloned().unwrap_or_default(),
-        runtime: update::with_waiting(
-            runtime_state_for(&spec, app_state, container.as_ref()),
-            app_state,
-        ),
-        configs: config_views(&d, &spec),
-        host_mounts: host_mount_views(&d, &spec),
-        name,
-        spec,
+        configs,
+        host_mounts,
+        ..show_response(access, name.clone(), spec, app_state, container.as_ref())
     }))
 }
 
@@ -508,6 +506,7 @@ pub(crate) fn validate_host_rules<P: PodmanClient>(
 
 async fn add_app<P: PodmanClient + 'static>(
     State(d): Shared<P>,
+    access: Access,
     body: Bytes,
 ) -> ApiResult<Response> {
     let req: AddAppRequest = parse_json(&body)?;
@@ -553,18 +552,13 @@ async fn add_app<P: PodmanClient + 'static>(
         .await
         .ok();
     let app_state = st.apps.get(&req.name);
-    Ok(json(ShowAppResponse {
-        runtime: update::with_waiting(
-            runtime_state_for(&req.spec, app_state, container.as_ref()),
-            app_state,
-        ),
-        state: app_state.cloned().unwrap_or_default(),
-        // Only `GET /v1/apps/{name}` resolves the mounts: add/update never touch `config_root`.
-        configs: None,
-        host_mounts: None,
-        name: req.name,
-        spec: req.spec,
-    }))
+    Ok(json(show_response(
+        access,
+        req.name,
+        req.spec,
+        app_state,
+        container.as_ref(),
+    )))
 }
 
 async fn remove_app<P: PodmanClient + 'static>(

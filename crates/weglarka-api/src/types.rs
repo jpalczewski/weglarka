@@ -100,6 +100,28 @@ pub struct ShowAppResponse {
     /// absent when the app declares none. Only `GET /v1/apps/{name}` fills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_mounts: Option<Vec<HostMountView>>,
+    /// Times Podman restarted the container (restart policy); absent when there is no container.
+    /// Runtime detail, only `GET /v1/apps/{name}` fills it (add/update answer without a probe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<u32>,
+    /// The container's health as Podman reports it, unlike `runtime` (which folds everything but
+    /// `unhealthy` into `running`) it tells `starting` from `healthy`. Absent when there is no
+    /// container or the image has no healthcheck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ContainerHealth>,
+    /// When the container last started, RFC 3339 as Podman reports it; absent when it never ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+/// Raw container health (`GET /v1/apps/{name}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerHealth {
+    /// Inside the healthcheck start period or before the first passing probe.
+    Starting,
+    Healthy,
+    Unhealthy,
 }
 
 /// State of one declared host mount as the daemon sees it (issue #178).

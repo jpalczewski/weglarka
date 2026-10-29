@@ -734,6 +734,9 @@ fn show_app(start: bool) -> ShowAppResponse {
         },
         configs: None,
         host_mounts: None,
+        restarts: None,
+        health: None,
+        started_at: None,
     }
 }
 

@@ -251,6 +251,7 @@ mod tests {
             exit_code: None,
             health,
             restarts,
+            started_at: None,
             networks: vec![],
             addresses: vec![],
             published_ports: vec![],

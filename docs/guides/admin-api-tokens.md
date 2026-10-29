@@ -47,6 +47,13 @@ revoked before it expires.
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
+`GET /v1/apps/{name}` is open to `read` but redacted: for a token without `admin` the values of `env` are blank (the keys
+stay), in every response that carries an app spec. Put connection strings and other credentials in secrets, not in `env`,
+and do not put them in `command` or `health.command` either, which are shown as written. The same answer also reports the
+container's `restarts`, its raw `health` (`starting`, `healthy` or `unhealthy`) and `started_at` (RFC 3339). The unix socket
+and `admin` tokens see the real values. The notification status (`GET /v1/notifications`) is safe at `read`: its
+`last_error` holds the daemon's own wording of the failure, never the server URL or the access token.
+
 A token whose scopes are too small, or whose groups map to no scope, gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
 not declared with a scope is refused even to an admin.
 
