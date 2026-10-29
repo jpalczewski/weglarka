@@ -34,7 +34,7 @@ weglarka-registry = { path = "crates/weglarka-registry", version = "0.0" }
 
 # external
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "matched-path"] }
 base64 = "0.22"
 # No `color` (anstream and friends): plain help output is enough for a CLI run over SSH.
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }

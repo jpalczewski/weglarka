@@ -6,6 +6,7 @@
 
 pub mod acme;
 pub mod admin;
+pub mod admin_token;
 pub mod app;
 pub mod cdn;
 pub mod doctor;
@@ -91,6 +92,9 @@ pub enum StartError {
     /// `[acme.dns]` is unusable (an unreadable or world-readable token file, an invalid apex).
     #[error("{0}")]
     Acme(String),
+    /// `[admin.http]` cannot be served (docs/decisions/0056).
+    #[error("[admin.http] {0}")]
+    AdminHttp(String),
     /// `[ingress]` cannot work in the selected mode (an `edge` host without `https_bind`, a
     /// `behind`-only key in `edge`, a privileged publish port without the opt-in — issue #95).
     #[error("{0}")]
@@ -126,9 +130,13 @@ const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Running<P: PodmanClient + 'static> {
     pub daemon: Arc<Daemon<P>>,
     pub admin_socket: PathBuf,
+    /// Socket of the token listener (`[admin.http]`); `None` without it.
+    pub admin_token_socket: Option<PathBuf>,
     pub webhook_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     admin: JoinHandle<()>,
+    /// The token listener (`[admin.http]`); `None` without it.
+    admin_token: Option<JoinHandle<()>>,
     webhook: JoinHandle<()>,
     ingress: JoinHandle<()>,
     reconcile: JoinHandle<()>,
@@ -153,10 +161,13 @@ fn ensure_dir(dir: &Path, mode: u32) -> Result<(), StartError> {
         .map_err(io(format!("create {}", dir.display())))
 }
 
-/// Binds the admin API socket: removes only a stale *socket*, sets mode 0600 right after the bind.
-fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
+/// Binds a unix socket for an API listener: creates its directory with `dir_mode`, removes only a stale
+/// *socket*, and sets `socket_mode` right after the bind. The full-trust admin socket is `0700`/`0600`;
+/// the token listener's is more open because its callers are containers with other uids and every
+/// request there carries a verified token (docs/decisions/0056).
+fn bind_unix(path: &Path, dir_mode: u32, socket_mode: u32) -> Result<UnixListener, StartError> {
     if let Some(parent) = path.parent() {
-        ensure_dir(parent, 0o700)?;
+        ensure_dir(parent, dir_mode)?;
     }
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_socket() => {
@@ -164,7 +175,7 @@ fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
         }
         Ok(_) => {
             return Err(StartError::Io {
-                what: format!("admin socket {}", path.display()),
+                what: format!("socket {}", path.display()),
                 source: std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "path exists and is not a socket",
@@ -175,9 +186,39 @@ fn bind_admin(path: &Path) -> Result<UnixListener, StartError> {
         Err(e) => return Err(io(format!("stat {}", path.display()))(e)),
     }
     let listener = UnixListener::bind(path).map_err(io(format!("bind {}", path.display())))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))
         .map_err(io(format!("chmod {}", path.display())))?;
     Ok(listener)
+}
+
+/// Sets `dir`'s mode whatever it was created with (`ensure_dir` leaves an existing directory alone).
+fn enforce_dir_mode(dir: &Path, mode: u32) -> Result<(), StartError> {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .map_err(io(format!("chmod {}", dir.display())))
+}
+
+/// Serves `app` on `listener` until `shutdown` flips; a server that stops by itself is logged.
+fn spawn_server<L>(
+    name: &'static str,
+    listener: L,
+    app: axum::Router,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
+    tokio::spawn(async move {
+        let stop = async move {
+            let _ = shutdown.wait_for(|stop| *stop).await;
+        };
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(stop)
+            .await
+        {
+            tracing::error!(server = name, error = %e, "server stopped");
+        }
+    })
 }
 
 pub async fn start<P: PodmanClient + 'static>(
@@ -252,6 +293,13 @@ pub async fn start_with<P: PodmanClient + 'static>(
         group_add: host.runtime.group_add.clone(),
         // Static sites live in the one directory nginx mounts (ADR 0049, ADR 0036).
         sites_root: Some(paths.nginx_conf_dir.join("sites")),
+        // The token admin API socket, mounted into the `[admin.http] clients` only (ADR 0056).
+        admin_token: host.admin.http.as_ref().map(|http| {
+            weglarka_engine::admin_token::AdminTokenMount {
+                dir: paths.admin_token_dir.clone(),
+                clients: http.clients.iter().cloned().collect(),
+            }
+        }),
         dependency_wait_secs: host
             .runtime
             .dependency_wait_secs
@@ -358,7 +406,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         tasks: Mutex::new(JoinSet::new()),
     });
 
-    let admin_listener = bind_admin(&host.admin.socket)?;
+    let admin_listener = bind_unix(&host.admin.socket, 0o700, 0o600)?;
     let webhook_listener = TcpListener::bind(host.webhook.listen)
         .await
         .map_err(io(format!("bind {}", host.webhook.listen)))?;
@@ -368,33 +416,48 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let _ = daemon.webhook_addr.set(webhook_addr);
 
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let wait = |mut rx: watch::Receiver<bool>| async move {
-        let _ = rx.wait_for(|stop| *stop).await;
+    let admin = spawn_server(
+        "admin API",
+        admin_listener,
+        admin::router(daemon.clone()),
+        shutdown_rx.clone(),
+    );
+    // The token listener (docs/decisions/0056): only with `[admin.http]` (which needs `[identity]`,
+    // checked by `host.validate()` above). It shares the routes of the socket above, behind a bearer.
+    let admin_token = match (&host.admin.http, &host.identity) {
+        (Some(http), Some(identity)) => {
+            let listener = bind_unix(&paths.admin_token_socket(), 0o711, 0o666)?;
+            // Re-applied on every start, like the probe directory: a directory that already existed
+            // (or was created under a restrictive umask) must still be traversable by the clients'
+            // uids, and must not have drifted wider than intended.
+            enforce_dir_mode(&paths.admin_token_dir, 0o711)?;
+            let issuer_host = weglarka_model::identity::issuer_host(&identity.issuer)
+                .map_err(|reason| {
+                    StartError::AdminHttp(format!("issuer {:?}: {reason}", identity.issuer))
+                })?
+                .to_owned();
+            let verifier = Arc::new(admin_token::JwksVerifier::new(
+                admin_token::ProbeJwks {
+                    socket: ingress::probe_socket_path(&paths.nginx_conf_dir),
+                    issuer_host,
+                },
+                http.validation(&identity.issuer),
+            ));
+            Some(spawn_server(
+                "admin token API",
+                listener,
+                admin_token::token_router(daemon.clone(), verifier),
+                shutdown_rx.clone(),
+            ))
+        }
+        _ => None,
     };
-    let admin = tokio::spawn({
-        let app = admin::router(daemon.clone());
-        let rx = shutdown_rx.clone();
-        async move {
-            if let Err(e) = axum::serve(admin_listener, app)
-                .with_graceful_shutdown(wait(rx))
-                .await
-            {
-                tracing::error!(error = %e, "admin API server stopped");
-            }
-        }
-    });
-    let webhook = tokio::spawn({
-        let app = webhook::router(daemon.clone());
-        let rx = shutdown_rx.clone();
-        async move {
-            if let Err(e) = axum::serve(webhook_listener, app)
-                .with_graceful_shutdown(wait(rx))
-                .await
-            {
-                tracing::error!(error = %e, "webhook server stopped");
-            }
-        }
-    });
+    let webhook = spawn_server(
+        "webhook",
+        webhook_listener,
+        webhook::router(daemon.clone()),
+        shutdown_rx.clone(),
+    );
 
     let period = Duration::from_secs(host.runtime.reconcile_interval_secs.max(1));
     let ingress_task = tokio::spawn({
@@ -436,9 +499,11 @@ pub async fn start_with<P: PodmanClient + 'static>(
     Ok(Running {
         daemon,
         admin_socket: host.admin.socket.clone(),
+        admin_token_socket: admin_token.is_some().then(|| paths.admin_token_socket()),
         webhook_addr,
         shutdown,
         admin,
+        admin_token,
         webhook,
         ingress: ingress_task,
         reconcile,
@@ -457,6 +522,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             daemon,
             shutdown,
             admin,
+            admin_token,
             webhook,
             ingress,
             reconcile,
@@ -465,6 +531,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             cdn,
             generated,
             admin_socket,
+            admin_token_socket,
             ..
         } = self;
         let _ = shutdown.send(true);
@@ -475,6 +542,13 @@ impl<P: PodmanClient + 'static> Running<P> {
             {
                 tracing::warn!(task = name, "did not stop in time");
             }
+        }
+        if let Some(handle) = admin_token
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("admin token API did not stop in time");
         }
         if let Some(handle) = notify
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
@@ -527,6 +601,9 @@ impl<P: PodmanClient + 'static> Running<P> {
             abort.abort();
         }
         let _ = std::fs::remove_file(admin_socket);
+        if let Some(socket) = admin_token_socket {
+            let _ = std::fs::remove_file(socket);
+        }
         tracing::info!("weglarka-daemon stopped");
     }
 }

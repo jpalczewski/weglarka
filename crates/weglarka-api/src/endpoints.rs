@@ -1,5 +1,7 @@
 //! Endpoint list. Paths contain `{name}` / `{secret}` / `{volume}` parameters.
 
+use weglarka_model::admin_auth::Scope;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -8,16 +10,41 @@ pub enum Method {
     Delete,
 }
 
+impl Method {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Endpoint {
     pub method: Method,
     pub path: &'static str,
+    /// Scope a bearer token needs on the token listener (docs/decisions/0056). `None` = no
+    /// authentication: only `GET /v1/health`. The full-trust unix socket never checks scopes.
+    pub scope: Option<Scope>,
+}
+
+impl Endpoint {
+    /// The endpoint a request for `method` and the router's matched path template (`{name}` style)
+    /// belongs to. `None` for anything not in [`ENDPOINTS`]: the token listener refuses it.
+    pub fn lookup(method: &str, path: &str) -> Option<&'static Endpoint> {
+        ENDPOINTS
+            .iter()
+            .find(|e| e.method.as_str() == method && e.path == path)
+    }
 }
 
 /// `GET` → [`StatusResponse`](crate::StatusResponse)
 pub const STATUS: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/status",
+    scope: Some(Scope::Read),
 };
 /// `GET` → [`HealthResponse`](crate::HealthResponse). Readiness only: it answers once the admin API
 /// is serving and deliberately never calls Podman, so the host-side self-update watchdog can tell a
@@ -25,27 +52,32 @@ pub const STATUS: Endpoint = Endpoint {
 pub const HEALTH: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/health",
+    scope: None,
 };
 /// `GET` → [`ListAppsResponse`](crate::ListAppsResponse)
 pub const APPS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps",
+    scope: Some(Scope::Read),
 };
 /// `POST` [`AddAppRequest`](crate::AddAppRequest) → [`ShowAppResponse`](crate::ShowAppResponse)
 pub const APPS_ADD: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ShowAppResponse`](crate::ShowAppResponse)
 pub const APPS_SHOW: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}",
+    scope: Some(Scope::Read),
 };
 /// `PUT` [`UpdateAppRequest`](crate::UpdateAppRequest) → [`UpdateAppResponse`](crate::UpdateAppResponse).
 /// Full spec replacement (see the request type). Owner: session 3.
 pub const APPS_UPDATE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204. Query [`RemoveAppQuery`](crate::RemoveAppQuery): `?purge_volumes=true` also removes
 /// the instance's volumes (kept by default), `?purge_secrets=true` also removes the instance's secrets
@@ -53,11 +85,13 @@ pub const APPS_UPDATE: Endpoint = Endpoint {
 pub const APPS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/apps/{name}",
+    scope: Some(Scope::Admin),
 };
 /// `POST` [`DeployRequest`](crate::DeployRequest) → [`DeployResponse`](crate::DeployResponse)
 pub const APPS_DEPLOY: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/deploy",
+    scope: Some(Scope::Admin),
 };
 /// `PUT` a streamed `application/x-tar` image archive (`oci-archive` or `docker-archive`, as written by
 /// `podman save`) → [`DeployResponse`](crate::DeployResponse). Loads the image into Podman's store,
@@ -67,6 +101,7 @@ pub const APPS_DEPLOY: Endpoint = Endpoint {
 pub const APPS_PUSH_IMAGE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/image",
+    scope: Some(Scope::Admin),
 };
 /// `POST` [`ReloadRequest`](crate::ReloadRequest) → [`ReloadResponse`](crate::ReloadResponse).
 /// Sends the app's `reload_signal`, restarts the container when the spec sets none, or recreates it
@@ -74,6 +109,7 @@ pub const APPS_PUSH_IMAGE: Endpoint = Endpoint {
 pub const APPS_RELOAD: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/reload",
+    scope: Some(Scope::Admin),
 };
 /// `POST` [`RunRequest`](crate::RunRequest) → a stream of [`RunFrame`](crate::RunFrame)s
 /// (`application/vnd.weglarka.run-stream`). Runs a command once in a fresh container of the app
@@ -82,6 +118,7 @@ pub const APPS_RELOAD: Endpoint = Endpoint {
 pub const APPS_RUN: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/run",
+    scope: Some(Scope::Admin),
 };
 /// `POST` [`ForwardRequest`](crate::ForwardRequest) → a stream of
 /// [`ForwardFrame`](crate::ForwardFrame)s (`application/vnd.weglarka.forward-stream`). Starts a relay
@@ -90,17 +127,20 @@ pub const APPS_RUN: Endpoint = Endpoint {
 pub const APPS_FORWARD: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/forward",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}/secrets",
+    scope: Some(Scope::Read),
 };
 /// `PUT` [`SetSecretRequest`](crate::SetSecretRequest) → [`SecretInfo`](crate::SecretInfo).
 /// Overwrite only; there is no endpoint for reading the value back.
 pub const SECRETS_SET: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/secrets/{secret}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204. Query [`RemoveSecretQuery`](crate::RemoveSecretQuery): `?force=true` removes the
 /// secret even though the app's spec still binds it (the app then waits for it). Refused with 409
@@ -110,28 +150,33 @@ pub const SECRETS_SET: Endpoint = Endpoint {
 pub const SECRETS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/apps/{name}/secrets/{secret}",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListVolumesResponse`](crate::ListVolumesResponse): volumes declared in the app's spec.
 pub const VOLUMES_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}/volumes",
+    scope: Some(Scope::Read),
 };
 /// `GET` → `application/x-tar`, streamed. `{volume}` is the volume's name within the instance.
 pub const VOLUMES_EXPORT: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}/volumes/{volume}/export",
+    scope: Some(Scope::Admin),
 };
 /// `PUT` a streamed `application/x-tar` body → 204. Extracts into the volume (existing files with the
 /// same path are overwritten; others are kept). Ownership of the extracted files: docs/decisions/0009.
 pub const VOLUMES_IMPORT: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/apps/{name}/volumes/{volume}/import",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListSharedVolumesResponse`](crate::ListSharedVolumesResponse): shared volumes declared in
 /// `apps.toml` with their members, uid range and whether Podman knows them (issue #33).
 pub const SHARED_VOLUMES_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/volumes",
+    scope: Some(Scope::Read),
 };
 /// `PUT` with no body → 204. Declares a shared volume (idempotent); apps mount it through
 /// `shared_volumes = [...]` (issue #33). Query `group=<name>` puts it in a group that shares one uid
@@ -140,40 +185,47 @@ pub const SHARED_VOLUMES_LIST: Endpoint = Endpoint {
 pub const SHARED_VOLUMES_DECLARE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/volumes/{volume}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204. Query `purge=true` also deletes the Podman volume (its data). Refused while an app
 /// mounts it, and without `purge` while it still holds data (issue #33).
 pub const SHARED_VOLUMES_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/volumes/{volume}",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListSharedNetworksResponse`](crate::ListSharedNetworksResponse): shared networks declared
 /// in `apps.toml` with their members and whether Podman knows them (issue #128).
 pub const SHARED_NETWORKS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/networks",
+    scope: Some(Scope::Read),
 };
 /// `PUT` with no body → 204. Declares a shared network (idempotent); apps join it through
 /// `shared_networks = [...]` (issue #128).
 pub const SHARED_NETWORKS_DECLARE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/networks/{network}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204. Refused (409) while an app joins it (issue #128).
 pub const SHARED_NETWORKS_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/networks/{network}",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListSitesResponse`](crate::ListSitesResponse): sites with their environments and the
 /// digest each serves (issue #205).
 pub const SITES_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/sites",
+    scope: Some(Scope::Read),
 };
 /// `GET` → [`SiteSummary`](crate::SiteSummary).
 pub const SITES_SHOW: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/sites/{site}",
+    scope: Some(Scope::Read),
 };
 /// `PUT` [`DeclareSiteRequest`](crate::DeclareSiteRequest) → 204. Declares or replaces a site; its
 /// environments become the instances `<site>-<env>`. An instance name taken by `[apps]` or another
@@ -181,12 +233,14 @@ pub const SITES_SHOW: Endpoint = Endpoint {
 pub const SITES_DECLARE: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/sites/{site}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204. Query [`RemoveSiteQuery`](crate::RemoveSiteQuery): refused (409) while an
 /// environment serves a release unless `?purge=true`.
 pub const SITES_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/sites/{site}",
+    scope: Some(Scope::Admin),
 };
 /// `POST` [`PromoteRequest`](crate::PromoteRequest) → [`PromoteResponse`](crate::PromoteResponse).
 /// Deploys the digest of the environment's `promote_from` source (or an explicit one, or the
@@ -194,11 +248,13 @@ pub const SITES_REMOVE: Endpoint = Endpoint {
 pub const SITES_PROMOTE: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/sites/{site}/envs/{env}/promote",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/doctor",
+    scope: Some(Scope::Read),
 };
 /// `POST` [`PruneImagesRequest`](crate::PruneImagesRequest) → [`PruneImagesResponse`](crate::PruneImagesResponse).
 /// Removes images of the repositories named in `apps.toml` that are neither an app's current nor its
@@ -206,39 +262,47 @@ pub const DOCTOR: Endpoint = Endpoint {
 pub const IMAGES_PRUNE: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/images/prune",
+    scope: Some(Scope::Admin),
 };
 /// `POST` with no body → [`OidcRotateResponse`](crate::OidcRotateResponse): replaces the app's OIDC
 /// client secret, re-renders the provider's clients, then recreates the app (#213).
 pub const OIDC_ROTATE: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/apps/{name}/oidc/rotate",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`ListOidcClientsResponse`](crate::ListOidcClientsResponse): the external clients.
 pub const OIDC_CLIENTS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/oidc-clients",
+    // The answer carries each client's `secret_digest`: a credential, so `admin` only.
+    scope: Some(Scope::Admin),
 };
 /// `PUT` [`PutOidcClientRequest`](crate::PutOidcClientRequest) → 204; replaces a client of that id.
 pub const OIDC_CLIENT_PUT: Endpoint = Endpoint {
     method: Method::Put,
     path: "/v1/oidc-clients/{id}",
+    scope: Some(Scope::Admin),
 };
 /// `DELETE` → 204.
 pub const OIDC_CLIENT_REMOVE: Endpoint = Endpoint {
     method: Method::Delete,
     path: "/v1/oidc-clients/{id}",
+    scope: Some(Scope::Admin),
 };
 /// `GET` → [`NotifyStatusResponse`](crate::NotifyStatusResponse): configured channels, the pending
 /// outbox and the last delivery error (issue #38).
 pub const NOTIFICATIONS_STATUS: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/notifications",
+    scope: Some(Scope::Read),
 };
 /// `POST` with no body → [`NotifyTestResponse`](crate::NotifyTestResponse). Delivers a test
 /// notification now, bypassing the outbox (issue #38).
 pub const NOTIFICATIONS_TEST: Endpoint = Endpoint {
     method: Method::Post,
     path: "/v1/notifications/test",
+    scope: Some(Scope::Admin),
 };
 
 pub const ENDPOINTS: &[Endpoint] = &[
@@ -280,3 +344,59 @@ pub const ENDPOINTS: &[Endpoint] = &[
     OIDC_CLIENT_PUT,
     OIDC_CLIENT_REMOVE,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_health_is_unauthenticated() {
+        let open: Vec<_> = ENDPOINTS.iter().filter(|e| e.scope.is_none()).collect();
+        assert_eq!(open, [&HEALTH]);
+    }
+
+    #[test]
+    fn mutations_and_data_exports_need_admin() {
+        for e in ENDPOINTS {
+            let mutating = e.method != Method::Get;
+            if mutating || e.path.ends_with("/export") {
+                assert_eq!(
+                    e.scope,
+                    Some(Scope::Admin),
+                    "{} {}",
+                    e.method.as_str(),
+                    e.path
+                );
+            }
+        }
+    }
+
+    /// GETs whose answer carries a credential or the data of an app: never `read`. Add an endpoint
+    /// here whenever a response type gains such a field.
+    #[test]
+    fn credential_bearing_reads_need_admin() {
+        for e in [VOLUMES_EXPORT, OIDC_CLIENTS_LIST] {
+            assert_eq!(e.scope, Some(Scope::Admin), "{}", e.path);
+        }
+    }
+
+    #[test]
+    fn lookup_finds_by_method_and_template() {
+        assert_eq!(Endpoint::lookup("GET", "/v1/apps/{name}"), Some(&APPS_SHOW));
+        assert_eq!(
+            Endpoint::lookup("DELETE", "/v1/apps/{name}"),
+            Some(&APPS_REMOVE)
+        );
+        assert_eq!(Endpoint::lookup("PATCH", "/v1/apps/{name}"), None);
+        assert_eq!(Endpoint::lookup("GET", "/v1/nope"), None);
+    }
+
+    #[test]
+    fn endpoints_are_unique() {
+        for (i, a) in ENDPOINTS.iter().enumerate() {
+            for b in &ENDPOINTS[i + 1..] {
+                assert!(a.method != b.method || a.path != b.path, "{}", a.path);
+            }
+        }
+    }
+}

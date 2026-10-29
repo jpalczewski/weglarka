@@ -11,6 +11,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Token minting for tests of this crate and its consumers (admin_auth::testing).
+testing = []
+
 [dependencies]
 bytes.workspace = true
 futures-core.workspace = true

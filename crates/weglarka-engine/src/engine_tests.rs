@@ -4396,3 +4396,102 @@ health = { attempts = 2, window_secs = 2 }
         assert!(live(&h).is_none());
     }
 }
+
+mod admin_token {
+    use super::*;
+    use crate::admin_token::AdminTokenMount;
+    use weglarka_model::admin_auth::CONTAINER_SOCKET_DIR;
+
+    const APPS: &str = r#"
+[apps.panel]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8085
+
+[apps.other]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+port = 8086
+"#;
+
+    fn harness(socket_dir: &std::path::Path) -> Harness {
+        Harness::build(
+            APPS,
+            ReconcilerOptions {
+                admin_token: Some(AdminTokenMount {
+                    dir: socket_dir.to_owned(),
+                    clients: [name("panel")].into(),
+                }),
+                ..ReconcilerOptions::default()
+            },
+            crash::Policy::disabled(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_client_gets_the_socket_directory_read_only() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let h = harness(socket_dir.path());
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("panel", [HealthStatus::Healthy]);
+        h.fake.script_health("other", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+
+        let canonical = std::fs::canonicalize(socket_dir.path()).unwrap();
+        let mounts_of = |instance: &str| {
+            h.fake
+                .created_specs()
+                .into_iter()
+                .filter(|s| s.labels.get(labels::INSTANCE).map(String::as_str) == Some(instance))
+                .flat_map(|s| s.mounts)
+                .filter(|m| m.target == CONTAINER_SOCKET_DIR)
+                .collect::<Vec<_>>()
+        };
+        let panel = mounts_of("panel");
+        assert_eq!(panel.len(), 1, "{panel:?}");
+        assert_eq!(panel[0].source, canonical.display().to_string());
+        assert!(panel[0].read_only);
+        assert!(mounts_of("other").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_client_gets_the_extra_hash_input() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let h = harness(socket_dir.path());
+        let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+        let d = digest('a');
+        let panel = &apps.apps[&name("panel")];
+        let other = &apps.apps[&name("other")];
+        assert_eq!(
+            h.rec.desired_hash(&name("panel"), panel, &d).await.unwrap(),
+            weglarka_model::hash::spec_hash_with_admin_token(
+                weglarka_model::hash::spec_hash(panel, &d),
+                CONTAINER_SOCKET_DIR
+            )
+        );
+        assert_eq!(
+            h.rec.desired_hash(&name("other"), other, &d).await.unwrap(),
+            weglarka_model::hash::spec_hash(other, &d),
+            "an app that is not a client keeps the hash it had"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_socket_directory_fails_the_client_before_anything_starts() {
+        let h = harness(std::path::Path::new("/nonexistent/weglarka/admin-token"));
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("other", [HealthStatus::Healthy]);
+        let _ = h.rec.reconcile().await;
+        assert!(
+            h.fake
+                .created_specs()
+                .iter()
+                .all(|s| s.mounts.iter().all(|m| m.target != CONTAINER_SOCKET_DIR))
+        );
+        assert!(
+            h.fake.created_specs().iter().all(|s| s
+                .labels
+                .get(labels::INSTANCE)
+                .map(String::as_str)
+                != Some("panel"))
+        );
+    }
+}

@@ -140,6 +140,12 @@ impl CliError {
                 Some("the daemon is still busy (deploy in progress) — try again in a moment"),
             ),
             ErrorCode::InvalidRequest => (Kind::InvalidRequest, None),
+            // Only the token listener answers these; the CLI talks to the unix socket, so they
+            // appear once `weglarka login` exists (#93).
+            ErrorCode::Unauthorized | ErrorCode::Forbidden => (
+                Kind::InvalidRequest,
+                Some("the token listener refused the request: check the token and its groups"),
+            ),
             ErrorCode::Internal => (
                 Kind::Internal,
                 Some("details in the daemon logs (`journalctl --user -u weglarka`)"),

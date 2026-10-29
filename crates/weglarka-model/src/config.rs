@@ -87,6 +87,15 @@ impl HostConfig {
         if let Some(identity) = &self.identity {
             identity.validate()?;
         }
+        if let Some(http) = &self.admin.http {
+            http.validate()?;
+            if self.identity.is_none() {
+                return Err(
+                    "[admin.http] needs [identity]: its tokens are issued by that provider"
+                        .to_owned(),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -416,6 +425,69 @@ impl IngressConfig {
 pub struct AdminConfig {
     /// Unix socket of the admin API (never exposed through nginx).
     pub socket: PathBuf,
+    /// `[admin.http]`: the token listener (docs/decisions/0056). Absent = only the unix socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<AdminHttpConfig>,
+}
+
+/// `[admin.http]`: a second admin API listener where every request needs a bearer token issued by
+/// the `[identity]` provider. It is a unix socket in its own directory, mounted only into `clients`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminHttpConfig {
+    /// App instances that get the socket mounted at [`crate::admin_auth::CONTAINER_SOCKET`]. The
+    /// opt-in lives here, in the host's config, so an app cannot grant itself the API.
+    #[serde(default)]
+    pub clients: Vec<InstanceName>,
+    /// The `aud` a token must carry, byte for byte (the OIDC client's `audience`).
+    pub audience: String,
+    /// Groups (the token's `groups` claim) that get the `read` scope.
+    #[serde(default)]
+    pub read_groups: Vec<String>,
+    /// Groups that get the `admin` scope (which includes `read`).
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+}
+
+impl AdminHttpConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let audience = &self.audience;
+        if audience.is_empty() || audience.bytes().any(|b| !b.is_ascii_graphic()) {
+            return Err(format!(
+                "[admin.http] audience {audience:?} must be non-empty printable ASCII without spaces"
+            ));
+        }
+        if self.read_groups.is_empty() && self.admin_groups.is_empty() {
+            return Err(
+                "[admin.http] needs read_groups or admin_groups, or no token maps to a scope"
+                    .to_owned(),
+            );
+        }
+        for group in self.read_groups.iter().chain(&self.admin_groups) {
+            if group.is_empty() || group.chars().any(char::is_control) {
+                return Err(format!(
+                    "[admin.http] group {group:?} must be non-empty without control characters"
+                ));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for client in &self.clients {
+            if !seen.insert(client) {
+                return Err(format!("[admin.http] clients lists {client} twice"));
+            }
+        }
+        Ok(())
+    }
+
+    /// What a token must satisfy, given the provider's issuer URL.
+    pub fn validation(&self, issuer: &str) -> crate::admin_auth::Validation {
+        crate::admin_auth::Validation {
+            issuer: issuer.to_owned(),
+            audience: self.audience.clone(),
+            read_groups: self.read_groups.iter().cloned().collect(),
+            admin_groups: self.admin_groups.iter().cloned().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1529,5 +1601,61 @@ domain = "weglarka.example.com"
         ] {
             assert!(host(bad).is_err(), "{bad} must be rejected");
         }
+    }
+
+    const IDENTITY: &str = "[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\n\
+                            issuer = \"https://auth.example.com\"\n";
+
+    fn admin_http(extra: &str, identity: bool) -> Result<HostConfig, String> {
+        let src = SAMPLE.replace("[webhook]", &format!("[admin.http]\n{extra}\n[webhook]"));
+        let src = if identity {
+            format!("{src}\n{IDENTITY}")
+        } else {
+            src
+        };
+        let cfg = HostConfig::from_toml_str(&src).map_err(|e| e.to_string())?;
+        cfg.validate().map(|()| cfg)
+    }
+
+    #[test]
+    fn admin_http_parses_and_builds_the_validation() {
+        let cfg = admin_http(
+            "clients = [\"panel\"]\naudience = \"https://admin.example.com/api/\"\n\
+             read_groups = [\"viewers\"]\nadmin_groups = [\"admins\"]",
+            true,
+        )
+        .unwrap();
+        let http = cfg.admin.http.unwrap();
+        assert_eq!(http.clients.len(), 1);
+        let v = http.validation("https://auth.example.com");
+        assert_eq!(v.audience, "https://admin.example.com/api/");
+        assert!(v.admin_groups.contains("admins") && v.read_groups.contains("viewers"));
+    }
+
+    #[test]
+    fn admin_http_is_rejected_when_it_cannot_work() {
+        let aud = "audience = \"https://admin.example.com/api/\"\n";
+        let err = |extra: String, identity| admin_http(&extra, identity).unwrap_err();
+        assert!(err(format!("{aud}admin_groups = [\"a\"]"), false).contains("needs [identity]"));
+        assert!(err(aud.to_owned(), true).contains("read_groups or admin_groups"));
+        assert!(
+            err(
+                "audience = \"has space\"\nadmin_groups = [\"a\"]".into(),
+                true
+            )
+            .contains("audience")
+        );
+        assert!(err(format!("{aud}admin_groups = [\"\"]"), true).contains("group"));
+        assert!(
+            err(
+                format!("{aud}admin_groups = [\"a\"]\nclients = [\"p\", \"p\"]"),
+                true
+            )
+            .contains("twice")
+        );
+        assert!(
+            admin_http(&format!("{aud}admin_groups = [\"a\"]\nunknown = 1"), true).is_err(),
+            "deny_unknown_fields"
+        );
     }
 }

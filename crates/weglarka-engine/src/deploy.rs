@@ -353,8 +353,17 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         // A consumer of generated config carries one more bind mount; only it gets the extra input,
         // so every other app keeps the hash it had before the feature existed.
-        Ok(if self.is_generated_consumer(instance) {
+        let hash = if self.is_generated_consumer(instance) {
             weglarka_model::hash::spec_hash_with_generated(hash, crate::generated::MOUNT_TARGET)
+        } else {
+            hash
+        };
+        // The same for a client of the token admin API (ADR 0056): one more host-policy mount.
+        Ok(if self.is_admin_token_client(instance) {
+            weglarka_model::hash::spec_hash_with_admin_token(
+                hash,
+                weglarka_model::admin_auth::CONTAINER_SOCKET_DIR,
+            )
         } else {
             hash
         })
@@ -508,6 +517,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // Shared by deploys and one-off runs (incl. the validation run), so a container of the
         // consumer always sees the generated versions.
         configs.extend(self.generated_mounts(instance)?);
+        configs.extend(self.admin_token_mounts(instance)?);
         self.podman
             .network_create(&NetworkSpec {
                 name: labels::network_name(instance),

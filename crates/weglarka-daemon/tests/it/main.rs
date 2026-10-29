@@ -24,5 +24,6 @@ mod self_update;
 mod shared_networks;
 mod shared_volumes;
 mod sites;
+mod token_api;
 mod update;
 mod volumes;

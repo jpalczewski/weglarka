@@ -5,6 +5,7 @@
 //! additive. The crate calls no Podman and runs no tasks: it must stay cheap to depend on for
 //! model-only consumers (API contract, ingress generators, notifications, ACME, DNS, registry).
 
+pub mod admin_auth;
 pub mod app;
 pub mod config;
 pub mod delivery;
