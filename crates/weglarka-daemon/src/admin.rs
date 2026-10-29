@@ -62,7 +62,7 @@ impl Fail {
     pub(crate) fn invalid(msg: impl Into<String>) -> Self {
         Self(ErrorCode::InvalidRequest, msg.into())
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self(ErrorCode::NotFound, msg.into())
     }
     pub(crate) fn internal(msg: impl ToString) -> Self {
