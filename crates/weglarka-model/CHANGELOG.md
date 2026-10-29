@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.4...weglarka-model-v0.0.5) - 2026-10-29
+
+### Added
+
+- *(daemon)* app logs stream ([#287](https://github.com/jpalczewski/weglarka/pull/287))
+- *(daemon)* recent events ([#256](https://github.com/jpalczewski/weglarka/pull/256))
+- *(api)* redacted app view and runtime detail ([#252](https://github.com/jpalczewski/weglarka/pull/252))
+
+### Fixed
+
+- *(daemon)* logs stream review follow-ups ([#304](https://github.com/jpalczewski/weglarka/pull/304))
+
+### Other
+
+- *(model)* typed token kinds and structural id-token checks
+- *(model)* split JWT verification from access-token claims ([#261](https://github.com/jpalczewski/weglarka/pull/261))
+
 ## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.3...weglarka-model-v0.0.4) - 2026-10-29
 
 ### Added
