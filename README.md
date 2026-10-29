@@ -20,6 +20,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 ```
 
 Conventions and division of work: [CLAUDE.md](CLAUDE.md). Implementation decisions: [docs/decisions](docs/decisions).
+Contributing with agent sessions, issues and the roadmap project: [agent workflow](docs/contributing/agent-workflow.md), [issues and project](docs/contributing/issues-and-project.md).
 
 ## Installation
 
