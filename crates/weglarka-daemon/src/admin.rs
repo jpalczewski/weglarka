@@ -403,8 +403,19 @@ async fn show_app<P: PodmanClient + 'static>(
         .container_inspect(&labels::container_name(&name))
         .await
         .ok();
-    let configs = config_views(&d, &spec);
-    let host_mounts = host_mount_views(&d, &spec);
+    let mut configs = config_views(&d, &spec);
+    let mut host_mounts = host_mount_views(&d, &spec);
+    if access == Access::Redacted {
+        // The views sit outside the spec projection: their free-form `detail` (host paths, io
+        // errors) and the content fingerprint of config files are withheld from `read`.
+        for view in configs.iter_mut().flatten() {
+            view.detail = None;
+            view.fingerprint = None;
+        }
+        for view in host_mounts.iter_mut().flatten() {
+            view.detail = None;
+        }
+    }
     let app_state = st.apps.get(&name);
     Ok(json(ShowAppResponse {
         configs,

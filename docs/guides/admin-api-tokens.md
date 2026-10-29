@@ -48,13 +48,14 @@ revoked before it expires.
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
 `GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. The `read`
-view is an allowlist: the daemon rebuilds it field by field, so a field added in a later release stays hidden from
-`read` until it is deliberately listed. For a token without `admin`: the values of `env` are blank (the keys stay);
+view is an allowlist projection: the daemon rebuilds it field by field, so a field added in a later release does not
+compile until someone decides what `read` sees of it. The free-form `detail` and the content `fingerprint` of the
+config and host mount views are withheld too. For a token without `admin`: the values of `env` are blank (the keys stay);
 `command` and `health.command` keep only their first element and show `<redacted>` for every other argument (the count
 stays); `health.http.path` keeps its first path segment and shows `<redacted>` for the rest (`/hooks/<token>/ready` is
 shown as `/hooks/<redacted>`; the query string is always dropped, and a credential in the *first* segment would still be
 visible, so keep credentials out of the probe path); and the engine's failure text in `state.failed.reason` is replaced
-by a fixed marker (the failed `digest` stays). The response then carries `"redacted": true`; an `admin` token and the unix
+by a fixed marker (the failed `digest` stays); `state.spec_hash` is omitted, because it is a hash of the spec including the blanked `env` values. The response then carries `"redacted": true`; an `admin` token and the unix
 socket get no such key. A redacted spec is a view, not the stored spec: do not send it back in `PUT /v1/apps/{name}`
 (a full replacement), and `weglarka apps update/start/stop` refuses to when it receives one. Put
 connection strings and other credentials in secrets, not in `env` or command arguments. The same answer also reports the

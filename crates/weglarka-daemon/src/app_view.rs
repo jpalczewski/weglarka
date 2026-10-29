@@ -372,7 +372,7 @@ fn read_state(state: AppState) -> AppState {
         generation,
         current,
         previous,
-        spec_hash,
+        spec_hash: _spec_hash,
         failed,
         waiting_for_secrets,
         uid_range,
@@ -382,7 +382,9 @@ fn read_state(state: AppState) -> AppState {
         generation,
         current,
         previous,
-        spec_hash,
+        // A sha256 of the whole spec, `env` values included: with the other fields known it lets a
+        // reader test guesses of a blanked value offline, so `read` does not get it.
+        spec_hash: None,
         failed: failed.map(read_failed),
         waiting_for_secrets,
         uid_range,
@@ -645,6 +647,22 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
         let failed = shown.state.failed.unwrap();
         assert_eq!(failed.digest, digest);
         assert_eq!(failed.reason, REDACTED_REASON);
+        let hashed = AppState {
+            spec_hash: Some(serde_json::from_str("\"abc123\"").expect("hash")),
+            ..Default::default()
+        };
+        assert!(
+            show_response(Access::Full, name(), spec(), Some(&hashed), None)
+                .state
+                .spec_hash
+                .is_some()
+        );
+        assert!(
+            show_response(Access::Redacted, name(), spec(), Some(&hashed), None)
+                .state
+                .spec_hash
+                .is_none()
+        );
         // No failure, nothing invented.
         let none = show_response(Access::Redacted, name(), spec(), None, None);
         assert!(none.state.failed.is_none());
