@@ -2028,6 +2028,7 @@ dependencies = [
  "weglarka-api",
  "weglarka-engine",
  "weglarka-model",
+ "weglarka-unix-http",
 ]
 
 [[package]]
@@ -2207,6 +2208,18 @@ dependencies = [
  "url",
  "weglarka-http",
  "weglarka-model",
+]
+
+[[package]]
+name = "weglarka-unix-http"
+version = "0.0.4"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "thiserror",
+ "tokio",
+ "weglarka-unix-http",
 ]
 
 [[package]]

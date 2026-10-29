@@ -9,15 +9,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use clap::Args;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::Request;
 use hyper::body::Bytes;
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::CONTENT_TYPE;
 use weglarka_api::{
     FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest, endpoints,
 };
+use weglarka_unix_http::StreamingResponse;
 
-use crate::client::{ApiClient, error_from_response, method_str, request_path};
+use crate::client::{ApiClient, method_str, request_path};
 use crate::commands::{client, instance};
 use crate::error::CliError;
 use crate::run::parse_timeout;
@@ -104,11 +105,10 @@ pub(crate) fn ssh_args(destination: &str, local_port: u16, host_port: u16) -> Ve
 
 /// The frames of a forward response, as they arrive.
 pub(crate) struct ForwardStream {
-    body: hyper::body::Incoming,
+    /// Keeps the connection's request side open for as long as the response is read.
+    response: StreamingResponse<Full<Bytes>>,
     decoder: ForwardFrameDecoder,
     ready: VecDeque<ForwardFrame>,
-    /// Keeps the connection's request side open for as long as the response is read.
-    _sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
 }
 
 impl ForwardStream {
@@ -118,7 +118,7 @@ impl ForwardStream {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let Some(frame) = self.body.frame().await else {
+            let Some(frame) = self.response.frame().await else {
                 return if self.decoder.is_clean() {
                     Ok(None)
                 } else {
@@ -153,40 +153,16 @@ impl ApiClient {
         let req = Request::builder()
             .method(method_str(endpoints::APPS_FORWARD.method))
             .uri(request_path(endpoints::APPS_FORWARD, &[("name", name)], ""))
-            .header(HOST, "weglarka")
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload)))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
-        let status = resp.status();
-        let is_stream = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .is_some_and(|v| v == FORWARD_STREAM_CONTENT_TYPE);
-        let body = resp.into_body();
-        if !status.is_success() {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
-                .to_bytes();
-            return Err(error_from_response(status, &bytes));
-        }
-        if !is_stream {
-            return Err(
-                CliError::internal("the daemon did not answer with a forward stream")
-                    .with_hint("CLI and daemon versions may differ"),
-            );
-        }
+        let response = self
+            .open_stream(req, FORWARD_STREAM_CONTENT_TYPE, "forward")
+            .await?;
         Ok(ForwardStream {
-            body,
+            response,
             decoder: ForwardFrameDecoder::default(),
             ready: VecDeque::new(),
-            _sender: sender,
         })
     }
 }
@@ -297,6 +273,7 @@ pub async fn run(json: bool, o: &Overrides, a: ForwardArgs) -> Result<i32, CliEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     #[test]
     fn ssh_carries_loopback_to_loopback_and_takes_the_destination_last() {

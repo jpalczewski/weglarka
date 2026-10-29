@@ -1,16 +1,10 @@
 //! Tests: the client against a mock server (unix socket), preflight on a fake host, exit codes.
 
-use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 use clap::Parser as _;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
 use weglarka_api::{
     ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
     DoctorCheck, DoctorReport, ErrorCode, NotifyStatusResponse, PruneImagesResponse, PrunedImage,
@@ -34,86 +28,8 @@ use crate::preflight::{Context, all_checks, render, run_checks};
 use crate::settings::Overrides;
 use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_label};
 
-// ---------- mock server on a unix socket ----------
-
-#[derive(Debug, Clone)]
-pub(crate) struct Seen {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    /// Query string without the leading `?` (`None` when the request had none).
-    pub(crate) query: Option<String>,
-    host: Option<String>,
-    pub(crate) body: String,
-}
-
-pub(crate) struct Mock {
-    pub(crate) socket: PathBuf,
-    pub(crate) seen: Arc<Mutex<Vec<Seen>>>,
-}
-
-impl Drop for Mock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-static N: AtomicU32 = AtomicU32::new(0);
-
-/// `reply(method, path) -> (status, body)`.
-pub(crate) async fn mock(
-    reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
-) -> Mock {
-    // Short path: the sun_path limit (~104 B on macOS).
-    let socket = std::env::temp_dir().join(format!(
-        "wgl-{}-{}.sock",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let reply = Arc::new(reply);
-    let seen2 = seen.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reply, seen) = (reply.clone(), seen2.clone());
-            tokio::spawn(async move {
-                let svc = service_fn(move |req: Request<Incoming>| {
-                    let (reply, seen) = (reply.clone(), seen.clone());
-                    async move {
-                        let method = req.method().to_string();
-                        let path = req.uri().path().to_owned();
-                        let query = req.uri().query().map(str::to_owned);
-                        let host = req
-                            .headers()
-                            .get("host")
-                            .map(|h| h.to_str().unwrap().to_owned());
-                        let body = req.into_body().collect().await.unwrap().to_bytes();
-                        seen.lock().unwrap().push(Seen {
-                            method: method.clone(),
-                            path: path.clone(),
-                            query,
-                            host,
-                            body: String::from_utf8_lossy(&body).into_owned(),
-                        });
-                        let (status, body) = reply(&method, &path);
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(status)
-                                .body(Full::new(Bytes::from(body)))
-                                .unwrap(),
-                        )
-                    }
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), svc)
-                    .await;
-            });
-        }
-    });
-    Mock { socket, seen }
-}
+// The mock unix-socket server lives in `weglarka-unix-http` (feature `testing`).
+pub(crate) use weglarka_unix_http::testing::{Mock, mock};
 
 fn api_err(code: ErrorCode, msg: &str) -> String {
     serde_json::to_string(&ApiError {

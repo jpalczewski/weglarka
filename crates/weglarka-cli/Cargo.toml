@@ -29,7 +29,9 @@ toml.workspace = true
 weglarka-api.workspace = true
 weglarka-engine.workspace = true
 weglarka-model.workspace = true
+weglarka-unix-http.workspace = true
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["server"] }
 insta.workspace = true
+weglarka-unix-http = { workspace = true, features = ["testing"] }
