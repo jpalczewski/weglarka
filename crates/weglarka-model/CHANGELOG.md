@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.3...weglarka-model-v0.0.4) - 2026-10-29
+
+### Added
+
+- *(daemon)* token admin API with read/admin scopes (ADR 0056) ([#246](https://github.com/jpalczewski/weglarka/pull/246))
+- *(identity)* enforce forward-auth policy and groups with generated access rules ([#245](https://github.com/jpalczewski/weglarka/pull/245))
+- *(identity)* wire OIDC clients and the provider into the daemon ([#239](https://github.com/jpalczewski/weglarka/pull/239))
+- *(engine)* generated config pipeline (render, validate, apply) ([#238](https://github.com/jpalczewski/weglarka/pull/238))
+- *(identity)* pure renderers for Authelia OIDC clients and access control ([#233](https://github.com/jpalczewski/weglarka/pull/233))
+- *(ingress)* forward auth via nginx auth_request in both modes ([#236](https://github.com/jpalczewski/weglarka/pull/236))
+- *(model)* SecretOps and OIDC client credentials ([#229](https://github.com/jpalczewski/weglarka/pull/229))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-core-v0.0.2...weglarka-core-v0.0.3) - 2026-10-26
 
 ### Added
