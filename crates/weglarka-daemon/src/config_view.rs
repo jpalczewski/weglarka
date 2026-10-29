@@ -102,7 +102,8 @@ fn ingress_view(ingress: &IngressConfig) -> IngressView {
         bind: *bind,
         https_bind: *https_bind,
         nginx_image: nginx_image.clone(),
-        trusted_proxies: trusted_proxies.clone(),
+        // The ranges are the proxy network topology and decide whose `X-Forwarded-*` is trusted.
+        custom_trusted_proxies: !trusted_proxies.is_empty(),
         cdn: cdn.as_ref().map(|cdn| {
             let CdnConfig { provider, ranges } = cdn;
             CdnView {
@@ -279,7 +280,9 @@ mod tests {
     use super::*;
 
     /// Every value that must never reach the panel, recognizable in the output.
-    const SECRETS: [&str; 13] = [
+    const SECRETS: [&str; 15] = [
+        "10.77.0.0/16",
+        "/SECRET/traefik.yml",
         "SECRET-upstream",
         "SECRET-ntfy-topic",
         "secret-ntfy.internal",
@@ -363,10 +366,30 @@ issuer = "https://auth.example.com"
 upstream = "SECRET-upstream:9091"
 "#;
 
-    fn view() -> serde_json::Value {
-        let host = HostConfig::from_toml_str(FIXTURE).unwrap();
+    /// `behind` mode, the only one that allows `traefik_dynamic_file` and `trusted_proxies`.
+    const BEHIND_FIXTURE: &str = r#"
+[ingress]
+mode = "behind"
+bind = "127.0.0.1:8080"
+traefik_dynamic_file = "/SECRET/traefik.yml"
+trusted_proxies = ["10.77.0.0/16"]
+
+[admin]
+socket = "/SECRET/admin.sock"
+
+[webhook]
+listen = "127.0.0.1:9000"
+domain = "hooks.example.com"
+"#;
+
+    fn project_toml(toml: &str) -> serde_json::Value {
+        let host = HostConfig::from_toml_str(toml).unwrap();
         host.validate().unwrap();
         serde_json::to_value(project(&host)).unwrap()
+    }
+
+    fn view() -> serde_json::Value {
+        project_toml(FIXTURE)
     }
 
     #[test]
@@ -376,6 +399,17 @@ upstream = "SECRET-upstream:9091"
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
         assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_and_the_traefik_file_stay_hidden() {
+        let v = project_toml(BEHIND_FIXTURE);
+        let text = v.to_string();
+        for secret in ["10.77.0.0", "SECRET", "traefik"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(v["ingress"]["custom_trusted_proxies"], true);
+        assert_eq!(view()["ingress"]["custom_trusted_proxies"], false);
     }
 
     #[test]

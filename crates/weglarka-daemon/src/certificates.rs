@@ -106,7 +106,12 @@ fn collect_with(
     now: SystemTime,
     not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
 ) -> Vec<Cert> {
-    let read = |stem: &str| std::fs::read(tls.join(format!("{stem}.crt"))).ok();
+    // nginx needs the `.crt` + `.key` pair: a chain without its key is treated as absent. The key is
+    // only checked for existence, never opened.
+    let read = |stem: &str| {
+        let chain = std::fs::read(tls.join(format!("{stem}.crt"))).ok()?;
+        tls.join(format!("{stem}.key")).exists().then_some(chain)
+    };
     let apexes: &[String] = config.dns.as_ref().map_or(&[], |dns| &dns.wildcards);
     let mut certs = Vec::new();
     for domain in domains {
@@ -189,6 +194,7 @@ mod tests {
     }
 
     fn write(tls: &Path, stem: &str, not_after: SystemTime) {
+        std::fs::write(tls.join(format!("{stem}.key")), "key").unwrap();
         std::fs::write(
             tls.join(format!("{stem}.crt")),
             FakeAcme::chain_expiring_at(not_after),
@@ -281,6 +287,53 @@ mod tests {
         assert_eq!(
             by_id(&certs, "_wildcard.example.com").status(now, w),
             CertStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_certificate_without_its_key_is_not_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        write(dir.path(), "keyless.example.com", now + 80 * DAY);
+        std::fs::remove_file(dir.path().join("keyless.example.com.key")).unwrap();
+        let config = config("");
+        let certs = collect_with(
+            dir.path(),
+            &config,
+            &["keyless.example.com".to_owned()],
+            now,
+            &fake_not_after,
+        );
+        assert_eq!(
+            by_id(&certs, "keyless.example.com").status(now, window(&config)),
+            CertStatus::Missing
+        );
+    }
+
+    #[test]
+    fn the_longest_covering_apex_is_the_one_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        write(dir.path(), "_wildcard.example.com", now + 60 * DAY);
+        write(dir.path(), "_wildcard.a.example.com", now + 60 * DAY);
+        // Config order lists the shorter apex first; nginx serves the longer one.
+        let config = config(
+            "[acme.dns]\nprovider = \"cloudflare\"\ntoken_file = \"/t\"\nwildcards = [\"example.com\", \"a.example.com\"]\n",
+        );
+        let certs = collect_with(
+            dir.path(),
+            &config,
+            &["a.example.com".to_owned(), "x.a.example.com".to_owned()],
+            now,
+            &fake_not_after,
+        );
+        assert_eq!(
+            by_id(&certs, "a.example.com").covered_by.as_deref(),
+            Some("a.example.com")
+        );
+        assert_eq!(
+            by_id(&certs, "x.a.example.com").covered_by.as_deref(),
+            Some("a.example.com")
         );
     }
 

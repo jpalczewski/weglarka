@@ -2,10 +2,13 @@
 //!
 //! An allow-list (docs/decisions/0057 decision 8). The daemon builds it by destructuring every field
 //! of `HostConfig` and of each section, so a new field does not compile until someone decides whether
-//! the panel may see it. Left out on purpose: every filesystem path of the host layout (the operator-chosen `host_mounts` allowlist is the one exception), the
-//! account, ntfy URL/topic/token, the ACME contact address, and the internal identity upstream address, and the names of the groups that map to
-//! the `read`/`admin` scopes (only their number is shown). Where a hidden value matters, a flag
-//! says whether it is set.
+//! the panel may see it.
+//!
+//! Left out on purpose: every filesystem path of the host layout, the account, the ntfy
+//! URL/topic/token, the ACME contact address, the trusted proxy ranges and the internal identity
+//! upstream address. The names of the groups that map to the `read`/`admin` scopes are left out too
+//! (only their number is shown). The one path that is shown is the operator-chosen `host_mounts`
+//! allowlist. Where a hidden value matters, a flag says whether it is set.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -59,7 +62,9 @@ pub struct IngressView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_bind: Option<SocketAddr>,
     pub nginx_image: String,
-    pub trusted_proxies: Vec<String>,
+    /// `trusted_proxies` overrides the default ranges. The CIDRs are not shown: in `behind` mode
+    /// they are the proxy network, and they decide whose `X-Forwarded-*` is trusted (ADR 0007).
+    pub custom_trusted_proxies: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdn: Option<CdnView>,
 }

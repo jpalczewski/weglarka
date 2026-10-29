@@ -86,12 +86,16 @@ material, no file paths and no failure text (that stays in `doctor` and the log)
 the list is empty and `acme_enabled` is `false`.
 
 `GET /v1/config` (`read`) is an allow-list view of `weglarka.toml`: ingress mode and binds, the runtime allowlists
-and limits, which optional sections are on (`notify`, `acme`, `identity`, `self_update`, `[admin.http]`) with their
-non-secret settings (intervals, thresholds, issuer URL, audience, client instances). Everything that reveals the host
-layout (socket, state and config paths, the runtime account, the identity upstream address) or is a credential or personal data is left out; where it
-matters a flag says it is set (`authenticated`, `has_contact`, `custom_public_key`). The ntfy URL, host and topic are
-not shown, and the operator-chosen `host_mounts` allowlist is shown as configured, and the groups behind `read`/`admin` appear only as counts. The daemon builds it field by field, so a new
-config field stays hidden until it is added on purpose.
+and limits, and which optional sections are on (`notify`, `acme`, `identity`, `self_update`, `[admin.http]`) with their
+non-secret settings (intervals, thresholds, issuer URL, audience, client instances).
+
+Everything that reveals the host layout is left out: socket, state and config paths, the runtime account, the identity
+upstream address and the trusted proxy ranges. Credentials and personal data are left out too. Where a hidden value
+matters, a flag says it is set (`authenticated`, `has_contact`, `custom_public_key`, `custom_trusted_proxies`). The ntfy
+URL, host and topic are not shown. The operator-chosen `host_mounts` allowlist is shown as configured. The groups
+behind `read`/`admin` appear only as counts.
+
+The daemon builds the view field by field, so a new config field stays hidden until it is added on purpose.
 
 A token whose scopes are too small, or whose groups map to no scope, gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
 not declared with a scope is refused even to an admin.

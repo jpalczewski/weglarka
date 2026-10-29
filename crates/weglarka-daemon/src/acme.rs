@@ -351,9 +351,11 @@ pub(crate) fn real_not_after(chain: &[u8]) -> Option<SystemTime> {
     weglarka_acme::chain_not_after(chain).ok()
 }
 
-/// The apex of the first wildcard certificate that covers `domain`, is on disk and is unexpired
-/// (`tls/_wildcard.<apex>.crt`): the domain then needs no certificate of its own. `not_after` reads
-/// the expiry of a chain (a parameter so tests need no real x509).
+/// The apex of the wildcard certificate that covers `domain` and that nginx would serve: the longest
+/// covering apex whose pair `tls/_wildcard.<apex>.crt` + `.key` is on disk (as
+/// `NginxOptions::certificate_stem` picks it). The domain needs no certificate of its own only when
+/// that chain is unexpired. `not_after` reads the expiry of a chain (a parameter so tests need no
+/// real x509). The key is only checked for existence, never read.
 pub(crate) fn covering_wildcard(
     tls: &Path,
     apexes: &[String],
@@ -361,16 +363,20 @@ pub(crate) fn covering_wildcard(
     now: SystemTime,
     not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
 ) -> Option<String> {
-    apexes
+    let (apex, chain) = apexes
         .iter()
         .filter(|apex| wildcard_covers(apex, domain))
-        .find(|apex| {
-            std::fs::read(tls.join(format!("{WILDCARD_CERT_PREFIX}{apex}.crt")))
-                .ok()
-                .and_then(|chain| not_after(&chain))
-                .is_some_and(|not_after| not_after > now)
+        .filter_map(|apex| {
+            let stem = format!("{WILDCARD_CERT_PREFIX}{apex}");
+            let chain = std::fs::read(tls.join(format!("{stem}.crt"))).ok()?;
+            tls.join(format!("{stem}.key"))
+                .exists()
+                .then_some((apex, chain))
         })
-        .cloned()
+        .max_by_key(|(apex, _)| apex.len())?;
+    not_after(&chain)
+        .is_some_and(|at| at > now)
+        .then(|| apex.clone())
 }
 
 /// `*.<apex>` plus `<apex>` in one certificate, stored under the id `_wildcard.<apex>` (a literal
