@@ -31,10 +31,11 @@ pub enum Scope {
     Admin,
 }
 
-/// A verified caller: the token's `sub` and the scopes its groups map to.
+/// A verified caller: the token's `sub`, its expiry and the scopes its groups map to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub sub: String,
+    pub exp: SystemTime,
     pub scopes: BTreeSet<Scope>,
 }
 
@@ -213,6 +214,18 @@ struct Claims {
     nbf: Option<f64>,
     #[serde(default)]
     groups: Vec<String>,
+    // Only id-token callers read these; a badly typed value must not reject an access token.
+    #[serde(default, deserialize_with = "string_or_none")]
+    nonce: Option<String>,
+    #[serde(default, deserialize_with = "string_or_none")]
+    azp: Option<String>,
+}
+
+fn string_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 struct Parts<'a> {
@@ -256,21 +269,56 @@ fn epoch(now: SystemTime) -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// Verifies `token` and maps its groups to scopes.
-pub fn validate(
+/// JOSE `typ` values an access token may carry (RFC 9068): `at+jwt` only, and it must be present.
+pub const ACCESS_TOKEN_TYP: &[Option<&str>] = &[Some("at+jwt")];
+/// JOSE `typ` values an OIDC id token may carry: absent or `JWT`.
+pub const ID_TOKEN_TYP: &[Option<&str>] = &[None, Some("JWT")];
+
+/// A token whose signature and registered claims have been verified, before any policy (scopes) is
+/// applied. It holds claims only, never any part of the token itself.
+///
+/// `exp` is the raw claim: [`LEEWAY`] was applied when accepting the token, not to this value.
+/// `nonce` and `azp` are returned unchecked; an id-token caller must compare `nonce` with the one
+/// it issued, and require `azp` to equal its client id when the token has several audiences
+/// (OIDC Core 3.1.3.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedToken {
+    pub sub: String,
+    pub exp: SystemTime,
+    pub nonce: Option<String>,
+    pub azp: Option<String>,
+    pub groups: Vec<String>,
+}
+
+/// `typ` matches an entry of `accept` (an `application/` prefix is ignored, case-insensitively);
+/// a `None` entry accepts a header without `typ`.
+fn typ_accepted(typ: Option<&str>, accept: &[Option<&str>]) -> bool {
+    let typ = typ.map(|t| t.strip_prefix("application/").unwrap_or(t));
+    accept.iter().any(|a| match (a, typ) {
+        (None, None) => true,
+        (Some(a), Some(t)) => a.eq_ignore_ascii_case(t),
+        _ => false,
+    })
+}
+
+/// Verifies the signature and the registered claims of `token`: algorithm allowlist (`RS256` and
+/// `ES256` only, matching the key type), required `kid`, signature, `iss`, `aud`, `exp`/`nbf` (with
+/// [`LEEWAY`]) and `sub`. `accept_typ` lists the JOSE `typ` values the caller allows
+/// ([`ACCESS_TOKEN_TYP`], [`ID_TOKEN_TYP`]). No scope policy is applied here.
+pub fn verify(
     token: &str,
     keys: &JwkSet,
-    expected: &Validation,
+    iss: &str,
+    aud: &str,
+    accept_typ: &[Option<&str>],
     now: SystemTime,
-) -> Result<Principal, AuthError> {
+) -> Result<VerifiedToken, AuthError> {
     let parts = split(token)?;
     let alg = match parts.header.alg.as_str() {
         "RS256" | "ES256" => parts.header.alg.as_str(),
         _ => return Err(AuthError::UnsupportedAlg),
     };
-    let typ = parts.header.typ.as_deref().ok_or(AuthError::WrongType)?;
-    let typ = typ.strip_prefix("application/").unwrap_or(typ);
-    if !typ.eq_ignore_ascii_case("at+jwt") {
+    if !typ_accepted(parts.header.typ.as_deref(), accept_typ) {
         return Err(AuthError::WrongType);
     }
     let kid = parts.header.kid.as_deref().ok_or(AuthError::NoKeyId)?;
@@ -303,12 +351,12 @@ pub fn validate(
         .decode(parts.payload)
         .map_err(|_| AuthError::Malformed)?;
     let claims: Claims = serde_json::from_slice(&claims_json).map_err(|_| AuthError::Malformed)?;
-    if claims.iss.as_deref() != Some(expected.issuer.as_str()) {
+    if claims.iss.as_deref() != Some(iss) {
         return Err(AuthError::WrongIssuer);
     }
     let audience_ok = match &claims.aud {
-        Some(Audience::One(a)) => *a == expected.audience,
-        Some(Audience::Many(list)) => list.contains(&expected.audience),
+        Some(Audience::One(a)) => a == aud,
+        Some(Audience::Many(list)) => list.iter().any(|a| a == aud),
         None => false,
     };
     if !audience_ok {
@@ -317,10 +365,10 @@ pub fn validate(
     let now = epoch(now);
     let leeway = LEEWAY.as_secs_f64();
     // A token without `exp` never expires: refuse it rather than trust it forever.
-    match claims.exp {
-        Some(exp) if now <= exp + leeway => {}
+    let exp = match claims.exp {
+        Some(exp) if now <= exp + leeway => exp,
         _ => return Err(AuthError::Expired),
-    }
+    };
     if claims.nbf.is_some_and(|nbf| now + leeway < nbf) {
         return Err(AuthError::NotYetValid);
     }
@@ -328,11 +376,44 @@ pub fn validate(
         .sub
         .filter(|s| !s.is_empty())
         .ok_or(AuthError::Malformed)?;
-    let scopes = scopes_for(&claims.groups, expected);
+    // `exp` is finite and not in the past here; only an absurdly large value fails to convert.
+    let exp = Duration::try_from_secs_f64(exp)
+        .ok()
+        .and_then(|d| UNIX_EPOCH.checked_add(d))
+        .ok_or(AuthError::Malformed)?;
+    Ok(VerifiedToken {
+        sub,
+        exp,
+        nonce: claims.nonce,
+        azp: claims.azp,
+        groups: claims.groups,
+    })
+}
+
+/// Verifies an access token (`typ: at+jwt`) and maps its groups to scopes.
+pub fn validate(
+    token: &str,
+    keys: &JwkSet,
+    expected: &Validation,
+    now: SystemTime,
+) -> Result<Principal, AuthError> {
+    let verified = verify(
+        token,
+        keys,
+        &expected.issuer,
+        &expected.audience,
+        ACCESS_TOKEN_TYP,
+        now,
+    )?;
+    let scopes = scopes_for(&verified.groups, expected);
     if scopes.is_empty() {
         return Err(AuthError::NoScope);
     }
-    Ok(Principal { sub, scopes })
+    Ok(Principal {
+        sub: verified.sub,
+        exp: verified.exp,
+        scopes,
+    })
 }
 
 fn scopes_for(groups: &[String], expected: &Validation) -> BTreeSet<Scope> {
@@ -633,10 +714,124 @@ mod tests {
         assert!(JwkSet::from_json(b"{}").unwrap().is_empty());
     }
 
+    fn id_claims() -> serde_json::Value {
+        let mut c = claims();
+        c["nonce"] = json!("n-0S6_WzA2Mj");
+        c["azp"] = json!("panel");
+        c["groups"] = json!([]);
+        c
+    }
+
+    fn verify_with(
+        issuer: &TestIssuer,
+        token: &str,
+        accept: &[Option<&str>],
+    ) -> Result<VerifiedToken, AuthError> {
+        verify(token, &issuer.jwks(), ISSUER, AUDIENCE, accept, at(NOW))
+    }
+
+    #[test]
+    fn id_token_verifies_with_id_typ_but_is_not_an_access_token() {
+        let issuer = TestIssuer::new("k1");
+        for typ in [Some("JWT"), None] {
+            let token = issuer.sign_with_typ(typ, &id_claims());
+            let v = verify_with(&issuer, &token, ID_TOKEN_TYP).unwrap();
+            assert_eq!(v.sub, "alice");
+            assert_eq!(v.nonce.as_deref(), Some("n-0S6_WzA2Mj"));
+            assert_eq!(v.azp.as_deref(), Some("panel"));
+            assert_eq!(v.exp, at(NOW + 600));
+            assert_eq!(
+                validate(&token, &issuer.jwks(), &validation(), at(NOW)),
+                Err(AuthError::WrongType)
+            );
+            assert_eq!(
+                verify_with(&issuer, &token, ACCESS_TOKEN_TYP),
+                Err(AuthError::WrongType)
+            );
+        }
+        // An access token is not an id token either.
+        let at_token = issuer.sign(&claims());
+        assert_eq!(
+            verify_with(&issuer, &at_token, ID_TOKEN_TYP),
+            Err(AuthError::WrongType)
+        );
+    }
+
+    #[test]
+    fn verify_applies_no_scope_policy() {
+        let issuer = TestIssuer::new("k1");
+        let mut c = claims();
+        c["groups"] = json!(["other"]);
+        let token = issuer.sign(&c);
+        let v = verify_with(&issuer, &token, ACCESS_TOKEN_TYP).unwrap();
+        assert_eq!(v.groups, ["other"]);
+        assert_eq!(
+            validate(&token, &issuer.jwks(), &validation(), at(NOW)),
+            Err(AuthError::NoScope)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_bad_tokens_for_id_tokens_too() {
+        let issuer = TestIssuer::new("k1");
+        let sign = |c: &serde_json::Value| issuer.sign_with_typ(Some("JWT"), c);
+        let run = |t: &str| verify_with(&issuer, t, ID_TOKEN_TYP);
+        let mut c = id_claims();
+        c["iss"] = json!("https://evil.example.com");
+        assert_eq!(run(&sign(&c)), Err(AuthError::WrongIssuer));
+        let mut c = id_claims();
+        c["aud"] = json!("https://admin.example.com/api");
+        assert_eq!(run(&sign(&c)), Err(AuthError::WrongAudience));
+        let mut c = id_claims();
+        c["exp"] = json!(NOW - 61);
+        assert_eq!(run(&sign(&c)), Err(AuthError::Expired));
+        let mut c = id_claims();
+        c["nbf"] = json!(NOW + 61);
+        assert_eq!(run(&sign(&c)), Err(AuthError::NotYetValid));
+        let mut c = id_claims();
+        c.as_object_mut().unwrap().remove("sub");
+        assert_eq!(run(&sign(&c)), Err(AuthError::Malformed));
+
+        let good = sign(&id_claims());
+        let mut parts: Vec<_> = good.split('.').map(str::to_owned).collect();
+        let header = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        // Missing kid.
+        parts[0] = header(json!({"alg": "ES256", "typ": "JWT"}));
+        assert_eq!(run(&parts.join(".")), Err(AuthError::NoKeyId));
+        // Disallowed algorithm.
+        for alg in ["none", "HS256"] {
+            parts[0] = header(json!({"alg": alg, "typ": "JWT", "kid": "k1"}));
+            assert_eq!(run(&parts.join(".")), Err(AuthError::UnsupportedAlg));
+        }
+        // Key-type confusion: RS256 header against an EC key.
+        parts[0] = header(json!({"alg": "RS256", "typ": "JWT", "kid": "k1"}));
+        assert_eq!(run(&parts.join(".")), Err(AuthError::KeyMismatch));
+        // Signature from another key.
+        let stranger = TestIssuer::new("k1").sign_with_typ(Some("JWT"), &id_claims());
+        assert_eq!(run(&stranger), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn badly_typed_nonce_and_azp_do_not_reject_an_access_token() {
+        let issuer = TestIssuer::new("k1");
+        let mut c = claims();
+        c["nonce"] = json!(7);
+        c["azp"] = json!(["a"]);
+        assert!(check(&issuer, &c).is_ok());
+    }
+
+    #[test]
+    fn principal_carries_the_token_expiry() {
+        let issuer = TestIssuer::new("k1");
+        let p = check(&issuer, &claims()).unwrap();
+        assert_eq!(p.exp, at(NOW + 600));
+    }
+
     #[test]
     fn authorize_checks_the_declared_scope() {
         let reader = Principal {
             sub: "r".into(),
+            exp: at(NOW),
             scopes: BTreeSet::from([Scope::Read]),
         };
         assert_eq!(authorize(&reader, None), Ok(()));

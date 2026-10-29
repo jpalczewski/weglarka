@@ -98,6 +98,7 @@ mod tests {
     fn principal(scopes: &[Scope]) -> Principal {
         Principal {
             sub: "u".into(),
+            exp: std::time::SystemTime::UNIX_EPOCH,
             scopes: scopes.iter().copied().collect::<BTreeSet<_>>(),
         }
     }
