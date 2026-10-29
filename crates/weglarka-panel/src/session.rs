@@ -166,7 +166,7 @@ impl Session {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("too many sessions or pending logins")]
+#[error("too many sessions")]
 pub struct Full;
 
 pub struct SessionStore {
@@ -200,9 +200,9 @@ impl SessionStore {
     pub fn insert(&self, session: Session) -> Result<String, Full> {
         let now = self.clock.now();
         let mut map = self.lock();
-        if map.len() >= self.capacity {
-            Self::drop_dead(&mut map, now, self.idle, self.max);
-        }
+        // Dead sessions go first, so they neither count against the identity's quota nor push out
+        // one of its live sessions.
+        Self::drop_dead(&mut map, now, self.idle, self.max);
         // The identity's own oldest sessions make room for the new one.
         let sub = session.user.sub.clone();
         let mut mine: Vec<(Instant, String)> = map
