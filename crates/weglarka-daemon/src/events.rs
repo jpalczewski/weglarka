@@ -203,7 +203,7 @@ fn describe(event: &Event) -> (String, String) {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` (UTC) without a date-time dependency.
-fn rfc3339(at: SystemTime) -> String {
+pub(crate) fn rfc3339(at: SystemTime) -> String {
     let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Howard Hinnant's civil-from-days, shifted to a year starting on 1 March.

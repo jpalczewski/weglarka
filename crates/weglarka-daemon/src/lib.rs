@@ -10,6 +10,8 @@ pub mod admin_token;
 pub mod app;
 mod app_view;
 pub mod cdn;
+pub mod certificates;
+pub mod config_view;
 pub mod doctor;
 pub mod events;
 pub mod forgejo;

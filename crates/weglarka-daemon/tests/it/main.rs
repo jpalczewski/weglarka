@@ -5,6 +5,7 @@
 
 mod common;
 
+mod certificates_config;
 mod configs;
 mod daemon;
 mod depends_on;

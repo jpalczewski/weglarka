@@ -315,6 +315,21 @@ pub const EVENTS_RECENT: Endpoint = Endpoint {
     scope: Some(Scope::Read),
     body: Body::NoAppData,
 };
+/// `GET` → [`CertificatesResponse`](crate::CertificatesResponse): expiry of every ACME-managed
+/// certificate; never key material or paths.
+pub const CERTIFICATES: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/certificates",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
+/// `GET` → [`ConfigView`](crate::ConfigView): an allow-list projection of `weglarka.toml`.
+pub const CONFIG: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/config",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
 /// `GET` → [`DoctorReport`](crate::DoctorReport)
 pub const DOCTOR: Endpoint = Endpoint {
     method: Method::Get,
@@ -410,6 +425,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SITES_REMOVE,
     SITES_PROMOTE,
     EVENTS_RECENT,
+    CERTIFICATES,
+    CONFIG,
     DOCTOR,
     IMAGES_PRUNE,
     NOTIFICATIONS_STATUS,

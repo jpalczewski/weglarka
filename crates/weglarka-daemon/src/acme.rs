@@ -346,24 +346,37 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
     }
 }
 
-/// Whether the wildcard certificate of one of `apexes` covers `domain` and is on disk and unexpired
-/// (`tls/_wildcard.<apex>.crt`). Used to decide that a domain needs no certificate of its own, and by
-/// `doctor`.
-pub fn valid_covering_wildcard(
+/// `notAfter` of a PEM chain; the production reader for [`covering_wildcard`] and `certificates::collect`.
+pub(crate) fn real_not_after(chain: &[u8]) -> Option<SystemTime> {
+    weglarka_acme::chain_not_after(chain).ok()
+}
+
+/// The apex of the wildcard certificate that covers `domain` and that nginx would serve: the longest
+/// covering apex whose pair `tls/_wildcard.<apex>.crt` + `.key` is on disk (as
+/// `NginxOptions::certificate_stem` picks it). The domain needs no certificate of its own only when
+/// that chain is unexpired. `not_after` reads the expiry of a chain (a parameter so tests need no
+/// real x509). The key is only checked for existence, never read.
+pub(crate) fn covering_wildcard(
     tls: &Path,
     apexes: &[String],
     domain: &str,
     now: SystemTime,
-) -> bool {
-    apexes
+    not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
+) -> Option<String> {
+    let (apex, chain) = apexes
         .iter()
         .filter(|apex| wildcard_covers(apex, domain))
-        .any(|apex| {
-            std::fs::read(tls.join(format!("{WILDCARD_CERT_PREFIX}{apex}.crt")))
-                .ok()
-                .and_then(|chain| weglarka_acme::chain_not_after(&chain).ok())
-                .is_some_and(|not_after| not_after > now)
+        .filter_map(|apex| {
+            let stem = format!("{WILDCARD_CERT_PREFIX}{apex}");
+            let chain = std::fs::read(tls.join(format!("{stem}.crt"))).ok()?;
+            tls.join(format!("{stem}.key"))
+                .exists()
+                .then_some((apex, chain))
         })
+        .max_by_key(|(apex, _)| apex.len())?;
+    not_after(&chain)
+        .is_some_and(|at| at > now)
+        .then(|| apex.clone())
 }
 
 /// `*.<apex>` plus `<apex>` in one certificate, stored under the id `_wildcard.<apex>` (a literal
