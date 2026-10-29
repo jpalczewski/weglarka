@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 
-use weglarka_api::{CheckStatus, DoctorCheck, DoctorReport};
+use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
 use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::IngressMode;
@@ -18,6 +18,7 @@ use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
+use crate::certificates::{self, routed_domains};
 use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
 
 fn check(
@@ -1064,19 +1065,6 @@ fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     ));
 }
 
-/// The domains the ingress routes: the webhook domain plus every app domain, sorted and unique.
-/// `None` when `apps.toml` cannot be read (`state.apps` reports that).
-fn routed_domains<P: PodmanClient>(d: &Daemon<P>) -> Option<Vec<String>> {
-    let apps = state::load_apps(&d.paths.state.apps).ok()?;
-    let mut domains: Vec<String> = vec![d.host.webhook.domain.clone()];
-    for spec in apps.apps.values() {
-        domains.extend(spec.domains.iter().cloned());
-    }
-    domains.sort();
-    domains.dedup();
-    Some(domains)
-}
-
 /// `[acme]` (issue #96): the configuration, the account key and the state of every certificate.
 /// `acme.certs` is a failure only for a certificate that has already expired; a missing one or one
 /// inside the renewal window is a warning (the worker is expected to deal with it on its next pass),
@@ -1226,35 +1214,27 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Some(domains) = routed_domains(d) else {
         return; // `state.apps` already reports this
     };
-    let tls = d.ingress.tls_dir();
     let now = std::time::SystemTime::now();
-    let window = std::time::Duration::from_secs(config.renew_before_days * 24 * 3600);
+    let window = certificates::window(config);
+    let certs = certificates::collect(&d.ingress.tls_dir(), config, &domains, now);
     let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
     let mut soonest: Option<u64> = None;
-    let wildcards: &[String] = config.dns.as_ref().map_or(&[], |dns| &dns.wildcards);
     let mut covered = 0usize;
-    for domain in &domains {
-        let Ok(chain) = std::fs::read(tls.join(format!("{domain}.crt"))) else {
-            // No certificate of its own: fine when a valid wildcard serves it (issue #97).
-            if crate::acme::valid_covering_wildcard(&tls, wildcards, domain, now) {
-                covered += 1;
-            } else {
-                missing.push(domain.as_str());
-            }
-            continue;
-        };
-        match weglarka_acme::chain_not_after(&chain) {
-            Err(_) => missing.push(domain.as_str()),
-            Ok(not_after) => match not_after.duration_since(now) {
-                Err(_) => expired.push(domain.as_str()),
-                Ok(left) => {
-                    let days = left.as_secs() / (24 * 3600);
+    for cert in certs.iter().filter(|c| !c.wildcard) {
+        let status = cert.status(now, window);
+        let days = cert.days_left(now).and_then(|d| u64::try_from(d).ok());
+        match status {
+            CertStatus::Covered => covered += 1,
+            CertStatus::Missing => missing.push(cert.label()),
+            CertStatus::Expired => expired.push(cert.label()),
+            CertStatus::RenewalDue | CertStatus::Valid => {
+                if let Some(days) = days {
                     soonest = Some(soonest.map_or(days, |s| s.min(days)));
-                    if left <= window {
-                        due.push(domain.as_str());
-                    }
                 }
-            },
+                if status == CertStatus::RenewalDue {
+                    due.push(cert.label());
+                }
+            }
         }
     }
     let status = d.acme.as_ref().map(|s| s.snapshot()).unwrap_or_default();
@@ -1346,29 +1326,25 @@ fn acme_dns<P: PodmanClient>(
         )),
     }
 
-    let tls = d.ingress.tls_dir();
     let now = std::time::SystemTime::now();
-    let window = std::time::Duration::from_secs(config.renew_before_days * 24 * 3600);
+    let window = certificates::window(config);
     let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
     let mut soonest: Option<u64> = None;
-    for apex in &dns.wildcards {
-        let name = format!("*.{apex}");
-        let Ok(chain) = std::fs::read(tls.join(format!("_wildcard.{apex}.crt"))) else {
-            missing.push(name);
-            continue;
-        };
-        match weglarka_acme::chain_not_after(&chain) {
-            Err(_) => missing.push(name),
-            Ok(not_after) => match not_after.duration_since(now) {
-                Err(_) => expired.push(name),
-                Ok(left) => {
-                    let days = left.as_secs() / (24 * 3600);
+    for cert in certificates::collect(&d.ingress.tls_dir(), config, &[], now) {
+        let status = cert.status(now, window);
+        let days = cert.days_left(now).and_then(|d| u64::try_from(d).ok());
+        let name = cert.label().to_owned();
+        match status {
+            CertStatus::Missing | CertStatus::Covered => missing.push(name),
+            CertStatus::Expired => expired.push(name),
+            CertStatus::RenewalDue | CertStatus::Valid => {
+                if let Some(days) = days {
                     soonest = Some(soonest.map_or(days, |s| s.min(days)));
-                    if left <= window {
-                        due.push(name);
-                    }
                 }
-            },
+                if status == CertStatus::RenewalDue {
+                    due.push(name);
+                }
+            }
         }
     }
     let mut problems = Vec::new();

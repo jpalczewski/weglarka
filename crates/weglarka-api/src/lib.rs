@@ -4,6 +4,8 @@
 //! The admin API listens only on a unix socket (`admin.socket`); bodies are JSON.
 //! Errors: [`ApiError`] with the matching HTTP status (see [`ErrorCode::http_status`]).
 
+pub mod certificates;
+pub mod config_view;
 pub mod doctor;
 pub mod endpoints;
 pub mod forward;
@@ -12,6 +14,8 @@ pub mod logs;
 pub mod run;
 pub mod types;
 
+pub use certificates::{CertStatus, CertificateRecord, CertificatesResponse};
+pub use config_view::*;
 pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
 pub use endpoints::{Body, ENDPOINTS, Endpoint, Method};
 pub use forward::{FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest};

@@ -31,6 +31,9 @@ email = "ops@example.com"            # optional: CA contact address (expiry noti
 - **`doctor`:** `acme.config` (warns on staging), `acme.account` (account file mode), `acme.certs`
   (missing/expired/due for renewal and the last error). A domain without a certificate still gives
   `ingress.tls` = warn, with a hint that the worker will order it in the next pass.
+- **API:** `GET /v1/certificates` (`read` scope, see [admin API tokens](admin-api-tokens.md)) returns the same
+  state as structured data: per certificate the names, `not_after`, days left, status, wildcard coverage and the
+  renewal threshold, plus the worker's last pass and failure count. `acme.certs` is built from the same rows.
 - **Staging:** for trials set `directory_url` to Let's Encrypt staging; browsers do not trust its certificates.
   Switching to production: remove `directory_url` and the `tls/<domain>.*` files and
   `<state dir>/acme/account.key` (the staging account does not exist in production), then restart the daemon.

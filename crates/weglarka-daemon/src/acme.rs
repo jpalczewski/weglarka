@@ -355,15 +355,33 @@ pub fn valid_covering_wildcard(
     domain: &str,
     now: SystemTime,
 ) -> bool {
+    covering_wildcard(tls, apexes, domain, now, &real_not_after).is_some()
+}
+
+/// `notAfter` of a PEM chain; the production reader for [`covering_wildcard`] and `certificates::collect`.
+pub(crate) fn real_not_after(chain: &[u8]) -> Option<SystemTime> {
+    weglarka_acme::chain_not_after(chain).ok()
+}
+
+/// The apex of the first wildcard certificate that [`valid_covering_wildcard`] accepts; `not_after`
+/// reads the expiry of a chain (a parameter so tests need no real x509).
+pub(crate) fn covering_wildcard(
+    tls: &Path,
+    apexes: &[String],
+    domain: &str,
+    now: SystemTime,
+    not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
+) -> Option<String> {
     apexes
         .iter()
         .filter(|apex| wildcard_covers(apex, domain))
-        .any(|apex| {
+        .find(|apex| {
             std::fs::read(tls.join(format!("{WILDCARD_CERT_PREFIX}{apex}.crt")))
                 .ok()
-                .and_then(|chain| weglarka_acme::chain_not_after(&chain).ok())
+                .and_then(|chain| not_after(&chain))
                 .is_some_and(|not_after| not_after > now)
         })
+        .cloned()
 }
 
 /// `*.<apex>` plus `<apex>` in one certificate, stored under the id `_wildcard.<apex>` (a literal

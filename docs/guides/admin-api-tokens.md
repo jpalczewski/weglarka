@@ -44,7 +44,7 @@ revoked before it expires.
 |---|---|
 | none (no token) | `GET /v1/health` only; everything else is `401` |
 | a valid token whose groups map to no scope | nothing: `403` |
-| `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
+| `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, certificates, the host config view, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push`, app logs and OIDC clients |
 
 App logs (`GET /v1/apps/{name}/logs`) need `admin`, although they only read: logs can hold anything the app printed,
@@ -77,6 +77,21 @@ message built from structured fields only: the engine's free-form failure text (
 included, it stays in the daemon log. Pass the answer's `next_seq` as `since` and its `boot_id` as `boot` to get only
 newer events. `dropped` is `true` when events after `since` were evicted. The history is not persisted: a restart begins
 again at `seq` 1 with a new `boot_id`, and a request carrying the old one gets everything retained with `reset: true`.
+
+`GET /v1/certificates` (`read`) lists the certificates the ACME worker looks after, one row per routed domain and per
+wildcard: the names covered, `not_after` (UTC), whole `days_left` (negative once expired), a `status` (`valid`,
+`renewal_due`, `expired`, `missing`, or `covered` by a wildcard) and whether the last pass `failed` on it, plus
+`renew_before_days`, the worker's `last_pass` and its failure count. Only `notAfter` is read from the chains: no key
+material, no file paths and no failure text (that stays in `doctor` and the log). Without an enabled `[acme]` section
+the list is empty and `acme_enabled` is `false`.
+
+`GET /v1/config` (`read`) is an allow-list view of `weglarka.toml`: ingress mode and binds, the runtime allowlists
+and limits, which optional sections are on (`notify`, `acme`, `identity`, `self_update`, `[admin.http]`) with their
+non-secret settings (intervals, thresholds, issuer URL, audience, client instances). Everything that reveals the host
+layout (socket, state and config paths, the runtime account) or is a credential or personal data is left out; where it
+matters a flag says it is set (`authenticated`, `has_contact`, `custom_public_key`). The ntfy URL, host and topic are
+not shown, and the groups behind `read`/`admin` appear only as counts. The daemon builds it field by field, so a new
+config field stays hidden until it is added on purpose.
 
 A token whose scopes are too small, or whose groups map to no scope, gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
 not declared with a scope is refused even to an admin.
