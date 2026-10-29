@@ -13,13 +13,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use weglarka_api::{Endpoint, ErrorCode};
-use weglarka_model::admin_auth::{self, AuthError, JwkSet, Principal, Validation};
+use weglarka_model::admin_auth::{self, AuthError, JwkSet, Principal, Scope, Validation};
 use weglarka_model::podman::PodmanClient;
 
 use crate::admin::{self, Fail};
@@ -36,6 +38,9 @@ pub const MIN_REFRESH: Duration = Duration::from_secs(30);
 /// Keys are refetched after this long even when every `kid` is known, so a withdrawn key stops
 /// verifying within the hour.
 pub const MAX_KEY_AGE: Duration = Duration::from_secs(3600);
+/// While no fetch has ever succeeded there is nothing to protect from a stampede and every token is
+/// refused, so a failed first fetch is retried after this much instead of [`MIN_REFRESH`].
+const EMPTY_RETRY: Duration = Duration::from_secs(1);
 
 /// Source of the provider's `jwks.json`.
 pub trait JwksFetcher: Send + Sync + 'static {
@@ -62,7 +67,7 @@ impl JwksFetcher for ProbeJwks {
 }
 
 struct Cache {
-    keys: JwkSet,
+    keys: Arc<JwkSet>,
     /// When the last fetch was *attempted* (failures count: they are rate limited too).
     attempted: Option<Instant>,
     /// When `keys` was last fetched successfully.
@@ -74,6 +79,9 @@ pub struct JwksVerifier<F: JwksFetcher> {
     fetcher: F,
     expected: Validation,
     cache: Mutex<Cache>,
+    /// Held across a fetch: concurrent requests that need keys wait for the one fetch in flight and
+    /// then use its result, instead of racing past it with an empty or stale set.
+    flight: AsyncMutex<()>,
     min_refresh: Duration,
 }
 
@@ -83,10 +91,11 @@ impl<F: JwksFetcher> JwksVerifier<F> {
             fetcher,
             expected,
             cache: Mutex::new(Cache {
-                keys: JwkSet::default(),
+                keys: Arc::new(JwkSet::default()),
                 attempted: None,
                 fetched: None,
             }),
+            flight: AsyncMutex::new(()),
             min_refresh: MIN_REFRESH,
         }
     }
@@ -99,8 +108,12 @@ impl<F: JwksFetcher> JwksVerifier<F> {
 
     pub async fn verify(&self, token: &str, now: SystemTime) -> Result<Principal, AuthError> {
         let kid = admin_auth::key_id(token)?;
-        if self.should_refresh(&kid) {
-            self.refresh().await;
+        if self.stale(&kid) {
+            let _flight = self.flight.lock().await;
+            // Whoever held the lock before us may have fetched what we need.
+            if self.claim_fetch(&kid) {
+                self.refresh().await;
+            }
         }
         let keys = self.lock().keys.clone();
         admin_auth::validate(token, &keys, &self.expected, now)
@@ -110,19 +123,30 @@ impl<F: JwksFetcher> JwksVerifier<F> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Decides under the lock and reserves the fetch slot, so concurrent requests fetch once.
-    fn should_refresh(&self, kid: &str) -> bool {
-        let mut cache = self.lock();
-        let stale =
-            !cache.keys.contains(kid) || cache.fetched.is_none_or(|at| at.elapsed() > MAX_KEY_AGE);
-        let allowed = cache
-            .attempted
-            .is_none_or(|at| at.elapsed() >= self.min_refresh);
-        if stale && allowed {
-            cache.attempted = Some(Instant::now());
-            return true;
+    /// The cached keys cannot be trusted to verify a token with this `kid`: it is unknown, or the set
+    /// is older than [`MAX_KEY_AGE`].
+    fn stale(&self, kid: &str) -> bool {
+        let cache = self.lock();
+        !cache.keys.contains(kid) || cache.fetched.is_none_or(|at| at.elapsed() > MAX_KEY_AGE)
+    }
+
+    /// Under the flight lock: whether this request should fetch (still stale, and the rate limit
+    /// allows it), reserving the slot.
+    fn claim_fetch(&self, kid: &str) -> bool {
+        if !self.stale(kid) {
+            return false;
         }
-        false
+        let mut cache = self.lock();
+        let wait = if cache.keys.is_empty() {
+            self.min_refresh.min(EMPTY_RETRY)
+        } else {
+            self.min_refresh
+        };
+        if cache.attempted.is_some_and(|at| at.elapsed() < wait) {
+            return false;
+        }
+        cache.attempted = Some(Instant::now());
+        true
     }
 
     async fn refresh(&self) {
@@ -134,7 +158,7 @@ impl<F: JwksFetcher> JwksVerifier<F> {
         match fetched {
             Ok(keys) if !keys.is_empty() => {
                 let mut cache = self.lock();
-                cache.keys = keys;
+                cache.keys = Arc::new(keys);
                 cache.fetched = Some(Instant::now());
             }
             // Keep verifying with the old keys: a provider that blips must not lock operators out.
@@ -217,6 +241,14 @@ async fn authenticate(
     };
     let principal = match verifier.verify(token, SystemTime::now()).await {
         Ok(principal) => principal,
+        // A genuine token of someone the host maps to no scope: authenticated, not authorized.
+        Err(AuthError::NoScope) => {
+            tracing::warn!(%method, %route, "admin token API: the token's groups map to no scope");
+            return deny(
+                ErrorCode::Forbidden,
+                "the token's groups give no access to the admin API",
+            );
+        }
         Err(error) => {
             tracing::warn!(%method, %route, %error, "admin token API: token refused");
             return deny(ErrorCode::Unauthorized, "invalid bearer token");
@@ -243,11 +275,12 @@ async fn authenticate(
         );
     }
 
-    let mutating = method != "GET";
+    let audited = required == Some(Scope::Admin);
     let sub = principal.sub;
     let response = next.run(request).await;
-    if mutating {
-        // The audit trail of everything a token changed: who, what, and how it ended.
+    if audited {
+        // The audit trail of everything done with `admin`: every mutation, and the reads that return
+        // credentials or app data (exports, the OIDC client list). Who, what, and how it ended.
         let status = response.status().as_u16();
         tracing::info!(%sub, %method, %route, status, "admin token API call");
     }
@@ -263,11 +296,14 @@ mod tests {
     struct Counting {
         jwks: Mutex<Result<String, String>>,
         calls: Arc<AtomicUsize>,
+        /// How long a fetch takes, so concurrent requests overlap it.
+        delay: Duration,
     }
 
     impl JwksFetcher for Counting {
         async fn fetch(&self) -> Result<Vec<u8>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             self.jwks.lock().unwrap().clone().map(String::into_bytes)
         }
     }
@@ -280,6 +316,7 @@ mod tests {
         let fetcher = Counting {
             jwks: Mutex::new(jwks),
             calls: calls.clone(),
+            delay: Duration::ZERO,
         };
         (
             JwksVerifier::new(fetcher, validation()).with_min_refresh(min_refresh),
@@ -297,6 +334,47 @@ mod tests {
             assert_eq!(p.sub, "alice");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_share_one_fetch_and_all_succeed() {
+        let issuer = TestIssuer::new("k1");
+        let (mut v, calls) = verifier(Ok(issuer.jwks_json()), MIN_REFRESH);
+        v.fetcher.delay = Duration::from_millis(50);
+        let v = Arc::new(v);
+        let token = issuer.token("alice", &["admins"]);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (v, token) = (v.clone(), token.clone());
+            tasks.push(tokio::spawn(async move {
+                v.verify(&token, SystemTime::now()).await
+            }));
+        }
+        for task in tasks {
+            // Not a spurious `UnknownKey` for the requests that arrived during the fetch.
+            assert_eq!(task.await.unwrap().unwrap().sub, "alice");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_fetch_is_retried_soon_not_after_the_full_rate_limit() {
+        let issuer = TestIssuer::new("k1");
+        let (v, calls) = verifier(Err("down".into()), MIN_REFRESH);
+        let token = issuer.token("alice", &["admins"]);
+        assert_eq!(
+            v.verify(&token, SystemTime::now()).await.unwrap_err(),
+            AuthError::UnknownKey
+        );
+        // Still inside the retry backoff: no second fetch.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        *v.fetcher.jwks.lock().unwrap() = Ok(issuer.jwks_json());
+        tokio::time::sleep(EMPTY_RETRY + Duration::from_millis(100)).await;
+        assert_eq!(
+            v.verify(&token, SystemTime::now()).await.unwrap().sub,
+            "alice"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

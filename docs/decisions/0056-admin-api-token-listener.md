@@ -54,7 +54,7 @@ Constraints: security first, then one implementation for both listeners (traits 
    - Keys come from the provider's `jwks.json`. The daemon shares no network with the provider, so it fetches the JWKS
      over the **ingress probe socket** (ADR 0054) with the issuer's host as `Host`, the way nginx would route a client
      minus TLS and forward auth. The set is cached (a few keys); an unknown `kid` triggers a refetch, rate limited to
-     one attempt per 30 s (failures count), and a set older than an hour is refetched even for a known `kid`, so a
+     one attempt per 30 s (failures count; while no fetch has ever succeeded the wait is 1 s), and concurrent requests share the one fetch in flight, and a set older than an hour is refetched even for a known `kid`, so a
      withdrawn key stops verifying. A failed fetch keeps the old keys: a provider that blips does not lock operators out.
    - Lifetime: tokens are short (Authelia `lifespans.access_token`, at most 15 minutes), because a JWT cannot be revoked
      mid-life. **Introspection** (`/api/oidc/introspection`) would give real revocation at the price of a provider call
@@ -64,7 +64,7 @@ Constraints: security first, then one implementation for both listeners (traits 
      first real deployment must confirm it, and this line comes out when it has.
 6. **Groups become scopes.** There are two scopes, `read` and `admin` (`admin` includes `read`). The client's claims
    policy puts the `groups` claim into the access token (`groups_in_access_token`, ADR 0051); `[admin.http] read_groups`
-   and `admin_groups` map groups to scopes. A token whose groups map to nothing is refused. There are no custom provider
+   and `admin_groups` map groups to scopes. A genuine token whose groups map to nothing is authenticated but not authorized: `403`, not `401`. There are no custom provider
    scopes to keep in sync.
 7. **Every endpoint declares its scope.** `weglarka_api::Endpoint` carries `scope: Option<Scope>` (`None` only for
    `GET /v1/health`, the readiness probe the host watchdog uses). Reads are `read`; every mutation is `admin`, as is
@@ -72,9 +72,11 @@ Constraints: security first, then one implementation for both listeners (traits 
    endpoint up by method and matched route template and **fails closed**: a route that is not in `ENDPOINTS` is refused
    even to an admin. Tests assert that every declared endpoint is routed, that only health is open, and that mutations
    need `admin`.
-8. **Audit.** Every mutation made through the token listener logs `sub`, method, route template and the response
-   status at `info`; every refusal logs at `warn` with the reason. No token, no part of one, and no claim other than `sub`
-   is ever logged.
+8. **Audit.** Every call that needs the `admin` scope is logged at `info` with `sub`, method, route template and the
+   response status: all mutations, and the reads that return credentials or app data (volume export, the OIDC client
+   list). Every refusal logs at `warn` with the reason. No token, no part of one, and no claim other than `sub` is ever
+   logged. The rule is the endpoint's declared scope, not the HTTP method, so a new `admin` read is audited without
+   anyone remembering to.
 9. **The panel is a confidential client with a backend (BFF).** Tokens stay server-side and the browser gets an
    httpOnly session cookie; a public SPA client would keep bearer tokens in the browser. The panel's `client_secret` is
    the one minted by #213 (ADR 0051).

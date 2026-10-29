@@ -15,8 +15,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
 use serde::Deserialize;
 
-/// Directory under the state dir that holds the token listener's socket (`0700`); mounted into
-/// the `[admin.http] clients` only.
+/// Directory under the state dir that holds the token listener's socket (`0711`: containers with
+/// other uids must traverse it; the socket is `0666` and every request carries a token); mounted
+/// into the `[admin.http] clients` only.
 pub const SOCKET_SUBDIR: &str = "run/admin-token";
 pub const SOCKET_NAME: &str = "api.sock";
 /// Where a client container sees the token socket.

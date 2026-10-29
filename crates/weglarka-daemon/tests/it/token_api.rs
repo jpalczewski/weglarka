@@ -15,7 +15,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use weglarka_api::ENDPOINTS;
-use weglarka_api::endpoints::Method;
 use weglarka_model::admin_auth::Scope;
 use weglarka_model::admin_auth::testing::{AUDIENCE, ISSUER, TestIssuer};
 
@@ -194,11 +193,15 @@ async fn the_token_socket_demands_a_valid_bearer_and_only_health_is_open() {
         "exp": 4_000_000_000u64, "groups": ["admins"]
     }));
     let stranger = TestIssuer::new("k1").token("a", &["admins"]);
-    let no_group = s.issuer.token("a", &["interns"]);
-    for token in [wrong_aud, stranger, no_group] {
+    for token in [wrong_aud, stranger] {
         let (status, ..) = call(sock, "GET", "/v1/apps", Some(&token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
+    // A genuine token whose groups map to no scope is authenticated but not authorized: 403.
+    let no_group = s.issuer.token("a", &["interns"]);
+    let (status, _, body) = call(sock, "GET", "/v1/apps", Some(&no_group), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
 }
 
 #[tokio::test]
@@ -267,10 +270,6 @@ async fn every_declared_endpoint_is_routed_and_enforces_its_scope() {
         let (status, ..) = call(sock, method, &path, None, None).await;
         let open = e.scope.is_none();
         assert_eq!(status != StatusCode::UNAUTHORIZED, open, "{}", e.path);
-        assert!(matches!(
-            e.method,
-            Method::Get | Method::Post | Method::Put | Method::Delete
-        ));
     }
 }
 
@@ -307,6 +306,89 @@ async fn doctor_reports_the_listener_and_the_providers_keys() {
     };
     assert!(says("warn", "panel"), "{checks:?}");
     assert!(says("ok", "signing keys"), "{checks:?}");
+}
+
+/// Every endpoint the router registers is declared in `ENDPOINTS` (and so has a scope), and the other
+/// way round. The router cannot be enumerated at runtime, so this reads the sources: a route is added
+/// with `endpoints::<NAME>.path` (the rule of `endpoints.rs`), a declaration is an entry of `ENDPOINTS`.
+/// An undeclared route would be refused by the token listener (fail closed) — this catches it in CI
+/// instead of as a mysterious 403.
+#[test]
+fn every_routed_endpoint_is_declared_and_every_declared_one_is_routed() {
+    use std::collections::BTreeSet;
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let idents = |text: &str, prefix: &str| -> BTreeSet<String> {
+        text.match_indices(prefix)
+            .map(|(i, _)| {
+                text[i + prefix.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty() && name != "ENDPOINTS")
+            .collect()
+    };
+
+    let mut routed = BTreeSet::new();
+    for entry in std::fs::read_dir(crates.join("weglarka-daemon/src")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Only files that register routes; `endpoints::X` elsewhere (docs, probes) is not a route.
+            if text.contains(".route(") || text.contains("routing::") {
+                routed.extend(
+                    idents(&text, "endpoints::")
+                        .into_iter()
+                        .filter(|n| text.contains(&format!("endpoints::{n}.path"))),
+                );
+            }
+        }
+    }
+
+    let endpoints_rs =
+        std::fs::read_to_string(crates.join("weglarka-api/src/endpoints.rs")).unwrap();
+    let array = &endpoints_rs[endpoints_rs.find("pub const ENDPOINTS").unwrap()..];
+    let array = &array[..array.find("];").unwrap()];
+    let declared: BTreeSet<String> = array
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_suffix(','))
+        .filter(|l| {
+            l.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_owned)
+        .collect();
+
+    assert_eq!(
+        declared.len(),
+        ENDPOINTS.len(),
+        "the scan must see every entry of ENDPOINTS"
+    );
+    // A route chains several methods on one path (`get(..).post(..)`) and names the constant only once,
+    // so compare by path. An extra *method* on a known path is still caught: the token listener has no
+    // declaration for it and refuses it (and `every_declared_endpoint_...` covers the declared ones).
+    let path_of = |name: &String| -> String {
+        let at = endpoints_rs
+            .find(&format!("pub const {name}: Endpoint"))
+            .unwrap_or_else(|| panic!("{name} is not a constant of endpoints.rs"));
+        let rest = &endpoints_rs[at..];
+        let from = rest.find("path: \"").unwrap() + "path: \"".len();
+        rest[from..from + rest[from..].find('"').unwrap()].to_owned()
+    };
+    let routed_paths: BTreeSet<String> = routed.iter().map(path_of).collect();
+    let declared_paths: BTreeSet<String> = declared.iter().map(path_of).collect();
+    assert!(
+        routed.is_subset(&declared),
+        "routed but undeclared: {:?}",
+        routed.difference(&declared).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        routed_paths,
+        declared_paths,
+        "declared but unrouted paths: {:?}",
+        declared_paths.difference(&routed_paths).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

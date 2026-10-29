@@ -96,17 +96,28 @@ impl ProbeResponse {
 const MAX_HEAD: usize = 16 * 1024;
 const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
-/// One `GET` on a fresh connection (`Connection: close`) with `headers` added. Returns the head and,
-/// when `max_body > 0`, the body read until the peer closes (an answer longer than `max_body` is an
-/// error). A body is requested over `HTTP/1.0` so nginx answers without chunked framing; a status-only
-/// probe uses `HTTP/1.1`. Redirects are not followed.
+/// How much of the answer an exchange reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    /// Only the status line: the health gate asks nothing more, so a peer that sends a short or odd
+    /// head (or none after the status line) still answers it.
+    Status,
+    /// The whole head, up to [`MAX_HEAD`].
+    Head,
+    /// The head and a body of at most this many bytes, read until the peer closes.
+    Body(usize),
+}
+
+/// One `GET` on a fresh connection (`Connection: close`) with `headers` added; reads as much of the
+/// answer as `want` says. A body is requested over `HTTP/1.0` so nginx answers without chunked framing;
+/// the other two use `HTTP/1.1`. Redirects are not followed.
 async fn exchange<S>(
     stream: &mut S,
     host: &str,
     path: &str,
     user_agent: &str,
     headers: &[(&str, &str)],
-    max_body: usize,
+    want: Want,
 ) -> Result<ProbeResponse, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -118,7 +129,11 @@ where
     {
         return Err("invalid header for a probe".into());
     }
-    let version = if max_body > 0 { "1.0" } else { "1.1" };
+    let version = if matches!(want, Want::Body(_)) {
+        "1.0"
+    } else {
+        "1.1"
+    };
     let mut request = format!(
         "GET {path} HTTP/{version}\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n\
          Accept: */*\r\nConnection: close\r\n"
@@ -138,7 +153,10 @@ where
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break Some(i + 4);
         }
-        // A bare status line ends the head too (some peers close right after it).
+        // The status line fits well within 64 bytes: "HTTP/1.1 200 ".
+        if want == Want::Status && (buf.len() >= 12 || buf.contains(&b'\n')) {
+            break None;
+        }
         if buf.len() >= MAX_HEAD {
             return Err("response head too large".into());
         }
@@ -155,7 +173,7 @@ where
         return Err("no response (connection closed; no server for this Host yet?)".to_owned());
     }
     let status = parse_status(&buf).ok_or_else(|| "malformed HTTP response".to_owned())?;
-    let Some(head_end) = head_end else {
+    let (Some(head_end), false) = (head_end, want == Want::Status) else {
         return Ok(ProbeResponse {
             status,
             ..ProbeResponse::default()
@@ -168,8 +186,9 @@ where
         .filter_map(|l| l.split_once(':'))
         .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_owned()))
         .collect();
-    let mut body = buf[head_end..].to_vec();
-    if max_body > 0 {
+    let mut body = Vec::new();
+    if let Want::Body(max_body) = want {
+        body.extend_from_slice(&buf[head_end..]);
         while body.len() <= max_body {
             let n = stream
                 .read(&mut chunk)
@@ -183,8 +202,6 @@ where
         if body.len() > max_body {
             return Err(format!("response body longer than {max_body} bytes"));
         }
-    } else {
-        body.clear();
     }
     Ok(ProbeResponse {
         status,
@@ -193,14 +210,21 @@ where
     })
 }
 
-/// One `GET` on a fresh connection; returns the status of the response. The body is not read.
+/// One `GET` on a fresh connection; returns the status of the response. Only the status line is read.
 async fn get_status<S>(stream: &mut S, host: &str, path: &str) -> Result<u16, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    exchange(stream, host, path, "weglarka-health-probe", &[], 0)
-        .await
-        .map(|r| r.status)
+    exchange(
+        stream,
+        host,
+        path,
+        "weglarka-health-probe",
+        &[],
+        Want::Status,
+    )
+    .await
+    .map(|r| r.status)
 }
 
 /// One `GET` of `path` with `Host: host` over the probe socket; the status of the answer (5 s budget).
@@ -232,7 +256,7 @@ pub async fn probe_get(
             path,
             "weglarka-daemon",
             &[],
-            max_body.max(1),
+            Want::Body(max_body),
         )
         .await
     })
@@ -269,7 +293,7 @@ pub async fn authz_probe(
                 ("X-Original-URL", original_url),
                 ("X-Original-Method", "GET"),
             ],
-            0,
+            Want::Head,
         )
         .await?;
         Ok(AuthzAnswer {

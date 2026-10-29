@@ -92,6 +92,9 @@ pub enum StartError {
     /// `[acme.dns]` is unusable (an unreadable or world-readable token file, an invalid apex).
     #[error("{0}")]
     Acme(String),
+    /// `[admin.http]` cannot be served (docs/decisions/0056).
+    #[error("[admin.http] {0}")]
+    AdminHttp(String),
     /// `[ingress]` cannot work in the selected mode (an `edge` host without `https_bind`, a
     /// `behind`-only key in `edge`, a privileged publish port without the opt-in — issue #95).
     #[error("{0}")]
@@ -186,6 +189,12 @@ fn bind_unix(path: &Path, dir_mode: u32, socket_mode: u32) -> Result<UnixListene
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))
         .map_err(io(format!("chmod {}", path.display())))?;
     Ok(listener)
+}
+
+/// Sets `dir`'s mode whatever it was created with (`ensure_dir` leaves an existing directory alone).
+fn enforce_dir_mode(dir: &Path, mode: u32) -> Result<(), StartError> {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .map_err(io(format!("chmod {}", dir.display())))
 }
 
 /// Serves `app` on `listener` until `shutdown` flips; a server that stops by itself is logged.
@@ -418,8 +427,14 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let admin_token = match (&host.admin.http, &host.identity) {
         (Some(http), Some(identity)) => {
             let listener = bind_unix(&paths.admin_token_socket(), 0o711, 0o666)?;
+            // Re-applied on every start, like the probe directory: a directory that already existed
+            // (or was created under a restrictive umask) must still be traversable by the clients'
+            // uids, and must not have drifted wider than intended.
+            enforce_dir_mode(&paths.admin_token_dir, 0o711)?;
             let issuer_host = weglarka_model::identity::issuer_host(&identity.issuer)
-                .map_err(|reason| StartError::Ingress(format!("[identity] issuer: {reason}")))?
+                .map_err(|reason| {
+                    StartError::AdminHttp(format!("issuer {:?}: {reason}", identity.issuer))
+                })?
                 .to_owned();
             let verifier = Arc::new(admin_token::JwksVerifier::new(
                 admin_token::ProbeJwks {

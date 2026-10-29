@@ -42,11 +42,12 @@ revoked before it expires.
 
 | Scope | Allowed |
 |---|---|
-| none (no token, or a token that maps to no scope) | `GET /v1/health` only; everything else is `401` |
+| none (no token) | `GET /v1/health` only; everything else is `401` |
+| a valid token whose groups map to no scope | nothing: `403` |
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
-A token whose scopes are too small gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
+A token whose scopes are too small, or whose groups map to no scope, gets `403`; an invalid, expired, foreign or missing token gets `401`. A route that is
 not declared with a scope is refused even to an admin.
 
 A request is checked by the daemon itself, never by whoever accepted the connection:
@@ -61,7 +62,7 @@ The daemon reaches the provider's `jwks.json` over the ingress probe socket (it 
 the keys cached, refetches when it sees an unknown key id (at most every 30 s) and at least hourly, and keeps using the old
 keys while the provider is down.
 
-Every change made through the token listener is logged with the token's `sub`, the route and the result; refusals are
+Every call that needs `admin` (all changes, plus exports and the OIDC client list) is logged with the token's `sub`, the route and the result; refusals are
 logged with their reason. Tokens themselves are never logged.
 
 ## Checks
