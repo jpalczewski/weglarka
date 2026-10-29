@@ -32,6 +32,8 @@ pub enum Scope {
 }
 
 /// A verified caller: the token's `sub`, its expiry and the scopes its groups map to.
+///
+/// `exp` is the raw claim: [`LEEWAY`] was applied when accepting the token, not to this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub sub: String,
@@ -65,6 +67,10 @@ pub enum AuthError {
     WrongIssuer,
     #[error("token audience does not include the configured audience")]
     WrongAudience,
+    #[error("id token nonce does not match the login it answers")]
+    NonceMismatch,
+    #[error("id token authorized party is not this client")]
+    WrongAuthorizedParty,
     #[error("token has expired")]
     Expired,
     #[error("token is not valid yet")]
@@ -270,17 +276,37 @@ fn epoch(now: SystemTime) -> f64 {
 }
 
 /// JOSE `typ` values an access token may carry (RFC 9068): `at+jwt` only, and it must be present.
-pub const ACCESS_TOKEN_TYP: &[Option<&str>] = &[Some("at+jwt")];
+const ACCESS_TOKEN_TYP: &[Option<&str>] = &[Some("at+jwt")];
 /// JOSE `typ` values an OIDC id token may carry: absent or `JWT`.
-pub const ID_TOKEN_TYP: &[Option<&str>] = &[None, Some("JWT")];
+const ID_TOKEN_TYP: &[Option<&str>] = &[None, Some("JWT")];
+
+/// What kind of token [`verify`] is asked to accept. The kind fixes the accepted JOSE `typ`, so a
+/// caller cannot make access tokens and id tokens interchangeable (RFC 9068), and for id tokens it
+/// carries the values the checks of OIDC Core 3.1.3.7 compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind<'a> {
+    /// An RFC 9068 access token (`typ: at+jwt`).
+    Access,
+    /// An OIDC id token (`typ` absent or `JWT`) answering one login: its `nonce` must equal the one
+    /// sent in the authorization request, and `azp` must be `client_id` when present, and present
+    /// when the token has several audiences.
+    Id { client_id: &'a str, nonce: &'a str },
+}
+
+impl TokenKind<'_> {
+    fn typ(&self) -> &'static [Option<&'static str>] {
+        match self {
+            Self::Access => ACCESS_TOKEN_TYP,
+            Self::Id { .. } => ID_TOKEN_TYP,
+        }
+    }
+}
 
 /// A token whose signature and registered claims have been verified, before any policy (scopes) is
 /// applied. It holds claims only, never any part of the token itself.
 ///
 /// `exp` is the raw claim: [`LEEWAY`] was applied when accepting the token, not to this value.
-/// `nonce` and `azp` are returned unchecked; an id-token caller must compare `nonce` with the one
-/// it issued, and require `azp` to equal its client id when the token has several audiences
-/// (OIDC Core 3.1.3.7).
+/// `nonce` and `azp` are informational: for [`TokenKind::Id`] [`verify`] has already compared them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedToken {
     pub sub: String,
@@ -303,14 +329,14 @@ fn typ_accepted(typ: Option<&str>, accept: &[Option<&str>]) -> bool {
 
 /// Verifies the signature and the registered claims of `token`: algorithm allowlist (`RS256` and
 /// `ES256` only, matching the key type), required `kid`, signature, `iss`, `aud`, `exp`/`nbf` (with
-/// [`LEEWAY`]) and `sub`. `accept_typ` lists the JOSE `typ` values the caller allows
-/// ([`ACCESS_TOKEN_TYP`], [`ID_TOKEN_TYP`]). No scope policy is applied here.
+/// [`LEEWAY`]) and `sub`. `kind` fixes the JOSE `typ` values accepted and, for an id token, adds the
+/// `nonce` and `azp` checks. No scope policy is applied here.
 pub fn verify(
     token: &str,
     keys: &JwkSet,
     iss: &str,
     aud: &str,
-    accept_typ: &[Option<&str>],
+    kind: TokenKind<'_>,
     now: SystemTime,
 ) -> Result<VerifiedToken, AuthError> {
     let parts = split(token)?;
@@ -318,7 +344,7 @@ pub fn verify(
         "RS256" | "ES256" => parts.header.alg.as_str(),
         _ => return Err(AuthError::UnsupportedAlg),
     };
-    if !typ_accepted(parts.header.typ.as_deref(), accept_typ) {
+    if !typ_accepted(parts.header.typ.as_deref(), kind.typ()) {
         return Err(AuthError::WrongType);
     }
     let kid = parts.header.kid.as_deref().ok_or(AuthError::NoKeyId)?;
@@ -376,6 +402,17 @@ pub fn verify(
         .sub
         .filter(|s| !s.is_empty())
         .ok_or(AuthError::Malformed)?;
+    if let TokenKind::Id { client_id, nonce } = kind {
+        if claims.nonce.as_deref() != Some(nonce) {
+            return Err(AuthError::NonceMismatch);
+        }
+        let several = matches!(&claims.aud, Some(Audience::Many(list)) if list.len() > 1);
+        match claims.azp.as_deref() {
+            Some(azp) if azp == client_id => {}
+            None if !several => {}
+            _ => return Err(AuthError::WrongAuthorizedParty),
+        }
+    }
     // `exp` is finite and not in the past here; only an absurdly large value fails to convert.
     let exp = Duration::try_from_secs_f64(exp)
         .ok()
@@ -402,7 +439,7 @@ pub fn validate(
         keys,
         &expected.issuer,
         &expected.audience,
-        ACCESS_TOKEN_TYP,
+        TokenKind::Access,
         now,
     )?;
     let scopes = scopes_for(&verified.groups, expected);
@@ -716,18 +753,24 @@ mod tests {
 
     fn id_claims() -> serde_json::Value {
         let mut c = claims();
-        c["nonce"] = json!("n-0S6_WzA2Mj");
+        c["nonce"] = json!(NONCE);
         c["azp"] = json!("panel");
         c["groups"] = json!([]);
         c
     }
 
+    const NONCE: &str = "n-0S6_WzA2Mj";
+    const ID: TokenKind<'static> = TokenKind::Id {
+        client_id: "panel",
+        nonce: NONCE,
+    };
+
     fn verify_with(
         issuer: &TestIssuer,
         token: &str,
-        accept: &[Option<&str>],
+        kind: TokenKind<'_>,
     ) -> Result<VerifiedToken, AuthError> {
-        verify(token, &issuer.jwks(), ISSUER, AUDIENCE, accept, at(NOW))
+        verify(token, &issuer.jwks(), ISSUER, AUDIENCE, kind, at(NOW))
     }
 
     #[test]
@@ -735,7 +778,7 @@ mod tests {
         let issuer = TestIssuer::new("k1");
         for typ in [Some("JWT"), None] {
             let token = issuer.sign_with_typ(typ, &id_claims());
-            let v = verify_with(&issuer, &token, ID_TOKEN_TYP).unwrap();
+            let v = verify_with(&issuer, &token, ID).unwrap();
             assert_eq!(v.sub, "alice");
             assert_eq!(v.nonce.as_deref(), Some("n-0S6_WzA2Mj"));
             assert_eq!(v.azp.as_deref(), Some("panel"));
@@ -745,15 +788,84 @@ mod tests {
                 Err(AuthError::WrongType)
             );
             assert_eq!(
-                verify_with(&issuer, &token, ACCESS_TOKEN_TYP),
+                verify_with(&issuer, &token, TokenKind::Access),
                 Err(AuthError::WrongType)
             );
         }
         // An access token is not an id token either.
         let at_token = issuer.sign(&claims());
         assert_eq!(
-            verify_with(&issuer, &at_token, ID_TOKEN_TYP),
+            verify_with(&issuer, &at_token, ID),
             Err(AuthError::WrongType)
+        );
+    }
+
+    fn id_token(issuer: &TestIssuer, c: &serde_json::Value) -> String {
+        issuer.sign_with_typ(Some("JWT"), c)
+    }
+
+    #[test]
+    fn id_token_nonce_must_be_present_and_equal() {
+        let issuer = TestIssuer::new("k1");
+        let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
+        assert!(run(&id_claims()).is_ok());
+        let mut c = id_claims();
+        c["nonce"] = json!("another-login");
+        assert_eq!(run(&c), Err(AuthError::NonceMismatch));
+        c["nonce"] = json!(7);
+        assert_eq!(run(&c), Err(AuthError::NonceMismatch));
+        c.as_object_mut().unwrap().remove("nonce");
+        assert_eq!(run(&c), Err(AuthError::NonceMismatch));
+        // An empty expected nonce never matches a missing claim by accident.
+        let empty = TokenKind::Id {
+            client_id: "panel",
+            nonce: "",
+        };
+        assert_eq!(
+            verify_with(&issuer, &id_token(&issuer, &c), empty),
+            Err(AuthError::NonceMismatch)
+        );
+    }
+
+    #[test]
+    fn id_token_with_several_audiences_needs_the_right_azp() {
+        let issuer = TestIssuer::new("k1");
+        let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
+        let mut c = id_claims();
+        c["aud"] = json!(["other", AUDIENCE]);
+        assert!(run(&c).is_ok());
+        c["azp"] = json!("someone-else");
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        c.as_object_mut().unwrap().remove("azp");
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        c["azp"] = json!(["panel"]);
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+    }
+
+    #[test]
+    fn id_token_azp_is_optional_for_a_single_audience_but_never_wrong() {
+        let issuer = TestIssuer::new("k1");
+        let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
+        for aud in [json!(AUDIENCE), json!([AUDIENCE])] {
+            let mut c = id_claims();
+            c["aud"] = aud;
+            assert!(run(&c).is_ok());
+            c.as_object_mut().unwrap().remove("azp");
+            assert!(run(&c).is_ok());
+            c["azp"] = json!("someone-else");
+            assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        }
+    }
+
+    #[test]
+    fn id_check_errors_name_no_token_content() {
+        for e in [AuthError::NonceMismatch, AuthError::WrongAuthorizedParty] {
+            let text = format!("{e} {e:?}");
+            assert!(!text.contains(NONCE) && !text.contains("panel"), "{text}");
+        }
+        assert_ne!(
+            AuthError::NonceMismatch.to_string(),
+            AuthError::WrongAuthorizedParty.to_string()
         );
     }
 
@@ -763,7 +875,7 @@ mod tests {
         let mut c = claims();
         c["groups"] = json!(["other"]);
         let token = issuer.sign(&c);
-        let v = verify_with(&issuer, &token, ACCESS_TOKEN_TYP).unwrap();
+        let v = verify_with(&issuer, &token, TokenKind::Access).unwrap();
         assert_eq!(v.groups, ["other"]);
         assert_eq!(
             validate(&token, &issuer.jwks(), &validation(), at(NOW)),
@@ -775,7 +887,7 @@ mod tests {
     fn verify_rejects_bad_tokens_for_id_tokens_too() {
         let issuer = TestIssuer::new("k1");
         let sign = |c: &serde_json::Value| issuer.sign_with_typ(Some("JWT"), c);
-        let run = |t: &str| verify_with(&issuer, t, ID_TOKEN_TYP);
+        let run = |t: &str| verify_with(&issuer, t, ID);
         let mut c = id_claims();
         c["iss"] = json!("https://evil.example.com");
         assert_eq!(run(&sign(&c)), Err(AuthError::WrongIssuer));
