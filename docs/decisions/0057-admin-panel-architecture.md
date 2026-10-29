@@ -58,6 +58,15 @@ Threats, in priority order:
    an allowlisted view of host config, and certificate expiry. Two things must hold before any page uses them:
    - **No credential at `read`.** `GET /v1/apps/{name}` returns the whole app spec today, including `env` values; for a
      `read` principal those values are blanked, from one constructor shared by every code path that builds the response.
+     The read view is an allowlist projection, not a blocklist: the constructor rebuilds the spec and the state by
+     destructuring every field of `AppSpec`, `AppState` and the nested structs without `..`, so a new field does not
+     compile until someone decides what a `read` caller sees of it. Policy: `env` values blank (keys kept), arguments
+     after the first replaced by a placeholder (arity kept), `health.http.path` cut to its first segment plus
+     `<redacted>` for the rest (query always dropped), `state.failed.reason` a fixed marker. `ShowAppResponse` carries
+     `redacted: true` whenever this applies (absent otherwise, so the unredacted answer is byte-identical), and the CLI
+     refuses to write such a spec back. Every `Endpoint` declares its `Body` (`NoAppData`, `AppView`, `Credential`); a
+     `read` endpoint cannot be `Credential`, and an integration test walks the table and checks that each `AppView`
+     endpoint answers `read` with `redacted: true`.
    - **A stream ends with its token.** The token layer verifies once at the start of a request, so the verified
      principal carries the token's `exp` and a streaming handler stops when it passes; the panel reconnects with a
      refreshed token, resuming by sequence number. The panel's own stream to the browser ends when the session does

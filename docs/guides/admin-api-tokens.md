@@ -47,10 +47,16 @@ revoked before it expires.
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
 | `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push` and OIDC clients |
 
-`GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. For a token
-without `admin`: the values of `env` are blank (the keys stay); `command` and `health.command` keep only their first
-element and show `<redacted>` for every other argument (the count stays); `health.http.path` loses its query string; and
-the engine's failure text in `state.failed.reason` is replaced by a fixed marker (the failed `digest` stays). Put
+`GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. The `read`
+view is an allowlist: the daemon rebuilds it field by field, so a field added in a later release stays hidden from
+`read` until it is deliberately listed. For a token without `admin`: the values of `env` are blank (the keys stay);
+`command` and `health.command` keep only their first element and show `<redacted>` for every other argument (the count
+stays); `health.http.path` keeps its first path segment and shows `<redacted>` for the rest (`/hooks/<token>/ready` is
+shown as `/hooks/<redacted>`; the query string is always dropped, and a credential in the *first* segment would still be
+visible, so keep credentials out of the probe path); and the engine's failure text in `state.failed.reason` is replaced
+by a fixed marker (the failed `digest` stays). The response then carries `"redacted": true`; an `admin` token and the unix
+socket get no such key. A redacted spec is a view, not the stored spec: do not send it back in `PUT /v1/apps/{name}`
+(a full replacement), and `weglarka apps update/start/stop` refuses to when it receives one. Put
 connection strings and other credentials in secrets, not in `env` or command arguments. The same answer also reports the
 container's `restarts`, its raw `health` (`starting`, `healthy` or `unhealthy`) and `started_at` (RFC 3339). The unix socket
 and `admin` tokens see the real values. The notification status (`GET /v1/notifications`) is safe at `read`: its

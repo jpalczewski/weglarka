@@ -737,6 +737,7 @@ fn show_app(start: bool) -> ShowAppResponse {
         restarts: None,
         health: None,
         started_at: None,
+        redacted: false,
     }
 }
 

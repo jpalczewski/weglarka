@@ -14,7 +14,7 @@ use hyper::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use weglarka_api::ENDPOINTS;
+use weglarka_api::{Body, ENDPOINTS, Method};
 use weglarka_model::admin_auth::Scope;
 use weglarka_model::admin_auth::testing::{AUDIENCE, ISSUER, TestIssuer};
 
@@ -382,6 +382,59 @@ async fn every_declared_endpoint_is_routed_and_enforces_its_scope() {
         let open = e.scope.is_none();
         assert_eq!(status != StatusCode::UNAUTHORIZED, open, "{}", e.path);
     }
+}
+
+/// Every endpoint the table declares as answering with app data hands a `read` token the redacted
+/// view, and an `admin` token the stored one (issue #255). An `AppView` endpoint above `read` is
+/// refused outright.
+#[tokio::test]
+async fn every_app_view_endpoint_answers_read_with_the_redacted_view() {
+    let s = setup().await;
+    let sock = &s.token_socket;
+    let reader = s.issuer.token("rita", &["viewers"]);
+    let admin_token = s.issuer.token("adam", &["admins"]);
+
+    let mut app = spec("w.example.com");
+    app["env"] = json!({ "DATABASE_URL": "postgres://u:hunter2@db/w" });
+    let mut walked = 0;
+    for e in ENDPOINTS.iter().filter(|e| e.body == Body::AppView) {
+        let method = e.method.as_str();
+        let path = match e.path {
+            "/v1/apps" => "/v1/apps".to_owned(),
+            _ => "/v1/apps/w".to_owned(),
+        };
+        let body = match e.method {
+            Method::Post => Some(json!({ "name": "w", "spec": app })),
+            Method::Put => Some(json!({ "spec": app })),
+            _ => None,
+        };
+        let what = format!("{method} {}", e.path);
+
+        // The view sits in `app` when the answer wraps it (update).
+        let view = |body: &Value| body.get("app").unwrap_or(body).clone();
+
+        let (status, _, answer) = call(sock, method, &path, Some(&reader), body.clone()).await;
+        match e.scope {
+            Some(Scope::Read) => {
+                assert_eq!(status, StatusCode::OK, "{what}: {answer}");
+                let v = view(&answer);
+                assert_eq!(v["redacted"], true, "{what}: {answer}");
+                assert!(!answer.to_string().contains("hunter2"), "{what}: {answer}");
+            }
+            _ => assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {answer}"),
+        }
+
+        let (status, _, answer) = call(sock, method, &path, Some(&admin_token), body).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {answer}");
+        let v = view(&answer);
+        assert!(v.get("redacted").is_none(), "{what}: {answer}");
+        assert_eq!(
+            v["spec"]["env"]["DATABASE_URL"], "postgres://u:hunter2@db/w",
+            "{what}: {answer}"
+        );
+        walked += 1;
+    }
+    assert_eq!(walked, 3, "add, show and update");
 }
 
 #[tokio::test]
