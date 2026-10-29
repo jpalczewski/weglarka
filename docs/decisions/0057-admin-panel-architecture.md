@@ -1,6 +1,6 @@
 # 0057 — Admin panel: a server-rendered BFF with htmx and Alpine
 
-Status: proposed (2026-10-29). Builds on ADR 0056 (token listener, the panel as a confidential BFF client) and ADR 0052
+Status: accepted (2026-10-29). Builds on ADR 0056 (token listener, the panel as a confidential BFF client) and ADR 0052
 (forward auth). Scope of the first release: read-mostly (decision 7).
 
 ## Problem
@@ -109,3 +109,13 @@ dependency of the daemon (the unix socket works with the panel gone).
   removes the main defence against injected script.
 - **Letting the panel hold its own admin credential.** It would make a compromised panel equal to the break-glass socket.
   The user's token is forwarded instead, so the panel is never more powerful than its current user.
+
+## Implemented
+
+- `weglarka-panel` crate: skeleton, OIDC login and sessions, hardening of both, and the read-mostly pages with live
+  events and admin-only logs (#268, #288, #302, #305); `weglarka-unix-http` as the shared socket client.
+- The daemon endpoints of decision 8 (events, redacted app view, certificates, config view, log stream) landed with the
+  token listener of ADR 0056.
+- The panel image `ghcr.io/jpalczewski/weglarka-panel` is built and smoke-tested in CI and published by the release
+  workflow at the daemon's version.
+- Operator documentation: [admin panel](../guides/admin-panel.md).

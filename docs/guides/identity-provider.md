@@ -5,7 +5,8 @@ Węglarka can run an OpenID Connect provider (Authelia) as an ordinary app and k
 registered in the provider, and its credentials arrive in the container as environment variables or a mounted secret.
 Removing the app removes the client at the next apply, so a dead client cannot outlive its app.
 
-Forward auth in front of an app without a login of its own is a separate switch: [forward auth](forward-auth.md).
+Forward auth in front of an app without a login of its own is a separate switch: [forward auth](forward-auth.md). A worked
+OIDC client is the [admin panel](admin-panel.md).
 
 ## The provider
 

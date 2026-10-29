@@ -68,7 +68,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `config_root` | [host configs](host-configs.md) |
 | `weglarka.toml` | `[webhook.forgejo]` | [webhooks](webhooks.md) |
 | `weglarka.toml` | `[identity]` | [identity provider](identity-provider.md) |
-| `weglarka.toml` | `[admin.http]` (the unix socket keeps working) | [admin API tokens](admin-api-tokens.md) |
+| `weglarka.toml` | `[admin.http]` (the unix socket keeps working; remove the panel app first and `[identity]` last) | [admin API tokens](admin-api-tokens.md), [admin panel](admin-panel.md) |
 | `weglarka.toml` | `[acme]` (or set `enabled = false` before rolling back to a release that knows it) | [ACME certificates](acme.md) |
 | `weglarka.toml` | `[acme.dns]` | [wildcard certificates](wildcard-certificates.md) |
 | `weglarka.toml` | `[ingress.cdn]` | [edge behind a CDN](edge-cdn.md) |
