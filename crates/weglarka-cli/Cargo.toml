@@ -20,7 +20,6 @@ clap = { workspace = true, features = ["env"] }
 futures-util.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
-hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -29,7 +28,8 @@ toml.workspace = true
 weglarka-api.workspace = true
 weglarka-engine.workspace = true
 weglarka-model.workspace = true
+weglarka-unix-http.workspace = true
 
 [dev-dependencies]
-hyper = { workspace = true, features = ["server"] }
 insta.workspace = true
+weglarka-unix-http = { workspace = true, features = ["testing"] }

@@ -109,15 +109,9 @@ async fn archive(json: bool, o: &Overrides, a: &PushArgs, path: &PathBuf) -> Res
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::sync::Mutex;
 
     use clap::Parser;
-    use http_body_util::{BodyExt, Full};
-    use hyper::body::Incoming;
-    use hyper::service::service_fn;
-    use hyper::{Request, Response};
-    use hyper_util::rt::TokioIo;
 
     use super::*;
     use crate::cli::{Cli, Command};
@@ -131,42 +125,21 @@ mod tests {
         })
     }
 
-    type Seen = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+    type Seen = Arc<Mutex<Vec<weglarka_unix_http::testing::Seen>>>;
 
-    /// Unix-socket daemon answering every request with `status` and `reply`.
-    async fn mock(tag: &str, status: u16, reply: &'static [u8]) -> (PathBuf, Seen) {
-        let socket = std::env::temp_dir().join(format!("wgp-{}-{tag}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let seen: Seen = Arc::default();
-        let seen2 = seen.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let seen = seen2.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let seen = seen.clone();
-                        async move {
-                            let method = req.method().to_string();
-                            let uri = req.uri().to_string();
-                            let body = req.into_body().collect().await.unwrap().to_bytes();
-                            seen.lock().unwrap().push((method, uri, body.to_vec()));
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(status)
-                                    .body(Full::new(Bytes::from_static(reply)))
-                                    .unwrap(),
-                            )
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-        (socket, seen)
+    /// Unix-socket daemon answering every request with `status` and `reply`. The returned guard
+    /// derefs to the socket path and removes the socket on drop.
+    async fn mock(
+        _tag: &str,
+        status: u16,
+        reply: &'static [u8],
+    ) -> (weglarka_unix_http::testing::Mock, Seen) {
+        let m = weglarka_unix_http::testing::mock_with(move |_, _| {
+            weglarka_unix_http::testing::Reply::new(status, Bytes::from_static(reply))
+        })
+        .await;
+        let seen = m.seen.clone();
+        (m, seen)
     }
 
     fn overrides(socket: &std::path::Path) -> Overrides {
@@ -210,9 +183,9 @@ mod tests {
         .unwrap();
         assert_eq!(code, exit::OK);
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].0, "PUT");
-        assert_eq!(seen[0].1, "/v1/apps/app/image");
-        assert_eq!(seen[0].2, payload, "the archive arrives intact");
+        assert_eq!(seen[0].method, "PUT");
+        assert_eq!(seen[0].uri(), "/v1/apps/app/image");
+        assert_eq!(seen[0].raw_body, payload, "the archive arrives intact");
         let _ = std::fs::remove_file(file);
     }
 
@@ -266,9 +239,9 @@ mod tests {
         .unwrap();
         {
             let seen = seen.lock().unwrap();
-            assert_eq!(seen[0].0, "POST");
-            assert_eq!(seen[0].1, "/v1/apps/app/deploy");
-            let body: serde_json::Value = serde_json::from_slice(&seen[0].2).unwrap();
+            assert_eq!(seen[0].method, "POST");
+            assert_eq!(seen[0].uri(), "/v1/apps/app/deploy");
+            let body: serde_json::Value = serde_json::from_slice(&seen[0].raw_body).unwrap();
             assert_eq!(body["image_ref"], "ghcr.io/me/app:sha-1");
         }
 

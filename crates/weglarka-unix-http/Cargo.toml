@@ -1,0 +1,29 @@
+[package]
+name = "weglarka-unix-http"
+description = "Węglarka: HTTP/1 client over a unix socket (hyper, one connection per request)"
+version = "0.0.4"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# A mock unix-socket server for tests of the clients built on this crate.
+testing = ["hyper/server", "dep:futures-util"]
+
+[dependencies]
+bytes.workspace = true
+futures-util = { workspace = true, optional = true }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "io-util"] }
+weglarka-unix-http = { path = ".", features = ["testing"] }

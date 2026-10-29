@@ -5,23 +5,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{Full, StreamBody};
 use hyper::body::{Bytes, Frame};
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::{CONTENT_TYPE, HeaderValue};
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
 use weglarka_api::{
     ApiError, Endpoint, Method, RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest,
     endpoints,
 };
+use weglarka_unix_http::{StreamingResponse, UnixClient};
 
 use crate::error::{CliError, Kind};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deploy waits for the image pull and the health gate, so the overall timeout is long.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long a request answered with `busy` (another mutation holds the engine, e.g. a deploy behind
@@ -33,11 +31,10 @@ const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// The frames of a run response, as they arrive.
 pub struct RunStream {
-    body: hyper::body::Incoming,
+    /// Keeps the connection's request side open for as long as the response is read.
+    response: StreamingResponse<Full<Bytes>>,
     decoder: RunFrameDecoder,
     ready: std::collections::VecDeque<RunFrame>,
-    /// Keeps the connection's request side open for as long as the response is read.
-    _sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
 }
 
 impl RunStream {
@@ -47,28 +44,26 @@ impl RunStream {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let Some(frame) = self.body.frame().await else {
+            let Some(chunk) = self.response.chunk().await else {
                 return if self.decoder.is_clean() {
                     Ok(None)
                 } else {
                     Err(CliError::internal("run stream ended inside a frame"))
                 };
             };
-            let frame =
-                frame.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
-            if let Some(data) = frame.data_ref() {
-                self.ready.extend(
-                    self.decoder
-                        .push(data)
-                        .map_err(|e| CliError::internal(e.to_string()))?,
-                );
-            }
+            let data =
+                chunk.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
+            self.ready.extend(
+                self.decoder
+                    .push(&data)
+                    .map_err(|e| CliError::internal(e.to_string()))?,
+            );
         }
     }
 }
 
 pub struct ApiClient {
-    socket: PathBuf,
+    http: UnixClient,
     busy_wait: Duration,
 }
 
@@ -110,7 +105,7 @@ pub(crate) fn method_str(m: Method) -> &'static str {
 impl ApiClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
-            socket: socket.into(),
+            http: UnixClient::new(socket).with_host(HeaderValue::from_static("weglarka")),
             busy_wait: BUSY_WAIT,
         }
     }
@@ -183,10 +178,7 @@ impl ApiClient {
         json: bool,
         payload: Bytes,
     ) -> Result<Vec<u8>, CliError> {
-        let mut req = Request::builder()
-            .method(method_str(method))
-            .uri(uri)
-            .header(HOST, "weglarka");
+        let mut req = Request::builder().method(method_str(method)).uri(uri);
         if json {
             req = req.header(CONTENT_TYPE, "application/json");
         }
@@ -194,46 +186,32 @@ impl ApiClient {
             .body(Full::new(payload))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
 
-        let mut sender = self.connect().await?;
-
-        let exchange = async {
-            let resp = sender.send_request(req).await?;
-            let status = resp.status();
-            let bytes = resp.into_body().collect().await?.to_bytes();
-            Ok::<_, hyper::Error>((status, bytes))
-        };
-        let (status, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+        let resp = self
+            .http
+            .buffered(req, Some(REQUEST_TIMEOUT))
             .await
-            .map_err(|_| CliError::internal("request to daemon timed out"))?
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
+            .map_err(|e| match e {
+                weglarka_unix_http::Error::Timeout => {
+                    CliError::internal("request to daemon timed out")
+                }
+                e => self.map_error(e, "request to daemon failed"),
+            })?;
 
-        if status.is_success() {
-            Ok(bytes.to_vec())
+        if resp.status.is_success() {
+            Ok(resp.body.to_vec())
         } else {
-            Err(error_from_response(status, &bytes))
+            Err(error_from_response(resp.status, &resp.body))
         }
     }
 
-    /// One HTTP/1.1 connection to the admin socket (the connection task is spawned).
-    pub(crate) async fn connect<B>(
-        &self,
-    ) -> Result<hyper::client::conn::http1::SendRequest<B>, CliError>
-    where
-        B: hyper::body::Body + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket))
-            .await
-            .map_err(|_| self.unreachable("connection timed out"))?
-            .map_err(|e| self.unreachable(&e.to_string()))?;
-        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|e| self.unreachable(&e.to_string()))?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        Ok(sender)
+    /// Connection failures become `Unreachable` (with the socket hint); everything else is an
+    /// internal error prefixed with `what`.
+    fn map_error(&self, e: weglarka_unix_http::Error, what: &str) -> CliError {
+        if e.is_connect() {
+            self.unreachable(&e.to_string())
+        } else {
+            CliError::internal(format!("{what}: {e}"))
+        }
     }
 
     /// Call without a response body (204), with an optional query string (`a=b&c`) appended to the
@@ -291,26 +269,18 @@ impl ApiClient {
         let req = Request::builder()
             .method(method_str(endpoint.method))
             .uri(path)
-            .header(HOST, "weglarka")
             .header(CONTENT_TYPE, "application/x-tar")
             .body(body)
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let resp = sender
-            .send_request(req)
+        let resp = self
+            .http
+            .buffered(req, None)
             .await
-            .map_err(|e| CliError::internal(format!("upload to daemon failed: {e}")))?;
-        let status = resp.status();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| CliError::internal(format!("upload to daemon failed: {e}")))?
-            .to_bytes();
-        if status.is_success() {
-            Ok(bytes)
+            .map_err(|e| self.map_error(e, "upload to daemon failed"))?;
+        if resp.status.is_success() {
+            Ok(resp.body)
         } else {
-            Err(error_from_response(status, &bytes))
+            Err(error_from_response(resp.status, &resp.body))
         }
     }
 
@@ -324,32 +294,19 @@ impl ApiClient {
         let req = Request::builder()
             .method(method_str(endpoint.method))
             .uri(request_path(endpoint, params, ""))
-            .header(HOST, "weglarka")
             .body(Full::new(Bytes::new()))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
-        let status = resp.status();
-        let mut body = resp.into_body();
-        if !status.is_success() {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
-                .to_bytes();
-            return Err(error_from_response(status, &bytes));
+        let mut resp = self.open(req).await?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            return Err(error_from_response(status, &self.read_rest(resp).await?));
         }
         let io = |e: &dyn std::fmt::Display| CliError::internal(format!("download failed: {e}"));
         let mut written = 0u64;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| io(&e))?;
-            if let Some(data) = frame.data_ref() {
-                sink.write_all(data).await.map_err(|e| io(&e))?;
-                written += data.len() as u64;
-            }
+        while let Some(chunk) = resp.chunk().await {
+            let data = chunk.map_err(|e| io(&e))?;
+            sink.write_all(&data).await.map_err(|e| io(&e))?;
+            written += data.len() as u64;
         }
         sink.flush().await.map_err(|e| io(&e))?;
         Ok(written)
@@ -365,47 +322,67 @@ impl ApiClient {
         let req = Request::builder()
             .method(method_str(endpoints::APPS_RUN.method))
             .uri(request_path(endpoints::APPS_RUN, &[("name", name)], ""))
-            .header(HOST, "weglarka")
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload)))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
-        let status = resp.status();
-        let is_run_stream = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .is_some_and(|v| v == RUN_STREAM_CONTENT_TYPE);
-        let body = resp.into_body();
-        if !status.is_success() {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
-                .to_bytes();
-            return Err(error_from_response(status, &bytes));
-        }
-        if !is_run_stream {
-            return Err(
-                CliError::internal("the daemon did not answer with a run stream")
-                    .with_hint("CLI and daemon versions may differ"),
-            );
-        }
+        let response = self
+            .open_stream(req, RUN_STREAM_CONTENT_TYPE, "run")
+            .await?;
         Ok(RunStream {
-            body,
+            response,
             decoder: RunFrameDecoder::default(),
             ready: std::collections::VecDeque::new(),
-            _sender: sender,
         })
+    }
+
+    /// Sends `req` and returns the response head with the body still unread.
+    pub(crate) async fn open(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<StreamingResponse<Full<Bytes>>, CliError> {
+        self.http
+            .open(req)
+            .await
+            .map_err(|e| self.map_error(e, "request to daemon failed"))
+    }
+
+    /// Reads the rest of a response body (an error body, in practice).
+    async fn read_rest(&self, resp: StreamingResponse<Full<Bytes>>) -> Result<Bytes, CliError> {
+        resp.collect()
+            .await
+            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))
+    }
+
+    /// [`Self::open`] for a streaming endpoint: a non-success status is an ordinary API error, and a
+    /// success that is not `content_type` means CLI and daemon disagree about the endpoint.
+    pub(crate) async fn open_stream(
+        &self,
+        req: Request<Full<Bytes>>,
+        content_type: &str,
+        kind: &str,
+    ) -> Result<StreamingResponse<Full<Bytes>>, CliError> {
+        let resp = self.open(req).await?;
+        if !resp.status.is_success() {
+            let status = resp.status;
+            return Err(error_from_response(status, &self.read_rest(resp).await?));
+        }
+        if resp
+            .headers
+            .get(CONTENT_TYPE)
+            .is_none_or(|v| v != content_type)
+        {
+            return Err(CliError::internal(format!(
+                "the daemon did not answer with a {kind} stream"
+            ))
+            .with_hint("CLI and daemon versions may differ"));
+        }
+        Ok(resp)
     }
 
     fn unreachable(&self, cause: &str) -> CliError {
         CliError::new(
             Kind::Unreachable,
-            format!("cannot connect to {}: {cause}", self.socket.display()),
+            format!("cannot connect to {}: {cause}", self.http.socket().display()),
         )
         .with_hint(
             "is the daemon running and do you have permission for the socket? \

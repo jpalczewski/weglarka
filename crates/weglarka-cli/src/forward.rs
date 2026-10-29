@@ -9,15 +9,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use clap::Args;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::Request;
 use hyper::body::Bytes;
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::CONTENT_TYPE;
 use weglarka_api::{
     FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest, endpoints,
 };
+use weglarka_unix_http::StreamingResponse;
 
-use crate::client::{ApiClient, error_from_response, method_str, request_path};
+use crate::client::{ApiClient, method_str, request_path};
 use crate::commands::{client, instance};
 use crate::error::CliError;
 use crate::run::parse_timeout;
@@ -104,11 +105,10 @@ pub(crate) fn ssh_args(destination: &str, local_port: u16, host_port: u16) -> Ve
 
 /// The frames of a forward response, as they arrive.
 pub(crate) struct ForwardStream {
-    body: hyper::body::Incoming,
+    /// Keeps the connection's request side open for as long as the response is read.
+    response: StreamingResponse<Full<Bytes>>,
     decoder: ForwardFrameDecoder,
     ready: VecDeque<ForwardFrame>,
-    /// Keeps the connection's request side open for as long as the response is read.
-    _sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
 }
 
 impl ForwardStream {
@@ -118,22 +118,20 @@ impl ForwardStream {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let Some(frame) = self.body.frame().await else {
+            let Some(chunk) = self.response.chunk().await else {
                 return if self.decoder.is_clean() {
                     Ok(None)
                 } else {
                     Err(CliError::internal("forward stream ended inside a frame"))
                 };
             };
-            let frame = frame
+            let data = chunk
                 .map_err(|e| CliError::internal(format!("forward stream interrupted: {e}")))?;
-            if let Some(data) = frame.data_ref() {
-                self.ready.extend(
-                    self.decoder
-                        .push(data)
-                        .map_err(|e| CliError::internal(e.to_string()))?,
-                );
-            }
+            self.ready.extend(
+                self.decoder
+                    .push(&data)
+                    .map_err(|e| CliError::internal(e.to_string()))?,
+            );
         }
     }
 }
@@ -153,40 +151,16 @@ impl ApiClient {
         let req = Request::builder()
             .method(method_str(endpoints::APPS_FORWARD.method))
             .uri(request_path(endpoints::APPS_FORWARD, &[("name", name)], ""))
-            .header(HOST, "weglarka")
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload)))
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut sender = self.connect().await?;
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?;
-        let status = resp.status();
-        let is_stream = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .is_some_and(|v| v == FORWARD_STREAM_CONTENT_TYPE);
-        let body = resp.into_body();
-        if !status.is_success() {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| CliError::internal(format!("request to daemon failed: {e}")))?
-                .to_bytes();
-            return Err(error_from_response(status, &bytes));
-        }
-        if !is_stream {
-            return Err(
-                CliError::internal("the daemon did not answer with a forward stream")
-                    .with_hint("CLI and daemon versions may differ"),
-            );
-        }
+        let response = self
+            .open_stream(req, FORWARD_STREAM_CONTENT_TYPE, "forward")
+            .await?;
         Ok(ForwardStream {
-            body,
+            response,
             decoder: ForwardFrameDecoder::default(),
             ready: VecDeque::new(),
-            _sender: sender,
         })
     }
 }
@@ -364,48 +338,21 @@ mod tests {
 
     #[tokio::test]
     async fn the_stream_reassembles_frames_and_ends_when_the_daemon_closes() {
-        use hyper::service::service_fn;
-        use hyper_util::rt::TokioIo;
-        use std::convert::Infallible;
-        let socket = std::env::temp_dir().join(format!("wgl-fwd-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let svc = service_fn(|req: Request<hyper::body::Incoming>| async move {
-                assert_eq!(req.uri().path(), "/v1/apps/db/forward");
-                let sent = req.into_body().collect().await.unwrap().to_bytes();
-                assert_eq!(
-                    serde_json::from_slice::<ForwardRequest>(&sent)
-                        .unwrap()
-                        .port,
-                    5432
-                );
-                let bytes: Vec<u8> = [
-                    ForwardFrame::Ready { host_port: 43211 },
-                    ForwardFrame::TimedOut,
-                ]
-                .iter()
-                .flat_map(ForwardFrame::encode)
-                .collect();
-                // Cut inside the first frame.
-                let frames = [bytes[..3].to_vec(), bytes[3..].to_vec()]
-                    .into_iter()
-                    .map(|c| Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(c))));
-                Ok::<_, Infallible>(
-                    hyper::Response::builder()
-                        .header("content-type", FORWARD_STREAM_CONTENT_TYPE)
-                        .body(http_body_util::StreamBody::new(futures_util::stream::iter(
-                            frames,
-                        )))
-                        .unwrap(),
-                )
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-        });
-        let mut stream = ApiClient::new(&socket)
+        use weglarka_unix_http::testing::{Reply, mock_with};
+        let bytes: Vec<u8> = [
+            ForwardFrame::Ready { host_port: 43211 },
+            ForwardFrame::TimedOut,
+        ]
+        .iter()
+        .flat_map(ForwardFrame::encode)
+        .collect();
+        // Cut inside the first frame.
+        let pieces = [bytes[..3].to_vec(), bytes[3..].to_vec()].map(Bytes::from);
+        let socket = mock_with(move |_, _| {
+            Reply::chunks(200, pieces.clone()).content_type(FORWARD_STREAM_CONTENT_TYPE)
+        })
+        .await;
+        let mut stream = ApiClient::new(socket.socket.clone())
             .open_forward(
                 "db",
                 &ForwardRequest {
@@ -418,6 +365,9 @@ mod tests {
         assert_eq!(wait_ready(&mut stream).await.unwrap(), 43211);
         assert_eq!(stream.next().await.unwrap(), Some(ForwardFrame::TimedOut));
         assert_eq!(stream.next().await.unwrap(), None);
-        let _ = std::fs::remove_file(&socket);
+        let seen = socket.seen.lock().unwrap();
+        assert_eq!(seen[0].path, "/v1/apps/db/forward");
+        let sent: ForwardRequest = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(sent.port, 5432);
     }
 }
