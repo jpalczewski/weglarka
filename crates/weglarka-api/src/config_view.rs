@@ -2,8 +2,8 @@
 //!
 //! An allow-list (docs/decisions/0057 decision 8). The daemon builds it by destructuring every field
 //! of `HostConfig` and of each section, so a new field does not compile until someone decides whether
-//! the panel may see it. Left out on purpose: every filesystem path of the host layout, the
-//! account, ntfy URL/topic/token, the ACME contact address, and the names of the groups that map to
+//! the panel may see it. Left out on purpose: every filesystem path of the host layout (the operator-chosen `host_mounts` allowlist is the one exception), the
+//! account, ntfy URL/topic/token, the ACME contact address, and the internal identity upstream address, and the names of the groups that map to
 //! the `read`/`admin` scopes (only their number is shown). Where a hidden value matters, a flag
 //! says whether it is set.
 
@@ -161,6 +161,6 @@ pub struct IdentityView {
     pub provider: IdentityProvider,
     pub instance: InstanceName,
     pub issuer: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<String>,
+    /// `upstream` is set; the internal address itself is not shown.
+    pub custom_upstream: bool,
 }

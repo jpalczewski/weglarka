@@ -54,7 +54,8 @@ pub struct CertificatesResponse {
     /// When the worker's last pass finished; absent before the first one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pass: Option<String>,
-    /// Certificates the last pass failed on.
+    /// Certificates the last pass failed on (rows with `failed`); a pass-level failure such as an
+    /// unreadable `apps.toml` is not counted.
     pub failures: u32,
     pub certificates: Vec<CertificateRecord>,
 }

@@ -106,26 +106,23 @@ fn collect_with(
     now: SystemTime,
     not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
 ) -> Vec<Cert> {
-    let read = |stem: &str| {
-        let chain = std::fs::read(tls.join(format!("{stem}.crt"))).ok()?;
-        not_after(&chain)
-    };
+    let read = |stem: &str| std::fs::read(tls.join(format!("{stem}.crt"))).ok();
     let apexes: &[String] = config.dns.as_ref().map_or(&[], |dns| &dns.wildcards);
     let mut certs = Vec::new();
     for domain in domains {
-        let own_file = tls.join(format!("{domain}.crt")).exists();
-        // Without a file of its own a valid wildcard may serve it (issue #97); an unparseable file
-        // of its own is just missing.
-        let covered_by = if own_file {
-            None
-        } else {
+        // Without a readable file of its own a valid wildcard may serve it (issue #97); an
+        // unparseable file of its own is just missing.
+        let chain = read(domain);
+        let covered_by = if chain.is_none() {
             crate::acme::covering_wildcard(tls, apexes, domain, now, not_after)
+        } else {
+            None
         };
         certs.push(Cert {
             id: domain.clone(),
             names: vec![domain.clone()],
             wildcard: false,
-            not_after: read(domain),
+            not_after: chain.and_then(|chain| not_after(&chain)),
             covered_by,
         });
     }
@@ -133,7 +130,7 @@ fn collect_with(
         let stem = wildcard_cert_stem(apex);
         certs.push(Cert {
             names: vec![format!("*.{apex}"), apex.clone()],
-            not_after: read(&stem),
+            not_after: read(&stem).and_then(|chain| not_after(&chain)),
             id: stem,
             wildcard: true,
             covered_by: None,
@@ -150,7 +147,7 @@ async fn list<P: PodmanClient + 'static>(State(d): Shared<P>) -> Result<Response
     let domains = routed_domains(&d).ok_or_else(|| Fail::internal("apps.toml cannot be read"))?;
     let now = SystemTime::now();
     let window = window(config);
-    let certificates = collect(&d.ingress.tls_dir(), config, &domains, now)
+    let certificates: Vec<CertificateRecord> = collect(&d.ingress.tls_dir(), config, &domains, now)
         .into_iter()
         .map(|cert| CertificateRecord {
             status: cert.status(now, window),
@@ -167,7 +164,8 @@ async fn list<P: PodmanClient + 'static>(State(d): Shared<P>) -> Result<Response
         acme_enabled: true,
         renew_before_days: Some(config.renew_before_days),
         last_pass: status.last_pass.map(rfc3339),
-        failures: u32::try_from(status.failures.len()).unwrap_or(u32::MAX),
+        failures: u32::try_from(certificates.iter().filter(|c| c.failed).count())
+            .unwrap_or(u32::MAX),
         certificates,
     })
     .into_response())

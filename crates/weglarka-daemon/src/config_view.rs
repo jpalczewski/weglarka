@@ -263,13 +263,14 @@ fn identity_view(identity: &IdentityConfig) -> IdentityView {
         provider,
         instance,
         issuer,
+        // Internal network topology.
         upstream,
     } = identity;
     IdentityView {
         provider: *provider,
         instance: instance.clone(),
         issuer: issuer.clone(),
-        upstream: upstream.clone(),
+        custom_upstream: upstream.is_some(),
     }
 }
 
@@ -278,7 +279,8 @@ mod tests {
     use super::*;
 
     /// Every value that must never reach the panel, recognizable in the output.
-    const SECRETS: [&str; 12] = [
+    const SECRETS: [&str; 13] = [
+        "SECRET-upstream",
         "SECRET-ntfy-topic",
         "secret-ntfy.internal",
         "SECRET-ntfy-host",
@@ -358,6 +360,7 @@ wildcards = ["example.com"]
 provider = "authelia"
 instance = "authelia"
 issuer = "https://auth.example.com"
+upstream = "SECRET-upstream:9091"
 "#;
 
     fn view() -> serde_json::Value {

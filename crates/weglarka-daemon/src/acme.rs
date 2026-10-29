@@ -346,25 +346,14 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
     }
 }
 
-/// Whether the wildcard certificate of one of `apexes` covers `domain` and is on disk and unexpired
-/// (`tls/_wildcard.<apex>.crt`). Used to decide that a domain needs no certificate of its own, and by
-/// `doctor`.
-pub fn valid_covering_wildcard(
-    tls: &Path,
-    apexes: &[String],
-    domain: &str,
-    now: SystemTime,
-) -> bool {
-    covering_wildcard(tls, apexes, domain, now, &real_not_after).is_some()
-}
-
 /// `notAfter` of a PEM chain; the production reader for [`covering_wildcard`] and `certificates::collect`.
 pub(crate) fn real_not_after(chain: &[u8]) -> Option<SystemTime> {
     weglarka_acme::chain_not_after(chain).ok()
 }
 
-/// The apex of the first wildcard certificate that [`valid_covering_wildcard`] accepts; `not_after`
-/// reads the expiry of a chain (a parameter so tests need no real x509).
+/// The apex of the first wildcard certificate that covers `domain`, is on disk and is unexpired
+/// (`tls/_wildcard.<apex>.crt`): the domain then needs no certificate of its own. `not_after` reads
+/// the expiry of a chain (a parameter so tests need no real x509).
 pub(crate) fn covering_wildcard(
     tls: &Path,
     apexes: &[String],
