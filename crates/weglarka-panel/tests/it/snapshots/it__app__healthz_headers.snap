@@ -1,0 +1,13 @@
+---
+source: crates/weglarka-panel/tests/it/app.rs
+expression: describe(&response)
+---
+200 OK
+cache-control: no-store
+content-length: 3
+content-security-policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'
+content-type: text/plain; charset=utf-8
+cross-origin-opener-policy: same-origin
+cross-origin-resource-policy: same-origin
+referrer-policy: no-referrer
+x-content-type-options: nosniff

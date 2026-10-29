@@ -1,0 +1,43 @@
+[package]
+name = "weglarka-panel"
+description = "Węglarka: admin panel (server-rendered BFF over the admin API token socket)"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "weglarka_panel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weglarka-panel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+askama.workspace = true
+axum.workspace = true
+clap = { workspace = true, features = ["env"] }
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+weglarka-api.workspace = true
+weglarka-http.workspace = true
+weglarka-model.workspace = true
+weglarka-unix-http.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tower.workspace = true
+weglarka-unix-http = { workspace = true, features = ["testing"] }
