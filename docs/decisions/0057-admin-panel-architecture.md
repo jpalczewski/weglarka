@@ -1,7 +1,7 @@
 # 0057 — Admin panel: a server-rendered BFF with htmx and Alpine
 
 Status: proposed (2026-10-29). Builds on ADR 0056 (token listener, the panel as a confidential BFF client) and ADR 0052
-(forward auth). Scope of the first release: read-only.
+(forward auth). Scope of the first release: read-mostly (decision 7).
 
 ## Problem
 
@@ -23,7 +23,9 @@ Threats, in priority order:
 1. **Server-rendered HTML, no SPA.** The panel is one Rust binary (a new crate, `weglarka-panel`) that renders pages
    and fragments on the server. The browser receives HTML and never sees a bearer token or the raw admin API.
 2. **Interactivity: htmx for fragment swaps and refresh, Alpine.js for local widgets** (menus, modals, confirmations).
-   Both are vendored as static files and served by the panel itself: no CDN, no bundler, no Node in the build. Alpine is
+   Both, and htmx's `sse` extension, are vendored as static files and served by the panel itself: no CDN, no bundler, no
+   Node in the build. htmx runs with `includeIndicatorStyles: false` (it would otherwise inject an inline `<style>`) and
+   the indicator CSS ships as a static file, so `style-src` never needs `unsafe-inline`. Alpine is
    the CSP build (`@alpinejs/csp`), so the panel can send a Content-Security-Policy without `unsafe-eval`; there is no
    inline script and no inline event handler. The policy also sets `frame-ancestors 'none'`, `form-action 'self'` and
    `base-uri 'none'`, and htmx is configured with `allowEval: false` (a `htmx-config` meta tag), so `hx-on:*` attributes
@@ -36,8 +38,10 @@ Threats, in priority order:
    verifies every request it forwards (ADR 0056, decision 4), so the panel can never hold more than the user's scope.
    The session id is regenerated at login, a session has an absolute lifetime and an idle timeout, and logout is a `POST`.
    The panel reaches the provider at the public `OIDC_ISSUER` URL over ordinary outbound HTTPS (discovery, token
-   endpoint, refresh); unlike the daemon it has no probe socket and needs none, because it verifies nothing itself: the
-   daemon checks every token it is given. The host must let the panel's container resolve and reach that URL.
+   endpoint, refresh); unlike the daemon it has no probe socket and needs none. The panel validates the login exchange
+   itself (`state`, PKCE and, for any claim it reads from the id token, signature, `iss`, `aud` and `nonce`), but it never
+   authorizes an API call: the daemon checks every access token it is given. The host must let the panel's container
+   resolve and reach that URL.
 5. **CSRF.** Every state-changing request needs a per-session token (a header htmx sets on all requests, or a hidden
    form field) checked by the panel, in addition to `SameSite`. A state-changing route never answers `GET`.
 6. **Authorization stays in the daemon.** The panel hides what a viewer cannot do, but never decides it: it forwards
@@ -56,7 +60,8 @@ Threats, in priority order:
      `read` principal those values are blanked, from one constructor shared by every code path that builds the response.
    - **A stream ends with its token.** The token layer verifies once at the start of a request, so the verified
      principal carries the token's `exp` and a streaming handler stops when it passes; the panel reconnects with a
-     refreshed token, resuming by sequence number.
+     refreshed token, resuming by sequence number. The panel's own stream to the browser ends when the session does
+     (logout, idle timeout, absolute lifetime or a failed refresh), so a logged-out browser stops receiving logs.
 9. **Deployment.** The panel is an ordinary app: an image from the same release, an entry in `[admin.http] clients`, an
    OIDC registration and `ingress.auth_policy` per ADR 0056/0052 (its `health.http` path in `auth_exempt_paths`). It runs
    under the container hardening profile (ADR 0014) with no host mounts besides the token socket.
@@ -68,8 +73,8 @@ dependency of the daemon (the unix socket works with the panel gone).
 
 ## Consequences
 
-- **Code:** a new leaf crate `weglarka-panel` depending on `weglarka-api`, `weglarka-model`, `weglarka-http` and a shared unix-socket HTTP client crate extracted from
-  the CLI (never `engine`, and the daemon never depends on the panel), with
+- **Code:** a new leaf crate `weglarka-panel` depending on `weglarka-api`, `weglarka-model`, `weglarka-http` and a shared
+  unix-socket HTTP client crate extracted from the CLI (never `engine`, and the daemon never depends on the panel), with
   `askama`/`maud`-style compile-time templates and static assets embedded in the binary. Its dependencies go in
   `[workspace.dependencies]`; the CI dependency guard gains the new crate.
 - **API contract:** new read endpoints and stream frames in `weglarka-api` (see decision 8); `ENDPOINTS` tests already
