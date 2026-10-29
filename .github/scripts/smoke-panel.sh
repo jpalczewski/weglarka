@@ -40,13 +40,14 @@ trap cleanup EXIT
 # --- a bad configuration: non-zero exit, a readable reason, and never the secret
 echo "--- bad configuration is refused without printing the secret"
 set +e
-podman run --rm --name "$name-bad" --pull=never "${hardening[@]}" \
+timeout 60 podman run --rm --name "$name-bad" --pull=never "${hardening[@]}" \
   -e OIDC_CLIENT_ID=panel-smoke -e "OIDC_CLIENT_SECRET=$secret" -e OIDC_ISSUER=not-a-url \
   -e "PANEL_PUBLIC_URL=$base" -e PANEL_API_AUDIENCE=https://admin.example.test/api/ \
   "$image" > "$tmp/bad.out" 2>&1
 rc=$?
 set -e
 cat "$tmp/bad.out"
+[ "$rc" -ne 124 ] || { podman rm -f "$name-bad" >/dev/null 2>&1 || true; fail "the panel kept running with an invalid OIDC_ISSUER"; }
 [ "$rc" -ne 0 ] || fail "the panel started with an invalid OIDC_ISSUER"
 grep -q 'OIDC_ISSUER' "$tmp/bad.out" || fail "the error does not name OIDC_ISSUER"
 if grep -qF "$secret" "$tmp/bad.out"; then fail "the client secret was printed"; fi
