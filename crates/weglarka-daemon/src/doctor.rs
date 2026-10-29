@@ -295,7 +295,11 @@ async fn desired_state<P: PodmanClient>(
             .find(|c| c.name == labels::container_name(name));
         match (app_state.and_then(|s| s.current.as_ref()), container) {
             (None, _) => match app_state.and_then(|s| s.failed.as_ref()) {
-                Some(f) => problems.push(format!("{name}: first deploy failed ({})", f.reason)),
+                // The engine's failure text is withheld from `read` tokens (`app_view`), and the
+                // doctor report is served at `read`, so the reason stays in `apps show`.
+                Some(_) => problems.push(format!(
+                    "{name}: first deploy failed (see `weglarka apps show {name}`)"
+                )),
                 None => problems.push(format!("{name}: not deployed yet")),
             },
             (Some(_), None) => problems.push(format!("{name}: missing container")),

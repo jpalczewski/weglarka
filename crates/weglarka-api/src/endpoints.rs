@@ -388,7 +388,7 @@ mod tests {
         }
     }
 
-    /// `GET /v1/apps/{name}` is `read` only because the daemon blanks `env` values for a caller
+    /// `GET /v1/apps/{name}` is `read` only because the daemon redacts `env` values, argv and failure text for a caller
     /// without `admin` (`weglarka-daemon`, `app_view`; test `token_api.rs`). Any other GET that
     /// returns a whole `AppSpec` must either do the same or move to `admin`.
     #[test]

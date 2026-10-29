@@ -3,7 +3,10 @@
 //!
 //! The unix socket is full trust and carries no principal. On the token listener `authenticate`
 //! stores the verified [`Principal`] in the request extensions; a caller without `admin` gets the
-//! `env` values blanked (keys stay), because `env` is where operators put connection strings. Every
+//! `env` values blanked (keys stay), because `env` is where operators put connection strings. The
+//! other free-form places get the same treatment: every argument of `command` and `health.command`
+//! after the first, the query string of `health.http.path`, and the engine's failure text in
+//! `state.failed.reason` (which `events.rs` keeps from `read` too). Every
 //! handler that answers with a spec takes an [`Access`] and builds the answer with [`show_response`],
 //! so a new path cannot forget to redact.
 
@@ -49,14 +52,52 @@ impl<S: Send + Sync> FromRequestParts<S> for Access {
     }
 }
 
-/// `spec` as `access` may see it: with `Redacted`, `env` values are blank and the keys are kept.
+/// Stands in for every argument after `argv[0]` of a redacted command line.
+pub(crate) const REDACTED_ARG: &str = "<redacted>";
+
+/// Stands in for the engine's failure text of a redacted deploy failure.
+pub(crate) const REDACTED_REASON: &str = "deploy failed (details withheld)";
+
+/// Keeps `argv[0]` and the number of arguments, so the shape of the command stays useful. `command`
+/// replaces the image's `CMD`, so `argv[0]` is not always a program name: one that looks like a
+/// flag or an assignment (`--token=x`, `KEY=x`) is redacted too.
+fn redact_argv(argv: &mut [String]) {
+    for (i, arg) in argv.iter_mut().enumerate() {
+        if i > 0 || arg.starts_with('-') || arg.contains('=') {
+            *arg = REDACTED_ARG.to_owned();
+        }
+    }
+}
+
+/// `spec` as `access` may see it: with `Redacted`, `env` values are blank (keys kept), `command` and
+/// `health.command` keep only `argv[0]` and their length, and `health.http.path` loses its query.
 pub(crate) fn redact_spec(access: Access, mut spec: AppSpec) -> AppSpec {
     if access == Access::Redacted {
         for value in spec.env.values_mut() {
             value.clear();
         }
+        redact_argv(&mut spec.command);
+        if let Some(argv) = spec.health.command.as_mut() {
+            redact_argv(argv);
+        }
+        if let Some(http) = spec.health.http.as_mut()
+            && let Some(at) = http.path.find(['?', '#'])
+        {
+            http.path.truncate(at);
+        }
     }
     spec
+}
+
+/// `state` as `access` may see it: with `Redacted`, a failed deploy keeps its digest but not the
+/// engine's free-form `reason` (podman and validator output).
+pub(crate) fn redact_state(access: Access, mut state: AppState) -> AppState {
+    if access == Access::Redacted
+        && let Some(failed) = state.failed.as_mut()
+    {
+        failed.reason = REDACTED_REASON.to_owned();
+    }
+    state
 }
 
 fn container_health(health: HealthStatus) -> ContainerHealth {
@@ -78,7 +119,7 @@ pub(crate) fn show_response(
 ) -> ShowAppResponse {
     ShowAppResponse {
         runtime: with_waiting(runtime_state_for(&spec, app_state, container), app_state),
-        state: app_state.cloned().unwrap_or_default(),
+        state: redact_state(access, app_state.cloned().unwrap_or_default()),
         configs: None,
         host_mounts: None,
         restarts: container.map(|c| c.restarts),
@@ -139,6 +180,81 @@ mod tests {
         assert_eq!(keys, ["DATABASE_URL", "MODE"]);
         assert!(redacted.spec.env.values().all(String::is_empty));
         assert_eq!(redacted.spec.image, full.spec.image);
+    }
+
+    fn leaky_spec() -> AppSpec {
+        let mut spec = spec();
+        spec.command = vec![
+            "serve".into(),
+            "--password=hunter2".into(),
+            "--port".into(),
+            "80".into(),
+        ];
+        spec.health.command = Some(vec!["check".into(), "--token=t0k3n".into()]);
+        spec.health.http = Some(weglarka_model::app::HttpProbe {
+            path: "/ready?key=s3cret".into(),
+            ..Default::default()
+        });
+        spec
+    }
+
+    #[test]
+    fn redaction_keeps_argv0_and_the_argument_count() {
+        let full = show_response(Access::Full, name(), leaky_spec(), None, None);
+        assert_eq!(full.spec.command[1], "--password=hunter2");
+        assert_eq!(
+            full.spec.health.command.as_deref().unwrap()[1],
+            "--token=t0k3n"
+        );
+
+        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None);
+        let r = REDACTED_ARG.to_owned();
+        assert_eq!(shown.spec.command, ["serve", &r, &r, &r]);
+        assert_eq!(shown.spec.health.command, Some(vec!["check".into(), r]));
+        assert!(!format!("{shown:?}").contains("hunter2"));
+        assert!(!format!("{shown:?}").contains("t0k3n"));
+    }
+
+    #[test]
+    fn redaction_hides_an_argv0_that_is_a_flag_or_an_assignment() {
+        let mut spec = spec();
+        spec.command = vec!["--api-key=k".into(), "x".into()];
+        spec.health.command = Some(vec!["TOKEN=t".into()]);
+        let shown = show_response(Access::Redacted, name(), spec, None, None);
+        assert_eq!(shown.spec.command, [REDACTED_ARG, REDACTED_ARG]);
+        assert_eq!(shown.spec.health.command, Some(vec![REDACTED_ARG.into()]));
+    }
+
+    #[test]
+    fn redaction_strips_the_probe_query_and_keeps_the_path() {
+        let full = show_response(Access::Full, name(), leaky_spec(), None, None);
+        assert_eq!(full.spec.health.http.unwrap().path, "/ready?key=s3cret");
+        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None);
+        let http = shown.spec.health.http.unwrap();
+        assert_eq!(http.path, "/ready");
+        assert_eq!(http.expect_status, 200);
+    }
+
+    #[test]
+    fn redaction_replaces_the_failure_text_and_keeps_the_digest() {
+        let digest =
+            weglarka_model::app::Digest::new(format!("sha256:{}", "a".repeat(64))).expect("digest");
+        let state = AppState {
+            failed: Some(weglarka_model::state::FailedDeploy {
+                digest: digest.clone(),
+                reason: "pull ghcr.io/x: password=hunter2 rejected".into(),
+            }),
+            ..Default::default()
+        };
+        let full = show_response(Access::Full, name(), spec(), Some(&state), None);
+        assert!(full.state.failed.unwrap().reason.contains("hunter2"));
+        let shown = show_response(Access::Redacted, name(), spec(), Some(&state), None);
+        let failed = shown.state.failed.unwrap();
+        assert_eq!(failed.digest, digest);
+        assert_eq!(failed.reason, REDACTED_REASON);
+        // No failure, nothing invented.
+        let none = show_response(Access::Redacted, name(), spec(), None, None);
+        assert!(none.state.failed.is_none());
     }
 
     #[test]
