@@ -214,10 +214,18 @@ struct Claims {
     nbf: Option<f64>,
     #[serde(default)]
     groups: Vec<String>,
-    #[serde(default)]
+    // Only id-token callers read these; a badly typed value must not reject an access token.
+    #[serde(default, deserialize_with = "string_or_none")]
     nonce: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_none")]
     azp: Option<String>,
+}
+
+fn string_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 struct Parts<'a> {
@@ -268,6 +276,11 @@ pub const ID_TOKEN_TYP: &[Option<&str>] = &[None, Some("JWT")];
 
 /// A token whose signature and registered claims have been verified, before any policy (scopes) is
 /// applied. It holds claims only, never any part of the token itself.
+///
+/// `exp` is the raw claim: [`LEEWAY`] was applied when accepting the token, not to this value.
+/// `nonce` and `azp` are returned unchecked; an id-token caller must compare `nonce` with the one
+/// it issued, and require `azp` to equal its client id when the token has several audiences
+/// (OIDC Core 3.1.3.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedToken {
     pub sub: String,
@@ -796,6 +809,15 @@ mod tests {
         // Signature from another key.
         let stranger = TestIssuer::new("k1").sign_with_typ(Some("JWT"), &id_claims());
         assert_eq!(run(&stranger), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn badly_typed_nonce_and_azp_do_not_reject_an_access_token() {
+        let issuer = TestIssuer::new("k1");
+        let mut c = claims();
+        c["nonce"] = json!(7);
+        c["azp"] = json!(["a"]);
+        assert!(check(&issuer, &c).is_ok());
     }
 
     #[test]
