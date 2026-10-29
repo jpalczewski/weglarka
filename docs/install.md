@@ -249,6 +249,10 @@ cosign verify-attestation --type spdxjson <as above> ghcr.io/jpalczewski/weglark
 cosign verify-blob --bundle SHA256SUMS.sigstore.json <identity flags as above> SHA256SUMS
 ```
 
+Each `v*` release also publishes the admin panel image, `ghcr.io/jpalczewski/weglarka-panel`, at the same version
+tag (and `:latest`). It is an ordinary app image, not part of the daemon install: nothing above needs it, and it is
+signed and attested the same way, so the commands above verify it with the image name swapped.
+
 ## CLI from a laptop
 
 The admin socket is 0600 and owned by `weglarka`, so the tunnel is set up as that user (or root). Example for macOS:

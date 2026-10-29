@@ -307,7 +307,7 @@ jobs:
           echo "::group::test-body-size.sh"; cat "$RUNNER_TEMP/body-size.log"; echo "::endgroup::"
           exit "$failed"
 
-  # Static (musl) daemon + CLI — built once and used three ways: build check, image content, and the
+  # Static (musl) daemon + CLI + panel — built once and used three ways: build check, image content, and the
   # binaries run by the smoke test. PRs build the cheap `ci` profile, main the full `release` profile
   # (docs/decisions/0008).
   musl:
@@ -329,13 +329,14 @@ jobs:
         with:
           shared-key: musl-${{ env.PROFILE }}
           save-if: false
-      - run: cargo build --profile "$PROFILE" --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli
+      - run: cargo build --profile "$PROFILE" --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli -p weglarka-panel
       - uses: actions/upload-artifact@v4
         with:
           name: musl-bin
           path: |
             target/x86_64-unknown-linux-musl/${{ env.PROFILE }}/weglarka-daemon
             target/x86_64-unknown-linux-musl/${{ env.PROFILE }}/weglarka
+            target/x86_64-unknown-linux-musl/${{ env.PROFILE }}/weglarka-panel
           if-no-files-found: error
           retention-days: 1
 
@@ -352,7 +353,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: musl-ci
-      - run: cargo build --profile ci --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli
+      - run: cargo build --profile ci --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli -p weglarka-panel
 
   # Integration tests with a real Podman 6.1 — decision: docs/decisions/0002-podman-in-ci.md.
   # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host), set up by the local action
@@ -432,3 +433,26 @@ jobs:
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true
+
+  # The panel image (ADR 0057, decision 9), built from the same musl artifact as the daemon image and run the way an
+  # operator runs it: read-only root, no capabilities, no-new-privileges. No Podman socket is needed, so the job only
+  # installs a rootless Podman and the script talks to the container over a published loopback port.
+  smoke-panel:
+    needs: [changes, musl]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/podman-rootless
+      - uses: actions/download-artifact@v8
+        with:
+          name: musl-bin
+          path: bin
+      - name: Build the image from the prebuilt binary
+        run: |
+          set -euo pipefail
+          chmod +x bin/weglarka-panel
+          podman build -q -t localhost/weglarka-panel:ci -f Containerfile.panel --build-arg BIN_SOURCE=prebuilt .
+          podman images
+      - name: Panel image smoke test
+        run: .github/scripts/smoke-panel.sh localhost/weglarka-panel:ci
