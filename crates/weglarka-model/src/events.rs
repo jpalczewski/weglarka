@@ -178,9 +178,7 @@ impl Event {
             | Self::GeneratedConfigApplied { .. } => Severity::Info,
         }
     }
-}
 
-impl Event {
     /// Stable snake_case name of the variant. Part of the admin API contract (`GET /v1/events`):
     /// renaming a variant must not change it.
     pub fn kind(&self) -> &'static str {
@@ -452,5 +450,110 @@ mod tests {
             Severity::Critical
         );
         assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
+    }
+
+    /// `kind` is part of the admin API contract: a changed string must show up as a snapshot diff.
+    #[test]
+    fn kind_and_instance_per_variant_snapshot() {
+        let d = digest();
+        let events = vec![
+            Event::DeployOk {
+                instance: name("a"),
+                digest: d.clone(),
+                generation: 1,
+            },
+            Event::Provisioned {
+                instance: name("a"),
+                digest: d.clone(),
+            },
+            Event::DeployFailed {
+                instance: name("a"),
+                digest: None,
+                reason: "x".into(),
+            },
+            Event::RolledBack {
+                instance: name("a"),
+                failed: d.clone(),
+                restored: d.clone(),
+                reason: "x".into(),
+            },
+            Event::RollbackFailed {
+                instance: name("a"),
+                reason: "x".into(),
+            },
+            Event::Recreated {
+                instance: name("a"),
+                reason: "x".into(),
+            },
+            Event::Pruned {
+                container: "c".into(),
+            },
+            Event::WaitingForSecret {
+                instance: name("a"),
+                missing: vec![],
+            },
+            Event::WaitingForDependency {
+                instance: name("a"),
+                dependencies: vec![],
+            },
+            Event::WebhookDuplicate {
+                delivery_id: "d".into(),
+            },
+            Event::CrashLooping {
+                instance: name("a"),
+                restarts: 1,
+            },
+            Event::Unhealthy {
+                instance: name("a"),
+            },
+            Event::Recovered {
+                instance: name("a"),
+            },
+            Event::SelfUpdated {
+                from: None,
+                to: d.clone(),
+            },
+            Event::SelfUpdatePending {
+                expected: d.clone(),
+                actual: d.clone(),
+            },
+            Event::SelfUpdateFellBack {
+                from: d.clone(),
+                to: d,
+            },
+            Event::CertificateIssued {
+                cert: "c".into(),
+                renewed: false,
+                expires_in_days: 1,
+            },
+            Event::CertificateRenewalFailed {
+                cert: "c".into(),
+                reason: "x".into(),
+                expires_in_days: None,
+            },
+            Event::GeneratedConfigApplied {
+                id: "g".into(),
+                consumer: name("a"),
+                fingerprint: "f".into(),
+                validated: true,
+            },
+            Event::GeneratedConfigInvalid {
+                id: "g".into(),
+                consumer: name("a"),
+                output: "x".into(),
+            },
+            Event::GeneratedConfigRolledBack {
+                id: "g".into(),
+                consumer: name("a"),
+            },
+        ];
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| {
+                let app = e.instance().map_or("-".to_owned(), ToString::to_string);
+                format!("{} app={app} {}", e.kind(), e.severity())
+            })
+            .collect();
+        insta::assert_snapshot!(lines.join("\n"));
     }
 }

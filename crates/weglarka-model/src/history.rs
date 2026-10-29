@@ -9,10 +9,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::events::{Event, EventSink};
+use crate::events::{Event, EventSink, Severity};
 
 /// Entries kept. Small on purpose: this is a "what just happened" view, not a journal.
 pub const DEFAULT_CAPACITY: usize = 256;
+
+/// Events below this severity are not recorded: `Debug` bookkeeping (a redelivered webhook, a pruned
+/// container) would evict the deploys and failures the history is for.
+pub const DEFAULT_MIN_SEVERITY: Severity = Severity::Info;
 
 /// One recorded event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +36,8 @@ pub struct Recent {
     pub oldest_seq: Option<u64>,
     /// Highest `seq` assigned so far (0 = nothing emitted yet): the cursor for the next call.
     pub latest_seq: u64,
-    /// Events after the cursor were evicted before they could be returned.
+    /// A cursor was given and events after it were evicted before they could be returned. Always
+    /// `false` without a cursor: a first call has nothing to have missed.
     pub dropped: bool,
 }
 
@@ -44,6 +49,8 @@ struct Inner {
 
 pub struct EventHistory {
     capacity: usize,
+    min_severity: Severity,
+    boot_id: String,
     inner: Mutex<Inner>,
 }
 
@@ -56,14 +63,33 @@ impl Default for EventHistory {
 impl EventHistory {
     /// A history keeping at most `capacity` entries (at least 1).
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::new(capacity, DEFAULT_MIN_SEVERITY)
+    }
+
+    /// Keeps at most `capacity` entries (at least 1) of severity `min_severity` or higher.
+    pub fn new(capacity: usize, min_severity: Severity) -> Self {
         let capacity = capacity.max(1);
+        // Identifies this process: `seq` restarts at 1 with every daemon, and a client holding a cursor
+        // from an earlier process must be able to tell. Not a secret, only needs to differ per start.
+        static BOOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let boots = BOOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         Self {
             capacity,
+            min_severity,
+            boot_id: format!("{nanos:x}-{:x}-{boots:x}", std::process::id()),
             inner: Mutex::new(Inner {
                 latest_seq: 0,
                 entries: VecDeque::with_capacity(capacity),
             }),
         }
+    }
+
+    /// Differs between daemon processes (see [`EventHistory::new`]).
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -73,11 +99,12 @@ impl EventHistory {
 
     /// Entries with `seq > after` (`None` = everything retained). An unknown or too-old cursor is not
     /// an error: what is retained comes back and `dropped` says whether anything was missed.
-    pub fn since(&self, after: Option<u64>) -> Recent {
+    pub fn since(&self, cursor: Option<u64>) -> Recent {
         let inner = self.lock();
-        let after = after.unwrap_or(0);
+        let after = cursor.unwrap_or(0);
         let oldest_seq = inner.entries.front().map(|e| e.seq);
-        let dropped = oldest_seq.is_some_and(|oldest| oldest > after.saturating_add(1));
+        let dropped =
+            cursor.is_some() && oldest_seq.is_some_and(|oldest| oldest > after.saturating_add(1));
         // Seqs are contiguous, so the first wanted entry sits at a computable index.
         let skip = oldest_seq.map_or(0, |oldest| after.saturating_add(1).saturating_sub(oldest));
         let skip = usize::try_from(skip).unwrap_or(usize::MAX);
@@ -92,6 +119,9 @@ impl EventHistory {
 
 impl EventSink for EventHistory {
     fn emit(&self, event: Event) {
+        if event.severity() < self.min_severity {
+            return;
+        }
         let at = SystemTime::now();
         let mut inner = self.lock();
         inner.latest_seq += 1;
@@ -131,6 +161,13 @@ mod tests {
     use crate::events::VecSink;
 
     fn event(n: u32) -> Event {
+        Event::Recreated {
+            instance: crate::app::InstanceName::new("a").unwrap(),
+            reason: format!("d{n}"),
+        }
+    }
+
+    fn debug_event(n: u32) -> Event {
         Event::WebhookDuplicate {
             delivery_id: format!("d{n}"),
         }
@@ -176,7 +213,7 @@ mod tests {
         let all = history.since(None);
         assert_eq!(seqs(&all), [5, 6, 7]);
         assert_eq!(all.oldest_seq, Some(5));
-        assert!(all.dropped, "seq 1..=4 were evicted before the first call");
+        assert!(!all.dropped, "no cursor: nothing to have missed");
         // Cursor exactly before the oldest: nothing missed.
         let edge = history.since(Some(4));
         assert_eq!(seqs(&edge), [5, 6, 7]);
@@ -186,6 +223,25 @@ mod tests {
         assert_eq!(seqs(&old), [5, 6, 7]);
         assert!(old.dropped);
         assert_eq!(seqs(&history.since(Some(6))), [7]);
+    }
+
+    #[test]
+    fn debug_events_are_not_recorded_and_take_no_seq() {
+        let history = EventHistory::with_capacity(2);
+        history.emit(event(0));
+        for n in 0..10 {
+            history.emit(debug_event(n));
+        }
+        let recent = history.since(None);
+        assert_eq!(seqs(&recent), [1]);
+        assert_eq!(recent.latest_seq, 1);
+    }
+
+    #[test]
+    fn boot_id_differs_per_history() {
+        let (a, b) = (EventHistory::default(), EventHistory::default());
+        assert!(!a.boot_id().is_empty());
+        assert_ne!(a.boot_id(), b.boot_id());
     }
 
     #[test]

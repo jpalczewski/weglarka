@@ -45,6 +45,27 @@ async fn a_deploy_shows_up_in_the_history_and_since_pages_through_it() {
     assert_eq!(again["events"], json!([]));
     assert_eq!(again["next_seq"], next);
 
+    // A cursor from another process is ignored, and the answer says so.
+    let boot = body["boot_id"].as_str().unwrap();
+    let (_, same) = admin(
+        &h,
+        "GET",
+        &format!("/v1/events?since={next}&boot={boot}"),
+        None,
+    )
+    .await;
+    assert_eq!(same["reset"], false);
+    let (_, other) = admin(
+        &h,
+        "GET",
+        &format!("/v1/events?since={next}&boot=dead-beef"),
+        None,
+    )
+    .await;
+    assert_eq!(other["reset"], true);
+    assert_eq!(other["events"], body["events"]);
+    assert_eq!(other["dropped"], false);
+
     let (status, bad) = admin(&h, "GET", "/v1/events?since=soon", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
     h.running.stop().await;

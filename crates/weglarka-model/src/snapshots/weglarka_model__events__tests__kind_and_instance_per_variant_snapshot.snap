@@ -1,0 +1,25 @@
+---
+source: crates/weglarka-model/src/events.rs
+expression: "lines.join(\"\\n\")"
+---
+deploy_ok app=a info
+provisioned app=a info
+deploy_failed app=a warning
+rolled_back app=a warning
+rollback_failed app=a critical
+recreated app=a info
+pruned app=- debug
+waiting_for_secret app=a info
+waiting_for_dependency app=a debug
+webhook_duplicate app=- debug
+crash_looping app=a critical
+unhealthy app=a warning
+recovered app=a info
+self_updated app=- info
+self_update_pending app=- warning
+self_update_fell_back app=- warning
+certificate_issued app=- info
+certificate_renewal_failed app=- critical
+generated_config_applied app=a info
+generated_config_invalid app=a warning
+generated_config_rolled_back app=a warning
