@@ -1,38 +1,64 @@
 //! The HTTP app. Two route groups:
 //!
-//! - **public**: `GET /healthz` (no auth, no daemon call) and `/static/*` (embedded, not secret);
-//! - **protected**: everything else, behind [`require_session`], which today refuses every
-//!   request. Sessions (OIDC login) replace its body without touching the routes around it.
+//! - **public**: `GET /healthz` (no auth, no daemon call), `/static/*` (embedded, not secret) and
+//!   the login flow, `GET /auth/login` and `GET /auth/callback`;
+//! - **protected**: everything else, behind [`auth::require_session`], which is default-deny: no
+//!   valid session cookie, no answer but 401. State-changing requests there also need a CSRF token.
 //!
 //! [`headers::security_headers`] wraps the whole router, so every response carries the policy.
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::Router;
-use axum::extract::{Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
+use weglarka_api::ListAppsResponse;
+use weglarka_api::endpoints::APPS_LIST;
+use weglarka_http::{HttpError, Purpose};
 
 use crate::config::PanelConfig;
-use crate::daemon::DaemonClient;
-use crate::pages::ErrorPage;
-use crate::{assets, headers};
+use crate::daemon::{Call, DaemonClient, DaemonError};
+use crate::oidc::OidcClient;
+use crate::pages::{ErrorPage, IndexPage};
+use crate::session::{Clock, PendingLogins, SessionStore, SessionView};
+use crate::{assets, auth, headers};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<PanelConfig>,
     pub daemon: DaemonClient,
+    pub oidc: Arc<OidcClient>,
+    pub sessions: Arc<SessionStore>,
+    pub logins: Arc<PendingLogins>,
+    pub clock: Clock,
 }
 
 impl AppState {
-    pub fn new(config: PanelConfig) -> Self {
+    pub fn new(config: PanelConfig) -> Result<Self, HttpError> {
+        Self::with_clock(config, Clock::default())
+    }
+
+    /// [`AppState::new`] with a clock the caller can move (tests age sessions with it).
+    pub fn with_clock(config: PanelConfig, clock: Clock) -> Result<Self, HttpError> {
+        let http = weglarka_http::client(Purpose::Api)?;
         let daemon = DaemonClient::from_config(&config);
-        Self {
-            config: Arc::new(config),
+        let sessions = Arc::new(SessionStore::new(
+            config.session_idle,
+            config.session_max,
+            clock.clone(),
+        ));
+        let config = Arc::new(config);
+        Ok(Self {
+            oidc: Arc::new(OidcClient::new(config.clone(), http, clock.clone())),
+            logins: Arc::new(PendingLogins::new(clock.clone())),
+            sessions,
             daemon,
-        }
+            config,
+            clock,
+        })
     }
 }
 
@@ -41,15 +67,19 @@ pub fn router(state: AppState) -> Router {
     // wraps what exists at that point. The fallback is wrapped too, so an unknown path is refused
     // the same way as a known one.
     let protected = Router::new()
+        .route("/", get(index))
+        .route("/auth/logout", post(auth::logout))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            require_session,
+            auth::require_session,
         ));
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/static/{file}", get(assets::serve))
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
         .merge(protected)
         .layer(middleware::from_fn(headers::security_headers))
         .with_state(state)
@@ -63,21 +93,36 @@ async fn not_found() -> Response {
     ErrorPage {
         title: "Not found",
         message: "There is nothing here.",
+        sign_in: None,
     }
     .respond(StatusCode::NOT_FOUND)
 }
 
-/// The single authentication point: default-deny. A later change resolves the session cookie here,
-/// puts the session in the request extensions and calls `next`; until then nobody gets past.
-/// Unauthenticated callers cannot tell a real route from a missing one.
-async fn require_session(
-    State(_state): State<AppState>,
-    _request: Request,
-    _next: Next,
+/// The signed-in placeholder; the real pages replace it.
+async fn index(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Extension(view): Extension<SessionView>,
 ) -> Response {
-    ErrorPage {
-        title: "Sign-in required",
-        message: "You need to sign in to use the panel.",
+    let daemon = match state
+        .daemon
+        .send::<ListAppsResponse>(&view.token, &Call::new(&APPS_LIST))
+        .await
+    {
+        Ok(list) => format!("The daemon answers: {} app(s).", list.apps.len()),
+        Err(DaemonError::Unauthorized) => {
+            return ErrorPage {
+                title: "Sign-in required",
+                message: "The daemon no longer accepts your session.",
+                sign_in: Some("/auth/login"),
+            }
+            .respond(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => format!("The daemon says: {e}."),
+    };
+    IndexPage {
+        user: &view.user.name,
+        csrf: &view.csrf,
+        daemon: &daemon,
     }
-    .respond(StatusCode::UNAUTHORIZED)
+    .respond()
 }

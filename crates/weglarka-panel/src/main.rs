@@ -47,7 +47,9 @@ async fn main() -> Result<()> {
     tracing::info!(listen = %config.listen, socket = %config.socket.display(), "panel started");
 
     let shutdown = Shutdown::install().context("cannot install signal handlers")?;
-    let app = router(AppState::new(config));
+    let state = AppState::new(config).context("cannot build the HTTP client")?;
+    state.sessions.spawn_sweeper();
+    let app = router(state);
     serve(listener, app, shutdown.wait())
         .await
         .context("server failed")?;

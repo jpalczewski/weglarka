@@ -3,4 +3,5 @@
 {% block content %}
     <h1>{{ title }}</h1>
     <p>{{ message }}</p>
-{% endblock %}
+{% if let Some(href) = sign_in %}    <p><a href="{{ href }}">Sign in</a></p>
+{% endif %}{% endblock %}

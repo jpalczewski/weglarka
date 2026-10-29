@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 use weglarka_panel::config::{
-    ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_PUBLIC_URL, ENV_SOCKET,
+    ENV_API_AUDIENCE, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_PUBLIC_URL, ENV_SOCKET,
 };
 use weglarka_panel::headers::CONTENT_SECURITY_POLICY_VALUE;
 use weglarka_panel::{AppState, PanelConfig, router};
@@ -19,11 +19,12 @@ async fn app() -> (Router, Mock) {
         ENV_CLIENT_SECRET => Some("secret".into()),
         ENV_ISSUER => Some("https://auth.example.com".into()),
         ENV_PUBLIC_URL => Some("https://panel.example.com".into()),
+        ENV_API_AUDIENCE => Some("https://admin.example.com/api/".into()),
         ENV_SOCKET => Some(socket.clone()),
         _ => None,
     })
     .unwrap();
-    (router(AppState::new(config)), daemon)
+    (router(AppState::new(config).unwrap()), daemon)
 }
 
 async fn call(app: &Router, method: Method, path: &str) -> axum::response::Response {
@@ -83,7 +84,7 @@ async fn everything_else_is_denied_by_default() {
             "{method} {path}: {}",
             denied.status()
         );
-        // The caller's cookie or Authorization header makes no difference until sessions exist.
+        // An Authorization header and an unknown session cookie make no difference.
     }
     let with_creds = app
         .clone()

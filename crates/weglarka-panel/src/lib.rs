@@ -5,7 +5,10 @@
 //!
 //! - [`config`]: typed, validated configuration from the environment; secrets never print.
 //! - [`daemon`]: the admin API client (`weglarka-unix-http`), one typed call per [`weglarka_api::Endpoint`].
-//! - [`app`]: the axum router: `/healthz`, embedded assets, and default-deny for everything else.
+//! - [`app`]: the axum router: `/healthz`, embedded assets, the login flow, and default-deny for everything else.
+//! - [`oidc`]: the OIDC client (discovery, PKCE, token exchange and refresh, id token verification).
+//! - [`session`]: server-side sessions and pending logins; [`auth`]: login/callback/logout and the session middleware;
+//!   [`csrf`]: the check for state-changing requests; [`secure`]: randomness and constant-time comparison.
 //! - [`headers`]: the security headers every response carries.
 //! - [`assets`]: static files embedded in the binary.
 //! - [`pages`]: compile-time templates.
@@ -13,11 +16,16 @@
 
 pub mod app;
 pub mod assets;
+pub mod auth;
 pub mod config;
+pub mod csrf;
 pub mod daemon;
 pub mod headers;
+pub mod oidc;
 pub mod pages;
+pub mod secure;
 pub mod server;
+pub mod session;
 
 pub use app::{AppState, router};
 pub use config::{ConfigError, PanelConfig, Secret};

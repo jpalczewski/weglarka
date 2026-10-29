@@ -4,7 +4,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use weglarka_panel::config::{ENV_CLIENT_SECRET, ENV_ISSUER, ENV_LISTEN, ENV_SOCKET};
+use weglarka_panel::config::{
+    ENV_API_AUDIENCE, ENV_CLIENT_SECRET, ENV_CLIENT_SECRET_FILE, ENV_ISSUER, ENV_LISTEN, ENV_SOCKET,
+};
 use weglarka_panel::headers::CONTENT_SECURITY_POLICY_VALUE;
 use weglarka_unix_http::testing::mock;
 
@@ -33,6 +35,26 @@ async fn serves_healthz_with_security_headers() {
     assert_eq!(denied.status, 401);
     assert!(denied.header("content-security-policy").is_some());
     assert!(daemon.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loopback_http_issuer_and_a_secret_file_are_accepted() {
+    let daemon = mock(|_, _| (200, "{}".into())).await;
+    let secret_file = std::env::temp_dir().join(format!("wgl-panel-secret-{}", free_port()));
+    std::fs::write(&secret_file, format!("{FAKE_SECRET}\n")).unwrap();
+    // Discovery is lazy: the provider need not be up for the panel to start.
+    let panel = Panel::start_with(&daemon.socket, |cmd| {
+        cmd.env(ENV_ISSUER, "http://127.0.0.1:9")
+            .env_remove(ENV_CLIENT_SECRET)
+            .env(ENV_CLIENT_SECRET_FILE, &secret_file);
+    });
+    assert_eq!(get(panel.addr, "/healthz").unwrap().status, 200);
+    // Login cannot start (no provider), and says so without leaking anything.
+    let login = get(panel.addr, "/auth/login").unwrap();
+    assert_eq!(login.status, 502);
+    assert!(!login.body.contains(FAKE_SECRET));
+    drop(panel);
+    std::fs::remove_file(secret_file).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -85,6 +107,34 @@ async fn bad_configuration_exits_non_zero_without_leaking_the_secret() {
                 c.env(ENV_ISSUER, "http://auth.example.com");
             }),
             ENV_ISSUER,
+        ),
+        (
+            "missing api audience",
+            Box::new(|c| {
+                c.env_remove(ENV_API_AUDIENCE);
+            }),
+            ENV_API_AUDIENCE,
+        ),
+        (
+            "http issuer that is not loopback",
+            Box::new(|c| {
+                c.env(ENV_ISSUER, "http://127.0.0.1.example.com");
+            }),
+            ENV_ISSUER,
+        ),
+        (
+            "secret and secret file",
+            Box::new(|c| {
+                c.env(ENV_CLIENT_SECRET_FILE, "/nonexistent");
+            }),
+            ENV_CLIENT_SECRET_FILE,
+        ),
+        (
+            "a secret with a control character",
+            Box::new(|c| {
+                c.env(ENV_CLIENT_SECRET, format!("{FAKE_SECRET}\u{7}tail"));
+            }),
+            ENV_CLIENT_SECRET,
         ),
         (
             "bad listen address",
