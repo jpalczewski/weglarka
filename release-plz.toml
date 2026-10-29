@@ -56,3 +56,13 @@ git_tag_name = "{{ package }}-v{{ version }}"
 [[package]]
 name = "weglarka-dns"
 git_tag_name = "{{ package }}-v{{ version }}"
+
+# `weglarka-panel` and `weglarka-unix-http` are tagged like the other non-daemon crates; pinning the template keeps a
+# panel release from ever producing a bare `vX.Y.Z` tag (reserved for `weglarka-daemon`, it triggers release.yml).
+[[package]]
+name = "weglarka-panel"
+git_tag_name = "{{ package }}-v{{ version }}"
+
+[[package]]
+name = "weglarka-unix-http"
+git_tag_name = "{{ package }}-v{{ version }}"
