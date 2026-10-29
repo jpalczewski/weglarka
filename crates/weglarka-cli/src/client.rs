@@ -44,22 +44,20 @@ impl RunStream {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let Some(frame) = self.response.frame().await else {
+            let Some(chunk) = self.response.chunk().await else {
                 return if self.decoder.is_clean() {
                     Ok(None)
                 } else {
                     Err(CliError::internal("run stream ended inside a frame"))
                 };
             };
-            let frame =
-                frame.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
-            if let Some(data) = frame.data_ref() {
-                self.ready.extend(
-                    self.decoder
-                        .push(data)
-                        .map_err(|e| CliError::internal(e.to_string()))?,
-                );
-            }
+            let data =
+                chunk.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
+            self.ready.extend(
+                self.decoder
+                    .push(&data)
+                    .map_err(|e| CliError::internal(e.to_string()))?,
+            );
         }
     }
 }
@@ -305,12 +303,10 @@ impl ApiClient {
         }
         let io = |e: &dyn std::fmt::Display| CliError::internal(format!("download failed: {e}"));
         let mut written = 0u64;
-        while let Some(frame) = resp.frame().await {
-            let frame = frame.map_err(|e| io(&e))?;
-            if let Some(data) = frame.data_ref() {
-                sink.write_all(data).await.map_err(|e| io(&e))?;
-                written += data.len() as u64;
-            }
+        while let Some(chunk) = resp.chunk().await {
+            let data = chunk.map_err(|e| io(&e))?;
+            sink.write_all(&data).await.map_err(|e| io(&e))?;
+            written += data.len() as u64;
         }
         sink.flush().await.map_err(|e| io(&e))?;
         Ok(written)

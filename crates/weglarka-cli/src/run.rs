@@ -199,16 +199,9 @@ pub async fn run(json: bool, o: &Overrides, a: RunArgs) -> Result<i32, CliError>
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     use clap::Parser as _;
-    use http_body_util::BodyExt;
-    use hyper::body::{Bytes, Incoming};
-    use hyper::service::service_fn;
-    use hyper::{Request, Response};
-    use hyper_util::rt::TokioIo;
+    use hyper::body::Bytes;
     use weglarka_api::{ApiError, ErrorCode, RUN_STREAM_CONTENT_TYPE};
 
     use super::*;
@@ -359,45 +352,21 @@ mod tests {
         );
     }
 
-    /// A one-route server: answers `POST /v1/apps/*/run` with `status`, `content_type` and the
-    /// `chunks` as separate body frames (so the client must reassemble frames cut anywhere).
-    async fn serve(status: u16, content_type: &'static str, chunks: Vec<Vec<u8>>) -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let socket = std::env::temp_dir().join(format!(
-            "wgl-run-{}-{}.sock",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let chunks = chunks.clone();
-                async move {
-                    assert_eq!(req.method(), "POST");
-                    assert_eq!(req.uri().path(), "/v1/apps/ntfy/run");
-                    let sent = req.into_body().collect().await.unwrap().to_bytes();
-                    assert!(serde_json::from_slice::<RunRequest>(&sent).is_ok());
-                    let frames = chunks
-                        .into_iter()
-                        .map(|c| Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(c))));
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(status)
-                            .header("content-type", content_type)
-                            .body(http_body_util::StreamBody::new(futures_util::stream::iter(
-                                frames,
-                            )))
-                            .unwrap(),
-                    )
-                }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-        });
-        socket
+    /// A one-route server: answers every request with `status`, `content_type` and the `chunks`
+    /// as separate body frames (so the client must reassemble frames cut anywhere).
+    async fn serve(
+        status: u16,
+        content_type: &'static str,
+        chunks: Vec<Vec<u8>>,
+    ) -> weglarka_unix_http::testing::Mock {
+        weglarka_unix_http::testing::mock_with(move |_, _| {
+            weglarka_unix_http::testing::Reply::chunks(
+                status,
+                chunks.iter().cloned().map(Bytes::from),
+            )
+            .content_type(content_type)
+        })
+        .await
     }
 
     fn request() -> RunRequest {
@@ -415,7 +384,7 @@ mod tests {
             .collect();
         let pieces = bytes.chunks(4).map(<[u8]>::to_vec).collect();
         let socket = serve(200, RUN_STREAM_CONTENT_TYPE, pieces).await;
-        let mut stream = ApiClient::new(&socket)
+        let mut stream = ApiClient::new(socket.socket.clone())
             .open_run("ntfy", &request())
             .await
             .unwrap();
@@ -425,7 +394,12 @@ mod tests {
         );
         assert_eq!(stream.next().await.unwrap(), Some(RunFrame::Exit(3)));
         assert_eq!(stream.next().await.unwrap(), None);
-        let _ = std::fs::remove_file(&socket);
+        let seen = socket.seen.lock().unwrap();
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("POST", "/v1/apps/ntfy/run")
+        );
+        assert!(serde_json::from_str::<RunRequest>(&seen[0].body).is_ok());
     }
 
     #[tokio::test]
@@ -433,12 +407,11 @@ mod tests {
         let mut bytes = RunFrame::Stdout(b"hello".to_vec()).encode();
         bytes.truncate(bytes.len() - 2);
         let socket = serve(200, RUN_STREAM_CONTENT_TYPE, vec![bytes]).await;
-        let mut stream = ApiClient::new(&socket)
+        let mut stream = ApiClient::new(socket.socket.clone())
             .open_run("ntfy", &request())
             .await
             .unwrap();
         assert_eq!(stream.next().await.unwrap_err().kind, Kind::Internal);
-        let _ = std::fs::remove_file(&socket);
     }
 
     #[tokio::test]
@@ -449,24 +422,22 @@ mod tests {
         })
         .unwrap();
         let socket = serve(409, "application/json", vec![body]).await;
-        let err = ApiClient::new(&socket)
+        let err = ApiClient::new(socket.socket.clone())
             .open_run("ntfy", &request())
             .await
             .err()
             .unwrap();
         assert_eq!(err.kind, Kind::Conflict);
-        let _ = std::fs::remove_file(&socket);
     }
 
     #[tokio::test]
     async fn a_success_that_is_not_a_run_stream_is_refused() {
         let socket = serve(200, "application/json", vec![b"{}".to_vec()]).await;
-        let err = ApiClient::new(&socket)
+        let err = ApiClient::new(socket.socket.clone())
             .open_run("ntfy", &request())
             .await
             .err()
             .unwrap();
         assert_eq!(err.kind, Kind::Internal);
-        let _ = std::fs::remove_file(&socket);
     }
 }

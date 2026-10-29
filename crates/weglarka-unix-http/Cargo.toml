@@ -13,9 +13,11 @@ workspace = true
 
 [features]
 # A mock unix-socket server for tests of the clients built on this crate.
-testing = ["hyper/server"]
+testing = ["hyper/server", "dep:futures-util"]
 
 [dependencies]
+bytes.workspace = true
+futures-util = { workspace = true, optional = true }
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

@@ -470,55 +470,26 @@ pub(crate) fn chunks(
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::sync::Mutex;
-
-    use http_body_util::{BodyExt, Full};
-    use hyper::body::Incoming;
-    use hyper::service::service_fn;
-    use hyper::{Request, Response};
-    use hyper_util::rt::TokioIo;
 
     use super::*;
     use crate::client::ApiClient;
 
-    /// What the mock daemon saw: `(method, path?query, body)`.
-    type Seen = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+    type Seen = Arc<Mutex<Vec<weglarka_unix_http::testing::Seen>>>;
 
-    /// Unix-socket server answering every request with `status` and `reply`.
-    async fn mock(tag: &str, status: u16, reply: &'static [u8]) -> (PathBuf, Seen) {
-        let socket = std::env::temp_dir().join(format!("wgv-{}-{tag}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let seen: Seen = Arc::default();
-        let seen2 = seen.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let seen = seen2.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let seen = seen.clone();
-                        async move {
-                            let method = req.method().to_string();
-                            let uri = req.uri().to_string();
-                            let body = req.into_body().collect().await.unwrap().to_bytes();
-                            seen.lock().unwrap().push((method, uri, body.to_vec()));
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(status)
-                                    .body(Full::new(Bytes::from_static(reply)))
-                                    .unwrap(),
-                            )
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-        (socket, seen)
+    /// Unix-socket daemon answering every request with `status` and `reply`. The returned guard
+    /// derefs to the socket path and removes the socket on drop.
+    async fn mock(
+        _tag: &str,
+        status: u16,
+        reply: &'static [u8],
+    ) -> (weglarka_unix_http::testing::Mock, Seen) {
+        let m = weglarka_unix_http::testing::mock_with(move |_, _| {
+            weglarka_unix_http::testing::Reply::new(status, Bytes::from_static(reply))
+        })
+        .await;
+        let seen = m.seen.clone();
+        (m, seen)
     }
 
     fn overrides(socket: &std::path::Path) -> Overrides {
@@ -558,18 +529,19 @@ mod tests {
             .unwrap();
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].0, "PUT");
+        assert_eq!(seen[0].method, "PUT");
         assert_eq!(
-            seen[0].1,
+            seen[0].uri(),
             "/v1/apps/szklana/volumes/data/import?foreign=true"
         );
-        assert_eq!(seen[0].2, payload, "body arrives intact");
+        assert_eq!(seen[0].raw_body, payload, "body arrives intact");
         assert_eq!(
-            seen[1].1, "/v1/apps/szklana/volumes/data/import",
+            seen[1].uri(),
+            "/v1/apps/szklana/volumes/data/import",
             "--own sends no foreign flag"
         );
         assert_eq!(
-            seen[2].1,
+            seen[2].uri(),
             "/v1/apps/szklana/volumes/data/import?foreign=true&replace=true"
         );
         let _ = std::fs::remove_file(file);
@@ -587,7 +559,7 @@ mod tests {
         export(&overrides(&socket), args()).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"TAR-BYTES");
         assert_eq!(
-            seen.lock().unwrap()[0].1,
+            seen.lock().unwrap()[0].uri(),
             "/v1/apps/szklana/volumes/data/export"
         );
         let _ = std::fs::remove_file(&out);
@@ -601,7 +573,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn purge_flag_goes_into_the_query() {
         let (socket, seen) = mock("purge", 204, b"").await;
-        ApiClient::new(&socket)
+        ApiClient::new(socket.socket.clone())
             .call_empty_query(
                 endpoints::APPS_REMOVE,
                 &[("name", "x")],
@@ -609,7 +581,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap()[0].1, "/v1/apps/x?purge_volumes=true");
+        assert_eq!(
+            seen.lock().unwrap()[0].uri(),
+            "/v1/apps/x?purge_volumes=true"
+        );
     }
 
     #[test]
@@ -666,7 +641,7 @@ mod tests {
         );
         let seen = seen.lock().unwrap();
         assert_eq!(
-            (seen[0].0.as_str(), seen[0].1.as_str()),
+            (seen[0].method.as_str(), seen[0].uri().as_str()),
             ("GET", "/v1/volumes")
         );
     }
@@ -681,7 +656,7 @@ mod tests {
                 .unwrap(),
             exit::OK
         );
-        assert_eq!(seen.lock().unwrap()[0].1, "/v1/apps/kajet-api/volumes");
+        assert_eq!(seen.lock().unwrap()[0].uri(), "/v1/apps/kajet-api/volumes");
     }
 
     #[test]
@@ -773,10 +748,10 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(
-            (seen[0].0.as_str(), seen[0].1.as_str()),
+            (seen[0].method.as_str(), seen[0].uri().as_str()),
             ("PUT", "/v1/volumes/kajet-data")
         );
-        assert!(seen[0].2.is_empty(), "the declaration has no body");
+        assert!(seen[0].raw_body.is_empty(), "the declaration has no body");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -797,7 +772,7 @@ mod tests {
         {
             let seen = seen.lock().unwrap();
             assert_eq!(
-                (seen[0].0.as_str(), seen[0].1.as_str()),
+                (seen[0].method.as_str(), seen[0].uri().as_str()),
                 ("PUT", "/v1/volumes/kajet-workspaces?group=kajet")
             );
         }
@@ -834,11 +809,11 @@ mod tests {
         }
         let seen = seen.lock().unwrap();
         assert_eq!(
-            (seen[0].0.as_str(), seen[0].1.as_str()),
+            (seen[0].method.as_str(), seen[0].uri().as_str()),
             ("DELETE", "/v1/volumes/kajet-data")
         );
         assert_eq!(
-            (seen[1].0.as_str(), seen[1].1.as_str()),
+            (seen[1].method.as_str(), seen[1].uri().as_str()),
             ("DELETE", "/v1/volumes/kajet-data?purge=true")
         );
     }
