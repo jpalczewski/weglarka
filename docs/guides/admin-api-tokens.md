@@ -35,6 +35,9 @@ access_token = "jwt"
 groups_in_access_token = true
 ```
 
+The [admin panel](admin-panel.md) is the ready-made client for this listener; it also needs the `groups` and `offline_access`
+scopes, which its guide lists in full.
+
 Keep the provider's access token lifetime short (Authelia `lifespans.access_token`, 15 minutes at most): a JWT cannot be
 revoked before it expires.
 
