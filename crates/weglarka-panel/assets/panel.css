@@ -1,0 +1,16 @@
+/* Placeholder stylesheet; the real one arrives with the first pages. No inline styles anywhere:
+   the Content-Security-Policy allows only same-origin stylesheets. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
