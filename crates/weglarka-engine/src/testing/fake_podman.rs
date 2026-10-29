@@ -241,7 +241,7 @@ impl FakePodman {
                 addresses: Vec::new(),
                 published_ports: Vec::new(),
                 restarts: 0,
-                started_at: None,
+                started_at: Some(FAKE_STARTED_AT.to_owned()),
             },
         );
     }

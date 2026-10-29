@@ -20,6 +20,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use weglarka_api::endpoints::APPS_SHOW;
 use weglarka_api::{Endpoint, ErrorCode};
 use weglarka_model::admin_auth::{self, AuthError, JwkSet, Principal, Scope, Validation};
 use weglarka_model::podman::PodmanClient;
@@ -275,7 +276,12 @@ async fn authenticate(
         );
     }
 
-    let audited = required == Some(Scope::Admin);
+    // `GET /v1/apps/{name}` is a `read` endpoint, but for an `admin` token it returns the real `env`
+    // values, so that read joins the audit trail.
+    let reveals_env = method == "GET"
+        && matched.as_deref() == Some(APPS_SHOW.path)
+        && principal.has(Scope::Admin);
+    let audited = required == Some(Scope::Admin) || reveals_env;
     let sub = principal.sub.clone();
     // Handlers that answer with app data decide what this caller may see (`app_view::Access`); the
     // unix socket never inserts one, so it stays full trust.
