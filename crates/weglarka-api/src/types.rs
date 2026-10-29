@@ -112,6 +112,17 @@ pub struct ShowAppResponse {
     /// When the container last started, RFC 3339 as Podman reports it; absent when it never ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    /// `true` when the daemon withheld parts of `spec` and `state` from this caller (a token
+    /// without `admin`): `env` values are blank, argv after the first argument and the failure text
+    /// are placeholders, the probe path is cut. Such a spec is a view, not the stored spec, so it must
+    /// never be sent back in `PUT /v1/apps/{name}` (a full replacement). Absent when nothing was
+    /// withheld, so the unredacted answer is unchanged (docs/decisions/0057 decision 8).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Raw container health (`GET /v1/apps/{name}`).

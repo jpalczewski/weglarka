@@ -11,7 +11,7 @@ pub mod run;
 pub mod types;
 
 pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
-pub use endpoints::{ENDPOINTS, Endpoint, Method};
+pub use endpoints::{Body, ENDPOINTS, Endpoint, Method};
 pub use forward::{FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest};
 pub use run::{
     FrameError, MAX_FRAME_PAYLOAD, RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest,

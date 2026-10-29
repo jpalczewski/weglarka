@@ -436,6 +436,19 @@ struct NoChange {
     app: ShowAppResponse,
 }
 
+/// A redacted view (a read token) is not the stored spec: writing it back would replace the real
+/// `env` values and arguments with placeholders (issue #254).
+fn ensure_writable(current: &ShowAppResponse) -> Result<(), CliError> {
+    if current.redacted {
+        return Err(CliError::usage(format!(
+            "{}: the daemon returned a redacted spec, which must not be written back",
+            current.name
+        ))
+        .with_hint("use a token with the `admin` scope, or the admin socket on the host"));
+    }
+    Ok(())
+}
+
 /// Prints the `PUT /v1/apps/{name}` a real run would send (`--dry-run` of update/start/stop).
 fn emit_update_dry_run(json: bool, params: &[(&str, &str)], diff: String, req: UpdateAppRequest) {
     let out = UpdateDryRun {
@@ -470,6 +483,7 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
     let current: ShowAppResponse = client
         .call(endpoints::APPS_SHOW, &params, None::<&()>)
         .await?;
+    ensure_writable(&current)?;
     let new_spec = match &a.spec {
         Some(path) => read_spec_file(path)?,
         None => apply_flags(current.spec.clone(), &a)?,
@@ -555,6 +569,7 @@ async fn set_start(
     let current: ShowAppResponse = client
         .call(endpoints::APPS_SHOW, &params, None::<&()>)
         .await?;
+    ensure_writable(&current)?;
     if current.spec.start == start {
         let out = NoChange {
             changed: false,
@@ -1309,6 +1324,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             restarts: None,
             health: None,
             started_at: None,
+            redacted: false,
         })
         .unwrap()
     }
@@ -1356,6 +1372,29 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         );
         // The whole spec travels, including fields the flags never mention.
         assert_eq!(body["spec"]["volumes"][0]["name"], "data");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redacted_spec_is_never_written_back() {
+        let mut view: serde_json::Value = serde_json::from_str(&show_json()).unwrap();
+        view["redacted"] = true.into();
+        let show = view.to_string();
+        let m = mock(move |_, _| (200, show.clone())).await;
+        let o = Overrides {
+            config: None,
+            socket: Some(m.socket.clone()),
+        };
+        let err = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
+        assert!(err.message.contains("redacted"), "{}", err.message);
+        let stop = StartStopArgs {
+            name: "ntfy".into(),
+            dry_run: false,
+        };
+        assert!(apps_start(true, &o, stop).await.is_err());
+        assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
     }
 
     #[tokio::test(flavor = "current_thread")]
