@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.3...weglarka-ingress-v0.0.4) - 2026-10-29
+
+### Added
+
+- *(identity)* enforce forward-auth policy and groups with generated access rules ([#245](https://github.com/jpalczewski/weglarka/pull/245))
+- *(ingress)* forward auth via nginx auth_request in both modes ([#236](https://github.com/jpalczewski/weglarka/pull/236))
+- *(core)* identity provider types behind a disabled gate ([#226](https://github.com/jpalczewski/weglarka/pull/226))
+
+### Fixed
+
+- *(ingress)* health probe over a unix probe socket in both modes ([#231](https://github.com/jpalczewski/weglarka/pull/231))
+
+### Other
+
+- split weglarka-core into weglarka-model and weglarka-engine ([#228](https://github.com/jpalczewski/weglarka/pull/228))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.2...weglarka-ingress-v0.0.3) - 2026-10-26
 
 ### Added

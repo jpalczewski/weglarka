@@ -1,7 +1,7 @@
 [package]
 name = "weglarka-identity"
 description = "Węglarka: pure renderers of the identity provider's (Authelia) generated config"
-version = "0.0.0"
+version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

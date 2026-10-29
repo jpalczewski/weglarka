@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-acme"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "base64 0.22.1",
  "hyper-rustls",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-api"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "insta",
  "serde",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "clap",
  "futures-util",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-daemon"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-dns"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-engine"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "flate2",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-http"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "reqwest",
  "rustls",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-identity"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "insta",
  "serde",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-ingress"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "insta",
  "thiserror",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-model"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-notify"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "insta",
  "serde",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-podman"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-registry"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
  "ring",
