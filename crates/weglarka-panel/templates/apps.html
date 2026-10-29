@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block title %}Applications · Węglarka{% endblock %}
+{% block content %}
+    <h1>Applications</h1>
+{% if apps.is_empty() %}    <p>No applications are declared.</p>
+{% else %}    <div class="scroll">
+    <table>
+      <caption class="sr">Applications</caption>
+      <thead><tr><th scope="col">Name</th><th scope="col">State</th><th scope="col">Image</th><th scope="col">Domains</th><th scope="col">Digest</th></tr></thead>
+      <tbody>
+{% for a in apps %}        <tr><th scope="row"><a href="/apps/{{ a.name }}">{{ a.name }}</a>{% if !a.site.is_empty() %} <span class="muted">({{ a.site }})</span>{% endif %}</th><td>{{ m::badge(&a.runtime) }}</td><td>{{ a.image }}</td><td>{{ a.domains.join(", ") }}</td><td><code>{{ a.digest }}</code></td></tr>
+{% endfor %}      </tbody>
+    </table>
+    </div>
+{% endif %}{% endblock %}

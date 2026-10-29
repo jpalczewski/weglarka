@@ -1,0 +1,16 @@
+{% extends "layout.html" %}
+{% block title %}Sites · Węglarka{% endblock %}
+{% block content %}
+    <h1>Sites and environments</h1>
+{% if sites.is_empty() %}    <p>No sites are declared.</p>
+{% endif %}{% for s in sites %}    <section>
+      <h2>{{ s.name }} <span class="muted">{{ s.image }}</span></h2>
+      <div class="scroll"><table>
+        <caption class="sr">Environments of {{ s.name }}</caption>
+        <thead><tr><th scope="col">Environment</th><th scope="col">Instance</th><th scope="col">Follows</th><th scope="col">Domains</th><th scope="col">Current</th><th scope="col">Previous</th></tr></thead>
+        <tbody>
+{% for e in s.envs %}          <tr><th scope="row">{{ e.env }}</th><td><a href="/apps/{{ e.instance }}">{{ e.instance }}</a></td><td>{{ e.follows }}</td><td>{{ e.domains }}</td><td><code>{{ e.current }}</code></td><td><code>{{ e.previous }}</code></td></tr>
+{% endfor %}        </tbody>
+      </table></div>
+    </section>
+{% endfor %}{% endblock %}

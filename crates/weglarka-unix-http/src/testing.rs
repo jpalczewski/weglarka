@@ -57,6 +57,7 @@ pub struct Reply {
     chunks: Vec<Bytes>,
     head_delay: Option<Duration>,
     fail_body: bool,
+    hold: bool,
 }
 
 impl Reply {
@@ -71,6 +72,7 @@ impl Reply {
             chunks: chunks.into_iter().collect(),
             head_delay: None,
             fail_body: false,
+            hold: false,
         }
     }
 
@@ -85,6 +87,13 @@ impl Reply {
         self
     }
 
+    /// Keeps the response open after the chunks (a stream that has nothing more to say yet). It is
+    /// counted in [`Mock::held`] until the client drops the connection.
+    pub fn hold_open(mut self) -> Self {
+        self.hold = true;
+        self
+    }
+
     /// Breaks the connection after the chunks, mid-body (the head has already been sent).
     pub fn fail_body(mut self) -> Self {
         self.fail_body = true;
@@ -95,6 +104,8 @@ impl Reply {
 pub struct Mock {
     pub socket: PathBuf,
     pub seen: Arc<Mutex<Vec<Seen>>>,
+    /// Responses made with [`Reply::hold_open`] that the client has not dropped yet.
+    pub held: Arc<AtomicU32>,
 }
 
 /// The socket path, so a `Mock` can be passed where a `&Path` is wanted.
@@ -124,6 +135,11 @@ pub async fn mock(reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 's
 
 /// [`mock`] with full control of the answer (content type, chunked or stalled or broken body).
 pub async fn mock_with(reply: impl Fn(&str, &str) -> Reply + Send + Sync + 'static) -> Mock {
+    mock_seen(move |seen| reply(&seen.method, &seen.path)).await
+}
+
+/// [`mock_with`] with the whole request to decide on (headers, query), not just method and path.
+pub async fn mock_seen(reply: impl Fn(&Seen) -> Reply + Send + Sync + 'static) -> Mock {
     // Short path: the sun_path limit (~104 B on macOS).
     let socket = std::env::temp_dir().join(format!(
         "wgl-{}-{}.sock",
@@ -133,16 +149,18 @@ pub async fn mock_with(reply: impl Fn(&str, &str) -> Reply + Send + Sync + 'stat
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let held = Arc::new(AtomicU32::new(0));
     let reply = Arc::new(reply);
     let seen2 = seen.clone();
+    let held2 = held.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let (reply, seen) = (reply.clone(), seen2.clone());
+            let (reply, seen, held) = (reply.clone(), seen2.clone(), held2.clone());
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
-                    let (reply, seen) = (reply.clone(), seen.clone());
-                    async move { Ok::<_, Infallible>(answer(req, &*reply, &seen).await) }
+                    let (reply, seen, held) = (reply.clone(), seen.clone(), held.clone());
+                    async move { Ok::<_, Infallible>(answer(req, &*reply, &seen, &held).await) }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), svc)
@@ -150,7 +168,7 @@ pub async fn mock_with(reply: impl Fn(&str, &str) -> Reply + Send + Sync + 'stat
             });
         }
     });
-    Mock { socket, seen }
+    Mock { socket, seen, held }
 }
 
 type Body = StreamBody<
@@ -159,8 +177,9 @@ type Body = StreamBody<
 
 async fn answer(
     req: Request<Incoming>,
-    reply: &(impl Fn(&str, &str) -> Reply + ?Sized),
+    reply: &(impl Fn(&Seen) -> Reply + ?Sized),
     seen: &Mutex<Vec<Seen>>,
+    held: &Arc<AtomicU32>,
 ) -> Response<Body> {
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
@@ -180,7 +199,7 @@ async fn answer(
         .find(|(n, _)| n == "host")
         .map(|(_, v)| v.clone());
     let body = req.into_body().collect().await.unwrap().to_bytes();
-    seen.lock().unwrap().push(Seen {
+    let this = Seen {
         method: method.clone(),
         path: path.clone(),
         query,
@@ -188,8 +207,9 @@ async fn answer(
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
         raw_body: body.to_vec(),
-    });
-    let reply = reply(&method, &path);
+    };
+    let reply = reply(&this);
+    seen.lock().unwrap().push(this);
     if let Some(delay) = reply.head_delay {
         tokio::time::sleep(delay).await;
     }
@@ -210,9 +230,29 @@ async fn answer(
         });
         frames = frames.chain(broken).boxed();
     }
+    if reply.hold {
+        // Counted from now until the client drops the connection (and with it this stream).
+        held.fetch_add(1, Ordering::SeqCst);
+        let guard = HeldGuard(held.clone());
+        frames = frames
+            .chain(futures_util::stream::pending())
+            .map(move |frame| {
+                let _keep = &guard;
+                frame
+            })
+            .boxed();
+    }
     let mut resp = Response::builder().status(reply.status);
     if let Some(ct) = reply.content_type {
         resp = resp.header("content-type", ct);
     }
     resp.body(StreamBody::new(frames)).unwrap()
+}
+
+struct HeldGuard(Arc<AtomicU32>);
+
+impl Drop for HeldGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }

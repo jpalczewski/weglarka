@@ -1,0 +1,13 @@
+{% extends "layout.html" %}
+{% block title %}Networks · Węglarka{% endblock %}
+{% block content %}
+    <h1>Shared networks</h1>
+{% if networks.is_empty() %}    <p>No shared networks are declared.</p>
+{% else %}    <div class="scroll"><table>
+      <caption class="sr">Shared networks</caption>
+      <thead><tr><th scope="col">Name</th><th scope="col">Podman name</th><th scope="col">Members</th><th scope="col">Created</th></tr></thead>
+      <tbody>
+{% for n in networks %}        <tr><th scope="row">{{ n.name }}</th><td><code>{{ n.podman_name }}</code></td><td>{{ n.members }}</td><td>{{ n.exists }}</td></tr>
+{% endfor %}      </tbody>
+    </table></div>
+{% endif %}{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% block title %}Notifications · Węglarka{% endblock %}
+{% block content %}
+    <h1>Notifications</h1>
+{% if !notify.enabled %}    <p>No notification channel is configured.</p>
+{% else %}    {{ m::fields(&notify.fields) }}
+    <h2>Channels</h2>
+    <ul class="plain">
+{% for c in notify.channels %}      <li>{{ c.value }}</li>
+{% endfor %}    </ul>
+{% endif %}{% endblock %}

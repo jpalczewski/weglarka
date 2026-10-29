@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% block title %}Events · Węglarka{% endblock %}
+{% block content %}
+    <h1>Events</h1>
+    <p class="muted">The daemon keeps a bounded history in memory. New events appear here as they happen.</p>
+    <section hx-ext="sse" sse-connect="{{ stream }}">
+      <ul class="events" id="events" sse-swap="message" hx-swap="afterbegin">
+{% for e in events %}{% include "event_item.html" %}{% endfor %}      </ul>
+    </section>
+{% if events.is_empty() %}    <p class="muted">No events yet.</p>
+{% endif %}{% endblock %}

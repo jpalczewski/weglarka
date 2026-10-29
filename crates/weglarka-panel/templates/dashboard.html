@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+{% block title %}Dashboard · Węglarka{% endblock %}
+{% block content %}
+    <h1>Dashboard</h1>
+    <section aria-labelledby="h-host">
+      <h2 id="h-host">Host</h2>
+      {{ m::fields(&host) }}
+    </section>
+    <section aria-labelledby="h-doctor">
+      <h2 id="h-doctor">Doctor</h2>
+      <p>{{ m::badge(&doctor) }} {{ doctor_text }} · <a href="/doctor">All checks</a></p>
+    </section>
+    <section aria-labelledby="h-apps">
+      <h2 id="h-apps">Applications</h2>
+      <p>{{ apps_total }} total, {{ apps_running }} running, {{ apps_attention }} needing attention · <a href="/apps">All applications</a></p>
+    </section>
+    <section aria-labelledby="h-certs">
+      <h2 id="h-certs">Certificates needing attention</h2>
+{% if certs.is_empty() %}      <p>Nothing expires soon.</p>
+{% else %}      <ul>
+{% for c in certs %}        <li>{{ c.names }} — {{ m::badge(&c.status) }} {% if c.days_left != "—" %}{{ c.days_left }} days left{% endif %}</li>
+{% endfor %}      </ul>
+{% endif %}      <p><a href="/certificates">All certificates</a></p>
+    </section>
+    <section aria-labelledby="h-events">
+      <h2 id="h-events">Recent events</h2>
+{% if events.is_empty() %}      <p>No events yet.</p>
+{% else %}      <ul class="events">
+{% for e in events %}{% include "event_item.html" %}{% endfor %}      </ul>
+{% endif %}      <p><a href="/events">Live event feed</a></p>
+    </section>
+{% endblock %}

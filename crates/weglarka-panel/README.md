@@ -31,7 +31,7 @@ This is the skeleton the login and the pages plug into:
   further login evicts that identity's oldest). A login in progress is not stored on the server at all: it travels
   in a short-lived `__Host-weglarka-login` cookie sealed with ChaCha20-Poly1305 under a key that exists only in the
   process, and each login can be answered once.
-- `auth`: a session whose first daemon call is refused (`401`, or `403` because the identity maps to no scope) is ended immediately.
+- `auth`: a session whose lowest-scope (`read`) call is refused (`401`, or `403` because the identity maps to no scope) is ended immediately; a `403` on a higher-scope call (the logs) shows the polite page and keeps the session.
 - `daemon`: `DaemonClient` calls the daemon's token socket (ADR 0056) over `weglarka-unix-http`. A `Call` is a
   `weglarka_api::Endpoint` plus path parameters (restricted to `[A-Za-z0-9._-]`) and query; the token goes in
   `Authorization: Bearer` only; `401`/`403`/`404`/`5xx` map to `DaemonError`; every exchange has a deadline (`Call::timeout` overrides it, `None` = no limit, for long operations). `send_empty` is for `204` endpoints.
@@ -40,8 +40,24 @@ This is the skeleton the login and the pages plug into:
   to the protected router before its `.layer(..)`.
 - `headers`: the Content-Security-Policy and the other security headers, on every response (one layer).
 - `assets`: files embedded with `include_bytes!`, served from a fixed table.
-- `pages`: askama templates (`templates/`). Templates carry no inline script, style or event handler; a test
-  scans them.
+- `pages`: askama templates (`templates/`; `layout.html` adds the navigation to `base.html`). Templates carry no
+  inline script, style or event handler; a test scans them, and the page tests scan every route's output.
+- `routes`, `views`: the read-only pages. Every handler forwards the signed-in user's own token and the daemon
+  decides: a `403` renders a polite "no access" page, a `401` ends the session, `5xx`/timeouts/unreachable render a
+  retryable page; daemon bodies are never quoted. `views` turns API types into plain strings (statuses are words as
+  well as styles; env values are never shown, only keys; a redacted app view carries a badge).
+- `live`: server-sent events for htmx's `sse` extension. `/events/stream` polls `GET /v1/events?since=` server-side
+  every few seconds and pushes new rows (`id: <boot_id>:<seq>`, so a reconnect resumes through `Last-Event-ID`);
+  `/apps/{name}/logs/stream` relays the daemon's admin-only log stream, decoded with `weglarka_api::LogFrameDecoder`,
+  every line cut, stripped of control characters and escaped, reconnecting with `since` after `TokenExpired`. A stream
+  ends with its session and with the browser connection; each session may hold four. Stream activity does not count as session activity, so a tab that only watches a stream is signed out when the idle timeout passes. The daemon's refusal of a stream is answered as an HTTP status before any event is sent; terminal log conditions send a `done` event (`sse-close`), so the browser does not reconnect.
+- Vendored front end: `assets/vendor/` holds htmx, its `sse` extension and Alpine's CSP build (versions and SHA-256
+  in `VENDORED.md`, verified by a test); `assets/app.css` and `assets/app.js` are the panel's own.
+
+Routes (all behind the session except `/healthz`, `/static/*` and the login): `/` (dashboard), `/apps`,
+`/apps/{name}`, `/doctor`, `/volumes`, `/networks`, `/sites`, `/certificates`, `/events`, `/notifications`,
+`/config`, plus the two streams above and `POST /auth/logout`. The app page offers the log section when the view is not
+`redacted` (the token has `admin`); the daemon still enforces it on the stream.
 
 Run it with `weglarka-panel` (flags and variables above); it logs JSON and shuts down gracefully on SIGTERM
 and SIGINT. Tests use `weglarka_unix_http::testing::mock` as a fake daemon.

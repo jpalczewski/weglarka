@@ -1,0 +1,1 @@
+{% for line in lines %}<div class="line{% if line.stderr %} stderr{% endif %}">{% if line.stderr %}<span class="tag">err</span> {% endif %}{{ line.text }}</div>{% endfor %}

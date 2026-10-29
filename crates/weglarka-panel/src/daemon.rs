@@ -9,7 +9,8 @@ use std::time::Duration;
 use http_body_util::Empty;
 use serde::de::DeserializeOwned;
 use weglarka_api::{ApiError, Endpoint, ErrorCode, Method};
-use weglarka_unix_http::{Bytes, UnixClient, bearer, header};
+use weglarka_model::admin_auth::Scope;
+use weglarka_unix_http::{Bytes, Request, StreamingResponse, UnixClient, bearer, header};
 
 use crate::config::{PanelConfig, Secret};
 
@@ -70,6 +71,11 @@ pub struct Call {
 }
 
 impl Call {
+    /// The scope the endpoint needs on the token listener (`None` = no authentication).
+    pub fn scope(&self) -> Option<Scope> {
+        self.endpoint.scope
+    }
+
     pub fn new(endpoint: &'static Endpoint) -> Self {
         Self {
             endpoint,
@@ -181,20 +187,7 @@ impl DaemonClient {
 
     /// Like [`Self::send`] but returns the raw success body.
     pub async fn send_raw(&self, token: &Secret, call: &Call) -> Result<Bytes, DaemonError> {
-        let method = match call.endpoint.method {
-            Method::Get => weglarka_unix_http::Method::GET,
-            Method::Post => weglarka_unix_http::Method::POST,
-            Method::Put => weglarka_unix_http::Method::PUT,
-            Method::Delete => weglarka_unix_http::Method::DELETE,
-        };
-        let request = weglarka_unix_http::Request::builder()
-            .method(method)
-            .uri(call.target()?)
-            .header(header::AUTHORIZATION, bearer(token.expose())?)
-            .header(header::ACCEPT, "application/json")
-            .body(Empty::<Bytes>::new())
-            .map_err(|_| DaemonError::InvalidRequest("malformed request".into()))?;
-
+        let request = self.request(token, call)?;
         let deadline = call.timeout.unwrap_or(Some(self.timeout));
         let http = self.http.clone().with_head_timeout(deadline);
         let reply = http.buffered(request, deadline).await?;
@@ -205,7 +198,44 @@ impl DaemonClient {
             Err(map_error(status, &reply.body))
         }
     }
+
+    /// Opens a streaming endpoint. A non-success head is mapped like any other error before any
+    /// body is read; on success the caller reads the body chunk by chunk and drops the stream to
+    /// close the connection. Only the head is bounded by the client's deadline.
+    pub async fn open(&self, token: &Secret, call: &Call) -> Result<Stream, DaemonError> {
+        let request = self.request(token, call)?;
+        let http = self.http.clone().with_head_timeout(Some(self.timeout));
+        let response = http.open(request).await?;
+        if response.status.is_success() {
+            return Ok(response);
+        }
+        let status = response.status.as_u16();
+        // An error body is a small JSON envelope; reading it is bounded like any exchange.
+        let body = tokio::time::timeout(self.timeout, response.collect())
+            .await
+            .map_err(|_| DaemonError::Timeout)??;
+        Err(map_error(status, &body))
+    }
+
+    fn request(&self, token: &Secret, call: &Call) -> Result<Request<Empty<Bytes>>, DaemonError> {
+        let method = match call.endpoint.method {
+            Method::Get => weglarka_unix_http::Method::GET,
+            Method::Post => weglarka_unix_http::Method::POST,
+            Method::Put => weglarka_unix_http::Method::PUT,
+            Method::Delete => weglarka_unix_http::Method::DELETE,
+        };
+        weglarka_unix_http::Request::builder()
+            .method(method)
+            .uri(call.target()?)
+            .header(header::AUTHORIZATION, bearer(token.expose())?)
+            .header(header::ACCEPT, "application/json")
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| DaemonError::InvalidRequest("malformed request".into()))
+    }
 }
+
+/// An open response whose body is read incrementally.
+pub type Stream = StreamingResponse<Empty<Bytes>>;
 
 /// Maps the API error envelope (or a bare status) to a [`DaemonError`]. A body that is not the
 /// envelope is dropped, never quoted.

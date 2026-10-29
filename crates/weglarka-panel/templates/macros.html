@@ -1,0 +1,5 @@
+{% macro badge(b) %}<span class="badge badge-{{ b.class }}">{{ b.text }}</span>{% endmacro %}
+{% macro fields(list) %}<dl class="fields">
+{% for f in list %}  <dt>{{ f.label }}</dt>
+  <dd>{{ f.value }}</dd>
+{% endfor %}</dl>{% endmacro %}
