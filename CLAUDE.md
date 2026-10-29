@@ -82,6 +82,7 @@ Priorytety przy każdej decyzji: **bezpieczeństwo → elegancki, rozszerzalny k
 6. Tytuł, commity i PR w Conventional Commits (`<type>(<scope>): <summary>`, patrz wyżej), po angielsku;
    `Closes #NN`; merge = squash po zielonym CI (`check`, `musl`, `nginx-e2e`, `podman-tests`, `smoke-behind`, `smoke-edge`; zmiana tylko w
    `docs/`/`*.md`/`.gitignore` nie buduje — job `changes`).
+7. Praca z równoległymi sesjami agentów, briefy, labele i projekt roadmapy: [`docs/contributing/agent-workflow.md`](docs/contributing/agent-workflow.md) i [`docs/contributing/issues-and-project.md`](docs/contributing/issues-and-project.md).
 
 ## Worktrees (praca równoległa)
 
