@@ -1,22 +1,25 @@
 name: Release
 
 # main → ghcr.io/jpalczewski/weglarka{,-panel}:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
+# Two entry points: a `v*` tag push builds everything here; on main, ci.yml calls this workflow (`workflow_call`)
+# with the musl binaries its own `musl` job already built, so the image job starts right after that build and
+# `binaries` is skipped (docs/decisions/0061).
 # One tag publishes two images: the daemon's and the panel's (docs/decisions/0057), both at the daemon's version.
 # Decisions: docs/decisions/0006-pakowanie-obrazy-i-release.md
 
 on:
   push:
-    branches: [main]
-    # A docs-only push to `main` must not rebuild/republish the image: it would be identical except
-    # for the revision label. Tag pushes are not affected (path filters are not evaluated for tags).
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "**/*.md"
-      - ".gitignore"
     # `v[0-9]*` is the daemon's tag only (release-plz.toml). The glob is anchored at the start of the tag name, so
     # the per-crate tags (`weglarka-panel-vX.Y.Z`, `weglarka-cli-vX.Y.Z`, ...) never start this workflow.
     tags: ["v[0-9]*"]
+  workflow_call:
+    inputs:
+      artifact:
+        description: >-
+          Name of an artifact of the calling run that holds the static musl binaries (weglarka, weglarka-daemon,
+          weglarka-panel). Set by ci.yml on main; empty on a tag push, where `binaries` builds them.
+        type: string
+        default: ""
 
 env:
   # Same as ci.yml: RUSTFLAGS is part of rust-cache's key, so the linux leg below only shares the
@@ -29,6 +32,8 @@ jobs:
   # both are signed and attested the same way and carry the same version tag.
   image:
     needs: binaries
+    # `binaries` is skipped when the caller supplied the artifact; a failed or cancelled build still blocks the image.
+    if: ${{ !cancelled() && contains(fromJSON('["success","skipped"]'), needs.binaries.result) }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +58,7 @@ jobs:
           [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != weglarka-daemon version v$ver"; exit 1; }
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: raw-x86_64-unknown-linux-musl
+          name: ${{ inputs.artifact || 'raw-x86_64-unknown-linux-musl' }}
           path: bin
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -121,12 +126,21 @@ jobs:
           upload-artifact: false
       - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE@${{ steps.build.outputs.digest }}"
 
-  # Full `release` profile (docs/decisions/0008). The linux/musl leg runs on every push to main (it feeds the
-  # image); the macOS leg only for tags (release asset only).
+  # Full `release` profile (docs/decisions/0008). Tags only: on main the very same linux/musl build is ci.yml's
+  # `musl` job, whose artifact reaches `image` through `inputs.artifact`.
   binaries:
+    if: ${{ inputs.artifact == '' }}
     strategy:
       matrix:
-        include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon -p weglarka-panel","files":"weglarka weglarka-daemon weglarka-panel"},{"os":"macos-15","target":"aarch64-apple-darwin","packages":"-p weglarka-cli","files":"weglarka"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","packages":"-p weglarka-cli -p weglarka-daemon -p weglarka-panel","files":"weglarka weglarka-daemon weglarka-panel"}]') }}
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            packages: -p weglarka-cli -p weglarka-daemon -p weglarka-panel
+            files: weglarka weglarka-daemon weglarka-panel
+          - os: macos-15
+            target: aarch64-apple-darwin
+            packages: -p weglarka-cli
+            files: weglarka
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -139,11 +153,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # The linux leg is the very same build as ci.yml's `musl` job on main (`--release` = `--profile
-          # release`), so both use one entry. This workflow is the single writer: both have identical
-          # `paths-ignore`, so they run on the same pushes, and the entry is written here because this
-          # run also covers tags. The macOS leg (tags only) keeps its own key.
+          # release`), so it restores that job's `musl-release` entry. CI is the only writer; a tag run only
+          # reads. The macOS leg keeps its own key and is never saved either (tags are rare).
           shared-key: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'musl-release' || format('release-{0}', matrix.target) }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
       # Raw binaries for the image job (the very same files that go into the release tarball).
       - if: matrix.target == 'x86_64-unknown-linux-musl'
