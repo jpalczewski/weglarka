@@ -118,6 +118,8 @@ dependency of the daemon (the unix socket works with the panel gone).
   identifier or path shapes (domains, paths, streaming/exempt/skip paths, auth groups, tmpfs, capabilities, groups,
   aliases, scopes) are shown; the query of `oidc.redirect_uris` and `oidc.audience` is cut. The `GET /v1/doctor`
   detail review of #281 is not part of this and is tracked with the doctor work (#272).
+  The path of `oidc.redirect_uris` and `oidc.audience` is shown on purpose: it is public OIDC registration data, not
+  a secret, and the view should say where the client lives. Putting a credential in such a path is unsupported.
 - `weglarka-panel` crate: skeleton, OIDC login and sessions, hardening of both, and the read-mostly pages with live
   events and admin-only logs (#268, #288, #302, #305); `weglarka-unix-http` as the shared socket client.
 - The daemon endpoints of decision 8 (events, redacted app view, certificates, config view, log stream) landed with the
