@@ -28,6 +28,9 @@ const DEFAULT_TAIL: u32 = 100;
 const MAX_LINE: usize = 64 * 1024;
 /// Reopens in a row, with no output in between, after which a stream is given up.
 const MAX_QUIET_REOPENS: u32 = 5;
+/// A reopen starts this much before the last output, so a line that was in flight when the
+/// connection ended is not lost (at the price of a repeat).
+const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
 /// A connection that stayed open at least this long was not a tight loop, however quiet: it does
 /// not count towards [`MAX_QUIET_REOPENS`] (an idle app followed for hours expires many tokens).
 const STABLE_FOR: Duration = Duration::from_secs(60);
@@ -392,16 +395,10 @@ impl AppStream<'_> {
         let app = self.app;
         loop {
             match self.stream.next().await {
-                Ok(Some(frame @ (LogFrame::Stdout(_) | LogFrame::Stderr(_)))) => {
-                    self.last_data = SystemTime::now();
-                    self.quiet_reopens = 0;
-                    let (stderr, bytes) = match frame {
-                        LogFrame::Stdout(b) => (false, b),
-                        LogFrame::Stderr(b) => (true, b),
-                        _ => unreachable!("matched above"),
-                    };
-                    return Some((Event::Data { app, stderr, bytes }, Some(self)));
+                Ok(Some(LogFrame::Stdout(bytes))) => {
+                    return Some(self.data(false, bytes));
                 }
+                Ok(Some(LogFrame::Stderr(bytes))) => return Some(self.data(true, bytes)),
                 Ok(Some(LogFrame::End)) => return Some((Event::End(app), None)),
                 Ok(Some(LogFrame::TokenExpired)) => {
                     if let Err(message) = self.reopen().await {
@@ -425,6 +422,19 @@ impl AppStream<'_> {
         }
     }
 
+    fn data(mut self, stderr: bool, bytes: Vec<u8>) -> (Event, Option<Self>) {
+        self.last_data = SystemTime::now();
+        self.quiet_reopens = 0;
+        (
+            Event::Data {
+                app: self.app,
+                stderr,
+                bytes,
+            },
+            Some(self),
+        )
+    }
+
     /// The token expired: continue from the last output with a fresh connection (a remote host
     /// refreshes its token when a connection opens).
     async fn reopen(&mut self) -> Result<(), String> {
@@ -432,7 +442,7 @@ impl AppStream<'_> {
             .ok_or("the stream keeps expiring without output")?;
         let query = LogsQuery {
             tail: None,
-            since: Some(since_epoch(Some(self.last_data))),
+            since: Some(since_epoch(self.last_data.checked_sub(REOPEN_OVERLAP))),
             ..self.query
         };
         self.stream = self
@@ -485,6 +495,10 @@ where
             .note(&name, &format!("skipped: {}", e.message))
             .await
             .map_err(io)?;
+    }
+    if streams.is_empty() {
+        // Nothing left to follow (every app was skipped); an empty `select_all` would never end.
+        return Ok(exit::OK);
     }
     let mut all = select_all(streams.into_iter().map(|(app, stream)| {
         let state = AppStream {
@@ -956,6 +970,14 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(out, "web | line\n");
         assert!(err.contains("gone") && err.contains("skipped"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn with_all_nothing_left_after_skipping_ends_at_once() {
+        let mock = mock_seen(|_| not_found()).await;
+        let (code, out, err) = drive(&mock, &["gone"], true, Mode::Prefixed).await;
+        assert_eq!(code.unwrap(), 0);
+        assert!(out.is_empty() && err.contains("skipped"), "{err}");
     }
 
     #[tokio::test]
