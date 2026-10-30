@@ -12,7 +12,7 @@ use super::parse::{
     apt_installed_from, can_read, can_write, gids_of, parse_major_minor, parse_proc_net_tcp,
     subid_total,
 };
-use super::{Check, Context, RuntimeUser, fail, ok, warn};
+use super::{Check, Context, RuntimeUser, fail, info, ok, warn};
 
 /// Minimum total size of the user's subuid/subgid ranges for `userns=auto`.
 /// 65536 is the standard rootless Podman range (images with uid > 0 fit in it);
@@ -191,22 +191,28 @@ impl Check for CgroupsV2 {
                 "/sys/fs/cgroup/user.slice/user-{0}.slice/user@{0}.service/cgroup.controllers",
                 u.uid
             );
-            if let Ok(delegated) = cx.host.read_to_string(Path::new(&p)) {
-                let missing: Vec<&str> = ["memory", "pids"]
-                    .into_iter()
-                    .filter(|c| !delegated.split_whitespace().any(|d| d == *c))
-                    .collect();
-                if !missing.is_empty() {
-                    return warn(
-                        self.id(),
-                        format!(
-                            "cgroups v2, but controllers not delegated to {}: {}",
-                            u.name,
-                            missing.join(", ")
-                        ),
-                        "create /etc/systemd/system/user@.service.d/delegate.conf with `[Service]\\nDelegate=cpu cpuset io memory pids`",
-                    );
-                }
+            let Ok(delegated) = cx.host.read_to_string(Path::new(&p)) else {
+                return info(
+                    self.id(),
+                    format!(
+                        "cgroups v2 present, but controller delegation not verified ({p} missing or unreadable)"
+                    ),
+                );
+            };
+            let missing: Vec<&str> = ["cpu", "memory", "pids"]
+                .into_iter()
+                .filter(|c| !delegated.split_whitespace().any(|d| d == *c))
+                .collect();
+            if !missing.is_empty() {
+                return warn(
+                    self.id(),
+                    format!(
+                        "cgroups v2, but controllers not delegated to {}: {}",
+                        u.name,
+                        missing.join(", ")
+                    ),
+                    "create /etc/systemd/system/user@.service.d/delegate.conf with `[Service]\nDelegate=cpu cpuset io memory pids`",
+                );
             }
         }
         ok(self.id(), "cgroups v2")
