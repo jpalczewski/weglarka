@@ -57,6 +57,9 @@ expires the daemon sends a final `TokenExpired` frame and closes, and the client
 because cutting a command off halfway can be destructive (it has its own `timeout_secs`). On the unix socket there is
 no token, so no deadline.
 
+The CLI reads this stream with `weglarka logs` (`weglarka --host https://panel.example.com logs web -f`, or `--all` for every
+running app): it renews the connection after `TokenExpired` itself, so lines around the renewal can appear twice.
+
 `GET /v1/apps/{name}` is open to `read` but redacted, in every response that carries an app spec or state. The `read`
 view is an allowlist projection: the daemon rebuilds it field by field, so a field added in a later release does not
 compile until someone decides what `read` sees of it. The free-form `detail` and the content `fingerprint` of the

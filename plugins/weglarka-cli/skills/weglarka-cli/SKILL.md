@@ -1,6 +1,6 @@
 ---
 name: weglarka-cli
-description: Operate a Węglarka host with the `weglarka` CLI: inspect apps, status and doctor, manage secrets, deploy, push, run and forward, locally or on a remote host with `--host`. Use when the user asks to look at, change or debug apps on a Węglarka host, or mentions `weglarka login`.
+description: Operate a Węglarka host with the `weglarka` CLI: inspect apps, status and doctor, manage secrets, deploy, push, run, forward and logs, locally or on a remote host with `--host`. Use when the user asks to look at, change or debug apps on a Węglarka host, or mentions `weglarka login`.
 ---
 
 # Operating a Węglarka host
@@ -24,5 +24,11 @@ code in a browser, so start the command, show the code and address, and wait. `w
    one-off operations (`run`, `forward`, `push`).
 6. `apps remove` has no undo; `push` leaves the loaded image behind (not removed by `images prune`); a 403 means the
    account lacks the group, not that the panel is down.
+
+`weglarka logs <app>... | --all [-f] [-n N|all] [--since 10m] [--timestamps]` prints what containers wrote (default last
+100 lines; several apps are prefixed `app | line`, `--json` gives `{"app","stream","line"}`). It needs `admin`, and logs
+can hold secrets the app printed, so reading them needs the owner's yes once per task, for the apps or the `--all` scope
+that task names; do not ask again for each read within it, and ask again for a new task or apps outside that scope. Do
+not paste logs into public places. After a reconnect a few lines may repeat.
 
 Do not put hostnames, tokens or account details from the user's environment into public places (issues, PRs, commits).
