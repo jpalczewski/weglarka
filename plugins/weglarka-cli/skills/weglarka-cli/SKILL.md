@@ -27,6 +27,8 @@ code in a browser, so start the command, show the code and address, and wait. `w
 
 `weglarka logs <app>... | --all [-f] [-n N|all] [--since 10m] [--timestamps]` prints what containers wrote (default last
 100 lines; several apps are prefixed `app | line`, `--json` gives `{"app","stream","line"}`). It needs `admin`, and logs
-can hold secrets the app printed, so reading them needs the owner's yes, per app, like a write; do not paste them into public places. After a reconnect a few lines may repeat.
+can hold secrets the app printed, so reading them needs the owner's yes once per task, for the apps or the `--all` scope
+that task names; do not ask again for each read within it, and ask again for a new task or apps outside that scope. Do
+not paste logs into public places. After a reconnect a few lines may repeat.
 
 Do not put hostnames, tokens or account details from the user's environment into public places (issues, PRs, commits).
