@@ -133,8 +133,8 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | `admin` | Everything a viewer sees, plus live logs on each app page. |
 
 - App detail is the daemon's *redacted* view for viewers: environment **values are never shown, only the keys** (and not
-  to admins either: the panel renders keys only), arguments after the first are replaced by a placeholder and the health
-  probe path is cut. A page built from a redacted view carries a badge. Details: [admin API tokens](admin-api-tokens.md).
+  to admins either: the panel renders keys only), every element of the command is replaced by a placeholder (the page then shows `<redacted>` where it names the
+  program) and the health probe path is cut. A page built from a redacted view carries a badge. Details: [admin API tokens](admin-api-tokens.md).
 - Logs need `admin` because they can hold secrets and user data. The log view relays the daemon's stream, with control
   characters stripped and long lines cut. A viewer's request is answered `403` by the daemon; the page offers the log
   section only when the view is not redacted.

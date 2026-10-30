@@ -6,7 +6,7 @@
 //! allowlist projection of the app (issue #265): `read_spec` and `read_state` destructure every
 //! field of the stored types without `..`, so a new field fails to compile until its read-scope
 //! treatment is decided. The policy: `env` values blank (keys kept), every argument of `command` and
-//! `health.command` after the first replaced (arity kept), `health.http.path` cut to its first
+//! `health.command` replaced element by element (arity kept), `health.http.path` cut to its first
 //! segment, the engine's failure text in `state.failed.reason` replaced by a marker (`events.rs` keeps
 //! it from `read` too), and `ShowAppResponse::redacted` set so no client mistakes the view for the
 //! stored spec. Every handler that answers with a spec takes an [`Access`] and builds the answer
@@ -59,23 +59,19 @@ impl<S: Send + Sync> FromRequestParts<S> for Access {
     }
 }
 
-/// Stands in for every argument after `argv[0]` of a redacted command line, and for every path
-/// segment of a redacted probe path after the first.
+/// Stands in for every element of a redacted command line, and for every path segment of a
+/// redacted probe path after the first.
 pub(crate) const REDACTED_ARG: &str = "<redacted>";
 
 /// Stands in for the engine's failure text of a redacted deploy failure.
 pub(crate) const REDACTED_REASON: &str = "deploy failed (details withheld)";
 
-/// Keeps `argv[0]` and the number of arguments, so the shape of the command stays useful. `command`
-/// replaces the image's `CMD`, so `argv[0]` is not always a program name: one that looks like a
-/// flag or an assignment (`--token=x`, `KEY=x`) is redacted too.
-fn redact_argv(mut argv: Vec<String>) -> Vec<String> {
-    for (i, arg) in argv.iter_mut().enumerate() {
-        if i > 0 || arg.starts_with('-') || arg.contains('=') {
-            *arg = REDACTED_ARG.to_owned();
-        }
-    }
-    argv
+/// Replaces every element with [`REDACTED_ARG`] and keeps only the number of arguments. `command`
+/// replaces the image's `CMD`, so even `argv[0]` is not necessarily a program name: it can be a
+/// positional secret or a connection URL with credentials, and no heuristic tells those apart
+/// (issue #273).
+fn redact_argv(argv: Vec<String>) -> Vec<String> {
+    vec![REDACTED_ARG.to_owned(); argv.len()]
 }
 
 /// The first path segment, then [`REDACTED_ARG`] for whatever follows it; the query and the fragment
@@ -296,7 +292,8 @@ fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
 }
 
 /// The spec a caller without `admin` may see: `env` values blank (keys kept), `command` and
-/// `health.command` keep `argv[0]` and their length, `health.http.path` keeps its first segment.
+/// `health.command` keep only their length (every element a placeholder), `health.http.path` keeps
+/// its first segment.
 fn read_spec(spec: AppSpec) -> AppSpec {
     let AppSpec {
         kind,
@@ -508,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn redaction_keeps_argv0_and_the_argument_count() {
+    fn redaction_keeps_only_the_argument_count() {
         let full = show_response(Access::Full, name(), leaky_spec(), None, None);
         assert_eq!(full.spec.command[1], "--password=hunter2");
         assert_eq!(
@@ -518,20 +515,27 @@ mod tests {
 
         let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None);
         let r = REDACTED_ARG.to_owned();
-        assert_eq!(shown.spec.command, ["serve", &r, &r, &r]);
-        assert_eq!(shown.spec.health.command, Some(vec!["check".into(), r]));
+        assert_eq!(shown.spec.command, [REDACTED_ARG; 4]);
+        assert_eq!(shown.spec.health.command, Some(vec![r.clone(), r]));
         assert!(!format!("{shown:?}").contains("hunter2"));
         assert!(!format!("{shown:?}").contains("t0k3n"));
     }
 
     #[test]
-    fn redaction_hides_an_argv0_that_is_a_flag_or_an_assignment() {
-        let mut spec = spec();
-        spec.command = vec!["--api-key=k".into(), "x".into()];
-        spec.health.command = Some(vec!["TOKEN=t".into()]);
-        let shown = show_response(Access::Redacted, name(), spec, None, None);
-        assert_eq!(shown.spec.command, [REDACTED_ARG, REDACTED_ARG]);
-        assert_eq!(shown.spec.health.command, Some(vec![REDACTED_ARG.into()]));
+    fn redaction_hides_a_bare_or_url_shaped_argv0() {
+        for secret in [
+            "s3cr3tpassword",
+            "postgres://user:pass@db/app",
+            "--api-key=k",
+        ] {
+            let mut spec = spec();
+            spec.command = vec![secret.into(), "x".into()];
+            spec.health.command = Some(vec![secret.into()]);
+            let shown = show_response(Access::Redacted, name(), spec, None, None);
+            assert_eq!(shown.spec.command, [REDACTED_ARG, REDACTED_ARG]);
+            assert_eq!(shown.spec.health.command, Some(vec![REDACTED_ARG.into()]));
+            assert!(!format!("{shown:?}").contains(secret), "{secret}");
+        }
     }
 
     #[test]

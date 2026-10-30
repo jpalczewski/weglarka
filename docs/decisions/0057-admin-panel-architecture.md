@@ -60,8 +60,8 @@ Threats, in priority order:
      `read` principal those values are blanked, from one constructor shared by every code path that builds the response.
      The read view is an allowlist projection, not a blocklist: the constructor rebuilds the spec and the state by
      destructuring every field of `AppSpec`, `AppState` and the nested structs without `..`, so a new field does not
-     compile until someone decides what a `read` caller sees of it. Policy: `env` values blank (keys kept), arguments
-     after the first replaced by a placeholder (arity kept), `health.http.path` cut to its first segment plus
+     compile until someone decides what a `read` caller sees of it. Policy: `env` values blank (keys kept), every
+     `command` element replaced by a placeholder (arity kept; amended by #273: `argv[0]` is not necessarily a program name), `health.http.path` cut to its first segment plus
      `<redacted>` for the rest (query always dropped), `state.failed.reason` a fixed marker. `ShowAppResponse` carries
      `redacted: true` whenever this applies (absent otherwise, so the unredacted answer is byte-identical), and the CLI
      refuses to write such a spec back. Every `Endpoint` declares its `Body` (`NoAppData`, `AppView`, `Credential`); a
