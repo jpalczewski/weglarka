@@ -24,7 +24,7 @@ weglarka-acme = { path = "crates/weglarka-acme", version = "0.0" }
 weglarka-api = { path = "crates/weglarka-api", version = "0.0.5" }
 weglarka-dns = { path = "crates/weglarka-dns", version = "0.0" }
 weglarka-engine = { path = "crates/weglarka-engine", version = "0.0" }
-weglarka-panel = { path = "crates/weglarka-panel", version = "0.0" }
+weglarka-panel = { path = "crates/weglarka-panel", version = "0.1" }
 weglarka-podman = { path = "crates/weglarka-podman", version = "0.0" }
 weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0" }
 weglarka-identity = { path = "crates/weglarka-identity", version = "0.0" }
