@@ -33,11 +33,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: weglarka
-            image: ghcr.io/jpalczewski/weglarka
+          - image: ghcr.io/jpalczewski/weglarka
             file: Containerfile
-          - name: weglarka-panel
-            image: ghcr.io/jpalczewski/weglarka-panel
+          - image: ghcr.io/jpalczewski/weglarka-panel
             file: Containerfile.panel
     env:
       IMAGE: ${{ matrix.image }}
