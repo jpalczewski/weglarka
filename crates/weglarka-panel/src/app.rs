@@ -1,7 +1,8 @@
 //! The HTTP app. Two route groups:
 //!
-//! - **public**: `GET /healthz` (no auth, no daemon call), `/static/*` (embedded, not secret) and
-//!   the login flow, `GET /auth/login` and `GET /auth/callback`;
+//! - **public**: `GET /healthz` (no auth, no daemon call), `/static/*` (embedded, not secret), the
+//!   login flow, `GET /auth/login` and `GET /auth/callback`, and `/_weglarka/api/*`, the bearer-only relay to
+//!   the daemon ([`relay`], docs/decisions/0060);
 //! - **protected**: everything else, behind [`auth::require_session`], which is default-deny: no
 //!   valid session cookie, no answer but 401. State-changing requests there also need a CSRF token.
 //!
@@ -13,7 +14,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use weglarka_http::{HttpError, Purpose};
 
 use crate::config::PanelConfig;
@@ -23,7 +24,7 @@ use crate::live::StreamSlots;
 use crate::oidc::OidcClient;
 use crate::pages::ErrorPage;
 use crate::session::{Clock, PendingLogins, SessionStore};
-use crate::{assets, auth, headers, live, routes};
+use crate::{assets, auth, headers, live, relay, routes};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,6 +38,10 @@ pub struct AppState {
     pub clock: Clock,
     /// Live streams held per session.
     pub streams: Arc<StreamSlots>,
+    /// `/api` requests per client address (docs/decisions/0060).
+    pub api_limit: Arc<AddressLimiter>,
+    /// Relayed requests in flight, streams included.
+    pub api_slots: Arc<tokio::sync::Semaphore>,
     /// How often the events stream asks the daemon for news.
     pub stream_poll: std::time::Duration,
 }
@@ -63,7 +68,13 @@ impl AppState {
             sessions,
             daemon,
             config,
+            api_limit: Arc::new(AddressLimiter::with_limits(
+                clock.clone(),
+                relay::LIMIT,
+                relay::LIMIT_WINDOW,
+            )),
             clock,
+            api_slots: Arc::new(tokio::sync::Semaphore::new(relay::MAX_CONCURRENT)),
             streams: Arc::new(StreamSlots::default()),
             stream_poll: std::time::Duration::from_secs(3),
         })
@@ -100,6 +111,8 @@ pub fn router(state: AppState) -> Router {
         .route("/static/{file}", get(assets::serve))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
+        // Bearer-only, outside `require_session` on purpose: no cookie ever authenticates here.
+        .route(&format!("{}/{{*rest}}", relay::PREFIX), any(relay::handle))
         .merge(protected)
         .layer(middleware::from_fn(headers::security_headers))
         .with_state(state)

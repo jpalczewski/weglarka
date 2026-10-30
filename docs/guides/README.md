@@ -60,6 +60,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Forward auth](forward-auth.md) | Login in front of an app via the identity provider (`ingress.auth`) |
 | [Admin API tokens](admin-api-tokens.md) | A token listener for the panel and other clients, `read`/`admin` scopes from provider groups (`[admin.http]`) |
 | [Admin panel](admin-panel.md) | The read-mostly web UI: app definition, OIDC login, sessions, what viewers and admins see |
+| [Remote CLI](remote-cli.md) | `weglarka login` with the device flow, where the tokens are kept, `whoami`, `logout` |
 | [Identity provider](identity-provider.md) | Authelia as a managed app, OIDC clients per app, external clients, secret rotation (`oidc`, `[identity]`) |
 
 ## Operations

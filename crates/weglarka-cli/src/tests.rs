@@ -757,6 +757,7 @@ fn overrides(m: &Mock) -> Overrides {
     Overrides {
         config: None,
         socket: Some(m.socket.clone()),
+        host: None,
     }
 }
 
@@ -1741,5 +1742,33 @@ fn notify_status_rendering_covers_off_pending_and_errors() {
     assert!(
         rendered.contains("last error: ntfy answered 500"),
         "{rendered}"
+    );
+}
+
+#[test]
+fn host_is_a_global_flag_that_excludes_socket() {
+    use clap::Parser;
+    let cli = crate::cli::Cli::try_parse_from([
+        "weglarka",
+        "status",
+        "--host",
+        "https://panel.example.com",
+    ])
+    .unwrap();
+    assert_eq!(cli.host.as_deref(), Some("https://panel.example.com"));
+    assert!(
+        crate::cli::Cli::try_parse_from([
+            "weglarka",
+            "--host",
+            "https://panel.example.com",
+            "--socket",
+            "/run/w.sock",
+            "status",
+        ])
+        .is_err()
+    );
+    assert!(
+        crate::cli::Cli::try_parse_from(["weglarka", "login", "--issuer", "a", "--audience", "b"])
+            .is_ok()
     );
 }

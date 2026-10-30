@@ -52,6 +52,7 @@ struct Client<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     client_secret: Option<&'a str>,
     public: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     redirect_uris: &'a [String],
     scopes: Vec<&'a str>,
     authorization_policy: &'static str,
@@ -83,6 +84,7 @@ struct Common<'a> {
     access_token: AccessTokenFormat,
     pkce: Pkce,
     public: bool,
+    device_flow: bool,
 }
 
 impl<'a> From<&'a OidcClientSpec> for Common<'a> {
@@ -98,6 +100,7 @@ impl<'a> From<&'a OidcClientSpec> for Common<'a> {
             access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
+            device_flow: c.device_flow,
         }
     }
 }
@@ -115,6 +118,7 @@ impl<'a> From<&'a ExternalClientSpec> for Common<'a> {
             access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
+            device_flow: c.device_flow,
         }
     }
 }
@@ -180,6 +184,20 @@ pub fn render_oidc_clients(
             );
             policy
         });
+        // Unset `device_flow` keeps the file exactly as before: no grants listed unless refresh is on.
+        let has_code_grant = !c.redirect_uris.is_empty();
+        let mut grant_types = Vec::new();
+        if refresh || c.device_flow {
+            if has_code_grant {
+                grant_types.push("authorization_code");
+            }
+            if c.device_flow {
+                grant_types.push("urn:ietf:params:oauth:grant-type:device_code");
+            }
+            if refresh {
+                grant_types.push("refresh_token");
+            }
+        }
         clients.push(Client {
             client_id: id,
             client_name: name,
@@ -201,12 +219,12 @@ pub fn render_oidc_clients(
             require_pkce,
             // Authelia treats any non-empty method as "PKCE required", so `pkce = "off"` omits it.
             pkce_challenge_method: require_pkce.then_some("S256"),
-            response_types: if refresh { vec!["code"] } else { Vec::new() },
-            grant_types: if refresh {
-                vec!["authorization_code", "refresh_token"]
+            response_types: if has_code_grant && (refresh || c.device_flow) {
+                vec!["code"]
             } else {
                 Vec::new()
             },
+            grant_types,
             access_token_signed_response_alg: (c.access_token == AccessTokenFormat::Jwt)
                 .then_some("RS256"),
         });

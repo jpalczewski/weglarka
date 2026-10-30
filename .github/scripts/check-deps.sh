@@ -30,6 +30,17 @@ if grep -q '^reqwest v' <<<"$unix_tree"; then
   status=1
 fi
 
+# The shared OIDC logic (docs/decisions/0060) is transport-agnostic: the CLI uses it, so it must carry no HTTP
+# client or TLS stack of its own.
+oidc_tree=$(cargo tree -p weglarka-oidc -e normal --prefix none)
+for banned in reqwest hyper rustls tokio-rustls weglarka-http weglarka-engine weglarka-panel; do
+  if grep -q "^$banned v" <<<"$oidc_tree"; then
+    echo "error: '$banned' is in the weglarka-oidc dependency graph:" >&2
+    cargo tree -p weglarka-oidc -e normal -i "$banned" >&2 || true
+    status=1
+  fi
+done
+
 # The panel (docs/decisions/0057) is a network-facing leaf: same crypto rules as the daemon, and
 # never the engine (it holds no Podman access; it only talks to the admin API).
 panel_tree=$(cargo tree -p weglarka-panel --target "$target" -e normal --prefix none)

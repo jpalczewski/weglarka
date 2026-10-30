@@ -10,6 +10,9 @@
 //! Timeouts are explicit: connecting always has one; the response head only with
 //! [`UnixClient::with_head_timeout`]; the whole buffered exchange only when the caller passes one.
 //! Streaming bodies are never capped.
+//!
+//! [`buffered_over`] and [`open_over`] do the same over a stream the caller connected itself (the
+//! CLI's TLS connection to a remote host); they add no `Host` header and no head timeout.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -165,13 +168,7 @@ impl UnixClient {
             .await
             .map_err(|_| Error::ConnectTimeout)?
             .map_err(Error::Connect)?;
-        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|e| Error::Handshake(Cause(e)))?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        Ok(sender)
+        handshake(TokioIo::new(stream)).await
     }
 
     /// Sends `request` and reads the whole response. `timeout` bounds the exchange after connecting
@@ -187,27 +184,8 @@ impl UnixClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let request = self.with_host_header(request);
-        let mut sender = self.connect().await?;
-        let exchange = async {
-            let resp = self.head(&mut sender, request).await?;
-            let (parts, body) = resp.into_parts();
-            let body = body
-                .collect()
-                .await
-                .map_err(|e| Error::Request(Cause(e)))?
-                .to_bytes();
-            Ok(Buffered {
-                status: parts.status,
-                headers: parts.headers,
-                body,
-            })
-        };
-        match timeout {
-            Some(limit) => tokio::time::timeout(limit, exchange)
-                .await
-                .map_err(|_| Error::Timeout)?,
-            None => exchange.await,
-        }
+        let sender = self.connect().await?;
+        read_buffered(sender, request, timeout, self.head_timeout).await
     }
 
     /// Sends `request` and returns as soon as the response head arrives; no timeout.
@@ -218,36 +196,8 @@ impl UnixClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let request = self.with_host_header(request);
-        let mut sender = self.connect().await?;
-        let resp = self.head(&mut sender, request).await?;
-        let (parts, body) = resp.into_parts();
-        Ok(StreamingResponse {
-            status: parts.status,
-            headers: parts.headers,
-            body,
-            _sender: sender,
-        })
-    }
-
-    /// Sends the request and waits for the response head, within the head timeout if one is set.
-    async fn head<B>(
-        &self,
-        sender: &mut SendRequest<B>,
-        request: Request<B>,
-    ) -> Result<hyper::Response<Incoming>, Error>
-    where
-        B: Body + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let sent = sender.send_request(request);
-        match self.head_timeout {
-            Some(limit) => tokio::time::timeout(limit, sent)
-                .await
-                .map_err(|_| Error::Timeout)?,
-            None => sent.await,
-        }
-        .map_err(|e| Error::Request(Cause(e)))
+        let sender = self.connect().await?;
+        read_head(sender, request, self.head_timeout).await
     }
 
     fn with_host_header<B>(&self, mut request: Request<B>) -> Request<B> {
@@ -257,4 +207,121 @@ impl UnixClient {
             .or_insert_with(|| self.host.clone());
         request
     }
+}
+
+/// One HTTP/1.1 client connection over `io` (the connection task is spawned).
+async fn handshake<I, B>(io: I) -> Result<SendRequest<B>, Error>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| Error::Handshake(Cause(e)))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(sender)
+}
+
+/// Sends the request and waits for the response head, within `head_timeout` if one is set.
+async fn send_head<B>(
+    sender: &mut SendRequest<B>,
+    request: Request<B>,
+    head_timeout: Option<Duration>,
+) -> Result<hyper::Response<Incoming>, Error>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let sent = sender.send_request(request);
+    match head_timeout {
+        Some(limit) => tokio::time::timeout(limit, sent)
+            .await
+            .map_err(|_| Error::Timeout)?,
+        None => sent.await,
+    }
+    .map_err(|e| Error::Request(Cause(e)))
+}
+
+async fn read_buffered<B>(
+    mut sender: SendRequest<B>,
+    request: Request<B>,
+    timeout: Option<Duration>,
+    head_timeout: Option<Duration>,
+) -> Result<Buffered, Error>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let exchange = async {
+        let resp = send_head(&mut sender, request, head_timeout).await?;
+        let (parts, body) = resp.into_parts();
+        let body = body
+            .collect()
+            .await
+            .map_err(|e| Error::Request(Cause(e)))?
+            .to_bytes();
+        Ok(Buffered {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+        })
+    };
+    match timeout {
+        Some(limit) => tokio::time::timeout(limit, exchange)
+            .await
+            .map_err(|_| Error::Timeout)?,
+        None => exchange.await,
+    }
+}
+
+async fn read_head<B>(
+    mut sender: SendRequest<B>,
+    request: Request<B>,
+    head_timeout: Option<Duration>,
+) -> Result<StreamingResponse<B>, Error>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let resp = send_head(&mut sender, request, head_timeout).await?;
+    let (parts, body) = resp.into_parts();
+    Ok(StreamingResponse {
+        status: parts.status,
+        headers: parts.headers,
+        body,
+        _sender: sender,
+    })
+}
+
+/// [`UnixClient::buffered`] over a stream the caller connected. `Host` must be set by the caller.
+pub async fn buffered_over<I, B>(
+    io: I,
+    request: Request<B>,
+    timeout: Option<Duration>,
+) -> Result<Buffered, Error>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    read_buffered(handshake(io).await?, request, timeout, None).await
+}
+
+/// [`UnixClient::open`] over a stream the caller connected. `Host` must be set by the caller.
+pub async fn open_over<I, B>(io: I, request: Request<B>) -> Result<StreamingResponse<B>, Error>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    read_head(handshake(io).await?, request, None).await
 }

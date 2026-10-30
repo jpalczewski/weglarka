@@ -27,6 +27,17 @@ pub struct Cli {
     #[arg(long, global = true, env = "WEGLARKA_SOCKET", value_name = "SOCKET")]
     pub socket: Option<PathBuf>,
 
+    /// Address of a remote host's admin panel (after `weglarka login`), e.g. `https://panel.example.com`:
+    /// the commands go through the panel instead of the local socket. Also `host` in `cli.toml`.
+    #[arg(
+        long,
+        global = true,
+        env = "WEGLARKA_HOST",
+        value_name = "URL",
+        conflicts_with = "socket"
+    )]
+    pub host: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -80,6 +91,13 @@ pub enum Command {
     /// Notifications: channel status and a test delivery.
     #[command(subcommand)]
     Notify(NotifyCommand),
+    /// Sign in to a remote host with the OAuth 2.0 device authorization grant: the command prints a
+    /// code, you approve it on any device, and the tokens are kept for later commands.
+    Login(crate::login::LoginArgs),
+    /// Sign out of a remote host: forget the tokens and ask the provider to revoke the session.
+    Logout,
+    /// Show the session with a remote host (refreshes the token when it is about to expire).
+    Whoami,
 }
 
 #[derive(Debug, Subcommand)]

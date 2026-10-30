@@ -12,6 +12,9 @@ use crate::error::{CliError, Kind};
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    /// Address of a remote host's admin panel (`https://panel.example.com`): commands go through
+    /// it, with the tokens of `weglarka login`, unless `--socket` is given.
+    pub host: Option<String>,
     /// SSH destination of the Węglarka host (`host`, `user@host` or an `ssh_config` alias):
     /// `weglarka forward` tunnels through it.
     pub ssh_host: Option<String>,
@@ -24,7 +27,7 @@ impl UserConfig {
                 Kind::Config,
                 format!("invalid CLI settings {}: {e}", origin.display()),
             )
-            .with_hint("the only key is `ssh_host = \"user@host\"`")
+            .with_hint("the keys are `host = \"https://panel.example.com\"` and `ssh_host = \"user@host\"`")
         })
     }
 
@@ -66,13 +69,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_file_takes_ssh_host_and_nothing_else() {
+    fn the_file_takes_host_and_ssh_host_and_nothing_else() {
         let origin = Path::new("cli.toml");
         assert_eq!(
             UserConfig::parse("ssh_host = \"me@deploy\"\n", origin).unwrap(),
             UserConfig {
-                ssh_host: Some("me@deploy".into())
+                ssh_host: Some("me@deploy".into()),
+                host: None,
             }
+        );
+        assert_eq!(
+            UserConfig::parse("host = \"https://panel.example.com\"\n", origin)
+                .unwrap()
+                .host
+                .as_deref(),
+            Some("https://panel.example.com")
         );
         assert_eq!(
             UserConfig::parse("", origin).unwrap(),

@@ -140,11 +140,13 @@ impl CliError {
                 Some("the daemon is still busy (deploy in progress) — try again in a moment"),
             ),
             ErrorCode::InvalidRequest => (Kind::InvalidRequest, None),
-            // Only the token listener answers these; the CLI talks to the unix socket, so they
-            // appear once `weglarka login` exists (#93).
+            // Only the token listener (reached through the panel's relay) answers these.
             ErrorCode::Unauthorized | ErrorCode::Forbidden => (
                 Kind::InvalidRequest,
-                Some("the token listener refused the request: check the token and its groups"),
+                Some(
+                    "the host refused the token: sign in again with `weglarka login`, \
+                     and check that your account is in a group with this access",
+                ),
             ),
             ErrorCode::Internal => (
                 Kind::Internal,

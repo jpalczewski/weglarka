@@ -1,6 +1,7 @@
 //! Backends and the `location`s rendered for them.
 
-use weglarka_model::app::AppIngress;
+use weglarka_model::admin_auth::{RELAY_MAX_BODY_BYTES, RELAY_PREFIX};
+use weglarka_model::app::{AppIngress, BodySizeLimit};
 
 use super::NginxOptions;
 use super::common::{
@@ -43,6 +44,9 @@ struct Location<'a> {
     /// gets the raw request URI, so a request that only an upstream treating `;` or `\` as path
     /// syntax would resolve elsewhere (`/mcp/..;/admin`) is refused instead of passed on unguarded.
     exempt: bool,
+    /// The admin API relay of an `[admin.http] clients` app (docs/decisions/0060): no `auth_request`
+    /// (the daemon checks the bearer token), the long-lived stream directives, and the upload body limit.
+    relay: bool,
 }
 
 /// The `location`(s) of one `(app, path)`. The root prefix is a plain `location /`; any other prefix
@@ -64,10 +68,18 @@ fn path_locations<'a>(
             long_lived: false,
             auth,
             exempt: false,
+            relay: false,
         }]
         .into_iter()
         .chain(streaming_locations(ingress, app, auth))
         .chain(exempt_locations(&route.auth_exempt, app))
+        .chain(
+            route
+                .admin_relay
+                .then(|| relay_locations(app))
+                .into_iter()
+                .flatten(),
+        )
         .collect();
     }
     let p = path.as_str();
@@ -92,6 +104,7 @@ fn path_locations<'a>(
             long_lived: false,
             auth,
             exempt: false,
+            relay: false,
         },
         Location {
             header: format!("location ^~ {p}/"),
@@ -100,6 +113,7 @@ fn path_locations<'a>(
             long_lived: false,
             auth,
             exempt: false,
+            relay: false,
         },
     ]
 }
@@ -121,6 +135,7 @@ fn streaming_locations<'a>(
                 long_lived: true,
                 auth,
                 exempt: false,
+                relay: false,
             })
     })
 }
@@ -144,8 +159,29 @@ fn exempt_locations<'a>(
                 long_lived: false,
                 auth: false,
                 exempt: true,
+                relay: false,
             })
     })
+}
+
+/// The relay prefix: the exact path and everything below it, never guarded by forward auth. The same
+/// `;`/`\\`/`%25` guard as an exempt path refuses the ways of writing a path differently.
+fn relay_locations(app: Option<&str>) -> Vec<Location<'_>> {
+    [
+        format!("location = {RELAY_PREFIX}"),
+        format!("location ^~ {RELAY_PREFIX}/"),
+    ]
+    .into_iter()
+    .map(|header| Location {
+        header,
+        strip: None,
+        app,
+        long_lived: false,
+        auth: false,
+        exempt: true,
+        relay: true,
+    })
+    .collect()
 }
 
 impl Backend<'_> {
@@ -163,7 +199,15 @@ impl Backend<'_> {
             stream_timeout_secs: AppIngress::STREAMING_PATH_TIMEOUT_SECS,
             ..ingress.clone()
         };
-        let ingress = if location.long_lived {
+        // The relay streams uploads and answers that are silent until a deploy ends: long-lived
+        // directives and the largest body the daemon accepts.
+        let relay = AppIngress {
+            max_body_size: BodySizeLimit::from_bytes(RELAY_MAX_BODY_BYTES).ok(),
+            ..long_lived.clone()
+        };
+        let ingress = if location.relay {
+            &relay
+        } else if location.long_lived {
             &long_lived
         } else {
             ingress

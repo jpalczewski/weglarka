@@ -118,6 +118,31 @@ weglarka oidc clients remove forge
 Generate a digest with `authelia crypto hash generate pbkdf2 --variant sha512 --iterations 310000 --password <secret>`.
 A client id must not equal any app name.
 
+### Device authorization grant
+
+`device_flow = true` (on `[apps.<name>.oidc]` and on `[oidc_clients.<id>]`) adds the OAuth 2.0 device authorization
+grant (RFC 8628, `urn:ietf:params:oauth:grant-type:device_code`) to the client, so a program with no browser can sign a
+person in: it shows a short code, the person approves it on another device, and the provider applies its authorization
+policy (two factors by default). The provider must advertise a `device_authorization_endpoint` in its discovery document;
+Authelia does. It is how `weglarka login` is meant to authenticate ([ADR 0060](../decisions/0060-remote-cli-device-login-via-the-panel.md)),
+as a public client:
+
+```toml
+[oidc_clients.cli]
+name = "weglarka CLI"
+public = true
+device_flow = true
+scopes = ["openid", "profile", "groups", "offline_access"]
+audience = ["https://admin.example.com/api/"]   # byte for byte equal to [admin.http] audience
+access_token = "jwt"
+groups_in_access_token = true
+```
+
+A client with `device_flow` may leave `redirect_uris` out; it then has no authorization code grant, only the device grant
+(and `refresh_token` when `offline_access` is in its scopes). With redirect URIs it has both. The flag is render-only,
+like the other client fields: changing it restarts the provider, never an app. Left unset, the rendered file is byte for
+byte what it was before.
+
 ## Migrating a hand-written configuration
 
 1. Delete `access_control` (including `default_policy`) and `identity_providers.oidc.clients` from the base file.
@@ -155,3 +180,6 @@ every `oidc` section and `[oidc_clients]`, or restore the state files from a cop
 Removing them stops generation; the provider keeps the last files it was given, so give it a hand-written configuration
 again first, then downgrade. The minted secrets stay in `secrets.toml` until you remove them
 (`apps remove --purge-secrets`).
+
+`device_flow` was added at schema version 15: a file that carries it is refused by an older Węglarka the same way, so remove
+the key (and any client left with no `redirect_uris`) before downgrading.

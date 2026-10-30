@@ -49,6 +49,7 @@ follow a login redirect. List them in `auth_exempt_paths`:
 - The guard is a denylist of the common ways a path is read differently by nginx and an upstream. It assumes the upstream
   does not resolve dot-segments from overlong or non-ASCII input and does not Unicode-normalize paths; exempt only paths
   that the app protects by itself (tokens), never ones that rely on the path layout.
+- An `[admin.http] clients` app (the [admin panel](admin-panel.md)) gets `/_weglarka/api` exempted and streaming by itself; you do not list it, and an entry of yours that overlaps it is refused.
 - `kind = "static"` apps cannot use forward auth. Exempt paths must not overlap `streaming_paths`, and cannot be combined with `paths` (prefix routing).
 
 ## Access rules

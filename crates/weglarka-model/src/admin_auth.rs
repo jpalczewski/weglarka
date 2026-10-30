@@ -23,6 +23,14 @@ pub const SOCKET_NAME: &str = "api.sock";
 /// Where a client container sees the token socket.
 pub const CONTAINER_SOCKET_DIR: &str = "/run/weglarka-admin";
 pub const CONTAINER_SOCKET: &str = "/run/weglarka-admin/api.sock";
+/// Where an `[admin.http] clients` app that is the admin panel serves its bearer-only relay to the
+/// token socket (docs/decisions/0060). The ingress carves this path out of the app's forward auth and
+/// gives it the long-lived stream settings itself, so an operator configures neither. A prefix no
+/// ordinary app serves, so exempting it from the identity provider unprotects nothing real.
+pub const RELAY_PREFIX: &str = "/_weglarka/api";
+/// The largest body the relay passes (an image archive or a volume import); also the ingress's body
+/// limit on [`RELAY_PREFIX`].
+pub const RELAY_MAX_BODY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// What a token may do on the token listener. `Admin` implies `Read`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

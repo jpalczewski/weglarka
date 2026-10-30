@@ -1,0 +1,56 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: text
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "claims_policies": {},
+      "clients": [
+        {
+          "client_id": "cli",
+          "client_name": "weglarka CLI",
+          "public": true,
+          "scopes": [
+            "openid",
+            "profile",
+            "groups",
+            "offline_access"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "none",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256",
+          "grant_types": [
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "refresh_token"
+          ]
+        },
+        {
+          "client_id": "tv",
+          "client_name": "Device and browser",
+          "public": true,
+          "redirect_uris": [
+            "https://tv.example.com/cb"
+          ],
+          "scopes": [
+            "openid",
+            "offline_access"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "none",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256",
+          "response_types": [
+            "code"
+          ],
+          "grant_types": [
+            "authorization_code",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "refresh_token"
+          ]
+        }
+      ]
+    }
+  }
+}

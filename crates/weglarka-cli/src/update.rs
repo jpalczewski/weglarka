@@ -1351,6 +1351,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         let o = Overrides {
             config: None,
             socket: Some(m.socket.clone()),
+            host: None,
         };
         let code = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
@@ -1383,6 +1384,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         let o = Overrides {
             config: None,
             socket: Some(m.socket.clone()),
+            host: None,
         };
         let err = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
@@ -1404,6 +1406,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         let o = Overrides {
             config: None,
             socket: Some(m.socket.clone()),
+            host: None,
         };
         let mut a = args(&["--domain", "new.example.eu"]);
         a.dry_run = true;

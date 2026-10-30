@@ -19,6 +19,7 @@ use weglarka_api::{
 use weglarka_unix_http::{StreamingResponse, UnixClient};
 
 use crate::error::{CliError, Kind};
+use crate::login::remote::Remote;
 
 /// Deploy waits for the image pull and the health gate, so the overall timeout is long.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -63,8 +64,82 @@ impl RunStream {
 }
 
 pub struct ApiClient {
-    http: UnixClient,
+    backend: Backend,
     busy_wait: Duration,
+}
+
+/// Where requests go: the local daemon's socket, or a remote host's panel relay.
+enum Backend {
+    Unix(UnixClient),
+    Remote(Box<Remote>),
+}
+
+impl Backend {
+    async fn buffered<B>(
+        &self,
+        request: Request<B>,
+        timeout: Option<Duration>,
+        what: &str,
+    ) -> Result<weglarka_unix_http::Buffered, CliError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        match self {
+            Self::Unix(http) => http
+                .buffered(request, timeout)
+                .await
+                .map_err(|e| map_transport(e, what, |cause| unreachable_socket(http, &cause))),
+            Self::Remote(remote) => remote.buffered(request, timeout, what).await,
+        }
+    }
+
+    async fn open<B>(
+        &self,
+        request: Request<B>,
+        what: &str,
+    ) -> Result<StreamingResponse<B>, CliError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        match self {
+            Self::Unix(http) => http
+                .open(request)
+                .await
+                .map_err(|e| map_transport(e, what, |cause| unreachable_socket(http, &cause))),
+            Self::Remote(remote) => remote.open(request, what).await,
+        }
+    }
+}
+
+/// Connection failures become `Unreachable` (built by `unreachable`), a timeout and everything
+/// else an internal error prefixed with `what`.
+pub(crate) fn map_transport(
+    e: weglarka_unix_http::Error,
+    what: &str,
+    unreachable: impl FnOnce(String) -> CliError,
+) -> CliError {
+    if matches!(e, weglarka_unix_http::Error::Timeout) {
+        CliError::internal("request to daemon timed out")
+    } else if e.is_connect() {
+        unreachable(e.to_string())
+    } else {
+        CliError::internal(format!("{what}: {e}"))
+    }
+}
+
+fn unreachable_socket(http: &UnixClient, cause: &str) -> CliError {
+    CliError::new(
+        Kind::Unreachable,
+        format!("cannot connect to {}: {cause}", http.socket().display()),
+    )
+    .with_hint(
+        "is the daemon running and do you have permission for the socket? \
+         Change the path with --socket / WEGLARKA_SOCKET; diagnosis without the daemon: `weglarka doctor --preflight`",
+    )
 }
 
 /// Substitutes `{param}` in an endpoint path. Values must already be validated
@@ -105,9 +180,19 @@ pub(crate) fn method_str(m: Method) -> &'static str {
 impl ApiClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
-            http: UnixClient::new(socket).with_host(HeaderValue::from_static("weglarka")),
+            backend: Backend::Unix(
+                UnixClient::new(socket).with_host(HeaderValue::from_static("weglarka")),
+            ),
             busy_wait: BUSY_WAIT,
         }
+    }
+
+    /// A client of a remote host, through its panel (`weglarka login` first).
+    pub fn remote(host: &str) -> Result<Self, CliError> {
+        Ok(Self {
+            backend: Backend::Remote(Box::new(Remote::new(host)?)),
+            busy_wait: BUSY_WAIT,
+        })
     }
 
     /// How long `busy` answers are retried (default `BUSY_WAIT`; zero = no retry).
@@ -187,30 +272,14 @@ impl ApiClient {
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
 
         let resp = self
-            .http
-            .buffered(req, Some(REQUEST_TIMEOUT))
-            .await
-            .map_err(|e| match e {
-                weglarka_unix_http::Error::Timeout => {
-                    CliError::internal("request to daemon timed out")
-                }
-                e => self.map_error(e, "request to daemon failed"),
-            })?;
+            .backend
+            .buffered(req, Some(REQUEST_TIMEOUT), "request to daemon failed")
+            .await?;
 
         if resp.status.is_success() {
             Ok(resp.body.to_vec())
         } else {
             Err(error_from_response(resp.status, &resp.body))
-        }
-    }
-
-    /// Connection failures become `Unreachable` (with the socket hint); everything else is an
-    /// internal error prefixed with `what`.
-    fn map_error(&self, e: weglarka_unix_http::Error, what: &str) -> CliError {
-        if e.is_connect() {
-            self.unreachable(&e.to_string())
-        } else {
-            CliError::internal(format!("{what}: {e}"))
         }
     }
 
@@ -273,10 +342,9 @@ impl ApiClient {
             .body(body)
             .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
         let resp = self
-            .http
-            .buffered(req, None)
-            .await
-            .map_err(|e| self.map_error(e, "upload to daemon failed"))?;
+            .backend
+            .buffered(req, None, "upload to daemon failed")
+            .await?;
         if resp.status.is_success() {
             Ok(resp.body)
         } else {
@@ -340,10 +408,7 @@ impl ApiClient {
         &self,
         req: Request<Full<Bytes>>,
     ) -> Result<StreamingResponse<Full<Bytes>>, CliError> {
-        self.http
-            .open(req)
-            .await
-            .map_err(|e| self.map_error(e, "request to daemon failed"))
+        self.backend.open(req, "request to daemon failed").await
     }
 
     /// Reads the rest of a response body (an error body, in practice).
@@ -378,17 +443,6 @@ impl ApiClient {
         }
         Ok(resp)
     }
-
-    fn unreachable(&self, cause: &str) -> CliError {
-        CliError::new(
-            Kind::Unreachable,
-            format!("cannot connect to {}: {cause}", self.http.socket().display()),
-        )
-        .with_hint(
-            "is the daemon running and do you have permission for the socket? \
-             Change the path with --socket / WEGLARKA_SOCKET; diagnosis without the daemon: `weglarka doctor --preflight`",
-        )
-    }
 }
 
 pub(crate) fn error_from_response(status: StatusCode, body: &[u8]) -> CliError {
@@ -416,7 +470,9 @@ where
         match attempt().await {
             Err(e) if e.is_busy() && tokio::time::Instant::now() + pause < deadline => {
                 if !announced {
-                    eprintln!("daemon is busy (deploy in progress), waiting…");
+                    eprintln!(
+                        "the daemon is busy (a deploy is in progress, or the host is limiting requests), waiting…"
+                    );
                     announced = true;
                 }
                 tokio::time::sleep(pause).await;

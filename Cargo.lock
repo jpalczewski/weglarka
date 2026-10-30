@@ -2067,19 +2067,26 @@ dependencies = [
 name = "weglarka-cli"
 version = "0.0.6"
 dependencies = [
+ "bytes",
  "clap",
  "futures-util",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "insta",
+ "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "webpki-roots",
  "weglarka-api",
  "weglarka-engine",
  "weglarka-model",
+ "weglarka-oidc",
  "weglarka-unix-http",
 ]
 
@@ -2226,6 +2233,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "weglarka-oidc"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "weglarka-panel"
 version = "0.1.0"
 dependencies = [
@@ -2250,6 +2270,7 @@ dependencies = [
  "weglarka-api",
  "weglarka-http",
  "weglarka-model",
+ "weglarka-oidc",
  "weglarka-unix-http",
 ]
 

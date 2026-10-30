@@ -86,7 +86,7 @@ Notes on each part:
 - **Health.** `GET /healthz` answers `200 ok` without a session. The daemon's probe reaches it through the ingress probe
   socket, which forward auth lets through, so `auth_exempt_paths` is not needed for Węglarka's own health gate. List it
   only if an *external* monitor must reach it ([forward auth](forward-auth.md)). Paths other than `/healthz`,
-  `/static/*`, `/auth/login` and `/auth/callback` need a session, so exempting `/healthz` exposes nothing else.
+  `/static/*`, `/auth/login`, `/auth/callback` and `/_weglarka/api/*` (bearer only, [see below](#the-api-relay-for-weglarka-login)) need a session, so exempting `/healthz` exposes nothing else.
 - **Forward auth in front.** The panel does its own OpenID Connect login, so forward auth is a second gate: it keeps the
   login page, the assets and the callback away from anyone who is not in `auth_groups`. The provider session cookie domain
   must cover `panel.example.com`. You can leave `ingress.auth` out and rely on the panel's own login and the daemon's
@@ -120,7 +120,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | `PANEL_SESSION_IDLE_SECS` | `1800` | A session ends after this long without a request (60 to 86400); must not exceed the maximum. |
 | `PANEL_SESSION_MAX_SECS` | `28800` | A session ends this long after login, however active (300 to 604800). |
 | `OIDC_ENDPOINT_HOSTS` | none | Comma-separated host names, besides the issuer's, that the discovery document may name for `token_endpoint` and `jwks_uri`. By default both must be on the issuer's host and port, so a poisoned discovery document cannot redirect the client secret. |
-| `PANEL_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR ranges (for example the Traefik network) whose `X-Forwarded-For` the panel believes. Sign-in callbacks are limited to 20 per minute per client address ([ADR 0059](../decisions/0059-panel-login-callback-rate-limit.md)); the client is the connection's peer, or, for a trusted peer, the right-most forwarded address that is not itself trusted. Behind a proxy set this, otherwise all clients share the proxy's address and one budget. Leave it empty when nothing sits in front of the panel (`edge` mode). |
+| `PANEL_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR ranges (for example the Traefik network) whose `X-Forwarded-For` the panel believes. Sign-in callbacks are limited to 20 per minute per client address ([ADR 0059](../decisions/0059-panel-login-callback-rate-limit.md)); the client is the connection's peer, or, for a trusted peer, the right-most forwarded address that is not itself trusted. Behind a proxy set this, otherwise all clients share the proxy's address and one budget: Traefik's network in `behind` mode, Węglarka's own nginx in `edge` mode (it sets `X-Forwarded-For` from the client address). The same address also keys the `/api` relay's rate limit. Leave it empty only when the panel's port is reachable without a proxy. |
 | `PANEL_LISTEN` | `0.0.0.0:8080` | Listen address inside the container. Leave it unless you also change `port`. |
 | `WEGLARKA_PANEL_SOCKET` | `/run/weglarka-admin/api.sock` | The daemon's token socket (also `--socket`). |
 | `PANEL_REQUEST_TIMEOUT_SECS` | `10` | How long the daemon may take to answer a request (1 to 120). |
@@ -165,6 +165,41 @@ restart that recreates it) signs everybody out, and users just log in again. The
 
 A request whose lowest-scope (`read`) call is refused by the daemon (`401`, or `403` because the groups map to no scope)
 ends the session immediately and shows the sign-in page. A `403` on a higher-scope call (the logs) keeps the session.
+
+## The API relay for `weglarka login`
+
+`/_weglarka/api/v1/*` is a second, non-browser face of the panel ([ADR 0060](../decisions/0060-remote-cli-device-login-via-the-panel.md)):
+it forwards a request, byte for byte, to the daemon's token socket, so the CLI can work with a remote host after
+[`weglarka login`](remote-cli.md). `GET https://panel.example.com/_weglarka/api/v1/apps` reaches `GET /v1/apps` on the daemon.
+
+- **It decides nothing.** The caller's own `Authorization: Bearer …` goes through unchanged and the daemon verifies the
+  signature, audience and groups and applies the scope, exactly as for the panel's own calls. A compromised panel
+  cannot make a token more powerful than the daemon says it is.
+- **Bearer only.** No cookie is read or forwarded, and the session gate does not apply to the relay, so a browser session
+  cannot authenticate there. A request without a `Bearer` credential is refused (`401`) before the daemon is asked,
+  except `GET /v1/health`.
+- **Only declared endpoints.** A method and path must match an entry of the admin API's endpoint table, with a path
+  parameter being a single segment of `[A-Za-z0-9_.-]`; anything else is `404`. Only `Authorization`, `Content-Type`,
+  `Accept` and `Content-Length` are forwarded.
+- **Limits.** 300 requests per minute per client address, and 64 relayed requests in flight at once (a stream holds a
+  slot until it ends); beyond that the answer is `429` with `Retry-After` and the `busy` error code, which makes the CLI
+  back off and retry. A JSON request body may be 1 MiB; image archives (`push`) and volume imports 8 GiB.
+- **Streams** (logs, events) pass through unbuffered and end where the daemon ends them, including its `TokenExpired`
+  frame when the token expires.
+
+**Nothing to configure.** The instance listed in `[admin.http] clients` is the panel, and Węglarka carves the relay
+prefix `/_weglarka/api` out of that app's `location /` by itself (the same mechanism as
+[forward auth](forward-auth.md) exemptions and [streaming](streaming.md) paths, rendered with the rest of `nginx.conf`):
+no forward-auth login on it (the CLI sends a token, not a cookie; the daemon checks the token), buffering off for bodies
+and answers, an idle timeout of an hour (a deploy through the relay is silent until the health gate ends), and a body
+limit of 8 GiB. The rest of the panel keeps its forward auth and its defaults. Nothing is written to `apps.toml`.
+
+- The prefix exists on every `clients` instance that is served at `/` (not under `paths`), so only list the panel
+  there, or an app that serves nothing at `/_weglarka/` of its own. A `streaming_paths` or `auth_exempt_paths` entry
+  that overlaps the prefix is refused, because the carve-out owns it.
+- `weglarka run`, `push` and `forward` are not claimed to work through the relay yet; they need a request body that
+  streams while the answer does, and stay on the socket (SSH) path until that is tested end to end.
+- Set `PANEL_TRUSTED_PROXIES` too, or every client shares one rate-limit budget.
 
 ## Security properties
 

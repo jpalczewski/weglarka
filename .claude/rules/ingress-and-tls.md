@@ -29,6 +29,10 @@ paths:
   loses the client address; `weglarka.ingress-hash` = v5 in both modes (mount of `probe/`, ADR 0054). Ports < 1024 need
   a sysctl and `[runtime] allow_privileged_host_ports`.
 
+- **Admin relay carve-out (ADR 0060):** `Plan::build` sets `AppRoute::admin_relay` for an `[admin.http] clients` app served
+  at `/`, and the nginx generator renders `RELAY_PREFIX` (`weglarka_model::admin_auth`) as unguarded, long-lived locations
+  with the upload body limit. Derived from the host config, never from the spec (no `spec_hash`, no `apps.toml` field).
+
 ## Entry points
 
 | Area | Files |
