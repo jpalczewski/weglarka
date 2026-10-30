@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/v0.0.6...v0.0.7) - 2026-10-30
+
+### Added
+
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
+### Fixed
+
+- *(daemon)* exhaustive read-scope projection below the first nesting level ([#333](https://github.com/jpalczewski/weglarka/pull/333))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/v0.0.5...v0.0.6) - 2026-10-30
 
 ### Fixed

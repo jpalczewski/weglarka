@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.1...weglarka-identity-v0.0.2) - 2026-10-30
+
+### Added
+
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
 ## [0.0.1](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.0...weglarka-identity-v0.0.1) - 2026-10-29
 
 ### Added

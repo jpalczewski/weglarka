@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.0.6...weglarka-cli-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
+### Other
+
+- *(cli)* bump weglarka-cli to 0.1.0 ([#343](https://github.com/jpalczewski/weglarka/pull/343))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.0.5...weglarka-cli-v0.0.6) - 2026-10-30
 
 ### Other
