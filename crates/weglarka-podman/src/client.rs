@@ -6,10 +6,10 @@ use futures_core::Stream;
 use futures_util::stream;
 use hyper::Method;
 use weglarka_model::podman::{
-    ContainerFilter, ContainerInfo, ContainerSpec, EventFilter, HealthStatus, ImageInfo,
-    LoadedImage, LogOptions, LogStream, NetworkInfo, NetworkSpec, NetworkSummary, PodmanClient,
-    PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream, VersionInfo,
-    VolumeFilter, VolumeInfo, VolumeSpec,
+    ContainerFilter, ContainerInfo, ContainerSpec, ContainerStats, EventFilter, HealthStatus,
+    ImageInfo, LoadedImage, LogOptions, LogStream, NetworkInfo, NetworkSpec, NetworkSummary,
+    PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream,
+    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 use crate::registry_auth;
@@ -19,8 +19,8 @@ use crate::wire::{
     ConnectNetwork, CreateContainer, CreateExec, CreateNetwork, CreateVolume, CreatedContainer,
     CreatedExec, DisconnectNetwork, HealthReport, Info, InspectContainer, InspectExec,
     InspectImage, InspectNetwork, ListedContainer, ListedImage, ListedNetwork, LoadReport,
-    LogDemux, NetworkRmReport, PullLine, PullReport, StartExec, Version, WireEvent, WireVolume,
-    decode, health_status, parse_wait,
+    LogDemux, NetworkRmReport, PullLine, PullReport, StartExec, StatsReport, Version, WireEvent,
+    WireVolume, decode, health_status, parse_wait,
 };
 
 /// libpod client over a unix socket. Cheap to clone (shares only the socket path);
@@ -243,6 +243,15 @@ impl PodmanClient for LibpodClient {
             }
         }
         Ok(containers)
+    }
+
+    async fn container_stats(&self) -> Result<Vec<ContainerStats>> {
+        // No `containers=`: libpod answers 404 for the whole call when one named container is unknown.
+        let body = self
+            .transport
+            .call(Method::GET, "/containers/stats?stream=false", None)
+            .await?;
+        decode::<StatsReport>(&body)?.into_domain()
     }
 
     fn image_pull_with(

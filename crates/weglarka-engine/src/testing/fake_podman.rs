@@ -14,15 +14,16 @@ use sha2::{Digest as _, Sha256};
 
 use weglarka_model::app::Digest;
 use weglarka_model::podman::{
-    ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, EventFilter, HealthStatus,
-    ImageInfo, LoadedImage, LogChunk, LogOptions, LogSource, LogStream, NetworkInfo, NetworkSpec,
-    NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result,
-    TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
+    ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, ContainerStats, EventFilter,
+    HealthStatus, ImageInfo, LoadedImage, LogChunk, LogOptions, LogSource, LogStream, NetworkInfo,
+    NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth,
+    Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
+    ContainerStats,
     ContainerCreate(String),
     ContainerStart(String),
     ContainerStop(String),
@@ -131,6 +132,9 @@ struct State {
     run_scripts: BTreeMap<String, RunScript>,
     /// Logs scripted per container name ([`FakePodman::script_logs`]).
     log_scripts: BTreeMap<String, LogScript>,
+    /// Scripted `container_stats` ([`FakePodman::script_stats`]).
+    stats_script: Option<Vec<ContainerStats>>,
+    stats_error: Option<String>,
     /// Held-open follow streams that have not been dropped yet.
     open_log_streams: Arc<AtomicUsize>,
     containers: BTreeMap<String, ContainerInfo>,
@@ -273,6 +277,7 @@ impl FakePodman {
                 published_ports: Vec::new(),
                 restarts: 0,
                 started_at: Some(FAKE_STARTED_AT.to_owned()),
+                memory_limit: None,
             },
         );
     }
@@ -330,6 +335,18 @@ impl FakePodman {
     /// script and is not consumed by reading.
     pub fn script_logs(&self, name: &str, script: LogScript) {
         self.lock().log_scripts.insert(name.to_owned(), script);
+    }
+
+    /// What `container_stats` reports: replaces an earlier script and is not consumed by reading. Like
+    /// libpod, the call lists only running containers, so entries for containers that are not running
+    /// are left out. Without a script every running container reports `0` (no data).
+    pub fn script_stats(&self, stats: impl IntoIterator<Item = ContainerStats>) {
+        self.lock().stats_script = Some(stats.into_iter().collect());
+    }
+
+    /// Makes `container_stats` fail (a protocol error with this text) until cleared with `None`.
+    pub fn fail_stats(&self, error: Option<&str>) {
+        self.lock().stats_error = error.map(str::to_owned);
     }
 
     /// How many held-open `follow` log streams ([`LogScript::hold_open`]) are alive: a consumer that
@@ -597,6 +614,7 @@ impl PodmanClient for FakePodman {
                 networks: Vec::new(),
                 addresses: Vec::new(),
                 published_ports: spec.publish.clone(),
+                memory_limit: spec.resources.memory.map(|m| m.bytes()),
             },
         );
         Ok(id)
@@ -679,6 +697,35 @@ impl PodmanClient for FakePodman {
             )));
         }
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
+    }
+
+    async fn container_stats(&self) -> Result<Vec<ContainerStats>> {
+        let mut s = self.lock();
+        s.calls.push(Call::ContainerStats);
+        if let Some(error) = s.stats_error.clone() {
+            return Err(PodmanError::Protocol(error));
+        }
+        let running = |name: &str| {
+            s.containers
+                .get(name)
+                .is_some_and(|c| c.state == ContainerState::Running)
+        };
+        Ok(match &s.stats_script {
+            Some(script) => script
+                .iter()
+                .filter(|c| running(&c.name))
+                .cloned()
+                .collect(),
+            None => s
+                .containers
+                .values()
+                .filter(|c| c.state == ContainerState::Running)
+                .map(|c| ContainerStats {
+                    name: c.name.clone(),
+                    memory_usage: 0,
+                })
+                .collect(),
+        })
     }
 
     async fn container_logs(&self, name: &str, options: &LogOptions) -> Result<LogStream> {

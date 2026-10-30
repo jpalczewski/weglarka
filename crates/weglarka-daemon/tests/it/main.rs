@@ -18,6 +18,7 @@ mod identity;
 mod images;
 mod ingress;
 mod logs;
+mod memory;
 mod notify;
 mod oidc_credentials;
 mod push;

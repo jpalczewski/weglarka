@@ -8,9 +8,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weglarka_model::app::{Digest, Resources, SecretTarget};
 use weglarka_model::podman::{
-    ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, EventKind, HealthStatus,
-    IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkSpec, NetworkSummary, PodmanError,
-    PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo, VolumeInfo, VolumeSpec, image_repo,
+    ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, ContainerStats, EventKind,
+    HealthStatus, IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkSpec,
+    NetworkSummary, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
+    VolumeInfo, VolumeSpec, image_repo,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -469,6 +470,15 @@ pub(crate) struct InspectContainer {
     restart_count: u32,
     #[serde(rename = "NetworkSettings")]
     network_settings: InspectNetworkSettings,
+    #[serde(rename = "HostConfig")]
+    host_config: InspectHostConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct InspectHostConfig {
+    /// Memory limit in bytes; `0` = none.
+    memory: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -585,7 +595,45 @@ impl InspectContainer {
             networks: networks.keys().cloned().collect(),
             addresses: addresses.into_iter().collect(),
             published_ports,
+            memory_limit: (self.host_config.memory > 0).then_some(self.host_config.memory),
         }
+    }
+}
+
+// ---- stats ----
+
+/// `GET /containers/stats?stream=false`. Never use the entries' `MemLimit`: without a limit libpod
+/// reports the host's RAM there.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub(crate) struct StatsReport {
+    error: Option<serde_json::Value>,
+    /// `null` when no container runs.
+    stats: Option<Vec<WireStats>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct WireStats {
+    name: String,
+    mem_usage: u64,
+}
+
+impl StatsReport {
+    pub(crate) fn into_domain(self) -> Result<Vec<ContainerStats>> {
+        // libpod reports a failure for the whole call as a non-null `Error` object.
+        if let Some(error) = self.error.filter(|e| !e.is_null()) {
+            return Err(PodmanError::Protocol(format!("container stats: {error}")));
+        }
+        Ok(self
+            .stats
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| ContainerStats {
+                name: s.name.trim_start_matches('/').to_owned(),
+                memory_usage: s.mem_usage,
+            })
+            .collect())
     }
 }
 
@@ -1080,6 +1128,67 @@ mod tests {
             "libpod `RestartCount` maps to `ContainerInfo::restarts`"
         );
         assert_eq!(info.started_at.as_deref(), Some("2026-10-23T10:00:01Z"));
+    }
+
+    #[test]
+    fn stats_report_reads_name_and_working_set() {
+        let stats = decode::<StatsReport>(
+            br#"{"Error":null,"Stats":[{"ContainerID":"a","Name":"app-1","MemUsage":1048576,"MemLimit":8589934592,"CPU":1.5},{"Name":"/b","MemUsage":0}]}"#,
+        )
+        .unwrap()
+        .into_domain()
+        .unwrap();
+        assert_eq!(
+            stats,
+            vec![
+                ContainerStats {
+                    name: "app-1".into(),
+                    memory_usage: 1_048_576
+                },
+                ContainerStats {
+                    name: "b".into(),
+                    memory_usage: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_null_is_an_empty_list() {
+        let stats = decode::<StatsReport>(br#"{"Error":null,"Stats":null}"#)
+            .unwrap()
+            .into_domain()
+            .unwrap();
+        assert!(stats.is_empty());
+        let none = decode::<StatsReport>(b"{}").unwrap().into_domain().unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn stats_error_maps_to_podman_error() {
+        let err = decode::<StatsReport>(
+            br#"{"Error":{"cause":"boom","message":"no stats"},"Stats":null}"#,
+        )
+        .unwrap()
+        .into_domain()
+        .unwrap_err();
+        assert!(matches!(err, PodmanError::Protocol(m) if m.contains("no stats")));
+    }
+
+    #[test]
+    fn inspect_memory_limit_zero_is_none() {
+        let limited = decode::<InspectContainer>(br#"{"Id":"1","HostConfig":{"Memory":67108864}}"#)
+            .unwrap()
+            .into_domain();
+        assert_eq!(limited.memory_limit, Some(67_108_864));
+        let unlimited = decode::<InspectContainer>(br#"{"Id":"1","HostConfig":{"Memory":0}}"#)
+            .unwrap()
+            .into_domain();
+        assert_eq!(unlimited.memory_limit, None);
+        let absent = decode::<InspectContainer>(br#"{"Id":"1"}"#)
+            .unwrap()
+            .into_domain();
+        assert_eq!(absent.memory_limit, None);
     }
 
     #[test]
