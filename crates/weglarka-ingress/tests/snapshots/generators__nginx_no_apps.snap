@@ -30,10 +30,14 @@ http {
         default 0;
         10.89.0.0/24 1;
     }
-    map "$weglarka_trusted:$http_x_forwarded_proto" $weglarka_proto {
+    map "$weglarka_trusted:$http_x_forwarded_proto" $weglarka_proto_peer {
         default $scheme;
         "1:https" https;
         "1:http" http;
+    }
+    map "$remote_addr:$http_x_forwarded_proto" $weglarka_proto {
+        default $weglarka_proto_peer;
+        "unix::https" https;
     }
     map "$weglarka_trusted:$http_x_forwarded_proto" $weglarka_redirect_https {
         default 0;

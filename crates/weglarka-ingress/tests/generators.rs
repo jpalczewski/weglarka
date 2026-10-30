@@ -874,6 +874,38 @@ fn edge_probe_socket_serves_domains_without_a_certificate() {
     assert!(server_block(&conf, "nz.example.eu").contains("return 301"));
 }
 
+/// Issue #321: the identity provider refuses OIDC requests that claim plain HTTP, so the daemon's
+/// `X-Forwarded-Proto: https` must reach it — from the probe socket only, in both modes.
+#[test]
+fn probe_socket_may_announce_https_and_nobody_else_can() {
+    let edge = nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&[])).unwrap();
+    let behind = nginx::generate(
+        &host(),
+        &apps(ONE_APP),
+        &NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
+            .with_trusted_proxies(&["10.89.0.2".to_owned()])
+            .unwrap(),
+    )
+    .unwrap();
+    for (mode, conf) in [("edge", edge), ("behind", behind)] {
+        // The key starts with the literal peer address `unix:`, which only the probe socket has.
+        assert!(
+            conf.contains("map \"$remote_addr:$http_x_forwarded_proto\" $weglarka_proto {"),
+            "{mode}: {conf}"
+        );
+        assert!(conf.contains("\"unix::https\" https;"), "{mode}");
+        assert_eq!(
+            conf.matches("\"unix::").count(),
+            1,
+            "{mode}: only https, only unix:"
+        );
+        assert!(
+            conf.contains("proxy_set_header X-Forwarded-Proto $weglarka_proto;"),
+            "{mode}"
+        );
+    }
+}
+
 #[test]
 fn probe_socket_is_a_plain_listener_without_proxy_protocol_on_every_app_server() {
     let mut behind = NginxOptions::new(vec!["10.89.0.1".parse().unwrap()])
@@ -928,14 +960,19 @@ fn edge_never_trusts_forwarded_headers() {
         nginx::generate(&edge_host(), &apps(ONE_APP), &edge_opts(&["nz.example.eu"])).unwrap();
     assert!(!conf.contains("set_real_ip_from"), "{conf}");
     assert!(!conf.contains("$weglarka_trusted"), "{conf}");
-    assert!(!conf.contains("$http_x_forwarded_proto"), "{conf}");
+    // The one reader of the header is keyed on the probe socket's literal peer address (#321).
+    assert_eq!(conf.matches("$http_x_forwarded_proto").count(), 1, "{conf}");
+    assert!(
+        conf.contains("map \"$remote_addr:$http_x_forwarded_proto\""),
+        "{conf}"
+    );
     // The headers are nginx's own: a direct client cannot choose them.
     assert!(
         conf.contains("proxy_set_header X-Forwarded-For $remote_addr;"),
         "{conf}"
     );
     assert!(
-        conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"),
+        conf.contains("proxy_set_header X-Forwarded-Proto $weglarka_proto;"),
         "{conf}"
     );
     assert!(
@@ -1356,7 +1393,7 @@ fn edge_cdn_trusts_only_the_ranges_and_never_x_forwarded_for() {
     );
     assert!(conf.contains("proxy_set_header X-Forwarded-For $weglarka_client;"));
     assert!(conf.contains("proxy_set_header X-Real-IP $weglarka_client;"));
-    assert!(conf.contains("proxy_set_header X-Forwarded-Proto $scheme;"));
+    assert!(conf.contains("proxy_set_header X-Forwarded-Proto $weglarka_proto;"));
     assert!(!conf.contains("$http_x_forwarded_for"));
     assert!(conf.contains("\"peer\":\"$weglarka_peer\""));
     // A fallback to the peer for a CDN peer without a usable header, and for any non-CDN peer: a

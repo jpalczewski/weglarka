@@ -42,7 +42,10 @@ shape is unchanged (`GET path`, `Host` = first domain, no `X-Forwarded-*`).
   `realip` only replaces the address of connections that carry one). Upstreams see `X-Real-IP: unix:` and
   `X-Forwarded-For: unix:` for probes — documented, and deliberately **not** mapped to `127.0.0.1`, which would
   look like loopback to apps that trust loopback. In `edge`, `X-Forwarded-Proto` is `http` for a probe (the
-  scheme of the listener); `behind` always did this. The access log's `$weglarka_peer` map keeps `unix:` for such
+  scheme of the listener); `behind` always did this. Exception (issue #321): traffic to the identity provider
+  (JWKS fetch, `doctor` authz probe) sends `X-Forwarded-Proto: https`, and nginx honours that header **only** when
+  `$remote_addr` is the literal `unix:` (a `map` in both modes, `$weglarka_proto`), because the provider's OIDC
+  endpoints answer 400 to a request that claims plain HTTP. The health gate still sends no `X-Forwarded-*`. The access log's `$weglarka_peer` map keeps `unix:` for such
   connections instead of the empty `$proxy_protocol_addr`.
 * **`INGRESS_HASH_FORMAT` goes to v5 for both modes.** The probe directory is a new mount, and a mount cannot be
   added to a live container; without the bump an existing nginx would keep running without the directory and
