@@ -306,14 +306,20 @@ case $(probe_status unknown.example.invalid /) in
   *) echo "FAIL probe socket: unknown Host not dropped"; fail=1 ;;
 esac
 # `$remote_addr` stays the literal `unix:` (no PROXY header, realip does not rewrite it), and the
-# forwarded headers are rebuilt from it — a forged value does not survive.
-probe_forged=$(probe_body "$plain_domain" / -H 'X-Forwarded-For: 203.0.113.9' -H 'X-Forwarded-Proto: https' \
+# forwarded headers are rebuilt from it — a forged address does not survive. The one value this
+# listener takes from the sender is `X-Forwarded-Proto: https` (the daemon's requests to the identity
+# provider, issue #321); anything else, and no header at all, gives the listener's scheme.
+probe_forged=$(probe_body "$plain_domain" / -H 'X-Forwarded-For: 203.0.113.9' -H 'X-Forwarded-Proto: wss' \
   -H 'X-Real-IP: 203.0.113.9')
 body_contains "probe socket: X-Real-IP" "$probe_forged" "X-Real-Ip: unix:"
 body_contains "probe socket: X-Forwarded-For" "$probe_forged" "X-Forwarded-For: unix:"
 body_lacks_line "probe socket: forged X-Forwarded-For" "$probe_forged" "X-Forwarded-For: 203.0.113.9"
 body_contains "probe socket: scheme" "$probe_forged" "X-Forwarded-Proto: http"
-body_lacks_line "probe socket: forged X-Forwarded-Proto" "$probe_forged" "X-Forwarded-Proto: https"
+body_lacks_line "probe socket: forged X-Forwarded-Proto" "$probe_forged" "X-Forwarded-Proto: wss"
+probe_https=$(probe_body "$plain_domain" / -H 'X-Forwarded-Proto: https')
+body_contains "probe socket: announced https" "$probe_https" "X-Forwarded-Proto: https"
+probe_plain=$(probe_body "$plain_domain" /)
+body_contains "probe socket: no header means http" "$probe_plain" "X-Forwarded-Proto: http"
 # `http2 on` is set on the same server: HTTP/1.1 on the plain unix listener must be undisturbed.
 expect "probe socket: HTTP/1.1 next to http2 on" \
   "$(curl -sS -o /dev/null -w '%{http_version}' --max-time 10 --unix-socket "$probe_dir/probe.sock" \
