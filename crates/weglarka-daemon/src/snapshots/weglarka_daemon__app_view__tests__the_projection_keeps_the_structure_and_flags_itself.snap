@@ -1,0 +1,130 @@
+---
+source: crates/weglarka-daemon/src/app_view.rs
+expression: shown
+---
+{
+  "name": "app",
+  "spec": {
+    "image": "ghcr.io/example/app:1",
+    "command": [
+      "<redacted>",
+      "<redacted>"
+    ],
+    "domains": [
+      "a.example.com"
+    ],
+    "paths": [
+      "/app"
+    ],
+    "port": 8080,
+    "ingress": {
+      "streaming": true,
+      "auth_groups": [
+        "staff"
+      ]
+    },
+    "env": {
+      "DATABASE_URL": "",
+      "MODE": ""
+    },
+    "secrets": [
+      {
+        "secret": "db",
+        "kind": "env",
+        "var": "DB_PASSWORD"
+      },
+      {
+        "secret": "key",
+        "kind": "mount",
+        "path": "/run/key",
+        "mode": 256,
+        "uid": 1,
+        "gid": 2
+      }
+    ],
+    "health": {
+      "attempts": 5,
+      "window_secs": 30,
+      "command": [
+        "<redacted>",
+        "<redacted>"
+      ],
+      "http": {
+        "path": "/hooks/<redacted>",
+        "expect_status": 204,
+        "timeout_secs": 3
+      }
+    },
+    "volumes": [
+      {
+        "name": "data",
+        "target": "/data",
+        "read_only": true
+      }
+    ],
+    "shared_networks": [
+      {
+        "name": "backbone",
+        "aliases": [
+          "svc"
+        ]
+      }
+    ],
+    "host_ports": [
+      {
+        "host": 9000,
+        "container": 80,
+        "ip": "127.0.0.1"
+      }
+    ],
+    "depends_on": [
+      "db"
+    ],
+    "resources": {
+      "pids_limit": 100
+    },
+    "security": {
+      "read_only": true,
+      "tmpfs": [
+        "/tmp"
+      ],
+      "cap_drop": [
+        "ALL"
+      ]
+    },
+    "auto_update": false,
+    "start": false,
+    "configs": [
+      {
+        "source": "app/conf",
+        "target": "/etc/app"
+      }
+    ],
+    "reload_signal": "SIGHUP",
+    "host_mounts": [
+      {
+        "source": "/srv/media",
+        "target": "/media"
+      }
+    ],
+    "group_add": [
+      "media"
+    ],
+    "strategy": "blue_green",
+    "oidc": {
+      "redirect_uris": [
+        "https://a.example.com/callback"
+      ],
+      "client_id_env": "OIDC_ID",
+      "client_secret": {
+        "kind": "env",
+        "var": "OIDC_SECRET"
+      }
+    }
+  },
+  "state": {
+    "generation": 0
+  },
+  "runtime": "missing",
+  "redacted": true
+}

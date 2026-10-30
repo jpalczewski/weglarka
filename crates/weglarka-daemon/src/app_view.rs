@@ -596,6 +596,7 @@ reload_signal = "SIGHUP"
 strategy = "blue_green"
 start = false
 auto_update = false
+command = ["serve", "--password=hunter2"]
 secrets = [
   { secret = "db", kind = "env", var = "DB_PASSWORD" },
   { secret = "key", kind = "mount", path = "/run/key", mode = 256, uid = 1, gid = 2 },
@@ -605,6 +606,15 @@ host_ports = [{ host = 9000, container = 80, ip = "127.0.0.1" }]
 configs = [{ source = "app/conf", target = "/etc/app" }]
 host_mounts = [{ source = "/srv/media", target = "/media" }]
 shared_networks = [{ name = "backbone", aliases = ["svc"] }]
+[env]
+DATABASE_URL = "postgres://u:p@h/db"
+MODE = "prod"
+[health]
+command = ["check", "--token=t0k3n"]
+[health.http]
+path = "/hooks/t0k3n/ready?key=s3cret"
+expect_status = 204
+timeout_secs = 3
 [resources]
 pids_limit = 100
 [security]
@@ -630,8 +640,20 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
         let shown = show_response(Access::Redacted, name(), spec.clone(), None, None);
         assert!(shown.redacted);
         assert_eq!(serde_json::to_value(&shown).unwrap()["redacted"], true);
-        // Nothing else to blank here: the view equals the stored spec.
-        assert_eq!(shown.spec, spec);
+        // Everything the policy does not touch equals the stored spec; the rest is spelled out.
+        let mut expected = spec.clone();
+        expected.command = vec![REDACTED_ARG.into(); 2];
+        expected.env = [("DATABASE_URL", ""), ("MODE", "")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into();
+        expected.health.command = Some(vec![REDACTED_ARG.into(); 2]);
+        expected.health.http.as_mut().unwrap().path = format!("/hooks/{REDACTED_ARG}");
+        assert_eq!(shown.spec, expected);
+        let text = format!("{shown:?}");
+        for secret in ["hunter2", "t0k3n", "s3cret", "postgres://", "prod"] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+        insta::assert_json_snapshot!(shown);
     }
 
     #[test]
