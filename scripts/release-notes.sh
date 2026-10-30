@@ -47,7 +47,8 @@ for f in crates/*/CHANGELOG.md; do
   crate=$(basename "$(dirname "$f")")
   # The newest entry of the crate, if it was released on the daemon's day.
   v=$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' "$f" | head -1)
-  [ -n "$v" ] && [ "$(date_of "$f" "$v")" = "$day" ] || continue
+  [ -n "$v" ] || continue
+  [ "$(date_of "$f" "$v")" = "$day" ] || continue
   body=$(section "$f" "$v")
   [ -n "$body" ] || continue
   printf '\n## %s %s\n\n%s\n' "$crate" "$v" "$body"
