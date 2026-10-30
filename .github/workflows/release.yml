@@ -106,8 +106,14 @@ jobs:
             echo "::warning::COSIGN_PRIVATE_KEY is not set — the image is not signed with the static key, self-update will refuse it"
             exit 0
           fi
+          # The daemon's verifier reads the legacy `sha256-<hex>.sig` tag. Cosign 3 stores a sigstore bundle as
+          # an OCI referrer by default, so ask for the legacy simple-signing layout explicitly (#316).
           cosign sign --yes --key env://COSIGN_PRIVATE_KEY --use-signing-config=false --tlog-upload=false \
+            --new-bundle-format=false --registry-referrers-mode=legacy \
             "$IMAGE@${{ steps.build.outputs.digest }}"
+          # Fail the release instead of the first host: the tag the daemon fetches must exist now.
+          digest="${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect "$IMAGE:${digest/:/-}.sig" > /dev/null
       - name: SBOM (SPDX) jako atestacja cosign
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
