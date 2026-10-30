@@ -1,5 +1,7 @@
 # Węglarka
 
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fjpalczewski.github.io%2Fweglarka%2Fbadge.json)](https://jpalczewski.github.io/weglarka/)
+
 A lightweight deploy tool in Rust that manages **rootless Podman 6**: declarative state in TOML,
 a reconcile loop, nginx in a container, auto-update on a GitHub webhook (GHCR), a health gate with rollback,
 and push notifications (ntfy) for deploys, rollbacks and failures — through a durable outbox, so a

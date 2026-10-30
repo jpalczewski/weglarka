@@ -64,3 +64,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0055](0055-generated-config-pipeline.md) | Generated config pipeline |
 | [0056](0056-admin-api-token-listener.md) | Admin API beyond the unix socket: a token listener |
 | [0057](0057-admin-panel-architecture.md) | Admin panel: a server-rendered BFF with htmx and Alpine |
+| [0058](0058-test-coverage-reporting.md) | Test coverage reporting on GitHub Pages |

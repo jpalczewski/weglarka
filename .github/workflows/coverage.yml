@@ -1,0 +1,71 @@
+name: Coverage
+
+# Line coverage of the workspace (docs/decisions/0058-test-coverage-reporting.md): cargo-llvm-cov runs the
+# test suite on `main`, publishes the HTML report and a shields.io endpoint file (the README badge) to
+# GitHub Pages. Informational only: nothing gates on the percentage, and pull requests do not run it.
+on:
+  push:
+    branches: [main]
+    # Same rule as ci.yml: a docs-only push changes no code, so the numbers cannot move.
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "**/*.md"
+      - ".gitignore"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: coverage
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-debug-toolchain
+        with:
+          shared-key: coverage
+          save-if: true
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+        with:
+          tool: cargo-llvm-cov,nextest
+      # Tests that need a real Podman skip themselves without WEGLARKA_PODMAN_SOCKET, so their code counts as
+      # uncovered here; the number is a floor, not the whole picture.
+      - name: Run the tests with instrumentation
+        run: cargo llvm-cov nextest --workspace --no-report
+      - name: Report
+        run: |
+          set -euo pipefail
+          cargo llvm-cov report --html --output-dir site
+          cargo llvm-cov report --json --summary-only --output-path summary.json
+          pct=$(jq -r '.data[0].totals.lines.percent' summary.json)
+          pct=$(printf '%.1f' "$pct")
+          color=$(awk -v p="$pct" 'BEGIN { print (p >= 80 ? "brightgreen" : p >= 60 ? "yellow" : "red") }')
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > site/badge.json
+          echo "Line coverage: ${pct}%" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/html
+
+  # Separate job so only the deploy holds the Pages write permissions.
+  deploy:
+    needs: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
