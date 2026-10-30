@@ -23,7 +23,7 @@ paths:
   `InstanceName`) pass through whole; pass-through structs bind every field (`field: _`, no `..`); path and name lists
   the model validates to identifier shapes (`domains`, `paths`, `streaming_paths`, `auth_exempt_paths`,
   `access_log_skip_paths`, `auth_groups`, `security.tmpfs`, `cap_add/cap_drop`, `group_add`, `aliases`, `scopes`) are
-  shown, `oidc.redirect_uris` and `oidc.audience` lose their query. A new free-text field needs an explicit decision
+  shown, `oidc.redirect_uris` and `oidc.audience` lose their query (their path stays visible on purpose: public registration data, a credential there is unsupported). A new free-text field needs an explicit decision
   there, not a pass-through. `ShowAppResponse` carries `redacted: true` whenever this applies, and
   the CLI refuses to write such a spec back.
 - **A stream ends with its token:** streaming handlers stop at the verified principal's `exp` (`StreamDeadline`).
