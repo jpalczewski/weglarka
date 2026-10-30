@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.5...weglarka-api-v0.0.6) - 2026-10-30
+
+### Fixed
+
+- *(daemon)* redact all of argv for read tokens ([#319](https://github.com/jpalczewski/weglarka/pull/319))
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.4...weglarka-api-v0.0.5) - 2026-10-29
 
 ### Added

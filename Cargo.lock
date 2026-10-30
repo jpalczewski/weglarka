@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-api"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "insta",
  "serde",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "clap",
  "futures-util",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-daemon"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-ingress"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "insta",
  "thiserror",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "weglarka-panel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "askama",

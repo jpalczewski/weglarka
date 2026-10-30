@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.0...weglarka-panel-v0.1.1) - 2026-10-30
+
+### Other
+
+- updated the following local packages: weglarka-api
+
 ## [0.0.1](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.0.0...weglarka-panel-v0.0.1) - 2026-10-29
 
 ### Added
