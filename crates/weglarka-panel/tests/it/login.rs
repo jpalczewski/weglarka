@@ -575,6 +575,37 @@ async fn sessions_end_when_idle_or_too_old() {
 }
 
 #[tokio::test]
+async fn a_forged_post_does_not_extend_the_idle_timer() {
+    let s = setup_with(&[
+        (ENV_SESSION_IDLE_SECS, "120"),
+        (ENV_SESSION_MAX_SECS, "600"),
+    ])
+    .await;
+
+    // Forged requests keep nothing alive: refused at 110 s, the session is still idle-dead at 130 s.
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    let csrf = b.csrf().await;
+    s.clock.advance(Duration::from_secs(110));
+    let wrong = b.post_logout(Some(("header", "wrong")), None).await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN, "wrong token");
+    let cross = b
+        .post_logout(Some(("header", csrf.as_str())), Some("cross-site"))
+        .await;
+    assert_eq!(cross.status, StatusCode::FORBIDDEN, "cross-site");
+    s.clock.advance(Duration::from_secs(20));
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
+
+    // Control: a genuine request at the same moment does keep the session alive.
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    s.clock.advance(Duration::from_secs(110));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    s.clock.advance(Duration::from_secs(20));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn state_changing_requests_need_the_csrf_token() {
     let s = setup().await;
     let mut b = Browser::new(&s.app);
