@@ -60,6 +60,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     let observed = desired_state(d, &mut checks).await;
     if let Some(observed) = &observed {
         image_retention(d, observed, &mut checks).await;
+        memory_use(d, observed, &mut checks).await;
     }
     configs(d, &mut checks);
     host_mounts(d, &mut checks);
@@ -352,6 +353,109 @@ async fn desired_state<P: PodmanClient>(
         st,
         containers,
     })
+}
+
+/// Share of its memory limit (in percent) at which a container is reported as nearly full.
+const MEMORY_WARN_PERCENT: u64 = 80;
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Memory use of the running containers (issue #208): one libpod stats call, matched to the container
+/// list by name. Never `fail`: the numbers are advice, and a missing stats answer must not hide the
+/// rest of the report. The nginx container has no limit setting yet, so its missing limit is `info`.
+async fn memory_use<P: PodmanClient>(
+    d: &Daemon<P>,
+    observed: &Observed,
+    out: &mut Vec<DoctorCheck>,
+) {
+    const ID: &str = "runtime.memory";
+    let running: Vec<&ContainerInfo> = observed
+        .containers
+        .iter()
+        .filter(|c| c.state == ContainerState::Running)
+        .collect();
+    let stats = match d.engine.podman().container_stats().await {
+        Ok(stats) => stats,
+        Err(e) => {
+            out.push(check(
+                ID,
+                CheckStatus::Info,
+                format!("memory use unavailable: {e}"),
+                None,
+            ));
+            return;
+        }
+    };
+    let usage: BTreeMap<&str, u64> = stats
+        .iter()
+        .map(|s| (s.name.as_str(), s.memory_usage))
+        .collect();
+
+    let mut total = 0u64;
+    let mut highest: Option<(&str, u64, u64)> = None; // name, usage, limit
+    let mut near_limit = Vec::new();
+    let mut no_data = Vec::new();
+    let mut nginx_unlimited = false;
+    for c in &running {
+        // No stats entry is "no data" just like a reported 0: never idle.
+        let used = usage.get(c.name.as_str()).copied().unwrap_or(0);
+        if used == 0 {
+            no_data.push(c.name.as_str());
+            continue;
+        }
+        total += used;
+        match c.memory_limit {
+            Some(limit) => {
+                let percent = used.saturating_mul(100) / limit;
+                if percent >= MEMORY_WARN_PERCENT {
+                    near_limit.push(format!("{} ({percent}%)", c.name));
+                }
+                let ratio = |u: u64, l: u64| u as f64 / l as f64;
+                if highest.is_none_or(|(_, u, l)| ratio(used, limit) > ratio(u, l)) {
+                    highest = Some((&c.name, used, limit));
+                }
+            }
+            None => nginx_unlimited |= c.name == NGINX_CONTAINER,
+        }
+    }
+
+    let mut summary = format!(
+        "{} running container(s), {} in use",
+        running.len(),
+        mib(total)
+    );
+    if let Some((name, used, limit)) = highest {
+        summary.push_str(&format!(
+            ", highest against a limit: {name} {} of {}",
+            mib(used),
+            mib(limit)
+        ));
+    }
+    let mut parts = vec![summary];
+    let mut status = CheckStatus::Ok;
+    let mut hint = None;
+    if !near_limit.is_empty() {
+        status = CheckStatus::Warn;
+        parts.push(format!(
+            "at {MEMORY_WARN_PERCENT}% or more of the memory limit: {}",
+            near_limit.join(", ")
+        ));
+        hint = Some("raise `resources.memory` of these apps, or find out why they use more");
+    }
+    if nginx_unlimited {
+        status = status.max(CheckStatus::Info);
+        parts.push(format!("{NGINX_CONTAINER} has no memory limit"));
+    }
+    if !no_data.is_empty() {
+        status = status.max(CheckStatus::Info);
+        parts.push(format!(
+            "no memory data for {} (probably no cgroup controller delegation to the runtime user)",
+            no_data.join(", ")
+        ));
+    }
+    out.push(check(ID, status, parts.join("; "), hint));
 }
 
 /// Image retention (issue #40): images of a repository Węglarka deploys that are neither an app's

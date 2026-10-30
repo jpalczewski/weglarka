@@ -605,3 +605,53 @@ async fn logs_are_demultiplexed_and_wait_returns_the_exit_code() {
         mock.requests()
     );
 }
+
+#[tokio::test]
+async fn stats_is_one_unfiltered_call_and_null_stats_is_empty() {
+    let mock = serve(vec![(
+        "GET /v6.0.0/libpod/containers/stats",
+        200,
+        r#"{"Error":null,"Stats":[{"Name":"app-1","MemUsage":2048,"MemLimit":8589934592}]}"#,
+    )]);
+    let stats = LibpodClient::new(&mock.socket)
+        .container_stats()
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(
+        (stats[0].name.as_str(), stats[0].memory_usage),
+        ("app-1", 2048)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "one call, whatever runs");
+    assert!(
+        requests[0].contains("/containers/stats?stream=false"),
+        "{requests:?}"
+    );
+    assert!(
+        !requests[0].contains("containers="),
+        "naming containers makes one unknown name fail the whole call: {requests:?}"
+    );
+
+    let empty = serve(vec![(
+        "GET /v6.0.0/libpod/containers/stats",
+        200,
+        r#"{"Error":null,"Stats":null}"#,
+    )]);
+    let stats = LibpodClient::new(&empty.socket)
+        .container_stats()
+        .await
+        .unwrap();
+    assert!(stats.is_empty());
+
+    let failing = serve(vec![(
+        "GET /v6.0.0/libpod/containers/stats",
+        200,
+        r#"{"Error":{"message":"cgroup gone"},"Stats":null}"#,
+    )]);
+    let err = LibpodClient::new(&failing.socket)
+        .container_stats()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cgroup gone"), "{err}");
+}

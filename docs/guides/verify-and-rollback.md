@@ -10,6 +10,22 @@ podman logs weglarka-nginx                      # JSON access log with the app f
 podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'  # true [] (ADR 0014)
 ```
 
+## Memory use
+
+`weglarka doctor` reports `runtime.memory`: the working set of every running container (one Podman stats call,
+matched to containers by name) against its `resources.memory` limit.
+
+| Status | When |
+|---|---|
+| `ok` | every container with a limit is below 80% of it; the message gives the container count, the total in use and the container closest to its limit |
+| `warn` | a container is at or above 80% of its limit; the message names it with the percentage |
+| `info` | `weglarka-nginx` runs without a memory limit (there is no setting for it yet) |
+| `info` | a running container reports no memory data, usually because the cgroup memory controller is not delegated to the runtime user; such a container is never counted as idle |
+| `info` | the stats call failed; the rest of `doctor` is unaffected |
+
+When several conditions hold the highest status wins and the message mentions all of them. The check never fails.
+Raise `resources.memory` of a container that warns (`weglarka apps update <app> --memory 256M`).
+
 ## Automatic rollback
 
 A deploy that fails the health gate returns to the previous digest (retention 1). The result is reported by

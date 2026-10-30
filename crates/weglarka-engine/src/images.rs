@@ -331,6 +331,7 @@ mod tests {
             networks: Vec::new(),
             addresses: Vec::new(),
             published_ports: Vec::new(),
+            memory_limit: None,
         }
     }
 
