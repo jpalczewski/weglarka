@@ -442,7 +442,9 @@ async fn memory_use<P: PodmanClient>(
             "at {MEMORY_WARN_PERCENT}% or more of the memory limit: {}",
             near_limit.join(", ")
         ));
-        hint = Some("raise `resources.memory` of these apps, or find out why they use more");
+        hint = Some(
+            "raise `resources.memory` of the app (blue-green `.next`/`.prev` share it), or `[platform] memory` in weglarka.toml for the daemon itself; or find out why it uses more",
+        );
     }
     if nginx_unlimited {
         status = status.max(CheckStatus::Info);

@@ -24,7 +24,8 @@ matched to containers by name) against its `resources.memory` limit.
 | `info` | the stats call failed; the rest of `doctor` is unaffected |
 
 When several conditions hold the highest status wins and the message mentions all of them. The check never fails.
-Raise `resources.memory` of a container that warns (`weglarka apps update <app> --memory 256M`).
+Raise `resources.memory` of an app that warns (`weglarka apps update <app> --memory 256M`; the blue-green `.next`/`.prev`
+containers share the app's setting). If the daemon's own container warns, its limit is `[platform] memory` in `weglarka.toml`.
 
 ## Automatic rollback
 
