@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.0.5...weglarka-cli-v0.0.6) - 2026-10-30
+
+### Other
+
+- updated the following local packages: weglarka-api
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.0.4...weglarka-cli-v0.0.5) - 2026-10-29
 
 ### Added
