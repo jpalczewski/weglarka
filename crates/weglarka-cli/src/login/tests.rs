@@ -157,7 +157,8 @@ async fn login_waits_through_pending_and_stores_the_tokens() {
     );
     let entry = store.read().unwrap().hosts.remove(HOST).unwrap();
     assert_eq!(entry.access_token, "ACCESS1");
-    assert_eq!(entry.access_expires, 1_900);
+    // Issued after the 5 + 5 + 10 s of waiting, not when the login started.
+    assert_eq!(entry.access_expires, 1_920);
     assert_eq!(entry.refresh_token.as_deref(), Some("REFRESH1"));
     // The device request is public (client_id, no secret) and names the audience.
     let requests = provider.requests();

@@ -470,7 +470,9 @@ where
         match attempt().await {
             Err(e) if e.is_busy() && tokio::time::Instant::now() + pause < deadline => {
                 if !announced {
-                    eprintln!("daemon is busy (deploy in progress), waiting…");
+                    eprintln!(
+                        "the daemon is busy (a deploy is in progress, or the host is limiting requests), waiting…"
+                    );
                     announced = true;
                 }
                 tokio::time::sleep(pause).await;

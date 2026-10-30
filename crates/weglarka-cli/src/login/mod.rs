@@ -204,6 +204,8 @@ where
         expires_in_secs: tokens.expires_in.as_secs(),
         refreshable: tokens.refresh.is_some(),
     };
+    // `now` was taken before the person approved; the token is as old as the time spent waiting.
+    let issued = now + waited.as_secs();
     store.update(|c| {
         c.hosts.insert(
             request.host.clone(),
@@ -212,7 +214,7 @@ where
                 client_id: request.client_id.clone(),
                 audience: request.audience.clone(),
                 access_token: tokens.access.expose().to_owned(),
-                access_expires: now + tokens.expires_in.as_secs(),
+                access_expires: issued + tokens.expires_in.as_secs(),
                 refresh_token: tokens.refresh.as_ref().map(|t| t.expose().to_owned()),
             },
         );
