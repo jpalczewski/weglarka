@@ -171,6 +171,10 @@ pub fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
     check(id, CheckStatus::Ok, message, None)
 }
 
+pub fn info(id: &str, message: impl Into<String>) -> DoctorCheck {
+    check(id, CheckStatus::Info, message, None)
+}
+
 pub fn warn(id: &str, message: impl Into<String>, hint: impl Into<String>) -> DoctorCheck {
     check(id, CheckStatus::Warn, message, Some(hint.into()))
 }

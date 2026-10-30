@@ -373,6 +373,36 @@ fn preflight_edge_requires_the_sysctl_for_privileged_ports() {
     assert_eq!(status("0\n"), weglarka_api::CheckStatus::Ok);
 }
 
+fn cgroups_check(host: &FakeHost) -> weglarka_api::DoctorCheck {
+    report(host, Some(CONFIG))
+        .checks
+        .into_iter()
+        .find(|c| c.id == "runtime.cgroups")
+        .expect("runtime.cgroups")
+}
+
+const USER_CGROUP: &str =
+    "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/cgroup.controllers";
+
+#[test]
+fn preflight_cgroups_without_a_delegation_file_is_info_not_ok() {
+    let mut host = FakeHost::healthy();
+    host.files.remove(&PathBuf::from(USER_CGROUP));
+    let c = cgroups_check(&host);
+    assert_eq!(c.status, weglarka_api::CheckStatus::Info);
+    assert!(c.message.contains(USER_CGROUP), "{}", c.message);
+    assert!(c.message.contains("not verified"), "{}", c.message);
+}
+
+#[test]
+fn preflight_cgroups_requires_cpu_memory_and_pids() {
+    let c = cgroups_check(&FakeHost::healthy());
+    assert_eq!(c.status, weglarka_api::CheckStatus::Ok);
+    let c = cgroups_check(&FakeHost::healthy().file(USER_CGROUP, "memory pids io\n"));
+    assert_eq!(c.status, weglarka_api::CheckStatus::Warn);
+    assert!(c.message.ends_with(": cpu"), "{}", c.message);
+}
+
 #[test]
 fn preflight_broken_host() {
     let mut h = FakeHost::healthy()
