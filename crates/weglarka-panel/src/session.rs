@@ -341,6 +341,13 @@ const LOGIN_AAD: &[u8] = b"weglarka-panel login cookie v1";
 /// cookie does not open), and when a flood of genuine ones fills it the entry closest to expiry is
 /// dropped instead of refusing logins: replay protection degrades first, availability does not. The
 /// authorization code is single use at the provider, so a replay needs more than the cookie.
+///
+/// That set is also where an attacker could act without a provider: a fake callback with a genuine
+/// cookie is recorded by [`PendingLogins::open`] before the provider has accepted anything, and all
+/// entries share one TTL, so the nearest-expiry victim is the oldest cookie, possibly a real
+/// user's. Refusing when full would bring back the lockout of #292, so instead the callback handler
+/// applies [`crate::limit::AddressLimiter`] per client address before calling `open`: one address
+/// cannot write more than a few entries a minute, so it cannot push out other people's.
 pub struct PendingLogins {
     key: LessSafeKey,
     used: Mutex<HashMap<String, u64>>,

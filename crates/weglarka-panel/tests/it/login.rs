@@ -5,14 +5,17 @@ use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use tower::ServiceExt;
 use weglarka_http::reqwest;
 use weglarka_panel::config::{
     ENV_API_AUDIENCE, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_PUBLIC_URL,
-    ENV_SESSION_IDLE_SECS, ENV_SESSION_MAX_SECS, ENV_SOCKET,
+    ENV_SESSION_IDLE_SECS, ENV_SESSION_MAX_SECS, ENV_SOCKET, ENV_TRUSTED_PROXIES,
 };
 use weglarka_panel::session::Clock;
 use weglarka_panel::{AppState, PanelConfig, router};
@@ -99,6 +102,8 @@ impl Reply {
 struct Browser {
     app: Router,
     jar: BTreeMap<String, String>,
+    /// The connection's peer address, as the server would report it.
+    peer: Option<SocketAddr>,
     provider_client: reqwest::Client,
 }
 
@@ -107,6 +112,7 @@ impl Browser {
         Self {
             app: app.clone(),
             jar: BTreeMap::new(),
+            peer: None,
             // Redirects are never followed by this client, so the test reads each Location itself.
             provider_client: weglarka_http::client(weglarka_http::Purpose::Api).unwrap(),
         }
@@ -126,12 +132,11 @@ impl Browser {
             let cookies: Vec<String> = self.jar.iter().map(|(k, v)| format!("{k}={v}")).collect();
             builder = builder.header(header::COOKIE, cookies.join("; "));
         }
-        let response = self
-            .app
-            .clone()
-            .oneshot(builder.body(body).unwrap())
-            .await
-            .unwrap();
+        let mut request = builder.body(body).unwrap();
+        if let Some(peer) = self.peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        let response = self.app.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let reply = Reply {
             status: parts.status,
@@ -153,6 +158,23 @@ impl Browser {
     async fn get(&mut self, path: &str) -> Reply {
         self.send(Request::builder().method(Method::GET).uri(path))
             .await
+    }
+
+    fn from(app: &Router, peer: &str) -> Self {
+        let mut b = Self::new(app);
+        b.peer = Some(format!("{peer}:40000").parse().unwrap());
+        b
+    }
+
+    /// A callback request carrying the given `X-Forwarded-For`.
+    async fn callback_forwarded(&mut self, callback: &str, forwarded: &str) -> Reply {
+        self.send(
+            Request::builder()
+                .method(Method::GET)
+                .uri(callback)
+                .header("x-forwarded-for", forwarded),
+        )
+        .await
     }
 
     /// Starts a login and lets the provider approve it; returns the callback path and query.
@@ -575,6 +597,37 @@ async fn sessions_end_when_idle_or_too_old() {
 }
 
 #[tokio::test]
+async fn a_forged_post_does_not_extend_the_idle_timer() {
+    let s = setup_with(&[
+        (ENV_SESSION_IDLE_SECS, "120"),
+        (ENV_SESSION_MAX_SECS, "600"),
+    ])
+    .await;
+
+    // Forged requests keep nothing alive: refused at 110 s, the session is still idle-dead at 130 s.
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    let csrf = b.csrf().await;
+    s.clock.advance(Duration::from_secs(110));
+    let wrong = b.post_logout(Some(("header", "wrong")), None).await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN, "wrong token");
+    let cross = b
+        .post_logout(Some(("header", csrf.as_str())), Some("cross-site"))
+        .await;
+    assert_eq!(cross.status, StatusCode::FORBIDDEN, "cross-site");
+    s.clock.advance(Duration::from_secs(20));
+    assert_eq!(b.get("/apps").await.status, StatusCode::UNAUTHORIZED);
+
+    // Control: a genuine request at the same moment does keep the session alive.
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    s.clock.advance(Duration::from_secs(110));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    s.clock.advance(Duration::from_secs(20));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn state_changing_requests_need_the_csrf_token() {
     let s = setup().await;
     let mut b = Browser::new(&s.app);
@@ -860,6 +913,7 @@ async fn one_identity_cannot_fill_the_session_table() {
     let first_id = first.cookie(SESSION).unwrap().to_owned();
     // The same account signing in again and again without ever sending its old cookie.
     for _ in 0..20 {
+        s.clock.advance(Duration::from_secs(5));
         let done = Browser::new(&s.app).login().await;
         assert_eq!(done.status, StatusCode::SEE_OTHER);
     }
@@ -1093,4 +1147,127 @@ async fn no_secret_appears_in_logs_urls_or_debug_output() {
     }
     // Neither the PKCE verifier nor the state travel in the callback redirect.
     assert_eq!(locations[1], "/apps");
+}
+
+/// A callback with no cookie: it reaches the limiter but opens nothing.
+async fn bare_callback(b: &mut Browser) -> StatusCode {
+    b.get("/auth/callback?code=x&state=y").await.status
+}
+
+#[tokio::test]
+async fn callbacks_are_limited_per_address_before_a_login_is_recorded() {
+    let s = setup().await;
+    let limit = weglarka_panel::limit::CALLBACK_LIMIT;
+    let mut attacker = Browser::from(&s.app, "198.51.100.1");
+    for _ in 0..limit {
+        assert_eq!(bare_callback(&mut attacker).await, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        bare_callback(&mut attacker).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // A real cookie spent past the limit is not recorded as used (the limiter ran first)...
+    let callback = attacker.approve("/").await;
+    let refused = attacker.get(&callback).await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(s.state.logins.used_len(), 0);
+
+    // ...and another address signs in normally, while the first is still locked out.
+    let mut other = Browser::from(&s.app, "198.51.100.2");
+    assert_eq!(other.login().await.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        bare_callback(&mut attacker).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // The window slides: a minute later the first address may try again.
+    s.clock.advance(Duration::from_secs(61));
+    assert_eq!(bare_callback(&mut attacker).await, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn forwarded_for_from_an_untrusted_peer_cannot_dodge_or_frame_anyone() {
+    // No trusted proxies configured: the header is ignored, the peer is the client.
+    let s = setup().await;
+    let limit = weglarka_panel::limit::CALLBACK_LIMIT;
+    let mut b = Browser::from(&s.app, "198.51.100.1");
+    for n in 0..limit {
+        let spoof = format!("203.0.113.{n}");
+        let r = b
+            .callback_forwarded("/auth/callback?code=x&state=y", &spoof)
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    }
+    let r = b
+        .callback_forwarded("/auth/callback?code=x&state=y", "203.0.113.250")
+        .await;
+    assert_eq!(
+        r.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rotating the header did not help"
+    );
+    // Nor does it frame an innocent address.
+    let mut victim = Browser::from(&s.app, "203.0.113.0");
+    assert_eq!(bare_callback(&mut victim).await, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_forwards_the_client_address_from_the_right() {
+    let s = setup_with(&[(ENV_TRUSTED_PROXIES, "10.89.0.0/24")]).await;
+    let limit = weglarka_panel::limit::CALLBACK_LIMIT;
+    let mut proxy = Browser::from(&s.app, "10.89.0.2");
+    let path = "/auth/callback?code=x&state=y";
+    // The client prepends a different forged value each time; the proxy appends the real peer.
+    for n in 0..limit {
+        let h = format!("192.0.2.{n}, 198.51.100.1");
+        assert_eq!(
+            proxy.callback_forwarded(path, &h).await.status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let h = "192.0.2.99, 198.51.100.1";
+    assert_eq!(
+        proxy.callback_forwarded(path, h).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A different client behind the same proxy is not affected.
+    let h = "192.0.2.99, 198.51.100.2";
+    assert_eq!(
+        proxy.callback_forwarded(path, h).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    // The same header from a peer outside the trusted range is ignored: it is its own client.
+    let mut stranger = Browser::from(&s.app, "198.51.100.77");
+    assert_eq!(
+        stranger
+            .callback_forwarded(path, "198.51.100.1")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn trusted_proxies_must_be_addresses_or_ranges() {
+    let get = |value: &'static str| {
+        PanelConfig::from_lookup(move |var| match var {
+            ENV_CLIENT_ID => Some("panel".into()),
+            ENV_CLIENT_SECRET => Some("s".into()),
+            ENV_ISSUER => Some("https://auth.example.com".into()),
+            ENV_PUBLIC_URL => Some(PUBLIC.into()),
+            ENV_API_AUDIENCE => Some(AUDIENCE.into()),
+            ENV_TRUSTED_PROXIES => Some(value.into()),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        get("127.0.0.1, 10.89.0.0/24, ::1")
+            .unwrap()
+            .trusted_proxies
+            .len(),
+        3
+    );
+    assert!(get("proxy.example.com").is_err());
+    assert!(get("10.0.0.0/99").is_err());
 }

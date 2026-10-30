@@ -120,6 +120,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | `PANEL_SESSION_IDLE_SECS` | `1800` | A session ends after this long without a request (60 to 86400); must not exceed the maximum. |
 | `PANEL_SESSION_MAX_SECS` | `28800` | A session ends this long after login, however active (300 to 604800). |
 | `OIDC_ENDPOINT_HOSTS` | none | Comma-separated host names, besides the issuer's, that the discovery document may name for `token_endpoint` and `jwks_uri`. By default both must be on the issuer's host and port, so a poisoned discovery document cannot redirect the client secret. |
+| `PANEL_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR ranges (for example the Traefik network) whose `X-Forwarded-For` the panel believes. Sign-in callbacks are limited to 20 per minute per client address ([ADR 0059](../decisions/0059-panel-login-callback-rate-limit.md)); the client is the connection's peer, or, for a trusted peer, the right-most forwarded address that is not itself trusted. Behind a proxy set this, otherwise all clients share the proxy's address and one budget. Leave it empty when nothing sits in front of the panel (`edge` mode). |
 | `PANEL_LISTEN` | `0.0.0.0:8080` | Listen address inside the container. Leave it unless you also change `port`. |
 | `WEGLARKA_PANEL_SOCKET` | `/run/weglarka-admin/api.sock` | The daemon's token socket (also `--socket`). |
 | `PANEL_REQUEST_TIMEOUT_SECS` | `10` | How long the daemon may take to answer a request (1 to 120). |

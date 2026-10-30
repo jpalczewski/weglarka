@@ -65,3 +65,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0056](0056-admin-api-token-listener.md) | Admin API beyond the unix socket: a token listener |
 | [0057](0057-admin-panel-architecture.md) | Admin panel: a server-rendered BFF with htmx and Alpine |
 | [0058](0058-test-coverage-reporting.md) | Test coverage reporting on GitHub Pages |
+| [0059](0059-panel-login-callback-rate-limit.md) | Per-address rate limit on panel login callbacks |
