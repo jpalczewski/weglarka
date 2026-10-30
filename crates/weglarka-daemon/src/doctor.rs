@@ -412,8 +412,8 @@ async fn memory_use<P: PodmanClient>(
                 if percent >= MEMORY_WARN_PERCENT {
                     near_limit.push(format!("{} ({percent}%)", c.name));
                 }
-                let ratio = |u: u64, l: u64| u as f64 / l as f64;
-                if highest.is_none_or(|(_, u, l)| ratio(used, limit) > ratio(u, l)) {
+                if highest.is_none_or(|(_, u, l)| used as f64 / limit as f64 > u as f64 / l as f64)
+                {
                     highest = Some((&c.name, used, limit));
                 }
             }
