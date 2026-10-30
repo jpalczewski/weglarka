@@ -9,7 +9,11 @@
 //! `health.command` replaced element by element (arity kept), `health.http.path` cut to its first
 //! segment, the engine's failure text in `state.failed.reason` replaced by a marker (`events.rs` keeps
 //! it from `read` too), and `ShowAppResponse::redacted` set so no client mistakes the view for the
-//! stored spec. Every handler that answers with a spec takes an [`Access`] and builds the answer
+//! stored spec. The projection goes below the first nesting level (issue #281): enums without data are
+//! rebuilt by an exhaustive `match` with no wildcard arm, so a variant that gains data does not compile
+//! here; validated newtypes (`MemoryLimit`, `CpuLimit`, `InstanceName`, `Digest`) pass through whole;
+//! free-text lists are shown when the model validates them to an identifier or path shape, and the OIDC
+//! `redirect_uris` and `audience` lose their query. Every handler that answers with a spec takes an [`Access`] and builds the answer
 //! with [`show_response`], so a new path cannot forget to redact.
 
 use std::convert::Infallible;
@@ -19,13 +23,17 @@ use axum::http::request::Parts;
 use weglarka_api::{ContainerHealth, ShowAppResponse};
 use weglarka_model::admin_auth::{Principal, Scope};
 use weglarka_model::app::{
-    AppIngress, AppSpec, ConfigMount, HealthGate, HostMount, HostPort, HttpProbe, InstanceName,
-    Resources, SecretBinding, SecretTarget, Security, SharedNetworkRef, SharedVolumeRef,
-    VolumeMount,
+    AppIngress, AppKind, AppSpec, ConfigMount, HealthGate, HostMount, HostPort, HttpProbe,
+    InstanceName, Resources, SecretBinding, SecretTarget, Security, SharedNetworkRef,
+    SharedVolumeRef, Strategy, VolumeMount,
 };
-use weglarka_model::identity::OidcClientSpec;
+use weglarka_model::identity::{
+    AccessTokenFormat, AuthorizationPolicy, IngressAuth, OidcClientSpec, Pkce,
+    TokenEndpointAuthMethod,
+};
 use weglarka_model::podman::{ContainerInfo, HealthStatus};
 use weglarka_model::state::{AppState, FailedDeploy};
+use weglarka_model::uid_range::UidRange;
 
 use crate::admin::runtime_state_for;
 use crate::update::with_waiting;
@@ -89,7 +97,76 @@ fn redact_probe_path(path: &str) -> String {
 // `..` and rebuilds it field by field, so a field added to one of these types does not compile until
 // someone decides what a `read` caller sees of it (issue #265, docs/decisions/0057 decision 8).
 // A field is passed through only when it holds a name, a number, a flag or a path, never a value
-// an operator may have typed a credential into.
+// an operator may have typed a credential into. A helper that passes its whole input through binds
+// every field by reference (`field: _`, still no `..`) and returns the input; one that changes or
+// trims something rebuilds it field by field.
+
+/// A URL without its query and fragment: `https_host` lets both through, and either can carry a
+/// token. The scheme, host, port and path stay, which is what says where the client lives.
+fn redact_url(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or_default().to_owned()
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_kind(kind: AppKind) -> AppKind {
+    match kind {
+        AppKind::Container => AppKind::Container,
+        AppKind::Static => AppKind::Static,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_strategy(strategy: Strategy) -> Strategy {
+    match strategy {
+        Strategy::Recreate => Strategy::Recreate,
+        Strategy::BlueGreen => Strategy::BlueGreen,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_ingress_auth(auth: IngressAuth) -> IngressAuth {
+    match auth {
+        IngressAuth::None => IngressAuth::None,
+        IngressAuth::Forward => IngressAuth::Forward,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_authorization_policy(policy: AuthorizationPolicy) -> AuthorizationPolicy {
+    match policy {
+        AuthorizationPolicy::OneFactor => AuthorizationPolicy::OneFactor,
+        AuthorizationPolicy::TwoFactor => AuthorizationPolicy::TwoFactor,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_token_endpoint_auth_method(method: TokenEndpointAuthMethod) -> TokenEndpointAuthMethod {
+    match method {
+        TokenEndpointAuthMethod::ClientSecretBasic => TokenEndpointAuthMethod::ClientSecretBasic,
+        TokenEndpointAuthMethod::ClientSecretPost => TokenEndpointAuthMethod::ClientSecretPost,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_access_token_format(format: AccessTokenFormat) -> AccessTokenFormat {
+    match format {
+        AccessTokenFormat::Opaque => AccessTokenFormat::Opaque,
+        AccessTokenFormat::Jwt => AccessTokenFormat::Jwt,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_pkce(pkce: Pkce) -> Pkce {
+    match pkce {
+        Pkce::Required => Pkce::Required,
+        Pkce::Off => Pkce::Off,
+    }
+}
+
+fn read_uid_range(range: UidRange) -> UidRange {
+    let UidRange { start: _, size: _ } = &range;
+    range
+}
 
 fn read_probe(probe: HttpProbe) -> HttpProbe {
     let HttpProbe {
@@ -147,61 +224,50 @@ fn read_secret_target(target: SecretTarget) -> SecretTarget {
 
 fn read_volume(volume: VolumeMount) -> VolumeMount {
     let VolumeMount {
-        name,
-        target,
-        read_only,
-    } = volume;
-    VolumeMount {
-        name,
-        target,
-        read_only,
-    }
+        name: _,
+        target: _,
+        read_only: _,
+    } = &volume;
+    volume
 }
 
 fn read_shared_volume(volume: SharedVolumeRef) -> SharedVolumeRef {
     let SharedVolumeRef {
-        name,
-        target,
-        read_only,
-    } = volume;
-    SharedVolumeRef {
-        name,
-        target,
-        read_only,
-    }
+        name: _,
+        target: _,
+        read_only: _,
+    } = &volume;
+    volume
 }
 
 fn read_shared_network(network: SharedNetworkRef) -> SharedNetworkRef {
-    let SharedNetworkRef { name, aliases } = network;
-    SharedNetworkRef { name, aliases }
+    let SharedNetworkRef {
+        name: _,
+        aliases: _,
+    } = &network;
+    network
 }
 
 fn read_host_port(port: HostPort) -> HostPort {
     let HostPort {
-        host,
-        container,
-        ip,
-    } = port;
-    HostPort {
-        host,
-        container,
-        ip,
-    }
+        host: _,
+        container: _,
+        ip: _,
+    } = &port;
+    port
 }
 
+/// `memory` and `cpus` are validated newtypes (a byte count, a CPU count): they pass through whole.
 fn read_resources(resources: Resources) -> Resources {
     let Resources {
-        memory,
-        pids_limit,
-        cpus,
-    } = resources;
-    Resources {
-        memory,
-        pids_limit,
-        cpus,
-    }
+        memory: _,
+        pids_limit: _,
+        cpus: _,
+    } = &resources;
+    resources
 }
 
+/// `tmpfs` entries are validated absolute paths without `:` or `,`, so they cannot carry mount options.
 fn read_security(security: Security) -> Security {
     let Security {
         read_only,
@@ -232,6 +298,8 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_groups,
         auth_exempt_paths,
     } = ingress;
+    // The path lists are validated by the model to `[A-Za-z0-9_.-]` segments (`check_path_prefix`,
+    // `check_skip_path`), `auth_groups` to `[A-Za-z0-9._-]{1,128}`: shapes that hold no credential.
     AppIngress {
         streaming,
         stream_timeout_secs,
@@ -239,25 +307,33 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         max_body_size,
         access_log_skip_paths,
         streaming_paths,
-        auth,
-        auth_policy,
+        auth: read_ingress_auth(auth),
+        auth_policy: auth_policy.map(read_authorization_policy),
         auth_groups,
         auth_exempt_paths,
     }
 }
 
 fn read_config_mount(mount: ConfigMount) -> ConfigMount {
-    let ConfigMount { source, target } = mount;
-    ConfigMount { source, target }
+    let ConfigMount {
+        source: _,
+        target: _,
+    } = &mount;
+    mount
 }
 
 fn read_host_mount(mount: HostMount) -> HostMount {
-    let HostMount { source, target } = mount;
-    HostMount { source, target }
+    let HostMount {
+        source: _,
+        target: _,
+    } = &mount;
+    mount
 }
 
-/// Redirect URIs, scopes and the names of the injected variables are public configuration of the
-/// client; the secret itself only appears as a reference (`client_secret` is a target).
+/// Scopes (an allowlist in the model) and the names of the injected variables are public
+/// configuration of the client; the secret itself only appears as a reference (`client_secret` is a
+/// target). `redirect_uris` and `audience` are https URLs whose query the model accepts, so those lose
+/// it.
 fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
     let OidcClientSpec {
         redirect_uris,
@@ -275,15 +351,15 @@ fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
         client_secret,
     } = oidc;
     OidcClientSpec {
-        redirect_uris,
+        redirect_uris: redirect_uris.iter().map(|uri| redact_url(uri)).collect(),
         scopes,
-        authorization_policy,
-        token_endpoint_auth_method,
-        audience,
+        authorization_policy: read_authorization_policy(authorization_policy),
+        token_endpoint_auth_method: read_token_endpoint_auth_method(token_endpoint_auth_method),
+        audience: audience.iter().map(|uri| redact_url(uri)).collect(),
         groups_in_id_token,
         groups_in_access_token,
-        access_token,
-        pkce,
+        access_token: read_access_token_format(access_token),
+        pkce: read_pkce(pkce),
         public,
         client_id_env,
         issuer_env,
@@ -322,8 +398,11 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         strategy,
         oidc,
     } = spec;
+    // `image`, `domains`, `paths`, `depends_on`, `reload_signal` and `group_add` are names the model
+    // validates (an image reference, DNS names, path prefixes, instance names, a signal name, group
+    // names) and are shown as configured.
     AppSpec {
-        kind,
+        kind: read_kind(kind),
         image,
         command: redact_argv(command),
         domains,
@@ -349,7 +428,7 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         reload_signal,
         host_mounts: host_mounts.into_iter().map(read_host_mount).collect(),
         group_add,
-        strategy,
+        strategy: read_strategy(strategy),
         oidc: oidc.map(read_oidc),
     }
 }
@@ -377,15 +456,18 @@ fn read_state(state: AppState) -> AppState {
     } = state;
     AppState {
         generation,
+        // `current`, `previous` and the digest of a failed deploy are validated `Digest` newtypes
+        // (`sha256:<hex>`): they pass through whole.
         current,
         previous,
         // A sha256 of the whole spec, `env` values included: with the other fields known it lets a
         // reader test guesses of a blanked value offline, so `read` does not get it.
         spec_hash: None,
         failed: failed.map(read_failed),
+        // Secret names the deploy waits for: references, never values.
         waiting_for_secrets,
-        uid_range,
-        effective_uid_range,
+        uid_range: uid_range.map(read_uid_range),
+        effective_uid_range: effective_uid_range.map(read_uid_range),
     }
 }
 
@@ -596,6 +678,7 @@ reload_signal = "SIGHUP"
 strategy = "blue_green"
 start = false
 auto_update = false
+command = ["serve", "--password=hunter2"]
 secrets = [
   { secret = "db", kind = "env", var = "DB_PASSWORD" },
   { secret = "key", kind = "mount", path = "/run/key", mode = 256, uid = 1, gid = 2 },
@@ -605,17 +688,38 @@ host_ports = [{ host = 9000, container = 80, ip = "127.0.0.1" }]
 configs = [{ source = "app/conf", target = "/etc/app" }]
 host_mounts = [{ source = "/srv/media", target = "/media" }]
 shared_networks = [{ name = "backbone", aliases = ["svc"] }]
+[env]
+DATABASE_URL = "postgres://u:p@h/db"
+MODE = "prod"
+[health]
+command = ["check", "--token=t0k3n"]
+[health.http]
+path = "/hooks/t0k3n/ready?key=s3cret"
+expect_status = 204
+timeout_secs = 3
 [resources]
 pids_limit = 100
 [security]
 read_only = true
 tmpfs = ["/tmp"]
 cap_drop = ["ALL"]
+cap_add = ["NET_BIND_SERVICE"]
 [ingress]
 streaming = true
+access_log_skip_paths = ["/healthz/"]
+streaming_paths = ["/events"]
+auth = "forward"
+auth_policy = "one_factor"
 auth_groups = ["staff"]
+auth_exempt_paths = ["/mcp/"]
 [oidc]
-redirect_uris = ["https://a.example.com/callback"]
+redirect_uris = ["https://a.example.com/callback?token=s3cret2", "https://b.example.com/cb"]
+scopes = ["openid", "groups"]
+audience = ["https://api.example.com/v1?key=s3cret3"]
+authorization_policy = "one_factor"
+token_endpoint_auth_method = "client_secret_post"
+access_token = "jwt"
+pkce = "off"
 client_id_env = "OIDC_ID"
 client_secret = { kind = "env", var = "OIDC_SECRET" }
 "#,
@@ -627,11 +731,35 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
         let json = serde_json::to_value(&full).unwrap();
         assert!(json.get("redacted").is_none(), "{json}");
 
-        let shown = show_response(Access::Redacted, name(), spec.clone(), None, None);
+        let state = AppState {
+            waiting_for_secrets: vec!["db".into()],
+            uid_range: Some(UidRange {
+                start: 100_000,
+                size: 65_536,
+            }),
+            ..Default::default()
+        };
+        let shown = show_response(Access::Redacted, name(), spec.clone(), Some(&state), None);
         assert!(shown.redacted);
         assert_eq!(serde_json::to_value(&shown).unwrap()["redacted"], true);
-        // Nothing else to blank here: the view equals the stored spec.
-        assert_eq!(shown.spec, spec);
+        // Everything the policy does not touch equals the stored spec; the rest is spelled out.
+        let mut expected = spec.clone();
+        expected.command = vec![REDACTED_ARG.into(); 2];
+        expected.env = [("DATABASE_URL", ""), ("MODE", "")]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into();
+        expected.health.command = Some(vec![REDACTED_ARG.into(); 2]);
+        expected.health.http.as_mut().unwrap().path = format!("/hooks/{REDACTED_ARG}");
+        let oidc = expected.oidc.as_mut().unwrap();
+        oidc.redirect_uris[0] = "https://a.example.com/callback".into();
+        oidc.audience[0] = "https://api.example.com/v1".into();
+        assert_eq!(shown.state, redact_state(Access::Redacted, state));
+        assert_eq!(shown.spec, expected);
+        let text = format!("{shown:?}");
+        for secret in ["hunter2", "t0k3n", "s3cret", "postgres://", "prod"] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+        insta::assert_json_snapshot!(shown);
     }
 
     #[test]

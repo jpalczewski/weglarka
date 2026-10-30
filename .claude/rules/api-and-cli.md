@@ -18,7 +18,13 @@ paths:
   rebuilds the spec and the state by destructuring every field of `AppSpec`, `AppState` and the nested structs
   **without `..`**, so a new field does not compile until someone decides what a `read` caller sees of it. Policy: `env`
   values blank (keys kept), every `command` element replaced by a placeholder (arity kept), `health.http.path` cut to its first
-  segment, `state.failed.reason` a fixed marker; `ShowAppResponse` carries `redacted: true` whenever this applies, and
+  segment, `state.failed.reason` a fixed marker. Below the first level (#281): data-less enums go through a `read_*`
+  function with an exhaustive `match` and no wildcard arm; validated newtypes (`MemoryLimit`, `CpuLimit`, `Digest`,
+  `InstanceName`) pass through whole; pass-through structs bind every field (`field: _`, no `..`); path and name lists
+  the model validates to identifier shapes (`domains`, `paths`, `streaming_paths`, `auth_exempt_paths`,
+  `access_log_skip_paths`, `auth_groups`, `security.tmpfs`, `cap_add/cap_drop`, `group_add`, `aliases`, `scopes`) are
+  shown, `oidc.redirect_uris` and `oidc.audience` lose their query. A new free-text field needs an explicit decision
+  there, not a pass-through. `ShowAppResponse` carries `redacted: true` whenever this applies, and
   the CLI refuses to write such a spec back.
 - **A stream ends with its token:** streaming handlers stop at the verified principal's `exp` (`StreamDeadline`).
 - Contract changes (`app.rs`, `podman.rs`, `weglarka-api`) are additive only and always update `FakePodman`.

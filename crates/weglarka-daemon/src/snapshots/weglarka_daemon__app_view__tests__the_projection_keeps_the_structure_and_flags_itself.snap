@@ -1,0 +1,163 @@
+---
+source: crates/weglarka-daemon/src/app_view.rs
+expression: shown
+---
+{
+  "name": "app",
+  "spec": {
+    "image": "ghcr.io/example/app:1",
+    "command": [
+      "<redacted>",
+      "<redacted>"
+    ],
+    "domains": [
+      "a.example.com"
+    ],
+    "paths": [
+      "/app"
+    ],
+    "port": 8080,
+    "ingress": {
+      "streaming": true,
+      "access_log_skip_paths": [
+        "/healthz/"
+      ],
+      "streaming_paths": [
+        "/events"
+      ],
+      "auth": "forward",
+      "auth_policy": "one_factor",
+      "auth_groups": [
+        "staff"
+      ],
+      "auth_exempt_paths": [
+        "/mcp/"
+      ]
+    },
+    "env": {
+      "DATABASE_URL": "",
+      "MODE": ""
+    },
+    "secrets": [
+      {
+        "secret": "db",
+        "kind": "env",
+        "var": "DB_PASSWORD"
+      },
+      {
+        "secret": "key",
+        "kind": "mount",
+        "path": "/run/key",
+        "mode": 256,
+        "uid": 1,
+        "gid": 2
+      }
+    ],
+    "health": {
+      "attempts": 5,
+      "window_secs": 30,
+      "command": [
+        "<redacted>",
+        "<redacted>"
+      ],
+      "http": {
+        "path": "/hooks/<redacted>",
+        "expect_status": 204,
+        "timeout_secs": 3
+      }
+    },
+    "volumes": [
+      {
+        "name": "data",
+        "target": "/data",
+        "read_only": true
+      }
+    ],
+    "shared_networks": [
+      {
+        "name": "backbone",
+        "aliases": [
+          "svc"
+        ]
+      }
+    ],
+    "host_ports": [
+      {
+        "host": 9000,
+        "container": 80,
+        "ip": "127.0.0.1"
+      }
+    ],
+    "depends_on": [
+      "db"
+    ],
+    "resources": {
+      "pids_limit": 100
+    },
+    "security": {
+      "read_only": true,
+      "tmpfs": [
+        "/tmp"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "NET_BIND_SERVICE"
+      ]
+    },
+    "auto_update": false,
+    "start": false,
+    "configs": [
+      {
+        "source": "app/conf",
+        "target": "/etc/app"
+      }
+    ],
+    "reload_signal": "SIGHUP",
+    "host_mounts": [
+      {
+        "source": "/srv/media",
+        "target": "/media"
+      }
+    ],
+    "group_add": [
+      "media"
+    ],
+    "strategy": "blue_green",
+    "oidc": {
+      "redirect_uris": [
+        "https://a.example.com/callback",
+        "https://b.example.com/cb"
+      ],
+      "scopes": [
+        "openid",
+        "groups"
+      ],
+      "authorization_policy": "one_factor",
+      "token_endpoint_auth_method": "client_secret_post",
+      "audience": [
+        "https://api.example.com/v1"
+      ],
+      "access_token": "jwt",
+      "pkce": "off",
+      "client_id_env": "OIDC_ID",
+      "client_secret": {
+        "kind": "env",
+        "var": "OIDC_SECRET"
+      }
+    }
+  },
+  "state": {
+    "generation": 0,
+    "waiting_for_secrets": [
+      "db"
+    ],
+    "uid_range": {
+      "start": 100000,
+      "size": 65536
+    }
+  },
+  "runtime": "waiting_for_secret",
+  "redacted": true
+}
