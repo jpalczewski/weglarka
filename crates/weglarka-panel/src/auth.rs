@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::header::{COOKIE, RETRY_AFTER, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -138,14 +138,14 @@ pub async fn login(State(state): State<AppState>, uri: Uri) -> Response {
 /// `GET /auth/callback`: the provider's answer. Every failure ends here with a generic page; the
 /// reason goes to the log (never the code, the state, a token or the secret).
 pub async fn callback(State(state): State<AppState>, request: Request) -> Response {
-    let (uri, headers) = (request.uri().clone(), request.headers().clone());
+    let (uri, headers) = (request.uri(), request.headers());
     // Before `open`, which records the login as used: a fake callback must not cost the table
     // anything for an address that already spent its share (#308).
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::from([0, 0, 0, 0]), |c| c.0.ip());
-    let client = limit::client_addr(peer, &headers, &state.config.trusted_proxies);
+    let client = limit::client_addr(peer, headers, &state.config.trusted_proxies);
     if !state.callback_limit.admit(client) {
         tracing::warn!(%client, "too many sign-in callbacks from one address");
         let mut response = failure(
@@ -156,10 +156,14 @@ pub async fn callback(State(state): State<AppState>, request: Request) -> Respon
         response
             .headers_mut()
             .append(SET_COOKIE, clear_cookie(LOGIN_COOKIE));
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from(limit::CALLBACK_WINDOW.as_secs()),
+        );
         return response;
     }
-    let pending = cookie_value(&headers, LOGIN_COOKIE).and_then(|id| state.logins.open(&id));
-    let mut response = callback_inner(&state, &uri, &headers, pending).await;
+    let pending = cookie_value(headers, LOGIN_COOKIE).and_then(|id| state.logins.open(&id));
+    let mut response = callback_inner(&state, uri, headers, pending).await;
     // The login cookie has done its job, whatever the outcome.
     response
         .headers_mut()
