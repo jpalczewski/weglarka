@@ -324,12 +324,12 @@ async fn a_read_token_does_not_see_argv_or_failure_text() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["spec"]["command"],
-        json!(["serve", "<redacted>"]),
+        json!(["<redacted>", "<redacted>"]),
         "{body}"
     );
     assert_eq!(
         body["spec"]["health"]["command"],
-        json!(["check", "<redacted>"])
+        json!(["<redacted>", "<redacted>"])
     );
     assert_eq!(body["spec"]["health"]["http"]["path"], "/ready");
     assert_eq!(body["state"]["failed"]["digest"], json!(digest), "{body}");

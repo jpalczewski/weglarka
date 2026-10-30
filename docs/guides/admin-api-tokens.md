@@ -61,8 +61,8 @@ no token, so no deadline.
 view is an allowlist projection: the daemon rebuilds it field by field, so a field added in a later release does not
 compile until someone decides what `read` sees of it. The free-form `detail` and the content `fingerprint` of the
 config and host mount views are withheld too. For a token without `admin`: the values of `env` are blank (the keys stay);
-`command` and `health.command` keep only their first element and show `<redacted>` for every other argument (the count
-stays); `health.http.path` keeps its first path segment and shows `<redacted>` for the rest (`/hooks/<token>/ready` is
+`command` and `health.command` show `<redacted>` for every element (only the count stays: `command` replaces the
+image's `CMD`, so even the first element can be a credential); `health.http.path` keeps its first path segment and shows `<redacted>` for the rest (`/hooks/<token>/ready` is
 shown as `/hooks/<redacted>`; the query string is always dropped, and a credential in the *first* segment would still be
 visible, so keep credentials out of the probe path); and the engine's failure text in `state.failed.reason` is replaced
 by a fixed marker (the failed `digest` stays); `state.spec_hash` is omitted, because it is a hash of the spec including the blanked `env` values. The response then carries `"redacted": true`; an `admin` token and the unix

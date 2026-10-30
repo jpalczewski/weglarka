@@ -17,7 +17,7 @@ paths:
 - **Read-scope views are allowlist projections, never blocklists (ADR 0057):** the constructor behind `GET /v1/apps/{name}`
   rebuilds the spec and the state by destructuring every field of `AppSpec`, `AppState` and the nested structs
   **without `..`**, so a new field does not compile until someone decides what a `read` caller sees of it. Policy: `env`
-  values blank (keys kept), arguments after the first replaced by a placeholder, `health.http.path` cut to its first
+  values blank (keys kept), every `command` element replaced by a placeholder (arity kept), `health.http.path` cut to its first
   segment, `state.failed.reason` a fixed marker; `ShowAppResponse` carries `redacted: true` whenever this applies, and
   the CLI refuses to write such a spec back.
 - **A stream ends with its token:** streaming handlers stop at the verified principal's `exp` (`StreamDeadline`).
