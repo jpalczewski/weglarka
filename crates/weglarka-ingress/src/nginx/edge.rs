@@ -13,7 +13,7 @@ use crate::plan::{AppRoute, Domain, Plan, WEBHOOK_UPSTREAM_HOST};
 pub(super) const EDGE_FORWARDED: Forwarded = Forwarded {
     real_ip: "$remote_addr",
     xff: "$remote_addr",
-    proto: "$scheme",
+    proto: "$weglarka_proto",
     fwd_host: "$host",
     original_proto: "https",
 };
@@ -23,7 +23,7 @@ pub(super) const EDGE_FORWARDED: Forwarded = Forwarded {
 pub(super) const EDGE_CDN_FORWARDED: Forwarded = Forwarded {
     real_ip: "$weglarka_client",
     xff: "$weglarka_client",
-    proto: "$scheme",
+    proto: "$weglarka_proto",
     fwd_host: "$host",
     original_proto: "https",
 };
@@ -88,6 +88,8 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
             c.line("real_ip_header proxy_protocol;");
             c.blank();
         }
+        write_probe_proto_map(c, "$scheme");
+        c.blank();
         let forwarded = if let Some(cdn) = &o.cdn {
             write_cdn_client(c, cdn, client.peer());
             c.blank();

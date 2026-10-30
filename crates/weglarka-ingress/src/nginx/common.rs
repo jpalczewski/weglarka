@@ -205,6 +205,21 @@ pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
     }
 }
 
+/// `$weglarka_proto`, with one exception to "the scheme of the listener": a request on the probe
+/// socket (`$remote_addr` is the literal `unix:` there and nowhere else, ADR 0054) may announce
+/// `X-Forwarded-Proto: https`. The socket is `0700` and mounted into nginx only, so the sender is the
+/// daemon. It does so when it fetches from the identity provider, whose OIDC endpoints refuse a
+/// request that claims to be plain HTTP (issue #321). Anyone else gets `fallback`.
+pub(super) fn write_probe_proto_map(c: &mut Conf, fallback: &str) {
+    c.block(
+        "map \"$remote_addr:$http_x_forwarded_proto\" $weglarka_proto",
+        |c| {
+            c.line(&format!("default {fallback};"));
+            c.line("\"unix::https\" https;");
+        },
+    );
+}
+
 /// The full proxy header set. At `http {}` level (`auth: None`) the `Remote-*` identity headers are
 /// set to the empty string, which removes whatever a client sent (same discipline as `X-Forwarded-*`,
 /// ADR 0007) in every location, static sites and the webhook included. nginx's `proxy_set_header`

@@ -113,13 +113,14 @@ fn behind_prelude(c: &mut Conf, o: &NginxOptions) {
         &o.trusted_proxies,
     );
     c.block(
-        "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_proto",
+        "map \"$weglarka_trusted:$http_x_forwarded_proto\" $weglarka_proto_peer",
         |c| {
             c.line("default $scheme;");
             c.line("\"1:https\" https;");
             c.line("\"1:http\" http;");
         },
     );
+    write_probe_proto_map(c, "$weglarka_proto_peer");
     // Redirect only on an explicit non-secure scheme from a trusted peer. A trusted peer that sends no
     // header (the daemon's health probe) falls back to `$scheme` in `$weglarka_proto` — which is
     // `http` too — so `$weglarka_proto` alone cannot drive the redirect.

@@ -50,11 +50,16 @@ http {
     set_real_ip_from unix:;
     real_ip_header proxy_protocol;
 
+    map "$remote_addr:$http_x_forwarded_proto" $weglarka_proto {
+        default $scheme;
+        "unix::https" https;
+    }
+
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Proto $weglarka_proto;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Request-Id $request_id;
     proxy_set_header Upgrade $http_upgrade;

@@ -8,7 +8,9 @@
 //! which only a client-facing listener has. nginx routes by `Host`, hence the app's first domain
 //! (`state::validate_app` requires one when `health.http` is set). The request deliberately carries no
 //! `X-Forwarded-*`; on this socket `$remote_addr` is the literal `unix:`, so an upstream sees
-//! `X-Real-IP: unix:` and trusts no forwarded value.
+//! `X-Real-IP: unix:` and trusts no forwarded value. The exception is the traffic to the identity
+//! provider (JWKS, authz): it announces `X-Forwarded-Proto: https`, which nginx honours on this socket
+//! only, because the provider's OIDC endpoints refuse a request that claims plain HTTP.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -95,6 +97,11 @@ impl ProbeResponse {
 /// Longest response head read; nginx's own default `large_client_header_buffers` is of this order.
 const MAX_HEAD: usize = 16 * 1024;
 const PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Requests to the identity provider claim the scheme its clients use: the provider's OIDC endpoints
+/// answer 400 to a request that says it came over plain HTTP, and the probe socket itself is plain
+/// HTTP. nginx honours this header only on the probe socket (issue #321). The health gate sends none.
+const PROVIDER_HEADERS: &[(&str, &str)] = &[("X-Forwarded-Proto", "https")];
 
 /// How much of the answer an exchange reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,7 +247,8 @@ pub async fn get_over_probe(
 }
 
 /// One `GET` of `path` with `Host: host` over the probe socket, returning the head and a body of at
-/// most `max_body` bytes (5 s budget). The token listener fetches the provider's JWKS this way.
+/// most `max_body` bytes (5 s budget). The token listener fetches the provider's JWKS this way, so it
+/// announces `X-Forwarded-Proto: https` ([`PROVIDER_HEADERS`]).
 pub async fn probe_get(
     socket: &std::path::Path,
     host: &str,
@@ -255,7 +263,7 @@ pub async fn probe_get(
             host,
             path,
             "weglarka-daemon",
-            &[],
+            PROVIDER_HEADERS,
             Want::Body(max_body),
         )
         .await
@@ -290,6 +298,7 @@ pub async fn authz_probe(
             "/api/authz/auth-request",
             "weglarka-doctor",
             &[
+                PROVIDER_HEADERS[0],
                 ("X-Original-URL", original_url),
                 ("X-Original-Method", "GET"),
             ],
@@ -361,6 +370,26 @@ mod tests {
         assert!(req.starts_with("GET /up?x=1 HTTP/1.1\r\n"), "{req}");
         assert!(req.contains("\r\nHost: who.example.com\r\n"), "{req}");
         assert!(!req.to_ascii_lowercase().contains("x-forwarded"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn provider_requests_announce_https_and_the_health_gate_does_not() {
+        let (_dir, sock) = socket();
+        let req = serve_once(&sock, "HTTP/1.0 200 OK\r\n\r\n{}");
+        probe_get(&sock, "auth.example.com", "/jwks.json", 1024)
+            .await
+            .unwrap();
+        let req = req.await.unwrap();
+        assert!(req.contains("\r\nX-Forwarded-Proto: https\r\n"), "{req}");
+        assert!(req.contains("\r\nHost: auth.example.com\r\n"), "{req}");
+
+        let (_dir, sock) = socket();
+        let req = serve_once(&sock, "HTTP/1.1 401 Unauthorized\r\nLocation: /x\r\n\r\n");
+        authz_probe(&sock, "auth.example.com", "https://app.example.com/")
+            .await
+            .unwrap();
+        let req = req.await.unwrap();
+        assert!(req.contains("\r\nX-Forwarded-Proto: https\r\n"), "{req}");
     }
 
     #[tokio::test]
