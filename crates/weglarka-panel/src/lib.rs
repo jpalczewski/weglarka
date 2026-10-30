@@ -9,6 +9,7 @@
 //! - [`oidc`]: the OIDC client (discovery, PKCE, token exchange and refresh, id token verification).
 //! - [`session`]: server-side sessions and pending logins; [`auth`]: login/callback/logout and the session middleware;
 //!   [`csrf`]: the check for state-changing requests; [`secure`]: randomness and constant-time comparison.
+//! - [`limit`]: the per-address limit on login callbacks and how the client address is found.
 //! - [`headers`]: the security headers every response carries.
 //! - [`assets`]: static files embedded in the binary.
 //! - [`pages`]: compile-time templates.
@@ -21,6 +22,7 @@ pub mod config;
 pub mod csrf;
 pub mod daemon;
 pub mod headers;
+pub mod limit;
 pub mod live;
 pub mod oidc;
 pub mod pages;

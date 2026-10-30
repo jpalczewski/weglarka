@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use url::Url;
 
+use crate::limit::ProxyNet;
+
 pub const ENV_CLIENT_ID: &str = "OIDC_CLIENT_ID";
 pub const ENV_ISSUER: &str = "OIDC_ISSUER";
 pub const ENV_CLIENT_SECRET: &str = "OIDC_CLIENT_SECRET";
@@ -23,6 +25,7 @@ pub const ENV_ENDPOINT_HOSTS: &str = "OIDC_ENDPOINT_HOSTS";
 pub const ENV_API_AUDIENCE: &str = "PANEL_API_AUDIENCE";
 pub const ENV_SESSION_IDLE_SECS: &str = "PANEL_SESSION_IDLE_SECS";
 pub const ENV_SESSION_MAX_SECS: &str = "PANEL_SESSION_MAX_SECS";
+pub const ENV_TRUSTED_PROXIES: &str = "PANEL_TRUSTED_PROXIES";
 
 /// Where the token listener's directory is mounted in a client (docs/decisions/0056, decision 2).
 pub const DEFAULT_SOCKET: &str = "/run/weglarka-admin/api.sock";
@@ -106,6 +109,8 @@ pub struct PanelConfig {
     pub session_idle: Duration,
     /// A session ends this long after login, however active.
     pub session_max: Duration,
+    /// Proxies whose `X-Forwarded-For` is believed (empty: the header is ignored).
+    pub trusted_proxies: Vec<ProxyNet>,
     pub oidc: OidcConfig,
 }
 
@@ -187,6 +192,7 @@ impl PanelConfig {
             request_timeout,
             session_idle,
             session_max,
+            trusted_proxies: trusted_proxies(get(ENV_TRUSTED_PROXIES))?,
             oidc: OidcConfig {
                 client_id: required(ENV_CLIENT_ID)?,
                 client_secret,
@@ -196,6 +202,20 @@ impl PanelConfig {
             },
         })
     }
+}
+
+/// `PANEL_TRUSTED_PROXIES`: comma-separated IP addresses or CIDR ranges.
+fn trusted_proxies(raw: Option<String>) -> Result<Vec<ProxyNet>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(|net| {
+            net.trim()
+                .parse()
+                .map_err(|reason: String| invalid(ENV_TRUSTED_PROXIES, reason))
+        })
+        .collect()
 }
 
 /// `OIDC_ENDPOINT_HOSTS`: comma-separated host names (no scheme, port or path), lower-cased.

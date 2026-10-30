@@ -36,7 +36,11 @@ pub async fn serve(
     app: Router,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(stop)
-        .await
+    // The peer address feeds the callback limit.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(stop)
+    .await
 }

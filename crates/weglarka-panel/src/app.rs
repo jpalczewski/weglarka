@@ -18,6 +18,7 @@ use weglarka_http::{HttpError, Purpose};
 
 use crate::config::PanelConfig;
 use crate::daemon::DaemonClient;
+use crate::limit::AddressLimiter;
 use crate::live::StreamSlots;
 use crate::oidc::OidcClient;
 use crate::pages::ErrorPage;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub oidc: Arc<OidcClient>,
     pub sessions: Arc<SessionStore>,
     pub logins: Arc<PendingLogins>,
+    /// Login callbacks per client address, checked before `logins` records anything.
+    pub callback_limit: Arc<AddressLimiter>,
     pub clock: Clock,
     /// Live streams held per session.
     pub streams: Arc<StreamSlots>,
@@ -56,6 +59,7 @@ impl AppState {
         Ok(Self {
             oidc: Arc::new(OidcClient::new(config.clone(), http, clock.clone())),
             logins: Arc::new(PendingLogins::new(clock.clone())),
+            callback_limit: Arc::new(AddressLimiter::new(clock.clone())),
             sessions,
             daemon,
             config,

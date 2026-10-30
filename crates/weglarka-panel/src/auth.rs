@@ -5,9 +5,10 @@
 //! top-level GET, which Lax sends). The session id is minted at the callback, never taken from
 //! anything the browser sent before logging in, so a planted id gains nothing (session fixation).
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
@@ -16,6 +17,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use crate::app::AppState;
 use crate::config::Secret;
 use crate::csrf;
+use crate::limit;
 use crate::pages::ErrorPage;
 use crate::secure::constant_time_eq;
 use crate::session::{PendingLogin, Session, SessionView, Tokens, User};
@@ -135,7 +137,27 @@ pub async fn login(State(state): State<AppState>, uri: Uri) -> Response {
 
 /// `GET /auth/callback`: the provider's answer. Every failure ends here with a generic page; the
 /// reason goes to the log (never the code, the state, a token or the secret).
-pub async fn callback(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
+pub async fn callback(State(state): State<AppState>, request: Request) -> Response {
+    let (uri, headers) = (request.uri().clone(), request.headers().clone());
+    // Before `open`, which records the login as used: a fake callback must not cost the table
+    // anything for an address that already spent its share (#308).
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::from([0, 0, 0, 0]), |c| c.0.ip());
+    let client = limit::client_addr(peer, &headers, &state.config.trusted_proxies);
+    if !state.callback_limit.admit(client) {
+        tracing::warn!(%client, "too many sign-in callbacks from one address");
+        let mut response = failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Slow down",
+            "Too many sign-in attempts from your address. Wait a minute and start again.",
+        );
+        response
+            .headers_mut()
+            .append(SET_COOKIE, clear_cookie(LOGIN_COOKIE));
+        return response;
+    }
     let pending = cookie_value(&headers, LOGIN_COOKIE).and_then(|id| state.logins.open(&id));
     let mut response = callback_inner(&state, &uri, &headers, pending).await;
     // The login cookie has done its job, whatever the outcome.
