@@ -146,6 +146,7 @@ mod tests {
         Overrides {
             config: None,
             socket: Some(socket.to_owned()),
+            host: None,
         }
     }
 

@@ -25,13 +25,14 @@ use crate::client::{ApiClient, append_query, request_path};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
 use crate::preflight;
-use crate::settings::Overrides;
+use crate::settings::{Overrides, Target};
 
 pub async fn run(cli: Cli) -> Result<i32, CliError> {
     let json = cli.json;
     let overrides = Overrides {
         config: cli.config,
         socket: cli.socket,
+        host: cli.host,
     };
     match cli.command {
         Command::Apps(AppsCommand::Add(a)) => apps_add(json, &overrides, a).await,
@@ -65,11 +66,17 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
         Command::Notify(NotifyCommand::Status) => notify_status(json, &overrides).await,
         Command::Notify(NotifyCommand::Test) => notify_test(json, &overrides).await,
+        Command::Login(a) => crate::login::login(json, overrides.host_name()?.as_deref(), a).await,
+        Command::Logout => crate::login::logout(json, overrides.host_name()?.as_deref()).await,
+        Command::Whoami => crate::login::whoami(json, overrides.host_name()?.as_deref()).await,
     }
 }
 
 pub(crate) fn client(overrides: &Overrides) -> Result<ApiClient, CliError> {
-    Ok(ApiClient::new(overrides.admin_socket()?))
+    match overrides.target()? {
+        Target::Socket(socket) => Ok(ApiClient::new(socket)),
+        Target::Host(host) => ApiClient::remote(&host),
+    }
 }
 
 pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {

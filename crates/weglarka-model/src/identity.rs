@@ -226,7 +226,9 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcClientSpec {
-    /// Callback URLs: `https`, no fragment, host one of the app's `domains`. At least one.
+    /// Callback URLs: `https`, no fragment, host one of the app's `domains`. At least one, unless
+    /// `device_flow` is set.
+    #[serde(default)]
     pub redirect_uris: Vec<String>,
     /// Unset means [`DEFAULT_SCOPES`]. `openid` is required; the rest comes from [`ALLOWED_SCOPES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +253,11 @@ pub struct OidcClientSpec {
     /// A public client: no secret, PKCE forced, auth method `none`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub public: bool,
+    /// Also grant the OAuth 2.0 device authorization grant (RFC 8628), e.g. for `weglarka login`
+    /// (ADR 0060). A client with this flag may have no `redirect_uris`: then it has no
+    /// authorization code grant either.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub device_flow: bool,
     /// Environment variable that will carry the client id.
     /// Unset means [`DEFAULT_CLIENT_ID_ENV`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,6 +321,7 @@ impl fmt::Display for ClientId {
 pub struct ExternalClientSpec {
     /// Display name (`client_name`).
     pub name: String,
+    #[serde(default)]
     pub redirect_uris: Vec<String>,
     /// Unset means [`DEFAULT_SCOPES`]. `openid` is required; the rest comes from [`ALLOWED_SCOPES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -338,6 +346,9 @@ pub struct ExternalClientSpec {
     pub pkce: Pkce,
     #[serde(default, skip_serializing_if = "is_false")]
     pub public: bool,
+    /// See [`OidcClientSpec::device_flow`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub device_flow: bool,
 }
 
 /// What the app-level and the external client share, borrowed so the checks exist once.
@@ -351,6 +362,7 @@ struct ClientCommon<'a> {
     access_token: AccessTokenFormat,
     pkce: Pkce,
     public: bool,
+    device_flow: bool,
 }
 
 impl<'a> From<&'a OidcClientSpec> for ClientCommon<'a> {
@@ -365,6 +377,7 @@ impl<'a> From<&'a OidcClientSpec> for ClientCommon<'a> {
             access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
+            device_flow: c.device_flow,
         }
     }
 }
@@ -381,6 +394,7 @@ impl<'a> From<&'a ExternalClientSpec> for ClientCommon<'a> {
             access_token: c.access_token,
             pkce: c.pkce,
             public: c.public,
+            device_flow: c.device_flow,
         }
     }
 }
@@ -521,8 +535,8 @@ pub fn valid_secret_digest(digest: &str) -> bool {
 }
 
 fn check_common(c: &ClientCommon<'_>) -> Result<(), String> {
-    if c.redirect_uris.is_empty() {
-        return Err("redirect_uris needs at least one entry".to_owned());
+    if c.redirect_uris.is_empty() && !c.device_flow {
+        return Err("redirect_uris needs at least one entry (or device_flow = true)".to_owned());
     }
     let mut seen = BTreeSet::new();
     for uri in c.redirect_uris {

@@ -217,6 +217,18 @@ impl DaemonClient {
         Err(map_error(status, &body))
     }
 
+    /// Forwards a prepared request (the relay, ADR 0060) and returns as soon as the head arrives;
+    /// the caller reads the body. `head_timeout` bounds only the head: a long operation answers
+    /// when it is done, and a stream is not cut by it.
+    pub async fn relay(
+        &self,
+        request: Request<RelayBody>,
+        head_timeout: Duration,
+    ) -> Result<RelayedResponse, DaemonError> {
+        let http = self.http.clone().with_head_timeout(Some(head_timeout));
+        Ok(http.open(request).await?)
+    }
+
     fn request(&self, token: &Secret, call: &Call) -> Result<Request<Empty<Bytes>>, DaemonError> {
         let method = match call.endpoint.method {
             Method::Get => weglarka_unix_http::Method::GET,
@@ -236,6 +248,12 @@ impl DaemonClient {
 
 /// An open response whose body is read incrementally.
 pub type Stream = StreamingResponse<Empty<Bytes>>;
+
+/// The request body the relay streams upstream: the caller's own, capped.
+pub type RelayBody = http_body_util::Limited<axum::body::Body>;
+
+/// The daemon's answer to a relayed request.
+pub type RelayedResponse = StreamingResponse<RelayBody>;
 
 /// Maps the API error envelope (or a bare status) to a [`DaemonError`]. A body that is not the
 /// envelope is dropped, never quoted.

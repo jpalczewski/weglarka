@@ -30,6 +30,7 @@ weglarka-ingress = { path = "crates/weglarka-ingress", version = "0.0" }
 weglarka-identity = { path = "crates/weglarka-identity", version = "0.0" }
 weglarka-http = { path = "crates/weglarka-http", version = "0.0" }
 weglarka-model = { path = "crates/weglarka-model", version = "0.0" }
+weglarka-oidc = { path = "crates/weglarka-oidc", version = "0.0" }
 weglarka-notify = { path = "crates/weglarka-notify", version = "0.0" }
 weglarka-registry = { path = "crates/weglarka-registry", version = "0.0" }
 weglarka-unix-http = { path = "crates/weglarka-unix-http", version = "0.0" }

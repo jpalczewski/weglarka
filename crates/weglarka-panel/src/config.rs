@@ -4,7 +4,6 @@
 //! (docs/guides/identity-provider.md); the rest are panel settings with defaults. Parsing takes a
 //! lookup function instead of reading the process environment, so tests never touch it.
 
-use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,25 +41,7 @@ const SESSION_MAX_BOUNDS: std::ops::RangeInclusive<u64> = 300..=7 * 24 * 60 * 60
 const MAX_SECRET_FILE_BYTES: u64 = 4096;
 const MAX_AUDIENCE_BYTES: usize = 512;
 
-/// A secret string. `Debug` never shows it; there is no `Display`, `Serialize`, `Clone` or `==`
-/// (a derived comparison is not constant-time): the only way out is [`Secret::expose`].
-pub struct Secret(String);
-
-impl Secret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Secret(<redacted>)")
-    }
-}
+pub use weglarka_oidc::Secret;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {

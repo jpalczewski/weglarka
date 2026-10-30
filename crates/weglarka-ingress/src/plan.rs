@@ -5,6 +5,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
+use weglarka_model::admin_auth::RELAY_PREFIX;
 use weglarka_model::app::{AppIngress, AppKind, AppSpec, InstanceName, check_path_prefix};
 use weglarka_model::config::{HostConfig, IngressMode};
 use weglarka_model::identity::{IngressAuth, check_issuer, check_upstream};
@@ -291,6 +292,11 @@ pub struct AppRoute<'a> {
     /// `auth_exempt_paths` (#89), normalized: empty unless the app uses forward auth. Sorted, one
     /// entry per path.
     pub auth_exempt: Vec<ExemptPath>,
+    /// The app is an `[admin.http] clients` instance routed at `/`: its
+    /// [`RELAY_PREFIX`](weglarka_model::admin_auth::RELAY_PREFIX) is carved out of the catch-all, without
+    /// forward auth and with the long-lived stream settings and the upload body limit
+    /// (docs/decisions/0060). Derived from the host config, never from the spec.
+    pub admin_relay: bool,
 }
 
 impl AppRoute<'_> {
@@ -447,6 +453,27 @@ impl<'a> Plan<'a> {
                 });
             }
             let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming)?;
+            // Only an app served at `/` can carve a location out of its catch-all, like the
+            // streaming and exempt paths above.
+            let admin_relay = paths.len() == 1
+                && paths[0].is_root()
+                && host
+                    .admin
+                    .http
+                    .as_ref()
+                    .is_some_and(|http| http.clients.contains(instance));
+            let relay = PathPrefix::new(RELAY_PREFIX)?;
+            if admin_relay
+                && let Some(other) = streaming
+                    .iter()
+                    .chain(auth_exempt.iter().map(|e| &e.path))
+                    .find(|p| p.overlaps(&relay))
+            {
+                return Err(IngressError::InvalidPath {
+                    value: other.to_string(),
+                    reason: "overlaps the admin API relay path of an admin client",
+                });
+            }
             let mut domains = Vec::with_capacity(spec.domains.len());
             for raw in &spec.domains {
                 let domain = Domain::new(raw.clone())?;
@@ -458,6 +485,7 @@ impl<'a> Plan<'a> {
                     .iter()
                     .chain(&streaming)
                     .chain(auth_exempt.iter().map(|e| &e.path))
+                    .chain(admin_relay.then_some(&relay))
                 {
                     if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
                     {
@@ -479,6 +507,7 @@ impl<'a> Plan<'a> {
                         .iter()
                         .chain(&streaming)
                         .chain(auth_exempt.iter().map(|e| &e.path))
+                        .chain(admin_relay.then_some(&relay))
                         .map(|p| (instance, p.clone())),
                 );
                 domains.push(domain);
@@ -492,6 +521,7 @@ impl<'a> Plan<'a> {
                 active: spec.start,
                 ingress: spec.ingress.clone(),
                 auth_exempt,
+                admin_relay,
             });
         }
 

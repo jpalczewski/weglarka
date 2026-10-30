@@ -26,6 +26,7 @@ pub mod limit;
 pub mod live;
 pub mod oidc;
 pub mod pages;
+pub mod relay;
 pub mod routes;
 pub mod secure;
 pub mod server;

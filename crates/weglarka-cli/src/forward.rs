@@ -248,7 +248,7 @@ pub async fn run(json: bool, o: &Overrides, a: ForwardArgs) -> Result<i32, CliEr
                     eprintln!("The forward reached its timeout and was closed.");
                     return Ok(0);
                 }
-                // Only the token listener sends this; the CLI talks to the unix socket.
+                // Only the token listener sends this: the token of a remote (`--host`) session ran out.
                 Some(ForwardFrame::TokenExpired) => {
                     return Err(CliError::internal("the forward ended: the token expired"));
                 }

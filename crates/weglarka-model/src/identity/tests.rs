@@ -817,3 +817,27 @@ fn issuer_host_is_the_host_without_port() {
         assert!(issuer_host(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn device_flow_is_the_only_way_to_have_no_redirect_uris() {
+    let with = |extra: &str| spec(&format!("[oidc]\npublic = true\n{extra}"));
+    assert!(lexical_err(&with("")).contains("redirect_uris"));
+    lexical(&with("device_flow = true")).unwrap();
+    lexical(&with(
+        "device_flow = true\nredirect_uris = [\"https://app.example.com/cb\"]",
+    ))
+    .unwrap();
+    // A redirect URI that is present is still checked.
+    assert!(
+        lexical_err(&with(
+            "device_flow = true\nredirect_uris = [\"http://app.example.com/cb\"]"
+        ))
+        .contains("redirect URI")
+    );
+    // The flag is optional and omitted when unset, so the stored spec is unchanged.
+    let oidc = spec("[oidc]\nredirect_uris = [\"https://app.example.com/cb\"]\npublic = true")
+        .oidc
+        .unwrap();
+    assert!(!oidc.device_flow);
+    assert!(!toml::to_string(&oidc).unwrap().contains("device_flow"));
+}

@@ -281,3 +281,35 @@ fn access_control_nested_prefixes_most_specific_first() {
     let text = render_access_control(ISSUER, &[outer.forward(), inner.forward()]).unwrap();
     assert!(text.find("docs/internal").unwrap() < text.find("^/docs(").unwrap());
 }
+
+#[test]
+fn oidc_device_flow_adds_the_device_grant_and_drops_the_code_grant_without_redirects() {
+    let cli = external(
+        r#"
+        name = "weglarka CLI"
+        redirect_uris = []
+        public = true
+        device_flow = true
+        scopes = ["openid", "profile", "groups", "offline_access"]
+        "#,
+    );
+    let with_redirect = external(
+        r#"
+        name = "Device and browser"
+        redirect_uris = ["https://tv.example.com/cb"]
+        public = true
+        device_flow = true
+        scopes = ["openid", "offline_access"]
+        "#,
+    );
+    let mut external = std::collections::BTreeMap::new();
+    external.insert(weglarka_model::identity::ClientId::new("cli").unwrap(), cli);
+    external.insert(
+        weglarka_model::identity::ClientId::new("tv").unwrap(),
+        with_redirect,
+    );
+    let text = render_oidc_clients(&[], &external).unwrap();
+    insta::assert_snapshot!(text);
+    // Unset, the file keeps listing no grants at all (see `oidc_offline_access_gets_refresh_grants`).
+    assert!(!clients_only(&["panel"]).contains("device_code"));
+}

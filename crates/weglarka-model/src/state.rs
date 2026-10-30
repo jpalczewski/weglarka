@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -139,6 +139,14 @@ fn identity_v14(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v14 → v15: the device authorization grant for OIDC clients (ADR 0060). `oidc.device_flow` and
+/// `[oidc_clients.<id>] device_flow` are optional booleans (default false) and `redirect_uris` may be
+/// empty when it is set, so a v14 document needs no data transformation — the marker records that the
+/// file may carry them. A no-op that must accept a hand-edited file which already has them.
+fn oidc_device_flow_v15(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -156,6 +164,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     static_sites_v12,
     site_environments_v13,
     identity_v14,
+    oidc_device_flow_v15,
 ];
 
 const _: () = assert!(

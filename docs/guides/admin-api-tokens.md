@@ -35,7 +35,7 @@ access_token = "jwt"
 groups_in_access_token = true
 ```
 
-The [admin panel](admin-panel.md) is the ready-made client for this listener; it also needs the `groups` and `offline_access`
+The [admin panel](admin-panel.md) is the ready-made client for this listener, and its `/_weglarka/api` relay lets the CLI use it from another machine ([remote CLI](remote-cli.md)); it also needs the `groups` and `offline_access`
 scopes, which its guide lists in full.
 
 Keep the provider's access token lifetime short (Authelia `lifespans.access_token`, 15 minutes at most): a JWT cannot be

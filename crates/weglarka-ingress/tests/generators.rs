@@ -2075,3 +2075,102 @@ port = 9091
         "{authz}"
     );
 }
+
+// --- the admin API relay of an `[admin.http] clients` app (docs/decisions/0060) -------------------
+
+const ADMIN_HTTP: &str = r#"
+[admin.http]
+clients = ["panel"]
+audience = "https://admin.example.eu/api/"
+"#;
+
+fn relay_host(base: &str) -> weglarka_model::config::HostConfig {
+    weglarka_model::config::HostConfig::from_toml_str(&format!("{base}{IDENTITY}{ADMIN_HTTP}"))
+        .unwrap()
+}
+
+#[test]
+fn an_admin_client_gets_its_relay_path_unguarded_and_streaming_in_both_modes() {
+    let a = apps(FORWARD_APPS);
+    let behind = nginx::generate(&relay_host(HOST), &a, &opts()).unwrap();
+    let edge = nginx::generate(&relay_host(EDGE_HOST), &a, &edge_opts(FORWARD_DOMAINS)).unwrap();
+    for (conf, is_edge) in [(behind, false), (edge, true)] {
+        let panel = if is_edge {
+            tls_server(&conf, "panel.example.eu")
+        } else {
+            server_block(&conf, "panel.example.eu")
+        };
+        // The catch-all stays behind the provider and keeps its own (default) buffering.
+        let root = location_block(&panel, "location / {");
+        assert!(
+            root.contains("auth_request /internal/weglarka/authz;"),
+            "{root}"
+        );
+        assert!(!root.contains("proxy_buffering off;"), "{root}");
+        for header in [
+            "location = /_weglarka/api {",
+            "location ^~ /_weglarka/api/ {",
+        ] {
+            let relay = location_block(&panel, header);
+            assert!(!relay.contains("auth_request"), "{relay}");
+            // The same path-confusion guard as an exempt path.
+            assert!(relay.contains("return 400;"), "{relay}");
+            assert!(relay.contains("proxy_pass $upstream;"), "{relay}");
+            assert!(relay.contains("proxy_buffering off;"), "{relay}");
+            assert!(relay.contains("proxy_request_buffering off;"), "{relay}");
+            assert!(relay.contains("proxy_read_timeout 3600s;"), "{relay}");
+            assert!(
+                relay.contains("client_max_body_size 8589934592;"),
+                "{relay}"
+            );
+        }
+        // Nobody else gets a relay: not the other apps, not the provider.
+        for domain in ["plain.example.eu", "auth.example.eu"] {
+            let other = if is_edge {
+                tls_server(&conf, domain)
+            } else {
+                server_block(&conf, domain)
+            };
+            assert!(!other.contains("_weglarka"), "{domain}: {other}");
+        }
+    }
+}
+
+#[test]
+fn without_an_admin_http_section_nothing_changes() {
+    let a = apps(FORWARD_APPS);
+    let with_section = nginx::generate(
+        &relay_host(HOST),
+        &apps("[apps.x]\nimage = \"i\"\n"),
+        &opts(),
+    )
+    .unwrap();
+    assert!(!with_section.contains("_weglarka"));
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    assert!(!conf.contains("_weglarka"), "{conf}");
+}
+
+#[test]
+fn an_admin_client_cannot_also_claim_the_relay_path_itself() {
+    for ingress in [
+        r#"ingress = { auth = "forward", streaming_paths = ["/_weglarka/api/events"] }"#,
+        r#"ingress = { auth = "forward", auth_exempt_paths = ["/_weglarka/"] }"#,
+    ] {
+        let a = apps(&format!(
+            "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+             [apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\nport = 3000\n{ingress}\n"
+        ));
+        let err = nginx::generate(&relay_host(HOST), &a, &opts()).unwrap_err();
+        assert!(err.to_string().contains("relay"), "{ingress}: {err}");
+    }
+}
+
+#[test]
+fn a_prefix_routed_admin_client_gets_no_relay() {
+    let a = apps(
+        "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+         [apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/admin\"]\nport = 3000\n",
+    );
+    let conf = nginx::generate(&relay_host(HOST), &a, &opts()).unwrap();
+    assert!(!conf.contains("_weglarka"), "{conf}");
+}

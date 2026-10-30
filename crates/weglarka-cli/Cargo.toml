@@ -16,20 +16,27 @@ name = "weglarka"
 path = "src/main.rs"
 
 [dependencies]
+bytes.workspace = true
 clap = { workspace = true, features = ["env"] }
 futures-util.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "io-std", "fs", "macros", "time", "process", "signal"] }
+tokio-rustls.workspace = true
 toml.workspace = true
+webpki-roots.workspace = true
 weglarka-api.workspace = true
 weglarka-engine.workspace = true
 weglarka-model.workspace = true
+weglarka-oidc.workspace = true
 weglarka-unix-http.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true
 weglarka-unix-http = { workspace = true, features = ["testing"] }
