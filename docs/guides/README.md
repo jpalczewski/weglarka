@@ -61,6 +61,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Admin API tokens](admin-api-tokens.md) | A token listener for the panel and other clients, `read`/`admin` scopes from provider groups (`[admin.http]`) |
 | [Admin panel](admin-panel.md) | The read-mostly web UI: app definition, OIDC login, sessions, what viewers and admins see |
 | [Remote CLI](remote-cli.md) | `weglarka login` with the device flow, where the tokens are kept, `whoami`, `logout` |
+| [Operating with the CLI](agent-cli.md) | The safe way to drive a host (people and coding agents): where commands go, reads first, writes only on a throwaway app, the agent plugin |
 | [Identity provider](identity-provider.md) | Authelia as a managed app, OIDC clients per app, external clients, secret rotation (`oidc`, `[identity]`) |
 
 ## Operations

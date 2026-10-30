@@ -1,0 +1,10 @@
+{
+  "name": "weglarka-cli",
+  "description": "A skill for operating a Węglarka host with the weglarka CLI safely: where commands go, reads first, writes only with approval and on a throwaway app, secrets from stdin",
+  "version": "0.1.0",
+  "author": { "name": "jpalczewski" },
+  "homepage": "https://github.com/jpalczewski/weglarka/blob/main/docs/guides/agent-cli.md",
+  "repository": "https://github.com/jpalczewski/weglarka",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["weglarka", "podman", "deploy", "cli"]
+}

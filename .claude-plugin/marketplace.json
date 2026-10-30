@@ -1,0 +1,12 @@
+{
+  "name": "weglarka",
+  "description": "Plugins for working with Węglarka hosts",
+  "owner": { "name": "jpalczewski" },
+  "plugins": [
+    {
+      "name": "weglarka-cli",
+      "source": "./plugins/weglarka-cli",
+      "description": "A skill for operating a Węglarka host with the weglarka CLI safely"
+    }
+  ]
+}
