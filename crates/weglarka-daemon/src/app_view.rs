@@ -59,8 +59,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Access {
     }
 }
 
-/// Stands in for every element of a redacted command line, and for every path
-/// segment of a redacted probe path after the first.
+/// Stands in for every element of a redacted command line, and for every path segment of a
+/// redacted probe path after the first.
 pub(crate) const REDACTED_ARG: &str = "<redacted>";
 
 /// Stands in for the engine's failure text of a redacted deploy failure.
@@ -292,7 +292,8 @@ fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
 }
 
 /// The spec a caller without `admin` may see: `env` values blank (keys kept), `command` and
-/// `health.command` keep only their length (every element a placeholder), `health.http.path` keeps its first segment.
+/// `health.command` keep only their length (every element a placeholder), `health.http.path` keeps
+/// its first segment.
 fn read_spec(spec: AppSpec) -> AppSpec {
     let AppSpec {
         kind,
