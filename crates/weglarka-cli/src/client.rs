@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use weglarka_api::{
-    ApiError, Endpoint, Method, RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest,
-    endpoints,
+    ApiError, Endpoint, FrameDecoder, FrameKind, LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery,
+    Method, RUN_STREAM_CONTENT_TYPE, RunFrame, RunRequest, endpoints,
 };
 use weglarka_unix_http::{StreamingResponse, UnixClient};
 
@@ -30,17 +30,31 @@ const BUSY_WAIT: Duration = Duration::from_secs(180);
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(500);
 const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// The frames of a run response, as they arrive.
-pub struct RunStream {
+/// The frames of a streaming response (`run`, `logs`), as they arrive.
+pub struct FrameStream<F> {
     /// Keeps the connection's request side open for as long as the response is read.
     response: StreamingResponse<Full<Bytes>>,
-    decoder: RunFrameDecoder,
-    ready: std::collections::VecDeque<RunFrame>,
+    decoder: FrameDecoder<F>,
+    ready: std::collections::VecDeque<F>,
+    /// What the stream is called in error messages.
+    what: &'static str,
 }
 
-impl RunStream {
+pub type RunStream = FrameStream<RunFrame>;
+pub type LogStream = FrameStream<LogFrame>;
+
+impl<F: FrameKind> FrameStream<F> {
+    fn new(response: StreamingResponse<Full<Bytes>>, what: &'static str) -> Self {
+        Self {
+            response,
+            decoder: FrameDecoder::default(),
+            ready: std::collections::VecDeque::new(),
+            what,
+        }
+    }
+
     /// The next frame, or `None` when the daemon closed the stream.
-    pub async fn next(&mut self) -> Result<Option<RunFrame>, CliError> {
+    pub async fn next(&mut self) -> Result<Option<F>, CliError> {
         loop {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
@@ -49,11 +63,15 @@ impl RunStream {
                 return if self.decoder.is_clean() {
                     Ok(None)
                 } else {
-                    Err(CliError::internal("run stream ended inside a frame"))
+                    Err(CliError::internal(format!(
+                        "{} stream ended inside a frame",
+                        self.what
+                    )))
                 };
             };
-            let data =
-                chunk.map_err(|e| CliError::internal(format!("run stream interrupted: {e}")))?;
+            let data = chunk.map_err(|e| {
+                CliError::internal(format!("{} stream interrupted: {e}", self.what))
+            })?;
             self.ready.extend(
                 self.decoder
                     .push(&data)
@@ -396,11 +414,26 @@ impl ApiClient {
         let response = self
             .open_stream(req, RUN_STREAM_CONTENT_TYPE, "run")
             .await?;
-        Ok(RunStream {
-            response,
-            decoder: RunFrameDecoder::default(),
-            ready: std::collections::VecDeque::new(),
-        })
+        Ok(FrameStream::new(response, "run"))
+    }
+
+    /// `GET /v1/apps/{name}/logs`: opens the response stream of an app's logs. No overall timeout
+    /// (a followed log is open for as long as the token lives); an error before the stream
+    /// (unknown app, no container) is an ordinary API error.
+    pub async fn open_logs(&self, name: &str, query: &LogsQuery) -> Result<LogStream, CliError> {
+        let req = Request::builder()
+            .method(method_str(endpoints::APPS_LOGS.method))
+            .uri(request_path(
+                endpoints::APPS_LOGS,
+                &[("name", name)],
+                &query.to_query_string(),
+            ))
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let response = self
+            .open_stream(req, LOGS_STREAM_CONTENT_TYPE, "logs")
+            .await?;
+        Ok(FrameStream::new(response, "logs"))
     }
 
     /// Sends `req` and returns the response head with the body still unread.

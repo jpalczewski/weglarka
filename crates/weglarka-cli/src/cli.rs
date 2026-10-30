@@ -53,6 +53,8 @@ pub enum Command {
     /// and networks; never its ports or routing) and print the output. For migrations and admin
     /// commands: `weglarka run <app> -- <command>`.
     Run(crate::run::RunArgs),
+    /// Print what the containers of one or many apps wrote to stdout and stderr, optionally following.
+    Logs(crate::logs::LogsArgs),
     /// Temporarily forward a port of an app to this machine: a short-lived relay container on the
     /// app's network plus an SSH tunnel, both removed when the command ends.
     Forward(crate::forward::ForwardArgs),

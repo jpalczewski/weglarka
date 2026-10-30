@@ -6,6 +6,7 @@ mod commands;
 mod error;
 mod forward;
 mod login;
+mod logs;
 mod networks;
 mod oidc;
 mod output;

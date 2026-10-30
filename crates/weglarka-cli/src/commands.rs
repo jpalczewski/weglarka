@@ -47,6 +47,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Apps(AppsCommand::Remove(a)) => apps_remove(json, &overrides, a).await,
         Command::Apps(AppsCommand::List) => apps_list(json, &overrides).await,
         Command::Apps(AppsCommand::Show { name }) => apps_show(json, &overrides, &name).await,
+        Command::Logs(a) => crate::logs::run(json, &overrides, a).await,
         Command::Run(a) => crate::run::run(json, &overrides, a).await,
         Command::Forward(a) => crate::forward::run(json, &overrides, a).await,
         Command::Deploy(a) => deploy(json, &overrides, a).await,
