@@ -64,7 +64,9 @@ config and host mount views are withheld too. For a token without `admin`: the v
 `command` and `health.command` show `<redacted>` for every element (only the count stays: `command` replaces the
 image's `CMD`, so even the first element can be a credential); `health.http.path` keeps its first path segment and shows `<redacted>` for the rest (`/hooks/<token>/ready` is
 shown as `/hooks/<redacted>`; the query string is always dropped, and a credential in the *first* segment would still be
-visible, so keep credentials out of the probe path); and the engine's failure text in `state.failed.reason` is replaced
+visible, so keep credentials out of the probe path); the query string of `oidc.redirect_uris` and `oidc.audience` is dropped (the
+rest of the lists, such as domains, paths, groups, scopes and tmpfs paths, is shown as configured: the daemon validates them
+to name and path shapes, so keep credentials out of them anyway); and the engine's failure text in `state.failed.reason` is replaced
 by a fixed marker (the failed `digest` stays); `state.spec_hash` is omitted, because it is a hash of the spec including the blanked `env` values. The response then carries `"redacted": true`; an `admin` token and the unix
 socket get no such key. A redacted spec is a view, not the stored spec: do not send it back in `PUT /v1/apps/{name}`
 (a full replacement), and `weglarka apps update/start/stop` refuses to when it receives one. Put

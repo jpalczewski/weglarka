@@ -112,6 +112,12 @@ dependency of the daemon (the unix socket works with the panel gone).
 
 ## Implemented
 
+- The read-scope app view reaches below the first nesting level (#281): enums without data are rebuilt by an
+  exhaustive `match` without a wildcard arm, so a variant that gains data fails to compile in `app_view.rs`; validated
+  newtypes pass through whole; pass-through structs bind every field. Free-text lists that the model validates to
+  identifier or path shapes (domains, paths, streaming/exempt/skip paths, auth groups, tmpfs, capabilities, groups,
+  aliases, scopes) are shown; the query of `oidc.redirect_uris` and `oidc.audience` is cut. The `GET /v1/doctor`
+  detail review of #281 is not part of this and is tracked with the doctor work (#272).
 - `weglarka-panel` crate: skeleton, OIDC login and sessions, hardening of both, and the read-mostly pages with live
   events and admin-only logs (#268, #288, #302, #305); `weglarka-unix-http` as the shared socket client.
 - The daemon endpoints of decision 8 (events, redacted app view, certificates, config view, log stream) landed with the
