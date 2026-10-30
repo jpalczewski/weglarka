@@ -51,7 +51,7 @@ jobs:
           color=$(awk -v p="$pct" 'BEGIN { print (p >= 80 ? "brightgreen" : p >= 60 ? "yellow" : "red") }')
           printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > site/badge.json
           echo "Line coverage: ${pct}%" | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/html
