@@ -89,7 +89,9 @@ fn redact_probe_path(path: &str) -> String {
 // `..` and rebuilds it field by field, so a field added to one of these types does not compile until
 // someone decides what a `read` caller sees of it (issue #265, docs/decisions/0057 decision 8).
 // A field is passed through only when it holds a name, a number, a flag or a path, never a value
-// an operator may have typed a credential into.
+// an operator may have typed a credential into. A helper that passes its whole input through binds
+// every field by reference (`field: _`, still no `..`) and returns the input; one that changes or
+// trims something rebuilds it field by field.
 
 fn read_probe(probe: HttpProbe) -> HttpProbe {
     let HttpProbe {
@@ -147,59 +149,46 @@ fn read_secret_target(target: SecretTarget) -> SecretTarget {
 
 fn read_volume(volume: VolumeMount) -> VolumeMount {
     let VolumeMount {
-        name,
-        target,
-        read_only,
-    } = volume;
-    VolumeMount {
-        name,
-        target,
-        read_only,
-    }
+        name: _,
+        target: _,
+        read_only: _,
+    } = &volume;
+    volume
 }
 
 fn read_shared_volume(volume: SharedVolumeRef) -> SharedVolumeRef {
     let SharedVolumeRef {
-        name,
-        target,
-        read_only,
-    } = volume;
-    SharedVolumeRef {
-        name,
-        target,
-        read_only,
-    }
+        name: _,
+        target: _,
+        read_only: _,
+    } = &volume;
+    volume
 }
 
 fn read_shared_network(network: SharedNetworkRef) -> SharedNetworkRef {
-    let SharedNetworkRef { name, aliases } = network;
-    SharedNetworkRef { name, aliases }
+    let SharedNetworkRef {
+        name: _,
+        aliases: _,
+    } = &network;
+    network
 }
 
 fn read_host_port(port: HostPort) -> HostPort {
     let HostPort {
-        host,
-        container,
-        ip,
-    } = port;
-    HostPort {
-        host,
-        container,
-        ip,
-    }
+        host: _,
+        container: _,
+        ip: _,
+    } = &port;
+    port
 }
 
 fn read_resources(resources: Resources) -> Resources {
     let Resources {
-        memory,
-        pids_limit,
-        cpus,
-    } = resources;
-    Resources {
-        memory,
-        pids_limit,
-        cpus,
-    }
+        memory: _,
+        pids_limit: _,
+        cpus: _,
+    } = &resources;
+    resources
 }
 
 fn read_security(security: Security) -> Security {
@@ -247,13 +236,19 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
 }
 
 fn read_config_mount(mount: ConfigMount) -> ConfigMount {
-    let ConfigMount { source, target } = mount;
-    ConfigMount { source, target }
+    let ConfigMount {
+        source: _,
+        target: _,
+    } = &mount;
+    mount
 }
 
 fn read_host_mount(mount: HostMount) -> HostMount {
-    let HostMount { source, target } = mount;
-    HostMount { source, target }
+    let HostMount {
+        source: _,
+        target: _,
+    } = &mount;
+    mount
 }
 
 /// Redirect URIs, scopes and the names of the injected variables are public configuration of the
