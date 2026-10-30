@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::io::IsTerminal;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use futures_util::StreamExt;
@@ -28,6 +28,20 @@ const DEFAULT_TAIL: u32 = 100;
 const MAX_LINE: usize = 64 * 1024;
 /// Reopens in a row, with no output in between, after which a stream is given up.
 const MAX_QUIET_REOPENS: u32 = 5;
+/// A connection that stayed open at least this long was not a tight loop, however quiet: it does
+/// not count towards [`MAX_QUIET_REOPENS`] (an idle app followed for hours expires many tokens).
+const STABLE_FOR: Duration = Duration::from_secs(60);
+
+/// The count of quick reopens after one more, given how long the connection being replaced lived;
+/// `None` when the stream expires in a tight loop and should be given up.
+fn count_reopen(quick_reopens: u32, lived: Duration) -> Option<u32> {
+    let before = if lived >= STABLE_FOR {
+        0
+    } else {
+        quick_reopens
+    };
+    (before < MAX_QUIET_REOPENS).then_some(before + 1)
+}
 
 /// `--tail`: a number of lines, or `all`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +328,8 @@ impl<O: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<O, E> {
                 let value = serde_json::json!({
                     "app": self.names[app],
                     "stream": if stderr { "stderr" } else { "stdout" },
-                    "line": String::from_utf8_lossy(&piece.bytes),
+                    // JSON escapes C0 only; C1 (U+009B is CSI) and bidi would still reach a terminal.
+                    "line": String::from_utf8_lossy(&sanitize_for_terminal(&piece.bytes, self.out_tty)),
                 });
                 line.extend_from_slice(value.to_string().as_bytes());
                 line.push(b'\n');
@@ -367,6 +382,8 @@ struct AppStream<'a> {
     /// When output last arrived: a reopen asks for output since then.
     last_data: SystemTime,
     quiet_reopens: u32,
+    /// When the current connection was opened.
+    opened: Instant,
 }
 
 impl AppStream<'_> {
@@ -411,10 +428,8 @@ impl AppStream<'_> {
     /// The token expired: continue from the last output with a fresh connection (a remote host
     /// refreshes its token when a connection opens).
     async fn reopen(&mut self) -> Result<(), String> {
-        self.quiet_reopens += 1;
-        if self.quiet_reopens > MAX_QUIET_REOPENS {
-            return Err("the stream keeps expiring without output".into());
-        }
+        self.quiet_reopens = count_reopen(self.quiet_reopens, self.opened.elapsed())
+            .ok_or("the stream keeps expiring without output")?;
         let query = LogsQuery {
             tail: None,
             since: Some(since_epoch(Some(self.last_data))),
@@ -425,6 +440,7 @@ impl AppStream<'_> {
             .open_logs(&self.name, &query)
             .await
             .map_err(|e| format!("cannot reopen the stream: {}", e.message))?;
+        self.opened = Instant::now();
         Ok(())
     }
 }
@@ -479,6 +495,7 @@ where
             stream,
             last_data: started,
             quiet_reopens: 0,
+            opened: Instant::now(),
         };
         Box::pin(stream::unfold(Some(state), |state| async move {
             state?.next().await
@@ -763,6 +780,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_on_a_terminal_is_sanitised_too() {
+        let mut p = printer(Mode::Json, &["web"], true);
+        p.data(0, false, b"a\xc2\x9b[0m\xe2\x80\xaeb\x1bc\n")
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_str(text(&p.out).trim()).unwrap();
+        assert_eq!(got["line"], "a\u{FFFD}[0m\u{FFFD}b\u{FFFD}c");
+    }
+
+    #[tokio::test]
     async fn a_terminal_gets_sanitised_lines_a_pipe_does_not() {
         for (tty, expected) in [
             (true, "web | a\u{FFFD}[0mb\n"),
@@ -1042,6 +1069,25 @@ mod tests {
         .await;
         assert_eq!(code.unwrap(), 0);
         assert!(err.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_quick_expiries_count_towards_giving_up() {
+        let quick = Duration::from_millis(5);
+        let mut n = 0;
+        for _ in 0..MAX_QUIET_REOPENS {
+            n = count_reopen(n, quick).unwrap();
+        }
+        assert_eq!(count_reopen(n, quick), None);
+        // A quiet stream that lives past the threshold each time is reopened without end.
+        let mut n = 0;
+        for _ in 0..MAX_QUIET_REOPENS * 10 {
+            n = count_reopen(n, STABLE_FOR).unwrap();
+        }
+        assert_eq!(n, 1);
+        // A stable stretch resets an earlier run of quick ones.
+        let n = count_reopen(MAX_QUIET_REOPENS, STABLE_FOR).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]
