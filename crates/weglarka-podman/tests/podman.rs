@@ -762,3 +762,71 @@ async fn restart_count_is_reported_and_grows_after_a_crash() {
     };
     assert!(info.restarts >= 1, "{info:?}");
 }
+
+/// `weglarka logs` always asks for `timestamps=true` and strips the prefix at the start of a line, so
+/// it relies on libpod stamping a *line*, not every record: a line of 64 KiB (longer than the
+/// runtime's record size) must carry exactly one timestamp.
+#[tokio::test]
+async fn a_long_log_line_carries_one_timestamp() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-longline-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.image = BUSYBOX.into();
+    s.entrypoint = Some(vec!["/bin/sh".into()]);
+    s.command = vec![
+        "-c".into(),
+        "head -c 65536 /dev/zero | tr '\\0' a; echo; echo short".into(),
+    ];
+    s.restart = RestartPolicy::No;
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+    timeout(STEP, client.container_wait(&name))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut logs = timeout(
+        STEP,
+        client.container_logs(
+            &name,
+            &LogOptions {
+                timestamps: true,
+                ..LogOptions::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut text = Vec::new();
+    while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
+        text.extend_from_slice(&chunk.unwrap().data);
+    }
+    let text = String::from_utf8(text).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let stamps = text.matches("T").count();
+    // Letters only (`a`), so a `T` can only come from a timestamp.
+    assert_eq!(
+        (lines.len(), stamps),
+        (2, 2),
+        "{} lines, {stamps} timestamps; lengths {:?}",
+        lines.len(),
+        lines.iter().map(|l| l.len()).collect::<Vec<_>>()
+    );
+    client.container_remove(&name, true).await.unwrap();
+}
