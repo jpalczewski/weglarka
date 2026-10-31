@@ -40,7 +40,7 @@ filtering: it keeps only the lines whose `app` is the one you named, and nobody 
 weglarka access web                          # the last 100 requests of the last hour
 weglarka access web -f                       # and follow new ones
 weglarka access web --since 10m --status 5xx
-weglarka access web -n 20 --path /api --method POST --host web.example.com
+weglarka access web -n 20 --path /api --method POST --domain web.example.com
 weglarka --json access web -f | jq -r .remote_addr
 ```
 
@@ -55,7 +55,7 @@ terminal control characters are replaced and a path can never start a line of it
 | `-n N` | the last N **matching** requests (at most 1000); default 100, none with `--since` |
 | `--since DUR` | only newer requests (`90`, `10m`, `2h`); default window: the last hour |
 | `--status` | one status (`404`) or a class (`5xx`) |
-| `--method`, `--host` | exact match |
+| `--method`, `--domain` | exact match (`--host` is the global flag naming the panel) |
 | `--path` | a prefix of the path as nginx logs it (`$uri`: no query string, percent-decoded, after any `strip_prefix` rewrite); the value itself accepts no `%` |
 
 - **By app, not by host.** With [path routing](path-routing.md) one domain serves several apps, so the filter is the
