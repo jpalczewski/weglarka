@@ -123,11 +123,11 @@ fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 /// scraper or a missing network membership is a `warn`, since the daemon itself keeps working.
 async fn metrics_scraper<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     const ID: &str = "metrics.scraper";
-    let Some((instance, network)) = d
+    let Some((instance, network, listen)) = d
         .host
         .metrics
         .as_ref()
-        .and_then(|m| m.scraper.as_ref().map(|s| (s, &m.network)))
+        .and_then(|m| m.scraper.as_ref().map(|s| (s, &m.network, m.listen)))
     else {
         return;
     };
@@ -195,7 +195,18 @@ async fn metrics_scraper<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChe
     if !networks.iter().any(|n| &n.name == network) {
         missing.insert(0, network.clone());
     }
-    if missing.is_empty() {
+    if missing.is_empty() && listen.ip().is_loopback() {
+        // Joined, but a loopback listener only answers inside the daemon's own container.
+        out.push(check(
+            ID,
+            CheckStatus::Warn,
+            format!(
+                "scraper {instance} is on its networks, but [metrics] listen {listen} is a loopback \
+                 address: the scraper can never reach the daemon's /metrics"
+            ),
+            Some("listen on 0.0.0.0 (nothing is published on the host) and restart the daemon"),
+        ));
+    } else if missing.is_empty() {
         out.push(ok(
             ID,
             format!(

@@ -897,7 +897,7 @@ mod host {
 mod scraper {
     use super::*;
 
-    const WITH_SCRAPER: &str = "\n[runtime]\nreconcile_interval_secs = 3600\n\n[metrics]\nlisten = \"127.0.0.1:0\"\nnetwork = \"scrape\"\nscraper = \"prom\"\n";
+    const WITH_SCRAPER: &str = "\n[runtime]\nreconcile_interval_secs = 3600\n\n[metrics]\nlisten = \"0.0.0.0:0\"\nnetwork = \"scrape\"\nscraper = \"prom\"\n";
 
     async fn scraper_check(running: &Running<FakePodman>) -> Option<Value> {
         doctor(running)
@@ -907,7 +907,11 @@ mod scraper {
     }
 
     async fn with_scraper() -> Harness {
-        let h = Builder::new().sections(WITH_SCRAPER).build().await;
+        with_sections(WITH_SCRAPER).await
+    }
+
+    async fn with_sections(sections: &str) -> Harness {
+        let h = Builder::new().sections(sections).build().await;
         own_container(&h.fake).await;
         h
     }
@@ -982,6 +986,26 @@ mod scraper {
         assert_eq!(check["status"], "warn", "{check}");
         assert!(
             check["message"].as_str().unwrap().contains("metrics-web"),
+            "{check}"
+        );
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_loopback_listener_is_a_warning_even_when_joined() {
+        let h = with_sections(&WITH_SCRAPER.replace("0.0.0.0:0", "127.0.0.1:0")).await;
+        add(&h, "prom", spec("prom.example.com")).await;
+        deployed(&h, "prom").await;
+        eventually("the scraper joins the daemon network", || async {
+            h.fake
+                .network_members("scrape")
+                .contains(&"prom".to_owned())
+        })
+        .await;
+        let check = scraper_check(&h.running).await.unwrap();
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("loopback"),
             "{check}"
         );
         h.running.stop().await;

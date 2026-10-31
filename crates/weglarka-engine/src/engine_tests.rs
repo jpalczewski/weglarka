@@ -2823,6 +2823,67 @@ mod scraper {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_scraper_that_opts_in_itself_stays_on_its_own_network_as_owner() {
+        let prom_bg = "[apps.prom]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nport = 9090\n\
+                       metrics_port = 9090\nstrategy = \"blue_green\"\n\
+                       health = { attempts = 3, window_secs = 6, command = [\"true\"] }\n";
+        let h = Harness::with_options(&format!("{A_IN}{prom_bg}"), options(Some("prom")));
+        h.fake
+            .network_create(&daemon_network(labels::METRICS_NETWORK))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("prom", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        // Once as the owner of `metrics-prom`, never twice.
+        assert_eq!(
+            h.fake.container_spec("prom").unwrap().networks,
+            vec!["net-prom", "metrics-prom", "metrics", "metrics-a"]
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+
+        // Blue-green: the challenger joins its own network after the gate with the alias, as any
+        // opted-in app does, and the other metrics networks up front.
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("prom.next", [HealthStatus::Healthy]);
+        let before = h.fake.calls().len();
+        assert!(matches!(
+            h.rec.deploy(&name("prom"), false).await.unwrap(),
+            DeployOutcome::Deployed { .. }
+        ));
+        let challenger = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .rfind(|s| s.name == "prom.next")
+            .expect("a challenger");
+        assert!(!challenger.networks.contains(&"metrics-prom".to_owned()));
+        assert!(
+            h.fake.calls()[before..].contains(&Call::NetworkConnectAliased {
+                network: "metrics-prom".into(),
+                container: "prom.next".into(),
+                aliases: vec!["prom".into()],
+            })
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+
+        // A pass keeps it there and changes nothing.
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        assert!(
+            !h.fake.calls()[before..].iter().any(|c| matches!(
+                c,
+                Call::NetworkConnect { .. } | Call::NetworkDisconnect { .. }
+            )),
+            "{:?}",
+            &h.fake.calls()[before..]
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_one_off_container_of_the_scraper_never_joins() {
         let h = deployed(&format!("{A_IN}{PROM}")).await;
         h.fake.script_next_run(RunScript {

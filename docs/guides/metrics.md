@@ -212,7 +212,15 @@ weglarka apps update forge --metrics-port 9100 --metrics-path /internal/metrics
 On the next deploy the daemon creates an `internal` Podman network `metrics-forge` (no route out, labelled
 `weglarka.metrics-for=forge`) and attaches the app's container to it. Each opted-in app gets its own network, shared
 only with the scraper: on one network for every app, opted-in apps could reach each other, and putting the scraper on
-`net-forge` would expose every port of the app. One-off containers (`weglarka run`, `weglarka forward`) never join it.
+`net-forge` would put it on the network the ingress nginx uses for that app. One-off containers (`weglarka run`,
+`weglarka forward`) never join it.
+
+**The network filters no port.** `metrics_port` only tells the scraper where to look; it is not a firewall rule, and
+the bridge passes every port between the members. So the scraper can reach every port of every opted-in app, and so
+can anyone who compromises the scraper. An app must not rely on `metrics-<app>` to protect its other listeners (an
+admin port, a debug endpoint): bind those to `127.0.0.1` inside the container, or protect them with their own
+authentication. What the network does keep apart is the opted-in apps from each other, and the scraper from the
+ingress nginx and from apps that did not opt in.
 
 - **Setting or changing `metrics_port` recreates the container once** (it changes the container's networks), like
   joining a shared network. `metrics_path` alone recreates nothing; only the scraper reads it. Apps that do not set
@@ -265,7 +273,8 @@ so it can scrape `weglarka:9464`) and on the `metrics-<app>` network of every op
 
 `weglarka doctor` shows a `metrics.scraper` line when `scraper` is set: `ok` with the networks the scraper is on, `warn`
 when the app is not in `apps.toml`, has no running container, or is missing from a network it should be on (the next
-pass connects it; the daemon log says why it could not). It is never `fail`, and absent without `scraper`.
+pass connects it; the daemon log says why it could not), and when `[metrics] listen` is a loopback address, which the
+scraper can never reach from its own container. It is never `fail`, and absent without `scraper`.
 `GET /v1/config` shows the field.
 
 ## Suggested alerts

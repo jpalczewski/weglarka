@@ -1029,7 +1029,8 @@ pub struct AppSpec {
     pub oidc: Option<OidcClientSpec>,
     /// Container port that serves Prometheus metrics (issue #364). Setting it opts the app in: the
     /// container also joins its own internal network `metrics-<instance>`, shared only with the
-    /// scraper. Part of the spec hash while set, because it changes the container's networks; unset
+    /// scraper. The network does not filter ports: the scraper reaches every port of the container, not
+    /// just this one, so another listener must not rely on it for protection. Part of the spec hash while set, because it changes the container's networks; unset
     /// it hashes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_port: Option<u16>,

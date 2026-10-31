@@ -91,7 +91,8 @@ pub const METRICS_APP_NETWORK_PREFIX: &str = "metrics-";
 pub const METRICS_FOR: &str = "weglarka.metrics-for";
 
 /// Internal network an app with `metrics_port` shares only with the scraper (issue #364), so that
-/// opted-in apps cannot reach each other and the scraper never joins `net-<instance>`. At most
+/// opted-in apps cannot reach each other and the scraper never shares a network with the ingress
+/// nginx. It filters no port: the scraper reaches every port of the app on it. At most
 /// 71 bytes for a 63-byte instance name: libpod caps network names only by its name pattern
 /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), not by length — [`staging_network_name`] is 72 bytes already —
 /// and the bridge interface gets its own short `podmanN` name.

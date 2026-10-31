@@ -305,3 +305,121 @@ async fn per_app_metrics_networks_isolate_apps_from_each_other() {
     assert_ne!(connect(&client, &a, &b).await, 0);
     assert_ne!(connect(&client, &b, &a).await, 0);
 }
+
+/// A free loopback port on the host (released before the container takes it).
+fn free_host_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback port");
+    listener.local_addr().expect("local addr").port()
+}
+
+/// What the published port answers from the host side, retried while the listener starts. `None` if
+/// it never answered.
+async fn host_answer(port: u16) -> Option<String> {
+    use std::io::Read;
+    for _ in 0..20 {
+        let got = tokio::task::spawn_blocking(move || {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let mut stream =
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            // The first chunk is enough: busybox `nc -l` need not close after its greeting.
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).ok()?;
+            (n > 0).then(|| String::from_utf8_lossy(&buf[..n]).into_owned())
+        })
+        .await
+        .unwrap();
+        if got.is_some() {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    None
+}
+
+/// An app with `host_ports` that opts into metrics (issue #364) is created on its normal network
+/// **and** an internal `metrics-<app>` (in that order, as `launch` does it), and an app that opts in
+/// later, or the scraper (issue #365), joins an internal network live. Either way the published
+/// loopback port must keep answering from the host: which network rootless Podman forwards a
+/// published port through is not something Węglarka chooses, and an internal network has no route
+/// out. Published on `127.0.0.1`, the default of `host_ports`.
+#[tokio::test]
+async fn a_published_port_still_answers_next_to_an_internal_network() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(&socket);
+    let id = run_id();
+    let (created, joined) = (format!("it-pc-{id}"), format!("it-pj-{id}"));
+    let own = |n: &str| format!("net-it-{n}-{id}");
+    let instance = |n: &str| weglarka_model::app::InstanceName::new(n).unwrap();
+    let metrics_created = labels::metrics_network_name(&instance(&created));
+    let metrics_joined = labels::metrics_network_name(&instance(&joined));
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![created.clone(), joined.clone()],
+        networks: vec![
+            own("pc"),
+            own("pj"),
+            metrics_created.clone(),
+            metrics_joined.clone(),
+        ],
+    };
+    let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
+    assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
+
+    for n in ["pc", "pj"] {
+        client
+            .network_create(&network(&own(n), false))
+            .await
+            .unwrap();
+    }
+    for net in [&metrics_created, &metrics_joined] {
+        client.network_create(&network(net, true)).await.unwrap();
+    }
+
+    let server_cmd = ["sh", "-c", "while true; do echo hi | nc -l -p 8080; done"];
+    let published = |name: &str, networks: &[&str], port: u16| {
+        let mut s = spec(name, networks, &[], &server_cmd);
+        s.publish = vec![weglarka_model::podman::PortMapping {
+            host_ip: Some("127.0.0.1".into()),
+            host_port: port,
+            container_port: 8080,
+        }];
+        s
+    };
+    let (port_created, port_joined) = (free_host_port(), free_host_port());
+    client
+        .container_create(&published(
+            &created,
+            &[&own("pc"), &metrics_created],
+            port_created,
+        ))
+        .await
+        .unwrap();
+    client
+        .container_create(&published(&joined, &[&own("pj")], port_joined))
+        .await
+        .unwrap();
+    for c in [&created, &joined] {
+        client.container_start(c).await.unwrap();
+    }
+
+    assert_eq!(
+        host_answer(port_created).await.as_deref(),
+        Some("hi\n"),
+        "created on a normal and an internal network: the published port must answer"
+    );
+    assert_eq!(
+        host_answer(port_joined).await.as_deref(),
+        Some("hi\n"),
+        "before the live join"
+    );
+    client
+        .network_connect(&metrics_joined, &joined)
+        .await
+        .unwrap();
+    assert_eq!(
+        host_answer(port_joined).await.as_deref(),
+        Some("hi\n"),
+        "after joining an internal network live: the published port must still answer"
+    );
+}
