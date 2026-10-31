@@ -201,3 +201,10 @@ thead th { font-size: 0.85rem; color: var(--muted); }
 .htmx-indicator { opacity: 0; }
 .htmx-request .htmx-indicator,
 .htmx-request.htmx-indicator { opacity: 1; }
+
+/* The access log: one row per request, the same viewer as the logs. */
+.filters { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: end; margin-bottom: 0.5rem; }
+.filters label { display: flex; flex-direction: column; gap: 0.2rem; }
+.log .access span, .log .access time { margin-right: 0.6rem; }
+.log .access .method { font-weight: 700; }
+.log .access .agent { color: var(--muted); }

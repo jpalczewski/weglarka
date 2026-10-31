@@ -46,11 +46,41 @@
 {% for c in app.host_mounts %}        <li><code>{{ c.source }}</code> → <code>{{ c.target }}</code> {{ m::badge(&c.status) }}{% if !c.detail.is_empty() %} {{ c.detail }}{% endif %}</li>
 {% endfor %}      </ul>
     </section>
-{% endif %}{% if logs %}    <section aria-labelledby="h-logs" hx-ext="sse" sse-connect="/apps/{{ app.name }}/logs/stream" sse-close="done" x-data="logView">
+{% endif %}{% if logs %}    <section aria-labelledby="h-logs">
       <h2 id="h-logs">Logs</h2>
-      <p class="muted">Live output of the running container (administrators only). Log content is untrusted text.</p>
-      <label class="check"><input type="checkbox" x-model="wrap"> Wrap long lines</label>
-      <div class="log" id="log" role="log" aria-live="off" tabindex="0" x-bind:data-wrap="wrap" sse-swap="lines" hx-swap="beforeend"></div>
-      <p id="log-status" class="muted" sse-swap="status" hx-swap="innerHTML"></p>
+      <p class="muted">Live output of the running container (administrators only). Log content is untrusted text. The stream opens when you start it and closes when you leave the page.</p>
+      <button type="button" hx-get="/apps/{{ app.name }}/logs" hx-target="#logs-live" hx-swap="innerHTML">Start</button>
+      <div id="logs-live" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="h-access">
+      <h2 id="h-access">Access log</h2>
+      <p class="muted">Requests that reached this application through its domains (administrators only). Every field comes from the client and is untrusted text. The stream opens when you start it and closes when you leave the page.</p>
+      <form class="filters" hx-get="/apps/{{ app.name }}/access" hx-target="#access-live" hx-swap="innerHTML">
+        <label>Status
+          <select name="status">
+            <option value="">any</option>
+            <option value="2xx">2xx</option>
+            <option value="3xx">3xx</option>
+            <option value="4xx">4xx</option>
+            <option value="5xx">5xx</option>
+          </select>
+        </label>
+        <label>Method
+          <select name="method">
+            <option value="">any</option>
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="PUT">PUT</option>
+            <option value="PATCH">PATCH</option>
+            <option value="DELETE">DELETE</option>
+            <option value="HEAD">HEAD</option>
+            <option value="OPTIONS">OPTIONS</option>
+          </select>
+        </label>
+        <label>Path prefix <input type="text" name="path" maxlength="128" placeholder="/api" autocomplete="off"></label>
+        <label>Host <input type="text" name="host" maxlength="253" placeholder="app.example.com" autocomplete="off"></label>
+        <button type="submit">Start</button>
+      </form>
+      <div id="access-live" aria-live="polite"></div>
     </section>
 {% endif %}{% endblock %}

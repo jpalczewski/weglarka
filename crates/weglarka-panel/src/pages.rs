@@ -105,7 +105,8 @@ pub struct AppsPage {
 pub struct AppPage {
     pub shell: Shell,
     pub app: AppDetail,
-    /// Whether the log section is offered: the daemon let this user open the logs stream.
+    /// Whether the log and access-log sections are offered: the daemon let this user open the
+    /// (admin-only) streams. Both start on demand, so the page itself opens none.
     pub logs: bool,
 }
 
@@ -213,6 +214,48 @@ pub struct LogLine {
 pub struct LogLines<'a> {
     pub lines: &'a [LogLine],
 }
+
+/// What the log "Start" button loads: the element that opens the stream.
+#[derive(Template)]
+#[template(path = "logs_live.html")]
+pub struct LogsLive {
+    /// The same-origin stream URL.
+    pub stream: String,
+}
+
+/// What the access-log filter form loads: the element that opens the (filtered) stream.
+#[derive(Template)]
+#[template(path = "access_live.html")]
+pub struct AccessLive {
+    /// The same-origin stream URL, carrying the re-encoded filter.
+    pub stream: String,
+}
+
+/// One access-log entry; every text field is untrusted and already cut and cleaned, the template
+/// escapes it.
+pub struct AccessRow {
+    pub time: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    /// Badge class: `ok`, `info`, `warn`, `fail` or `muted`.
+    pub class: &'static str,
+    pub bytes: u64,
+    pub request_time: String,
+    pub remote: String,
+    pub user_agent: String,
+}
+
+#[derive(Template)]
+#[template(path = "access_rows.html")]
+pub struct AccessRows<'a> {
+    pub rows: &'a [AccessRow],
+}
+
+/// The answer to a filter the panel refuses (400). Fixed text: the input is never echoed.
+#[derive(Template)]
+#[template(path = "filter_error.html")]
+pub struct FilterError;
 
 /// A bare page for a status: sign-in required, not found, daemon trouble.
 #[derive(Template)]

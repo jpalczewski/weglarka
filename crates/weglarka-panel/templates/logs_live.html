@@ -1,0 +1,5 @@
+<div hx-ext="sse" sse-connect="{{ stream }}" sse-close="done" x-data="logView">
+  <label class="check"><input type="checkbox" x-model="wrap"> Wrap long lines</label>
+  <div class="log" id="log" role="log" aria-live="off" tabindex="0" x-bind:data-wrap="wrap" sse-swap="lines" hx-swap="beforeend"></div>
+  <p id="log-status" class="muted" sse-swap="status" hx-swap="innerHTML"></p>
+</div>

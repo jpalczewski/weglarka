@@ -10,7 +10,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use weglarka_api::{LogFrame, ShowAppResponse};
+use weglarka_api::{AccessEntry, AccessFrame, LogFrame, ShowAppResponse};
 use weglarka_panel::config::{
     ENV_API_AUDIENCE, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_PUBLIC_URL, ENV_SOCKET,
     ENV_TIMEOUT_SECS,
@@ -93,6 +93,8 @@ struct Script {
     boot: &'static str,
     /// Frames for the logs stream, per connection number (0-based); the last repeats, held open.
     logs: Vec<(Vec<LogFrame>, bool)>,
+    /// The same for the access stream.
+    access: Vec<(Vec<AccessFrame>, bool)>,
 }
 
 impl Default for Script {
@@ -102,6 +104,10 @@ impl Default for Script {
             events: vec![event(1, "deploy_succeeded"), event(2, "deploy_failed")],
             boot: "b00f-1",
             logs: vec![(vec![LogFrame::Stdout(b"hello\n".to_vec())], true)],
+            access: vec![(
+                vec![AccessFrame::Entry(entry("/index.html", "curl/8"))],
+                true,
+            )],
         }
     }
 }
@@ -113,12 +119,28 @@ fn event(seq: u64, kind: &str) -> Value {
     })
 }
 
+fn entry(path: &str, agent: &str) -> AccessEntry {
+    AccessEntry {
+        time: "2026-10-31T12:00:00Z".into(),
+        host: "web.example.com".into(),
+        remote_addr: "203.0.113.7".into(),
+        method: "GET".into(),
+        path: path.into(),
+        status: 200,
+        bytes_sent: 512,
+        request_time: 0.0125,
+        user_agent: agent.into(),
+        ..AccessEntry::default()
+    }
+}
+
 fn frames(frames: &[LogFrame]) -> Vec<weglarka_unix_http::Bytes> {
     frames.iter().map(|f| f.encode().into()).collect()
 }
 
 async fn fake_daemon(script: Script) -> Mock {
     let logs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let access_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     mock_seen(move |seen| {
         let token = bearer(seen);
         if token != "tok-read" && token != "tok-admin" {
@@ -199,6 +221,16 @@ async fn fake_daemon(script: Script) -> Mock {
                 let n = logs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let (list, hold) = &script.logs[n.min(script.logs.len() - 1)];
                 let reply = Reply::chunks(200, frames(list));
+                if *hold { reply.hold_open() } else { reply }
+            }
+            "/v1/apps/web/access" => {
+                if token != "tok-admin" {
+                    return error(403, "forbidden", "admin only");
+                }
+                let n = access_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (list, hold) = &script.access[n.min(script.access.len() - 1)];
+                let chunks: Vec<weglarka_unix_http::Bytes> = list.iter().map(|f| f.encode().into()).collect();
+                let reply = Reply::chunks(200, chunks);
                 if *hold { reply.hold_open() } else { reply }
             }
             _ => error(404, "not_found", "no such route"),
@@ -472,20 +504,31 @@ async fn the_logs_section_is_offered_only_when_the_daemon_allows_it() {
     assert!(html.contains("not allowed"), "{html}");
 
     let (_, headers, html) = get(&site, Some(&admin), "/apps/web").await;
+    // The page only offers the section; the stream element comes with the Start button's fragment.
+    assert!(html.contains("hx-get=\"/apps/web/logs\"") && !html.contains("sse-connect"));
+    assert_page_is_clean("/apps/web", &headers, &html);
+    let (status, headers, html) = get(&site, Some(&admin), "/apps/web/logs").await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("sse-connect=\"/apps/web/logs/stream\""),
         "{html}"
     );
-    assert_page_is_clean("/apps/web", &headers, &html);
+    assert_page_is_clean("/apps/web/logs", &headers, &html);
+    let (status, ..) = get(&site, Some(&read), "/apps/web/logs").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn unauthenticated_requests_are_refused_without_a_daemon_call() {
     let site = site(Script::default()).await;
-    for path in PAGES
-        .iter()
-        .chain(&["/events/stream", "/apps/web/logs/stream", "/nope"])
-    {
+    for path in PAGES.iter().chain(&[
+        "/events/stream",
+        "/apps/web/logs",
+        "/apps/web/logs/stream",
+        "/apps/web/access",
+        "/apps/web/access/stream",
+        "/nope",
+    ]) {
         let (status, headers, _) = get(&site, None, path).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
         assert_eq!(
@@ -1033,4 +1076,262 @@ async fn the_events_stream_answers_a_refusal_with_a_status_not_a_reconnect_loop(
     let r = open_stream(&site, &who, "/events/stream?since=0", None).await;
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     assert!(who.session.is_ended());
+}
+
+// ---- access log -----------------------------------------------------------------------------
+
+/// The requests the daemon saw for the access stream, in order.
+fn access_opens(site: &Site) -> Vec<weglarka_unix_http::testing::Seen> {
+    site.daemon
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.path == "/v1/apps/web/access")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn the_access_section_is_admin_only_and_opens_nothing_on_page_load() {
+    let site = site(Script::default()).await;
+    let read = login(&site, "tok-read");
+    let admin = login(&site, "tok-admin");
+
+    let (_, _, html) = get(&site, Some(&read), "/apps/web").await;
+    assert!(
+        !html.contains("Access log") && !html.contains("/access"),
+        "{html}"
+    );
+    let (_, headers, html) = get(&site, Some(&admin), "/apps/web").await;
+    assert!(html.contains("Access log") && html.contains("hx-get=\"/apps/web/access\""));
+    assert!(!html.contains("sse-connect"), "{html}");
+    assert_page_is_clean("/apps/web", &headers, &html);
+    // Opening the page (as either user) asked the daemon for no stream.
+    {
+        let seen = site.daemon.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|s| !s.path.ends_with("/access") && !s.path.ends_with("/logs")),
+            "{:?}",
+            seen.iter().map(|s| &s.path).collect::<Vec<_>>()
+        );
+    }
+
+    // A read session is refused the fragment and the stream alike.
+    for path in ["/apps/web/access", "/apps/web/access/stream"] {
+        let (status, headers, html) = get(&site, Some(&read), path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert!(html.contains("No access"), "{html}");
+        assert_page_is_clean(path, &headers, &html);
+    }
+}
+
+#[tokio::test]
+async fn the_fragment_carries_the_reencoded_filter_and_a_bad_one_is_refused_without_echo() {
+    let site = site(Script::default()).await;
+    let admin = login(&site, "tok-admin");
+
+    // A form sends blank filters as empty values; the path arrives percent-encoded.
+    let (status, headers, html) = get(
+        &site,
+        Some(&admin),
+        "/apps/web/access?status=5xx&method=&path=%2Fapi&host=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(
+        html.contains(
+            "sse-connect=\"/apps/web/access/stream?follow=true&#38;status=5xx&#38;path=/api\""
+        ),
+        "{html}"
+    );
+    assert_page_is_clean("/apps/web/access", &headers, &html);
+
+    // Browser-chosen follow/since are replaced, never forwarded.
+    let (_, _, html) = get(&site, Some(&admin), "/apps/web/access?follow=false&since=5").await;
+    assert!(html.contains("stream?follow=true\""), "{html}");
+
+    for bad in [
+        "status=%3Cscript%3Ealert(1)%3C/script%3E",
+        "status=20",
+        "method=get",
+        "path=api",
+        "path=%2Fa%26status%3D500",
+        "host=Example.COM",
+        "evil=1",
+        "status=2xx&status=3xx",
+        "tail=5000",
+        &format!("path=%2F{}", "a".repeat(2000)),
+    ] {
+        let (status, headers, html) =
+            get(&site, Some(&admin), &format!("/apps/web/access?{bad}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(html.contains("filter is not valid"), "{html}");
+        for echoed in ["script", "=20", "evil", "Example", "aaaa"] {
+            assert!(!html.contains(echoed), "{bad} echoed {echoed}: {html}");
+        }
+        assert_page_is_clean("/apps/web/access", &headers, &html);
+        // The stream refuses it as well, before it asks the daemon for anything.
+        let (status, ..) = get(
+            &site,
+            Some(&admin),
+            &format!("/apps/web/access/stream?{bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert!(access_opens(&site).is_empty());
+    assert_eq!(site.state.streams.open_streams(), 0);
+}
+
+#[tokio::test]
+async fn the_daemon_gets_only_the_reencoded_query_with_follow() {
+    let site = site(Script::default()).await;
+    let admin = login(&site, "tok-admin");
+    let response = open_stream(
+        &site,
+        &admin,
+        "/apps/web/access/stream?since=1&follow=false&status=5xx&path=/api&host=&method=POST",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let text = read_until(&mut body, "index.html", WAIT).await.unwrap();
+    assert!(text.contains("event: rows"), "{text}");
+    let opens = access_opens(&site);
+    assert_eq!(opens.len(), 1);
+    assert_eq!(bearer(&opens[0]), "tok-admin");
+    assert_eq!(
+        opens[0].query.as_deref(),
+        Some("follow=true&tail=100&status=5xx&method=POST&path=%2Fapi")
+    );
+
+    // An explicit tail is kept (bounded by the parser), without a filter nothing else is sent.
+    let response = open_stream(&site, &admin, "/apps/web/access/stream?tail=7", None).await;
+    let mut body2 = response.into_body();
+    read_until(&mut body2, "index.html", WAIT).await.unwrap();
+    assert_eq!(
+        access_opens(&site)[1].query.as_deref(),
+        Some("follow=true&tail=7")
+    );
+}
+
+#[tokio::test]
+async fn hostile_access_entries_render_safely() {
+    let hostile = vec![
+        AccessFrame::Entry(entry(
+            "/<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+        )),
+        AccessFrame::Entry(entry(
+            "/ansi\x1b[31mred\x1b[0m",
+            "bidi \u{202e}evil\u{2066}x",
+        )),
+        AccessFrame::Entry(entry("/tab\tand\nnewline\0nul", &"U".repeat(10_000))),
+        AccessFrame::Entry(AccessEntry {
+            status: 503,
+            request_time: f64::from(u16::MAX),
+            method: "M".repeat(100),
+            remote_addr: "\"><b>".into(),
+            ..entry("/last", "end-marker")
+        }),
+    ];
+    let site = site(Script {
+        access: vec![(hostile, true)],
+        ..Script::default()
+    })
+    .await;
+    let admin = login(&site, "tok-admin");
+    let mut body = open_stream(&site, &admin, "/apps/web/access/stream", None)
+        .await
+        .into_body();
+    let text = read_until(&mut body, "end-marker", WAIT).await.unwrap();
+    assert!(!text.contains("<script>") && !text.contains("<img") && !text.contains("<b>"));
+    for c in ['\u{1b}', '\u{202e}', '\u{2066}', '\0', '\t'] {
+        assert!(!text.contains(c), "{c:?} in {text:?}");
+    }
+    assert!(!text.contains(&"U".repeat(201)));
+    insta::assert_snapshot!("hostile_access_entries", text);
+}
+
+#[tokio::test]
+async fn access_streams_share_the_session_limit() {
+    let site = site(Script::default()).await;
+    let admin = login(&site, "tok-admin");
+    let mut held = Vec::new();
+    for _ in 0..weglarka_panel::live::MAX_STREAMS_PER_SESSION {
+        let r = open_stream(&site, &admin, "/apps/web/access/stream", None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        held.push(r);
+    }
+    let r = open_stream(&site, &admin, "/apps/web/access/stream", None).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The refused one never reached the daemon.
+    assert_eq!(
+        access_opens(&site).len(),
+        weglarka_panel::live::MAX_STREAMS_PER_SESSION
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn token_expiry_resumes_the_access_log_since_the_last_entry() {
+    let site = site(Script {
+        access: vec![
+            (
+                vec![
+                    AccessFrame::Entry(entry("/one", "a")),
+                    AccessFrame::TokenExpired,
+                ],
+                false,
+            ),
+            (vec![AccessFrame::Entry(entry("/two", "b"))], true),
+        ],
+        ..Script::default()
+    })
+    .await;
+    let admin = login(&site, "tok-admin");
+    let mut body = open_stream(&site, &admin, "/apps/web/access/stream?status=2xx", None)
+        .await
+        .into_body();
+    let text = read_until(&mut body, "/two", WAIT).await.unwrap();
+    assert!(text.contains("/one"));
+    let opens = access_opens(&site);
+    assert_eq!(opens.len(), 2);
+    assert_eq!(
+        opens[0].query.as_deref(),
+        Some("follow=true&tail=100&status=2xx")
+    );
+    let at = weglarka_api::parse_rfc3339(b"2026-10-31T12:00:00Z").unwrap();
+    assert_eq!(
+        opens[1].query.as_deref(),
+        Some(
+            format!(
+                "follow=true&since={}.{:09}&status=2xx",
+                at.as_secs(),
+                at.subsec_nanos()
+            )
+            .as_str()
+        )
+    );
+}
+
+#[tokio::test]
+async fn an_access_log_error_is_shown_sanitized_and_ends_the_stream() {
+    let site = site(Script {
+        access: vec![(vec![AccessFrame::Error("nginx <log> gone".into())], false)],
+        ..Script::default()
+    })
+    .await;
+    let admin = login(&site, "tok-admin");
+    let mut body = open_stream(&site, &admin, "/apps/web/access/stream", None)
+        .await
+        .into_body();
+    let text = read_until(&mut body, "event: done", WAIT).await.unwrap();
+    assert!(
+        text.contains("event: status") && text.contains("nginx &lt;log&gt; gone"),
+        "{text}"
+    );
 }

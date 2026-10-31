@@ -9,11 +9,23 @@ document.addEventListener("alpine:init", function () {
 
 // A log left open on a chatty app must not grow the page without bound: keep the newest lines.
 // htmx-ext-sse swaps a message in and then triggers htmx:sseMessage on the swap target.
+var KEEP_ROWS = { log: 2000, "access-rows": 1000 };
 document.addEventListener("htmx:sseMessage", function (event) {
   var target = event.target;
-  if (target && target.id === "log") {
-    while (target.childElementCount > 2000) {
+  var keep = target && KEEP_ROWS[target.id];
+  if (keep) {
+    while (target.childElementCount > keep) {
       target.removeChild(target.firstElementChild);
     }
+  }
+});
+
+// htmx does not swap a 4xx by default. A refused access-log filter answers 400 with a fixed
+// message, which is exactly what the form should show.
+document.addEventListener("htmx:beforeSwap", function (event) {
+  var detail = event.detail;
+  if (detail.xhr && detail.xhr.status === 400 && detail.target && detail.target.id === "access-live") {
+    detail.shouldSwap = true;
+    detail.isError = false;
   }
 });
