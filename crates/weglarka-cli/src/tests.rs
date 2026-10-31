@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use clap::Parser as _;
+use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
     ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
     DoctorCheck, DoctorReport, ErrorCode, NotifyStatusResponse, PruneImagesResponse, PrunedImage,
@@ -30,6 +30,33 @@ use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_l
 
 // The mock unix-socket server lives in `weglarka-unix-http` (feature `testing`).
 pub(crate) use weglarka_unix_http::testing::{Mock, mock};
+
+/// A subcommand's own flag with the id of a global one shares its value (`weglarka --host <url> access`
+/// once fed the panel's address to a filter), and nothing refuses that at parse time.
+#[test]
+fn no_subcommand_flag_shadows_a_global_one() {
+    fn check(cmd: &clap::Command, globals: &[String], path: &str) {
+        for sub in cmd.get_subcommands() {
+            let path = format!("{path} {}", sub.get_name());
+            for arg in sub.get_arguments() {
+                assert!(
+                    !globals.iter().any(|g| g == arg.get_id().as_str()),
+                    "`{path}` redefines the global `{}`",
+                    arg.get_id()
+                );
+            }
+            check(sub, globals, &path);
+        }
+    }
+    let root = crate::cli::Cli::command();
+    let globals: Vec<String> = root
+        .get_arguments()
+        .filter(|a| a.is_global_set())
+        .map(|a| a.get_id().to_string())
+        .collect();
+    assert!(globals.iter().any(|g| g == "host"), "{globals:?}");
+    check(&root, &globals, "weglarka");
+}
 
 fn api_err(code: ErrorCode, msg: &str) -> String {
     serde_json::to_string(&ApiError {

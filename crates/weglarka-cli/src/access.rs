@@ -51,9 +51,9 @@ pub struct AccessArgs {
     /// Only paths starting with this prefix (letters, digits and `_.-/`; no query string, no `%`).
     #[arg(long, value_name = "PREFIX", value_parser = |v: &str| filter("path", v))]
     pub path: Option<String>,
-    /// Only this host.
-    #[arg(long, value_name = "HOST", value_parser = |v: &str| filter("host", &v.to_ascii_lowercase()))]
-    pub host: Option<String>,
+    /// Only requests to this domain. Not `--host`: that is the global flag naming the panel.
+    #[arg(long, value_name = "DOMAIN", value_parser = |v: &str| filter("host", &v.to_ascii_lowercase()))]
+    pub domain: Option<String>,
 }
 
 /// Checks one filter value with the daemon's own parser, so a bad value is a usage error here and not
@@ -84,7 +84,7 @@ impl AccessArgs {
             ("status", &self.status),
             ("method", &self.method),
             ("path", &self.path),
-            ("host", &self.host),
+            ("host", &self.domain),
         ] {
             if let Some(value) = value {
                 raw.push_str(&format!("&{key}={value}"));
@@ -249,6 +249,7 @@ mod tests {
     use weglarka_unix_http::testing::{Reply, mock_seen};
 
     use super::*;
+    use crate::cli::{Cli, Command};
     use crate::error::Kind;
     use crate::logs::MAX_QUIET_REOPENS;
 
@@ -304,7 +305,7 @@ mod tests {
             "post",
             "--path",
             "/api",
-            "--host",
+            "--domain",
             "Web.Example.com",
         ])
         .unwrap()
@@ -329,7 +330,7 @@ mod tests {
             &["web", "--path", "/a&host=other.example.com"],
             &["web", "--path", "/a%2fb"],
             &["web", "--method", "GE T"],
-            &["web", "--host", "a b"],
+            &["web", "--domain", "a b"],
             &[],
             &["web", "api"],
         ] {
@@ -337,6 +338,48 @@ mod tests {
         }
         assert!(parse(&["web", "-n", "1000", "--status", "404"]).is_ok());
         assert_eq!(instance("Web!").unwrap_err().kind, Kind::Usage);
+    }
+
+    /// The whole command line, with the global `--host` that names the panel next to the filter.
+    #[test]
+    fn the_panel_address_and_the_domain_filter_are_separate() {
+        let panel = "https://panel.example.com";
+        for argv in [
+            &[
+                "weglarka",
+                "--host",
+                panel,
+                "access",
+                "web",
+                "--domain",
+                "web.example.com",
+            ][..],
+            &[
+                "weglarka",
+                "access",
+                "web",
+                "--domain",
+                "web.example.com",
+                "--host",
+                panel,
+            ],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.host.as_deref(), Some(panel), "{argv:?}");
+            let Command::Access(a) = cli.command else {
+                panic!("{argv:?}")
+            };
+            let q = a.query(now()).unwrap();
+            assert_eq!(q.host.as_deref(), Some("web.example.com"), "{argv:?}");
+        }
+        let Command::Access(a) =
+            Cli::try_parse_from(["weglarka", "--host", panel, "access", "web"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(a.query(now()).unwrap().host, None);
     }
 
     // ---- resuming

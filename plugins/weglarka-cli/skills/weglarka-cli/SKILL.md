@@ -31,7 +31,7 @@ can hold secrets the app printed, so reading them needs the owner's yes once per
 that task names; do not ask again for each read within it, and ask again for a new task or apps outside that scope. Do
 not paste logs into public places. After a reconnect a few lines may repeat.
 
-`weglarka access <app> [-f] [-n N] [--since 10m] [--status 5xx] [--method M] [--path /p] [--host H]` prints the requests
+`weglarka access <app> [-f] [-n N] [--since 10m] [--status 5xx] [--method M] [--path /p] [--domain D]` prints the requests
 that reached one app (client addresses, paths, user agents; `--json` gives one object per request). It needs `admin` and
 is not a free read: same rule as `logs`, one yes per task for the app it names. It shows only that app's traffic, the last
 hour by default; requests on `access_log_skip_paths` and unattributed ones are not in it. Do not paste addresses or
