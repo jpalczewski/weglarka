@@ -19,7 +19,7 @@ use weglarka_http::{HttpError, Purpose};
 
 use crate::config::PanelConfig;
 use crate::daemon::DaemonClient;
-use crate::limit::AddressLimiter;
+use crate::limit::{self, AddressLimiter};
 use crate::live::StreamSlots;
 use crate::oidc::OidcClient;
 use crate::pages::ErrorPage;
@@ -42,6 +42,8 @@ pub struct AppState {
     pub api_limit: Arc<AddressLimiter>,
     /// Relayed requests in flight, streams included.
     pub api_slots: Arc<tokio::sync::Semaphore>,
+    /// Warns once about a proxy missing from `PANEL_TRUSTED_PROXIES`.
+    pub proxy_notice: Arc<limit::UntrustedProxyNotice>,
     /// How often the events stream asks the daemon for news.
     pub stream_poll: std::time::Duration,
 }
@@ -76,8 +78,22 @@ impl AppState {
             clock,
             api_slots: Arc::new(tokio::sync::Semaphore::new(relay::MAX_CONCURRENT)),
             streams: Arc::new(StreamSlots::default()),
+            proxy_notice: Arc::default(),
             stream_poll: std::time::Duration::from_secs(3),
         })
+    }
+}
+
+impl AppState {
+    /// The client behind a request, for the per-address limits; see [`limit::client_addr`].
+    pub fn client_addr(
+        &self,
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> std::net::IpAddr {
+        let trusted = &self.config.trusted_proxies;
+        self.proxy_notice.note(peer, headers, trusted);
+        limit::client_addr(peer, headers, trusted)
     }
 }
 
