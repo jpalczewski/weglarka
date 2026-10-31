@@ -762,3 +762,74 @@ async fn restart_count_is_reported_and_grows_after_a_crash() {
     };
     assert!(info.restarts >= 1, "{info:?}");
 }
+
+/// With `timestamps=true` libpod stamps every log *record*, not every line: a line of 64 KiB (more than
+/// the runtime's record size) arrives as several records, each starting with a timestamp. The daemon's
+/// logs endpoint (`Records` in `weglarka-daemon`) relies on exactly this: chunks are records, a record
+/// that follows one without a newline is a continuation, and its stamp is the one to remove.
+#[tokio::test]
+async fn a_long_log_line_is_several_stamped_records() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-longline-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.image = BUSYBOX.into();
+    s.entrypoint = Some(vec!["/bin/sh".into()]);
+    s.command = vec![
+        "-c".into(),
+        "head -c 65536 /dev/zero | tr '\\0' a; echo; echo short".into(),
+    ];
+    s.restart = RestartPolicy::No;
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+    timeout(STEP, client.container_wait(&name))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut logs = timeout(
+        STEP,
+        client.container_logs(
+            &name,
+            &LogOptions {
+                timestamps: true,
+                ..LogOptions::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut records = Vec::new();
+    while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
+        records.push(chunk.unwrap().data.to_vec());
+    }
+    // Every record starts with `<RFC 3339 time> `; only the last record of a line ends in a newline.
+    for record in &records {
+        let word = record.split(|&b| b == b' ').next().unwrap();
+        assert!(
+            (20..=35).contains(&word.len()) && word.contains(&b'T') && word.ends_with(b"Z"),
+            "a record without a stamp: {:?}",
+            String::from_utf8_lossy(&record[..record.len().min(60)])
+        );
+    }
+    let ends: Vec<bool> = records.iter().map(|r| r.ends_with(b"\n")).collect();
+    let line_ends = ends.iter().filter(|e| **e).count();
+    assert_eq!(line_ends, 2, "{ends:?}");
+    assert!(records.len() > 2, "the long line was not split: {ends:?}");
+    client.container_remove(&name, true).await.unwrap();
+}

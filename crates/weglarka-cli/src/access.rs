@@ -15,7 +15,7 @@ use weglarka_api::{AccessEntry, AccessFrame, AccessQuery, MAX_ACCESS_TAIL};
 use crate::client::ApiClient;
 use crate::commands::{client, instance};
 use crate::error::{CliError, exit};
-use crate::logs::{count_reopen, sanitize_for_terminal, since_epoch};
+use crate::logs::{count_reopen, parse_rfc3339, sanitize_for_terminal, since_epoch};
 use crate::run::parse_timeout;
 use crate::settings::Overrides;
 
@@ -149,53 +149,6 @@ fn json_line(entry: &AccessEntry, terminal: bool) -> String {
     line
 }
 
-/// Seconds since the epoch of an nginx `$time_iso8601` (`2026-10-31T12:00:00+01:00`, offset included; `Z`
-/// is accepted too). `None` for anything else: the caller must then not move a resume point forward.
-fn parse_log_time(text: &str) -> Option<u64> {
-    let b = text.as_bytes();
-    let num = |from: usize, len: usize| -> Option<i64> {
-        let digits = b.get(from..from + len)?;
-        digits
-            .iter()
-            .all(u8::is_ascii_digit)
-            .then(|| digits.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
-    };
-    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
-    if b.len() < 19 || separators.iter().any(|&(at, c)| b[at] != c) {
-        return None;
-    }
-    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
-    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let offset = match &b[19..] {
-        b"Z" => 0,
-        [sign @ (b'+' | b'-'), ..] if b.len() == 25 && b[22] == b':' => {
-            let (h, m) = (num(20, 2)?, num(23, 2)?);
-            if h > 23 || m > 59 {
-                return None;
-            }
-            let secs = h * 3600 + m * 60;
-            if *sign == b'+' { secs } else { -secs }
-        }
-        _ => return None,
-    };
-    // Days from civil (proleptic Gregorian), counted from 1970-01-01.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
-}
-
 /// The query that continues a stream whose token expired. Before any entry arrived nothing was
 /// printed, so the original query is repeated whole (`tail` and `since` included: the history read, or
 /// its ring, may still have been running). Afterwards: from the second of the last entry (`since` is
@@ -231,8 +184,9 @@ pub(crate) async fn stream_access<O: AsyncWrite + Unpin>(
         match stream.next().await? {
             Some(AccessFrame::Entry(entry)) => {
                 received_any = true;
-                if let Some(secs) = parse_log_time(&entry.time) {
-                    resume = Some(Duration::from_secs(secs));
+                // An nginx `$time_iso8601`, floored to the second; unparseable leaves `resume` alone.
+                if let Some(at) = parse_rfc3339(entry.time.as_bytes()) {
+                    resume = Some(Duration::from_secs(at.as_secs()));
                 }
                 quiet_reopens = 0;
                 let line = if json {
@@ -389,6 +343,7 @@ mod tests {
 
     #[test]
     fn log_times_are_parsed_with_their_offset() {
+        let parse_log_time = |t: &str| parse_rfc3339(t.as_bytes()).map(|d| d.as_secs());
         assert_eq!(parse_log_time("1970-01-01T00:00:00+00:00"), Some(0));
         assert_eq!(
             parse_log_time("2026-10-31T12:00:00+00:00"),
