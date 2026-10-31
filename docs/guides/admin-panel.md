@@ -120,7 +120,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | `PANEL_SESSION_IDLE_SECS` | `1800` | A session ends after this long without a request (60 to 86400); must not exceed the maximum. |
 | `PANEL_SESSION_MAX_SECS` | `28800` | A session ends this long after login, however active (300 to 604800). |
 | `OIDC_ENDPOINT_HOSTS` | none | Comma-separated host names, besides the issuer's, that the discovery document may name for `token_endpoint` and `jwks_uri`. By default both must be on the issuer's host and port, so a poisoned discovery document cannot redirect the client secret. |
-| `PANEL_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR ranges (for example the Traefik network) whose `X-Forwarded-For` the panel believes. Sign-in callbacks are limited to 20 per minute per client address ([ADR 0059](../decisions/0059-panel-login-callback-rate-limit.md)); the client is the connection's peer, or, for a trusted peer, the right-most forwarded address that is not itself trusted. Behind a proxy set this, otherwise all clients share the proxy's address and one budget: Traefik's network in `behind` mode, Węglarka's own nginx in `edge` mode (it sets `X-Forwarded-For` from the client address). The same address also keys the `/api` relay's rate limit. Leave it empty only when the panel's port is reachable without a proxy. |
+| `PANEL_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR ranges (for example the Traefik network) whose `X-Forwarded-For` the panel believes. Sign-in callbacks are limited to 20 per minute per client address ([ADR 0059](../decisions/0059-panel-login-callback-rate-limit.md)); the client is the connection's peer, or, for a trusted peer, the right-most forwarded address that is not itself trusted. Behind a proxy set this, otherwise all clients share the proxy's address and one budget: Traefik's network in `behind` mode, Węglarka's own nginx in `edge` mode (it sets `X-Forwarded-For` from the client address). The same address also keys the `/api` relay's rate limit. **It is required for per-client limits:** without it the sign-in limit and the `/api` relay's limit (300 requests a minute) are each one counter shared by every client, so a single busy or hostile client can exhaust it for everybody. Leave it empty only when the panel's port is reachable without a proxy. |
 | `PANEL_LISTEN` | `0.0.0.0:8080` | Listen address inside the container. Leave it unless you also change `port`. |
 | `WEGLARKA_PANEL_SOCKET` | `/run/weglarka-admin/api.sock` | The daemon's token socket (also `--socket`). |
 | `PANEL_REQUEST_TIMEOUT_SECS` | `10` | How long the daemon may take to answer a request (1 to 120). |
@@ -199,7 +199,7 @@ limit of 8 GiB. The rest of the panel keeps its forward auth and its defaults. N
   that overlaps the prefix is refused, because the carve-out owns it.
 - `weglarka run`, `push` and `forward` are not claimed to work through the relay yet; they need a request body that
   streams while the answer does, and stay on the socket (SSH) path until that is tested end to end.
-- Set `PANEL_TRUSTED_PROXIES` too, or every client shares one rate-limit budget.
+- Set `PANEL_TRUSTED_PROXIES` too (required for per-client limits): the panel sits behind Węglarka's nginx, so without it every client shares nginx's address and one rate-limit budget.
 
 ## Security properties
 
