@@ -293,7 +293,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             out.push(check(
                 "self_update",
                 CheckStatus::Warn,
-                e.to_string(),
+                detail(e),
                 Some("the switcher will not run until the file is valid or removed"),
             ));
             return;
@@ -444,7 +444,7 @@ async fn desired_state<P: PodmanClient>(
         Err(e) => check(
             "state.apps_file",
             CheckStatus::Fail,
-            e.to_string(),
+            detail(e),
             Some(state_hint(e, "fix or remove apps.toml")),
         ),
     });
@@ -453,7 +453,7 @@ async fn desired_state<P: PodmanClient>(
         Err(e) => check(
             "state.state_file",
             CheckStatus::Fail,
-            e.to_string(),
+            detail(e),
             Some(state_hint(
                 e,
                 "removing state.toml is safe (instances get a fresh deploy)",
@@ -1329,7 +1329,7 @@ fn ingress_routes<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             out.push(check(
                 "ingress.routes",
                 CheckStatus::Fail,
-                e.to_string(),
+                detail(e),
                 Some("fix domains/paths in apps.toml; overlapping paths on a shared domain are refused"),
             ));
             return;
@@ -1413,7 +1413,7 @@ fn generated<P: PodmanClient + 'static>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
                 CheckStatus::Warn,
                 format!(
                     "{state}; {what}: {}",
-                    record.last_error.as_deref().unwrap_or("no output")
+                    detail(record.last_error.as_deref().unwrap_or("no output"))
                 ),
                 Some(
                     "the previous version is still live, so what it contains (OIDC clients, access \
@@ -1773,7 +1773,7 @@ fn ingress_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             out.push(check(
                 "ingress.cdn",
                 CheckStatus::Fail,
-                e.to_string(),
+                detail(e),
                 Some("fix [ingress.cdn] ranges in weglarka.toml"),
             ));
             return;
@@ -1923,7 +1923,7 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Err(e) => check(
             "state.secrets_file",
             CheckStatus::Fail,
-            e.to_string(),
+            detail(e),
             Some("chmod 600 secrets.toml"),
         ),
     });
@@ -1999,7 +1999,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Some(e) => check(
             "ingress.apply",
             CheckStatus::Fail,
-            e,
+            detail(e),
             Some("fix the cause; ingress will be recomputed on the next change or in the loop"),
         ),
     });
