@@ -290,22 +290,31 @@ const ACCESS_TOKEN_TYP: &[Option<&str>] = &[Some("at+jwt")];
 const ID_TOKEN_TYP: &[Option<&str>] = &[None, Some("JWT")];
 
 /// What kind of token [`verify`] is asked to accept. The kind fixes the accepted JOSE `typ`, so a
-/// caller cannot make access tokens and id tokens interchangeable (RFC 9068), and for id tokens it
-/// carries the values the checks of OIDC Core 3.1.3.7 compare against.
+/// caller cannot make access tokens and id tokens interchangeable (RFC 9068), and it carries the
+/// values the checks compare against, the audience included: an id token's audience *is* the client
+/// id (OIDC Core 3.1.3.7), so a caller cannot ask for one audience and check `azp` against another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind<'a> {
-    /// An RFC 9068 access token (`typ: at+jwt`).
-    Access,
-    /// An OIDC id token (`typ` absent or `JWT`) answering one login: its `nonce` must equal the one
-    /// sent in the authorization request, and `azp` must be `client_id` when present, and present
-    /// when the token has several audiences.
+    /// An RFC 9068 access token (`typ: at+jwt`) whose `aud` includes `audience`.
+    Access { audience: &'a str },
+    /// An OIDC id token (`typ` absent or `JWT`) answering one login: its `aud` must include
+    /// `client_id`, its `nonce` must equal the one sent in the authorization request, and `azp` must
+    /// be `client_id` when present, and present when the token has several audiences.
     Id { client_id: &'a str, nonce: &'a str },
 }
 
 impl TokenKind<'_> {
+    /// The value `aud` must include.
+    fn audience(&self) -> &str {
+        match self {
+            Self::Access { audience } => audience,
+            Self::Id { client_id, .. } => client_id,
+        }
+    }
+
     fn typ(&self) -> &'static [Option<&'static str>] {
         match self {
-            Self::Access => ACCESS_TOKEN_TYP,
+            Self::Access { .. } => ACCESS_TOKEN_TYP,
             Self::Id { .. } => ID_TOKEN_TYP,
         }
     }
@@ -338,13 +347,12 @@ fn typ_accepted(typ: Option<&str>, accept: &[Option<&str>]) -> bool {
 
 /// Verifies the signature and the registered claims of `token`: algorithm allowlist (`RS256` and
 /// `ES256` only, matching the key type), required `kid`, signature, `iss`, `aud`, `exp`/`nbf` (with
-/// [`LEEWAY`]) and `sub`. `kind` fixes the JOSE `typ` values accepted and, for an id token, adds the
-/// `nonce` and `azp` checks. No scope policy is applied here.
+/// [`LEEWAY`]) and `sub`. `kind` fixes the JOSE `typ` values accepted and the audience, and, for an
+/// id token, adds the `nonce` and `azp` checks. No scope policy is applied here.
 pub fn verify(
     token: &str,
     keys: &JwkSet,
     iss: &str,
-    aud: &str,
     kind: TokenKind<'_>,
     now: SystemTime,
 ) -> Result<VerifiedToken, AuthError> {
@@ -389,6 +397,7 @@ pub fn verify(
     if claims.iss.as_deref() != Some(iss) {
         return Err(AuthError::WrongIssuer);
     }
+    let aud = kind.audience();
     let audience_ok = match &claims.aud {
         Some(Audience::One(a)) => a == aud,
         Some(Audience::Many(list)) => list.iter().any(|a| a == aud),
@@ -450,8 +459,9 @@ pub fn validate(
         token,
         keys,
         &expected.issuer,
-        &expected.audience,
-        TokenKind::Access,
+        TokenKind::Access {
+            audience: &expected.audience,
+        },
         now,
     )?;
     let scopes = scopes_for(&verified.groups, expected);
@@ -766,12 +776,14 @@ mod tests {
     fn id_claims() -> serde_json::Value {
         let mut c = claims();
         c["nonce"] = json!(NONCE);
+        c["aud"] = json!("panel");
         c["azp"] = json!("panel");
         c["groups"] = json!([]);
         c
     }
 
     const NONCE: &str = "n-0S6_WzA2Mj";
+    const ACCESS: TokenKind<'static> = TokenKind::Access { audience: AUDIENCE };
     const ID: TokenKind<'static> = TokenKind::Id {
         client_id: "panel",
         nonce: NONCE,
@@ -782,7 +794,7 @@ mod tests {
         token: &str,
         kind: TokenKind<'_>,
     ) -> Result<VerifiedToken, AuthError> {
-        verify(token, &issuer.jwks(), ISSUER, AUDIENCE, kind, at(NOW))
+        verify(token, &issuer.jwks(), ISSUER, kind, at(NOW))
     }
 
     #[test]
@@ -800,7 +812,7 @@ mod tests {
                 Err(AuthError::WrongType)
             );
             assert_eq!(
-                verify_with(&issuer, &token, TokenKind::Access),
+                verify_with(&issuer, &token, ACCESS),
                 Err(AuthError::WrongType)
             );
         }
@@ -844,7 +856,7 @@ mod tests {
         let issuer = TestIssuer::new("k1");
         let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
         let mut c = id_claims();
-        c["aud"] = json!(["other", AUDIENCE]);
+        c["aud"] = json!(["other", "panel"]);
         assert!(run(&c).is_ok());
         c["azp"] = json!("someone-else");
         assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
@@ -853,7 +865,7 @@ mod tests {
         c["azp"] = json!(["panel"]);
         assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
         // A wrongly typed `azp` is not "absent" for a single audience either.
-        c["aud"] = json!(AUDIENCE);
+        c["aud"] = json!("panel");
         assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
     }
 
@@ -861,7 +873,7 @@ mod tests {
     fn id_token_azp_is_optional_for_a_single_audience_but_never_wrong() {
         let issuer = TestIssuer::new("k1");
         let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
-        for aud in [json!(AUDIENCE), json!([AUDIENCE])] {
+        for aud in [json!("panel"), json!(["panel"])] {
             let mut c = id_claims();
             c["aud"] = aud;
             assert!(run(&c).is_ok());
@@ -870,6 +882,28 @@ mod tests {
             c["azp"] = json!("someone-else");
             assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
         }
+    }
+
+    #[test]
+    fn id_token_audience_is_the_client_id_and_nothing_else() {
+        let issuer = TestIssuer::new("k1");
+        let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
+        // `aud` holding only the client id is accepted.
+        let mut c = id_claims();
+        assert!(run(&c).is_ok());
+        // The access-token audience does not satisfy an id token check.
+        c["aud"] = json!(AUDIENCE);
+        assert_eq!(run(&c), Err(AuthError::WrongAudience));
+        // A caller cannot ask for a different audience than the client id: the kind has no such field,
+        // and an id token for another client is refused.
+        let other = TokenKind::Id {
+            client_id: "other-client",
+            nonce: NONCE,
+        };
+        assert_eq!(
+            verify_with(&issuer, &id_token(&issuer, &id_claims()), other),
+            Err(AuthError::WrongAudience)
+        );
     }
 
     #[test]
@@ -890,7 +924,7 @@ mod tests {
         let mut c = claims();
         c["groups"] = json!(["other"]);
         let token = issuer.sign(&c);
-        let v = verify_with(&issuer, &token, TokenKind::Access).unwrap();
+        let v = verify_with(&issuer, &token, ACCESS).unwrap();
         assert_eq!(v.groups, ["other"]);
         assert_eq!(
             validate(&token, &issuer.jwks(), &validation(), at(NOW)),
@@ -907,7 +941,7 @@ mod tests {
         c["iss"] = json!("https://evil.example.com");
         assert_eq!(run(&sign(&c)), Err(AuthError::WrongIssuer));
         let mut c = id_claims();
-        c["aud"] = json!("https://admin.example.com/api");
+        c["aud"] = json!("another-client");
         assert_eq!(run(&sign(&c)), Err(AuthError::WrongAudience));
         let mut c = id_claims();
         c["exp"] = json!(NOW - 61);
