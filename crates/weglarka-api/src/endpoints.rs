@@ -169,6 +169,15 @@ pub const APPS_LOGS: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::Credential,
 };
+/// `GET` → a stream of [`AccessFrame`](crate::AccessFrame)s: the requests that reached the app through its
+/// domains (query: [`AccessQuery`](crate::AccessQuery)). `admin`: addresses and paths can be sensitive and
+/// cannot be redacted ([`Body::Credential`], docs/decisions/0063). The daemon filters the shared nginx log.
+pub const APPS_ACCESS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/apps/{name}/access",
+    scope: Some(Scope::Admin),
+    body: Body::Credential,
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -407,6 +416,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_RUN,
     APPS_FORWARD,
     APPS_LOGS,
+    APPS_ACCESS,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

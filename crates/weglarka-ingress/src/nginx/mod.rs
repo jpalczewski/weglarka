@@ -44,7 +44,24 @@ use weglarka_model::config::{HostConfig, IngressMode};
 
 use crate::plan::{IngressError, Plan};
 
+pub use common::LOG_FORMAT;
 pub use options::NginxOptions;
+
+/// Every form of the access log format `nginx.conf` can render (the client address comes from
+/// `$remote_addr`, the forwarder's PROXY header or a CDN header; behind a CDN the peer is a separate
+/// field). The daemon's `/access` endpoint parses these lines, and its tests hold it to this list.
+pub fn rendered_log_formats() -> Vec<String> {
+    use common::ClientAddr;
+    [
+        ClientAddr::Direct,
+        ClientAddr::Proxied,
+        ClientAddr::BehindCdn { proxied: false },
+        ClientAddr::BehindCdn { proxied: true },
+    ]
+    .into_iter()
+    .map(common::log_format)
+    .collect()
+}
 
 /// Container directory with the TLS material (`<nginx_conf_dir>/tls`): `<domain>.crt` (PEM chain,
 /// leaf first) and `<domain>.key` (PEM). Read by the nginx **master** at start and at every reload.

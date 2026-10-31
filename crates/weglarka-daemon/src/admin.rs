@@ -230,6 +230,7 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         .merge(sites::routes())
         .merge(crate::events::routes())
         .merge(crate::logs::routes())
+        .merge(crate::access::routes())
         .merge(crate::certificates::routes())
         .merge(crate::config_view::routes())
         .merge(crate::identity::routes())

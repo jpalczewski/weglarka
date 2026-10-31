@@ -40,7 +40,7 @@ pub(super) use crate::plan::AUTHZ_PATH as AUTHZ_LOCATION;
 
 /// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
 /// end up in logs); `upstream_response_time` is a string (`-` or a list on retry).
-pub(super) const LOG_FORMAT: &str = concat!(
+pub const LOG_FORMAT: &str = concat!(
     "{\"time\":\"$time_iso8601\",\"app\":\"$app\",\"host\":\"$host\",",
     "\"remote_addr\":\"$remote_addr\",\"method\":\"$request_method\",\"path\":\"$uri\",",
     "\"status\":$status,\"bytes_sent\":$body_bytes_sent,\"request_time\":$request_time,",
@@ -180,12 +180,10 @@ pub(super) fn write_peer_address(c: &mut Conf) {
     );
 }
 
-pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
-    c.line("# App name for the access log; `-` unless a `server`/`location` sets it.");
-    write_app_default(c);
-    c.line("log_format weglarka escape=json");
-    // Behind a CDN `remote_addr` is the visitor and the CDN's edge address is kept as `peer`.
-    let format = match client {
+/// The access log format as nginx renders it for `client`. Behind a CDN `remote_addr` is the visitor and
+/// the CDN's edge address is kept as `peer`.
+pub(super) fn log_format(client: ClientAddr) -> String {
+    match client {
         ClientAddr::BehindCdn { .. } => LOG_FORMAT.replace(
             "\"remote_addr\":\"$remote_addr\"",
             &format!(
@@ -196,7 +194,14 @@ pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
         ClientAddr::Direct | ClientAddr::Proxied => {
             LOG_FORMAT.replace("$remote_addr", client.peer())
         }
-    };
+    }
+}
+
+pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
+    c.line("# App name for the access log; `-` unless a `server`/`location` sets it.");
+    write_app_default(c);
+    c.line("log_format weglarka escape=json");
+    let format = log_format(client);
     c.line(&format!("    '{format}';"));
     if write_log_skip_maps(c, plan) {
         c.line("access_log /dev/stdout weglarka if=$weglarka_loggable;");

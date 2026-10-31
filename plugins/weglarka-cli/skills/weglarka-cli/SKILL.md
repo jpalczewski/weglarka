@@ -1,6 +1,6 @@
 ---
 name: weglarka-cli
-description: Operate a Węglarka host with the `weglarka` CLI: inspect apps, status and doctor, manage secrets, deploy, push, run, forward and logs, locally or on a remote host with `--host`. Use when the user asks to look at, change or debug apps on a Węglarka host, or mentions `weglarka login`.
+description: Operate a Węglarka host with the `weglarka` CLI: inspect apps, status and doctor, manage secrets, deploy, push, run, forward, logs and access, locally or on a remote host with `--host`. Use when the user asks to look at, change or debug apps on a Węglarka host, or mentions `weglarka login`.
 ---
 
 # Operating a Węglarka host
@@ -30,5 +30,11 @@ code in a browser, so start the command, show the code and address, and wait. `w
 can hold secrets the app printed, so reading them needs the owner's yes once per task, for the apps or the `--all` scope
 that task names; do not ask again for each read within it, and ask again for a new task or apps outside that scope. Do
 not paste logs into public places. After a reconnect a few lines may repeat.
+
+`weglarka access <app> [-f] [-n N] [--since 10m] [--status 5xx] [--method M] [--path /p] [--host H]` prints the requests
+that reached one app (client addresses, paths, user agents; `--json` gives one object per request). It needs `admin` and
+is not a free read: same rule as `logs`, one yes per task for the app it names. It shows only that app's traffic, the last
+hour by default; requests on `access_log_skip_paths` and unattributed ones are not in it. Do not paste addresses or
+paths into public places.
 
 Do not put hostnames, tokens or account details from the user's environment into public places (issues, PRs, commits).

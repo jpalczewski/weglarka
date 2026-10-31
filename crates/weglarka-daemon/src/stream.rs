@@ -11,6 +11,10 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc;
 use weglarka_model::admin_auth::Principal;
+use weglarka_model::app::InstanceName;
+use weglarka_model::podman::PodmanError;
+
+use crate::admin::Fail;
 
 /// A `200` response whose body is whatever arrives on `frames` until the sender side is dropped.
 /// Dropping the response (the client hung up) drops `frames`, which is how the task that feeds it
@@ -71,4 +75,46 @@ impl<S: Send + Sync> FromRequestParts<S> for CallerSub {
             parts.extensions.get::<Principal>().map(|p| p.sub.clone()),
         ))
     }
+}
+
+/// A missing container is a 404 (`missing` is the message); any other Podman failure is logged and
+/// answered without its text.
+pub(crate) fn podman_failure(name: &InstanceName, missing: &str, error: PodmanError) -> Fail {
+    match error {
+        PodmanError::NotFound(_) => Fail::not_found(missing.to_owned()),
+        other => {
+            tracing::warn!(app = %name, error = %other, "reading container logs failed");
+            Fail::internal("could not read the container's logs")
+        }
+    }
+}
+
+/// Why a stream ended (the `ended` field of the audit line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The client hung up (or stopped reading for good).
+    ClientClosed,
+    /// The token expired.
+    TokenExpired,
+    /// The log ended: a non-follow read reached its end, or the container exited.
+    Eof,
+    /// Podman failed mid-stream.
+    Error,
+}
+
+impl Ended {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientClosed => "client_closed",
+            Self::TokenExpired => "token_expired",
+            Self::Eof => "eof",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Seconds since the unix epoch, for the audit lines.
+pub(crate) fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }

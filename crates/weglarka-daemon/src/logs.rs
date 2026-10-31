@@ -29,12 +29,12 @@ use tokio::time::Instant;
 use weglarka_api::{LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, endpoints};
 use weglarka_model::app::InstanceName;
 use weglarka_model::labels;
-use weglarka_model::podman::{LogOptions, LogSource, LogStream, PodmanClient, PodmanError};
+use weglarka_model::podman::{LogOptions, LogSource, LogStream, PodmanClient};
 use weglarka_model::state;
 
 use crate::admin::{Fail, parse_name};
 use crate::app::Daemon;
-use crate::stream::{CallerSub, StreamDeadline, stream_response};
+use crate::stream::{CallerSub, Ended, StreamDeadline, podman_failure, stream_response, unix_secs};
 
 /// Frames queued between the pump and the response body: small, so a slow client holds back the
 /// reading of the Podman stream instead of buffering the log in memory.
@@ -65,7 +65,7 @@ async fn app_logs<P: PodmanClient + 'static>(
     podman
         .container_inspect(&container)
         .await
-        .map_err(|e| podman_failure(&name, e))?;
+        .map_err(|e| podman_failure(&name, &format!("app {name} has no container"), e))?;
     let options = LogOptions {
         follow: query.follow,
         tail: query.tail,
@@ -75,7 +75,7 @@ async fn app_logs<P: PodmanClient + 'static>(
     let logs = podman
         .container_logs(&container, &options)
         .await
-        .map_err(|e| podman_failure(&name, e))?;
+        .map_err(|e| podman_failure(&name, &format!("app {name} has no container"), e))?;
 
     let (frames_tx, frames_rx) = mpsc::channel::<Bytes>(FRAME_QUEUE);
     tokio::spawn(pump(
@@ -85,41 +85,6 @@ async fn app_logs<P: PodmanClient + 'static>(
         Audit::new(sub, name, &query),
     ));
     Ok(stream_response(LOGS_STREAM_CONTENT_TYPE, frames_rx))
-}
-
-/// A missing container is a 404; any other Podman failure is logged and answered without its text.
-fn podman_failure(name: &InstanceName, error: PodmanError) -> Fail {
-    match error {
-        PodmanError::NotFound(_) => Fail::not_found(format!("app {name} has no container")),
-        other => {
-            tracing::warn!(app = %name, error = %other, "reading container logs failed");
-            Fail::internal("could not read the container's logs")
-        }
-    }
-}
-
-/// Why a stream ended (the `ended` field of the audit line).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ended {
-    /// The client hung up (or stopped reading for good).
-    ClientClosed,
-    /// The token expired.
-    TokenExpired,
-    /// The log ended: a non-follow read reached its end, or the container exited.
-    Eof,
-    /// Podman failed mid-stream.
-    Error,
-}
-
-impl Ended {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ClientClosed => "client_closed",
-            Self::TokenExpired => "token_expired",
-            Self::Eof => "eof",
-            Self::Error => "error",
-        }
-    }
 }
 
 /// The facts of the audit line; none of them is log content.
@@ -163,11 +128,6 @@ impl Audit {
             "admin logs stream ended"
         );
     }
-}
-
-fn unix_secs(at: SystemTime) -> u64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// Copies `logs` into `frames_tx` as [`LogFrame`]s until the log ends, the client goes away or the
@@ -257,7 +217,7 @@ mod tests {
     use bytes::Bytes as B;
     use futures_util::stream;
     use weglarka_api::LogFrameDecoder;
-    use weglarka_model::podman::LogChunk;
+    use weglarka_model::podman::{LogChunk, PodmanError};
 
     use super::*;
 
