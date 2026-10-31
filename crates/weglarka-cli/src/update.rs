@@ -21,7 +21,7 @@ use weglarka_model::app::{
 use weglarka_model::state::AppState;
 
 use crate::cli::{StartStopArgs, parse_pair};
-use crate::client::expand_path;
+use crate::client::{ApiClient, expand_path};
 use crate::commands::{client, instance, render_show};
 use crate::error::{CliError, exit};
 use crate::output::emit;
@@ -469,9 +469,25 @@ struct NoChange {
     app: ShowAppResponse,
 }
 
+/// `GET /v1/apps/{name}`: the first half of every read-modify-write of a spec.
+pub(crate) async fn fetch_app(
+    client: &ApiClient,
+    params: &[(&str, &str)],
+) -> Result<ShowAppResponse, CliError> {
+    client.call(endpoints::APPS_SHOW, params, None::<&()>).await
+}
+
+/// Exit code of a successful `PUT`: a rollback is reported as such, anything else is success.
+pub(crate) fn deploy_exit(resp: &UpdateAppResponse) -> i32 {
+    match &resp.deploy {
+        Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
+        _ => exit::OK,
+    }
+}
+
 /// A redacted view (a read token) is not the stored spec: writing it back would replace the real
 /// `env` values and arguments with placeholders (issue #254).
-fn ensure_writable(current: &ShowAppResponse) -> Result<(), CliError> {
+pub(crate) fn ensure_writable(current: &ShowAppResponse) -> Result<(), CliError> {
     if current.redacted {
         return Err(CliError::usage(format!(
             "{}: the daemon returned a redacted spec, which must not be written back",
@@ -529,9 +545,7 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
     let name = instance(&a.name)?;
     let params = [("name", name.as_str())];
     let client = client(o)?;
-    let current: ShowAppResponse = client
-        .call(endpoints::APPS_SHOW, &params, None::<&()>)
-        .await?;
+    let current = fetch_app(&client, &params).await?;
     // `--spec` takes nothing from the fetched spec but the diff base, so a redacted view is
     // harmless there (a non-admin `PUT` is refused by the daemon); the flag edits start from it.
     let new_spec = match &a.spec {
@@ -561,10 +575,7 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
         .call(endpoints::APPS_UPDATE, &params, Some(&req))
         .await?;
     emit(json, &resp, || render_update(&resp, &diff));
-    Ok(match &resp.deploy {
-        Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
-        _ => exit::OK,
-    })
+    Ok(deploy_exit(&resp))
 }
 
 /// Flags of `apps diff`.
@@ -593,9 +604,7 @@ pub async fn apps_diff(json: bool, o: &Overrides, a: DiffArgs) -> Result<i32, Cl
     let name = instance(&a.name)?;
     let params = [("name", name.as_str())];
     let new_spec = read_spec_file(&a.spec)?;
-    let current: ShowAppResponse = client(o)?
-        .call(endpoints::APPS_SHOW, &params, None::<&()>)
-        .await?;
+    let current = fetch_app(&client(o)?, &params).await?;
     let out = SpecDiff {
         changed: false,
         redacted_base: current.redacted,
@@ -672,9 +681,7 @@ async fn set_start(
     let name = instance(&a.name)?;
     let params = [("name", name.as_str())];
     let client = client(o)?;
-    let current: ShowAppResponse = client
-        .call(endpoints::APPS_SHOW, &params, None::<&()>)
-        .await?;
+    let current = fetch_app(&client, &params).await?;
     ensure_writable(&current)?;
     if current.spec.start == start {
         let out = NoChange {
@@ -704,10 +711,7 @@ async fn set_start(
              the missing secrets are set)\n",
         )
     });
-    Ok(match &resp.deploy {
-        Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
-        _ => exit::OK,
-    })
+    Ok(deploy_exit(&resp))
 }
 
 /// `apps start`: `start = true` and a deploy (a provisioned app gets its container).

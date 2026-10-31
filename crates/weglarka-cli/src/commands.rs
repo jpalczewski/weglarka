@@ -90,7 +90,7 @@ pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {
 }
 
 /// The secret name ends up in a URL path, so we restrict the alphabet (no percent-encoding).
-fn secret_name(name: &str) -> Result<&str, CliError> {
+pub(crate) fn secret_name(name: &str) -> Result<&str, CliError> {
     let ok = (1..=64).contains(&name.len())
         && name
             .bytes()
@@ -543,8 +543,11 @@ pub fn read_secret_value(
 }
 
 async fn secrets_set(json: bool, o: &Overrides, a: SecretSetArgs) -> Result<i32, CliError> {
+    let Some(name) = a.name.as_deref() else {
+        return crate::secrets_env::set_from_env_file(json, o, a).await;
+    };
     let app = instance(&a.app)?;
-    let name = secret_name(&a.name)?;
+    let name = secret_name(name)?;
     let value = read_secret_value(
         a.from_file.as_deref(),
         &mut std::io::stdin(),

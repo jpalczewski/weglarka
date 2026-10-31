@@ -332,15 +332,46 @@ pub enum SecretsCommand {
 #[derive(Debug, Args)]
 pub struct SecretSetArgs {
     pub app: String,
-    /// Secret name ([A-Za-z0-9_-], 1–64 characters).
-    pub name: String,
+    /// Secret name ([A-Za-z0-9_-], 1–64 characters). Not used with `--env-file`.
+    #[arg(required_unless_present = "env_file", conflicts_with = "env_file")]
+    pub name: Option<String>,
     /// Read the value from a file instead of stdin.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", conflicts_with = "env_file")]
     pub from_file: Option<PathBuf>,
     /// Keep the value byte for byte (by default one trailing newline is stripped).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "env_file")]
     pub raw: bool,
-    /// Send nothing; validate the input and show the request (the value is masked).
+    /// Store every `NAME=value` line of a dotenv-style file (`-` = stdin) as a secret and bind each
+    /// new one as the environment variable of the same name (`--secret-env NAME=NAME`). Comments,
+    /// blank lines, `export`, single and double quotes are understood; values are never printed.
+    #[arg(long, value_name = "FILE")]
+    pub env_file: Option<PathBuf>,
+    /// With `--env-file`: use only these names (comma separated).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "NAME",
+        requires = "env_file"
+    )]
+    pub only: Vec<String>,
+    /// With `--env-file`: leave these names out (comma separated).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "NAME",
+        requires = "env_file"
+    )]
+    pub except: Vec<String>,
+    /// With `--env-file`: these names are not secrets; set them as plain `env` of the app.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "NAME",
+        requires = "env_file"
+    )]
+    pub plain: Vec<String>,
+    /// Send nothing; validate the input and show the request (the value is masked), or with
+    /// `--env-file` list the names that would be set and bound.
     #[arg(long)]
     pub dry_run: bool,
 }
