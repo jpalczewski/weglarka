@@ -195,3 +195,60 @@ async fn doctor_is_quiet_for_a_consistent_group() {
     assert_eq!(check["status"], "ok", "{check}");
     h.running.stop().await;
 }
+
+#[tokio::test]
+async fn doctor_warns_about_a_network_of_a_removed_app_and_ignores_the_rest() {
+    let h = harness().await;
+    add(
+        &h,
+        "kajet-api",
+        json!({"image": IMAGE, "health": {"attempts": 1, "window_secs": 1}}),
+    )
+    .await;
+    let create = |name: &str, label: Option<(&str, &str)>| NetworkSpec {
+        name: name.to_owned(),
+        internal: false,
+        labels: label
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into_iter()
+            .collect(),
+    };
+    let podman = h.running.daemon.engine.podman();
+    // Orphan: labelled, `net-<instance>`, no such app. Not orphans: a live app's network, a network
+    // Węglarka did not label, and the ingress network.
+    podman
+        .network_create(&create("net-ghost", Some((labels::INSTANCE, "ghost"))))
+        .await
+        .unwrap();
+    podman
+        .network_create(&create(
+            "net-kajet-api",
+            Some((labels::INSTANCE, "kajet-api")),
+        ))
+        .await
+        .unwrap();
+    podman
+        .network_create(&create("net-foreign", None))
+        .await
+        .unwrap();
+    podman
+        .network_create(&create(
+            labels::INGRESS_NETWORK,
+            Some(("weglarka.managed", "true")),
+        ))
+        .await
+        .unwrap();
+
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let found: Vec<&Value> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"] == "state.orphan_networks")
+        .collect();
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["status"], "warn");
+    let message = found[0]["message"].as_str().unwrap();
+    assert!(message.ends_with("net-ghost"), "{message}");
+    h.running.stop().await;
+}
