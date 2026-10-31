@@ -18,7 +18,7 @@ use weglarka_api::{Body, ENDPOINTS, Method};
 use weglarka_model::admin_auth::Scope;
 use weglarka_model::admin_auth::testing::{AUDIENCE, ISSUER, TestIssuer};
 
-const SECTIONS: &str = r#"
+pub(crate) const SECTIONS: &str = r#"
 [identity]
 provider = "authelia"
 instance = "authelia"
@@ -94,7 +94,12 @@ fn serve_jwks(socket: PathBuf, jwks: String) -> Arc<AtomicUsize> {
 }
 
 pub(crate) async fn setup() -> Setup {
-    let h = Builder::new().sections(SECTIONS).build().await;
+    setup_with(Builder::new().sections(SECTIONS)).await
+}
+
+/// [`setup`] on a caller-prepared [`Builder`] (it must carry [`SECTIONS`]).
+pub(crate) async fn setup_with(builder: Builder) -> Setup {
+    let h = builder.build().await;
     let issuer = TestIssuer::new("k1");
     let probe = weglarka_daemon::ingress::probe_socket_path(&h.root.join("state/nginx"));
     let jwks_fetches = serve_jwks(probe, issuer.jwks_json());
