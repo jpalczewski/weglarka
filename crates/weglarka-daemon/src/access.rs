@@ -478,7 +478,11 @@ where
         live = follow => live,
     };
     match live {
-        Ok(live) => read_phase(live, scan, None, tx, expiry, audit).await,
+        Ok(live) => {
+            // A fragment the history ended in is not the start of the live stream's first line.
+            scan.lines = LineBuffer::default();
+            read_phase(live, scan, None, tx, expiry, audit).await
+        }
         Err(error) => {
             tracing::warn!(app = %scan.app, %error, "following the nginx log failed");
             Err(Ended::Error)
@@ -917,6 +921,29 @@ mod tests {
         task.await.unwrap();
         // The ring bounds the history only; the followed lines all come.
         assert_eq!(paths(&frames), ["/h2", "/l1", "/l2"]);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_history_fragment_does_not_spoil_the_first_live_line() {
+        let q = query("follow=true");
+        let (tx, rx) = mpsc::channel(FRAME_QUEUE);
+        let history = stream::iter(vec![out(
+            line("web", 200, "/h").trim_end().to_owned() + "\n{\"app\":\"we"
+        )])
+        .boxed();
+        let live = stream::iter(vec![out(line("web", 200, "/live"))]).boxed();
+        let task = tokio::spawn(pump(
+            history,
+            Some(async move { Ok(live) }),
+            Scan::new(name(), &q),
+            None,
+            tx,
+            StreamDeadline(None),
+            audit(&q),
+        ));
+        let frames = drain(rx).await;
+        task.await.unwrap();
+        assert_eq!(paths(&frames), ["/h", "/live"]);
     }
 
     #[tokio::test]
