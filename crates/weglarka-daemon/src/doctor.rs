@@ -18,6 +18,7 @@ use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
+use crate::app_view::Access;
 use crate::certificates::{self, routed_domains};
 use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
 
@@ -50,7 +51,49 @@ fn state_hint(error: &state::StateError, malformed: &'static str) -> &'static st
     }
 }
 
-pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
+/// Delimits free-form failure text (engine, Podman and I/O errors) inside a check message; see
+/// [`detail`] and [`apply_access`].
+const DETAIL_OPEN: char = '\u{1}';
+const DETAIL_CLOSE: char = '\u{2}';
+/// Stands in for [`detail`] text in a report served to a caller that may not see it.
+const WITHHELD: &str = "<details withheld>";
+
+/// Marks `text` as free-form failure text. Checks interpolate every error they do not author
+/// themselves through this, so [`apply_access`] is the single place that decides who sees it: the
+/// report is also served at the `read` scope, and engine/Podman error text can name paths, images or
+/// secrets. The markers never reach the wire, and `text` cannot forge or close one.
+fn detail(text: impl std::fmt::Display) -> String {
+    let text: String = text
+        .to_string()
+        .chars()
+        .filter(|c| *c != DETAIL_OPEN && *c != DETAIL_CLOSE)
+        .collect();
+    format!("{DETAIL_OPEN}{text}{DETAIL_CLOSE}")
+}
+
+/// Resolves the [`detail`] markers in every message: kept for [`Access::Full`] callers, replaced by
+/// [`WITHHELD`] for [`Access::Redacted`] ones.
+fn apply_access(access: Access, checks: &mut [DoctorCheck]) {
+    for c in checks {
+        let mut out = String::with_capacity(c.message.len());
+        let mut rest = c.message.as_str();
+        while let Some(start) = rest.find(DETAIL_OPEN) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + DETAIL_OPEN.len_utf8()..];
+            // A missing close marker cannot happen, but then withhold the remainder.
+            let (text, tail) = after.split_once(DETAIL_CLOSE).unwrap_or(("", ""));
+            match access {
+                Access::Full => out.push_str(text),
+                Access::Redacted => out.push_str(WITHHELD),
+            }
+            rest = tail;
+        }
+        out.push_str(rest);
+        c.message = out;
+    }
+}
+
+pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(ok(
         "daemon.version",
@@ -80,6 +123,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     webhook(d, &mut checks).await;
     metrics(d, &mut checks);
     metrics_scraper(d, &mut checks).await;
+    apply_access(access, &mut checks);
     DoctorReport { checks }
 }
 
@@ -103,7 +147,7 @@ fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             CheckStatus::Warn,
             match last_error {
                 Some(error) => format!(
-                    "serving /metrics on {addr}, but not on network {network} yet: {error}"
+                    "serving /metrics on {addr}, but not on network {network} yet: {}", detail(&error)
                 ),
                 None => format!("serving /metrics on {addr}, joining network {network}"),
             },
@@ -112,7 +156,7 @@ fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Some(ListenerStatus::Failed(error)) => check(
             "metrics.listener",
             CheckStatus::Fail,
-            format!("not started: {error}"),
+            format!("not started: {}", detail(&error)),
             Some("fix [metrics] listen (the address must be free) and restart the daemon"),
         ),
         None => check("metrics.listener", CheckStatus::Warn, "starting", None),
@@ -271,7 +315,10 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
     if let Some(error) = &state.error {
         let age = now.saturating_sub(error.at);
-        parts.push(format!("last attempt failed {age}s ago: {}", error.message));
+        parts.push(format!(
+            "last attempt failed {age}s ago: {}",
+            detail(&error.message)
+        ));
     }
     // Issue #100: a switch in flight (the watchdog is waiting for the new daemon's health) and the
     // last automatic fallback.
@@ -370,7 +417,7 @@ async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Err(e) => check(
             "runtime.socket",
             CheckStatus::Fail,
-            format!("Podman socket unavailable: {e}"),
+            format!("Podman socket unavailable: {}", detail(&e)),
             Some("check the runtime user's `podman.socket` and that the socket is mounted into the container"),
         ),
     });
@@ -444,10 +491,9 @@ async fn desired_state<P: PodmanClient>(
             .find(|c| c.name == labels::container_name(name));
         match (app_state.and_then(|s| s.current.as_ref()), container) {
             (None, _) => match app_state.and_then(|s| s.failed.as_ref()) {
-                // The engine's failure text is withheld from `read` tokens (`app_view`), and the
-                // doctor report is served at `read`, so the reason stays in `apps show`.
-                Some(_) => problems.push(format!(
-                    "{name}: first deploy failed (see `weglarka apps show {name}`)"
+                Some(failed) => problems.push(format!(
+                    "{name}: first deploy failed: {}",
+                    detail(&failed.reason)
                 )),
                 None => problems.push(format!("{name}: not deployed yet")),
             },
@@ -529,7 +575,7 @@ async fn memory_use<P: PodmanClient>(
             out.push(check(
                 ID,
                 CheckStatus::Info,
-                format!("memory use unavailable: {e}"),
+                format!("memory use unavailable: {}", detail(&e)),
                 None,
             ));
             return;
@@ -799,7 +845,7 @@ fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         used.push(format!("{name}: groups {}", spec.group_add.join(",")));
         if let Err(e) = weglarka_engine::host_mounts::check_groups(&d.host.runtime.group_add, spec)
         {
-            broken.push(format!("{name}: {e}"));
+            broken.push(format!("{name}: {}", detail(&e)));
         }
     }
     if used.is_empty() {
@@ -862,7 +908,7 @@ fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Err(e) => check(
                 "configs.root",
                 CheckStatus::Warn,
-                format!("config_root {} is not available: {e}", root.display()),
+                format!("config_root {} is not available: {}", root.display(), detail(&e)),
                 Some(
                     "the daemon container must mount config_root read-only: set it in weglarka.toml \
                      and re-run `weglarka platform install`",
@@ -880,7 +926,7 @@ fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                     Err(e) => check(
                         "configs.root",
                         CheckStatus::Warn,
-                        format!("cannot read config_root {}: {e}", root.display()),
+                        format!("cannot read config_root {}: {}", root.display(), detail(&e)),
                         Some("the runtime user needs r+x on config_root"),
                     ),
                     Ok(_) => {
@@ -999,7 +1045,7 @@ async fn shared_volume_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Docto
             out.push(check(
                 "state.shared_volumes",
                 CheckStatus::Warn,
-                format!("cannot list Podman volumes: {e}"),
+                format!("cannot list Podman volumes: {}", detail(&e)),
                 None,
             ));
             return;
@@ -1180,7 +1226,7 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
             out.push(check(
                 "state.shared_networks",
                 CheckStatus::Warn,
-                format!("cannot list Podman networks: {e}"),
+                format!("cannot list Podman networks: {}", detail(&e)),
                 None,
             ));
             return;
@@ -1455,7 +1501,7 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         Err(e) => out.push(check(
             "acme.account",
             CheckStatus::Warn,
-            format!("{}: {e}", key.display()),
+            format!("{}: {}", key.display(), detail(&e)),
             None,
         )),
     }
@@ -1502,7 +1548,7 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         problems.push(format!("renewal due: {}", due.join(", ")));
     }
     for (cert, reason) in &status.failures {
-        problems.push(format!("last pass failed for {cert}: {reason}"));
+        problems.push(format!("last pass failed for {cert}: {}", detail(reason)));
     }
     if problems.is_empty() {
         out.push(ok(
@@ -1571,7 +1617,7 @@ fn acme_dns<P: PodmanClient>(
         Err(e) => out.push(check(
             "acme.dns",
             CheckStatus::Fail,
-            format!("{}: {e}", token.display()),
+            format!("{}: {}", token.display(), detail(&e)),
             Some(
                 "put the DNS provider's API token (scoped to the wildcard zones only) in this \
                  file with mode 600",
@@ -1758,7 +1804,10 @@ fn ingress_cdn<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         (Some(error), _) => check(
             "ingress.cdn",
             CheckStatus::Warn,
-            format!("{message}; the last refresh was not applied: {error}"),
+            format!(
+                "{message}; the last refresh was not applied: {}",
+                detail(&error)
+            ),
             Some("the last good list stays in use; the refresh is retried hourly"),
         ),
         (None, true) => check(
@@ -1940,7 +1989,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Err(e) => check(
                 "ingress.traefik_file",
                 CheckStatus::Fail,
-                format!("{}: {e}", path.display()),
+                format!("{}: {}", path.display(), detail(&e)),
                 Some("the file must exist and belong to the runtime user (ACL only for traversing the directory)"),
             ),
         });
@@ -2066,7 +2115,7 @@ async fn identity_provider<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
             Err(e) => check(
                 id,
                 CheckStatus::Fail,
-                format!("{name}: {e}"),
+                format!("{name}: {}", detail(&e)),
                 Some("the provider must run and have the issuer host routed by ingress"),
             ),
         },
@@ -2141,7 +2190,7 @@ async fn admin_http<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) 
         Err(e) => check(
             id,
             CheckStatus::Fail,
-            format!("cannot fetch the provider's JWKS: {e}"),
+            format!("cannot fetch the provider's JWKS: {}", detail(&e)),
             Some("the provider must run and have the issuer host routed by ingress"),
         ),
     });
@@ -2229,7 +2278,7 @@ async fn identity_forward<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCh
                 Err(e) => check(
                     id,
                     CheckStatus::Fail,
-                    format!("{domain}: {e}"),
+                    format!("{domain}: {}", detail(&e)),
                     Some("the provider must run and have a domain routed by ingress; protected apps answer 500 meanwhile"),
                 ),
             },
@@ -2266,4 +2315,42 @@ async fn webhook<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             None,
         ),
     });
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+
+    fn msg(text: String) -> Vec<DoctorCheck> {
+        vec![ok("x", text)]
+    }
+
+    #[test]
+    fn detail_is_kept_for_full_and_withheld_for_redacted() {
+        let text = format!("a: {} b: {}!", detail("secret one"), detail("two"));
+        let mut full = msg(text.clone());
+        apply_access(Access::Full, &mut full);
+        assert_eq!(full[0].message, "a: secret one b: two!");
+        let mut redacted = msg(text);
+        apply_access(Access::Redacted, &mut redacted);
+        assert_eq!(
+            redacted[0].message,
+            "a: <details withheld> b: <details withheld>!"
+        );
+    }
+
+    #[test]
+    fn detail_text_cannot_forge_or_close_a_marker() {
+        let hostile = format!("x{DETAIL_CLOSE} leaked {DETAIL_OPEN}");
+        let mut checks = msg(format!("e: {}", detail(&hostile)));
+        apply_access(Access::Redacted, &mut checks);
+        assert_eq!(checks[0].message, "e: <details withheld>");
+    }
+
+    #[test]
+    fn a_message_without_detail_is_untouched() {
+        let mut checks = msg("plain".into());
+        apply_access(Access::Redacted, &mut checks);
+        assert_eq!(checks[0].message, "plain");
+    }
 }

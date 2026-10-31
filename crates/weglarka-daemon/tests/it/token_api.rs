@@ -568,3 +568,66 @@ fn audience_constant_matches_the_configured_audience() {
     // The fixtures above rely on the test issuer's audience being the one in `SECTIONS`.
     assert!(SECTIONS.contains(&format!("audience = \"{AUDIENCE}\"")));
 }
+
+#[tokio::test]
+async fn doctor_withholds_free_form_failure_text_from_a_read_token_only() {
+    let s = setup().await;
+    add(&s.h, "y", spec("y.example.com")).await;
+    deployed(&s.h, "y").await;
+
+    // The engine records a first-deploy failure with free-form text.
+    let state_path = s.h.root.join("state/state.toml");
+    let mut st = weglarka_model::state::load_state(&state_path).unwrap();
+    let name = weglarka_model::app::InstanceName::new("y").unwrap();
+    let entry = st.apps.get_mut(&name).expect("state of y");
+    let digest = entry.current.take().expect("current digest");
+    entry.spec_hash = None;
+    entry.failed = Some(weglarka_model::state::FailedDeploy {
+        digest,
+        reason: "pull failed: password=hunter2".into(),
+    });
+    weglarka_model::state::save_state(&state_path, &st).unwrap();
+
+    let drift = |report: &Value| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["message"].as_str())
+            .filter(|m| m.contains("first deploy failed"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let reader = s.issuer.token("rita", &["viewers"]);
+    let (status, _, body) = call(&s.token_socket, "GET", "/v1/doctor", Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = drift(&body);
+    assert_eq!(messages.len(), 1, "{body}");
+    assert!(!body.to_string().contains("hunter2"), "{body}");
+    assert!(messages[0].contains("<details withheld>"), "{messages:?}");
+
+    // The unix socket and an admin token keep the text.
+    let (_, full) = admin(&s.h, "GET", "/v1/doctor", None).await;
+    assert!(
+        drift(&full)[0].contains("pull failed: password=hunter2"),
+        "{full}"
+    );
+    let admin_token = s.issuer.token("adam", &["admins"]);
+    let (_, _, full) = call(
+        &s.token_socket,
+        "GET",
+        "/v1/doctor",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert!(
+        drift(&full)[0].contains("pull failed: password=hunter2"),
+        "{full}"
+    );
+    // No marker leaks onto the wire.
+    for r in [&body, &full] {
+        assert!(!r.to_string().contains(['\u{1}', '\u{2}']), "{r}");
+    }
+}
