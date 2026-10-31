@@ -328,6 +328,19 @@ pub struct ContainerInfo {
     /// Ports the container publishes on the host as libpod reports them (`NetworkSettings.Ports`), with
     /// the **actual** host port — so a mapping created with `host_port = 0` shows the one it got.
     pub published_ports: Vec<PortMapping>,
+    /// Memory limit in bytes as libpod stored it (`HostConfig.Memory`); `None` for an unlimited container
+    /// (libpod reports `0`).
+    pub memory_limit: Option<u64>,
+}
+
+/// One running container's resource use as `PodmanClient::container_stats` reports it. Only the fields a
+/// consumer reads; later metrics add more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerStats {
+    pub name: String,
+    /// Working set in bytes (libpod `MemUsage`: `memory.current` minus inactive file cache). `0` means
+    /// libpod had no data (typically no cgroup controller delegation), not an idle container.
+    pub memory_usage: u64,
 }
 
 /// Repository from an image reference — without tag and digest but **with** the registry port:
@@ -501,6 +514,11 @@ pub trait PodmanClient: Send + Sync {
         &self,
         filter: &ContainerFilter,
     ) -> impl Future<Output = Result<Vec<ContainerInfo>>> + Send;
+
+    /// One snapshot of every **running** container of this user (`GET /containers/stats?stream=false`);
+    /// stopped containers are absent. A single call for all of them: naming containers would make one
+    /// unknown name fail the whole request.
+    fn container_stats(&self) -> impl Future<Output = Result<Vec<ContainerStats>>> + Send;
 
     // Images
     /// Pull as a stream; an error mid-pull appears as an `Err` in the stream. `auth` is sent as

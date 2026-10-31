@@ -1,4 +1,4 @@
-# 0061 — Publish the main image from CI through a reusable release workflow
+# 0062 — Publish the main image from CI through a reusable release workflow
 
 Status: proposed (2026-10-30).
 

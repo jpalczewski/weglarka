@@ -215,3 +215,57 @@ async fn health_command_overrides_the_image_and_drives_healthcheck_run() {
         );
     }
 }
+
+#[tokio::test]
+async fn stats_report_running_containers_with_usage_and_the_limit_comes_from_inspect() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(&socket);
+    let id = run_id();
+    let (limited, free, stopped) = (
+        format!("weglarka-it-stl-{id}"),
+        format!("weglarka-it-stf-{id}"),
+        format!("weglarka-it-sts-{id}"),
+    );
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![limited.clone(), free.clone(), stopped.clone()],
+    };
+    pull(&client).await;
+
+    let mut s = spec(&limited);
+    s.resources.memory = Some(MemoryLimit::parse("64m").unwrap());
+    client.container_create(&s).await.unwrap();
+    client.container_create(&spec(&free)).await.unwrap();
+    client.container_create(&spec(&stopped)).await.unwrap();
+    for name in [&limited, &free, &stopped] {
+        client.container_start(name).await.unwrap();
+    }
+    client.container_stop(&stopped, 1).await.unwrap();
+
+    assert_eq!(
+        client
+            .container_inspect(&limited)
+            .await
+            .unwrap()
+            .memory_limit,
+        Some(64 << 20)
+    );
+    assert_eq!(
+        client.container_inspect(&free).await.unwrap().memory_limit,
+        None
+    );
+
+    let stats = client.container_stats().await.unwrap();
+    for name in [&limited, &free] {
+        let entry = stats.iter().find(|c| &c.name == name);
+        let entry = entry.unwrap_or_else(|| panic!("{name} missing from {stats:?}"));
+        assert!(entry.memory_usage > 0, "{name}: {entry:?}");
+    }
+    // Measured here and reported in the PR: whether a stopped container is listed at all.
+    let stopped_listed = stats.iter().any(|c| c.name == stopped);
+    eprintln!("stopped container listed in stats: {stopped_listed}");
+    assert!(
+        !stopped_listed,
+        "a stopped container must not appear in stats: {stats:?}"
+    );
+}

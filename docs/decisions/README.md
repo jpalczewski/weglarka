@@ -67,4 +67,5 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0058](0058-test-coverage-reporting.md) | Test coverage reporting on GitHub Pages |
 | [0059](0059-panel-login-callback-rate-limit.md) | Per-address rate limit on panel login callbacks |
 | [0060](0060-remote-cli-device-login-via-the-panel.md) | Remote CLI: `weglarka login` (device authorization grant) through the panel |
-| [0061](0061-publish-main-image-from-ci.md) | Publish the main image from CI through a reusable release workflow |
+| [0061](0061-metrics-listener.md) | Metrics: an optional listener on a dedicated network |
+| [0062](0062-publish-main-image-from-ci.md) | Publish the main image from CI through a reusable release workflow |

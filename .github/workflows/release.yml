@@ -3,7 +3,7 @@ name: Release
 # main → ghcr.io/jpalczewski/weglarka{,-panel}:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
 # Two entry points: a `v*` tag push builds everything here; on main, ci.yml calls this workflow (`workflow_call`)
 # with the musl binaries its own `musl` job already built, so the image job starts right after that build and
-# `binaries` is skipped (docs/decisions/0061).
+# `binaries` is skipped (docs/decisions/0062).
 # One tag publishes two images: the daemon's and the panel's (docs/decisions/0057), both at the daemon's version.
 # Decisions: docs/decisions/0006-pakowanie-obrazy-i-release.md
 

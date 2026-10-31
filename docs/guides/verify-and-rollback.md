@@ -10,6 +10,23 @@ podman logs weglarka-nginx                      # JSON access log with the app f
 podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'  # true [] (ADR 0014)
 ```
 
+## Memory use
+
+`weglarka doctor` reports `runtime.memory`: the working set of every running container (one Podman stats call,
+matched to containers by name) against its `resources.memory` limit.
+
+| Status | When |
+|---|---|
+| `ok` | every container with a limit is below 80% of it; the message gives the container count, the total in use and the container closest to its limit |
+| `warn` | a container is at or above 80% of its limit; the message names it with the percentage |
+| `info` | `weglarka-nginx` runs without a memory limit (there is no setting for it yet) |
+| `info` | a running container reports no memory data, usually because the cgroup memory controller is not delegated to the runtime user; such a container is never counted as idle |
+| `info` | the stats call failed; the rest of `doctor` is unaffected |
+
+When several conditions hold the highest status wins and the message mentions all of them. The check never fails.
+Raise `resources.memory` of an app that warns (`weglarka apps update <app> --memory 256M`; the blue-green `.next`/`.prev`
+containers share the app's setting). If the daemon's own container warns, its limit is `[platform] memory` in `weglarka.toml`.
+
 ## Automatic rollback
 
 A deploy that fails the health gate returns to the previous digest (retention 1). The result is reported by
@@ -61,6 +78,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `ingress.auth_policy`, `ingress.auth_groups` (generated into the provider's access rules since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
+| `weglarka.toml` | `[metrics]` | [metrics](metrics.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |
 | `weglarka.toml` | `[monitor]` | [crash detection](crash-detection.md) |
 | `weglarka.toml` | `[self_update]`, together with `systemctl --user disable --now weglarka-self-update.timer weglarka-watchdog.timer` | [self-update](self-update.md) |

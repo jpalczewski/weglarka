@@ -1,0 +1,13 @@
+---
+source: crates/weglarka-daemon/src/metrics/encode.rs
+expression: text
+---
+# HELP weglarka_alpha Help with a \\ backslash\nand a newline.
+# TYPE weglarka_alpha gauge
+weglarka_alpha{app="inf"} +Inf
+weglarka_alpha{app="quo\"te\\back\nline"} NaN
+weglarka_alpha{app="web",role="active"} 2
+weglarka_alpha{app="web",role="retiring"} 1.5
+# HELP weglarka_zeta_total Second family, listed first.
+# TYPE weglarka_zeta_total counter
+weglarka_zeta_total 7

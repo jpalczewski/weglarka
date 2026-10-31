@@ -255,6 +255,7 @@ mod tests {
             networks: vec![],
             addresses: vec![],
             published_ports: vec![],
+            memory_limit: None,
         }
     }
 

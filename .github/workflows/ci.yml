@@ -458,7 +458,7 @@ jobs:
 
   # main only: publishes and signs the images from the binaries `musl` just built (the `release` profile on
   # main), so nothing is compiled twice and the image does not wait for the tests below
-  # (docs/decisions/0061). Tag pushes run release.yml directly.
+  # (docs/decisions/0062). Tag pushes run release.yml directly.
   publish-image:
     needs: musl
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
