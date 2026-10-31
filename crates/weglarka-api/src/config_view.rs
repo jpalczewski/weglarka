@@ -41,6 +41,16 @@ pub struct ConfigView {
     /// `[identity]`; absent = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityView>,
+    /// `[metrics]`; absent = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsView>,
+}
+
+/// `[metrics]`: where the opt-in metrics listener is and which network reaches it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsView {
+    pub listen: SocketAddr,
+    pub network: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

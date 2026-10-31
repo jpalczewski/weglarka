@@ -78,7 +78,44 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     identity_forward(d, &mut checks).await;
     admin_http(d, &mut checks).await;
     webhook(d, &mut checks).await;
+    metrics(d, &mut checks);
     DoctorReport { checks }
+}
+
+/// `metrics.listener` (issue #350): only with `[metrics]`; a feature that is off adds no line.
+fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use crate::metrics::ListenerStatus;
+    if d.host.metrics.is_none() {
+        return;
+    }
+    out.push(match d.metrics.get() {
+        Some(ListenerStatus::Listening { addr, network }) => ok(
+            "metrics.listener",
+            format!("serving /metrics on {addr}, reachable on network {network}"),
+        ),
+        Some(ListenerStatus::Joining {
+            addr,
+            network,
+            last_error,
+        }) => check(
+            "metrics.listener",
+            CheckStatus::Warn,
+            match last_error {
+                Some(error) => format!(
+                    "serving /metrics on {addr}, but not on network {network} yet: {error}"
+                ),
+                None => format!("serving /metrics on {addr}, joining network {network}"),
+            },
+            Some("the daemon keeps retrying every few seconds; no restart is needed once Podman works"),
+        ),
+        Some(ListenerStatus::Failed(error)) => check(
+            "metrics.listener",
+            CheckStatus::Fail,
+            format!("not started: {error}"),
+            Some("fix [metrics] listen (the address must be free) and restart the daemon"),
+        ),
+        None => check("metrics.listener", CheckStatus::Warn, "starting", None),
+    });
 }
 
 /// Self-update (issue #99): configured or not, the digest the switcher pinned, and whether the

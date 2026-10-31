@@ -24,6 +24,7 @@ pub mod identity;
 pub mod images;
 pub mod ingress;
 pub mod logs;
+pub mod metrics;
 pub mod platform;
 /// `PUT /v1/apps/{name}/image`: deploy an image archive built elsewhere (issue #109).
 pub mod push;
@@ -139,11 +140,17 @@ pub struct Running<P: PodmanClient + 'static> {
     /// Socket of the token listener (`[admin.http]`); `None` without it.
     pub admin_token_socket: Option<PathBuf>,
     pub webhook_addr: SocketAddr,
+    /// Where `/metrics` listens; `None` without `[metrics]` or after a failed start.
+    pub metrics_addr: Option<SocketAddr>,
     shutdown: watch::Sender<bool>,
     admin: JoinHandle<()>,
     /// The token listener (`[admin.http]`); `None` without it.
     admin_token: Option<JoinHandle<()>>,
     webhook: JoinHandle<()>,
+    /// The metrics listener (`[metrics]`); `None` when absent or when it could not bind.
+    metrics: Option<JoinHandle<()>>,
+    /// Joins the metrics network in the background; ends when joined or on shutdown.
+    metrics_join: Option<JoinHandle<()>>,
     ingress: JoinHandle<()>,
     reconcile: JoinHandle<()>,
     /// Notification worker; `None` when notifications are not configured.
@@ -225,6 +232,19 @@ where
             tracing::error!(server = name, error = %e, "server stopped");
         }
     })
+}
+
+/// Binds the metrics listener. It needs no Podman, so it is up before the network join finishes.
+async fn bind_metrics(
+    config: &weglarka_model::config::MetricsConfig,
+) -> Result<(TcpListener, SocketAddr), String> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|e| format!("bind {}: {e}", config.listen))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    Ok((listener, addr))
 }
 
 pub async fn start<P: PodmanClient + 'static>(
@@ -416,6 +436,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         started: std::time::Instant::now(),
         triggers: trigger_tx,
         webhook_addr: OnceLock::new(),
+        metrics: metrics::StatusCell::default(),
         tasks: Mutex::new(JoinSet::new()),
     });
 
@@ -471,6 +492,47 @@ pub async fn start_with<P: PodmanClient + 'static>(
         webhook::router(daemon.clone()),
         shutdown_rx.clone(),
     );
+    // Metrics (ADR 0061): opt-in. A bind failure is logged and shown by `doctor`; the network join runs
+    // in the background and never delays or stops the daemon.
+    let (metrics, metrics_join, metrics_addr) = match &host.metrics {
+        Some(config) => match bind_metrics(config).await {
+            Ok((listener, addr)) => {
+                daemon.metrics.set(metrics::ListenerStatus::Joining {
+                    addr,
+                    network: config.network.clone(),
+                    last_error: None,
+                });
+                let server = spawn_server(
+                    "metrics",
+                    listener,
+                    metrics::router(Arc::new(metrics::DaemonMetrics)),
+                    shutdown_rx.clone(),
+                );
+                let join = tokio::spawn({
+                    let daemon = daemon.clone();
+                    let config = config.clone();
+                    let rx = shutdown_rx.clone();
+                    async move {
+                        metrics::keep_joined(
+                            daemon.engine.podman(),
+                            &config,
+                            addr,
+                            &daemon.metrics,
+                            rx,
+                        )
+                        .await;
+                    }
+                });
+                (Some(server), Some(join), Some(addr))
+            }
+            Err(error) => {
+                tracing::error!(%error, "metrics listener not started");
+                daemon.metrics.set(metrics::ListenerStatus::Failed(error));
+                (None, None, None)
+            }
+        },
+        None => (None, None, None),
+    };
 
     let period = Duration::from_secs(host.runtime.reconcile_interval_secs.max(1));
     let ingress_task = tokio::spawn({
@@ -514,10 +576,13 @@ pub async fn start_with<P: PodmanClient + 'static>(
         admin_socket: host.admin.socket.clone(),
         admin_token_socket: admin_token.is_some().then(|| paths.admin_token_socket()),
         webhook_addr,
+        metrics_addr,
         shutdown,
         admin,
         admin_token,
         webhook,
+        metrics,
+        metrics_join,
         ingress: ingress_task,
         reconcile,
         notify: notify_task,
@@ -537,6 +602,8 @@ impl<P: PodmanClient + 'static> Running<P> {
             admin,
             admin_token,
             webhook,
+            metrics,
+            metrics_join,
             ingress,
             reconcile,
             notify,
@@ -562,6 +629,20 @@ impl<P: PodmanClient + 'static> Running<P> {
                 .is_err()
         {
             tracing::warn!("admin token API did not stop in time");
+        }
+        if let Some(handle) = metrics
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("metrics listener did not stop in time");
+        }
+        if let Some(handle) = metrics_join
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("metrics network join did not stop in time");
         }
         if let Some(handle) = notify
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)

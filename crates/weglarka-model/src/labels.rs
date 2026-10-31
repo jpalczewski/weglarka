@@ -69,6 +69,10 @@ pub fn staging_network_name(instance: &InstanceName) -> String {
 /// cleanup must never treat it as an orphan.
 pub const INGRESS_NETWORK: &str = "net-weglarka";
 
+/// Default name of the network the metrics listener is reachable on (`[metrics] network`, ADR 0061).
+/// Deliberately not `net-*`: reconcile prunes unused `net-<instance>` networks it created.
+pub const METRICS_NETWORK: &str = "metrics";
+
 /// Per-app network that the instance container (and the ingress nginx) joins.
 pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")
