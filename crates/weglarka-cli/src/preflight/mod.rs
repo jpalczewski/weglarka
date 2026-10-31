@@ -168,33 +168,19 @@ pub fn run_local(overrides: &Overrides, secrets_file: Option<PathBuf>) -> Doctor
 // ---- building results ----
 
 pub fn ok(id: &str, message: impl Into<String>) -> DoctorCheck {
-    check(id, CheckStatus::Ok, message, None)
+    DoctorCheck::ok(id, message)
 }
 
 pub fn info(id: &str, message: impl Into<String>) -> DoctorCheck {
-    check(id, CheckStatus::Info, message, None)
+    DoctorCheck::info(id, message)
 }
 
 pub fn warn(id: &str, message: impl Into<String>, hint: impl Into<String>) -> DoctorCheck {
-    check(id, CheckStatus::Warn, message, Some(hint.into()))
+    DoctorCheck::warn(id, message).with_hint(hint)
 }
 
 pub fn fail(id: &str, message: impl Into<String>, hint: impl Into<String>) -> DoctorCheck {
-    check(id, CheckStatus::Fail, message, Some(hint.into()))
-}
-
-fn check(
-    id: &str,
-    status: CheckStatus,
-    message: impl Into<String>,
-    hint: Option<String>,
-) -> DoctorCheck {
-    DoctorCheck {
-        id: id.to_owned(),
-        status,
-        message: message.into(),
-        hint,
-    }
+    DoctorCheck::fail(id, message).with_hint(hint)
 }
 
 /// Text rendering of the report (shared by `doctor` and `doctor --preflight`).
