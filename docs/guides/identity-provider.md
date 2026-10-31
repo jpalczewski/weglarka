@@ -175,8 +175,10 @@ The pipeline also writes `access-control.yml` from `ingress.auth_policy` and `in
 ## Rollback
 
 `oidc`, `[oidc_clients]` (in `apps.toml`) and `[identity]` (in `weglarka.toml`) are new fields, and both files use
-`deny_unknown_fields`: an older Węglarka refuses to start while they are present. Before downgrading, remove `[identity]`,
-every `oidc` section and `[oidc_clients]`, or restore the state files from a copy ([state schema](state-schema.md)).
+`deny_unknown_fields`: an older Węglarka refuses to start while they are present. Before downgrading, remove every `oidc` section and
+`[oidc_clients]` first, and `[identity]` **last**, or restore the state files from a copy ([state schema](state-schema.md)).
+The order matters: the daemon refuses to start while an app has `oidc` (or `[oidc_clients]` exists) and `weglarka.toml`
+has no `[identity]`, so removing `[identity]` first takes the admin API down before you can remove the `oidc` sections.
 Removing them stops generation; the provider keeps the last files it was given, so give it a hand-written configuration
 again first, then downgrade. The minted secrets stay in `secrets.toml` until you remove them
 (`apps remove --purge-secrets`).
