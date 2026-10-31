@@ -165,6 +165,15 @@ async fn version_is_podman_6() {
 }
 
 #[tokio::test]
+async fn storage_info_reports_the_graph_root_filesystem() {
+    let Some(socket) = socket() else { return };
+    let s = LibpodClient::new(socket).storage_info().await.unwrap();
+    let size = s.size_bytes.expect("graphRootAllocated");
+    let used = s.used_bytes.expect("graphRootUsed");
+    assert!(used > 0 && used <= size, "{s:?}");
+}
+
+#[tokio::test]
 async fn pull_failure_is_an_error_not_a_completion() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket);

@@ -757,3 +757,122 @@ mod resources {
         h.running.stop().await;
     }
 }
+
+// Host metrics (issue #353): the fixture `/proc` from `common::proc_fixture` and libpod `/info`.
+mod host {
+    use super::*;
+    use weglarka_model::podman::StorageInfo;
+
+    async fn metrics_harness() -> Harness {
+        let h = Builder::new().sections(ON).build().await;
+        own_container(&h.fake).await;
+        h
+    }
+
+    async fn scrape(h: &Harness) -> String {
+        let addr = h.running.metrics_addr.expect("listening");
+        let (status, body) = get(addr, "GET", "/metrics").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    fn families(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect()
+    }
+
+    fn storage_calls(fake: &FakePodman) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::StorageInfo))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn host_families_are_on_the_page_and_network_counters_are_not() {
+        let h = metrics_harness().await;
+        h.fake.set_storage_info(StorageInfo {
+            size_bytes: Some(1000),
+            used_bytes: Some(250),
+        });
+        let body = scrape(&h).await;
+        let names = families(&body);
+        for name in [
+            "node_memory_MemTotal_bytes",
+            "node_memory_MemAvailable_bytes",
+            "node_memory_SwapTotal_bytes",
+            "node_memory_SwapFree_bytes",
+            "node_cpu_seconds_total",
+            "node_load1",
+            "node_load5",
+            "node_load15",
+            "node_boot_time_seconds",
+            "node_disk_read_bytes_total",
+            "node_disk_written_bytes_total",
+            "node_pressure_cpu_waiting_seconds_total",
+            "node_pressure_memory_waiting_seconds_total",
+            "node_pressure_memory_stalled_seconds_total",
+            "node_pressure_io_waiting_seconds_total",
+            "node_pressure_io_stalled_seconds_total",
+            "node_vmstat_oom_kill",
+            "node_filefd_allocated",
+            "node_filefd_maximum",
+            "weglarka_storage_size_bytes",
+            "weglarka_storage_used_bytes",
+        ] {
+            assert!(names.contains(&name), "{name} missing from {names:?}");
+        }
+        // The fixture has a `net/dev`: it describes the daemon's own network namespace, never the host.
+        assert!(!body.contains("node_network_"), "{body}");
+        assert!(!body.contains("eth0"), "{body}");
+        // Free memory from `/info` is not available memory; it is never exported.
+        assert!(!body.contains("MemFree"), "{body}");
+        assert!(body.contains("weglarka_storage_used_bytes 250\n"), "{body}");
+        // Partitions and loop devices from the fixture are filtered out.
+        assert!(body.contains("device=\"sda\""), "{body}");
+        assert!(!body.contains("sda1") && !body.contains("loop0"), "{body}");
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_info_call_drops_only_the_storage_families() {
+        let h = metrics_harness().await;
+        h.fake.fail_storage_info(Some("store unavailable"));
+        let body = scrape(&h).await;
+        assert!(!body.contains("weglarka_storage_"), "{body}");
+        assert!(!body.contains("store unavailable"), "no free text");
+        for kept in [
+            "weglarka_build_info",
+            "weglarka_resource_metrics_up 1",
+            "node_memory_MemAvailable_bytes",
+            "node_cpu_seconds_total",
+        ] {
+            assert!(body.contains(kept), "{kept} in {body}");
+        }
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_info_answer_is_cached_across_scrapes() {
+        let h = metrics_harness().await;
+        let before = storage_calls(&h.fake);
+        let first = scrape(&h).await;
+        h.fake.set_storage_info(StorageInfo {
+            size_bytes: Some(1),
+            used_bytes: Some(1),
+        });
+        let second = scrape(&h).await;
+        assert_eq!(storage_calls(&h.fake) - before, 1);
+        let storage = |body: &str| {
+            body.lines()
+                .filter(|l| l.starts_with("weglarka_storage_"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(storage(&first), storage(&second));
+        assert!(!storage(&first).is_empty());
+        h.running.stop().await;
+    }
+}

@@ -6,7 +6,7 @@ expression: render(&r)
 [ OK ] runtime.user             user weglarka exists (uid 1001)
 [ OK ] runtime.subuid           2000000 ids for weglarka in /etc/subuid
 [ OK ] runtime.subgid           2000000 ids for weglarka in /etc/subgid
-[ OK ] runtime.cgroups          cgroups v2
+[ OK ] runtime.cgroups          cgroups v2 (io not delegated to weglarka: no per-app block I/O metrics; optional, add io to Delegate=)
 [ OK ] runtime.linger           linger enabled for weglarka
 [ OK ] runtime.socket           podman socket /run/user/1001/podman/podman.sock responds
 [ OK ] runtime.podman_version   libpod API 6.1

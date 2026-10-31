@@ -214,6 +214,17 @@ impl Check for CgroupsV2 {
                     "create /etc/systemd/system/user@.service.d/delegate.conf with `[Service]\nDelegate=cpu cpuset io memory pids`",
                 );
             }
+            // `io` is optional: without it only the per-app block I/O metrics are missing, so it is a
+            // note in an `ok` line, not a warning.
+            if !delegated.split_whitespace().any(|d| d == "io") {
+                return ok(
+                    self.id(),
+                    format!(
+                        "cgroups v2 (io not delegated to {}: no per-app block I/O metrics; optional, add io to Delegate=)",
+                        u.name
+                    ),
+                );
+            }
         }
         ok(self.id(), "cgroups v2")
     }

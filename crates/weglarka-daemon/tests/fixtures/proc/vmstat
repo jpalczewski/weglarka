@@ -1,0 +1,4 @@
+nr_free_pages 125000
+pgpgin 400000
+pgpgout 200000
+oom_kill 2
