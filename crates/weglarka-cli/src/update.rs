@@ -426,6 +426,10 @@ struct UpdateDryRun {
     path: String,
     /// `false` = the new spec equals the current one (a real run would send nothing).
     changed: bool,
+    /// `--spec` against a redacted view (a `read` token): the diff compares the file with
+    /// placeholders, so `env` values and `command` elements show as changed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    redacted_base: bool,
     diff: String,
     body: UpdateAppRequest,
 }
@@ -450,17 +454,30 @@ fn ensure_writable(current: &ShowAppResponse) -> Result<(), CliError> {
 }
 
 /// Prints the `PUT /v1/apps/{name}` a real run would send (`--dry-run` of update/start/stop).
-fn emit_update_dry_run(json: bool, params: &[(&str, &str)], diff: String, req: UpdateAppRequest) {
+fn emit_update_dry_run(
+    json: bool,
+    params: &[(&str, &str)],
+    redacted_base: bool,
+    diff: String,
+    req: UpdateAppRequest,
+) {
     let out = UpdateDryRun {
         dry_run: true,
         method: "PUT",
         path: expand_path(endpoints::APPS_UPDATE, params),
         changed: !diff.is_empty(),
+        redacted_base,
         diff,
         body: req,
     };
     emit(json, &out, || {
         let mut s = format!("dry-run: {} {}\n", out.method, out.path);
+        if out.redacted_base {
+            s.push_str(
+                "note: the current spec is a redacted view; env values and command elements \
+                 below differ only because they are withheld from this token\n",
+            );
+        }
         s.push_str(&if out.changed {
             format!("spec changes:\n{}", out.diff)
         } else {
@@ -483,16 +500,20 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
     let current: ShowAppResponse = client
         .call(endpoints::APPS_SHOW, &params, None::<&()>)
         .await?;
-    ensure_writable(&current)?;
+    // `--spec` takes nothing from the fetched spec but the diff base, so a redacted view is
+    // harmless there (a non-admin `PUT` is refused by the daemon); the flag edits start from it.
     let new_spec = match &a.spec {
         Some(path) => read_spec_file(path)?,
-        None => apply_flags(current.spec.clone(), &a)?,
+        None => {
+            ensure_writable(&current)?;
+            apply_flags(current.spec.clone(), &a)?
+        }
     };
     let diff = spec_diff(&current.spec, &new_spec);
     let req = UpdateAppRequest { spec: new_spec };
 
     if a.dry_run {
-        emit_update_dry_run(json, &params, diff, req);
+        emit_update_dry_run(json, &params, current.redacted, diff, req);
         return Ok(exit::OK);
     }
     if diff.is_empty() {
@@ -583,7 +604,7 @@ async fn set_start(
     let diff = spec_diff(&current.spec, &new_spec);
     let req = UpdateAppRequest { spec: new_spec };
     if a.dry_run {
-        emit_update_dry_run(json, &params, diff, req);
+        emit_update_dry_run(json, &params, false, diff, req);
         return Ok(exit::OK);
     }
     let resp: UpdateAppResponse = client
@@ -1397,6 +1418,39 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         };
         assert!(apps_start(true, &o, stop).await.is_err());
         assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spec_file_against_a_redacted_view_is_not_a_usage_error() {
+        let mut view: serde_json::Value = serde_json::from_str(&show_json()).unwrap();
+        view["redacted"] = true.into();
+        let show = view.to_string();
+        let m = mock(move |method, _| match method {
+            "GET" => (200, show.clone()),
+            _ => (403, r#"{"error":"forbidden"}"#.to_owned()),
+        })
+        .await;
+        let o = Overrides {
+            config: None,
+            socket: Some(m.socket.clone()),
+            host: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spec.toml");
+        let mut other = spec();
+        other.domains.push("other.example.eu".into());
+        std::fs::write(&file, toml::to_string(&other).unwrap()).unwrap();
+        let mut a = args(&[]);
+        a.spec = Some(file.clone());
+        a.dry_run = true;
+        assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);
+        // A real run reaches the daemon, which is the one to refuse the write.
+        let mut a = args(&[]);
+        a.spec = Some(file);
+        let err = apps_update(true, &o, a).await.unwrap_err();
+        assert!(!err.message.contains("redacted"), "{}", err.message);
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.last().unwrap().method, "PUT");
     }
 
     #[tokio::test(flavor = "current_thread")]
