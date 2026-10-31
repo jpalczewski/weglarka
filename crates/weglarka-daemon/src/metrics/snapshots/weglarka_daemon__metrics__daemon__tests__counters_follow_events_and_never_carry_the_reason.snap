@@ -6,7 +6,7 @@ expression: text
 # TYPE weglarka_app_health_transitions_total counter
 weglarka_app_health_transitions_total{app="api",to="recovered"} 1
 weglarka_app_health_transitions_total{app="api",to="unhealthy"} 1
-# HELP weglarka_deploys_total Deploys since the daemon started, by app and result (ok, failed). A deploy the health gate rejected counts in weglarka_rollbacks_total instead.
+# HELP weglarka_deploys_total Deploy attempts since the daemon started, by app and result (ok, failed); a reconcile retry is another attempt. A deploy rolled back after a failed health gate counts in weglarka_rollbacks_total instead.
 # TYPE weglarka_deploys_total counter
 weglarka_deploys_total{app="web",result="failed"} 1
 weglarka_deploys_total{app="web",result="ok"} 1

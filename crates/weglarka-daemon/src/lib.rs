@@ -503,8 +503,10 @@ pub async fn start_with<P: PodmanClient + 'static>(
     );
     // Metrics (ADR 0061): opt-in. A bind failure is logged and shown by `doctor`; the network join runs
     // in the background and never delays or stops the daemon.
-    let (metrics, metrics_join, metrics_addr) = match &host.metrics {
-        Some(config) => match bind_metrics(config).await {
+    // `counters` exists exactly when `[metrics]` does; pairing them keeps the listener from ever
+    // serving a set the event fan-out does not feed.
+    let (metrics, metrics_join, metrics_addr) = match host.metrics.as_ref().zip(counters) {
+        Some((config, counters)) => match bind_metrics(config).await {
             Ok((listener, addr)) => {
                 daemon.metrics.set(metrics::ListenerStatus::Joining {
                     addr,
@@ -516,7 +518,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
                     listener,
                     metrics::router(Arc::new(metrics::DaemonMetrics::new(
                         daemon.clone(),
-                        counters.clone().unwrap_or_default(),
+                        counters,
                     ))),
                     shutdown_rx.clone(),
                 );

@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use weglarka_model::app::InstanceName;
+use weglarka_model::config::wildcard_cert_stem;
 use weglarka_model::events::{Event, EventSink};
 use weglarka_model::podman::PodmanClient;
 
@@ -83,49 +84,34 @@ impl EventSink for EventCounters {
 
 impl EventCounters {
     fn families(&self) -> Vec<Family> {
-        let apps = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (mut deploys, mut rollbacks, mut health) = (Vec::new(), Vec::new(), Vec::new());
         // Only series that moved: an app that never failed has no `result="failed"` line.
-        let push = |into: &mut Vec<Sample>, app: &InstanceName, key, value, count: u64| {
+        let push = |into: &mut Vec<Sample>, app: &InstanceName, key, value: &str, count: u64| {
             if count > 0 {
                 into.push(Sample::new(
-                    vec![("app", app.to_string()), (key, value)],
+                    vec![("app", app.to_string()), (key, value.to_owned())],
                     count as f64,
                 ));
             }
         };
-        for (app, c) in &apps {
-            push(&mut deploys, app, "result", "ok".into(), c.deploy_ok);
-            push(
-                &mut deploys,
-                app,
-                "result",
-                "failed".into(),
-                c.deploy_failed,
-            );
-            push(&mut rollbacks, app, "result", "ok".into(), c.rollback_ok);
-            push(
-                &mut rollbacks,
-                app,
-                "result",
-                "failed".into(),
-                c.rollback_failed,
-            );
-            push(
-                &mut health,
-                app,
-                "to",
-                "crash_looping".into(),
-                c.crash_looping,
-            );
-            push(&mut health, app, "to", "unhealthy".into(), c.unhealthy);
-            push(&mut health, app, "to", "recovered".into(), c.recovered);
+        // Built under the lock: the map holds `Copy` counts, so no snapshot of it is needed.
+        let apps = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (app, c) in apps.iter() {
+            push(&mut deploys, app, "result", "ok", c.deploy_ok);
+            push(&mut deploys, app, "result", "failed", c.deploy_failed);
+            push(&mut rollbacks, app, "result", "ok", c.rollback_ok);
+            push(&mut rollbacks, app, "result", "failed", c.rollback_failed);
+            push(&mut health, app, "to", "crash_looping", c.crash_looping);
+            push(&mut health, app, "to", "unhealthy", c.unhealthy);
+            push(&mut health, app, "to", "recovered", c.recovered);
         }
+        drop(apps);
         vec![
             Family {
                 name: "weglarka_deploys_total",
-                help: "Deploys since the daemon started, by app and result (ok, failed). A deploy the \
-                       health gate rejected counts in weglarka_rollbacks_total instead.",
+                help: "Deploy attempts since the daemon started, by app and result (ok, failed); a \
+                       reconcile retry is another attempt. A deploy rolled back after a failed health \
+                       gate counts in weglarka_rollbacks_total instead.",
                 kind: Kind::Counter,
                 samples: deploys,
             },
@@ -209,9 +195,10 @@ fn certificate_family<P: PodmanClient + 'static>(
 /// it. Wildcard rows themselves are not domains the ingress routes and get no line of their own.
 fn certificate_samples(certs: &[certificates::Cert]) -> Vec<Sample> {
     let wildcard_expiry = |apex: &str| {
+        let stem = wildcard_cert_stem(apex);
         certs
             .iter()
-            .find(|c| c.wildcard && c.names.get(1).is_some_and(|name| name == apex))
+            .find(|c| c.wildcard && c.id == stem)
             .and_then(|c| c.not_after)
     };
     certs
@@ -265,7 +252,8 @@ fn self_update_families<P: PodmanClient + 'static>(d: &Daemon<P>) -> Vec<Family>
         ),
         gauge(
             "weglarka_self_update_last_error_timestamp_seconds",
-            "Unix time of the last failed or refused self-update attempt (kept until the next check).",
+            "Unix time of the last failed or refused self-update attempt (kept until a later attempt \
+             passes the signature check or an update is applied).",
             state.error.as_ref().map(|e| e.at),
         ),
     ]

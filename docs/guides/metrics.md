@@ -44,13 +44,13 @@ reset). A series appears once it has something to say: an app that never failed 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `weglarka_build_info` | gauge | `version` | Always 1; the running daemon version. |
-| `weglarka_deploys_total` | counter | `app`, `result` (`ok`, `failed`) | Deploys since the daemon started. A deploy the health gate rejected is counted in `weglarka_rollbacks_total`, not here. |
+| `weglarka_deploys_total` | counter | `app`, `result` (`ok`, `failed`) | Deploy attempts since the daemon started; a deploy the reconcile loop retries (a failing pull, for example) counts once per attempt. A deploy rolled back after a failed health gate is counted in `weglarka_rollbacks_total`, not here; a first deploy or a blue-green challenger that fails its gate has nothing to roll back to and counts as `failed`. |
 | `weglarka_rollbacks_total` | counter | `app`, `result` (`ok`, `failed`) | Rollbacks to the previous digest after a failed health gate. `failed` means the app needs intervention. |
 | `weglarka_app_health_transitions_total` | counter | `app`, `to` (`crash_looping`, `unhealthy`, `recovered`) | Transitions seen by the crash-loop and healthcheck monitor (`[monitor]`). |
 | `weglarka_certificate_not_after_seconds` | gauge | `domain` | Expiry of the certificate nginx serves for a routed domain (the webhook domain and every app domain), as a Unix timestamp; a domain served by an `[acme.dns]` wildcard reports the wildcard's expiry. Only with an enabled `[acme]`; a domain without a readable certificate has no line. Re-read at most every 5 minutes. |
 | `weglarka_self_update_pending` | gauge | — | 1 while a new daemon image is pinned but the daemon has not confirmed it runs it yet. Only with `[self_update]`. |
 | `weglarka_self_update_last_check_timestamp_seconds` | gauge | — | Unix time of the last completed self-update check. |
-| `weglarka_self_update_last_error_timestamp_seconds` | gauge | — | Unix time of the last failed or refused self-update attempt; absent when there is none. |
+| `weglarka_self_update_last_error_timestamp_seconds` | gauge | — | Unix time of the last failed or refused self-update attempt; it stays until a later attempt passes the signature check or an update is applied, and is absent when there is none. |
 
 Labels are only ever validated instance names (`app`), routed domains (`domain`) or the fixed values listed above. A
 failure reason, an error message, a digest or an image reference never becomes a label: read those with

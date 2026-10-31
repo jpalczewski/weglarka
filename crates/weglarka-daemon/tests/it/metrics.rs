@@ -379,30 +379,6 @@ async fn self_update_state_appears_only_with_the_section_and_an_unreadable_file_
     h.running.stop().await;
 }
 
-fn edge_settings(root: &std::path::Path, extra: &str) -> weglarka_daemon::Settings {
-    let host = weglarka_model::config::HostConfig::from_toml_str(&format!(
-        r#"
-[ingress]
-mode = "edge"
-bind = "127.0.0.1:18080"
-https_bind = "127.0.0.1:18443"
-
-[admin]
-socket = "{root}/run/admin.sock"
-
-[webhook]
-listen = "127.0.0.1:0"
-domain = "hooks.example.com"
-
-[state]
-dir = "{root}/state"
-{extra}"#,
-        root = root.display()
-    ))
-    .unwrap();
-    weglarka_daemon::Settings::from_host(host, root.join("weglarka.toml"))
-}
-
 #[tokio::test]
 async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
     // `openssl x509 -enddate` of the fixture: Oct  1 07:51:01 2126 GMT.
@@ -412,15 +388,15 @@ async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
 
     let (_dir, root) = tempdir("wg");
     let running = weglarka_daemon::start(
-        edge_settings(&root, &format!("{ON}{acme}")),
+        crate::daemon::edge_settings_with(&root, &format!("{ON}{acme}")),
         FakePodman::new(),
     )
     .await
     .unwrap();
     let tls = running.daemon.ingress.tls_dir();
     std::fs::create_dir_all(&tls).unwrap();
-    std::fs::write(tls.join("hooks.example.com.crt"), LEAF).unwrap();
-    std::fs::write(tls.join("hooks.example.com.key"), "key").unwrap();
+    std::fs::write(tls.join("hooks.example.eu.crt"), LEAF).unwrap();
+    std::fs::write(tls.join("hooks.example.eu.key"), "key").unwrap();
     // Not routed: a stray certificate gets no line.
     std::fs::write(tls.join("stray.example.org.crt"), LEAF).unwrap();
     std::fs::write(tls.join("stray.example.org.key"), "key").unwrap();
@@ -432,7 +408,7 @@ async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
     );
     assert!(
         body.contains(&format!(
-            "weglarka_certificate_not_after_seconds{{domain=\"hooks.example.com\"}} {NOT_AFTER}\n"
+            "weglarka_certificate_not_after_seconds{{domain=\"hooks.example.eu\"}} {NOT_AFTER}\n"
         )),
         "{body}"
     );
@@ -440,9 +416,12 @@ async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
     running.stop().await;
 
     // The same files without `[acme]`: no family.
-    let running = weglarka_daemon::start(edge_settings(&root, ON), FakePodman::new())
-        .await
-        .unwrap();
+    let running = weglarka_daemon::start(
+        crate::daemon::edge_settings_with(&root, ON),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
     let body = scrape(&running).await;
     assert!(!body.contains("weglarka_certificate_"), "{body}");
     running.stop().await;
