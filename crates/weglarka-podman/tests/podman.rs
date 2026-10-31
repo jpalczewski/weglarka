@@ -156,12 +156,18 @@ fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
     }
 }
 
+/// CI pins the stack (docs/decisions/0002-podman-in-ci.md) and sets `WEGLARKA_PODMAN_EXPECT_V6=1`, so a
+/// wrong version fails there. Against a dev or remote libpod the check is skipped with a message.
 #[tokio::test]
 async fn version_is_podman_6() {
     let Some(socket) = socket() else { return };
     let v = LibpodClient::new(socket).version().await.unwrap();
-    assert!(v.version.starts_with("6."), "{v:?}");
-    assert!(v.api_version.starts_with("6."), "{v:?}");
+    let is_6 = v.version.starts_with("6.") && v.api_version.starts_with("6.");
+    if std::env::var("WEGLARKA_PODMAN_EXPECT_V6").is_ok_and(|v| v == "1") {
+        assert!(is_6, "{v:?}");
+    } else if !is_6 {
+        eprintln!("server is not Podman 6 ({v:?}) — set WEGLARKA_PODMAN_EXPECT_V6=1 to enforce");
+    }
 }
 
 #[tokio::test]

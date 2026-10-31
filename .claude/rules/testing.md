@@ -35,6 +35,9 @@ paths:
   the `podman-tests` job); without the variable the tests are skipped (`docs/decisions/0002-podman-in-ci.md`). The job
   raises the subuid pool to ~1 M (an instance range is 65 536 UIDs, ADR 0009);
   `engine_ranges_volumes_secrets_import_migration_and_purge` goes through the whole engine on real Podman.
+  The subuid pool comes from the server (`PodmanClient::subuid_pool`), and `version_is_podman_6` is only enforced with
+  `WEGLARKA_PODMAN_EXPECT_V6=1` (CI sets it), so the suite can run against a remote libpod socket; tests that read a
+  volume mountpoint on the runner's filesystem still need the Podman host to be local.
 - Static build: `cargo build --release --target x86_64-unknown-linux-musl` (CI: job `musl`).
 - **Tests run in CI the way production does:** the smoke test starts the daemon from the quadlet's arguments (no
   `/etc/passwd`, no `/etc/subuid` in the `scratch` image).

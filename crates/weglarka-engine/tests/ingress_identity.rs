@@ -57,28 +57,6 @@ fn raw(socket: &str, method: &str, path: &str) -> Result<String, String> {
     }
 }
 
-/// Size of the current user's subuid pool from `/etc/subuid` (offsets of the explicit id map are
-/// relative to it, ADR 0009 finding 6).
-fn subuid_pool_size() -> u64 {
-    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
-        .unwrap()
-        .trim()
-        .to_owned();
-    fs::read_to_string("/etc/subuid")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split(':');
-            if parts.next()? != user {
-                return None;
-            }
-            parts.next()?.parse::<u64>().ok()?;
-            parts.next()?.parse::<u64>().ok()
-        })
-        .next()
-        .expect("the CI user has a /etc/subuid entry")
-}
-
 /// Removes the containers of the test, also on panic.
 struct Env {
     socket: String,
@@ -166,7 +144,8 @@ async fn ingress_id_map_keeps_the_master_on_the_host_user_and_the_worker_in_the_
     let key = dir.path().join("h.example.eu.key");
     fs::write(&key, "secret key material\n").unwrap();
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-    let range = allocate(&[], subuid_pool_size(), RANGE).expect("subuid pool");
+    let pool = env.client.subuid_pool().await.unwrap();
+    let range = allocate(&[], pool, RANGE).expect("subuid pool");
 
     // The nginx container (`ingress_id_mapping`): its master (container uid 0) is the host user, so
     // it reads the key; the worker's uid is in the ingress range.

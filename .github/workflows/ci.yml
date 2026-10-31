@@ -373,6 +373,9 @@ jobs:
       # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
       # so `--nocapture` shows that nothing was skipped.
       - run: cargo test -p weglarka-podman -- --nocapture
+        env:
+          # CI pins the stack: a server that is not Podman 6 fails `version_is_podman_6` here (skipped elsewhere).
+          WEGLARKA_PODMAN_EXPECT_V6: "1"
       # The engine tests that drive the engine against this Podman (they skip without WEGLARKA_PODMAN_SOCKET).
       - run: cargo test -p weglarka-engine --test volumes --test image_save --test ingress_identity -- --nocapture
       - name: Podman service log

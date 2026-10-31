@@ -83,7 +83,7 @@ fn raw(socket: &str, method: &str, path: &str, body: Option<&Value>) -> Result<S
 }
 
 /// The current user's first `/etc/subuid` entry — the rootless pool Podman maps subuid offsets
-/// onto (`host_id` 1 is `start`; ADR 0009, finding 6).
+/// onto (only for the test that also reads the volume mountpoint, so it needs the Podman host local anyway) (`host_id` 1 is `start`; ADR 0009, finding 6).
 fn subuid_pool() -> (u64, u64) {
     let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
         .unwrap()
@@ -103,11 +103,6 @@ fn subuid_pool() -> (u64, u64) {
         })
         .next()
         .expect("the CI user has a /etc/subuid entry")
-}
-
-/// Size of the current user's subuid pool from /etc/subuid.
-fn subuid_pool_size() -> u64 {
-    subuid_pool().1
 }
 
 /// Removes everything the test created, also on panic.
@@ -145,6 +140,11 @@ impl Drop for Env {
 impl Env {
     async fn new(socket: String) -> Self {
         let client = LibpodClient::new(&socket);
+        // Asked of the Podman host, not read from the runner's /etc/subuid, so a remote socket works.
+        let client_pool = client
+            .subuid_pool()
+            .await
+            .expect("podman reports a subuid pool");
         let events: Vec<_> = client.image_pull(ALPINE).collect().await;
         assert!(
             matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
@@ -156,7 +156,7 @@ impl Env {
             containers: vec![],
             volumes: vec![],
             used: vec![],
-            pool: subuid_pool_size(),
+            pool: client_pool,
         }
     }
 
