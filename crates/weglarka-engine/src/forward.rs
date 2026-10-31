@@ -22,7 +22,7 @@ use weglarka_model::app::{InstanceName, Security};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerSpec, ContainerState, PodmanClient, PodmanError, PodmanResultExt,
-    PortMapping, RestartPolicy,
+    PortMapping,
 };
 
 /// How many forwards may be alive at once, across all apps (separate from the run limit).
@@ -172,9 +172,6 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::ForwardNotRunning(instance.clone()))?;
         let name = labels::forward_container_name(instance, &forward_token());
         let container = ContainerSpec {
-            name: name.clone(),
-            image: options.image.clone(),
-            command: vec![],
             entrypoint: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
@@ -188,25 +185,16 @@ impl<P: PodmanClient> Reconciler<P> {
                 (labels::FORWARD.to_owned(), "true".to_owned()),
                 (labels::FORWARD_FOR.to_owned(), instance.to_string()),
             ]),
-            env: BTreeMap::new(),
             networks: vec![network],
-            network_aliases: BTreeMap::new(),
-            secrets: vec![],
             // Loopback only, random host port: read back from inspect once the container runs.
             publish: vec![PortMapping {
                 host_ip: Some("127.0.0.1".into()),
                 host_port: 0,
                 container_port: RELAY_PORT,
             }],
-            restart: RestartPolicy::No,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
             security: options.security.clone(),
+            ..ContainerSpec::new(name.clone(), options.image.clone())
         };
         self.podman.container_create(&container).await?;
         match self.relay_host_port(&name).await {

@@ -20,8 +20,8 @@ use weglarka_engine::volumes::id_mapping;
 use weglarka_model::app::SharedVolumeName;
 use weglarka_model::labels;
 use weglarka_model::podman::{
-    ContainerSpec, PodmanClient, PodmanError, PullEvent, RestartPolicy, TarStream,
-    VolumeAttachment, VolumeFilter, VolumeSpec,
+    ContainerSpec, PodmanClient, PodmanError, PullEvent, TarStream, VolumeAttachment, VolumeFilter,
+    VolumeSpec,
 };
 use weglarka_model::uid_range::{UidRange, allocate};
 use weglarka_podman::LibpodClient;
@@ -705,25 +705,11 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
     client.container_remove(&instance, true).await.unwrap();
     client
         .container_create(&ContainerSpec {
-            name: instance.clone(),
-            image: info.image.clone(),
-            command: vec![],
-            entrypoint: None,
             labels: legacy_labels,
-            env: BTreeMap::new(),
             networks: info.networks.clone(),
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new(instance.clone(), info.image.clone())
         })
         .await
         .unwrap();
@@ -780,29 +766,14 @@ fn host_uid(path: &str) -> u32 {
 /// image has to keep running by itself (nginx does) and commands run through `container_exec`.
 fn member_spec(name: &str, shared_volume: &str, range: UidRange) -> ContainerSpec {
     ContainerSpec {
-        name: name.to_owned(),
-        image: NGINX.to_owned(),
-        command: vec![],
-        entrypoint: None,
         labels: BTreeMap::from([(labels::UID_RANGE.to_owned(), labels::uid_range_label(range))]),
-        env: BTreeMap::new(),
-        networks: vec![],
-        network_aliases: Default::default(),
-        secrets: vec![],
-        publish: vec![],
-        restart: RestartPolicy::No,
-        userns_auto: false,
-        mounts: vec![],
         volumes: vec![VolumeAttachment {
             volume: shared_volume.to_owned(),
             target: "/data".to_owned(),
             read_only: false,
         }],
-        resources: Default::default(),
-        healthcheck: None,
-        keep_groups: false,
         id_mapping: Some(id_mapping(range)),
-        security: Default::default(),
+        ..ContainerSpec::new(name, NGINX)
     }
 }
 

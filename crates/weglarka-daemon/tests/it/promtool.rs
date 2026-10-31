@@ -20,9 +20,7 @@ use futures_util::StreamExt;
 use weglarka_daemon::metrics::targets::{CHECK_FILE, PrometheusTargets, TARGETS_FILE};
 use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::generated::{ConfigGenerator, RenderInput};
-use weglarka_model::podman::{
-    BindMount, ContainerSpec, LogOptions, PodmanClient, PullEvent, RestartPolicy,
-};
+use weglarka_model::podman::{BindMount, ContainerSpec, LogOptions, PodmanClient, PullEvent};
 use weglarka_podman::LibpodClient;
 
 /// The official image, pinned. `promtool` ships next to `prometheus` in `/bin`.
@@ -118,29 +116,15 @@ async fn promtool(
             .as_nanos()
     );
     let container = ContainerSpec {
-        name: name.clone(),
-        image: PROMETHEUS.into(),
         command: args.to_vec(),
         entrypoint: Some(vec![program.clone()]),
-        labels: BTreeMap::new(),
-        env: BTreeMap::new(),
-        networks: vec![],
-        network_aliases: BTreeMap::new(),
-        secrets: vec![],
-        publish: vec![],
-        restart: RestartPolicy::No,
         userns_auto: true,
         mounts: vec![BindMount {
             source: dir.path().to_string_lossy().into_owned(),
             target: MOUNT.into(),
             read_only: true,
         }],
-        volumes: vec![],
-        resources: Default::default(),
-        healthcheck: None,
-        id_mapping: None,
-        keep_groups: false,
-        security: Default::default(),
+        ..ContainerSpec::new(name.clone(), PROMETHEUS)
     };
     client.container_create(&container).await.unwrap();
     client.container_start(&name).await.unwrap();

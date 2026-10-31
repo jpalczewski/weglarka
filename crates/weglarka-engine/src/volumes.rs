@@ -36,7 +36,7 @@ use weglarka_model::app::{
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, PodmanResultExt,
-    RestartPolicy, Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
+    Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
 };
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, AppState, StateFile};
@@ -920,32 +920,17 @@ impl<P: PodmanClient> Reconciler<P> {
             .await
             .ignore_not_found()?;
         let helper = ContainerSpec {
-            name: name.clone(),
-            image,
-            command: vec![],
-            entrypoint: None,
             labels: BTreeMap::from([
                 (labels::IMPORT_FOR.to_owned(), instance.to_string()),
                 (labels::UID_RANGE.to_owned(), labels::uid_range_label(range)),
             ]),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
             volumes: vec![VolumeAttachment {
                 volume: target.podman_name.clone(),
                 target: target.path.clone(),
                 read_only: false, // the spec's read_only applies to the app, not to the import
             }],
-            resources: Default::default(),
-            healthcheck: None,
             id_mapping: Some(id_mapping(range)),
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new(name.clone(), image)
         };
         let result = async {
             self.podman.container_create(&helper).await?;

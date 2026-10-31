@@ -134,25 +134,10 @@ impl Drop for Cleanup {
 
 fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
     ContainerSpec {
-        name: name.into(),
-        image: IMAGE.into(),
-        command: vec![],
-        entrypoint: None,
         labels,
         env: BTreeMap::from([("WEGLARKA_IT".into(), "1".into())]),
-        networks: vec![],
-        network_aliases: Default::default(),
-        secrets: vec![],
-        publish: vec![],
-        restart: RestartPolicy::No,
         userns_auto: true,
-        mounts: vec![],
-        volumes: vec![],
-        resources: Default::default(),
-        healthcheck: None,
-        id_mapping: None,
-        keep_groups: false,
-        security: Default::default(),
+        ..ContainerSpec::new(name, IMAGE)
     }
 }
 
