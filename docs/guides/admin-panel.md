@@ -1,7 +1,7 @@
 # Admin panel
 
 The admin panel is a small web UI for looking at a Węglarka host: apps and their health, `doctor` results, volumes,
-sites, networks, notification state, certificates and recent events, and (for admins) live app logs. It is an ordinary
+sites, networks, notification state, certificates and recent events, and (for admins) live app logs and the live access log. It is an ordinary
 app that Węglarka runs for you, one container from the `ghcr.io/jpalczewski/weglarka-panel` image
 ([ADR 0057](../decisions/0057-admin-panel-architecture.md)).
 
@@ -131,7 +131,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 |---|---|
 | none | Signed in, but every page says "No access" and the session ends. |
 | `read` (viewers) | Dashboard, apps and app detail, `doctor`, volumes, networks, sites, notifications, certificates, recent events (with a live feed), and the allowlisted host config view. |
-| `admin` | Everything a viewer sees, plus live logs on each app page. |
+| `admin` | Everything a viewer sees, plus live logs and the live access log on each app page. |
 
 - App detail is the daemon's *redacted* view for viewers: environment **values are never shown, only the keys** (and not
   to admins either: the panel renders keys only), every element of the command is replaced by a placeholder (the page then shows `<redacted>` where it names the
@@ -139,6 +139,13 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 - Logs need `admin` because they can hold secrets and user data. The log view relays the daemon's stream, with control
   characters stripped and long lines cut. A viewer's request is answered `403` by the daemon; the page offers the log
   section only when the view is not redacted.
+- The access log (the requests that reached the app through its domains, [access log](access-log.md)) needs `admin` for
+  the same reason. The section has a filter (status class, method, path prefix, host) and a Start button. **Neither the
+  logs nor the access log open a stream when the page loads**: Start loads the stream element, so a few open tabs do not
+  use up the session's live-stream slots. The stream closes when you leave the page or start another one. The panel
+  parses the filter itself and forwards only what it parsed (a filter it does not accept is answered `400` without
+  repeating the input); every field of an entry (path, user agent and the rest come from clients) is cut, stripped of
+  control and direction-changing characters and escaped. The page keeps the newest 1000 rows.
 - Events are polled from the daemon every few seconds and pushed to the page as server-sent events; a reconnect resumes
   where it stopped. A session may hold at most four live streams.
 - The panel never decides access itself: a `403` from the daemon is the answer.

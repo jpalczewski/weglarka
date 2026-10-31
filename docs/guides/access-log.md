@@ -70,6 +70,15 @@ terminal control characters are replaced and a path can never start a line of it
   a window of days takes a while; a quiet app is not slower than a busy one). At most 1 MiB of entries is held in
   memory.
 
+## In the panel
+
+An administrator sees the same stream on the app page of the [admin panel](admin-panel.md) ("Access log"). The form
+offers a status class, a method, a path prefix and a host; the stream starts only when you press Start (100 entries
+of history, then new requests as they arrive). The filters are the ones above: a value the daemon would refuse is
+refused by the panel with `400` and is not repeated back. When the connection is renewed the panel asks for entries
+`since` the newest one it showed, so one request can appear twice, as with the CLI. A very busy app can produce
+entries faster than the page can show them: the panel drops the surplus and says how many it skipped.
+
 ## Reading `remote_addr`
 
 In the log, `remote_addr` `169.254.1.2` is **not a client**. It is the gateway address of rootless Podman

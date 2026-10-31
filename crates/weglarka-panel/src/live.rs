@@ -7,6 +7,12 @@
 //!   frame decoder. Log text is untrusted: lines are cut, stripped of control characters and
 //!   escaped by the template.
 //!
+//! - `GET /apps/{name}/access/stream`: the daemon's access-log stream (`admin` only), the same driver
+//!   over an `AccessFeed`. The browser's filter is parsed with `AccessQuery::parse` and only the
+//!   parsed value is forwarded; every entry field is untrusted and is cut, cleaned and escaped.
+//! - `GET /apps/{name}/logs` and `GET /apps/{name}/access`: the fragments the app page's "Start"
+//!   buttons load. They hold the `sse-connect`, so a page opens no stream until it is asked to.
+//!
 //! Every stream is a value owned by the response body: when the browser goes away hyper drops the
 //! body, which drops the upstream connection with it. A stream also ends when its session does.
 //! Stream activity does not count as session activity (only requests through `require_session`
@@ -23,16 +29,21 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::{self, Stream};
 use tokio::sync::watch;
-use weglarka_api::endpoints::{APPS_LOGS, EVENTS_RECENT};
+use weglarka_api::endpoints::{APPS_ACCESS, APPS_LOGS, APPS_SHOW, EVENTS_RECENT};
 use weglarka_api::{
-    Control, ControlFrame, EventsQuery, EventsResponse, FrameDecoder, FrameKind, LogFrame,
+    AccessEntry, AccessFrame, AccessQuery, Control, ControlFrame, EventsQuery, EventsResponse,
+    FrameDecoder, FrameKind, LogFrame, ShowAppResponse, parse_rfc3339,
 };
+use weglarka_model::admin_auth::Scope;
 use weglarka_unix_http::Bytes;
 
 use crate::app::AppState;
 use crate::auth::fresh_token;
 use crate::daemon::{Call, DaemonError, Stream as Upstream};
-use crate::pages::{ErrorPage, EventItem, LogLine, LogLines, fragment};
+use crate::pages::{
+    AccessLive, AccessRow, AccessRows, ErrorPage, EventItem, FilterError, LogLine, LogLines,
+    LogsLive, fragment, respond,
+};
 use crate::routes::Req;
 use crate::session::Session;
 use crate::views;
@@ -41,6 +52,18 @@ use crate::views;
 pub const MAX_STREAMS_PER_SESSION: usize = 4;
 /// Lines of history a log stream starts with.
 const LOG_TAIL: &str = "200";
+/// Entries of history an access-log stream starts with when the filter names no `tail`.
+const ACCESS_TAIL: u32 = 100;
+/// Longest filter query string accepted from the browser (bytes, before decoding).
+const MAX_FILTER_QUERY: usize = 1024;
+/// Rows waiting in one stream's queue; a faster daemon is counted, not stored.
+const MAX_QUEUED_ROWS: usize = 500;
+/// Characters of each access-log field shown (a longer one is cut).
+const MAX_TIME_CHARS: usize = 40;
+const MAX_METHOD_CHARS: usize = 16;
+const MAX_PATH_CHARS: usize = 300;
+const MAX_ADDR_CHARS: usize = 64;
+const MAX_AGENT_CHARS: usize = 200;
 /// A longer line is cut (characters).
 const MAX_LINE_CHARS: usize = 2_000;
 /// Lines kept from one chunk of daemon output; the rest are counted, not stored.
@@ -300,10 +323,19 @@ pub fn escape_html(text: &str) -> String {
 /// One line of untrusted log output made fit to show: control characters (escape sequences
 /// included) and bidirectional overrides are dropped, a tab becomes a space, and a long line is cut.
 pub fn sanitize_line(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
+    clean_text(
+        String::from_utf8_lossy(raw).trim_end_matches('\r'),
+        MAX_LINE_CHARS,
+    )
+}
+
+/// Untrusted text made fit to show: unsafe characters ([`weglarka_api::is_unsafe_char`]) are
+/// dropped, a tab becomes a space, and at most `max` characters of the input are looked at (the
+/// rest is replaced by `…`), so the work and the output are bounded whatever the input size.
+fn clean_text(text: &str, max: usize) -> String {
     let mut out = String::new();
-    for (count, c) in text.trim_end_matches('\r').chars().enumerate() {
-        if count >= MAX_LINE_CHARS {
+    for (count, c) in text.chars().enumerate() {
+        if count >= max {
             out.push('…');
             break;
         }
@@ -454,11 +486,16 @@ pub async fn logs_stream(req: Req, Path(name): Path<String>) -> Response {
         Ok(name) => name,
         Err(r) => return *r,
     };
+    serve(req, LogsFeed::new(name), APPS_LOGS.scope).await
+}
+
+/// Takes a stream slot, opens the feed's first request with the user's token and hands the
+/// connection to a [`Driver`]. A refusal from the daemon is the answer to the browser.
+async fn serve<F: UpstreamFeed>(req: Req, feed: F, scope: Option<Scope>) -> Response {
     let Some(slot) = req.state.streams.acquire(&req.session) else {
         return too_many();
     };
     let started = SystemTime::now();
-    let feed = LogsFeed::new(name);
     let upstream = match req
         .state
         .daemon
@@ -466,7 +503,7 @@ pub async fn logs_stream(req: Req, Path(name): Path<String>) -> Response {
         .await
     {
         Ok(upstream) => upstream,
-        Err(e) => return req.problem(&e, APPS_LOGS.scope),
+        Err(e) => return req.problem(&e, scope),
     };
     let link = PanelLink {
         app: req.state.clone(),
@@ -474,6 +511,35 @@ pub async fn logs_stream(req: Req, Path(name): Path<String>) -> Response {
     };
     let driver = Driver::new(feed, link, req.session.clone(), upstream, started, slot);
     sse(stream::unfold(driver, Driver::next))
+}
+
+/// The section fragments are for administrators like the streams they start: the daemon marks the
+/// app view `redacted` exactly for a token below `admin`. Nothing is opened here.
+async fn require_admin(req: &Req, name: &str, scope: Option<Scope>) -> Result<(), Box<Response>> {
+    let call = Call::new(&APPS_SHOW).param("name", name);
+    let app = req.get::<ShowAppResponse>(call).await?;
+    if app.redacted {
+        return Err(Box::new(req.problem(&DaemonError::Forbidden, scope)));
+    }
+    Ok(())
+}
+
+/// `GET /apps/{name}/logs`: the live log element the "Start" button loads (docs/decisions/0065,
+/// decision 7: a stream opens on demand, not on page load).
+pub async fn logs_section(req: Req, Path(name): Path<String>) -> Response {
+    let name = match req.app_name(&name) {
+        Ok(name) => name,
+        Err(r) => return *r,
+    };
+    if let Err(r) = require_admin(&req, &name, APPS_LOGS.scope).await {
+        return *r;
+    }
+    respond(
+        &LogsLive {
+            stream: format!("/apps/{name}/logs/stream"),
+        },
+        StatusCode::OK,
+    )
 }
 
 /// A status line for the log view. Terminal ones (`done`) are followed by a `done` event, which
@@ -484,6 +550,205 @@ fn status_event(text: &str) -> Event {
 
 fn done_event() -> Event {
     Event::default().event("done").data("")
+}
+
+// ---- access log -----------------------------------------------------------------------------
+
+/// The browser's filter was not acceptable. Carries no detail on purpose: nothing of the input is
+/// echoed back.
+#[derive(Debug)]
+struct InvalidFilter;
+
+fn invalid_filter() -> Response {
+    respond(&FilterError, StatusCode::BAD_REQUEST)
+}
+
+/// Turns the browser's query string into the query the panel is willing to forward.
+///
+/// The form sends an empty value for every filter left blank, which counts as "no filter". Values
+/// are percent-decoded first (a form encodes `/`), then checked by [`AccessQuery::parse`], which
+/// accepts only the shapes the daemon accepts. What is returned is that parsed value: the raw string
+/// never reaches the daemon. `follow` is always on and `since` is the panel's own (resume), so a
+/// browser-supplied one is dropped.
+fn access_filter(raw: Option<&str>) -> Result<AccessQuery, InvalidFilter> {
+    let raw = raw.unwrap_or_default();
+    if raw.len() > MAX_FILTER_QUERY {
+        return Err(InvalidFilter);
+    }
+    let mut pairs = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if value.is_empty() {
+            continue;
+        }
+        // A decoded `&` or `=` would turn into another parameter once the pairs are joined.
+        if key.contains(['&', '=']) || value.contains(['&', '=']) {
+            return Err(InvalidFilter);
+        }
+        pairs.push(format!("{key}={value}"));
+    }
+    let mut query = AccessQuery::parse(Some(&pairs.join("&"))).map_err(|_| InvalidFilter)?;
+    query.follow = true;
+    query.since = None;
+    Ok(query)
+}
+
+/// The request for an access stream: `follow=true` always; the first connection starts from the
+/// `tail` (default [`ACCESS_TAIL`]), a resume from `since`, then the filter.
+fn access_call(name: &str, filter: &AccessQuery, since: Option<Duration>) -> Call {
+    let mut call = Call::new(&APPS_ACCESS)
+        .param("name", name)
+        .query("follow", "true");
+    call = match since {
+        Some(d) => call.query("since", format!("{}.{:09}", d.as_secs(), d.subsec_nanos())),
+        None => call.query("tail", filter.tail.unwrap_or(ACCESS_TAIL).to_string()),
+    };
+    if let Some(status) = filter.status {
+        call = call.query("status", status.to_string());
+    }
+    if let Some(method) = &filter.method {
+        call = call.query("method", method.clone());
+    }
+    if let Some(path) = &filter.path {
+        call = call.query("path", path.clone());
+    }
+    if let Some(host) = &filter.host {
+        call = call.query("host", host.clone());
+    }
+    call
+}
+
+/// One access-log entry made fit to show. Every text field is untrusted (a client chooses the
+/// path and the user agent): cut, cleaned, and escaped later by the template.
+fn access_row(entry: &AccessEntry) -> AccessRow {
+    let request_time = if entry.request_time.is_finite() && entry.request_time >= 0.0 {
+        format!("{:.3} s", entry.request_time)
+    } else {
+        "-".to_owned()
+    };
+    AccessRow {
+        time: clean_text(&entry.time, MAX_TIME_CHARS),
+        method: clean_text(&entry.method, MAX_METHOD_CHARS),
+        path: clean_text(&entry.path, MAX_PATH_CHARS),
+        status: entry.status,
+        class: match entry.status / 100 {
+            2 => "ok",
+            3 => "info",
+            4 => "warn",
+            5 => "fail",
+            _ => "muted",
+        },
+        bytes: entry.bytes_sent,
+        request_time,
+        remote: clean_text(&entry.remote_addr, MAX_ADDR_CHARS),
+        user_agent: clean_text(&entry.user_agent, MAX_AGENT_CHARS),
+    }
+}
+
+/// The access log as a feed: one row per entry; remembers the time of the newest entry so that a
+/// reconnect asks for `since` it.
+struct AccessFeed {
+    name: String,
+    filter: AccessQuery,
+    /// The newest entry time seen (since the unix epoch); survives a reconnect.
+    last_entry: Option<Duration>,
+    /// Entries dropped because the queue was full, until the next row says so.
+    skipped: usize,
+}
+
+impl AccessFeed {
+    fn new(name: String, filter: AccessQuery) -> Self {
+        Self {
+            name,
+            filter,
+            last_entry: None,
+            skipped: 0,
+        }
+    }
+}
+
+impl UpstreamFeed for AccessFeed {
+    type Frame = AccessFrame;
+
+    const NOTICES: Notices = Notices {
+        ended: "The access log ended.",
+        corrupted: "The access-log stream from the daemon is corrupted.",
+        forbidden: "The access log is only available to administrators.",
+        not_found: "The application was not found.",
+    };
+
+    fn call(&self, resume_from: Option<SystemTime>) -> Call {
+        // A resume asks for entries since the newest one received (the daemon's `since` is
+        // inclusive, so that one may come twice); with none yet, since data last arrived.
+        let since = resume_from.map(|at| {
+            self.last_entry
+                .unwrap_or_else(|| at.duration_since(UNIX_EPOCH).unwrap_or_default())
+        });
+        access_call(&self.name, &self.filter, since)
+    }
+
+    fn on_data(&mut self, frame: AccessFrame, out: &mut VecDeque<Event>) -> bool {
+        let AccessFrame::Entry(entry) = frame else {
+            // Control frames are the driver's.
+            return false;
+        };
+        if let Some(at) = parse_rfc3339(entry.time.as_bytes()) {
+            self.last_entry = Some(self.last_entry.map_or(at, |old| old.max(at)));
+        }
+        if out.len() >= MAX_QUEUED_ROWS {
+            self.skipped += 1;
+            return true;
+        }
+        if self.skipped > 0 {
+            let text = format!("… {} entries skipped (too fast to show)", self.skipped);
+            out.push_back(status_event(&text));
+            self.skipped = 0;
+        }
+        if let Some(html) = fragment(&AccessRows {
+            rows: &[access_row(&entry)],
+        }) {
+            out.push_back(Event::default().event("rows").data(html));
+        }
+        true
+    }
+
+    fn reset(&mut self) {
+        // Nothing is half-assembled: an entry is a whole frame. `last_entry` must survive.
+    }
+}
+
+/// `GET /apps/{name}/access`: the live element the filter form's "Start" loads. The filter is
+/// validated here (400 without echoing it) and the stream URL it carries is the re-encoded parsed
+/// value.
+pub async fn access_section(req: Req, Path(name): Path<String>) -> Response {
+    let name = match req.app_name(&name) {
+        Ok(name) => name,
+        Err(r) => return *r,
+    };
+    if let Err(r) = require_admin(&req, &name, APPS_ACCESS.scope).await {
+        return *r;
+    }
+    let Ok(filter) = access_filter(req.uri.query()) else {
+        return invalid_filter();
+    };
+    respond(
+        &AccessLive {
+            stream: format!("/apps/{name}/access/stream?{}", filter.to_query_string()),
+        },
+        StatusCode::OK,
+    )
+}
+
+/// `GET /apps/{name}/access/stream`. Like the logs, the daemon's answer to the first request is
+/// the answer to the browser (403 for a user who is not an admin).
+pub async fn access_stream(req: Req, Path(name): Path<String>) -> Response {
+    let name = match req.app_name(&name) {
+        Ok(name) => name,
+        Err(r) => return *r,
+    };
+    let Ok(filter) = access_filter(req.uri.query()) else {
+        return invalid_filter();
+    };
+    serve(req, AccessFeed::new(name, filter), APPS_ACCESS.scope).await
 }
 
 // ---- the resumable stream driver ------------------------------------------------------------
@@ -755,6 +1020,65 @@ mod tests {
         let split = s.push(&b"x\n".repeat(MAX_LINES_PER_CHUNK + 25));
         assert_eq!(split.lines.len(), MAX_LINES_PER_CHUNK);
         assert_eq!(split.skipped, 25);
+    }
+
+    #[test]
+    fn clean_text_drops_unsafe_characters_and_cuts() {
+        assert_eq!(clean_text("a\tb\x1b[0m\u{202e}c\0", 40), "a b[0mc");
+        assert_eq!(clean_text("abcdef", 3), "abc…");
+        assert_eq!(clean_text("abc", 3), "abc");
+        let huge = "é".repeat(1_000_000);
+        assert_eq!(clean_text(&huge, 10).chars().count(), 11);
+    }
+
+    #[test]
+    fn the_access_filter_is_parsed_not_passed_on() {
+        let q = access_filter(Some("status=5xx&method=&path=%2Fapi&follow=false&since=3")).unwrap();
+        assert!(q.follow && q.since.is_none());
+        assert_eq!(q.to_query_string(), "follow=true&status=5xx&path=/api");
+        assert_eq!(
+            access_filter(None).unwrap().to_query_string(),
+            "follow=true"
+        );
+        for bad in [
+            "status=1",
+            "path=%2Fa%26host%3Dx",
+            "path=%2Fa%3Db",
+            "path=%2Fa%25",
+            "x=1",
+            "host=A",
+            "status=2xx&status=2xx",
+        ] {
+            assert!(access_filter(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(access_filter(Some(&"a=b&".repeat(400))).is_err());
+    }
+
+    #[test]
+    fn the_access_feed_counts_what_it_cannot_queue_and_remembers_the_newest_time() {
+        let mut feed = AccessFeed::new("web".into(), AccessQuery::default());
+        let entry = |time: &str| {
+            AccessFrame::Entry(AccessEntry {
+                time: time.into(),
+                ..AccessEntry::default()
+            })
+        };
+        let mut out = VecDeque::new();
+        assert!(feed.on_data(entry("2026-10-31T12:00:05Z"), &mut out));
+        assert!(feed.on_data(entry("2026-10-31T12:00:01Z"), &mut out));
+        assert!(feed.on_data(entry("not a time"), &mut out));
+        let newest = parse_rfc3339(b"2026-10-31T12:00:05Z");
+        assert_eq!(feed.last_entry, newest);
+        assert_eq!(out.len(), 3);
+        // A full queue drops the entry, and the next row that fits says how many.
+        let mut full: VecDeque<Event> = (0..MAX_QUEUED_ROWS).map(|_| Event::default()).collect();
+        assert!(feed.on_data(entry("x"), &mut full));
+        assert_eq!((full.len(), feed.skipped), (MAX_QUEUED_ROWS, 1));
+        full.clear();
+        assert!(feed.on_data(entry("x"), &mut full));
+        assert_eq!((full.len(), feed.skipped), (2, 0));
+        // Control frames are not data.
+        assert!(!feed.on_data(AccessFrame::End, &mut out));
     }
 
     #[test]

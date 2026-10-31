@@ -1,0 +1,15 @@
+---
+source: crates/weglarka-panel/tests/it/pages.rs
+expression: text
+---
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/&#60;script&#62;alert(1)&#60;/script&#62;</span> <span class="badge badge-ok">200</span> <span class="num">512 B</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">&#60;img src=x onerror=alert(1)&#62;</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/ansi[31mred[0m</span> <span class="badge badge-ok">200</span> <span class="num">512 B</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">bidi evilx</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/tab andnewlinenul</span> <span class="badge badge-ok">200</span> <span class="num">512 B</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU…</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">MMMMMMMMMMMMMMMM…</span> <span class="path">/last</span> <span class="badge badge-fail">503</span> <span class="num">512 B</span> <span class="num">65535.000 s</span> <span class="addr">&#34;&#62;&#60;b&#62;</span> <span class="agent">end-marker</span></div>
