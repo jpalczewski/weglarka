@@ -14,9 +14,9 @@ and in the [roadmap project](https://github.com/users/jpalczewski/projects/12) (
 
 ## Why
 
-- **Alpine-first.** The target host is a small Alpine VPS: static musl binaries, no dependency on systemd in the
-  design, tiny images. systemd (Ubuntu) is what the install guide covers today; OpenRC support is in progress
-  ([#46](https://github.com/jpalczewski/weglarka/issues/46)).
+- **Designed for Alpine.** The target host is a small Alpine VPS: static musl binaries, no dependency on systemd in
+  the design, tiny images. It does not run on Alpine yet: the install guide covers Ubuntu with systemd today, and
+  OpenRC support is in progress ([#46](https://github.com/jpalczewski/weglarka/issues/46)).
 - **Rootless.** Everything runs as an unprivileged user through the libpod API (v6) on a unix socket. Containers are
   hardened by default and the ingress container is always hardened.
 - **Declarative.** `apps.toml` is the desired state; a reconcile loop makes the host match it. State files are
