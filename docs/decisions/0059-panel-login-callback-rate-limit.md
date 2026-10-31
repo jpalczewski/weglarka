@@ -22,17 +22,18 @@ lockout that #292 removed.
 - **Client address:** the connection's peer, except when the peer is in `PANEL_TRUSTED_PROXIES` (comma-separated
   addresses or CIDR ranges, default empty). Then `X-Forwarded-For` is read from the right, skipping trusted hops; the
   first other entry is the client. The left-most entry is never used, because a client can write it. An unparsable
-  entry makes the panel fall back to the peer. With no trusted proxy configured (including `edge` mode, where nothing
-  sits in front of the panel) the header is ignored.
+  entry makes the panel fall back to the peer. With no trusted proxy configured the header is ignored. That includes
+  `edge` mode, where Węglarka's nginx does sit in front of the panel (and sets `X-Forwarded-For` from the real client
+  address) but the panel only sees nginx's address until nginx is listed in `PANEL_TRUSTED_PROXIES`.
 - The panel serves with `into_make_service_with_connect_info` to see the peer address.
 
 ## Consequences
 
 - The panel's configuration is env-only, so there is **no** `apps.toml`/`state.toml` field, no `SCHEMA_VERSION` bump and
   no `spec_hash` change. `PANEL_TRUSTED_PROXIES` is an ordinary entry in the panel app's `env`.
-- Operators running the panel behind Traefik (`behind` mode) should set `PANEL_TRUSTED_PROXIES` to the proxy's network;
-  otherwise every client shares the proxy's address and therefore one bucket (safe, but 20 sign-ins a minute for
-  everybody together). Documented in `docs/guides/admin-panel.md`.
+- Operators running the panel behind a proxy (Traefik in `behind` mode, Węglarka's nginx in `edge` mode) should set
+  `PANEL_TRUSTED_PROXIES` to the proxy's network; otherwise every client shares the proxy's address and therefore one
+  bucket (safe, but 20 sign-ins a minute for everybody together). Documented in `docs/guides/admin-panel.md`.
 - A user behind a shared address (NAT, office) shares the budget; a person needs one callback per sign-in.
 
 ## Rejected alternatives

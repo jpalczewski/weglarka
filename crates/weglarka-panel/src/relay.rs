@@ -139,6 +139,18 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
         );
     };
 
+    // Cheap refusal first, and before the rate limit is charged: the endpoints that need a token
+    // get one or nothing, and tokenless traffic must not eat the budget of authenticated calls
+    // from the same address.
+    // Cheap refusal before anything upstream: the endpoints that need a token get one or nothing.
+    if endpoint.scope.is_some() && !has_bearer(&request) {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            "a bearer token is required",
+        );
+    }
+
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -147,14 +159,6 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
     if !state.api_limit.admit(client) {
         tracing::warn!(%client, "too many API requests from one address");
         return slow_down();
-    }
-    // Cheap refusal before anything upstream: the endpoints that need a token get one or nothing.
-    if endpoint.scope.is_some() && !has_bearer(&request) {
-        return refuse(
-            StatusCode::UNAUTHORIZED,
-            ErrorCode::Unauthorized,
-            "a bearer token is required",
-        );
     }
     let Ok(permit) = state.api_slots.clone().try_acquire_owned() else {
         return slow_down();

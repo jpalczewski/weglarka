@@ -298,3 +298,34 @@ async fn one_address_is_limited_and_told_to_wait() {
     assert_eq!(statuses, [200, 200, 429]);
     assert_eq!(daemon.seen.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn tokenless_requests_do_not_spend_the_budget_of_authenticated_ones() {
+    let daemon = mock_seen(|_| Reply::new(200, "{}")).await;
+    let mut state = state_for(&daemon);
+    state.api_limit = Arc::new(AddressLimiter::with_limits(
+        Clock::default(),
+        2,
+        Duration::from_secs(60),
+    ));
+    let app = router(state);
+    let get = |bearer: bool| {
+        let mut builder = request(Method::GET, "/_weglarka/api/v1/apps");
+        if bearer {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    // Far more tokenless refusals than the budget of two...
+    for _ in 0..5 {
+        let (status, _, _) = send(&app, get(false)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // ...and the same address can still make its two authenticated calls.
+    for _ in 0..2 {
+        let (status, _, _) = send(&app, get(true)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _, _) = send(&app, get(true)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
