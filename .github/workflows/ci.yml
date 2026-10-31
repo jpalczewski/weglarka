@@ -321,14 +321,13 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # Separate key per profile: the two never share artifacts. Read-only: on main the `release` entry
-      # (`musl-release`) is written by the identical build in release.yml (job `binaries`), which has the
-      # same RUSTFLAGS, toolchain and lockfile, so one entry serves both workflows. PRs restore `musl-ci`,
+      # Separate key per profile: the two never share artifacts. Only main writes (`musl-release`, which a
+      # tag build in release.yml restores too: same RUSTFLAGS, toolchain and lockfile). PRs restore `musl-ci`,
       # which `seed-ci-cache` writes.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: musl-${{ env.PROFILE }}
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --profile "$PROFILE" --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli -p weglarka-panel
       - uses: actions/upload-artifact@v7
         with:
@@ -456,3 +455,20 @@ jobs:
           podman images
       - name: Panel image smoke test
         run: .github/scripts/smoke-panel.sh localhost/weglarka-panel:ci
+
+  # main only: publishes and signs the images from the binaries `musl` just built (the `release` profile on
+  # main), so nothing is compiled twice and the image does not wait for the tests below
+  # (docs/decisions/0062). Tag pushes run release.yml directly.
+  publish-image:
+    needs: musl
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # A called workflow cannot ask for more than its caller grants, even in a job that is skipped: `contents: write`
+    # is for the tag-only `release` job of release.yml, which never runs here.
+    permissions:
+      contents: write
+      packages: write
+      id-token: write # cosign keyless (GitHub OIDC)
+    uses: ./.github/workflows/release.yml
+    with:
+      artifact: musl-bin
+    secrets: inherit
