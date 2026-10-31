@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use crate::frame::{Control, ControlFrame, FrameDecoder, FrameError, FrameKind, encode_frame};
 use std::borrow::Cow;
 
 /// `Content-Type` of a run response stream.
@@ -100,6 +100,15 @@ impl FrameKind for RunFrame {
     }
 }
 
+impl ControlFrame for RunFrame {
+    fn control(&self) -> Option<Control> {
+        match self {
+            Self::Error(message) => Some(Control::Error(message.clone())),
+            Self::Stdout(_) | Self::Stderr(_) | Self::Exit(_) | Self::TimedOut => None,
+        }
+    }
+}
+
 /// Reassembles [`RunFrame`]s from a byte stream cut anywhere.
 pub type RunFrameDecoder = FrameDecoder<RunFrame>;
 
@@ -171,5 +180,18 @@ mod tests {
         let empty: RunRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, RunRequest::default());
         assert!(serde_json::from_str::<RunRequest>(r#"{"cmd":["x"]}"#).is_err());
+    }
+
+    #[test]
+    fn control_frames_map_and_data_frames_do_not() {
+        assert_eq!(
+            RunFrame::Error("x".into()).control(),
+            Some(Control::Error("x".into()))
+        );
+        assert_eq!(RunFrame::Stdout(b"x".to_vec()).control(), None);
+        assert_eq!(RunFrame::Stderr(Vec::new()).control(), None);
+        // The exit code and the timeout are results the client reports, not a bare end.
+        assert_eq!(RunFrame::Exit(0).control(), None);
+        assert_eq!(RunFrame::TimedOut.control(), None);
     }
 }

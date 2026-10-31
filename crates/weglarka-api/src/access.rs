@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use crate::frame::{Control, ControlFrame, FrameDecoder, FrameError, FrameKind, encode_frame};
 use std::borrow::Cow;
 
 /// `Content-Type` of an access response stream.
@@ -93,6 +93,17 @@ impl FrameKind for AccessFrame {
     }
 }
 
+impl ControlFrame for AccessFrame {
+    fn control(&self) -> Option<Control> {
+        match self {
+            Self::End => Some(Control::End),
+            Self::TokenExpired => Some(Control::TokenExpired),
+            Self::Error(message) => Some(Control::Error(message.clone())),
+            Self::Entry(_) => None,
+        }
+    }
+}
+
 /// Reassembles [`AccessFrame`]s from a byte stream cut anywhere.
 pub type AccessFrameDecoder = FrameDecoder<AccessFrame>;
 
@@ -160,5 +171,19 @@ mod tests {
             serde_json::from_str(r#"{"app":"web","status":200,"extra":1,"path":"/"}"#).unwrap();
         assert_eq!((got.status, got.path.as_str()), (200, "/"));
         assert!(!serde_json::to_string(&got).unwrap().contains("\"app\""));
+    }
+
+    #[test]
+    fn control_frames_map_and_data_frames_do_not() {
+        assert_eq!(AccessFrame::End.control(), Some(Control::End));
+        assert_eq!(
+            AccessFrame::TokenExpired.control(),
+            Some(Control::TokenExpired)
+        );
+        assert_eq!(
+            AccessFrame::Error("x".into()).control(),
+            Some(Control::Error("x".into()))
+        );
+        assert_eq!(AccessFrame::Entry(entry()).control(), None);
     }
 }

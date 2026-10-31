@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use crate::frame::{Control, ControlFrame, FrameDecoder, FrameError, FrameKind, encode_frame};
 use std::borrow::Cow;
 
 /// `Content-Type` of a forward response stream.
@@ -83,6 +83,16 @@ impl FrameKind for ForwardFrame {
     }
 }
 
+impl ControlFrame for ForwardFrame {
+    fn control(&self) -> Option<Control> {
+        match self {
+            Self::TokenExpired => Some(Control::TokenExpired),
+            Self::Error(message) => Some(Control::Error(message.clone())),
+            Self::Ready { .. } | Self::Keepalive | Self::TimedOut => None,
+        }
+    }
+}
+
 /// Reassembles [`ForwardFrame`]s from a byte stream cut anywhere.
 pub type ForwardFrameDecoder = FrameDecoder<ForwardFrame>;
 
@@ -136,5 +146,21 @@ mod tests {
         assert_eq!(ok.port, 5432);
         assert!(serde_json::from_str::<ForwardRequest>("{}").is_err());
         assert!(serde_json::from_str::<ForwardRequest>(r#"{"port":1,"x":1}"#).is_err());
+    }
+
+    #[test]
+    fn control_frames_map_and_data_frames_do_not() {
+        assert_eq!(
+            ForwardFrame::TokenExpired.control(),
+            Some(Control::TokenExpired)
+        );
+        assert_eq!(
+            ForwardFrame::Error("x".into()).control(),
+            Some(Control::Error("x".into()))
+        );
+        assert_eq!(ForwardFrame::Ready { host_port: 1 }.control(), None);
+        assert_eq!(ForwardFrame::Keepalive.control(), None);
+        // Its own final frame, not a plain end: the client says what timed out.
+        assert_eq!(ForwardFrame::TimedOut.control(), None);
     }
 }
