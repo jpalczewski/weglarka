@@ -77,7 +77,11 @@ rest of the lists, such as domains, paths, groups, scopes and tmpfs paths, is sh
 to name and path shapes, so keep credentials out of them anyway); and the engine's failure text in `state.failed.reason` is replaced
 by a fixed marker (the failed `digest` stays); `state.spec_hash` is omitted, because it is a hash of the spec including the blanked `env` values. The response then carries `"redacted": true`; an `admin` token and the unix
 socket get no such key. A redacted spec is a view, not the stored spec: do not send it back in `PUT /v1/apps/{name}`
-(a full replacement), and `weglarka apps update/start/stop` refuses to when it receives one. Put
+(a full replacement), and `weglarka apps update/start/stop` refuses to when it receives one. The refusal relies on the
+`redacted` marker, which an unredacted answer omits, so the CLI cannot tell a daemon that predates the marker from an
+`admin` answer: upgrade the CLI and the daemon together (`weglarka-api` is pinned to an exact version across
+`weglarka-cli` and `weglarka-daemon` for this reason), and note that a `read` token cannot write anyway, because
+`PUT /v1/apps/{name}` answers 403 without `admin`. Put
 connection strings and other credentials in secrets, not in `env` or command arguments. The same answer also reports the
 container's `restarts`, its raw `health` (`starting`, `healthy` or `unhealthy`) and `started_at` (RFC 3339). The unix socket
 and `admin` tokens see the real values. The notification status (`GET /v1/notifications`) is safe at `read`: its
