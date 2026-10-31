@@ -47,6 +47,9 @@ pub struct Daemon<P: PodmanClient> {
     pub(crate) webhook_addr: OnceLock<SocketAddr>,
     /// How the `[metrics]` listener is doing; empty without `[metrics]`.
     pub(crate) metrics: crate::metrics::StatusCell,
+    /// The one container resource snapshot, shared by metrics, the API and doctor; it exists whether or
+    /// not `[metrics]` is on.
+    pub resources: crate::resources::SnapshotCache,
     pub(crate) tasks: Mutex<JoinSet<()>>,
 }
 

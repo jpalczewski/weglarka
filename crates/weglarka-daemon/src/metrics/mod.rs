@@ -44,9 +44,8 @@ pub trait MetricsSource: Send + Sync + 'static {
 pub struct DaemonMetrics<P: PodmanClient + 'static, H: host::HostSource = host::ProcSource> {
     daemon: Arc<Daemon<P>>,
     daemon_source: daemon::DaemonSource,
-    resources: resources::Cache,
     host: H,
-    storage: resources::Cache,
+    storage: crate::resources::TtlCell<Vec<Family>>,
 }
 
 impl<P: PodmanClient + 'static, H: host::HostSource> DaemonMetrics<P, H> {
@@ -55,9 +54,8 @@ impl<P: PodmanClient + 'static, H: host::HostSource> DaemonMetrics<P, H> {
         Self {
             daemon,
             daemon_source: daemon::DaemonSource::new(counters),
-            resources: resources::Cache::default(),
             host,
-            storage: resources::Cache::default(),
+            storage: crate::resources::TtlCell::default(),
         }
     }
 }
@@ -65,9 +63,9 @@ impl<P: PodmanClient + 'static, H: host::HostSource> DaemonMetrics<P, H> {
 impl<P: PodmanClient + 'static, H: host::HostSource> MetricsSource for DaemonMetrics<P, H> {
     async fn collect(&self) -> Vec<Family> {
         let mut families = vec![build_info()];
-        families.extend(daemon::families(&self.daemon, &self.daemon_source));
+        families.extend(daemon::families(&self.daemon, &self.daemon_source).await);
         let (resources, host, storage) = tokio::join!(
-            resources::collect(&self.daemon, &self.resources),
+            resources::collect(&self.daemon),
             self.host.collect(),
             host::storage(self.daemon.engine.podman(), &self.storage),
         );

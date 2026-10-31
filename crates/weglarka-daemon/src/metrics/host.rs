@@ -19,7 +19,7 @@ use std::time::Duration;
 use weglarka_model::podman::{PodmanClient, StorageInfo};
 
 use super::encode::{Family, Kind, Sample};
-use super::resources::{Cache, REFRESH_TIMEOUT};
+use crate::resources::{REFRESH_TIMEOUT, TtlCell};
 
 /// Where host metrics come from. Called once per scrape.
 ///
@@ -469,7 +469,7 @@ pub const STORAGE_TTL: Duration = Duration::from_secs(60);
 
 /// The container storage families, from `cache` when it is fresh. A failed or slow `/info` drops
 /// only these families (the failure is cached too, so a broken libpod is not asked on every scrape).
-pub async fn storage<P: PodmanClient>(podman: &P, cache: &Cache) -> Vec<Family> {
+pub async fn storage<P: PodmanClient>(podman: &P, cache: &TtlCell<Vec<Family>>) -> Vec<Family> {
     cache
         .get_or_refresh(STORAGE_TTL, async {
             match tokio::time::timeout(REFRESH_TIMEOUT, podman.storage_info()).await {
