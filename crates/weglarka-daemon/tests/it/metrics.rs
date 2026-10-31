@@ -426,3 +426,334 @@ async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
     assert!(!body.contains("weglarka_certificate_"), "{body}");
     running.stop().await;
 }
+
+// ---- per-app resources (#351) ----
+
+mod resources {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use weglarka_daemon::ingress::NGINX_CONTAINER;
+    use weglarka_model::podman::{ContainerStats, NetworkIo};
+
+    /// A daemon with `[metrics]` on and the daemon's own container present.
+    async fn metrics_harness() -> Harness {
+        let h = Builder::new().sections(ON).build().await;
+        own_container(&h.fake).await;
+        h
+    }
+
+    async fn scrape(h: &Harness) -> String {
+        let addr = h.running.metrics_addr.expect("listening");
+        let (status, body) = get(addr, "GET", "/metrics").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// The value of the series `name{app="…",role="…"}`, if the page has it.
+    fn sample(body: &str, name: &str, app: &str, role: &str) -> Option<f64> {
+        let series = format!("{name}{{app=\"{app}\",role=\"{role}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&series))
+            .map(|v| v.parse().unwrap())
+    }
+
+    fn unlabelled(body: &str, name: &str) -> Option<f64> {
+        body.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .map(|v| v.parse().unwrap())
+    }
+
+    /// Every `app` label value on the page.
+    fn apps(body: &str) -> Vec<String> {
+        let mut apps: Vec<String> = body
+            .lines()
+            .filter_map(|line| line.split("app=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_owned)
+            .collect();
+        apps.sort();
+        apps.dedup();
+        apps
+    }
+
+    fn stat(name: &str, mib: u64) -> ContainerStats {
+        ContainerStats {
+            name: name.to_owned(),
+            memory_usage: mib << 20,
+            cpu_nanos: 1_000_000_000,
+            pids: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A running container with `labels`, as a deploy, `run`, `forward` or an import leaves it.
+    fn labelled(fake: &FakePodman, name: &str, labels: &[(&str, &str)]) {
+        fake.add_foreign_container(name, IMAGE);
+        fake.set_container_labels(
+            name,
+            labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+
+    async fn app(h: &Harness, name: &str, memory: Option<&str>) {
+        let mut spec = spec(&format!("{name}.example.com"));
+        if let Some(memory) = memory {
+            spec["resources"] = serde_json::json!({ "memory": memory });
+        }
+        add(h, name, spec).await;
+        deployed(h, name).await;
+    }
+
+    fn stats_calls(fake: &FakePodman) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ContainerStats))
+            .count()
+    }
+
+    const MEMORY: &str = "weglarka_container_memory_usage_bytes";
+
+    #[tokio::test]
+    async fn the_role_comes_from_the_blue_green_container_name() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        labelled(&h.fake, "alpha.next", &[("weglarka.instance", "alpha")]);
+        labelled(&h.fake, "alpha.prev", &[("weglarka.instance", "alpha")]);
+        h.fake.script_stats([
+            stat("alpha", 1),
+            stat("alpha.next", 2),
+            stat("alpha.prev", 3),
+        ]);
+
+        let body = scrape(&h).await;
+        assert_eq!(sample(&body, MEMORY, "alpha", "active"), Some(1048576.0));
+        assert_eq!(
+            sample(&body, MEMORY, "alpha", "challenger"),
+            Some(2097152.0)
+        );
+        assert_eq!(sample(&body, MEMORY, "alpha", "retiring"), Some(3145728.0));
+        assert_eq!(unlabelled(&body, "weglarka_resource_metrics_up"), Some(1.0));
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn one_off_containers_and_unlabelled_strangers_get_no_series() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        // Names of one-off containers carry tokens; they also carry the instance as `*-for`.
+        labelled(
+            &h.fake,
+            "wg-run.alpha.3f9a2c",
+            &[("weglarka.run", "true"), ("weglarka.run-for", "alpha")],
+        );
+        labelled(
+            &h.fake,
+            "wg-fwd.alpha.77ab01",
+            &[
+                ("weglarka.forward", "true"),
+                ("weglarka.forward-for", "alpha"),
+            ],
+        );
+        labelled(
+            &h.fake,
+            "wg-import.alpha",
+            &[("weglarka.import-for", "alpha")],
+        );
+        // Even with the instance label, a run marker wins.
+        labelled(
+            &h.fake,
+            "wg-run.alpha.b0b0",
+            &[("weglarka.run", "true"), ("weglarka.instance", "alpha")],
+        );
+        h.fake.add_foreign_container("hand-started", IMAGE);
+        h.fake.script_stats(
+            [
+                "alpha",
+                "wg-run.alpha.3f9a2c",
+                "wg-fwd.alpha.77ab01",
+                "wg-import.alpha",
+                "wg-run.alpha.b0b0",
+                "hand-started",
+            ]
+            .map(|n| stat(n, 1)),
+        );
+
+        let body = scrape(&h).await;
+        assert!(!body.contains("wg-run."), "{body}");
+        assert!(!body.contains("wg-fwd."), "{body}");
+        assert!(!body.contains("wg-import."), "{body}");
+        assert!(!body.contains("hand-started"), "{body}");
+        assert!(sample(&body, MEMORY, "alpha", "active").is_some(), "{body}");
+        assert!(
+            body.lines()
+                .filter(|l| l.starts_with(MEMORY))
+                .all(|l| !l.contains("role=\"challenger\"")),
+            "{body}"
+        );
+        h.running.stop().await;
+    }
+
+    /// The forwarder exists only in `edge` mode (the `behind` harness removes it on every ingress
+    /// pass); its naming is covered by the unit tests of `metrics::resources`.
+    #[tokio::test]
+    async fn the_ingress_and_the_daemon_are_reported_by_their_names() {
+        let h = metrics_harness().await;
+        if h.fake.container_inspect(NGINX_CONTAINER).await.is_err() {
+            h.fake.add_foreign_container(NGINX_CONTAINER, IMAGE);
+        }
+        h.fake
+            .script_stats([stat(NGINX_CONTAINER, 4), stat(SERVICE_NAME, 6)]);
+
+        let body = scrape(&h).await;
+        assert_eq!(
+            sample(&body, MEMORY, NGINX_CONTAINER, "active"),
+            Some(4.0 * 1048576.0)
+        );
+        assert_eq!(
+            sample(&body, MEMORY, SERVICE_NAME, "active"),
+            Some(6.0 * 1048576.0)
+        );
+        assert_eq!(
+            apps(&body),
+            vec![SERVICE_NAME.to_owned(), NGINX_CONTAINER.to_owned()]
+        );
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn every_field_libpod_supplies_becomes_a_sample() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        h.fake.set_restarts("alpha", 3);
+        h.fake.set_oom_killed("alpha", true);
+        h.fake.script_stats([ContainerStats {
+            name: "alpha".into(),
+            memory_usage: 4096,
+            cpu_nanos: 2_500_000_000,
+            pids: 7,
+            block_read_bytes: 8192,
+            block_write_bytes: 0,
+            network: Some(NetworkIo {
+                rx_bytes: 1024,
+                tx_bytes: 206,
+            }),
+        }]);
+
+        let body = scrape(&h).await;
+        let alpha = |name| sample(&body, name, "alpha", "active");
+        assert_eq!(alpha(MEMORY), Some(4096.0));
+        assert_eq!(alpha("weglarka_container_cpu_seconds_total"), Some(2.5));
+        assert_eq!(alpha("weglarka_container_pids"), Some(7.0));
+        assert_eq!(
+            alpha("weglarka_container_block_read_bytes_total"),
+            Some(8192.0)
+        );
+        assert_eq!(
+            alpha("weglarka_container_block_write_bytes_total"),
+            Some(0.0),
+            "a real zero next to a non-zero read is data"
+        );
+        assert_eq!(
+            alpha("weglarka_container_network_receive_bytes_total"),
+            Some(1024.0)
+        );
+        assert_eq!(
+            alpha("weglarka_container_network_transmit_bytes_total"),
+            Some(206.0)
+        );
+        assert_eq!(alpha("weglarka_container_restarts_total"), Some(3.0));
+        assert_eq!(alpha("weglarka_container_oom_killed"), Some(1.0));
+        assert!(
+            body.contains("# TYPE weglarka_container_cpu_seconds_total counter"),
+            "{body}"
+        );
+        assert!(
+            body.contains("# TYPE weglarka_container_memory_usage_bytes gauge"),
+            "{body}"
+        );
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_memory_limit_is_reported_only_when_one_is_set() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", Some("64m")).await;
+        app(&h, "beta", None).await;
+        h.fake.script_stats([stat("alpha", 1), stat("beta", 1)]);
+
+        let body = scrape(&h).await;
+        let limit = "weglarka_container_memory_limit_bytes";
+        assert_eq!(sample(&body, limit, "alpha", "active"), Some(67108864.0));
+        assert_eq!(sample(&body, limit, "beta", "active"), None, "{body}");
+        assert!(sample(&body, MEMORY, "beta", "active").is_some());
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn missing_data_is_no_sample_not_zero() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        app(&h, "beta", None).await;
+        // alpha: libpod answered with zeros (no controller delegation); beta: no stats entry at all.
+        h.fake.script_stats([ContainerStats {
+            name: "alpha".into(),
+            ..Default::default()
+        }]);
+
+        let body = scrape(&h).await;
+        for app in ["alpha", "beta"] {
+            for name in [
+                MEMORY,
+                "weglarka_container_cpu_seconds_total",
+                "weglarka_container_pids",
+                "weglarka_container_block_read_bytes_total",
+                "weglarka_container_block_write_bytes_total",
+                "weglarka_container_network_receive_bytes_total",
+                "weglarka_container_network_transmit_bytes_total",
+            ] {
+                assert_eq!(sample(&body, name, app, "active"), None, "{name} {app}");
+            }
+            // What inspect knows is still there.
+            assert_eq!(
+                sample(&body, "weglarka_container_restarts_total", app, "active"),
+                Some(0.0)
+            );
+        }
+        assert_eq!(unlabelled(&body, "weglarka_resource_metrics_up"), Some(1.0));
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_stats_call_drops_the_families_and_reports_down() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        h.fake.fail_stats(Some("cgroup stats unavailable"));
+
+        let body = scrape(&h).await;
+        assert_eq!(unlabelled(&body, "weglarka_resource_metrics_up"), Some(0.0));
+        assert!(!body.contains("weglarka_container_"), "{body}");
+        assert!(body.contains("weglarka_build_info"), "{body}");
+        assert!(!body.contains("cgroup stats unavailable"), "no free text");
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_repeated_scrapes_share_one_stats_call() {
+        let h = metrics_harness().await;
+        app(&h, "alpha", None).await;
+        h.fake.script_stats([stat("alpha", 1)]);
+        let before = stats_calls(&h.fake);
+
+        let bodies = futures_util::future::join_all((0..4).map(|_| scrape(&h))).await;
+        assert!(bodies.windows(2).all(|w| w[0] == w[1]));
+        // Inside the TTL, a later change is not seen and costs no call.
+        h.fake.script_stats([stat("alpha", 9)]);
+        assert_eq!(scrape(&h).await, bodies[0]);
+        assert_eq!(stats_calls(&h.fake) - before, 1);
+        h.running.stop().await;
+    }
+}

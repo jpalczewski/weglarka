@@ -11,6 +11,7 @@
 
 pub mod daemon;
 pub mod encode;
+pub mod resources;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -36,11 +37,12 @@ pub trait MetricsSource: Send + Sync + 'static {
     fn collect(&self) -> impl Future<Output = Vec<Family>> + Send;
 }
 
-/// The sources of this daemon: `weglarka_build_info` and the daemon counters (#352); #351 and #353
-/// add theirs here.
+/// The sources of this daemon: `weglarka_build_info`, the daemon counters (#352) and per-app
+/// resources (#351); #353 adds its own here.
 pub struct DaemonMetrics<P: PodmanClient + 'static> {
     daemon: Arc<Daemon<P>>,
     daemon_source: daemon::DaemonSource,
+    resources: resources::Cache,
 }
 
 impl<P: PodmanClient + 'static> DaemonMetrics<P> {
@@ -49,6 +51,7 @@ impl<P: PodmanClient + 'static> DaemonMetrics<P> {
         Self {
             daemon,
             daemon_source: daemon::DaemonSource::new(counters),
+            resources: resources::Cache::default(),
         }
     }
 }
@@ -57,6 +60,7 @@ impl<P: PodmanClient + 'static> MetricsSource for DaemonMetrics<P> {
     async fn collect(&self) -> Vec<Family> {
         let mut families = vec![build_info()];
         families.extend(daemon::families(&self.daemon, &self.daemon_source));
+        families.extend(resources::collect(&self.daemon, &self.resources).await);
         families
     }
 }

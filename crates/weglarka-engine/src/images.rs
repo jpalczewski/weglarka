@@ -332,6 +332,7 @@ mod tests {
             addresses: Vec::new(),
             published_ports: Vec::new(),
             memory_limit: None,
+            oom_killed: false,
         }
     }
 

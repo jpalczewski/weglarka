@@ -29,6 +29,7 @@ fn stat(name: &str, mib: u64) -> ContainerStats {
     ContainerStats {
         name: name.to_owned(),
         memory_usage: mib * MIB,
+        ..Default::default()
     }
 }
 

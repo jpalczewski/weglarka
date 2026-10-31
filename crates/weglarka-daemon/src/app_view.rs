@@ -825,6 +825,7 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             addresses: vec![],
             published_ports: vec![],
             memory_limit: None,
+            oom_killed: false,
         };
         let shown = show_response(Access::Full, name(), spec(), None, Some(&container));
         assert_eq!(shown.restarts, Some(2));
