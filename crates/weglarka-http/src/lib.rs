@@ -50,12 +50,15 @@ pub enum Purpose {
     /// A JSON API called with a bearer token (the DNS provider). The API root is fixed, so redirects
     /// are never followed and the token cannot be handed to another host.
     Api,
+    /// The ACME client talking to a certificate authority. JWS requests are bound to their URL, so a
+    /// redirect would only fail the exchange: none is followed.
+    Acme,
 }
 
 impl Purpose {
     fn connect_timeout(self) -> Duration {
         match self {
-            Self::Notify | Self::Registry | Self::Api => Duration::from_secs(10),
+            Self::Notify | Self::Registry | Self::Api | Self::Acme => Duration::from_secs(10),
         }
     }
 
@@ -63,13 +66,13 @@ impl Purpose {
     fn timeout(self) -> Duration {
         match self {
             Self::Notify => Duration::from_secs(10),
-            Self::Registry | Self::Api => Duration::from_secs(30),
+            Self::Registry | Self::Api | Self::Acme => Duration::from_secs(30),
         }
     }
 
     fn redirects(self) -> Policy {
         match self {
-            Self::Notify | Self::Api => Policy::none(),
+            Self::Notify | Self::Api | Self::Acme => Policy::none(),
             Self::Registry => Policy::custom(|attempt| {
                 let previous = attempt.previous();
                 if previous.len() > REGISTRY_MAX_REDIRECTS {
@@ -97,7 +100,7 @@ impl Purpose {
 
     fn pooled(self) -> bool {
         match self {
-            Self::Notify | Self::Registry | Self::Api => false,
+            Self::Notify | Self::Registry | Self::Api | Self::Acme => false,
         }
     }
 }

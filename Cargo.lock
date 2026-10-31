@@ -847,18 +847,14 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httpdate",
- "hyper",
  "hyper-rustls",
- "hyper-util",
  "rcgen",
  "ring",
- "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
- "x509-parser",
 ]
 
 [[package]]
@@ -2036,20 +2032,19 @@ name = "weglarka-acme"
 version = "0.0.4"
 dependencies = [
  "base64 0.22.1",
- "hyper-rustls",
- "hyper-util",
+ "bytes",
+ "http",
+ "http-body-util",
  "instant-acme",
- "rustls",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
- "webpki-roots",
  "weglarka-dns",
+ "weglarka-http",
  "weglarka-model",
- "x509-parser",
 ]
 
 [[package]]

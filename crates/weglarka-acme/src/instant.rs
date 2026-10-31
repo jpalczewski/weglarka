@@ -1,8 +1,7 @@
 //! The real [`AcmeClient`]: orders certificates from an ACME CA through `instant-acme`.
 //!
-//! TLS is `ring` with the bundled Mozilla roots (`webpki-roots`) because the daemon image is
-//! `scratch` and has no CA store (docs/decisions/0021); the crate's default platform verifier is
-//! deliberately not used. The account is created on first use and its credentials (which contain
+//! TLS is `ring` with the bundled Mozilla roots because the daemon image is `scratch` and has no CA
+//! store (docs/decisions/0021); the HTTP client is the shared one of `weglarka-http` (`crate::http`). The account is created on first use and its credentials (which contain
 //! the account private key) are kept in a `0600` file outside the webroot and `tls/`.
 
 use std::fmt::Write as _;
@@ -10,23 +9,20 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioExecutor;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, HttpClient, Identifier,
     NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
-use rustls::{ClientConfig, RootCertStore};
 use tokio::sync::OnceCell;
 use weglarka_model::fsutil::write_atomic;
 
 use crate::cert::{CertSpec, Issued, PrivateKeyPem};
 use crate::client::{AcmeClient, CertInspector};
 use crate::error::AcmeError;
+use crate::http::ReqwestClient;
+use crate::not_after::chain_not_after;
 use crate::solver::{Challenge, ChallengeKind, ChallengeSolver};
 
 const ACCOUNT_KEY_MODE: u32 = 0o600;
@@ -266,63 +262,17 @@ async fn challenge_failures(order: &mut instant_acme::Order, wanted: &ChallengeT
     out
 }
 
-/// `notAfter` of the first (leaf) certificate of a PEM chain.
-pub fn chain_not_after(chain_pem: &[u8]) -> Result<SystemTime, AcmeError> {
-    let expiry = |e: &dyn std::fmt::Display| AcmeError::Expiry(e.to_string());
-    let (_, pem) = x509_parser::pem::parse_x509_pem(chain_pem).map_err(|e| expiry(&e))?;
-    let cert = pem.parse_x509().map_err(|e| expiry(&e))?;
-    let secs = cert.validity().not_after.timestamp();
-    Ok(match u64::try_from(secs) {
-        Ok(secs) => UNIX_EPOCH + Duration::from_secs(secs),
-        Err(_) => UNIX_EPOCH,
-    })
-}
-
 fn order_err(e: instant_acme::Error) -> AcmeError {
     AcmeError::Order(e.to_string())
 }
 
-/// HTTPS client trusting the bundled roots over the `ring` provider (HTTP/1.1 only).
 fn http_client() -> Result<Box<dyn HttpClient>, AcmeError> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // Explicit provider: never touch the process-wide default (another component may install one).
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-        .map_err(|e| AcmeError::Order(format!("TLS setup: {e}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = HttpsConnectorBuilder::new()
-        .with_tls_config(config)
-        .https_only()
-        .enable_http1()
-        .build();
-    Ok(Box::new(
-        HyperClient::builder(TokioExecutor::new()).build(connector),
-    ))
+    Ok(Box::new(ReqwestClient::new()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LEAF: &[u8] = include_bytes!("../tests/fixtures/leaf.crt");
-
-    #[test]
-    fn reads_not_after_of_the_leaf() {
-        // `openssl x509 -enddate` of the fixture: Oct  1 07:51:01 2126 GMT.
-        let want = UNIX_EPOCH + Duration::from_secs(4_946_514_661);
-        assert_eq!(chain_not_after(LEAF).unwrap(), want);
-    }
-
-    #[test]
-    fn garbage_is_an_expiry_error() {
-        assert!(matches!(
-            chain_not_after(b"not a pem"),
-            Err(AcmeError::Expiry(_))
-        ));
-    }
 
     #[tokio::test]
     async fn account_creation_requires_accepted_terms_and_files_must_be_private() {

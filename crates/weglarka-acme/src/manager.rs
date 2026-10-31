@@ -88,10 +88,17 @@ where
     async fn one(&self, now: SystemTime, spec: &CertSpec) -> Result<Outcome, AcmeError> {
         let existing = match self.store.read_chain(spec.id())? {
             Some(chain) => {
-                let not_after = self.client.not_after(&chain)?;
-                match renewal::decide(now, not_after, self.renew_before) {
-                    Decision::Wait => return Ok(Outcome::Valid { not_after }),
-                    decision => Some(decision),
+                match self.client.not_after(&chain) {
+                    Ok(not_after) => match renewal::decide(now, not_after, self.renew_before) {
+                        Decision::Wait => return Ok(Outcome::Valid { not_after }),
+                        decision => Some(decision),
+                    },
+                    // Fail closed: a certificate whose expiry cannot be read is not known to be valid,
+                    // so it is replaced (and reported as expired) instead of being kept forever.
+                    Err(e) => {
+                        tracing::warn!(cert = %spec.id(), error = %e, "unreadable certificate, ordering a new one");
+                        Some(Decision::Expired)
+                    }
                 }
             }
             None => None,
