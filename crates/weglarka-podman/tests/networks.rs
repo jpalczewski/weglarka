@@ -203,3 +203,52 @@ async fn group_members_resolve_each_other_and_outsiders_cannot() {
     client.container_start(&peer).await.unwrap();
     wait_for_listener(&client, &peer, &srv).await;
 }
+
+/// The metrics network (ADR 0061) is `internal`, and the daemon joins it with a live `network_connect`
+/// while it already runs on another network: a scraper on the metrics network must still resolve the
+/// daemon's container by name and connect to it.
+#[tokio::test]
+async fn live_join_of_an_internal_network_resolves_by_container_name() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(&socket);
+    let id = run_id();
+    let metrics = format!("it-metrics-{id}");
+    let own = format!("net-it-daemon-{id}");
+    let (daemon, scraper) = (format!("it-daemon-{id}"), format!("it-scraper-{id}"));
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![daemon.clone(), scraper.clone()],
+        networks: vec![metrics.clone(), own.clone()],
+    };
+    let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
+    assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
+
+    client
+        .network_create(&network(&metrics, true))
+        .await
+        .unwrap();
+    // Idempotent, as the daemon calls it at every start.
+    client
+        .network_create(&network(&metrics, true))
+        .await
+        .unwrap();
+    client.network_create(&network(&own, false)).await.unwrap();
+
+    let server_cmd = ["sh", "-c", "while true; do echo hi | nc -l -p 8080; done"];
+    client
+        .container_create(&spec(&daemon, &[&own], &[], &server_cmd))
+        .await
+        .unwrap();
+    client
+        .container_create(&spec(&scraper, &[&metrics], &[], &["sleep", "300"]))
+        .await
+        .unwrap();
+    for c in [&daemon, &scraper] {
+        client.container_start(c).await.unwrap();
+    }
+
+    // Before the join the scraper cannot find the daemon; after it, it can.
+    assert_ne!(connect(&client, &scraper, &daemon).await, 0);
+    client.network_connect(&metrics, &daemon).await.unwrap();
+    wait_for_listener(&client, &scraper, &daemon).await;
+}

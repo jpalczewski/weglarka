@@ -32,9 +32,12 @@ Constraints, in order: security, then extensible code (traits, adapters), then R
    `GET /metrics`, and shares no code path with `admin::api_routes`, so it cannot serve an admin endpoint by mistake or
    by a later edit that adds one to the shared table. Every other path answers `404`, every other method `405`.
 5. **TCP on a dedicated Podman network.** Prometheus cannot scrape a unix socket. The daemon creates the network
-   (default name `metrics`) idempotently at start and joins its own container to it with `network_connect`, so enabling
-   metrics needs no `platform install` and no quadlet change. Prometheus (and later an app, #36) joins the same network.
-   Nothing is published on a host address.
+   (default name `metrics`) idempotently and joins its own container to it with `network_connect`, so enabling metrics
+   needs no `platform install` and no quadlet change. Prometheus (and later an app, #36) joins the same network.
+   Nothing is published on a host address. The network is **`internal`**, like the shared networks: nothing on it needs
+   a route out, and joining a second non-internal network would give the daemon another default route. Name resolution
+   still works on an internal network (`crates/weglarka-podman/tests/networks.rs`, which also covers a live
+   `network_connect` of a running container).
 6. **It listens on `0.0.0.0` inside the container, like the webhook listener.** The daemon is also on `net-weglarka`, so
    nginx could reach the port, but nginx never routes it (the generators emit only the webhook and app routes). Binding
    to the daemon's address on the `metrics` network alone would be tighter in theory, but that address is assigned by
@@ -43,7 +46,7 @@ Constraints, in order: security, then extensible code (traits, adapters), then R
    little gain.
 7. **No authentication in the first version.** Isolation is the network: only containers an operator put on it can
    connect. The text carries no secrets by the label contract below. An optional bearer can be added later without
-   changing the exposition contract (a scraper sends `Authorization` today only if configured).
+   changing the exposition contract.
 8. **Label contract for #351, #352, #353.**
    - Labels are `app` (a validated instance name) and `role` (`active`, `challenger`, `retiring`). One-off containers
      (`weglarka run`, forward relays) are skipped.
@@ -55,9 +58,13 @@ Constraints, in order: security, then extensible code (traits, adapters), then R
    nothing. The encoder takes `Family` values with a name, help, type and samples, sorts families and samples for stable
    output, writes `# HELP` and `# TYPE`, and is independent of where the values come from: a source returns families,
    so the later issues add sources without touching it.
-10. **A network failure never stops the daemon.** Creating or joining the network can fail (Podman down, a name that
-    clashes). The daemon logs it, does not bind, keeps every other listener running, and `doctor` reports a
-    `metrics.listener` check. Absent `[metrics]` adds no doctor line.
+10. **Startup never depends on the network.** The listener is bound synchronously at start (it needs no Podman) and
+    serves `/metrics` from then on. Creating the network and joining it runs in a background task that retries with a
+    backoff (5 s doubling to 60 s) until it works or the daemon stops, so a slow or briefly unavailable Podman delays
+    neither the daemon nor reconcile, and metrics become reachable without a restart. The first failure is a warning,
+    the retries are debug lines. A bind failure is permanent until restart and is logged. `doctor` shows
+    `metrics.listener`: `ok` once joined, `warn` with the last error while retrying, `fail` after a bind failure.
+    Absent `[metrics]` adds no doctor line.
 11. **The network name is validated** like the other network-name components (the instance alphabet), and may not start
     with `net-` or equal `net-weglarka`: those are per-app and ingress networks, which reconcile may prune. The metrics
     network carries `weglarka.managed=metrics` and is never an instance network.
@@ -69,9 +76,11 @@ Constraints, in order: security, then extensible code (traits, adapters), then R
 - **Rollback:** `weglarka.toml` has `deny_unknown_fields`, so an older daemon refuses a file with `[metrics]`. Remove the
   table before downgrading; the network and the membership disappear with the container, and `podman network rm` removes
   the empty network. Documented in `docs/guides/metrics.md`.
-- Tests: an encoder snapshot with label escaping, and daemon integration tests (off by default, on serves `/metrics`
-  only, a connect failure leaves the daemon running and doctor reports it).
+- Tests: an encoder snapshot with label escaping, daemon integration tests (off by default, on serves `/metrics`
+  only, a join that fails and then succeeds without a restart, a bind failure), and a real-Podman test of a live join of
+  an internal network.
 - A self-update recreates the container; the network join is repeated at every start, so it comes back.
+- Until the join succeeds the page is served but not reachable from the network; scrapers see a connection error.
 
 ## Rejected alternatives
 

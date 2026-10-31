@@ -147,8 +147,10 @@ pub struct Running<P: PodmanClient + 'static> {
     /// The token listener (`[admin.http]`); `None` without it.
     admin_token: Option<JoinHandle<()>>,
     webhook: JoinHandle<()>,
-    /// The metrics listener (`[metrics]`); `None` when absent or when it could not start.
+    /// The metrics listener (`[metrics]`); `None` when absent or when it could not bind.
     metrics: Option<JoinHandle<()>>,
+    /// Joins the metrics network in the background; ends when joined or on shutdown.
+    metrics_join: Option<JoinHandle<()>>,
     ingress: JoinHandle<()>,
     reconcile: JoinHandle<()>,
     /// Notification worker; `None` when notifications are not configured.
@@ -232,12 +234,10 @@ where
     })
 }
 
-/// Joins the metrics network, then binds. Nothing is bound when the network is not usable.
-async fn start_metrics<P: PodmanClient>(
-    podman: &P,
+/// Binds the metrics listener. It needs no Podman, so it is up before the network join finishes.
+async fn bind_metrics(
     config: &weglarka_model::config::MetricsConfig,
 ) -> Result<(TcpListener, SocketAddr), String> {
-    metrics::join_network(podman, config).await?;
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("bind {}: {e}", config.listen))?;
@@ -436,7 +436,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         started: std::time::Instant::now(),
         triggers: trigger_tx,
         webhook_addr: OnceLock::new(),
-        metrics: OnceLock::new(),
+        metrics: metrics::StatusCell::default(),
         tasks: Mutex::new(JoinSet::new()),
     });
 
@@ -492,31 +492,46 @@ pub async fn start_with<P: PodmanClient + 'static>(
         webhook::router(daemon.clone()),
         shutdown_rx.clone(),
     );
-    // Metrics (ADR 0061): opt-in, and a failure here is logged and reported by `doctor`, never fatal.
-    let (metrics, metrics_addr) = match &host.metrics {
-        Some(config) => match start_metrics(daemon.engine.podman(), config).await {
+    // Metrics (ADR 0061): opt-in. A bind failure is logged and shown by `doctor`; the network join runs
+    // in the background and never delays or stops the daemon.
+    let (metrics, metrics_join, metrics_addr) = match &host.metrics {
+        Some(config) => match bind_metrics(config).await {
             Ok((listener, addr)) => {
-                let _ = daemon.metrics.set(metrics::ListenerStatus::Listening {
+                daemon.metrics.set(metrics::ListenerStatus::Joining {
                     addr,
                     network: config.network.clone(),
+                    last_error: None,
                 });
-                (
-                    Some(spawn_server(
-                        "metrics",
-                        listener,
-                        metrics::router(Arc::new(metrics::DaemonMetrics)),
-                        shutdown_rx.clone(),
-                    )),
-                    Some(addr),
-                )
+                let server = spawn_server(
+                    "metrics",
+                    listener,
+                    metrics::router(Arc::new(metrics::DaemonMetrics)),
+                    shutdown_rx.clone(),
+                );
+                let join = tokio::spawn({
+                    let daemon = daemon.clone();
+                    let config = config.clone();
+                    let rx = shutdown_rx.clone();
+                    async move {
+                        metrics::keep_joined(
+                            daemon.engine.podman(),
+                            &config,
+                            addr,
+                            &daemon.metrics,
+                            rx,
+                        )
+                        .await;
+                    }
+                });
+                (Some(server), Some(join), Some(addr))
             }
             Err(error) => {
                 tracing::error!(%error, "metrics listener not started");
-                let _ = daemon.metrics.set(metrics::ListenerStatus::Failed(error));
-                (None, None)
+                daemon.metrics.set(metrics::ListenerStatus::Failed(error));
+                (None, None, None)
             }
         },
-        None => (None, None),
+        None => (None, None, None),
     };
 
     let period = Duration::from_secs(host.runtime.reconcile_interval_secs.max(1));
@@ -567,6 +582,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         admin_token,
         webhook,
         metrics,
+        metrics_join,
         ingress: ingress_task,
         reconcile,
         notify: notify_task,
@@ -587,6 +603,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             admin_token,
             webhook,
             metrics,
+            metrics_join,
             ingress,
             reconcile,
             notify,
@@ -619,6 +636,13 @@ impl<P: PodmanClient + 'static> Running<P> {
                 .is_err()
         {
             tracing::warn!("metrics listener did not stop in time");
+        }
+        if let Some(handle) = metrics_join
+            && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)
+                .await
+                .is_err()
+        {
+            tracing::warn!("metrics network join did not stop in time");
         }
         if let Some(handle) = notify
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)

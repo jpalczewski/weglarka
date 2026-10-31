@@ -13,8 +13,9 @@ listen = "0.0.0.0:9464"   # inside the Węglarka container; not published on the
 network = "metrics"       # optional; this is the default
 ```
 
-Restart the daemon. At start it creates the network (if missing) and connects its own container to it, so no
-`platform install` is needed. The network name uses lowercase letters, digits and `-`, and must not start with `net-`
+Restart the daemon. It binds the listener at once, then creates the network (if missing; it is `internal`, with no
+route out) and connects its own container to it in the background, retrying every few seconds up to a minute until
+Podman cooperates, so no `platform install` and no second restart is needed. The network name uses lowercase letters, digits and `-`, and must not start with `net-`
 (those names belong to app and ingress networks).
 
 The listener serves `GET /metrics` and nothing else: every other path is `404`, and it has no admin route. There is no
@@ -30,9 +31,9 @@ podman run --rm --network metrics docker.io/curlimages/curl:latest -s http://weg
 ```
 
 Expected: exposition text starting with `# HELP weglarka_build_info …` and a `weglarka_build_info{version="…"} 1` line.
-`weglarka doctor` shows a `metrics.listener` line when `[metrics]` is set; it is `fail` when the network could not be
-created or joined (the daemon and its other listeners keep running without `/metrics`), and absent when `[metrics]` is not
-set. `GET /v1/config` shows the section.
+`weglarka doctor` shows a `metrics.listener` line when `[metrics]` is set; it is `ok` once the network is joined, `warn`
+with the last error while the daemon is still retrying (the page is already served), `fail` when the address could not be
+bound (fix `listen` and restart), and absent when `[metrics]` is not set. `GET /v1/config` shows the section.
 
 ## What is there
 

@@ -93,11 +93,26 @@ fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             "metrics.listener",
             format!("serving /metrics on {addr}, reachable on network {network}"),
         ),
+        Some(ListenerStatus::Joining {
+            addr,
+            network,
+            last_error,
+        }) => check(
+            "metrics.listener",
+            CheckStatus::Warn,
+            match last_error {
+                Some(error) => format!(
+                    "serving /metrics on {addr}, but not on network {network} yet: {error}"
+                ),
+                None => format!("serving /metrics on {addr}, joining network {network}"),
+            },
+            Some("the daemon keeps retrying every few seconds; no restart is needed once Podman works"),
+        ),
         Some(ListenerStatus::Failed(error)) => check(
             "metrics.listener",
             CheckStatus::Fail,
             format!("not started: {error}"),
-            Some("the daemon keeps running without /metrics; fix the cause and restart the daemon"),
+            Some("fix [metrics] listen (the address must be free) and restart the daemon"),
         ),
         None => check("metrics.listener", CheckStatus::Warn, "starting", None),
     });

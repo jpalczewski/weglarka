@@ -90,16 +90,16 @@ async fn off_by_default_binds_nothing_and_touches_no_network() {
 async fn on_creates_and_joins_the_network_and_serves_only_metrics() {
     let (_dir, fake, running) = start_daemon(ON, true).await;
     let addr = running.metrics_addr.expect("listening");
+    joined(&running).await;
 
     assert!(fake.networks().contains(&"scrape".to_owned()));
     assert_eq!(
         fake.network_members("scrape"),
         vec![SERVICE_NAME.to_owned()]
     );
-    assert_eq!(
-        fake.network_spec("scrape").unwrap().labels["weglarka.managed"],
-        "metrics"
-    );
+    let spec = fake.network_spec("scrape").unwrap();
+    assert_eq!(spec.labels["weglarka.managed"], "metrics");
+    assert!(spec.internal, "nothing needs egress through this network");
 
     let (status, body) = get(addr, "GET", "/metrics").await;
     assert_eq!(status, StatusCode::OK);
@@ -148,28 +148,73 @@ async fn a_second_start_does_not_connect_again() {
             .await
             .unwrap();
         assert!(running.metrics_addr.is_some());
+        joined(&running).await;
         running.stop().await;
     }
     assert_eq!(connects(&fake), 1);
 }
 
-#[tokio::test]
-async fn a_network_failure_leaves_the_daemon_running_and_doctor_reports_it() {
-    // No container named like the service: joining the network is impossible.
-    let (_dir, _fake, running) = start_daemon(ON, false).await;
-    assert!(running.metrics_addr.is_none());
+/// Waits for the background join to finish.
+async fn joined(running: &Running<FakePodman>) {
+    eventually("the metrics network join", || async {
+        listener_check(running).await["status"] == "ok"
+    })
+    .await;
+}
 
-    let checks = doctor(&running).await;
-    let check = checks
-        .iter()
+async fn listener_check(running: &Running<FakePodman>) -> Value {
+    doctor(running)
+        .await
+        .into_iter()
         .find(|c| c["id"] == "metrics.listener")
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_network_failure_keeps_serving_retries_and_recovers_without_a_restart() {
+    // No container named like the service yet: joining the network is impossible.
+    let (_dir, fake, running) = start_daemon(ON, false).await;
+    // Bound and serving from the start; the daemon itself is up.
+    let addr = running.metrics_addr.expect("bound without the network");
+    let (status, _) = get(addr, "GET", "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = admin_running(&running, "GET", "/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let check = listener_check(&running).await;
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("not on network scrape yet")
+    );
+    assert_eq!(connects(&fake), 0);
+
+    // Podman recovers; the next retry joins without a restart.
+    own_container(&fake).await;
+    tokio::time::sleep(std::time::Duration::from_secs(70)).await;
+    let check = listener_check(&running).await;
+    assert_eq!(check["status"], "ok", "{check}");
+    assert_eq!(
+        fake.network_members("scrape"),
+        vec![SERVICE_NAME.to_owned()]
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_bind_failure_is_permanent_and_reported_without_stopping_the_daemon() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sections = format!(
+        "\n[metrics]\nlisten = \"{}\"\nnetwork = \"scrape\"\n",
+        taken.local_addr().unwrap()
+    );
+    let (_dir, _fake, running) = start_daemon(&sections, true).await;
+    assert!(running.metrics_addr.is_none());
+    let check = listener_check(&running).await;
     assert_eq!(check["status"], "fail", "{check}");
     assert!(check["message"].as_str().unwrap().contains("not started"));
-
-    // The other listeners are up.
-    let (status, _) = get(running.webhook_addr, "GET", "/nothing").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = admin_running(&running, "GET", "/v1/health", None).await;
     assert_eq!(status, StatusCode::OK);
     running.stop().await;
