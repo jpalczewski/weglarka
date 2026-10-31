@@ -4,6 +4,7 @@
 //! The daemon is generic over `PodmanClient` (the trait is not dyn-compatible), so tests
 //! run it on `FakePodman` and the binary on `LibpodClient`.
 
+pub mod access;
 pub mod acme;
 pub mod admin;
 pub mod admin_token;

@@ -660,6 +660,79 @@ mod tests {
     }
 
     #[test]
+    fn access_query_roundtrip_and_every_key() {
+        assert_eq!(AccessQuery::parse(None).unwrap(), AccessQuery::default());
+        assert_eq!(AccessQuery::default().to_query_string(), "");
+        let q = AccessQuery::parse(Some(
+            "follow=true&tail=1000&since=1700000000.5&status=5xx&method=GET&path=/api/v1.x_y-z&host=app.example.com",
+        ))
+        .unwrap();
+        assert!(q.follow && q.is_filtered());
+        assert_eq!(q.tail, Some(MAX_ACCESS_TAIL));
+        assert_eq!(q.status, Some(StatusFilter::Class(5)));
+        assert_eq!(q.method.as_deref(), Some("GET"));
+        assert_eq!(q.path.as_deref(), Some("/api/v1.x_y-z"));
+        assert_eq!(q.host.as_deref(), Some("app.example.com"));
+        assert_eq!(AccessQuery::parse(Some(&q.to_query_string())).unwrap(), q);
+        let exact = AccessQuery::parse(Some("status=404&tail=0")).unwrap();
+        assert_eq!(exact.status, Some(StatusFilter::Exact(404)));
+        assert!(exact.status.unwrap().matches(404) && !exact.status.unwrap().matches(500));
+        assert!(StatusFilter::Class(5).matches(503) && !StatusFilter::Class(5).matches(404));
+        assert!(
+            !AccessQuery::parse(Some("follow=false"))
+                .unwrap()
+                .is_filtered()
+        );
+    }
+
+    #[test]
+    fn access_query_refuses_anything_outside_its_shapes() {
+        for bad in [
+            "x=1",
+            "follow=1",
+            "follow=true&follow=false",
+            "tail=1001",
+            "tail=-1",
+            "tail=",
+            "tail=5&tail=6",
+            "since=-1",
+            "since=1&since=2",
+            "status=",
+            "status=40",
+            "status=4040",
+            "status=6xx",
+            "status=0xx",
+            "status=5XX",
+            "status=4xx&status=5xx",
+            "status=+40",
+            "status=404&x",
+            "method=get",
+            "method=GET%26x",
+            "method=GE T",
+            "method=ABCDEFGHIJKLMNOPQ",
+            "method=",
+            "path=api",
+            "path=/a%2fb",
+            "path=/a b",
+            "path=/a?b",
+            "path=/\u{e9}",
+            "path=",
+            "host=Example.com",
+            "host=a_b",
+            "host=a b",
+            "host=a%2e",
+            "host=",
+        ] {
+            assert!(AccessQuery::parse(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(AccessQuery::parse(Some(&format!("path=/{}", "a".repeat(128)))).is_err());
+        assert!(AccessQuery::parse(Some(&format!("path=/{}", "a".repeat(127)))).is_ok());
+        assert!(AccessQuery::parse(Some(&format!("host={}", "a".repeat(254)))).is_err());
+        let err = AccessQuery::parse(Some("bad\nkey=1")).unwrap_err();
+        assert!(!err.contains('\n'), "{err:?}");
+    }
+
+    #[test]
     fn endpoints_snapshot() {
         let list: Vec<String> = crate::ENDPOINTS
             .iter()
@@ -816,6 +889,185 @@ impl LogsQuery {
         }
         if self.timestamps {
             parts.push("timestamps=true".to_owned());
+        }
+        parts.join("&")
+    }
+
+    /// `since` as an instant; `None` when absent.
+    pub fn since_time(&self) -> Option<std::time::SystemTime> {
+        self.since
+            .and_then(|d| std::time::UNIX_EPOCH.checked_add(d))
+    }
+}
+
+/// Highest `tail` of [`AccessQuery`]: a ring of this many entries is kept in memory.
+pub const MAX_ACCESS_TAIL: u32 = 1000;
+
+/// The `status` filter of [`AccessQuery`]: one status (`404`) or a class (`5xx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFilter {
+    Exact(u16),
+    /// The hundreds digit, 1 to 5.
+    Class(u8),
+}
+
+impl StatusFilter {
+    pub fn matches(self, status: u16) -> bool {
+        match self {
+            Self::Exact(s) => s == status,
+            Self::Class(c) => status / 100 == u16::from(c),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        let bad =
+            || "`status` must be a three-digit status like `404` or a class like `5xx`".to_owned();
+        let b = value.as_bytes();
+        match b {
+            [c @ b'1'..=b'5', b'x', b'x'] => Ok(Self::Class(c - b'0')),
+            [a, b2, c] if [a, b2, c].iter().all(|d| d.is_ascii_digit()) => {
+                value.parse().map(Self::Exact).map_err(|_| bad())
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
+impl std::fmt::Display for StatusFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(s) => write!(f, "{s}"),
+            Self::Class(c) => write!(f, "{c}xx"),
+        }
+    }
+}
+
+/// Query of `GET /v1/apps/{name}/access`. Nothing in it reaches libpod (the daemon filters what it reads),
+/// but the values are echoed into filters and the audit shape, so [`AccessQuery::parse`] is as strict as
+/// [`LogsQuery::parse`]: known keys only, once each, values restricted to the shapes below.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessQuery {
+    /// Keep the stream open for new requests.
+    pub follow: bool,
+    /// Only the last this many matching entries, at most [`MAX_ACCESS_TAIL`] (default: all of the window).
+    pub tail: Option<u32>,
+    /// Only requests from this instant on, as a duration since the unix epoch (default: the last hour).
+    pub since: Option<std::time::Duration>,
+    pub status: Option<StatusFilter>,
+    /// Exact request method, upper case.
+    pub method: Option<String>,
+    /// A prefix of the request path (`$uri`, which is not percent-decoded).
+    pub path: Option<String>,
+    /// Exact host.
+    pub host: Option<String>,
+}
+
+impl AccessQuery {
+    /// Parses a raw query string (`follow=true&tail=100&status=5xx&path=/api`).
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let mut query = Self::default();
+        let mut seen = Vec::new();
+        for kv in raw
+            .unwrap_or_default()
+            .split('&')
+            .filter(|kv| !kv.is_empty())
+        {
+            let (key, value) = kv.split_once('=').unwrap_or((kv, ""));
+            if seen.contains(&key) {
+                return Err(format!("`{}` is given twice", printable(key)));
+            }
+            seen.push(key);
+            match key {
+                "follow" => query.follow = parse_bool("follow", value)?,
+                "tail" => {
+                    let ok = !value.is_empty()
+                        && value.len() <= 4
+                        && value.bytes().all(|b| b.is_ascii_digit());
+                    let tail = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|t| ok && *t <= MAX_ACCESS_TAIL);
+                    query.tail = Some(tail.ok_or_else(|| {
+                        format!("`tail` must be a number from 0 to {MAX_ACCESS_TAIL}")
+                    })?);
+                }
+                "since" => query.since = Some(parse_since(value)?),
+                "status" => query.status = Some(StatusFilter::parse(value)?),
+                "method" => {
+                    if value.is_empty()
+                        || value.len() > 16
+                        || !value.bytes().all(|b| b.is_ascii_uppercase())
+                    {
+                        return Err("`method` must be 1 to 16 upper-case letters".into());
+                    }
+                    query.method = Some(value.to_owned());
+                }
+                "path" => {
+                    if !value.starts_with('/')
+                        || value.len() > 128
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_.-/".contains(&b))
+                    {
+                        return Err(
+                            "`path` must start with `/` and hold only letters, digits and `_.-/` (at most 128 bytes)"
+                                .into(),
+                        );
+                    }
+                    query.path = Some(value.to_owned());
+                }
+                "host" => {
+                    if value.is_empty()
+                        || value.len() > 253
+                        || !value.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b"-.".contains(&b)
+                        })
+                    {
+                        return Err(
+                            "`host` must be lower-case letters, digits, `-` and `.` (at most 253 bytes)"
+                                .into(),
+                        );
+                    }
+                    query.host = Some(value.to_owned());
+                }
+                other => return Err(format!("unknown query parameter `{}`", printable(other))),
+            }
+        }
+        Ok(query)
+    }
+
+    /// Whether any of `status`, `method`, `path`, `host` is set.
+    pub fn is_filtered(&self) -> bool {
+        self.status.is_some() || self.method.is_some() || self.path.is_some() || self.host.is_some()
+    }
+
+    /// The query string a client sends for this query (parses back to `self`).
+    pub fn to_query_string(&self) -> String {
+        let mut parts = Vec::new();
+        if self.follow {
+            parts.push("follow=true".to_owned());
+        }
+        if let Some(tail) = self.tail {
+            parts.push(format!("tail={tail}"));
+        }
+        if let Some(since) = self.since {
+            parts.push(format!(
+                "since={}.{:09}",
+                since.as_secs(),
+                since.subsec_nanos()
+            ));
+        }
+        if let Some(status) = self.status {
+            parts.push(format!("status={status}"));
+        }
+        if let Some(method) = &self.method {
+            parts.push(format!("method={method}"));
+        }
+        if let Some(path) = &self.path {
+            parts.push(format!("path={path}"));
+        }
+        if let Some(host) = &self.host {
+            parts.push(format!("host={host}"));
         }
         parts.join("&")
     }
