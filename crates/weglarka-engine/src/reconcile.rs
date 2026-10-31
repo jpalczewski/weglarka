@@ -24,7 +24,7 @@ use weglarka_model::events::{Event, EventSink, TracingSink};
 use weglarka_model::hash::SpecHash;
 use weglarka_model::labels;
 use weglarka_model::podman::{
-    ContainerFilter, ContainerInfo, ContainerState, PodmanClient, PodmanError,
+    ContainerFilter, ContainerInfo, ContainerState, NetworkSummary, PodmanClient, PodmanError,
 };
 use weglarka_model::secret_store::{SecretError, SecretStore, scoped_name};
 use weglarka_model::state::{self, StateError, StatePaths};
@@ -1033,17 +1033,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 }
                 continue;
             }
-            if net.name == labels::INGRESS_NETWORK || !is_weglarka_network(&net.labels) {
-                continue;
-            }
-            let Some(instance) = net
-                .name
-                .strip_prefix("net-")
-                .and_then(|rest| InstanceName::new(rest).ok())
-            else {
-                continue;
-            };
-            if apps.apps.contains_key(&instance) {
+            if !is_orphaned_app_network(&net, apps) {
                 continue;
             }
             self.remove_network(&net.name, "network of a removed app")
@@ -1119,6 +1109,22 @@ impl<P: PodmanClient> Reconciler<P> {
             }
         }
     }
+}
+
+/// A per-app network (`net-<instance>`, created by Węglarka) whose instance is not in `apps`: what
+/// reconcile prunes and `doctor` warns about when pruning keeps failing. Shared networks and
+/// [`labels::INGRESS_NETWORK`] are never per-app networks.
+pub fn is_orphaned_app_network(net: &NetworkSummary, apps: &AppsFile) -> bool {
+    if net.name == labels::INGRESS_NETWORK
+        || net.labels.contains_key(labels::SHARED_NETWORK)
+        || !is_weglarka_network(&net.labels)
+    {
+        return false;
+    }
+    net.name
+        .strip_prefix("net-")
+        .and_then(|rest| InstanceName::new(rest).ok())
+        .is_some_and(|instance| !apps.apps.contains_key(&instance))
 }
 
 /// Whether a network was created by Węglarka (deploy labels it with the instance, ingress with

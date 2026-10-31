@@ -110,6 +110,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     sites(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     shared_network_state(d, &mut checks).await;
+    orphan_networks(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
@@ -1314,6 +1315,36 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
         status,
         message,
         hint.as_deref(),
+    ));
+}
+
+/// `state.orphan_networks` (issue #53): Węglarka-labelled `net-<instance>` networks without an app.
+/// Reconcile removes them best effort, so one that lingers means the cleanup keeps failing (a
+/// container is still attached) or it is a leftover from an older version. Silent when there are none.
+async fn orphan_networks<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // already reported as `state.apps_file`
+    };
+    // A listing failure is already reported by `state.shared_networks`.
+    let Ok(networks) = d.engine.podman().network_list().await else {
+        return;
+    };
+    let orphans: Vec<&str> = networks
+        .iter()
+        .filter(|n| weglarka_engine::reconcile::is_orphaned_app_network(n, &apps))
+        .map(|n| n.name.as_str())
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    out.push(check(
+        "state.orphan_networks",
+        CheckStatus::Warn,
+        format!(
+            "Podman networks of apps that no longer exist: {}",
+            orphans.join(", ")
+        ),
+        Some("detach what is still attached and remove them: `podman network rm <name>`"),
     ));
 }
 
