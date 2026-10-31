@@ -26,6 +26,23 @@ weglarka apps show ntfy                                         # the deploy sta
 `secrets set` only overwrites a value — a secret is removed with `secrets remove`, and an app's whole scope is
 cleaned up with `apps remove --purge-secrets` ([Secrets cleanup](secrets-cleanup.md)).
 
+## Many secrets at once: an env file
+
+An app that reads a dozen variables from a `.env` file does not need a dozen calls:
+
+```bash
+weglarka secrets set web --env-file - --except DEBUG --plain LOG_LEVEL < prod.env
+```
+
+Every `NAME=value` line (comments, blank lines, `export` and quotes as in dotenv; a quoted value ends on its own line) is
+stored as a secret and, unless the app already binds a secret of that name, bound as the environment variable `NAME`.
+`--only A,B` / `--except A,B` pick names from a mixed file, `--plain A,B` sets those as ordinary `env` of the app
+instead. A name that is already a plain `env` key cannot become a secret (and a bound variable cannot become plain):
+the command refuses and tells you which `apps update` flag resolves it. Pass the file by redirection and `-`, as above.
+Running it again is harmless (same values, same fingerprints, an unchanged spec is not sent). `--dry-run` lists
+names only; the output is names and fingerprints, never values. Copying bindings from another instance
+(`--from-app`) is not implemented: the API never returns secret values.
+
 ## Mounted secret: mode and owner (mode, uid, gid)
 
 `--secret-mount` mounts the file with the default mode `0444` (readable by everyone in the container) and the owner

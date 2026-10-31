@@ -14,6 +14,7 @@ mod output;
 mod preflight;
 mod push;
 mod run;
+mod secrets_env;
 mod settings;
 mod sites;
 mod spec_flags;
