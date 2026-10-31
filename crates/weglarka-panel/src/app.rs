@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(routes::dashboard))
         .route("/apps", get(routes::apps))
         .route("/apps/{name}", get(routes::app))
+        .route("/apps/{name}/stats", get(routes::app_stats))
         .route("/apps/{name}/logs", get(live::logs_section))
         .route("/apps/{name}/logs/stream", get(live::logs_stream))
         .route("/apps/{name}/access", get(live::access_section))

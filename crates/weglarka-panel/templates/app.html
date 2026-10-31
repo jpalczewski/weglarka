@@ -34,6 +34,12 @@
 {% for v in app.volumes %}        <li>{{ v }}</li>
 {% endfor %}      </ul>
 {% endif %}    </section>
+    <section aria-labelledby="h-stats">
+      <h2 id="h-stats">Resources</h2>
+      <div id="stats-live" hx-get="/apps/{{ app.name }}/stats" hx-trigger="load, every 10s" hx-swap="innerHTML" aria-live="off">
+        <p class="muted">Loading…</p>
+      </div>
+    </section>
 {% if !app.configs.is_empty() %}    <section aria-labelledby="h-cfg">
       <h2 id="h-cfg">Config mounts</h2>
       <ul class="plain">

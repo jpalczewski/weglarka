@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use crate::session::SessionView;
 use crate::views::{
     AppDetail, AppRow, Badge, CertRow, CheckGroup, ConfigSection, EventRow, Field, NotifyView,
-    SiteRow,
+    SiteRow, StatsView,
 };
 
 /// The navigation: key (for `aria-current`), path, label.
@@ -333,4 +333,11 @@ mod tests {
             }
         }
     }
+}
+
+/// The "Resources" section's body, polled by the app page (docs/decisions/0065, decision 5).
+#[derive(Template)]
+#[template(path = "stats.html")]
+pub struct StatsFragment {
+    pub stats: Option<StatsView>,
 }

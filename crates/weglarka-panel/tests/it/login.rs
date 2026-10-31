@@ -304,8 +304,8 @@ async fn the_full_login_flow() {
     let page = b.get("/apps").await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains("Alice Example"), "{}", page.body);
-    // The daemon was called with the user's own access token.
-    assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"]);
+    // The daemon was called with the user's own access token (the list and its usage columns).
+    assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"; 2]);
 
     // The callback is single use: replaying it fails and creates no second session.
     let mut other = Browser::new(&s.app);
@@ -738,7 +738,7 @@ async fn the_access_token_is_refreshed_once_and_the_daemon_sees_the_new_one() {
     assert_eq!(refreshes.len(), 1, "one refresh in flight at a time");
     assert!(refreshes[0].body.contains("refresh_token=refresh-token-1"));
     let seen = bearer_seen(&s.daemon);
-    assert_eq!(seen.len(), 5);
+    assert_eq!(seen.len(), 10, "the list and the usage columns, five times");
     assert!(
         seen.iter().all(|h| h == "Bearer access-token-2"),
         "{seen:?}"
@@ -781,7 +781,7 @@ async fn a_provider_outage_does_not_log_out_a_token_that_still_works() {
 
     // Valid for 30 s more: keep going on the current token, retry next time.
     assert_eq!(b.get("/apps").await.status, StatusCode::OK);
-    assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"]);
+    assert_eq!(bearer_seen(&s.daemon), vec!["Bearer access-token-1"; 2]);
 
     // Once it has expired and cannot be renewed, the session ends.
     s.clock.advance(Duration::from_secs(31));

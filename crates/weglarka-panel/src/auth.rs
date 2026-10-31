@@ -301,24 +301,69 @@ pub(crate) fn signed_out(request: &Request, clear: bool) -> Response {
     response
 }
 
+/// Status htmx treats as "success, stop polling" (it swaps the body, then cancels the poll).
+const HTMX_STOP_POLLING: u16 = 286;
+
+/// GET paths a page polls in the background. They need a valid session like any other route but
+/// are **passive**: they never reset the idle timer, otherwise a tab left open would keep a session
+/// alive for as long as the absolute lifetime (the same rule streams follow, see `live.rs`). This
+/// is an allowlist on the server's own routes; nothing a browser sends can opt a request in or out.
+pub(crate) fn is_passive(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        && path
+            .strip_prefix("/apps/")
+            .and_then(|rest| rest.strip_suffix("/stats"))
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+}
+
+/// The answer to a passive poll whose session is gone: a small fragment instead of a whole login
+/// page, with the status that makes htmx swap it once and stop polling.
+pub(crate) fn poll_ended(clear: bool) -> Response {
+    let mut response = (
+        StatusCode::from_u16(HTMX_STOP_POLLING).unwrap_or(StatusCode::UNAUTHORIZED),
+        axum::response::Html(
+            "<p class=\"muted\">Your session has ended. <a href=\"/auth/login\">Sign in</a> to see resource use again.</p>",
+        ),
+    )
+        .into_response();
+    if clear {
+        response
+            .headers_mut()
+            .append(SET_COOKIE, clear_cookie(SESSION_COOKIE));
+    }
+    response
+}
+
+/// [`signed_out`], or [`poll_ended`] for a passive poll.
+fn refuse(request: &Request, clear: bool) -> Response {
+    if is_passive(request.method(), request.uri().path()) {
+        poll_ended(clear)
+    } else {
+        signed_out(request, clear)
+    }
+}
+
 /// The session behind a [`SessionView`], for handlers that outlive one request (SSE streams).
 #[derive(Clone)]
 pub struct LiveSession(pub Arc<Session>);
 
 /// The single authentication point (default-deny): resolves the session cookie, enforces the idle
 /// and absolute lifetimes, checks CSRF on state-changing requests, refreshes the access token when
-/// it is about to expire, and hands handlers a [`SessionView`]. Unauthenticated callers cannot tell
+/// it is about to expire, and hands handlers a [`SessionView`]. A passive poll ([`is_passive`]) is
+/// authenticated the same way but does not reset the idle timer. Unauthenticated callers cannot tell
 /// a real route from a missing one.
 pub async fn require_session(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    let passive = is_passive(request.method(), request.uri().path());
     let Some(id) = cookie_value(request.headers(), SESSION_COOKIE) else {
-        return signed_out(&request, false);
+        return refuse(&request, false);
     };
+    // `peek` enforces the idle and absolute lifetimes without resetting the idle timer.
     let Some(session) = state.sessions.peek(&id) else {
-        return signed_out(&request, true);
+        return refuse(&request, true);
     };
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         request = match csrf::check(request, &session.csrf).await {
@@ -326,11 +371,13 @@ pub async fn require_session(
             Err(response) => return *response,
         };
     }
-    // Only a request that passed the CSRF check counts as activity.
-    state.sessions.touch(&session);
+    // Only a request that passed the CSRF check counts as activity, and a passive poll is none.
+    if !passive {
+        state.sessions.touch(&session);
+    }
     let Some(token) = fresh_token(&state, &session).await else {
         state.sessions.remove(&id);
-        return signed_out(&request, true);
+        return refuse(&request, true);
     };
     request.extensions_mut().insert(SessionView {
         token,

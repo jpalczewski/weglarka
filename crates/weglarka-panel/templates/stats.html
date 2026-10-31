@@ -1,0 +1,14 @@
+{% match stats %}{% when None %}<p class="muted">Resource data could not be loaded just now; it will be retried.</p>
+{% when Some with (s) %}{% if !s.available %}<p class="muted">Resource data unavailable.</p>
+{% else if s.rows.is_empty() %}<p>No running container.</p>
+{% else %}<div class="scroll">
+<table>
+  <caption class="sr">Resource use per container</caption>
+  <thead><tr><th scope="col">Role</th><th scope="col">Memory</th><th scope="col">CPU</th><th scope="col">PIDs</th><th scope="col">Net rx / tx</th><th scope="col">Block read / write</th><th scope="col">Restarts</th><th scope="col">OOM</th></tr></thead>
+  <tbody>
+{% for r in s.rows %}    <tr><th scope="row">{{ r.role }}</th><td>{{ r.memory }}{% if let Some((value, max)) = r.meter %} of {{ r.limit }} ({{ r.percent }}) <meter value="{{ value }}" min="0" max="{{ max }}">{{ r.percent }}</meter>{% else %} <span class="muted">(no limit)</span>{% endif %}</td><td>{{ r.cpu }}</td><td>{{ r.pids }}</td><td>{{ r.net_rx }} / {{ r.net_tx }}</td><td>{{ r.block_read }} / {{ r.block_write }}</td><td>{{ r.restarts }}</td><td>{% if r.oom_killed %}yes{% else %}no{% endif %}</td></tr>
+{% endfor %}  </tbody>
+</table>
+</div>
+{% if !s.sampled_at.is_empty() %}<p class="muted">Sampled {{ s.sampled_at }}. Updates every 10 seconds.</p>
+{% endif %}{% endif %}{% endmatch %}
