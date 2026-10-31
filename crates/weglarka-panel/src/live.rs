@@ -655,6 +655,7 @@ mod tests {
                     access: Arc::new(crate::config::Secret::new("t")),
                     refresh: None,
                     access_expires: std::time::Instant::now(),
+                    refresh_retry_at: None,
                 },
                 std::time::Instant::now(),
             ))

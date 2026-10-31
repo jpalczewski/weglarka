@@ -100,6 +100,10 @@ pub struct Tokens {
     pub access: Arc<Secret>,
     pub refresh: Option<Secret>,
     pub access_expires: Instant,
+    /// Set after a transient refresh failure: no further attempt before this time while the
+    /// access token still works, so an outage costs one provider call per interval, not one per
+    /// request.
+    pub refresh_retry_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for Tokens {
@@ -457,6 +461,7 @@ mod tests {
                 access: Arc::new(Secret::new("access-token-value")),
                 refresh: None,
                 access_expires: clock.now() + Duration::from_secs(300),
+                refresh_retry_at: None,
             },
             clock.now(),
         )
