@@ -1011,3 +1011,126 @@ mod scraper {
         h.running.stop().await;
     }
 }
+
+// ---- generated file_sd targets (#366) ----
+
+mod targets {
+    use super::*;
+    use serde_json::json;
+
+    const SCRAPER: &str =
+        "\n[metrics]\nlisten = \"127.0.0.1:0\"\nnetwork = \"scrape\"\nscraper = \"prom\"\n";
+
+    fn opted_in(domain: &str, path: Option<&str>) -> Value {
+        let mut spec = spec(domain);
+        spec["metrics_port"] = json!(9100);
+        if let Some(path) = path {
+            spec["metrics_path"] = json!(path);
+        }
+        spec
+    }
+
+    fn targets(h: &Harness) -> String {
+        read(&h.root.join("state/generated/prom/current/targets.yml"))
+    }
+
+    fn stops_of_prom(h: &Harness) -> usize {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(c, Call::ContainerStop(n) if n == "prom")
+                    || matches!(c, Call::ContainerKill { name, .. } if name == "prom")
+            })
+            .count()
+    }
+
+    async fn put(h: &Harness, name: &str, spec: Value) {
+        let (status, body) = admin(
+            h,
+            "PUT",
+            &format!("/v1/apps/{name}"),
+            Some(json!({ "spec": spec })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn targets_follow_apps_toml_and_the_scraper_is_never_restarted() {
+        let h = Builder::new().sections(SCRAPER).build().await;
+        add(&h, "prom", spec("prom.example.com")).await;
+        deployed(&h, "prom").await;
+        // The scraper mounts the generated directory read-only and has only the daemon as a target.
+        assert!(h.fake.created_specs().iter().any(|s| {
+            s.name == "prom"
+                && s.mounts
+                    .iter()
+                    .any(|m| m.target == "/weglarka/generated" && m.read_only)
+        }));
+        eventually("the daemon target", || async {
+            targets(&h).contains("\"weglarka:0\"")
+        })
+        .await;
+        assert!(!targets(&h).contains("app:"), "{}", targets(&h));
+        let stops = stops_of_prom(&h);
+
+        // Opt in.
+        add(&h, "forge", opted_in("forge.example.com", None)).await;
+        deployed(&h, "forge").await;
+        eventually("forge is a target", || async {
+            targets(&h).contains("- \"forge:9100\"\n  labels:\n    app: \"forge\"\n    __metrics_path__: \"/metrics\"\n")
+        })
+        .await;
+
+        // With #365 the same role puts the scraper on the app's network, so the target is reachable.
+        eventually("the scraper joins metrics-forge", || async {
+            h.fake
+                .network_members("metrics-forge")
+                .contains(&"prom".to_owned())
+        })
+        .await;
+
+        // A path-only change recreates nothing (`metrics_path` is outside `spec_hash`), yet the file
+        // follows it.
+        let created = h.fake.created_specs().len();
+        put(
+            &h,
+            "forge",
+            opted_in("forge.example.com", Some("/internal/metrics")),
+        )
+        .await;
+        eventually("the new path", || async {
+            targets(&h).contains("__metrics_path__: \"/internal/metrics\"")
+        })
+        .await;
+        assert!(
+            h.fake.created_specs()[created..]
+                .iter()
+                .all(|s| s.name != "forge"),
+            "a path-only change must not recreate the app"
+        );
+
+        // Removal drops the target.
+        let (status, _) = admin(&h, "DELETE", "/v1/apps/forge", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        eventually("forge is gone", || async {
+            let text = targets(&h);
+            !text.contains("forge") && text.contains("\"weglarka:0\"")
+        })
+        .await;
+
+        // Every render was validated with promtool in a one-off container of the scraper, and none
+        // of them stopped or signalled the running scraper.
+        let runs: Vec<_> = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .filter(|s| s.entrypoint.as_deref() == Some(&["promtool".to_owned()][..]))
+            .collect();
+        assert!(runs.len() >= 3, "{runs:?}");
+        assert!(runs.iter().all(|s| s.command[..2] == ["check", "config"]));
+        assert_eq!(stops_of_prom(&h), stops);
+        h.running.stop().await;
+    }
+}

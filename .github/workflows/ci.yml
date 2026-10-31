@@ -378,6 +378,8 @@ jobs:
           WEGLARKA_PODMAN_EXPECT_V6: "1"
       # The engine tests that drive the engine against this Podman (they skip without WEGLARKA_PODMAN_SOCKET).
       - run: cargo test -p weglarka-engine --test volumes --test image_save --test ingress_identity -- --nocapture
+      # The Prometheus targets generator against the real `promtool` of the official image (#366, ADR 0064).
+      - run: "cargo test -p weglarka-daemon --test it -- promtool:: --nocapture"
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true

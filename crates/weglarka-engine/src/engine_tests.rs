@@ -2617,6 +2617,86 @@ mod scraper {
             .collect()
     }
 
+    /// The `file_sd` targets consumer (#366): one file, re-read by the consumer itself.
+    struct Targets(InstanceName);
+
+    impl weglarka_model::generated::ConfigGenerator for Targets {
+        fn id(&self) -> &'static str {
+            "targets"
+        }
+
+        fn consumer(&self) -> &InstanceName {
+            &self.0
+        }
+
+        fn render(
+            &self,
+            _: &weglarka_model::generated::RenderInput<'_>,
+        ) -> Result<
+            Vec<weglarka_model::generated::GeneratedFile>,
+            weglarka_model::generated::RenderError,
+        > {
+            Ok(vec![weglarka_model::generated::GeneratedFile::new(
+                weglarka_model::generated::FileName::new("targets.yml").unwrap(),
+                b"[]\n".to_vec(),
+            )])
+        }
+
+        fn validate_argv(
+            &self,
+            _: &weglarka_model::app::AppSpec,
+            dir: &str,
+        ) -> Option<Vec<String>> {
+            Some(vec!["promtool".into(), format!("{dir}/check.yml")])
+        }
+
+        fn apply_mode(&self) -> weglarka_model::generated::ApplyMode {
+            weglarka_model::generated::ApplyMode::ConsumerWatches
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gaining_the_generated_mount_recreates_the_scraper_once_on_its_metrics_networks() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        let networks = h.fake.container_spec("prom").unwrap().networks;
+        assert_eq!(networks, vec!["net-prom", "metrics", "metrics-a"]);
+
+        // The daemon restarts with the targets generator registered for the scraper (#366).
+        let rec = Arc::new(restarted(&h, Some("prom")).with_generated(
+            crate::generated::GeneratedWiring {
+                generators: vec![Arc::new(Targets(name("prom")))],
+                digests: Arc::new(|_| BTreeMap::new()),
+            },
+        ));
+        let before = h.fake.calls().len();
+        rec.reconcile().await.unwrap();
+        let recreated = restarts(&h, before, "prom");
+        assert_eq!(
+            recreated
+                .iter()
+                .filter(|c| matches!(c, Call::ContainerCreate(_)))
+                .count(),
+            1,
+            "{recreated:?}"
+        );
+        let spec = h.fake.container_spec("prom").unwrap();
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| m.target == crate::generated::MOUNT_TARGET && m.read_only),
+            "{:?}",
+            spec.mounts
+        );
+        // `scraper_networks` still puts the recreated scraper on its metrics networks.
+        assert_eq!(spec.networks, networks);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+
+        // A second pass changes nothing.
+        let before = h.fake.calls().len();
+        rec.reconcile().await.unwrap();
+        assert!(restarts(&h, before, "prom").is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_scraper_joins_the_daemon_network_and_every_opted_in_app() {
         // `a` deploys before `prom` and `z` after it: one network exists at the scraper's creation,
@@ -4388,7 +4468,7 @@ mod generated {
     use std::sync::atomic::{AtomicBool, Ordering};
     use weglarka_model::app::{AppSpec, AppsFile};
     use weglarka_model::generated::{
-        ConfigGenerator, FileName, Fingerprint, GeneratedFile, RenderError, RenderInput,
+        ApplyMode, ConfigGenerator, FileName, Fingerprint, GeneratedFile, RenderError, RenderInput,
     };
     use weglarka_model::generated_state::{GeneratedState, LastResult};
     use weglarka_model::podman::{LogSource, PodmanClient};
@@ -4406,6 +4486,7 @@ health = { attempts = 2, window_secs = 2 }
         content: Mutex<String>,
         validator: bool,
         fail: AtomicBool,
+        watches: bool,
     }
 
     impl TestGen {
@@ -4415,6 +4496,18 @@ health = { attempts = 2, window_secs = 2 }
                 content: Mutex::new("v1".into()),
                 validator,
                 fail: AtomicBool::new(false),
+                watches: false,
+            })
+        }
+
+        /// A generator whose consumer re-reads its files by itself (ADR 0064).
+        fn watching() -> Arc<Self> {
+            Arc::new(Self {
+                consumer: name("idp"),
+                content: Mutex::new("v1".into()),
+                validator: true,
+                fail: AtomicBool::new(false),
+                watches: true,
             })
         }
 
@@ -4460,6 +4553,14 @@ health = { attempts = 2, window_secs = 2 }
                 argv.push(format!("--config={dir}"));
                 argv
             })
+        }
+
+        fn apply_mode(&self) -> ApplyMode {
+            if self.watches {
+                ApplyMode::ConsumerWatches
+            } else {
+                ApplyMode::Reload
+            }
         }
     }
 
@@ -4562,6 +4663,64 @@ health = { attempts = 2, window_secs = 2 }
                 format!("--config=/weglarka/generated/{}", fp.version_dir()),
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_that_watches_its_files_is_validated_but_never_signalled_or_restarted() {
+        let h = deployed().await;
+        let g = TestGen::watching();
+        let calls_before = h.fake.calls().len();
+        for content in ["v1", "v2", "v3"] {
+            g.set(content);
+            let fp = g.fingerprint();
+            assert_eq!(
+                apply(&h, &g, false).await,
+                GeneratedOutcome::Applied {
+                    fingerprint: fp.clone(),
+                    validated: true,
+                    reloaded: false
+                },
+                "{content}"
+            );
+            assert_eq!(live(&h), Some(fp.version_dir()));
+            let file = h
+                .rec
+                .generated_dir(&name("idp"))
+                .join("current")
+                .join("rules.yml");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), content);
+        }
+        // Three validator runs and nothing else touched the running consumer: no stop, no signal.
+        assert_eq!(run_specs(&h).len(), 3);
+        let touched: Vec<_> = h.fake.calls()[calls_before..]
+            .iter()
+            .filter(|c| {
+                matches!(c, Call::ContainerStop(n) if n == "idp")
+                    || matches!(c, Call::ContainerKill { name, .. } if name == "idp")
+            })
+            .cloned()
+            .collect();
+        assert!(touched.is_empty(), "{touched:?}");
+        assert_eq!(record(&h).last_result, LastResult::Applied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_that_watches_its_files_needs_a_validator() {
+        let h = deployed().await;
+        let g = Arc::new(TestGen {
+            consumer: name("idp"),
+            content: Mutex::new("v1".into()),
+            validator: false,
+            fail: AtomicBool::new(false),
+            watches: true,
+        });
+        let err = h
+            .rec
+            .apply_generated(&*g, &|_: &AppsFile| BTreeMap::new(), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("has no validator"), "{err}");
+        assert_eq!(live(&h), None, "an unchecked render never goes live");
     }
 
     #[tokio::test(start_paused = true)]

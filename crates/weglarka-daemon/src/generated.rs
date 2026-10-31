@@ -24,18 +24,24 @@ use weglarka_model::state;
 /// How long a change waits for more changes before the pipeline runs.
 pub const DEBOUNCE: Duration = Duration::from_secs(2);
 
-/// The generators this daemon runs: the identity provider's (#42) when `[identity]` is configured.
-/// With none registered no app has a generated config and the worker is not started.
+/// The generators this daemon runs: the identity provider's (#42) when `[identity]` is configured,
+/// and the scraper's `file_sd` targets (#366) when `[metrics] scraper` is set. With none registered
+/// no app has a generated config and the worker is not started.
 pub fn registered(host: &HostConfig) -> Vec<Arc<dyn ConfigGenerator>> {
-    host.identity
-        .iter()
-        .map(|identity| {
-            Arc::new(weglarka_identity::AutheliaGenerator::new(
-                identity.instance.clone(),
-                identity.issuer.clone(),
-            )) as Arc<dyn ConfigGenerator>
-        })
-        .collect()
+    let identity = host.identity.iter().map(|identity| {
+        Arc::new(weglarka_identity::AutheliaGenerator::new(
+            identity.instance.clone(),
+            identity.issuer.clone(),
+        )) as Arc<dyn ConfigGenerator>
+    });
+    let targets = host.metrics.iter().filter_map(|metrics| {
+        let scraper = metrics.scraper.clone()?;
+        Some(Arc::new(crate::metrics::targets::PrometheusTargets::new(
+            scraper,
+            metrics.listen.port(),
+        )) as Arc<dyn ConfigGenerator>)
+    });
+    identity.chain(targets).collect()
 }
 
 /// Credential digests for the apps that need one (#213): mints the OIDC client secret of every app
