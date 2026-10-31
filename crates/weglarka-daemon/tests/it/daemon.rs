@@ -644,7 +644,7 @@ fn edge_settings(root: &Path) -> Settings {
     edge_settings_with(root, "")
 }
 
-fn edge_settings_with(root: &Path, extra: &str) -> Settings {
+pub(crate) fn edge_settings_with(root: &Path, extra: &str) -> Settings {
     let host = HostConfig::from_toml_str(&format!(
         r#"
 [ingress]

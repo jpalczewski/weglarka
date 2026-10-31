@@ -1,0 +1,15 @@
+---
+source: crates/weglarka-daemon/src/metrics/daemon.rs
+expression: text
+---
+# HELP weglarka_app_health_transitions_total Health transitions seen by the crash-loop and healthcheck monitor since the daemon started, by app and new state (crash_looping, unhealthy, recovered).
+# TYPE weglarka_app_health_transitions_total counter
+weglarka_app_health_transitions_total{app="api",to="recovered"} 1
+weglarka_app_health_transitions_total{app="api",to="unhealthy"} 1
+# HELP weglarka_deploys_total Deploy attempts since the daemon started, by app and result (ok, failed); a reconcile retry is another attempt. A deploy rolled back after a failed health gate counts in weglarka_rollbacks_total instead.
+# TYPE weglarka_deploys_total counter
+weglarka_deploys_total{app="web",result="failed"} 1
+weglarka_deploys_total{app="web",result="ok"} 1
+# HELP weglarka_rollbacks_total Rollbacks to the previous digest since the daemon started, by app and result (ok, failed).
+# TYPE weglarka_rollbacks_total counter
+weglarka_rollbacks_total{app="api",result="ok"} 1

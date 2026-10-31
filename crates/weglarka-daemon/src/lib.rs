@@ -313,11 +313,19 @@ pub async fn start_with<P: PodmanClient + 'static>(
         Some(notifier) => notifier.sink(),
         None => Arc::new(weglarka_model::events::TracingSink),
     };
+    // `[metrics]` adds the counters behind `weglarka_deploys_total` and friends (#352); without it
+    // nothing is counted.
+    let counters = host
+        .metrics
+        .as_ref()
+        .map(|_| Arc::new(metrics::daemon::EventCounters::default()));
+    let mut sinks: Vec<Arc<dyn weglarka_model::events::EventSink>> =
+        vec![delivery, history.clone()];
+    if let Some(counters) = &counters {
+        sinks.push(counters.clone());
+    }
     let events: Arc<dyn weglarka_model::events::EventSink> =
-        Arc::new(weglarka_model::history::FanOut::new(vec![
-            delivery,
-            history.clone(),
-        ]));
+        Arc::new(weglarka_model::history::FanOut::new(sinks));
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
@@ -495,8 +503,10 @@ pub async fn start_with<P: PodmanClient + 'static>(
     );
     // Metrics (ADR 0061): opt-in. A bind failure is logged and shown by `doctor`; the network join runs
     // in the background and never delays or stops the daemon.
-    let (metrics, metrics_join, metrics_addr) = match &host.metrics {
-        Some(config) => match bind_metrics(config).await {
+    // `counters` exists exactly when `[metrics]` does; pairing them keeps the listener from ever
+    // serving a set the event fan-out does not feed.
+    let (metrics, metrics_join, metrics_addr) = match host.metrics.as_ref().zip(counters) {
+        Some((config, counters)) => match bind_metrics(config).await {
             Ok((listener, addr)) => {
                 daemon.metrics.set(metrics::ListenerStatus::Joining {
                     addr,
@@ -506,7 +516,10 @@ pub async fn start_with<P: PodmanClient + 'static>(
                 let server = spawn_server(
                     "metrics",
                     listener,
-                    metrics::router(Arc::new(metrics::DaemonMetrics)),
+                    metrics::router(Arc::new(metrics::DaemonMetrics::new(
+                        daemon.clone(),
+                        counters,
+                    ))),
                     shutdown_rx.clone(),
                 );
                 let join = tokio::spawn({
