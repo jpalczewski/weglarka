@@ -35,8 +35,8 @@ use weglarka_model::app::{
 };
 use weglarka_model::labels;
 use weglarka_model::podman::{
-    ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, RestartPolicy,
-    Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
+    ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, PodmanResultExt,
+    RestartPolicy, Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
 };
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, AppState, StateFile};
@@ -534,30 +534,26 @@ impl<P: PodmanClient> Reconciler<P> {
             return Ok(());
         }
         // A volume in use cannot be removed: the container goes first (desired state no longer lists it).
-        match self
-            .podman
+        self.podman
             .container_remove(&labels::container_name(name), true)
             .await
-        {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
+            .ignore_not_found()?;
         let filter = VolumeFilter {
             labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
         };
         for v in self.podman.volume_list(&filter).await? {
-            match self.podman.volume_remove(&v.name, true).await {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.podman
+                .volume_remove(&v.name, true)
+                .await
+                .ignore_not_found()?;
         }
         // The last member's purge deletes the shared volume too (the declaration stays).
         for mount in &spec.shared_volumes {
             let podman_name = labels::shared_volume_name(&mount.name);
-            match self.podman.volume_remove(&podman_name, true).await {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.podman
+                .volume_remove(&podman_name, true)
+                .await
+                .ignore_not_found()?;
         }
         let mut st = state::load_state(&self.paths.state)?;
         let mut changed = st.apps.remove(name).is_some();
@@ -623,11 +619,7 @@ impl<P: PodmanClient> Reconciler<P> {
             });
         }
         let podman_name = labels::shared_volume_name(name);
-        let exists = match self.podman.volume_inspect(&podman_name).await {
-            Ok(_) => true,
-            Err(PodmanError::NotFound(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
+        let exists = self.podman.volume_inspect(&podman_name).await.exists()?;
         if exists && !purge {
             return Err(EngineError::SharedVolumeHasData {
                 volume: name.clone(),
@@ -637,10 +629,10 @@ impl<P: PodmanClient> Reconciler<P> {
         apps.shared_volumes.remove(name);
         state::save_apps(&self.paths.apps, &apps)?;
         if exists {
-            match self.podman.volume_remove(&podman_name, true).await {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.podman
+                .volume_remove(&podman_name, true)
+                .await
+                .ignore_not_found()?;
         }
         // The range goes with the group's last volume: siblings may still hold data in it.
         if shared_volumes::group_members(&apps, &group).is_empty()
@@ -832,14 +824,14 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await?;
         }
         if replace {
-            match self.podman.container_remove(&app_container, true).await {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-            match self.podman.volume_remove(&podman_name, false).await {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.podman
+                .container_remove(&app_container, true)
+                .await
+                .ignore_not_found()?;
+            self.podman
+                .volume_remove(&podman_name, false)
+                .await
+                .ignore_not_found()?;
             self.ensure_import_target(instance, &apps, &spec, shared.as_ref())
                 .await?;
         }
@@ -923,10 +915,10 @@ impl<P: PodmanClient> Reconciler<P> {
         };
 
         let name = labels::import_container_name(instance);
-        match self.podman.container_remove(&name, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
+        self.podman
+            .container_remove(&name, true)
+            .await
+            .ignore_not_found()?;
         let helper = ContainerSpec {
             name: name.clone(),
             image,

@@ -21,8 +21,8 @@ use crate::reconcile::{EngineError, Reconciler};
 use weglarka_model::app::{InstanceName, Security};
 use weglarka_model::labels;
 use weglarka_model::podman::{
-    ContainerFilter, ContainerSpec, ContainerState, PodmanClient, PodmanError, PortMapping,
-    RestartPolicy,
+    ContainerFilter, ContainerSpec, ContainerState, PodmanClient, PodmanError, PodmanResultExt,
+    PortMapping, RestartPolicy,
 };
 
 /// How many forwards may be alive at once, across all apps (separate from the run limit).
@@ -138,17 +138,13 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     async fn ensure_relay_image(&self, image: &str) -> Result<(), EngineError> {
-        match self.podman.image_inspect(image).await {
-            Ok(_) => Ok(()),
-            Err(PodmanError::NotFound(_)) => {
-                let mut stream = std::pin::pin!(self.podman.image_pull(image));
-                while let Some(event) = stream.next().await {
-                    event?;
-                }
-                Ok(())
+        if !self.podman.image_inspect(image).await.exists()? {
+            let mut stream = std::pin::pin!(self.podman.image_pull(image));
+            while let Some(event) = stream.next().await {
+                event?;
             }
-            Err(e) => Err(e.into()),
         }
+        Ok(())
     }
 
     /// Creates and starts the relay; on any failure after the create it is removed again.
@@ -159,11 +155,12 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<(String, u16), EngineError> {
         let spec = self.load_spec(instance)?;
         let app = labels::container_name(instance);
-        let running = match self.podman.container_inspect(&app).await {
-            Ok(info) => info.state == ContainerState::Running,
-            Err(PodmanError::NotFound(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
+        let running = self
+            .podman
+            .container_inspect(&app)
+            .await
+            .ignore_not_found()?
+            .is_some_and(|info| info.state == ContainerState::Running);
         if !running {
             return Err(EngineError::ForwardNotRunning(instance.clone()));
         }

@@ -18,7 +18,7 @@ use futures_util::future::join_all;
 use weglarka_api::{ErrorCode, ListSharedNetworksResponse, SharedNetworkSummary, endpoints};
 use weglarka_model::app::SharedNetworkName;
 use weglarka_model::labels;
-use weglarka_model::podman::{PodmanClient, PodmanError};
+use weglarka_model::podman::{PodmanClient, PodmanResultExt};
 use weglarka_model::shared_networks;
 use weglarka_model::state;
 
@@ -52,11 +52,17 @@ async fn list_shared_networks<P: PodmanClient + 'static>(
     State(d): Shared<P>,
 ) -> Result<Response, Fail> {
     let apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
-    let existing = match d.engine.podman().network_list().await {
-        Ok(list) => list.into_iter().map(|n| n.name).collect::<Vec<_>>(),
-        Err(PodmanError::NotFound(_)) => Vec::new(),
-        Err(e) => return Err(Fail::internal(e)),
-    };
+    let existing = d
+        .engine
+        .podman()
+        .network_list()
+        .await
+        .ignore_not_found()
+        .map_err(Fail::internal)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.name)
+        .collect::<Vec<_>>();
     // Independent lookups; keeps the shape of the shared-volume listing without extra round trips.
     let rows = join_all(apps.shared_networks.keys().map(|name| {
         let podman_name = labels::shared_network_name(name);
