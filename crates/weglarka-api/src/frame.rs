@@ -41,6 +41,25 @@ pub trait FrameKind: Sized {
     fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError>;
 }
 
+/// What a client does about a control frame, whichever stream it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// The stream finished normally; the last frame.
+    End,
+    /// The token that opened the stream expired; the last frame. Reconnect with a fresh token.
+    TokenExpired,
+    /// The stream failed after it had started; the last frame.
+    Error(String),
+}
+
+/// A frame enum that can carry [`Control`] frames. Only frames that mean the same thing on every
+/// stream map to a control: a frame with a payload of its own (`Exit`, `TimedOut`, `Keepalive`)
+/// is data to the client, and so is anything the stream delivers (`Stdout`, `Entry`, `Ready`).
+pub trait ControlFrame {
+    /// The control this frame stands for, or `None` for a data frame.
+    fn control(&self) -> Option<Control>;
+}
+
 /// Reassembles frames of one stream from a byte stream cut anywhere.
 #[derive(Debug)]
 pub struct FrameDecoder<F> {

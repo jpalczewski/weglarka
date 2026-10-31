@@ -24,7 +24,9 @@ pub use config_view::*;
 pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
 pub use endpoints::{Body, ENDPOINTS, Endpoint, Method};
 pub use forward::{FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest};
-pub use frame::{FrameDecoder, FrameError, FrameKind, MAX_FRAME_PAYLOAD, encode_frame};
+pub use frame::{
+    Control, ControlFrame, FrameDecoder, FrameError, FrameKind, MAX_FRAME_PAYLOAD, encode_frame,
+};
 pub use logs::{LOGS_STREAM_CONTENT_TYPE, LogFrame, LogFrameDecoder};
 pub use logtime::{MAX_STAMP, parse_rfc3339, stamp_len};
 pub use run::{RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest};

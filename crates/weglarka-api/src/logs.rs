@@ -5,7 +5,7 @@
 //! ordinary JSON [`ApiError`](crate::ApiError)s; after that the status is sent, so the end is always
 //! a final frame — or the client hanging up.
 
-use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use crate::frame::{Control, ControlFrame, FrameDecoder, FrameError, FrameKind, encode_frame};
 use std::borrow::Cow;
 
 /// `Content-Type` of a logs response stream.
@@ -62,6 +62,17 @@ impl FrameKind for LogFrame {
     }
 }
 
+impl ControlFrame for LogFrame {
+    fn control(&self) -> Option<Control> {
+        match self {
+            Self::End => Some(Control::End),
+            Self::TokenExpired => Some(Control::TokenExpired),
+            Self::Error(message) => Some(Control::Error(message.clone())),
+            Self::Stdout(_) | Self::Stderr(_) => None,
+        }
+    }
+}
+
 /// Reassembles [`LogFrame`]s from a byte stream cut anywhere.
 pub type LogFrameDecoder = FrameDecoder<LogFrame>;
 
@@ -100,5 +111,20 @@ mod tests {
         let bytes = LogFrame::Stdout(b"abc".to_vec()).encode();
         assert!(d.push(&bytes[..bytes.len() - 1]).unwrap().is_empty());
         assert!(!d.is_clean());
+    }
+
+    #[test]
+    fn control_frames_map_and_data_frames_do_not() {
+        assert_eq!(LogFrame::End.control(), Some(Control::End));
+        assert_eq!(
+            LogFrame::TokenExpired.control(),
+            Some(Control::TokenExpired)
+        );
+        assert_eq!(
+            LogFrame::Error("x".into()).control(),
+            Some(Control::Error("x".into()))
+        );
+        assert_eq!(LogFrame::Stdout(b"x".to_vec()).control(), None);
+        assert_eq!(LogFrame::Stderr(Vec::new()).control(), None);
     }
 }

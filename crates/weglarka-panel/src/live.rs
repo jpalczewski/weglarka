@@ -24,7 +24,10 @@ use axum::response::{IntoResponse, Response};
 use futures_util::stream::{self, Stream};
 use tokio::sync::watch;
 use weglarka_api::endpoints::{APPS_LOGS, EVENTS_RECENT};
-use weglarka_api::{EventsQuery, EventsResponse, LogFrame, LogFrameDecoder};
+use weglarka_api::{
+    Control, ControlFrame, EventsQuery, EventsResponse, FrameDecoder, FrameKind, LogFrame,
+};
+use weglarka_unix_http::Bytes;
 
 use crate::app::AppState;
 use crate::auth::fresh_token;
@@ -48,6 +51,8 @@ const LINES_PER_EVENT: usize = 100;
 const MAX_RECONNECTS: u32 = 5;
 /// Consecutive failed polls after which the events stream ends (the browser reconnects).
 const MAX_POLL_FAILURES: u32 = 10;
+/// Wait before the second and later reconnects in a row.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// How many live streams each session holds; keyed by the session's address, which cannot be
@@ -360,23 +365,76 @@ impl LineSplitter {
     }
 }
 
-struct LogsState {
-    app: AppState,
-    session: Arc<Session>,
-    ended: watch::Receiver<bool>,
+/// The log stream as a feed: cuts the output into sanitized lines, one splitter per channel.
+struct LogsFeed {
     name: String,
-    upstream: Option<Upstream>,
-    decoder: LogFrameDecoder,
     stdout: LineSplitter,
     stderr: LineSplitter,
-    /// When data last arrived: a reconnect asks for output since then.
-    last_data: SystemTime,
-    reconnects: u32,
-    queue: VecDeque<Event>,
-    done: bool,
-    /// The terminal `done` event has been sent.
-    closed: bool,
-    _slot: StreamGuard,
+}
+
+impl LogsFeed {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            stdout: LineSplitter::default(),
+            stderr: LineSplitter::default(),
+        }
+    }
+
+    fn lines(&mut self, stderr: bool, data: &[u8], out: &mut VecDeque<Event>) {
+        let split = if stderr {
+            self.stderr.push(data)
+        } else {
+            self.stdout.push(data)
+        };
+        let mut lines: Vec<LogLine> = split
+            .lines
+            .into_iter()
+            .map(|text| LogLine { stderr, text })
+            .collect();
+        if split.skipped > 0 {
+            lines.push(LogLine {
+                stderr: true,
+                text: format!("… {} lines skipped (too fast to show)", split.skipped),
+            });
+        }
+        for batch in lines.chunks(LINES_PER_EVENT) {
+            if let Some(html) = fragment(&LogLines { lines: batch }) {
+                out.push_back(Event::default().event("lines").data(html));
+            }
+        }
+    }
+}
+
+impl UpstreamFeed for LogsFeed {
+    type Frame = LogFrame;
+
+    const NOTICES: Notices = Notices {
+        ended: "The log ended.",
+        corrupted: "The log stream from the daemon is corrupted.",
+        forbidden: "Logs are only available to administrators.",
+        not_found: "The application has no running container.",
+    };
+
+    fn call(&self, resume_from: Option<SystemTime>) -> Call {
+        log_call(&self.name, resume_from)
+    }
+
+    fn on_data(&mut self, frame: LogFrame, out: &mut VecDeque<Event>) -> bool {
+        match frame {
+            LogFrame::Stdout(data) => self.lines(false, &data, out),
+            LogFrame::Stderr(data) => self.lines(true, &data, out),
+            // Control frames are the driver's.
+            LogFrame::End | LogFrame::TokenExpired | LogFrame::Error(_) => return false,
+        }
+        true
+    }
+
+    fn reset(&mut self) {
+        // A half line from the old connection must not be glued to the new one's output.
+        self.stdout = LineSplitter::default();
+        self.stderr = LineSplitter::default();
+    }
 }
 
 fn log_call(name: &str, since: Option<SystemTime>) -> Call {
@@ -400,32 +458,22 @@ pub async fn logs_stream(req: Req, Path(name): Path<String>) -> Response {
         return too_many();
     };
     let started = SystemTime::now();
+    let feed = LogsFeed::new(name);
     let upstream = match req
         .state
         .daemon
-        .open(&req.view.token, &log_call(&name, None))
+        .open(&req.view.token, &feed.call(None))
         .await
     {
         Ok(upstream) => upstream,
         Err(e) => return req.problem(&e, APPS_LOGS.scope),
     };
-    let state = LogsState {
-        ended: req.session.ended(),
+    let link = PanelLink {
         app: req.state.clone(),
         session: req.session.clone(),
-        name,
-        upstream: Some(upstream),
-        decoder: LogFrameDecoder::default(),
-        stdout: LineSplitter::default(),
-        stderr: LineSplitter::default(),
-        last_data: started,
-        reconnects: 0,
-        queue: VecDeque::new(),
-        done: false,
-        closed: false,
-        _slot: slot,
     };
-    sse(stream::unfold(state, next_logs))
+    let driver = Driver::new(feed, link, req.session.clone(), upstream, started, slot);
+    sse(stream::unfold(driver, Driver::next))
 }
 
 /// A status line for the log view. Terminal ones (`done`) are followed by a `done` event, which
@@ -438,142 +486,232 @@ fn done_event() -> Event {
     Event::default().event("done").data("")
 }
 
-async fn next_logs(mut st: LogsState) -> Option<(Result<Event, Infallible>, LogsState)> {
-    loop {
-        if let Some(event) = st.queue.pop_front() {
-            return Some((Ok(event), st));
+// ---- the resumable stream driver ------------------------------------------------------------
+
+/// The texts a stream shows when it ends for a reason of its own.
+struct Notices {
+    /// The daemon sent `End`.
+    ended: &'static str,
+    /// The frames from the daemon could not be decoded.
+    corrupted: &'static str,
+    /// A reconnect was refused with 403.
+    forbidden: &'static str,
+    /// A reconnect found nothing to stream (404).
+    not_found: &'static str,
+}
+
+/// What one daemon stream turns into on the page; the [`Driver`] does the rest (frames, control,
+/// reconnect, end of the session).
+trait UpstreamFeed: Send + 'static {
+    type Frame: FrameKind + ControlFrame + Send + 'static;
+
+    const NOTICES: Notices;
+
+    /// The request that opens (or, with `resume_from` = when data last arrived, resumes) the stream.
+    fn call(&self, resume_from: Option<SystemTime>) -> Call;
+
+    /// Queues the events a data frame stands for. `true` = it was data, so the reconnect counter
+    /// starts over. Control frames never get here.
+    fn on_data(&mut self, frame: Self::Frame, out: &mut VecDeque<Event>) -> bool;
+
+    /// A new connection starts: drop anything half-assembled from the old one.
+    fn reset(&mut self);
+}
+
+/// Why a connection could not be made.
+#[derive(Debug)]
+enum Connect {
+    /// No usable token (the session ended or its refresh was refused).
+    NoToken,
+    Daemon(DaemonError),
+}
+
+/// An open connection to the daemon, read chunk by chunk.
+trait Conn: Send + 'static {
+    /// The next chunk; `None` = the daemon closed the connection or it broke.
+    fn chunk(&mut self) -> impl Future<Output = Option<Bytes>> + Send;
+}
+
+/// Opens connections with the session's current token.
+trait Link: Send + 'static {
+    type Conn: Conn;
+
+    fn connect(&self, call: &Call) -> impl Future<Output = Result<Self::Conn, Connect>> + Send;
+}
+
+impl Conn for Upstream {
+    async fn chunk(&mut self) -> Option<Bytes> {
+        match Upstream::chunk(self).await {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(_)) | None => None,
         }
-        if st.session.is_ended() {
-            return None;
+    }
+}
+
+struct PanelLink {
+    app: AppState,
+    session: Arc<Session>,
+}
+
+impl Link for PanelLink {
+    type Conn = Upstream;
+
+    async fn connect(&self, call: &Call) -> Result<Upstream, Connect> {
+        let token = fresh_token(&self.app, &self.session)
+            .await
+            .ok_or(Connect::NoToken)?;
+        self.app
+            .daemon
+            .open(&token, call)
+            .await
+            .map_err(Connect::Daemon)
+    }
+}
+
+/// One resumable stream from the daemon as SSE events. Owns the connection, the decoder, the
+/// stream slot, the queue and the reconnect counter, so that dropping it (the browser left) closes
+/// everything. Reconnects after `TokenExpired` or a dropped connection, asking for output since
+/// the last data; ends silently with the session; ends with a status and `done` otherwise.
+struct Driver<F: UpstreamFeed, L: Link> {
+    feed: F,
+    link: L,
+    session: Arc<Session>,
+    ended: watch::Receiver<bool>,
+    upstream: Option<L::Conn>,
+    decoder: FrameDecoder<F::Frame>,
+    /// When data last arrived: a reconnect asks for output since then.
+    last_data: SystemTime,
+    reconnects: u32,
+    /// Wait before the second and later reconnects in a row.
+    retry_delay: Duration,
+    queue: VecDeque<Event>,
+    done: bool,
+    /// The terminal `done` event has been sent.
+    closed: bool,
+    _slot: StreamGuard,
+}
+
+impl<F: UpstreamFeed, L: Link> Driver<F, L> {
+    fn new(
+        feed: F,
+        link: L,
+        session: Arc<Session>,
+        upstream: L::Conn,
+        started: SystemTime,
+        slot: StreamGuard,
+    ) -> Self {
+        Self {
+            feed,
+            link,
+            ended: session.ended(),
+            session,
+            upstream: Some(upstream),
+            decoder: FrameDecoder::default(),
+            last_data: started,
+            reconnects: 0,
+            retry_delay: RECONNECT_DELAY,
+            queue: VecDeque::new(),
+            done: false,
+            closed: false,
+            _slot: slot,
         }
-        if st.done {
-            if st.closed {
+    }
+
+    /// The next SSE event, or `None` when the stream is over.
+    async fn next(mut self) -> Option<(Result<Event, Infallible>, Self)> {
+        loop {
+            if let Some(event) = self.queue.pop_front() {
+                return Some((Ok(event), self));
+            }
+            if self.session.is_ended() {
                 return None;
             }
-            st.closed = true;
-            return Some((Ok(done_event()), st));
-        }
-        if st.upstream.is_none() {
-            reconnect(&mut st).await;
-            continue;
-        }
-        let upstream = st.upstream.as_mut()?;
-        let chunk = tokio::select! {
-            chunk = upstream.chunk() => chunk,
-            // Logout, expiry or a failed refresh: close without a word (the page is gone too).
-            _ = st.ended.changed() => return None,
-        };
-        match chunk {
-            Some(Ok(bytes)) => {
-                st.last_data = SystemTime::now();
-                match st.decoder.push(&bytes) {
-                    Ok(frames) => {
-                        for frame in frames {
-                            handle_frame(&mut st, frame);
+            if self.done {
+                if self.closed {
+                    return None;
+                }
+                self.closed = true;
+                return Some((Ok(done_event()), self));
+            }
+            if self.upstream.is_none() {
+                self.reconnect().await;
+                continue;
+            }
+            let upstream = self.upstream.as_mut()?;
+            let chunk = tokio::select! {
+                chunk = upstream.chunk() => chunk,
+                // Logout, expiry or a failed refresh: close without a word (the page is gone too).
+                _ = self.ended.changed() => return None,
+            };
+            match chunk {
+                Some(bytes) => {
+                    self.last_data = SystemTime::now();
+                    match self.decoder.push(&bytes) {
+                        Ok(frames) => {
+                            for frame in frames {
+                                self.handle(frame);
+                            }
                         }
-                    }
-                    Err(_) => {
-                        st.queue.push_back(status_event(
-                            "The log stream from the daemon is corrupted.",
-                        ));
-                        st.done = true;
+                        Err(_) => self.finish(F::NOTICES.corrupted),
                     }
                 }
+                // The daemon closed the connection or it broke: try once more from where we stopped.
+                None => self.upstream = None,
             }
-            // The daemon closed the connection or it broke: try once more from where we stopped.
-            Some(Err(_)) | None => st.upstream = None,
         }
     }
-}
 
-fn handle_frame(st: &mut LogsState, frame: LogFrame) {
-    match frame {
-        LogFrame::Stdout(data) => queue_lines(st, false, &data),
-        LogFrame::Stderr(data) => queue_lines(st, true, &data),
-        LogFrame::End => {
-            st.queue.push_back(status_event("The log ended."));
-            st.done = true;
-        }
-        // The token this stream was opened with expired: drop the connection, then reconnect with
-        // a refreshed one, since the last data.
-        LogFrame::TokenExpired => st.upstream = None,
-        LogFrame::Error(message) => {
-            let message = sanitize_line(message.as_bytes());
-            st.queue.push_back(status_event(&format!(
-                "The daemon reported an error: {message}"
-            )));
-            st.done = true;
-        }
+    /// A status line, then the end of the stream.
+    fn finish(&mut self, notice: &str) {
+        self.queue.push_back(status_event(notice));
+        self.done = true;
     }
-}
 
-fn queue_lines(st: &mut LogsState, stderr: bool, data: &[u8]) {
-    st.reconnects = 0;
-    let split = if stderr {
-        st.stderr.push(data)
-    } else {
-        st.stdout.push(data)
-    };
-    let mut lines: Vec<LogLine> = split
-        .lines
-        .into_iter()
-        .map(|text| LogLine { stderr, text })
-        .collect();
-    if split.skipped > 0 {
-        lines.push(LogLine {
-            stderr: true,
-            text: format!("… {} lines skipped (too fast to show)", split.skipped),
-        });
-    }
-    for batch in lines.chunks(LINES_PER_EVENT) {
-        if let Some(html) = fragment(&LogLines { lines: batch }) {
-            st.queue
-                .push_back(Event::default().event("lines").data(html));
+    fn handle(&mut self, frame: F::Frame) {
+        match frame.control() {
+            Some(Control::End) => self.finish(F::NOTICES.ended),
+            // The token this stream was opened with expired: drop the connection, then reconnect
+            // with a refreshed one, since the last data.
+            Some(Control::TokenExpired) => self.upstream = None,
+            Some(Control::Error(message)) => {
+                let message = sanitize_line(message.as_bytes());
+                self.finish(&format!("The daemon reported an error: {message}"));
+            }
+            None => {
+                if self.feed.on_data(frame, &mut self.queue) {
+                    self.reconnects = 0;
+                }
+            }
         }
     }
-}
 
-async fn reconnect(st: &mut LogsState) {
-    st.reconnects += 1;
-    if st.reconnects > MAX_RECONNECTS {
-        st.queue
-            .push_back(status_event("The connection to the daemon was lost."));
-        st.done = true;
-        return;
-    }
-    if st.reconnects > 1 && !pause(&mut st.ended, Duration::from_secs(1)).await {
-        st.done = true;
-        return;
-    }
-    let Some(token) = fresh_token(&st.app, &st.session).await else {
-        st.done = true;
-        return;
-    };
-    let call = log_call(&st.name, Some(st.last_data));
-    match st.app.daemon.open(&token, &call).await {
-        Ok(upstream) => {
-            st.upstream = Some(upstream);
-            // A half line from the old connection must not be glued to the new one's output.
-            st.decoder = LogFrameDecoder::default();
-            st.stdout = LineSplitter::default();
-            st.stderr = LineSplitter::default();
+    async fn reconnect(&mut self) {
+        self.reconnects += 1;
+        if self.reconnects > MAX_RECONNECTS {
+            self.finish("The connection to the daemon was lost.");
+            return;
         }
-        Err(DaemonError::Unauthorized) => {
-            st.session.end();
-            st.done = true;
+        if self.reconnects > 1 && !pause(&mut self.ended, self.retry_delay).await {
+            self.done = true;
+            return;
         }
-        Err(DaemonError::Forbidden) => {
-            st.queue
-                .push_back(status_event("Logs are only available to administrators."));
-            st.done = true;
+        let call = self.feed.call(Some(self.last_data));
+        match self.link.connect(&call).await {
+            Ok(upstream) => {
+                self.upstream = Some(upstream);
+                self.decoder = FrameDecoder::default();
+                self.feed.reset();
+            }
+            Err(Connect::NoToken) => self.done = true,
+            Err(Connect::Daemon(DaemonError::Unauthorized)) => {
+                self.session.end();
+                self.done = true;
+            }
+            Err(Connect::Daemon(DaemonError::Forbidden)) => self.finish(F::NOTICES.forbidden),
+            Err(Connect::Daemon(DaemonError::NotFound(_))) => self.finish(F::NOTICES.not_found),
+            // Anything else is transient: loop around and try again, up to the limit.
+            Err(Connect::Daemon(_)) => {}
         }
-        Err(DaemonError::NotFound(_)) => {
-            st.queue
-                .push_back(status_event("The application has no running container."));
-            st.done = true;
-        }
-        // Anything else is transient: loop around and try again, up to the limit.
-        Err(_) => {}
     }
 }
 
@@ -670,5 +808,344 @@ mod tests {
         let again = slots.acquire(&a);
         assert!(again.is_some());
         assert_eq!(slots.open_streams(), 1);
+    }
+
+    // ---- the driver, against a fake feed and a scripted link -------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What a scripted connection does.
+    enum Step {
+        Frames(Vec<TestFrame>),
+        /// Frames, then the connection breaks.
+        Broken(Vec<TestFrame>),
+        /// Garbage that is not a frame.
+        Garbage,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestFrame {
+        Data(String),
+        End,
+        TokenExpired,
+        Error(String),
+    }
+
+    impl FrameKind for TestFrame {
+        fn parts(&self) -> (u8, std::borrow::Cow<'_, [u8]>) {
+            use std::borrow::Cow;
+            match self {
+                Self::Data(t) => (1, Cow::Borrowed(t.as_bytes())),
+                Self::End => (3, Cow::Borrowed(&[])),
+                Self::TokenExpired => (4, Cow::Borrowed(&[])),
+                Self::Error(m) => (5, Cow::Borrowed(m.as_bytes())),
+            }
+        }
+        fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, weglarka_api::FrameError> {
+            let text = String::from_utf8_lossy(&payload).into_owned();
+            Ok(match kind {
+                1 => Self::Data(text),
+                3 => Self::End,
+                4 => Self::TokenExpired,
+                5 => Self::Error(text),
+                other => return Err(weglarka_api::FrameError::UnknownKind(other)),
+            })
+        }
+    }
+
+    impl ControlFrame for TestFrame {
+        fn control(&self) -> Option<Control> {
+            match self {
+                Self::Data(_) => None,
+                Self::End => Some(Control::End),
+                Self::TokenExpired => Some(Control::TokenExpired),
+                Self::Error(m) => Some(Control::Error(m.clone())),
+            }
+        }
+    }
+
+    struct TestFeed {
+        resets: Arc<AtomicUsize>,
+        /// The `resume_from` of every `call`.
+        calls: Arc<Mutex<Vec<Option<SystemTime>>>>,
+    }
+
+    impl UpstreamFeed for TestFeed {
+        type Frame = TestFrame;
+        const NOTICES: Notices = Notices {
+            ended: "ended",
+            corrupted: "corrupted",
+            forbidden: "forbidden",
+            not_found: "not found",
+        };
+        fn call(&self, resume_from: Option<SystemTime>) -> Call {
+            self.calls.lock().unwrap().push(resume_from);
+            Call::new(&APPS_LOGS).param("name", "web")
+        }
+        fn on_data(&mut self, frame: TestFrame, out: &mut VecDeque<Event>) -> bool {
+            let TestFrame::Data(text) = frame else {
+                return false;
+            };
+            out.push_back(Event::default().data(text));
+            true
+        }
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TestConn(VecDeque<Option<Bytes>>);
+
+    impl Conn for TestConn {
+        async fn chunk(&mut self) -> Option<Bytes> {
+            match self.0.pop_front() {
+                Some(chunk) => chunk,
+                // Held open, like a quiet daemon.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Connections the driver asks for after the first, in order; a missing script = refused.
+    struct TestLink {
+        script: Mutex<VecDeque<Result<Step, DaemonError>>>,
+        /// The `resume_from` of every reconnect is recorded by the feed's caller, so count here.
+        connects: Arc<AtomicUsize>,
+    }
+
+    impl Link for TestLink {
+        type Conn = TestConn;
+        async fn connect(&self, _call: &Call) -> Result<TestConn, Connect> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
+                Some(Ok(step)) => Ok(conn(step)),
+                Some(Err(e)) => Err(Connect::Daemon(e)),
+                None => Err(Connect::Daemon(DaemonError::Timeout)),
+            }
+        }
+    }
+
+    fn conn(step: Step) -> TestConn {
+        let (frames, broken) = match step {
+            Step::Frames(f) => (f, false),
+            Step::Broken(f) => (f, true),
+            Step::Garbage => {
+                return TestConn(VecDeque::from([Some(Bytes::from_static(&[9, 0, 0, 0, 0]))]));
+            }
+        };
+        let mut chunks: VecDeque<Option<Bytes>> = frames
+            .iter()
+            .map(|f| {
+                let (kind, payload) = f.parts();
+                Some(Bytes::from(weglarka_api::encode_frame(kind, &payload)))
+            })
+            .collect();
+        if broken {
+            chunks.push_back(None);
+        }
+        TestConn(chunks)
+    }
+
+    struct Rig {
+        driver: Driver<TestFeed, TestLink>,
+        connects: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<Option<SystemTime>>>>,
+        session: Arc<Session>,
+    }
+
+    fn rig(first: Step, later: Vec<Result<Step, DaemonError>>) -> Rig {
+        use crate::session::{Tokens, User};
+        let session = Arc::new(Session::new(
+            User {
+                sub: "u".into(),
+                name: "u".into(),
+            },
+            Tokens {
+                access: Arc::new(crate::config::Secret::new("t")),
+                refresh: None,
+                access_expires: std::time::Instant::now(),
+                refresh_retry_at: None,
+            },
+            std::time::Instant::now(),
+        ));
+        let slots = Arc::new(StreamSlots::default());
+        let connects = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let link = TestLink {
+            script: Mutex::new(later.into()),
+            connects: connects.clone(),
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let feed = TestFeed {
+            resets: resets.clone(),
+            calls: calls.clone(),
+        };
+        let mut driver = Driver::new(
+            feed,
+            link,
+            session.clone(),
+            conn(first),
+            SystemTime::now(),
+            slots.acquire(&session).unwrap(),
+        );
+        driver.retry_delay = Duration::ZERO;
+        Rig {
+            driver,
+            connects,
+            resets,
+            calls,
+            session,
+        }
+    }
+
+    /// Drains the stream: every event as text (`event: name|data`), until it ends or `limit`.
+    async fn drain(driver: Driver<TestFeed, TestLink>, limit: usize) -> Vec<String> {
+        use futures_util::StreamExt;
+        let stream = stream::unfold(driver, Driver::next);
+        futures_util::pin_mut!(stream);
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let next = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+            match next {
+                Ok(Some(Ok(event))) => out.push(format!("{event:?}")),
+                Ok(Some(Err(never))) => match never {},
+                Ok(None) => break,
+                Err(_) => {
+                    out.push("<quiet>".into());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn data(t: &str) -> TestFrame {
+        TestFrame::Data(t.into())
+    }
+
+    #[tokio::test]
+    async fn token_expiry_reconnects_since_the_last_data_and_resets_the_feed() {
+        let r = rig(
+            Step::Frames(vec![data("one"), TestFrame::TokenExpired]),
+            vec![Ok(Step::Frames(vec![data("two")]))],
+        );
+        let started = r.driver.last_data;
+        let (connects, resets, calls) = (r.connects.clone(), r.resets.clone(), r.calls.clone());
+        let events = drain(r.driver, 3).await;
+        assert!(
+            events[0].contains("one") && events[1].contains("two"),
+            "{events:?}"
+        );
+        assert_eq!(events[2], "<quiet>");
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+        // The reconnect asked for output since the chunk that carried `one` arrived.
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let since = calls[0].expect("a reconnect resumes");
+        assert!(since >= started && since <= SystemTime::now());
+    }
+
+    #[tokio::test]
+    async fn more_than_max_reconnects_gives_up_with_a_status_and_done() {
+        let r = rig(
+            Step::Broken(vec![]),
+            (0..MAX_RECONNECTS + 3)
+                .map(|_| Err(DaemonError::Timeout))
+                .collect(),
+        );
+        let connects = r.connects.clone();
+        let events = drain(r.driver, 10).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events[0].contains("status") && events[0].contains("connection to the daemon was lost")
+        );
+        assert!(events[1].contains("done"));
+        assert_eq!(connects.load(Ordering::SeqCst) as u32, MAX_RECONNECTS);
+    }
+
+    #[tokio::test]
+    async fn data_starts_the_reconnect_count_over() {
+        // Each connection delivers data and then breaks: far more reconnects than the limit are fine.
+        let rounds = MAX_RECONNECTS as usize * 2;
+        let later = (0..rounds)
+            .map(|i| Ok(Step::Broken(vec![data(&format!("n{i}"))])))
+            .collect();
+        let r = rig(Step::Broken(vec![data("n")]), later);
+        let events = drain(r.driver, rounds + 1).await;
+        assert_eq!(events.len(), rounds + 1, "{events:?}");
+        assert!(events.iter().all(|e| !e.contains("lost")));
+    }
+
+    #[tokio::test]
+    async fn end_shows_a_status_then_done() {
+        let r = rig(Step::Frames(vec![data("last"), TestFrame::End]), vec![]);
+        let events = drain(r.driver, 10).await;
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events[0].contains("last"));
+        assert!(events[1].contains("status") && events[1].contains("ended"));
+        assert!(events[2].contains("done"));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_error_is_shown_sanitized_and_ends_the_stream() {
+        let r = rig(
+            Step::Frames(vec![TestFrame::Error("bad\x1b[31m <b>".into())]),
+            vec![],
+        );
+        let events = drain(r.driver, 10).await;
+        assert!(
+            events[0].contains("The daemon reported an error: bad[31m &lt;b&gt;"),
+            "{events:?}"
+        );
+        assert!(events[1].contains("done"));
+    }
+
+    #[tokio::test]
+    async fn a_corrupted_stream_ends_with_a_notice() {
+        let r = rig(Step::Garbage, vec![]);
+        let events = drain(r.driver, 10).await;
+        assert!(
+            events[0].contains("corrupted") && events[1].contains("done"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_reconnect_says_why() {
+        for (error, text) in [
+            (DaemonError::Forbidden, "forbidden"),
+            (DaemonError::NotFound("x".into()), "not found"),
+        ] {
+            let r = rig(Step::Broken(vec![]), vec![Err(error)]);
+            let events = drain(r.driver, 10).await;
+            assert!(
+                events[0].contains(text) && events[1].contains("done"),
+                "{events:?}"
+            );
+        }
+        // Unauthorized ends the session and the stream without a word.
+        let r = rig(Step::Broken(vec![]), vec![Err(DaemonError::Unauthorized)]);
+        let session = r.session.clone();
+        assert!(drain(r.driver, 10).await.is_empty());
+        assert!(session.is_ended());
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_session_ends_the_stream_silently() {
+        let r = rig(Step::Frames(vec![data("one")]), vec![]);
+        let session = r.session.clone();
+        let mut events = Vec::new();
+        {
+            use futures_util::StreamExt;
+            let stream = stream::unfold(r.driver, Driver::next);
+            futures_util::pin_mut!(stream);
+            events.push(format!("{:?}", stream.next().await.unwrap().unwrap()));
+            session.end();
+            assert!(stream.next().await.is_none());
+        }
+        assert!(events[0].contains("one"));
     }
 }
