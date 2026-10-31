@@ -132,6 +132,9 @@ pub enum AppsCommand {
     Add(AddArgs),
     /// Change an app's spec (read-modify-write; domains, env, secrets, image…).
     Update(crate::update::UpdateArgs),
+    /// Show what `apps update --spec FILE` would change, without sending anything; exits 8 when
+    /// the file differs from the live spec (like `diff`), 0 when identical.
+    Diff(crate::update::DiffArgs),
     /// Start the app: sets `start = true` and deploys it (a provisioned app gets its container).
     Start(StartStopArgs),
     /// Stop the app: sets `start = false` and removes the container; volumes, the uid range and the
