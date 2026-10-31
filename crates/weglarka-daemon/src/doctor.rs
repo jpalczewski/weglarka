@@ -16,11 +16,13 @@ use weglarka_model::secret_store::{SecretStore, scoped_name, split_scoped};
 use weglarka_model::shared_networks;
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
+use weglarka_model::units::human_bytes;
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::app_view::Access;
 use crate::certificates::{self, routed_domains};
 use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
+use crate::resources::{ContainerResources, Owner, SystemContainer};
 
 fn check(
     id: &str,
@@ -102,8 +104,8 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     let observed = desired_state(d, &mut checks).await;
     if let Some(observed) = &observed {
         image_retention(d, observed, &mut checks).await;
-        memory_use(d, observed, &mut checks).await;
     }
+    memory_use(d, &mut checks).await;
     configs(d, &mut checks);
     host_mounts(d, &mut checks);
     sites(d, &mut checks);
@@ -552,106 +554,119 @@ async fn desired_state<P: PodmanClient>(
 /// Share of its memory limit (in percent) at which a container is reported as nearly full.
 const MEMORY_WARN_PERCENT: u64 = 80;
 
-fn mib(bytes: u64) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-}
-
-/// Memory use of the running containers (issue #208): one libpod stats call, matched to the container
-/// list by name. Never `fail`: the numbers are advice, and a missing stats answer must not hide the
-/// rest of the report. The nginx container has no limit setting yet, so its missing limit is `info`.
-async fn memory_use<P: PodmanClient>(
-    d: &Daemon<P>,
-    observed: &Observed,
-    out: &mut Vec<DoctorCheck>,
-) {
+/// Memory use against limits (issue #416, step 2 of #208): a projection of the daemon's shared resource
+/// snapshot, so it costs no libpod call of its own (it shares the cache window with `/metrics` and the
+/// stats API). Never `fail`: the numbers are advice, and a missing answer must not hide the rest of the
+/// report.
+///
+/// - a container at [`MEMORY_WARN_PERCENT`] or more of its limit: `warn`, one line each;
+/// - the ingress without a limit: `warn` (ADR 0005 left it open);
+/// - otherwise, with data: one `ok` summary line;
+/// - no snapshot, or no memory figure at all (no controller delegation): `info`.
+async fn memory_use<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     const ID: &str = "runtime.memory";
-    let running: Vec<&ContainerInfo> = observed
-        .containers
-        .iter()
-        .filter(|c| c.state == ContainerState::Running)
-        .collect();
-    let stats = match d.engine.podman().container_stats().await {
-        Ok(stats) => stats,
+    const NO_DATA_HINT: &str = "libpod reports no memory without cgroup controller delegation to the runtime user; `weglarka doctor --preflight` checks `memory pids`";
+    let snapshot = match d.resources.snapshot(d.engine.podman()).await {
+        Ok(snapshot) => snapshot,
         Err(e) => {
-            out.push(check(
-                ID,
-                CheckStatus::Info,
-                format!("memory use unavailable: {}", detail(&e)),
-                None,
-            ));
+            out.push(
+                DoctorCheck::info(ID, format!("memory use unavailable: {}", detail(&e)))
+                    .with_hint(NO_DATA_HINT),
+            );
             return;
         }
     };
-    let usage: BTreeMap<&str, u64> = stats
-        .iter()
-        .map(|s| (s.name.as_str(), s.memory_usage))
-        .collect();
+    let mut containers: Vec<&ContainerResources> = snapshot.containers.iter().collect();
+    containers.sort_by_key(|c| (c.owner.label(), c.role));
 
+    let mut with_data = 0usize;
     let mut total = 0u64;
-    let mut highest: Option<(&str, u64, u64)> = None; // name, usage, limit
+    let mut highest: Option<(&ContainerResources, u64, u64)> = None; // usage, limit
     let mut near_limit = Vec::new();
-    let mut no_data = Vec::new();
-    let mut nginx_unlimited = false;
-    for c in &running {
-        // No stats entry is "no data" just like a reported 0: never idle.
-        let used = usage.get(c.name.as_str()).copied().unwrap_or(0);
-        if used == 0 {
-            no_data.push(c.name.as_str());
-            continue;
-        }
+    let mut ingress_unlimited = Vec::new();
+    for c in &containers {
+        let Some(used) = c.memory_bytes else { continue };
+        with_data += 1;
         total += used;
-        match c.memory_limit {
+        match c.memory_limit.filter(|limit| *limit > 0) {
             Some(limit) => {
-                let percent = used.saturating_mul(100) / limit;
-                if percent >= MEMORY_WARN_PERCENT {
-                    near_limit.push(format!("{} ({percent}%)", c.name));
+                if used.saturating_mul(100) / limit >= MEMORY_WARN_PERCENT {
+                    near_limit.push((*c, used, limit));
                 }
                 if highest.is_none_or(|(_, u, l)| used as f64 / limit as f64 > u as f64 / l as f64)
                 {
-                    highest = Some((&c.name, used, limit));
+                    highest = Some((c, used, limit));
                 }
             }
-            None => nginx_unlimited |= c.name == NGINX_CONTAINER,
+            None => {
+                if c.owner == Owner::System(SystemContainer::Ingress) {
+                    ingress_unlimited.push(used);
+                }
+            }
+        }
+    }
+    // The ingress is reported unlimited even when it reports no figure yet.
+    for c in &containers {
+        if c.memory_bytes.is_none()
+            && c.owner == Owner::System(SystemContainer::Ingress)
+            && c.memory_limit.is_none()
+        {
+            ingress_unlimited.push(0);
         }
     }
 
-    let mut summary = format!(
-        "{} running container(s), {} in use",
-        running.len(),
-        mib(total)
-    );
-    if let Some((name, used, limit)) = highest {
-        summary.push_str(&format!(
-            ", highest against a limit: {name} {} of {}",
-            mib(used),
-            mib(limit)
-        ));
-    }
-    let mut parts = vec![summary];
-    let mut status = CheckStatus::Ok;
-    let mut hint = None;
-    if !near_limit.is_empty() {
-        status = CheckStatus::Warn;
-        parts.push(format!(
-            "at {MEMORY_WARN_PERCENT}% or more of the memory limit: {}",
-            near_limit.join(", ")
-        ));
-        hint = Some(
-            "raise `resources.memory` of the app (blue-green `.next`/`.prev` share it), or `[platform] memory` in weglarka.toml for the daemon itself; or find out why it uses more",
+    let describe = |c: &ContainerResources| format!("{} ({})", c.owner.label(), c.role.as_str());
+    for (c, used, limit) in &near_limit {
+        out.push(
+            DoctorCheck::warn(
+                ID,
+                format!(
+                    "{} uses {} of its {} memory limit ({}%)",
+                    describe(c),
+                    human_bytes(*used),
+                    human_bytes(*limit),
+                    used.saturating_mul(100) / limit
+                ),
+            )
+            .with_hint(
+                "raise `resources.memory` of the app (blue-green `.next`/`.prev` share it), or `[platform] memory` in weglarka.toml for the daemon itself; or find out why it uses more",
+            ),
         );
     }
-    if nginx_unlimited {
-        status = status.max(CheckStatus::Info);
-        parts.push(format!("{NGINX_CONTAINER} has no memory limit"));
+    if !ingress_unlimited.is_empty() {
+        out.push(
+            DoctorCheck::warn(ID, format!("{NGINX_CONTAINER} has no memory limit")).with_hint(
+                "its tmpfs mounts (/tmp, /run) are RAM that grows with traffic and no setting caps it yet (#208); watch its usage with `weglarka stats`",
+            ),
+        );
     }
-    if !no_data.is_empty() {
-        status = status.max(CheckStatus::Info);
-        parts.push(format!(
-            "no memory data for {} (probably no cgroup controller delegation to the runtime user)",
-            no_data.join(", ")
-        ));
+    if with_data == 0 {
+        if !containers.is_empty() {
+            out.push(
+                DoctorCheck::info(
+                    ID,
+                    "no memory data for any container (probably no cgroup controller delegation to the runtime user)",
+                )
+                .with_hint(NO_DATA_HINT),
+            );
+        }
+        return;
     }
-    out.push(check(ID, status, parts.join("; "), hint));
+    if near_limit.is_empty() {
+        let mut summary = format!(
+            "{with_data} container(s) with memory data, {} in use",
+            human_bytes(total)
+        );
+        if let Some((c, used, limit)) = highest {
+            summary.push_str(&format!(
+                ", highest against a limit: {} {} of {}",
+                describe(c),
+                human_bytes(used),
+                human_bytes(limit)
+            ));
+        }
+        out.push(ok(ID, summary));
+    }
 }
 
 /// Image retention (issue #40): images of a repository Węglarka deploys that are neither an app's

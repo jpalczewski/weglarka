@@ -12,20 +12,21 @@ podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.Effect
 
 ## Memory use
 
-`weglarka doctor` reports `runtime.memory`: the working set of every running container (one Podman stats call,
-matched to containers by name) against its `resources.memory` limit.
+`weglarka doctor` reports `runtime.memory`: the working set of every container Węglarka manages (apps, the ingress,
+the forwarder and the daemon) against its memory limit. It reads the daemon's shared resource snapshot, so it adds no
+libpod call of its own when `/metrics` or `weglarka stats` was read in the last few seconds.
 
 | Status | When |
 |---|---|
-| `ok` | every container with a limit is below 80% of it; the message gives the container count, the total in use and the container closest to its limit |
-| `warn` | a container is at or above 80% of its limit; the message names it with the percentage |
-| `info` | `weglarka-nginx` runs without a memory limit (there is no setting for it yet) |
-| `info` | a running container reports no memory data, usually because the cgroup memory controller is not delegated to the runtime user; such a container is never counted as idle |
-| `info` | the stats call failed; the rest of `doctor` is unaffected |
+| `ok` | one summary line: no container is at 80% of its limit; it gives the container count, the total in use and the container closest to its limit |
+| `warn` | a container is at or above 80% of its limit; one line per container with app, role (`active`, `challenger`, `retiring`), usage and limit |
+| `warn` | `weglarka-nginx` runs without a memory limit (there is no setting for it yet; its tmpfs is RAM that grows with traffic) |
+| `info` | no container reports memory data, usually because the cgroup `memory` controller is not delegated to the runtime user (`doctor --preflight` checks `memory pids`); such a container is never counted as idle |
+| `info` | the snapshot is unavailable (libpod failed or timed out); the rest of `doctor` is unaffected, and a `read` caller sees `<details withheld>` instead of the error text |
 
-When several conditions hold the highest status wins and the message mentions all of them. The check never fails.
-Raise `resources.memory` of an app that warns (`weglarka apps update <app> --memory 256M`; the blue-green `.next`/`.prev`
-containers share the app's setting). If the daemon's own container warns, its limit is `[platform] memory` in `weglarka.toml`.
+The check never fails. Raise `resources.memory` of an app that warns (`weglarka apps update <app> --memory 256M`; the
+blue-green `.next`/`.prev` containers share the app's setting). If the daemon's own container warns, its limit is
+`[platform] memory` in `weglarka.toml`.
 
 ## Automatic rollback
 
