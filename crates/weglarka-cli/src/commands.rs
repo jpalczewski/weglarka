@@ -158,21 +158,7 @@ impl DryRun {
 /// Builds an `AppSpec` from the flags of `apps add` (`--spec` wins when given).
 pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
     if let Some(path) = &a.spec {
-        let src = if path == Path::new("-") {
-            let mut s = String::new();
-            std::io::stdin()
-                .read_to_string(&mut s)
-                .map_err(|e| CliError::usage(format!("cannot read spec from stdin: {e}")))?;
-            s
-        } else {
-            std::fs::read_to_string(path)
-                .map_err(|e| CliError::usage(format!("cannot read spec {}: {e}", path.display())))?
-        };
-        return toml::from_str(&src).map_err(|e| {
-            CliError::usage(format!("invalid spec: {e}")).with_hint(
-                "format: AppSpec fields from apps.toml (image, domains, port, env, secrets…)",
-            )
-        });
+        return crate::update::read_spec_file(path);
     }
     let image = a
         .image
