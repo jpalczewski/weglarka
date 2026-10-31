@@ -8,9 +8,9 @@ use weglarka_panel::config::{
     ENV_API_AUDIENCE, ENV_CLIENT_SECRET, ENV_CLIENT_SECRET_FILE, ENV_ISSUER, ENV_LISTEN, ENV_SOCKET,
 };
 use weglarka_panel::headers::CONTENT_SECURITY_POLICY_VALUE;
-use weglarka_unix_http::testing::mock;
+use weglarka_unix_http::testing::{Mock, Reply, mock, mock_with};
 
-use crate::harness::{FAKE_SECRET, Panel, command, free_port, get, run_to_exit};
+use crate::harness::{FAKE_SECRET, Panel, TIMEOUT, command, free_port, get, run_to_exit};
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -211,27 +211,40 @@ async fn a_second_instance_on_the_same_port_fails_cleanly() {
     assert_eq!(get(first.addr, "/healthz").unwrap().status, 200);
 }
 
-/// Opens a keep-alive connection and sends only part of a request, so the server holds a
-/// connection with a request in progress when the signal arrives.
-fn start_request(addr: SocketAddr) -> TcpStream {
+/// How long the mock daemon sits on the relayed request. The signal is sent as soon as the
+/// request has reached the daemon, so this only has to outlast a `kill(1)`; it is not a guess
+/// about how long the server takes to read anything.
+const SLOW_DAEMON: Duration = Duration::from_secs(2);
+
+/// Sends a complete request through the relay to a daemon that answers slowly, and returns once
+/// the daemon has received it: from then on the panel is certainly holding a request in flight.
+fn start_request(addr: SocketAddr, daemon: &Mock) -> TcpStream {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+        .write_all(
+            b"GET /_weglarka/api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
         .unwrap();
-    stream.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + TIMEOUT;
+    while daemon.seen.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the daemon"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     stream
 }
 
-fn exits_cleanly_on(signal: &str) {
-    let daemon_socket = std::env::temp_dir().join(format!("wgl-panel-{}.sock", free_port()));
-    let panel = Panel::start(&daemon_socket);
-    let mut in_flight = start_request(panel.addr);
+async fn exits_cleanly_on(signal: &str) {
+    let daemon =
+        mock_with(|_, _| Reply::new(200, r#"{"status":"ok"}"#).head_delay(SLOW_DAEMON)).await;
+    let panel = Panel::start(&daemon.socket);
+    let mut in_flight = start_request(panel.addr, &daemon);
 
     panel.signal(signal);
     let started = Instant::now();
-    // The request in progress completes: the rest of it arrives after the signal.
-    let _ = in_flight.write_all(b"Connection: close\r\n\r\n");
+    // The request in progress completes even though the signal arrived while it was open.
     let mut answer = String::new();
     let _ = in_flight.read_to_string(&mut answer);
     assert!(
@@ -256,12 +269,12 @@ fn exits_cleanly_on(signal: &str) {
     assert!(!output.contains(FAKE_SECRET));
 }
 
-#[test]
-fn sigterm_exits_cleanly_with_a_request_in_flight() {
-    exits_cleanly_on("TERM");
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_exits_cleanly_with_a_request_in_flight() {
+    exits_cleanly_on("TERM").await;
 }
 
-#[test]
-fn sigint_exits_cleanly_with_a_request_in_flight() {
-    exits_cleanly_on("INT");
+#[tokio::test(flavor = "multi_thread")]
+async fn sigint_exits_cleanly_with_a_request_in_flight() {
+    exits_cleanly_on("INT").await;
 }
