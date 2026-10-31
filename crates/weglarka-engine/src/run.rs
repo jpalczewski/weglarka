@@ -22,7 +22,7 @@ use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerSpec, LogChunk, LogOptions, PodmanClient, PodmanError,
 };
-use weglarka_model::secret_store::valid_secret_name;
+use weglarka_model::secret_store::{is_daemon_managed, valid_secret_name};
 use weglarka_model::state;
 
 /// How many one-off containers may run at once, across all apps.
@@ -84,6 +84,11 @@ impl RunOptions {
             }
             if !valid_secret_name(secret) {
                 return invalid(format!("invalid secret name {secret:?}"));
+            }
+            if is_daemon_managed(secret) {
+                return invalid(format!(
+                    "secret {secret:?} is managed by Węglarka and cannot be given to a run"
+                ));
             }
             if self.env.contains_key(var) {
                 return invalid(format!(

@@ -189,6 +189,9 @@ async fn a_run_can_take_a_stored_secret_for_itself_only() {
         json!({ "command": ["x"], "secrets": { "V": "nope" } }),
         json!({ "command": ["x"], "env": { "V": "1" }, "secrets": { "V": "s3key" } }),
         json!({ "command": ["x"], "secrets": { "V": "bad name" } }),
+        json!({ "command": ["x"], "secrets": { "V": "registry-auth" } }),
+        json!({ "command": ["x"], "secrets": { "V": "webhook-hmac" } }),
+        json!({ "command": ["x"], "secrets": { "V": "oidc-client-digest" } }),
     ] {
         let (status, v) = admin(&h, "POST", "/v1/apps/ntfy/run", Some(body)).await;
         assert!(status.is_client_error(), "{status} {v}");

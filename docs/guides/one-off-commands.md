@@ -19,7 +19,8 @@ weglarka run gitea --entrypoint /bin/sh -- -c 'ls -l /data'
   credentials without a binding that restarts production. The value is read by the daemon and handed over as a Podman
   secret: it is never on a command line, in the request, in a log or in `Debug` (only the secret *name* is sent). It
   wins over `--env` (giving both for one variable is an error) and over a binding of the app on that variable. A secret
-  that is not stored is refused before the command starts. The Podman secret stays in the store like the app's own.
+  that is not stored is refused before the command starts, and so are the ones Węglarka manages itself
+  (`registry-auth`, `webhook-hmac`, `oidc-client-*`). The Podman secret stays in the store like the app's own.
 - **What it does not get:** `host_ports`, ingress routing or the app's DNS aliases — it does not answer under the
   app's name. Reconcile and `doctor` do not see it (label `weglarka.run`, no `weglarka.instance`).
 - **Arguments:** everything after `--` is arguments to the image entrypoint (like `command`, see
