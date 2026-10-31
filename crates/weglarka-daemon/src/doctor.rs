@@ -700,7 +700,7 @@ async fn image_retention<P: PodmanClient>(
         format!(
             "{} unused image(s) from earlier deploys ({} at most)",
             plan.remove.len(),
-            weglarka_engine::images::human_bytes(plan.reclaimable_bytes())
+            weglarka_model::units::human_bytes(plan.reclaimable_bytes())
         ),
         Some("`weglarka images prune` removes them (`--dry-run` first to see the list)"),
     ));
