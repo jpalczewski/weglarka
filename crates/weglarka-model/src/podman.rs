@@ -652,9 +652,35 @@ pub trait PodmanClient: Send + Sync {
     fn events(&self, filter: &EventFilter) -> impl Stream<Item = Result<PodmanEvent>> + Send;
 }
 
+/// Helpers for the "a missing object is not an error" pattern on libpod results.
+///
+/// Cleanup is best effort and idempotent (libpod may even answer 500 instead of 404 while an
+/// object is being removed, which the client maps to [`PodmanError::NotFound`]), and several
+/// callers only ask "is it there?". Every other error passes through untouched.
+pub trait PodmanResultExt<T>: Sized {
+    /// `Ok(Some(v))` on success, `Ok(None)` on [`PodmanError::NotFound`], any other error as is.
+    fn ignore_not_found(self) -> std::result::Result<Option<T>, PodmanError>;
+
+    /// `Ok(true)` on success (the value is dropped), `Ok(false)` on [`PodmanError::NotFound`],
+    /// any other error as is. For inspect-style calls that are only an existence probe.
+    fn exists(self) -> std::result::Result<bool, PodmanError> {
+        self.ignore_not_found().map(|found| found.is_some())
+    }
+}
+
+impl<T> PodmanResultExt<T> for std::result::Result<T, PodmanError> {
+    fn ignore_not_found(self) -> std::result::Result<Option<T>, PodmanError> {
+        match self {
+            Ok(v) => Ok(Some(v)),
+            Err(PodmanError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PodmanError, RegistryAuth, image_repo};
+    use super::{PodmanError, PodmanResultExt, RegistryAuth, image_repo};
 
     #[test]
     fn registry_auth_parses_user_colon_password_and_hides_the_password() {
@@ -699,5 +725,35 @@ mod tests {
         assert_eq!(image_repo("ghcr.io/x/y@sha256:ab"), "ghcr.io/x/y");
         assert_eq!(image_repo("localhost:5000/y"), "localhost:5000/y");
         assert_eq!(image_repo("localhost:5000/y:1"), "localhost:5000/y");
+    }
+
+    #[test]
+    fn ignore_not_found_maps_only_not_found_to_none() {
+        assert_eq!(Ok::<_, PodmanError>(7).ignore_not_found().unwrap(), Some(7));
+        let missing: Result<u8, _> = Err(PodmanError::NotFound("x".into()));
+        assert_eq!(missing.ignore_not_found().unwrap(), None);
+        let conflict: Result<u8, _> = Err(PodmanError::Conflict("x".into()));
+        assert!(matches!(
+            conflict.ignore_not_found(),
+            Err(PodmanError::Conflict(_))
+        ));
+        let api: Result<(), _> = Err(PodmanError::Api {
+            status: 500,
+            message: "boom".into(),
+        });
+        assert!(matches!(
+            api.ignore_not_found(),
+            Err(PodmanError::Api { status: 500, .. })
+        ));
+    }
+
+    #[test]
+    fn exists_is_false_only_for_not_found() {
+        assert!(Ok::<_, PodmanError>(()).exists().unwrap());
+        assert!(Ok::<_, PodmanError>("info").exists().unwrap());
+        let missing: Result<(), _> = Err(PodmanError::NotFound("x".into()));
+        assert!(!missing.exists().unwrap());
+        let down: Result<(), _> = Err(PodmanError::Unreachable("sock".into()));
+        assert!(matches!(down.exists(), Err(PodmanError::Unreachable(_))));
     }
 }

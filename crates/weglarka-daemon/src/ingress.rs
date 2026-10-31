@@ -30,7 +30,7 @@ use weglarka_model::fsutil::write_atomic;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerFilter, ContainerSpec, ContainerState, NetworkSpec, PodmanClient,
-    PodmanError, PortMapping, RestartPolicy,
+    PodmanError, PodmanResultExt, PortMapping, RestartPolicy,
 };
 use weglarka_model::state;
 use weglarka_model::uid_range::UidRange;
@@ -602,17 +602,15 @@ impl<P: PodmanClient> IngressManager<P> {
     /// Removes the forwarder if there is one (a switch to `behind`, or a replaced identity).
     async fn remove_forwarder(&self) -> Result<(), IngressApplyError> {
         let podman = self.engine.podman();
-        match podman
+        podman
             .container_stop(FORWARDER_CONTAINER, FORWARDER_STOP_TIMEOUT)
             .await
-        {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        match podman.container_remove(FORWARDER_CONTAINER, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+            .ignore_not_found()?;
+        podman
+            .container_remove(FORWARDER_CONTAINER, true)
+            .await
+            .ignore_not_found()?;
+        Ok(())
     }
 
     /// `nginx.conf` atomically (the directory is mounted, so the `rename` is visible in the container).
@@ -901,13 +899,10 @@ impl<P: PodmanClient> IngressManager<P> {
         // Everything slow (the image pull) is done: from here to the start below nothing serves.
         let gap = std::time::Instant::now();
         if replace.is_some() {
-            match podman
+            podman
                 .container_stop(NGINX_CONTAINER, NGINX_STOP_TIMEOUT)
                 .await
-            {
-                Ok(()) | Err(PodmanError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
+                .ignore_not_found()?;
             podman.container_remove(NGINX_CONTAINER, true).await?;
         }
         // nginx does not unlink the socket a killed predecessor left behind.
@@ -958,17 +953,13 @@ impl<P: PodmanClient> IngressManager<P> {
 
     async fn ensure_image(&self, image: &str) -> Result<(), IngressApplyError> {
         let podman = self.engine.podman();
-        match podman.image_inspect(image).await {
-            Ok(_) => Ok(()),
-            Err(PodmanError::NotFound(_)) => {
-                let mut stream = std::pin::pin!(podman.image_pull(image));
-                while let Some(ev) = stream.next().await {
-                    ev?;
-                }
-                Ok(())
+        if !podman.image_inspect(image).await.exists()? {
+            let mut stream = std::pin::pin!(podman.image_pull(image));
+            while let Some(ev) = stream.next().await {
+                ev?;
             }
-            Err(e) => Err(e.into()),
         }
+        Ok(())
     }
 }
 

@@ -22,7 +22,7 @@ use futures_util::future::join_all;
 use weglarka_api::{ErrorCode, ListSharedVolumesResponse, SharedVolumeSummary, endpoints};
 use weglarka_model::app::SharedVolumeName;
 use weglarka_model::labels;
-use weglarka_model::podman::{PodmanClient, PodmanError};
+use weglarka_model::podman::{PodmanClient, PodmanResultExt};
 use weglarka_model::shared_volumes;
 use weglarka_model::state;
 
@@ -64,11 +64,13 @@ async fn list_shared_volumes<P: PodmanClient + 'static>(
         let daemon = daemon.clone();
         let podman_name = labels::shared_volume_name(name);
         async move {
-            let exists = match daemon.engine.podman().volume_inspect(&podman_name).await {
-                Ok(_) => true,
-                Err(PodmanError::NotFound(_)) => false,
-                Err(e) => return Err(Fail::internal(e)),
-            };
+            let exists = daemon
+                .engine
+                .podman()
+                .volume_inspect(&podman_name)
+                .await
+                .exists()
+                .map_err(Fail::internal)?;
             Ok((name.clone(), podman_name, exists))
         }
     });

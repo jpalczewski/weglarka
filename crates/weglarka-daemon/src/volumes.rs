@@ -32,7 +32,7 @@ use weglarka_api::{
 use weglarka_engine::volumes::ImportMode;
 use weglarka_model::app::{AppSpec, InstanceName};
 use weglarka_model::labels;
-use weglarka_model::podman::{PodmanClient, PodmanError, TarStream};
+use weglarka_model::podman::{PodmanClient, PodmanError, PodmanResultExt, TarStream};
 use weglarka_model::state;
 
 use crate::admin::Fail;
@@ -140,11 +140,12 @@ fn podman_fail(e: PodmanError, what: &str, hint: &str) -> Fail {
 }
 
 async fn volume_exists<P: PodmanClient>(d: &Daemon<P>, podman_name: &str) -> ApiResult<bool> {
-    match d.engine.podman().volume_inspect(podman_name).await {
-        Ok(_) => Ok(true),
-        Err(PodmanError::NotFound(_)) => Ok(false),
-        Err(e) => Err(Fail(ErrorCode::Internal, e.to_string())),
-    }
+    d.engine
+        .podman()
+        .volume_inspect(podman_name)
+        .await
+        .exists()
+        .map_err(|e| Fail(ErrorCode::Internal, e.to_string()))
 }
 
 async fn volume_summaries<P: PodmanClient>(

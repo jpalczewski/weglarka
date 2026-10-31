@@ -18,7 +18,7 @@ use weglarka_model::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
-    PortMapping, PullEvent, RestartPolicy, image_repo,
+    PodmanResultExt, PortMapping, PullEvent, RestartPolicy, image_repo,
 };
 use weglarka_model::state::{self, AppState, FailedDeploy, StateFile};
 use weglarka_model::uid_range::UidRange;
@@ -489,18 +489,14 @@ impl<P: PodmanClient> Reconciler<P> {
         self.bootstrap_generated(instance).await?;
         let prepared = self.prepare_instance(instance, spec).await?;
         let name = labels::container_name(instance);
-        match self
-            .podman
+        self.podman
             .container_stop(&name, self.options.stop_timeout_secs)
             .await
-        {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        match self.podman.container_remove(&name, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
+            .ignore_not_found()?;
+        self.podman
+            .container_remove(&name, true)
+            .await
+            .ignore_not_found()?;
         Ok(prepared)
     }
 
@@ -776,17 +772,21 @@ impl<P: PodmanClient> Reconciler<P> {
 
         // The old container keeps serving through DNS caches until it stops: wait out the resolver TTL.
         tokio::time::sleep(self.options.switch_drain).await;
-        match self
+        if let Err(e) = self
             .podman
             .container_stop(&retiring, self.options.stop_timeout_secs)
             .await
+            .ignore_not_found()
         {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => tracing::warn!(%instance, error = %e, "cannot stop the retired container"),
+            tracing::warn!(%instance, error = %e, "cannot stop the retired container");
         }
-        match self.podman.container_remove(&retiring, true).await {
-            Ok(()) | Err(PodmanError::NotFound(_)) => {}
-            Err(e) => tracing::warn!(%instance, error = %e, "cannot remove the retired container"),
+        if let Err(e) = self
+            .podman
+            .container_remove(&retiring, true)
+            .await
+            .ignore_not_found()
+        {
+            tracing::warn!(%instance, error = %e, "cannot remove the retired container");
         }
         let _ = self.podman.network_disconnect(&staging, &serving).await;
         let _ = self.podman.network_remove(&staging).await;
