@@ -80,8 +80,11 @@ so an existing generator behaves exactly as before.
 - A validator that times out or is cancelled is recorded as `Invalid` like a rejection (ADR 0055), so that render is
   not retried until it changes and the scraper keeps the previous targets. The guide says how to clear the record.
 - Tests: a real-Podman test (`podman-tests` job) runs the official image's `promtool` on the generator's actual output:
-  the render passes, a malformed file, an invalid label name, an invalid address and a file of the wrong shape fail,
-  and the check config without `targets.yml` passes with a warning (the reason both files are written together);
+  the render passes, a malformed file, an empty label name, an invalid address and a file of the wrong shape fail,
+  and the check config without `targets.yml` passes with a warning (the reason both files are written together).
+  The first CI run corrected one assumption: Prometheus 3 validates label names as UTF-8, so a name such as
+  `bad-label` is accepted; only an empty name is rejected. The generator emits only `app` and `__metrics_path__`,
+  so its output is unaffected;
   a snapshot of the rendered file and of the check config, determinism, a fingerprint change for every trigger,
   an engine test that a `ConsumerWatches` consumer is validated but never stopped or signalled, and a daemon test that a
   path-only change rewrites the file without recreating the app or restarting the scraper.

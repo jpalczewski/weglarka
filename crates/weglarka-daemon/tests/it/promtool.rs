@@ -1,7 +1,8 @@
 //! The Prometheus targets generator (#366, ADR 0064) against the real `promtool` in the official
 //! Prometheus image, on a real rootless Podman. Validation is the only guard for this generator (no
 //! health gate, no rollback), so its contract is measured here rather than read from the source: the
-//! rendered files pass, and a malformed file, an invalid label name and an invalid address fail.
+//! rendered files pass, and a malformed file, an empty label name, an invalid address and a file of the
+//! wrong shape fail.
 //!
 //! Each case runs the way `validate_generated` runs it: a one-off container of the image with
 //! `argv[0]` of `validate_argv` as the entrypoint (so `promtool` must be on the image's `PATH`) and the
@@ -186,10 +187,11 @@ async fn promtool_accepts_the_render_and_rejects_bad_targets() {
     };
     let bad = [
         ("malformed", "- targets: [\"forge:9100\"\n  labels: {\n"),
-        // A label name with `-` is not a Prometheus label name.
+        // Prometheus 3 accepts any non-empty UTF-8 label name (`bad-label` passes, see below); an empty
+        // name is invalid under both validation schemes.
         (
             "label",
-            "- targets:\n    - \"forge:9100\"\n  labels:\n    bad-label: \"x\"\n",
+            "- targets:\n    - \"forge:9100\"\n  labels:\n    \"\": \"x\"\n",
         ),
         // `/` is not allowed in a target address.
         (
@@ -203,6 +205,17 @@ async fn promtool_accepts_the_render_and_rejects_bad_targets() {
         let (code, output) = promtool(&client, case, &with_targets(text)).await;
         assert_ne!(code, 0, "{case}: promtool accepted it\n{output}");
     }
+
+    // Measured in CI: the pinned Prometheus 3 validates label names as UTF-8, so a name outside the
+    // legacy `[a-zA-Z_][a-zA-Z0-9_]*` alphabet is accepted. The generator only ever emits `app` and
+    // `__metrics_path__`, so this does not matter for its output; the assertion keeps the ADR honest.
+    let (code, output) = promtool(
+        &client,
+        "utf8-label",
+        &with_targets("- targets:\n    - \"forge:9100\"\n  labels:\n    bad-label: \"x\"\n"),
+    )
+    .await;
+    assert_eq!(code, 0, "{output}");
 
     // Without the targets file the check config alone would pass with a warning: the reason the
     // generator writes both files into one version. Measured, so the ADR's claim stays true.
