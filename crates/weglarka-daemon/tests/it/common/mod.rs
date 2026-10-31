@@ -73,11 +73,19 @@ dir = \"{root}/state\"
     )
 }
 
+/// The fixture `/proc` every test daemon reads host metrics from (invented numbers; it also has a
+/// `net/dev` that must never reach the page), so no test depends on the machine it runs on.
+pub fn proc_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proc")
+}
+
 /// Daemon settings for `root` without starting anything (`root` must already exist): for tests
 /// that drive [`start`] themselves to observe a startup error.
 pub fn settings(root: &Path, top_level: &str, sections: &str) -> Settings {
     let host = HostConfig::from_toml_str(&host_toml(root, top_level, sections)).unwrap();
-    Settings::from_host(host, root.join("weglarka.toml"))
+    let mut settings = Settings::from_host(host, root.join("weglarka.toml"));
+    settings.paths.proc_root = proc_fixture();
+    settings
 }
 
 /// Builds a [`Harness`] whose config differs from [`host_toml`]'s default.

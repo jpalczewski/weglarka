@@ -8,8 +8,8 @@ use hyper::Method;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerStats, EventFilter, HealthStatus,
     ImageInfo, LoadedImage, LogOptions, LogStream, NetworkInfo, NetworkSpec, NetworkSummary,
-    PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, TarStream,
-    VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
+    PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth, Result, StorageInfo,
+    TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec,
 };
 
 use crate::registry_auth;
@@ -68,6 +68,11 @@ impl PodmanClient for LibpodClient {
     async fn subuid_pool(&self) -> Result<u64> {
         let body = self.transport.call(Method::GET, "/info", None).await?;
         Ok(decode::<Info>(&body)?.subuid_pool())
+    }
+
+    async fn storage_info(&self) -> Result<StorageInfo> {
+        let body = self.transport.call(Method::GET, "/info", None).await?;
+        Ok(decode::<Info>(&body)?.storage())
     }
 
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {

@@ -519,6 +519,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
                     metrics::router(Arc::new(metrics::DaemonMetrics::new(
                         daemon.clone(),
                         counters,
+                        metrics::host::ProcSource::new(paths.proc_root.clone()),
                     ))),
                     shutdown_rx.clone(),
                 );
