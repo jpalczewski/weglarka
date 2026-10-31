@@ -7,7 +7,7 @@ with their token) and ADR 0056 (token listener).
 
 `weglarka logs` shows what an app's container printed. It does not show the requests that reached the app through its
 domains: for that the operator reads the ingress nginx. nginx writes one JSON line per request to its stdout, with an
-`app` field, in **one log shared by every app** (ADR 0006 / the access-log guide). Handing that log to a client, even
+`app` field, in **one log shared by every app** (`docs/guides/access-log.md`). Handing that log to a client, even
 an `admin` one scoped to a single app in the CLI, would show it every other app's traffic.
 
 Threats and constraints, in priority order:

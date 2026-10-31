@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::Args;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use weglarka_api::{AccessEntry, AccessFrame, AccessQuery, MAX_ACCESS_TAIL, StatusFilter};
+use weglarka_api::{AccessEntry, AccessFrame, AccessQuery, MAX_ACCESS_TAIL};
 
 use crate::client::ApiClient;
 use crate::commands::{client, instance};
@@ -228,7 +228,7 @@ mod tests {
 
     use clap::Parser as _;
     use hyper::body::Bytes;
-    use weglarka_api::ACCESS_STREAM_CONTENT_TYPE;
+    use weglarka_api::{ACCESS_STREAM_CONTENT_TYPE, StatusFilter};
     use weglarka_unix_http::testing::{Reply, mock_seen};
 
     use super::*;

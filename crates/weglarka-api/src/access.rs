@@ -39,6 +39,8 @@ pub struct AccessEntry {
 }
 
 /// One piece of an access response stream.
+// Frames are short-lived and moved one at a time; boxing the entry would only add an allocation per request.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccessFrame {
     Entry(AccessEntry),

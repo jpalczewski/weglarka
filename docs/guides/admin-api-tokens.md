@@ -48,7 +48,7 @@ revoked before it expires.
 | none (no token) | `GET /v1/health` only; everything else is `401` |
 | a valid token whose groups map to no scope | nothing: `403` |
 | `read` | every `GET` except those that carry credentials or data: status, apps, doctor, volumes, sites, recent events, certificates, the host config view, secrets *names*, notifications (not volume exports and not the OIDC client list, which holds secret digests) |
-| `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push`, app logs and OIDC clients |
+| `admin` | everything, including deploys, secrets, volume export/import, `run`, `forward`, `push`, app logs, app access logs and OIDC clients |
 
 App logs (`GET /v1/apps/{name}/logs`) need `admin`, although they only read: logs can hold anything the app printed,
 secrets included, and unlike a spec they cannot be redacted. The answer is a stream that ends with the token: when it
@@ -56,6 +56,11 @@ expires the daemon sends a final `TokenExpired` frame and closes, and the client
 `since=` (unix seconds) set to where it stopped. `forward` streams end at the token's expiry the same way; `run` does not,
 because cutting a command off halfway can be destructive (it has its own `timeout_secs`). On the unix socket there is
 no token, so no deadline.
+
+The access log of an app (`GET /v1/apps/{name}/access`, [access log](access-log.md)) is the same kind of stream, `admin`
+only for the same reason: addresses, paths and user agents of visitors. nginx writes one log for all apps, so the
+daemon parses it and sends only the lines of the requested app, as an allowlist of fields. It ends with the token like
+the logs stream; the CLI reads it with `weglarka access`.
 
 The CLI reads this stream with `weglarka logs` (`weglarka --host https://panel.example.com logs web -f`, or `--all` for every
 running app): it renews the connection after `TokenExpired` itself, so lines around the renewal can appear twice.
@@ -120,7 +125,7 @@ The daemon reaches the provider's `jwks.json` over the ingress probe socket (it 
 the keys cached, refetches when it sees an unknown key id (at most every 30 s) and at least hourly, and keeps using the old
 keys while the provider is down.
 
-Every call that needs `admin` (all changes, plus exports, the OIDC client list and app logs) is logged with the token's `sub`, the route and the result; a logs stream adds a line when it ends (`sub`, app, `follow`, `tail`, `since`, frames, bytes, duration and why it ended — never the content); refusals are
+Every call that needs `admin` (all changes, plus exports, the OIDC client list and app logs) is logged with the token's `sub`, the route and the result; a logs stream adds a line when it ends (`sub`, app, `follow`, `tail`, `since`, frames, bytes, duration and why it ended — never the content); an access stream adds `admin access stream ended` (`sub`, app, `follow`, `tail`, `since`, `filtered` (whether any filter was set, never its value), `scanned`, `frames`, `skipped`, duration, `ended`); refusals are
 logged with their reason. Tokens themselves are never logged.
 
 There is no cap on concurrent `follow` log streams: each holds one Podman connection and an 8-frame queue until it ends (at the token's expiry at the latest), and starting one needs `admin` scope.

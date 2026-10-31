@@ -147,6 +147,8 @@ struct Logged {
 
 /// What a log line is.
 #[derive(Debug, PartialEq)]
+// Short-lived: one per log line, consumed at once.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Parsed {
     Entry {
         app: String,
