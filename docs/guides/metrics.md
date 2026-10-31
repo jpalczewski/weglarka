@@ -141,7 +141,8 @@ I/O. A number that is not known is `null`, never `0`; `memory_limit_bytes` is `n
 `cpu_ratio` is cores over the last `cpu_window_secs` (`1.0` is one full core) and is `null` for the first request
 after a quiet period. Values are at most 10 s old and are shared with the metrics page, so polling costs no extra
 libpod calls. When libpod does not answer the response is `200` with `available: false` and no rows. System containers
-(ingress, forwarder, daemon) are not listed yet. The CLI and the panel will show the same data.
+(ingress, forwarder, daemon) are not listed yet. `weglarka stats` prints the same data as a table (`weglarka stats myapp`
+for one app, `--json` for the response as is); the panel will show it too.
 
 ## Host
 

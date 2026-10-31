@@ -18,6 +18,7 @@ mod secrets_env;
 mod settings;
 mod sites;
 mod spec_flags;
+mod stats;
 mod update;
 mod user_config;
 mod volumes;

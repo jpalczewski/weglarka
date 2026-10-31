@@ -1,0 +1,6 @@
+---
+source: crates/weglarka-cli/src/stats.rs
+expression: render_app(&resp)
+---
+APP   ROLE    MEMORY  LIMIT  % LIMIT  CPU  PIDS  NET RX  NET TX  BLK READ  BLK WRITE  RESTARTS  OOM
+ntfy  active  —       —      —        —    —     —       —       —         —          0         no

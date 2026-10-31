@@ -1,0 +1,8 @@
+---
+source: crates/weglarka-cli/src/stats.rs
+expression: render_all(&resp)
+---
+APP   ROLE        MEMORY    LIMIT      % LIMIT  CPU   PIDS  NET RX   NET TX  BLK READ  BLK WRITE  RESTARTS  OOM
+ntfy  active      64.0 MiB  256.0 MiB  25.0%    5.4%  7     5.0 GiB  512 B   3.0 MiB   1.0 KiB    2         yes
+ntfy  retiring    64.0 MiB  256.0 MiB  25.0%    5.4%  7     5.0 GiB  512 B   3.0 MiB   1.0 KiB    2         yes
+web   challenger  64.0 MiB  256.0 MiB  25.0%    5.4%  7     5.0 GiB  512 B   3.0 MiB   1.0 KiB    2         yes

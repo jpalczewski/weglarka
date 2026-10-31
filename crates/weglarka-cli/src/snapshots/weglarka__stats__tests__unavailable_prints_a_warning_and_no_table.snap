@@ -1,0 +1,5 @@
+---
+source: crates/weglarka-cli/src/stats.rs
+expression: text
+---
+warning: container stats are unavailable right now (Podman did not answer); try again in a moment
