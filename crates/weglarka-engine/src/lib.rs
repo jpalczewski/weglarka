@@ -18,6 +18,7 @@ pub mod promote;
 pub mod push;
 pub mod reconcile;
 pub mod run;
+pub mod scraper;
 pub mod secrets;
 pub mod shared_networks;
 mod site_deploy;

@@ -2539,6 +2539,399 @@ mod metrics_network {
     }
 }
 
+// ── The metrics scraper on the metrics networks (issue #365) ────────────────
+
+mod scraper {
+    use super::*;
+    use crate::run::RunOptions;
+    use crate::scraper::MetricsScraper;
+    use crate::testing::RunScript;
+
+    const PROM: &str = "[apps.prom]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n";
+    const A_PLAIN: &str = "[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n";
+    const A_IN: &str =
+        "[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nmetrics_port = 9100\n";
+    const Z_IN: &str =
+        "[apps.z]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nmetrics_port = 9100\n";
+
+    fn options(scraper: Option<&str>) -> ReconcilerOptions {
+        ReconcilerOptions {
+            metrics_scraper: scraper.map(|s| MetricsScraper {
+                instance: name(s),
+                network: labels::METRICS_NETWORK.to_owned(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The daemon's own network, the way `[metrics]` creates it.
+    fn daemon_network(name: &str) -> NetworkSpec {
+        NetworkSpec {
+            name: name.to_owned(),
+            internal: true,
+            labels: BTreeMap::from([(
+                labels::MANAGED.to_owned(),
+                labels::MANAGED_METRICS.to_owned(),
+            )]),
+        }
+    }
+
+    async fn deployed(apps: &str) -> Harness {
+        let h = Harness::with_options(apps, options(Some("prom")));
+        h.fake
+            .network_create(&daemon_network(labels::METRICS_NETWORK))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    /// Another reconciler over the same Podman and state files, with other host options (the daemon
+    /// restarted after `weglarka.toml` changed).
+    fn restarted(h: &Harness, scraper: Option<&str>) -> Reconciler<FakePodman> {
+        Reconciler::new(
+            h.fake.clone(),
+            h.store.clone() as Arc<dyn SecretStore>,
+            h.rec.paths().clone(),
+            options(scraper),
+        )
+    }
+
+    fn members(h: &Harness, network: &str) -> Vec<String> {
+        let mut m = h.fake.network_members(network);
+        m.sort();
+        m
+    }
+
+    /// Calls after `before` that would restart or recreate `container`.
+    fn restarts(h: &Harness, before: usize, container: &str) -> Vec<Call> {
+        h.fake.calls()[before..]
+            .iter()
+            .filter(|c| {
+                matches!(c,
+                    Call::ContainerCreate(n) | Call::ContainerStop(n) | Call::ContainerRemove(n)
+                        | Call::ContainerStart(n) if n == container)
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_scraper_joins_the_daemon_network_and_every_opted_in_app() {
+        // `a` deploys before `prom` and `z` after it: one network exists at the scraper's creation,
+        // the other is joined live once its app creates it.
+        let h = deployed(&format!(
+            "{A_IN}{PROM}{Z_IN}[apps.b]\nimage = \"{IMAGE}\"\n"
+        ))
+        .await;
+        assert_eq!(
+            h.fake.container_spec("prom").unwrap().networks,
+            vec!["net-prom", "metrics", "metrics-a"],
+            "created on the networks that existed"
+        );
+        assert!(h.fake.calls().contains(&Call::NetworkConnect {
+            network: "metrics-z".into(),
+            container: "prom".into(),
+        }));
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+        assert_eq!(members(&h, "metrics-z"), vec!["prom", "z"]);
+        // Never an app network, and an app that did not opt in has nothing to join.
+        assert_eq!(members(&h, "net-a"), vec!["a"]);
+        assert!(!h.fake.networks().contains(&"metrics-b".to_owned()));
+        // A second pass has nothing to change.
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        assert!(
+            !h.fake.calls()[before..].iter().any(|c| matches!(
+                c,
+                Call::NetworkConnect { .. } | Call::NetworkDisconnect { .. }
+            )),
+            "{:?}",
+            &h.fake.calls()[before..]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_opt_in_joins_the_scraper_live_without_restarting_it() {
+        let h = deployed(&format!("{A_PLAIN}{PROM}")).await;
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        let before = h.fake.calls().len();
+        h.set_apps(&format!("{A_IN}{PROM}"));
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+        assert!(h.fake.calls()[before..].contains(&Call::NetworkConnect {
+            network: "metrics-a".into(),
+            container: "prom".into(),
+        }));
+        assert_eq!(restarts(&h, before, "prom"), Vec::<Call>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recreated_scraper_comes_back_on_its_networks() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        h.set_apps(&format!("{A_IN}{PROM}env = {{ RETENTION = \"15d\" }}\n"));
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        assert!(!restarts(&h, before, "prom").is_empty(), "recreated");
+        assert_eq!(
+            h.fake.container_spec("prom").unwrap().networks,
+            vec!["net-prom", "metrics", "metrics-a"]
+        );
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recreated_app_keeps_the_scraper_on_its_network() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        h.set_apps(&format!("{A_IN}env = {{ MODE = \"x\" }}\n{PROM}"));
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        assert!(
+            !restarts(&h, before, "a").is_empty(),
+            "the app was recreated"
+        );
+        assert_eq!(restarts(&h, before, "prom"), Vec::<Call>::new());
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opting_out_detaches_the_scraper_and_removes_the_network_in_the_same_pass() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+        h.set_apps(&format!("{A_PLAIN}{PROM}"));
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        let calls = h.fake.calls()[before..].to_vec();
+        let detach = Call::NetworkDisconnect {
+            network: "metrics-a".into(),
+            container: "prom".into(),
+        };
+        let remove = Call::NetworkRemove("metrics-a".into());
+        let at = |c: &Call| calls.iter().position(|x| x == c);
+        assert!(at(&detach).unwrap() < at(&remove).unwrap(), "{calls:?}");
+        assert!(!h.fake.networks().contains(&"metrics-a".to_owned()));
+        assert_eq!(
+            members(&h, "metrics"),
+            vec!["prom"],
+            "the daemon network stays"
+        );
+        assert_eq!(restarts(&h, before, "prom"), Vec::<Call>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_or_moving_the_role_detaches_the_former_scraper() {
+        let graf = "[apps.graf]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n";
+        let h = deployed(&format!("{A_IN}{graf}{PROM}")).await;
+        // Something the engine does not manage stays wherever it was put by hand.
+        h.fake.add_foreign_container("by-hand", IMAGE);
+        h.fake.network_connect("metrics", "by-hand").await.unwrap();
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+
+        // The role moves to `graf`: `prom` leaves, `graf` joins, neither restarts.
+        let before = h.fake.calls().len();
+        restarted(&h, Some("graf")).reconcile().await.unwrap();
+        assert_eq!(members(&h, "metrics"), vec!["by-hand", "graf"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "graf"]);
+        assert_eq!(restarts(&h, before, "prom"), Vec::<Call>::new());
+        assert_eq!(restarts(&h, before, "graf"), Vec::<Call>::new());
+
+        // No scraper at all: the former one is detached too, the app keeps its own network.
+        restarted(&h, None).reconcile().await.unwrap();
+        assert_eq!(members(&h, "metrics"), vec!["by-hand"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renamed_daemon_network_takes_the_scraper_along() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        h.fake
+            .network_create(&daemon_network("observability"))
+            .await
+            .unwrap();
+        let moved = Reconciler::new(
+            h.fake.clone(),
+            h.store.clone() as Arc<dyn SecretStore>,
+            h.rec.paths().clone(),
+            ReconcilerOptions {
+                metrics_scraper: Some(MetricsScraper {
+                    instance: name("prom"),
+                    network: "observability".into(),
+                }),
+                ..Default::default()
+            },
+        );
+        moved.reconcile().await.unwrap();
+        assert_eq!(members(&h, "observability"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics"), Vec::<String>::new());
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blue_green_scraper_never_loses_its_networks() {
+        let prom_bg = "[apps.prom]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nport = 9090\n\
+                       strategy = \"blue_green\"\nhealth = { attempts = 3, window_secs = 6, command = [\"true\"] }\n";
+        let h = Harness::with_options(&format!("{A_IN}{prom_bg}"), options(Some("prom")));
+        h.fake
+            .network_create(&daemon_network(labels::METRICS_NETWORK))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("prom", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("prom.next", [HealthStatus::Healthy]);
+        let before = h.fake.calls().len();
+        assert!(matches!(
+            h.rec.deploy(&name("prom"), false).await.unwrap(),
+            DeployOutcome::Deployed { .. }
+        ));
+        // The challenger was created on them, so the serving one is on them before and after the
+        // names swap, and the switch itself needs no connect.
+        let challenger = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .rfind(|s| s.name == "prom.next")
+            .expect("a challenger");
+        assert!(challenger.networks.contains(&"metrics".to_owned()));
+        assert!(challenger.networks.contains(&"metrics-a".to_owned()));
+        assert!(
+            !h.fake.calls()[before..]
+                .iter()
+                .any(|c| matches!(c, Call::NetworkConnect { container, .. } if container.starts_with("prom"))),
+            "{:?}",
+            &h.fake.calls()[before..]
+        );
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+        assert!(
+            h.container_digest_ref("prom")
+                .ends_with(digest('b').as_str())
+        );
+
+        // A challenger that fails its gate leaves nothing behind on them.
+        h.fake.set_pull_digest(IMAGE, digest('c'));
+        h.fake.script_health("prom.next", [HealthStatus::Unhealthy]);
+        let _ = h.rec.deploy(&name("prom"), false).await.unwrap();
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scraper_that_opts_in_itself_stays_on_its_own_network_as_owner() {
+        let prom_bg = "[apps.prom]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nport = 9090\n\
+                       metrics_port = 9090\nstrategy = \"blue_green\"\n\
+                       health = { attempts = 3, window_secs = 6, command = [\"true\"] }\n";
+        let h = Harness::with_options(&format!("{A_IN}{prom_bg}"), options(Some("prom")));
+        h.fake
+            .network_create(&daemon_network(labels::METRICS_NETWORK))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("prom", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        // Once as the owner of `metrics-prom`, never twice.
+        assert_eq!(
+            h.fake.container_spec("prom").unwrap().networks,
+            vec!["net-prom", "metrics-prom", "metrics", "metrics-a"]
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+
+        // Blue-green: the challenger joins its own network after the gate with the alias, as any
+        // opted-in app does, and the other metrics networks up front.
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("prom.next", [HealthStatus::Healthy]);
+        let before = h.fake.calls().len();
+        assert!(matches!(
+            h.rec.deploy(&name("prom"), false).await.unwrap(),
+            DeployOutcome::Deployed { .. }
+        ));
+        let challenger = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .rfind(|s| s.name == "prom.next")
+            .expect("a challenger");
+        assert!(!challenger.networks.contains(&"metrics-prom".to_owned()));
+        assert!(
+            h.fake.calls()[before..].contains(&Call::NetworkConnectAliased {
+                network: "metrics-prom".into(),
+                container: "prom.next".into(),
+                aliases: vec!["prom".into()],
+            })
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+
+        // A pass keeps it there and changes nothing.
+        let before = h.fake.calls().len();
+        h.rec.reconcile().await.unwrap();
+        assert!(
+            !h.fake.calls()[before..].iter().any(|c| matches!(
+                c,
+                Call::NetworkConnect { .. } | Call::NetworkDisconnect { .. }
+            )),
+            "{:?}",
+            &h.fake.calls()[before..]
+        );
+        assert_eq!(members(&h, "metrics-prom"), vec!["prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_one_off_container_of_the_scraper_never_joins() {
+        let h = deployed(&format!("{A_IN}{PROM}")).await;
+        h.fake.script_next_run(RunScript {
+            output: Vec::new(),
+            exit_code: 0,
+            hang: false,
+        });
+        let (tx, _rx) = mpsc::channel(16);
+        h.rec
+            .run_once(
+                &name("prom"),
+                RunOptions {
+                    command: vec!["true".into()],
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        let run = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .find(|s| s.labels.contains_key(labels::RUN))
+            .expect("a run container");
+        assert_eq!(run.networks, vec!["net-prom"]);
+        assert_eq!(members(&h, "metrics"), vec!["prom"]);
+        assert_eq!(members(&h, "metrics-a"), vec!["a", "prom"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_scraper_nothing_joins() {
+        let h = Harness::new(&format!("{A_IN}{PROM}"));
+        h.fake
+            .network_create(&daemon_network(labels::METRICS_NETWORK))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(members(&h, "metrics"), Vec::<String>::new());
+        assert_eq!(members(&h, "metrics-a"), vec!["a"]);
+        assert_eq!(
+            h.fake.container_spec("prom").unwrap().networks,
+            vec!["net-prom"]
+        );
+    }
+}
+
 // ── One-off containers (`weglarka run`, issue #106) ─────────────────────────
 
 mod run {

@@ -294,6 +294,9 @@ pub struct ReconcilerOptions {
     pub sites_root: Option<PathBuf>,
     /// The token admin API socket and the instances that get it (`[admin.http]`, ADR 0056).
     pub admin_token: Option<crate::admin_token::AdminTokenMount>,
+    /// `[metrics] scraper` (issue #365): the instance kept on the metrics networks. `None` = no app
+    /// is joined; a managed container left on them by an earlier scraper is still detached.
+    pub metrics_scraper: Option<crate::scraper::MetricsScraper>,
 }
 
 impl Default for ReconcilerOptions {
@@ -308,6 +311,7 @@ impl Default for ReconcilerOptions {
             switch_drain: Duration::from_secs(3),
             sites_root: None,
             admin_token: None,
+            metrics_scraper: None,
         }
     }
 }
@@ -990,7 +994,8 @@ impl<P: PodmanClient> Reconciler<P> {
     /// ingress nginx has not detached it yet) is left for a later pass. Only networks Węglarka
     /// created (labelled `weglarka.instance` or `weglarka.managed`) are touched, never
     /// [`labels::INGRESS_NETWORK`]. A per-app metrics network (issue #364) goes once its app is gone
-    /// or no longer sets `metrics_port`; after an opt-out the recreated container is no longer on it.
+    /// or no longer sets `metrics_port`; after an opt-out the recreated container is no longer on it,
+    /// and the scraper (issue #365) is detached from it just before, by [`Self::sync_metrics_networks`].
     async fn prune_networks(&self, apps: &AppsFile) {
         let networks = match self.podman.network_list().await {
             Ok(n) => n,
@@ -999,6 +1004,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 return;
             }
         };
+        // Membership first: a scraper still on an opted-out app's network would keep it in use.
+        self.sync_metrics_networks(apps, &networks).await;
         for net in networks {
             // A shared network (issue #128) belongs to its declaration, not to an instance: it
             // lives as long as `[shared_networks.<name>]` does, whoever is a member right now.
@@ -1117,7 +1124,7 @@ impl<P: PodmanClient> Reconciler<P> {
 /// Whether a network was created by Węglarka (deploy labels it with the instance, ingress with
 /// `weglarka.managed`).
 fn is_weglarka_network(network_labels: &BTreeMap<String, String>) -> bool {
-    network_labels.contains_key(labels::INSTANCE) || network_labels.contains_key("weglarka.managed")
+    network_labels.contains_key(labels::INSTANCE) || network_labels.contains_key(labels::MANAGED)
 }
 
 #[cfg(test)]

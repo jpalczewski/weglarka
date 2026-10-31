@@ -51,6 +51,9 @@ pub struct ConfigView {
 pub struct MetricsView {
     pub listen: SocketAddr,
     pub network: String,
+    /// `[metrics] scraper`: the app kept on the metrics networks (issue #365).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scraper: Option<InstanceName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

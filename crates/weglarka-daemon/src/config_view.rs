@@ -262,10 +262,16 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
 }
 
 fn metrics_view(metrics: &MetricsConfig) -> MetricsView {
-    let MetricsConfig { listen, network } = metrics;
+    let MetricsConfig {
+        listen,
+        network,
+        scraper,
+    } = metrics;
     MetricsView {
         listen: *listen,
         network: network.clone(),
+        // A validated instance name, like `[identity] instance`.
+        scraper: scraper.clone(),
     }
 }
 

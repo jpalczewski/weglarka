@@ -550,7 +550,7 @@ impl<P: PodmanClient> Reconciler<P> {
         if let Some(name) = metrics_network(instance, spec) {
             self.podman
                 .network_create(&NetworkSpec {
-                    name,
+                    name: name.clone(),
                     // Shared with the scraper only, never a route out. Not labelled with the
                     // instance: `prune_networks` keys this one on its own label.
                     internal: true,
@@ -560,6 +560,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     )]),
                 })
                 .await?;
+            // A late opt-in reaches the running scraper live, without restarting it (issue #365).
+            self.join_scraper(instance, &name).await;
         }
         // A changed uid range would make the instance's existing files unreadable
         // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
@@ -596,6 +598,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let name = labels::container_name(instance);
         let (mut networks, network_aliases) = instance_networks(instance, spec);
         networks.extend(metrics_network(instance, spec));
+        networks.extend(self.scraper_networks(instance).await);
         let mut container = container_spec(
             name.clone(),
             image,
@@ -699,6 +702,10 @@ impl<P: PodmanClient> Reconciler<P> {
         // serve, and the instance name there has to move to it in the same switch.
         let (mut networks, network_aliases) = instance_networks(instance, spec);
         networks[0] = staging.clone();
+        // A challenger of the scraper (issue #365) joins its metrics networks up front, unlike the app
+        // network: it only reads, so scraping before its gate is harmless, and being on them from the
+        // start means the serving scraper is never without a network after the switch.
+        networks.extend(self.scraper_networks(instance).await);
         let mut container = container_spec(
             next.clone(),
             image,

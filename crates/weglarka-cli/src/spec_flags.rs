@@ -131,7 +131,8 @@ pub struct SpecFlags {
     pub strategy: Option<StrategyFlag>,
     /// Container port that serves Prometheus metrics (`none` opts out, and drops --metrics-path too).
     /// Opting in puts the container on its own internal network `metrics-<app>`, shared only with
-    /// the scraper; setting or changing it recreates the container once.
+    /// the scraper, which then reaches every port of the container (the network filters no port);
+    /// setting or changing it recreates the container once.
     #[arg(long = "metrics-port", value_name = "PORT|none", value_parser = parse_metrics_port, conflicts_with = "spec")]
     pub metrics_port: Option<Limit<u16>>,
     /// Path of the metrics endpoint, e.g. /internal/metrics (`none` goes back to /metrics). Needs

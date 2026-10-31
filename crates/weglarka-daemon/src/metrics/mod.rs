@@ -198,7 +198,11 @@ pub async fn join_network<P: PodmanClient>(
             name: network.clone(),
             // Nothing on this network needs a route out; the daemon keeps its other networks.
             internal: true,
-            labels: [("weglarka.managed".to_owned(), "metrics".to_owned())].into(),
+            labels: [(
+                weglarka_model::labels::MANAGED.to_owned(),
+                weglarka_model::labels::MANAGED_METRICS.to_owned(),
+            )]
+            .into(),
         })
         .await
         .map_err(|e| format!("create network {network}: {e}"))?;

@@ -73,6 +73,14 @@ pub const INGRESS_NETWORK: &str = "net-weglarka";
 /// Deliberately not `net-*`: reconcile prunes unused `net-<instance>` networks it created.
 pub const METRICS_NETWORK: &str = "metrics";
 
+/// Label on networks Węglarka itself owns (the ingress network, the daemon's metrics network); the
+/// value says which one.
+pub const MANAGED: &str = "weglarka.managed";
+
+/// [`MANAGED`] value of the daemon's metrics network (`[metrics] network`). Reconcile finds that
+/// network by this label, so a renamed `[metrics] network` still has its old network recognised.
+pub const MANAGED_METRICS: &str = "metrics";
+
 /// Prefix of the per-app metrics networks ([`metrics_network_name`]); `[metrics] network` may not
 /// start with it, so the daemon's network never collides with an app's.
 pub const METRICS_APP_NETWORK_PREFIX: &str = "metrics-";
@@ -83,7 +91,8 @@ pub const METRICS_APP_NETWORK_PREFIX: &str = "metrics-";
 pub const METRICS_FOR: &str = "weglarka.metrics-for";
 
 /// Internal network an app with `metrics_port` shares only with the scraper (issue #364), so that
-/// opted-in apps cannot reach each other and the scraper never joins `net-<instance>`. At most
+/// opted-in apps cannot reach each other and the scraper never shares a network with the ingress
+/// nginx. It filters no port: the scraper reaches every port of the app on it. At most
 /// 71 bytes for a 63-byte instance name: libpod caps network names only by its name pattern
 /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), not by length — [`staging_network_name`] is 72 bytes already —
 /// and the bridge interface gets its own short `podmanN` name.
