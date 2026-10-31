@@ -304,8 +304,7 @@ pub fn sanitize_line(raw: &[u8]) -> String {
         }
         match c {
             '\t' => out.push(' '),
-            c if c.is_control() => {}
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' => {}
+            c if weglarka_api::is_unsafe_char(c) => {}
             c => out.push(c),
         }
     }

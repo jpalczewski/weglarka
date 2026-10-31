@@ -16,6 +16,7 @@ pub mod logtime;
 pub mod run;
 pub mod stats;
 pub mod types;
+pub mod untrusted;
 
 pub use access::{ACCESS_STREAM_CONTENT_TYPE, AccessEntry, AccessFrame, AccessFrameDecoder};
 pub use certificates::{CertStatus, CertificateRecord, CertificatesResponse};
@@ -29,6 +30,7 @@ pub use logtime::{MAX_STAMP, parse_rfc3339, stamp_len};
 pub use run::{RUN_STREAM_CONTENT_TYPE, RunFrame, RunFrameDecoder, RunRequest};
 pub use stats::{AppStatsResponse, ContainerStatsView, StatsResponse, StatsRole};
 pub use types::*;
+pub use untrusted::is_unsafe_char;
 
 /// Contract version; path prefix (`/v1/...`). A breaking change means a new prefix.
 pub const API_VERSION: &str = "v1";
