@@ -52,13 +52,18 @@ pub fn tempdir(prefix: &str) -> (tempfile::TempDir, PathBuf) {
 /// `sections` after `[state]`, so a test can add `[runtime]`, `[notify.*]`, `[self_update]` and so
 /// on without copying the whole file.
 pub fn host_toml(root: &Path, top_level: &str, sections: &str) -> String {
+    let ingress = format!(
+        "[ingress]\nmode = \"behind\"\nbind = \"127.0.0.1:18080\"\ntraefik_dynamic_file = \"{}/traefik.yml\"\n",
+        root.display()
+    );
+    host_toml_ingress(root, top_level, &ingress, sections)
+}
+
+/// [`host_toml`] with the whole `[ingress]` table given (an edge host, say).
+pub fn host_toml_ingress(root: &Path, top_level: &str, ingress: &str, sections: &str) -> String {
     format!(
         "{top_level}
-[ingress]
-mode = \"behind\"
-bind = \"127.0.0.1:18080\"
-traefik_dynamic_file = \"{root}/traefik.yml\"
-
+{ingress}
 [admin]
 socket = \"{root}/run/admin.sock\"
 
@@ -88,12 +93,20 @@ pub fn settings(root: &Path, top_level: &str, sections: &str) -> Settings {
     settings
 }
 
+/// [`settings`] with the `[ingress]` table replaced.
+pub fn settings_ingress(root: &Path, top_level: &str, ingress: &str, sections: &str) -> Settings {
+    let host =
+        HostConfig::from_toml_str(&host_toml_ingress(root, top_level, ingress, sections)).unwrap();
+    Settings::from_host(host, root.join("weglarka.toml"))
+}
+
 /// Builds a [`Harness`] whose config differs from [`host_toml`]'s default.
 pub struct Builder {
     dir: tempfile::TempDir,
     root: PathBuf,
     top_level: String,
     sections: String,
+    ingress: Option<String>,
     apps: Option<String>,
     generators: Vec<std::sync::Arc<dyn ConfigGenerator>>,
 }
@@ -113,6 +126,7 @@ impl Builder {
             root,
             top_level: String::new(),
             sections: String::new(),
+            ingress: None,
             apps: None,
             generators: Vec::new(),
         }
@@ -134,6 +148,13 @@ impl Builder {
         self
     }
 
+    /// Replaces the whole `[ingress]` table (the default is `behind` mode): an edge host with
+    /// `https_bind`, for tests that need `[acme]`.
+    pub fn ingress(mut self, toml: &str) -> Self {
+        self.ingress = Some(toml.to_owned());
+        self
+    }
+
     /// Writes `<root>/state/apps.toml` before the daemon starts (startup validation reads it).
     pub fn apps(mut self, apps_toml: &str) -> Self {
         self.apps = Some(apps_toml.to_owned());
@@ -152,13 +173,13 @@ impl Builder {
             std::fs::write(self.root.join("state/apps.toml"), apps).unwrap();
         }
         let fake = FakePodman::new();
-        let running = start_with(
-            settings(&self.root, &self.top_level, &self.sections),
-            fake.clone(),
-            self.generators,
-        )
-        .await
-        .unwrap();
+        let settings = match &self.ingress {
+            Some(ingress) => settings_ingress(&self.root, &self.top_level, ingress, &self.sections),
+            None => settings(&self.root, &self.top_level, &self.sections),
+        };
+        let running = start_with(settings, fake.clone(), self.generators)
+            .await
+            .unwrap();
         Harness {
             _dir: self.dir,
             config_root: self.root.join("config"),

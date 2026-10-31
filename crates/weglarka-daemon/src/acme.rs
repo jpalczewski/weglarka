@@ -68,7 +68,8 @@ impl AcmeStatus {
         }
     }
 
-    fn record(&self, at: SystemTime, failures: Vec<(String, String)>) {
+    /// Stores the outcome of a pass (the worker calls this; integration tests seed it).
+    pub fn record(&self, at: SystemTime, failures: Vec<(String, String)>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.last_pass = Some(at);
         inner.failures = failures;
