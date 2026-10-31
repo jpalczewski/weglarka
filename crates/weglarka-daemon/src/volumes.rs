@@ -25,7 +25,10 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
-use weglarka_api::{ErrorCode, ListVolumesResponse, VolumeSummary, endpoints};
+use weglarka_api::{
+    AppVolumeSummary, ErrorCode, ListAppVolumesResponse, ListVolumesResponse, VolumeSummary,
+    endpoints,
+};
 use weglarka_engine::volumes::ImportMode;
 use weglarka_model::app::{AppSpec, InstanceName};
 use weglarka_model::labels;
@@ -45,6 +48,7 @@ type ApiResult<T> = Result<T, Fail>;
 pub fn routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> {
     Router::new()
         .route(endpoints::VOLUMES_LIST.path, get(list_volumes::<P>))
+        .route(endpoints::APP_VOLUMES_LIST.path, get(list_app_volumes::<P>))
         .route(endpoints::VOLUMES_EXPORT.path, get(export_volume::<P>))
         .route(
             endpoints::VOLUMES_IMPORT.path,
@@ -143,19 +147,18 @@ async fn volume_exists<P: PodmanClient>(d: &Daemon<P>, podman_name: &str) -> Api
     }
 }
 
-async fn list_volumes<P: PodmanClient + 'static>(
-    State(d): Shared<P>,
-    Path(app): Path<String>,
-) -> ApiResult<Response> {
-    let name = parse_name(&app)?;
-    let spec = load_spec(&d, &name)?;
+async fn volume_summaries<P: PodmanClient>(
+    d: &Daemon<P>,
+    name: &InstanceName,
+    spec: &AppSpec,
+) -> ApiResult<Vec<VolumeSummary>> {
     let mut volumes = Vec::with_capacity(spec.volumes.len() + spec.shared_volumes.len());
     for v in &spec.volumes {
-        let podman_name = labels::volume_name(&name, &v.name);
+        let podman_name = labels::volume_name(name, &v.name);
         volumes.push(VolumeSummary {
             name: v.name.clone(),
             target: v.target.clone(),
-            exists: volume_exists(&d, &podman_name).await?,
+            exists: volume_exists(d, &podman_name).await?,
             podman_name,
             shared: false,
         });
@@ -166,12 +169,42 @@ async fn list_volumes<P: PodmanClient + 'static>(
         volumes.push(VolumeSummary {
             name: v.name.to_string(),
             target: v.target.clone(),
-            exists: volume_exists(&d, &podman_name).await?,
+            exists: volume_exists(d, &podman_name).await?,
             podman_name,
             shared: true,
         });
     }
+    Ok(volumes)
+}
+
+async fn list_volumes<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(app): Path<String>,
+) -> ApiResult<Response> {
+    let name = parse_name(&app)?;
+    let spec = load_spec(&d, &name)?;
+    let volumes = volume_summaries(&d, &name, &spec).await?;
     Ok(axum::Json(ListVolumesResponse { volumes }).into_response())
+}
+
+/// The volumes of every app, one row each with its owner (`apps.toml` order is by name).
+async fn list_app_volumes<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    let apps = state::load_apps(&d.paths.state.apps)
+        .map_err(|e| Fail(ErrorCode::Internal, e.to_string()))?
+        .apps;
+    let mut volumes = Vec::new();
+    for (name, spec) in &apps {
+        volumes.extend(
+            volume_summaries(&d, name, spec)
+                .await?
+                .into_iter()
+                .map(|volume| AppVolumeSummary {
+                    app: name.clone(),
+                    volume,
+                }),
+        );
+    }
+    Ok(axum::Json(ListAppVolumesResponse { volumes }).into_response())
 }
 
 async fn export_volume<P: PodmanClient + 'static>(

@@ -39,7 +39,10 @@ async fn recent<P: PodmanClient + 'static>(
     // A cursor from another process is meaningless: `seq` started over with the restart.
     let reset = query.boot.as_deref().is_some_and(|boot| boot != boot_id);
     let cursor = if reset { None } else { query.since };
-    let recent = d.events.since(cursor);
+    let limit = query
+        .limit
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let recent = d.events.since_newest(cursor, limit);
     Ok(axum::Json(EventsResponse {
         events: recent.entries.iter().map(record).collect(),
         boot_id,

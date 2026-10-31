@@ -100,6 +100,12 @@ impl EventHistory {
     /// Entries with `seq > after` (`None` = everything retained). An unknown or too-old cursor is not
     /// an error: what is retained comes back and `dropped` says whether anything was missed.
     pub fn since(&self, cursor: Option<u64>) -> Recent {
+        self.since_newest(cursor, None)
+    }
+
+    /// [`since`](Self::since), keeping only the newest `limit` entries (`None` = all of them).
+    /// `dropped` still describes the cursor, not the limit.
+    pub fn since_newest(&self, cursor: Option<u64>, limit: Option<usize>) -> Recent {
         let inner = self.lock();
         let after = cursor.unwrap_or(0);
         let oldest_seq = inner.entries.front().map(|e| e.seq);
@@ -107,7 +113,10 @@ impl EventHistory {
             cursor.is_some() && oldest_seq.is_some_and(|oldest| oldest > after.saturating_add(1));
         // Seqs are contiguous, so the first wanted entry sits at a computable index.
         let skip = oldest_seq.map_or(0, |oldest| after.saturating_add(1).saturating_sub(oldest));
-        let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+        let mut skip = usize::try_from(skip).unwrap_or(usize::MAX);
+        if let Some(limit) = limit {
+            skip = skip.max(inner.entries.len().saturating_sub(limit));
+        }
         Recent {
             entries: inner.entries.iter().skip(skip).cloned().collect(),
             oldest_seq,
@@ -202,6 +211,21 @@ mod tests {
         let ahead = history.since(Some(99));
         assert!(ahead.entries.is_empty() && !ahead.dropped);
         assert_eq!(ahead.latest_seq, 5);
+    }
+
+    #[test]
+    fn since_newest_keeps_the_last_entries_and_leaves_the_bounds_alone() {
+        let history = EventHistory::default();
+        for n in 0..5 {
+            history.emit(event(n));
+        }
+        let two = history.since_newest(None, Some(2));
+        assert_eq!(seqs(&two), [4, 5]);
+        assert_eq!((two.oldest_seq, two.latest_seq), (Some(1), 5));
+        assert_eq!(seqs(&history.since_newest(Some(3), Some(1))), [5]);
+        assert_eq!(seqs(&history.since_newest(Some(3), Some(9))), [4, 5]);
+        assert!(history.since_newest(Some(5), Some(2)).entries.is_empty());
+        assert_eq!(seqs(&history.since_newest(None, None)), [1, 2, 3, 4, 5]);
     }
 
     #[test]

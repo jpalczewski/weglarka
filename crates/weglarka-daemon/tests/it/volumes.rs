@@ -143,3 +143,36 @@ async fn remove_keeps_volumes_unless_purge_is_requested() {
     assert!(h.fake.containers().iter().all(|c| c.name != "szklana"));
     h.running.stop().await;
 }
+
+#[tokio::test]
+async fn host_wide_listing_names_the_owning_app_on_every_row() {
+    let h = deployed_app().await;
+    let (s, _) = admin(
+        &h,
+        "POST",
+        "/v1/apps",
+        Some(json!({
+            "name": "bez-danych",
+            "spec": {
+                "image": IMAGE,
+                "domains": ["bez.example.eu"],
+                "port": 8085,
+                "health": { "attempts": 1, "window_secs": 1 },
+                "volumes": [{ "name": "cache", "target": "/cache" }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, v) = admin(&h, "GET", "/v1/app-volumes", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v,
+        json!({"volumes": [
+            {"app": "bez-danych", "name": "cache", "target": "/cache", "podman_name": "bez-danych.cache", "exists": true},
+            {"app": "szklana", "name": "data", "target": "/data", "podman_name": "szklana.data", "exists": true},
+        ]})
+    );
+    h.running.stop().await;
+}

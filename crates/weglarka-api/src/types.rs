@@ -260,6 +260,21 @@ pub struct ListVolumesResponse {
     pub volumes: Vec<VolumeSummary>,
 }
 
+/// One row of the host-wide listing: a volume an app declares, with the app that owns the row. A
+/// shared volume appears once per mounting app (`shared` set), like in the per-app listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppVolumeSummary {
+    pub app: InstanceName,
+    #[serde(flatten)]
+    pub volume: VolumeSummary,
+}
+
+/// `GET /v1/app-volumes`: the volumes of every app, sorted by app and then in spec order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListAppVolumesResponse {
+    pub volumes: Vec<AppVolumeSummary>,
+}
+
 /// A shared volume declared once in `apps.toml` and mounted by several instances (issue #33).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedVolumeSummary {
@@ -576,6 +591,11 @@ mod tests {
         assert_eq!(EventsQuery::parse(None).unwrap(), EventsQuery::default());
         let q = EventsQuery::parse(Some("x=1&since=7&boot=1a2b-3c")).unwrap();
         assert_eq!((q.since, q.boot.as_deref()), (Some(7), Some("1a2b-3c")));
+        assert_eq!(q.limit, None);
+        assert_eq!(
+            EventsQuery::parse(Some("limit=50")).unwrap().limit,
+            Some(50)
+        );
         for bad in [
             "since=-1",
             "since=",
@@ -583,6 +603,10 @@ mod tests {
             "boot=",
             "boot=a/b",
             "boot=zz",
+            "limit=0",
+            "limit=",
+            "limit=-3",
+            "limit=2.5",
         ] {
             assert!(EventsQuery::parse(Some(bad)).is_err(), "{bad}");
         }
@@ -777,10 +801,15 @@ pub struct EventsQuery {
     /// so `seq` started over) the cursor is ignored and the answer has `reset` set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<String>,
+    /// Return at most this many events: the newest ones (still oldest first) among those `since`
+    /// selects. `next_seq` is unchanged, so older events skipped by the limit are not delivered
+    /// later; use it to show the latest rows, not to page. Absent = no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 impl EventsQuery {
-    /// Parses a raw query string (`since=12&boot=abc`); unknown keys are ignored.
+    /// Parses a raw query string (`since=12&boot=abc&limit=50`); unknown keys are ignored.
     pub fn parse(raw: Option<&str>) -> Result<Self, String> {
         let mut query = Self::default();
         for kv in raw
@@ -795,6 +824,15 @@ impl EventsQuery {
                         value
                             .parse()
                             .map_err(|_| "`since` must be a non-negative integer".to_owned())?,
+                    );
+                }
+                "limit" => {
+                    query.limit = Some(
+                        value
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| "`limit` must be a positive integer".to_owned())?,
                     );
                 }
                 "boot" => {
