@@ -264,6 +264,7 @@ fn login(site: &Site, token: &str) -> Login {
             access: Arc::new(Secret::new(token)),
             refresh: None,
             access_expires: site.state.clock.now() + Duration::from_secs(3600),
+            refresh_retry_at: None,
         },
         site.state.clock.now(),
     );

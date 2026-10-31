@@ -32,6 +32,9 @@ pub const SESSION_COOKIE: &str = "__Host-weglarka-session";
 pub const LOGIN_COOKIE: &str = "__Host-weglarka-login";
 /// The access token is refreshed when it has less than this left.
 pub const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+/// After a transient refresh failure, how long a session that still holds a working access token
+/// leaves the provider alone.
+pub const REFRESH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_RETURN_TO: usize = 512;
 
 fn cookie(name: &str, value: &str, max_age: Option<u64>) -> HeaderValue {
@@ -237,6 +240,7 @@ async fn callback_inner(
             access: Arc::new(tokens.access),
             refresh: tokens.refresh,
             access_expires: now + tokens.expires_in,
+            refresh_retry_at: None,
         },
         now,
     );
@@ -361,6 +365,11 @@ pub(crate) async fn fresh_token(state: &AppState, session: &Session) -> Option<A
         return Some(tokens.access.clone());
     }
     let expired = now >= tokens.access_expires;
+    // The provider failed a moment ago and the token still works: do not ask again yet. Once the
+    // token has expired the attempt is the last chance, so it is always made.
+    if !expired && tokens.refresh_retry_at.is_some_and(|at| now < at) {
+        return Some(tokens.access.clone());
+    }
     let Some(refresh) = tokens.refresh.as_ref() else {
         if expired {
             session.end();
@@ -375,10 +384,12 @@ pub(crate) async fn fresh_token(state: &AppState, session: &Session) -> Option<A
                 tokens.refresh = Some(rotated);
             }
             tokens.access_expires = state.clock.now() + set.expires_in;
+            tokens.refresh_retry_at = None;
             Some(tokens.access.clone())
         }
-        // A transient failure while the token still works: keep going, retry on the next request.
+        // A transient failure while the token still works: keep going, retry after the backoff.
         Err(e) if !e.is_definitive() && !expired => {
+            tokens.refresh_retry_at = Some(state.clock.now() + REFRESH_BACKOFF);
             tracing::warn!(error = %e, "refreshing the session token failed; will retry");
             Some(tokens.access.clone())
         }

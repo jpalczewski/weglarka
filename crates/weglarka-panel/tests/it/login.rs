@@ -789,6 +789,49 @@ async fn a_provider_outage_does_not_log_out_a_token_that_still_works() {
     assert!(s.state.sessions.is_empty());
 }
 
+#[tokio::test]
+async fn a_provider_outage_is_probed_once_per_interval_not_once_per_request() {
+    let s = setup().await;
+    s.provider.set(|p| p.expires_in = 60 * 5);
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    // Inside the refresh margin (60 s) but not expired.
+    s.clock.advance(Duration::from_secs(5 * 60 - 30));
+    s.provider.set(|p| p.refresh = Refresh::Down);
+    let refresh_calls = || {
+        s.provider
+            .requests("/token")
+            .iter()
+            .filter(|r| r.body.contains("grant_type=refresh_token"))
+            .count()
+    };
+
+    for _ in 0..4 {
+        assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    }
+    assert_eq!(refresh_calls(), 1, "the failure is remembered");
+
+    s.clock.advance(Duration::from_secs(5));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    assert_eq!(refresh_calls(), 1, "still inside the backoff");
+
+    s.clock.advance(Duration::from_secs(6));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    assert_eq!(refresh_calls(), 2, "probed again after the interval");
+
+    // The provider recovers: the next probe renews the token and clears the backoff.
+    s.provider.set(|p| p.refresh = Refresh::Ok);
+    s.clock.advance(Duration::from_secs(11));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    assert_eq!(refresh_calls(), 3);
+    let seen = bearer_seen(&s.daemon);
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("Bearer access-token-1")
+    );
+    assert_ne!(seen.last(), seen.first(), "the renewed token is used");
+}
+
 /// A panel whose daemon answers every request with `status` and `body`.
 async fn setup_refusing_daemon(s: &Setup, status: u16, body: &'static str) -> (AppState, Router) {
     let daemon = mock(move |_, _| (status, body.into())).await;
