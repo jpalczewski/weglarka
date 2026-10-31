@@ -2157,6 +2157,19 @@ async fn identity_provider<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
 /// Largest base config file `identity.base_config` reads.
 const BASE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// The file's text when it is a regular file of at most `cap` bytes (read bounded, whatever the
+/// metadata claimed), else `None`.
+fn read_capped(path: &std::path::Path, cap: u64) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(cap + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= cap).then_some(text)
+}
+
 /// `identity.base_config` (#242): sections of the provider's own base config that the generated config
 /// silently replaces (`access_control`, `identity_providers.oidc.clients`; ADR 0055). Scans only host
 /// files delivered through the provider's `configs` (never a secret's value); a base file delivered
@@ -2183,6 +2196,10 @@ fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChec
         .into_iter()
         .filter(|s| s != GENERATED_CONFIG)
     {
+        // `source` comes from the provider's command: never follow a `..` out of the mount.
+        if source.split('/').any(|seg| seg == "..") {
+            continue;
+        }
         // The mount whose target is `source` or a directory holding it.
         let host = mounts.iter().find_map(|m| {
             let rest = source.strip_prefix(m.target.as_str())?;
@@ -2217,17 +2234,21 @@ fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChec
             vec![host]
         };
         for file in files {
-            let Ok(meta) = std::fs::metadata(&file) else {
+            // A symlink must not lead out of the mount either.
+            let (Ok(real), Some(mount)) = (
+                file.canonicalize(),
+                mounts.iter().find(|m| file.starts_with(&m.source)),
+            ) else {
                 continue;
             };
-            if !meta.is_file() || meta.len() > BASE_CONFIG_MAX_BYTES {
+            if !real.starts_with(&mount.source) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Some(text) = read_capped(&real, BASE_CONFIG_MAX_BYTES) else {
                 continue;
             };
             for section in owned_sections_in(&text) {
-                let entry = format!("{section} in {source}");
+                let entry = format!("{section} in {}", detail(&source));
                 if !found.contains(&entry) {
                     found.push(entry);
                 }
@@ -2251,7 +2272,7 @@ fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChec
             CheckStatus::Info,
             format!(
                 "cannot verify {} (delivered as a secret): make sure it has no access_control or identity_providers.oidc.clients",
-                unverifiable.join(", ")
+                detail(unverifiable.join(", "))
             ),
             Some("see docs/guides/identity-provider.md"),
         ));

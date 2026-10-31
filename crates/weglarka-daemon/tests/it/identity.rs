@@ -365,3 +365,37 @@ async fn a_base_config_delivered_as_a_secret_cannot_be_verified() {
     );
     h.running.stop().await;
 }
+
+#[tokio::test]
+async fn the_base_config_scan_stays_inside_the_mount() {
+    let builder = Builder::new();
+    let config_root = builder.root().join("config");
+    std::fs::create_dir_all(config_root.join("authelia")).unwrap();
+    let outside = config_root.join("other.yml");
+    std::fs::write(&outside, "access_control:\n  default_policy: deny\n").unwrap();
+    std::fs::write(config_root.join("authelia/base.yml"), "server: {}\n").unwrap();
+    // A symlink inside the mount that points out of it.
+    std::os::unix::fs::symlink(&outside, config_root.join("authelia/escape.yml")).unwrap();
+    let h = builder
+        .top_level(&format!(
+            "config_root = {:?}\n",
+            config_root.display().to_string()
+        ))
+        .sections(IDENTITY)
+        .build()
+        .await;
+    let mut p = provider();
+    p["command"] = json!([
+        "authelia",
+        "--config=/config/../other.yml",
+        "--config=/config/escape.yml",
+        "--config=/config/base.yml",
+        "--config=/weglarka/generated/current"
+    ]);
+    // The mount is a directory, so `escape.yml` is a path inside it.
+    p["configs"] = json!([{ "source": "authelia", "target": "/config" }]);
+    add(&h, "authelia", p).await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert!(base_config_check(&report).is_empty(), "{report}");
+    h.running.stop().await;
+}
