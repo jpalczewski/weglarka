@@ -422,7 +422,10 @@ pub fn verify(
             _ => return Err(AuthError::WrongAuthorizedParty),
         }
     }
-    // `exp` is finite and not in the past here; only an absurdly large value fails to convert.
+    // `exp` is finite and not in the past here, so only an absurdly large value (beyond what a
+    // `SystemTime` holds, e.g. `1e30`) fails to convert. That is rejected on purpose as `Malformed`
+    // rather than clamped: no honest provider issues such a token, and clamping would hand the caller
+    // an expiry the token never carried. It still fails closed, and the error names no claim value.
     let exp = Duration::try_from_secs_f64(exp)
         .ok()
         .and_then(|d| UNIX_EPOCH.checked_add(d))
@@ -942,6 +945,27 @@ mod tests {
         c["nonce"] = json!(7);
         c["azp"] = json!(["a"]);
         assert!(check(&issuer, &c).is_ok());
+    }
+
+    #[test]
+    fn a_huge_exp_is_rejected_as_malformed_for_both_token_kinds() {
+        let issuer = TestIssuer::new("k1");
+        for exp in [json!(1e30), json!(u64::MAX), json!(1e300)] {
+            let mut c = claims();
+            c["exp"] = exp.clone();
+            assert_eq!(
+                check(&issuer, &c),
+                Err(AuthError::Malformed),
+                "access {exp}"
+            );
+            let mut c = id_claims();
+            c["exp"] = exp.clone();
+            assert_eq!(
+                verify_with(&issuer, &id_token(&issuer, &c), ID),
+                Err(AuthError::Malformed),
+                "id {exp}"
+            );
+        }
     }
 
     #[test]
