@@ -60,7 +60,7 @@ impl Overrides {
         Ok(UserConfig::load_default()?.host)
     }
 
-    /// `--socket` (or `WEGLARKA_SOCKET`) > `--host` (or `WEGLARKA_HOST`) > `host` in `cli.toml` >
+    /// `--socket` (or `WEGLARKA_SOCKET`; an explicit `--host` has already dropped the variable) > `--host` (or `WEGLARKA_HOST`) > `host` in `cli.toml` >
     /// `admin.socket` from the host config. A socket named on the command line is never
     /// overridden by a `cli.toml` default.
     pub fn target(&self) -> Result<Target, CliError> {

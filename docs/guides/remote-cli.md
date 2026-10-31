@@ -61,7 +61,9 @@ host = "https://panel.example.com"
 ```
 
 Where a command goes, first match wins: `--socket` / `WEGLARKA_SOCKET`, then `--host` / `WEGLARKA_HOST`, then `host` in
-`cli.toml`, then the local `admin.socket` from `weglarka.toml`. `--host` and `--socket` together are refused. On the host
+`cli.toml`, then the local `admin.socket` from `weglarka.toml`. `--host` and `--socket` together on the command line are refused, but an explicit flag beats the other one's variable:
+`weglarka --host https://panel.example.com status` works on a machine that exports `WEGLARKA_SOCKET`, and `--socket` beats
+`WEGLARKA_HOST`. On the host
 itself with a `host` default in `cli.toml`, pass `--socket` to use the local daemon.
 
 The relay forwards your token unchanged and the daemon decides: `read` endpoints need the `read` group, mutations the

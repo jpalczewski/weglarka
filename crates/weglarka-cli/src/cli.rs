@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use weglarka_model::app::BodySizeLimit;
 
 use crate::error::exit;
@@ -29,13 +30,10 @@ pub struct Cli {
 
     /// Address of a remote host's admin panel (after `weglarka login`), e.g. `https://panel.example.com`:
     /// the commands go through the panel instead of the local socket. Also `host` in `cli.toml`.
-    #[arg(
-        long,
-        global = true,
-        env = "WEGLARKA_HOST",
-        value_name = "URL",
-        conflicts_with = "socket"
-    )]
+    ///
+    /// An explicit `--host` beats `WEGLARKA_SOCKET` in the environment, and `--socket` beats
+    /// `WEGLARKA_HOST`; both flags together are refused.
+    #[arg(long, global = true, env = "WEGLARKA_HOST", value_name = "URL")]
     pub host: Option<String>,
 
     #[command(subcommand)]
@@ -116,6 +114,52 @@ pub struct PruneImagesArgs {
     /// List the images that would be removed; remove nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Which of `--socket` / `--host` survives. An explicit flag beats the other one's environment
+/// variable (a machine that exports `WEGLARKA_SOCKET` can still say `--host`); two flags, or two
+/// variables, keep the documented order (the socket first).
+#[derive(Debug, PartialEq, Eq)]
+enum TargetChoice {
+    Both,
+    DropSocket,
+    DropHost,
+    BothFlags,
+}
+
+fn choose_target(socket: Option<ValueSource>, host: Option<ValueSource>) -> TargetChoice {
+    let flag = |s: Option<ValueSource>| s == Some(ValueSource::CommandLine);
+    match (flag(socket), flag(host)) {
+        (true, true) => TargetChoice::BothFlags,
+        (false, true) if socket.is_some() => TargetChoice::DropSocket,
+        (true, false) if host.is_some() => TargetChoice::DropHost,
+        _ => TargetChoice::Both,
+    }
+}
+
+impl Cli {
+    /// `Cli::try_parse` plus the `--socket` / `--host` precedence above (clap's own
+    /// `conflicts_with` would count the environment variables as given).
+    pub fn parse_args<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        match choose_target(matches.value_source("socket"), matches.value_source("host")) {
+            TargetChoice::Both => {}
+            TargetChoice::DropSocket => cli.socket = None,
+            TargetChoice::DropHost => cli.host = None,
+            TargetChoice::BothFlags => {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "the argument '--host <URL>' cannot be used with '--socket <SOCKET>'",
+                ));
+            }
+        }
+        Ok(cli)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -336,5 +380,52 @@ pub(crate) fn parse_pair(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
         _ => Err(format!("expected KEY=VALUE, got {s:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ValueSource::{CommandLine, EnvVariable};
+
+    #[test]
+    fn an_explicit_flag_beats_the_other_ones_environment_variable() {
+        use TargetChoice::*;
+        assert_eq!(
+            choose_target(Some(EnvVariable), Some(CommandLine)),
+            DropSocket
+        );
+        assert_eq!(
+            choose_target(Some(CommandLine), Some(EnvVariable)),
+            DropHost
+        );
+        assert_eq!(
+            choose_target(Some(CommandLine), Some(CommandLine)),
+            BothFlags
+        );
+        // Nothing explicit, or only one side set: the documented order decides later.
+        assert_eq!(choose_target(Some(EnvVariable), Some(EnvVariable)), Both);
+        assert_eq!(choose_target(None, Some(CommandLine)), Both);
+        assert_eq!(choose_target(Some(CommandLine), None), Both);
+        assert_eq!(choose_target(None, None), Both);
+    }
+
+    #[test]
+    fn host_and_socket_flags_together_are_still_refused() {
+        let err = Cli::parse_args([
+            "weglarka",
+            "--host",
+            "https://panel.example.com",
+            "--socket",
+            "/run/w.sock",
+            "status",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let ok = Cli::parse_args(["weglarka", "--host", "https://panel.example.com", "status"]);
+        assert_eq!(
+            ok.unwrap().host.as_deref(),
+            Some("https://panel.example.com")
+        );
     }
 }
