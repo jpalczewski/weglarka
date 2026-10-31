@@ -73,6 +73,24 @@ pub const INGRESS_NETWORK: &str = "net-weglarka";
 /// Deliberately not `net-*`: reconcile prunes unused `net-<instance>` networks it created.
 pub const METRICS_NETWORK: &str = "metrics";
 
+/// Prefix of the per-app metrics networks ([`metrics_network_name`]); `[metrics] network` may not
+/// start with it, so the daemon's network never collides with an app's.
+pub const METRICS_APP_NETWORK_PREFIX: &str = "metrics-";
+
+/// Label marking a per-app metrics network (issue #364); the value is the instance. Deliberately not
+/// [`INSTANCE`]: cleanup keyed on the instance label handles `net-*` networks only, and this one has
+/// its own prune branch keyed on this label.
+pub const METRICS_FOR: &str = "weglarka.metrics-for";
+
+/// Internal network an app with `metrics_port` shares only with the scraper (issue #364), so that
+/// opted-in apps cannot reach each other and the scraper never joins `net-<instance>`. At most
+/// 71 bytes for a 63-byte instance name: libpod caps network names only by its name pattern
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), not by length — [`staging_network_name`] is 72 bytes already —
+/// and the bridge interface gets its own short `podmanN` name.
+pub fn metrics_network_name(instance: &InstanceName) -> String {
+    format!("{METRICS_APP_NETWORK_PREFIX}{instance}")
+}
+
 /// Per-app network that the instance container (and the ingress nginx) joins.
 pub fn network_name(instance: &InstanceName) -> String {
     format!("net-{instance}")
@@ -134,4 +152,27 @@ pub fn run_container_name(instance: &InstanceName, token: &str) -> String {
 /// with an app's container. `token` keeps concurrent forwards of one app apart.
 pub fn forward_container_name(instance: &InstanceName, token: &str) -> String {
     format!("wg-fwd.{instance}.{token}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_metrics_network_of_the_longest_instance_name_is_a_valid_podman_name() {
+        let longest = InstanceName::new("a".repeat(63)).unwrap();
+        let name = metrics_network_name(&longest);
+        assert_eq!(name.len(), 71);
+        // libpod's name pattern `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; the staging network is longer still.
+        assert!(name.starts_with(|c: char| c.is_ascii_alphanumeric()));
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        );
+        assert!(staging_network_name(&longest).len() > name.len());
+        assert_eq!(
+            metrics_network_name(&InstanceName::new("ntfy").unwrap()),
+            "metrics-ntfy"
+        );
+    }
 }

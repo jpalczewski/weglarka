@@ -75,6 +75,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml` | the `[sites.<site>]` sections (declare the environments as plain `kind = "static"` apps if the sites must keep running) | [site environments](site-environments.md) |
 | `apps.toml`, apps | `ingress.auth`, `ingress.auth_exempt_paths` (enforced by nginx since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
 | `apps.toml`, apps | `oidc` (with `device_flow`); the `[oidc_clients.<id>]` sections (with `device_flow`) | [identity provider](identity-provider.md) |
+| `apps.toml`, apps | `metrics_port`, `metrics_path` (`weglarka apps update <app> --metrics-port none`) | [metrics](metrics.md) |
 | `apps.toml`, apps | `ingress.auth_policy`, `ingress.auth_groups` (generated into the provider's access rules since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |

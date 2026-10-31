@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 15**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 15`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 16**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 16`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-model/src/state.rs`); a compile-time assert
@@ -52,6 +52,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 13 | #205 | optional `[sites.<site>]` with environments | [0050](../decisions/0050-site-environments.md) | [site environments](site-environments.md) |
 | 14 | #42 | optional `oidc`, `ingress.auth*` and `[oidc_clients]` (accepted by the parser, every non-default value rejected until the feature lands) | [0051](../decisions/0051-identity-provider-integration.md), [0052](../decisions/0052-forward-auth.md) | — (not enabled yet) |
 | 15 | #43 | optional `oidc.device_flow` and `[oidc_clients.<id>] device_flow`; `redirect_uris` may be empty with it | [0060](../decisions/0060-remote-cli-device-login-via-the-panel.md) | [identity provider](identity-provider.md) |
+| 16 | #364 | optional `metrics_port` and `metrics_path` in app specs | — | [metrics](metrics.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

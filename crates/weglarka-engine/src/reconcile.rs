@@ -954,7 +954,8 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Best effort and idempotent: a network still in use (the container is not pruned yet, or the
     /// ingress nginx has not detached it yet) is left for a later pass. Only networks Węglarka
     /// created (labelled `weglarka.instance` or `weglarka.managed`) are touched, never
-    /// [`labels::INGRESS_NETWORK`].
+    /// [`labels::INGRESS_NETWORK`]. A per-app metrics network (issue #364) goes once its app is gone
+    /// or no longer sets `metrics_port`; after an opt-out the recreated container is no longer on it.
     async fn prune_networks(&self, apps: &AppsFile) {
         let networks = match self.podman.network_list().await {
             Ok(n) => n,
@@ -971,6 +972,21 @@ impl<P: PodmanClient> Reconciler<P> {
                     .is_ok_and(|g| apps.shared_networks.contains_key(&g));
                 if !declared {
                     self.remove_network(&net.name, "shared network that is no longer declared")
+                        .await;
+                }
+                continue;
+            }
+            // Keyed on the label, never on the `metrics-` prefix: only networks the engine created.
+            if let Some(owner) = net.labels.get(labels::METRICS_FOR) {
+                let Ok(instance) = InstanceName::new(owner.as_str()) else {
+                    continue;
+                };
+                let wanted = apps
+                    .apps
+                    .get(&instance)
+                    .is_some_and(|spec| spec.metrics_port.is_some());
+                if !wanted {
+                    self.remove_network(&net.name, "metrics network of an app that opted out")
                         .await;
                 }
                 continue;

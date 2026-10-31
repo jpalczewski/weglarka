@@ -252,3 +252,56 @@ async fn live_join_of_an_internal_network_resolves_by_container_name() {
     client.network_connect(&metrics, &daemon).await.unwrap();
     wait_for_listener(&client, &scraper, &daemon).await;
 }
+
+/// Per-app metrics networks (issue #364): each opted-in app is on its own internal `metrics-<app>`,
+/// a scraper that joins both reaches both by name, and the two apps cannot reach each other there. The
+/// first network carries the longest name an instance can produce (63 + `metrics-` = 71 bytes), which
+/// libpod must accept.
+#[tokio::test]
+async fn per_app_metrics_networks_isolate_apps_from_each_other() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(&socket);
+    let id = run_id();
+    let mut long = format!("it-ma-{id}-");
+    long.extend(std::iter::repeat_n('x', 63 - long.len()));
+    let instance = |n: &str| weglarka_model::app::InstanceName::new(n).unwrap();
+    let (a, b) = (format!("it-ma-{id}"), format!("it-mb-{id}"));
+    let net_a = labels::metrics_network_name(&instance(&long));
+    let net_b = labels::metrics_network_name(&instance(&b));
+    assert_eq!(net_a.len(), 71);
+    let scraper = format!("it-ms-{id}");
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![a.clone(), b.clone(), scraper.clone()],
+        networks: vec![net_a.clone(), net_b.clone()],
+    };
+    let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
+    assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
+
+    for net in [&net_a, &net_b] {
+        client.network_create(&network(net, true)).await.unwrap();
+    }
+    let server_cmd = ["sh", "-c", "while true; do echo hi | nc -l -p 8080; done"];
+    client
+        .container_create(&spec(&a, &[&net_a], &[], &server_cmd))
+        .await
+        .unwrap();
+    client
+        .container_create(&spec(&b, &[&net_b], &[], &server_cmd))
+        .await
+        .unwrap();
+    client
+        .container_create(&spec(&scraper, &[&net_a], &[], &["sleep", "300"]))
+        .await
+        .unwrap();
+    for c in [&a, &b, &scraper] {
+        client.container_start(c).await.unwrap();
+    }
+    // The scraper joins the second network live, as it will for an app that opts in later.
+    client.network_connect(&net_b, &scraper).await.unwrap();
+    wait_for_listener(&client, &scraper, &a).await;
+    wait_for_listener(&client, &scraper, &b).await;
+    // Opted-in apps do not share a network, so neither finds the other.
+    assert_ne!(connect(&client, &a, &b).await, 0);
+    assert_ne!(connect(&client, &b, &a).await, 0);
+}

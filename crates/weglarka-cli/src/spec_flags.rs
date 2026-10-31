@@ -129,6 +129,15 @@ pub struct SpecFlags {
     /// apps only, needs a container healthcheck, ADR 0046). Not part of the spec hash.
     #[arg(long, value_enum, conflicts_with = "spec")]
     pub strategy: Option<StrategyFlag>,
+    /// Container port that serves Prometheus metrics (`none` opts out, and drops --metrics-path too).
+    /// Opting in puts the container on its own internal network `metrics-<app>`, shared only with
+    /// the scraper; setting or changing it recreates the container once.
+    #[arg(long = "metrics-port", value_name = "PORT|none", value_parser = parse_metrics_port, conflicts_with = "spec")]
+    pub metrics_port: Option<Limit<u16>>,
+    /// Path of the metrics endpoint, e.g. /internal/metrics (`none` goes back to /metrics). Needs
+    /// --metrics-port. Not part of the spec hash.
+    #[arg(long = "metrics-path", value_name = "PATH|none", value_parser = parse_metrics_path, conflicts_with = "spec")]
+    pub metrics_path: Option<Limit<String>>,
     /// Join a shared network: NAME[:ALIAS,ALIAS] (`none` leaves it). Members of one network reach
     /// each other by instance name (plus the aliases) on every port; a network membership replaces
     /// the previous one. The network must be declared first (`weglarka networks add NAME`).
@@ -176,6 +185,8 @@ impl SpecFlags {
             && self.reload_signal.is_none()
             && self.strategy.is_none()
             && self.shared_network.is_none()
+            && self.metrics_port.is_none()
+            && self.metrics_path.is_none()
             && !self.hardened
             && self.read_only.is_none()
             && self.tmpfs.is_empty()
@@ -247,6 +258,12 @@ impl SpecFlags {
             Some(SharedNetworkFlag::Leave) => spec.shared_networks.clear(),
             None => {}
         }
+        apply(&mut spec.metrics_port, &self.metrics_port);
+        if spec.metrics_port.is_none() {
+            // A path without a port is invalid; opting out takes the path with it.
+            spec.metrics_path = None;
+        }
+        apply(&mut spec.metrics_path, &self.metrics_path);
         let sec = &mut spec.security;
         if self.hardened {
             sec.read_only = true;
@@ -455,6 +472,22 @@ fn parse_pids(s: &str) -> Result<Limit<u32>, String> {
         _ => Err(format!(
             "invalid pids limit {s:?}: expected a positive integer"
         )),
+    })
+}
+
+fn parse_metrics_port(s: &str) -> Result<Limit<u16>, String> {
+    limit(s, |s| match s.parse::<u16>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("invalid metrics port {s:?}: expected 1-65535")),
+    })
+}
+
+/// The same syntax as a `paths` entry; the daemon validates it again.
+fn parse_metrics_path(s: &str) -> Result<Limit<String>, String> {
+    limit(s, |s| {
+        weglarka_model::app::check_path_prefix(s)
+            .map(|()| s.to_owned())
+            .map_err(|reason| format!("invalid metrics path {s:?}: {reason}"))
     })
 }
 
@@ -687,6 +720,41 @@ mod tests {
         }
         .apply(&mut spec);
         assert!(spec.shared_networks.is_empty());
+    }
+
+    #[test]
+    fn metrics_flags_set_and_clear_the_opt_in() {
+        let mut spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        SpecFlags {
+            metrics_port: Some(parse_metrics_port("9100").unwrap()),
+            metrics_path: Some(parse_metrics_path("/internal/metrics").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert_eq!(spec.metrics_port, Some(9100));
+        assert_eq!(spec.metrics_path.as_deref(), Some("/internal/metrics"));
+        SpecFlags {
+            metrics_path: Some(parse_metrics_path("none").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert_eq!(
+            (spec.metrics_port, spec.metrics_path.as_deref()),
+            (Some(9100), None)
+        );
+        spec.metrics_path = Some("/m".into());
+        SpecFlags {
+            metrics_port: Some(parse_metrics_port("NONE").unwrap()),
+            ..SpecFlags::default()
+        }
+        .apply(&mut spec);
+        assert_eq!((spec.metrics_port, spec.metrics_path), (None, None));
+        for bad in ["0", "65536", "x"] {
+            assert!(parse_metrics_port(bad).is_err(), "{bad}");
+        }
+        for bad in ["metrics", "/m?x=1", "/m#f", "/a/../b"] {
+            assert!(parse_metrics_path(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

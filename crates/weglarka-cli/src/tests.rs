@@ -1049,6 +1049,28 @@ fn show_renders_config_mounts_with_short_fingerprints_and_details() {
     assert!(!render_show(&show_app(true)).contains("[configs]"));
 }
 
+#[test]
+fn show_renders_the_metrics_opt_in_and_add_takes_the_flags() {
+    let mut app = show_app(true);
+    app.spec.metrics_port = Some(9100);
+    app.spec.metrics_path = Some("/internal/metrics".into());
+    let out = render_show(&app);
+    assert!(
+        out.contains("metrics_port = 9100\nmetrics_path = \"/internal/metrics\""),
+        "{out}"
+    );
+    assert!(!render_show(&show_app(true)).contains("metrics_"));
+    let spec = build_spec(&add_args(&[
+        "--metrics-port",
+        "9100",
+        "--metrics-path",
+        "/m",
+    ]))
+    .unwrap();
+    assert_eq!(spec.metrics_port, Some(9100));
+    assert_eq!(spec.metrics_path.as_deref(), Some("/m"));
+}
+
 fn reload_response(action: ReloadAction) -> ReloadResponse {
     ReloadResponse {
         name: InstanceName::new("prometheus").unwrap(),

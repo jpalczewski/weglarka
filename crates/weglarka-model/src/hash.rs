@@ -91,6 +91,12 @@ struct HashInput<'a> {
     /// Requested supplementary groups (issue #178); sorted, skipped while empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_add: Vec<&'a str>,
+    /// Metrics opt-in (issue #364): it adds the container to `metrics-<instance>`, so setting or
+    /// changing it recreates the container once, like a shared-network change. Skipped while unset,
+    /// so an app that does not opt in hashes exactly as before. `metrics_path` stays outside: only the
+    /// scraper reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_port: Option<u16>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -192,6 +198,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         configs,
         host_mounts,
         group_add,
+        metrics_port: spec.metrics_port,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -544,6 +551,28 @@ env = { B = "2", A = "1" }
             s.shared_volumes.push(mount("a", "/a", false));
         });
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn metrics_port_changes_the_hash_only_when_set_and_metrics_path_never() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        assert_eq!(base, hash(&|_| {}), "no metrics opt-in hashes as before");
+        let on = hash(&|s| s.metrics_port = Some(9100));
+        assert_ne!(base, on, "opting in changes the container's networks");
+        assert_ne!(on, hash(&|s| s.metrics_port = Some(9200)));
+        assert_eq!(
+            on,
+            hash(&|s| {
+                s.metrics_port = Some(9100);
+                s.metrics_path = Some("/internal/metrics".into());
+            }),
+            "only the scraper reads the path"
+        );
     }
 
     #[test]

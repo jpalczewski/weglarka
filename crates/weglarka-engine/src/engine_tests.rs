@@ -2408,6 +2408,137 @@ async fn a_declaration_with_members_cannot_be_removed() {
     h.rec.declare_shared_network(net).await.unwrap();
 }
 
+// ── Per-app metrics networks (issue #364) ───────────────────────────────────
+
+mod metrics_network {
+    use super::*;
+
+    const PLAIN: &str = "[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n";
+    const OPTED_IN: &str =
+        "[apps.a]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nmetrics_port = 9100\n";
+
+    async fn deployed(apps: &str) -> Harness {
+        let h = Harness::new(apps);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_opted_in_app_gets_its_own_internal_network() {
+        let h = deployed(&format!("{OPTED_IN}[apps.b]\nimage = \"{IMAGE}\"\n")).await;
+        let net = h.fake.network_spec("metrics-a").expect("network created");
+        assert!(net.internal, "no route out");
+        assert_eq!(
+            net.labels,
+            BTreeMap::from([(labels::METRICS_FOR.to_owned(), "a".to_owned())]),
+            "its own label, not the instance label of `net-*`"
+        );
+        let a = h.fake.container_spec("a").unwrap();
+        assert_eq!(a.networks, vec!["net-a", "metrics-a"]);
+        assert!(
+            a.network_aliases.is_empty(),
+            "the container name is the DNS name"
+        );
+        assert_eq!(h.fake.network_members("metrics-a"), vec!["a"]);
+        // An app that does not opt in gets nothing, and nobody else is on `a`'s network.
+        assert_eq!(h.fake.container_spec("b").unwrap().networks, vec!["net-b"]);
+        assert!(!h.fake.networks().contains(&"metrics-b".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opting_in_and_out_recreates_the_container_and_out_removes_the_network() {
+        let h = deployed(PLAIN).await;
+        let before = h.fake.container_spec("a").unwrap();
+        assert_eq!(before.networks, vec!["net-a"]);
+
+        h.set_apps(OPTED_IN);
+        h.rec.reconcile().await.unwrap();
+        let joined = h.fake.container_spec("a").unwrap();
+        assert_eq!(joined.networks, vec!["net-a", "metrics-a"]);
+        assert_ne!(
+            before.labels[labels::SPEC_HASH],
+            joined.labels[labels::SPEC_HASH]
+        );
+
+        // The path alone is not a container setting: nothing is recreated.
+        h.set_apps(&format!("{OPTED_IN}metrics_path = \"/internal/metrics\"\n"));
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(
+            h.fake.container_spec("a").unwrap().labels[labels::SPEC_HASH],
+            joined.labels[labels::SPEC_HASH]
+        );
+
+        // Opting out: the recreated container is not on it, and the same pass removes it.
+        h.set_apps(PLAIN);
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(h.fake.container_spec("a").unwrap().networks, vec!["net-a"]);
+        assert!(
+            !h.fake.networks().contains(&"metrics-a".to_owned()),
+            "{:?}",
+            h.fake.networks()
+        );
+        assert!(h.fake.networks().contains(&"net-a".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_app_takes_its_metrics_network_with_it() {
+        let h = deployed(OPTED_IN).await;
+        h.set_apps("");
+        h.rec.reconcile().await.unwrap();
+        let nets = h.fake.networks();
+        assert!(!nets.contains(&"metrics-a".to_owned()), "{nets:?}");
+        assert!(!nets.contains(&"net-a".to_owned()), "{nets:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_goes_by_the_label_and_leaves_a_network_in_use() {
+        let h = Harness::new(OPTED_IN);
+        let labelled = |name: &str, owner: &str| NetworkSpec {
+            name: name.to_owned(),
+            internal: true,
+            labels: BTreeMap::from([(labels::METRICS_FOR.to_owned(), owner.to_owned())]),
+        };
+        // Not created by the engine: the name alone decides nothing.
+        h.fake
+            .network_create(&NetworkSpec {
+                name: "metrics-stranger".into(),
+                internal: true,
+                labels: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        h.fake
+            .network_create(&labelled("metrics-gone", "gone"))
+            .await
+            .unwrap();
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        let nets = h.fake.networks();
+        assert!(nets.contains(&"metrics-a".to_owned()), "opted in: {nets:?}");
+        assert!(nets.contains(&"metrics-stranger".to_owned()), "{nets:?}");
+        assert!(!nets.contains(&"metrics-gone".to_owned()), "{nets:?}");
+
+        // Opted out while something else (a scraper) is still attached: removal is best effort, the
+        // network stays for a later pass and nothing fails.
+        h.fake.add_foreign_container("scraper", IMAGE);
+        h.fake
+            .network_connect("metrics-a", "scraper")
+            .await
+            .unwrap();
+        h.set_apps(PLAIN);
+        h.rec.reconcile().await.unwrap();
+        assert!(h.fake.networks().contains(&"metrics-a".to_owned()));
+        assert_eq!(h.fake.network_members("metrics-a"), vec!["scraper"]);
+        h.fake
+            .network_disconnect("metrics-a", "scraper")
+            .await
+            .unwrap();
+        h.rec.reconcile().await.unwrap();
+        assert!(!h.fake.networks().contains(&"metrics-a".to_owned()));
+    }
+}
+
 // ── One-off containers (`weglarka run`, issue #106) ─────────────────────────
 
 mod run {
@@ -3255,6 +3386,77 @@ health = { attempts = 3, window_secs = 6, command = ["true"] }
                 .map(String::as_str),
             Some("ntfy")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_metrics_network_moves_to_the_challenger_only_after_its_gate() {
+        let apps = format!("{BG}metrics_port = 9100\n");
+        let h = deployed_bg(&apps).await;
+        let ntfy = name("ntfy");
+        let metrics_net = labels::metrics_network_name(&ntfy);
+        assert_eq!(h.fake.network_members(&metrics_net), vec!["ntfy"]);
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("ntfy.next", [HealthStatus::Healthy]);
+        let before = h.fake.calls().len();
+
+        assert!(matches!(
+            h.rec.deploy(&ntfy, false).await.unwrap(),
+            DeployOutcome::Deployed { .. }
+        ));
+        let calls = h.fake.calls()[before..].to_vec();
+        let alias = |network: String| Call::NetworkConnectAliased {
+            network,
+            container: "ntfy.next".into(),
+            aliases: vec!["ntfy".into()],
+        };
+        // Joined after the gate, with the instance name as its alias, before the names swap: a
+        // target `ntfy:9100` resolves through the whole switch.
+        let order = [
+            Call::HealthcheckRun("ntfy.next".into()),
+            alias(labels::network_name(&ntfy)),
+            alias(metrics_net.clone()),
+            Call::ContainerRename {
+                from: "ntfy".into(),
+                to: "ntfy.prev".into(),
+            },
+            Call::ContainerStop("ntfy.prev".into()),
+        ];
+        let positions: Vec<usize> = order.iter().map(|c| pos(&calls, c)).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+        assert_eq!(h.fake.network_members(&metrics_net), vec!["ntfy"]);
+        let containers = h.fake.containers();
+        assert_eq!(containers.len(), 1, "{containers:?}");
+        assert!(
+            h.container_digest_ref("ntfy")
+                .ends_with(digest('b').as_str())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_challenger_that_fails_its_gate_never_joins_the_metrics_network() {
+        let apps = format!("{BG}metrics_port = 9100\n");
+        let h = deployed_bg(&apps).await;
+        let ntfy = name("ntfy");
+        let metrics_net = labels::metrics_network_name(&ntfy);
+        h.fake.set_pull_digest(IMAGE, digest('b'));
+        h.fake.script_health("ntfy.next", [HealthStatus::Unhealthy]);
+        let before = h.fake.calls().len();
+
+        let out = h.rec.deploy(&ntfy, false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Failed { .. }), "{out:?}");
+        let calls = h.fake.calls()[before..].to_vec();
+        assert!(!calls.iter().any(|c| matches!(
+            c,
+            Call::NetworkConnectAliased { network, .. } if *network == metrics_net
+        )));
+        let created = h
+            .fake
+            .created_specs()
+            .into_iter()
+            .rfind(|c| c.name == "ntfy.next")
+            .expect("a challenger was created");
+        assert!(!created.networks.contains(&metrics_net), "{created:?}");
+        assert_eq!(h.fake.network_members(&metrics_net), vec!["ntfy"]);
     }
 
     #[tokio::test(start_paused = true)]

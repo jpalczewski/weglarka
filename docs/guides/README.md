@@ -68,7 +68,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 
 | Guide | Covers |
 |---|---|
-| [Metrics](metrics.md) | The opt-in Prometheus `/metrics` listener on a dedicated network (`[metrics]`) |
+| [Metrics](metrics.md) | The opt-in Prometheus `/metrics` listener on a dedicated network (`[metrics]`), and opting an app in (`metrics_port`) |
 | [Notifications](notifications.md) | ntfy notifications, outbox, deduplication |
 | [Crash detection](crash-detection.md) | Crash loops and unhealthy apps (`[monitor]`) |
 | [Self-update](self-update.md) | Signed image updates, watchdog and automatic fallback |

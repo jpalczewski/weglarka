@@ -146,7 +146,9 @@ expression: shown
         "kind": "env",
         "var": "OIDC_SECRET"
       }
-    }
+    },
+    "metrics_port": 9100,
+    "metrics_path": "/internal/metrics"
   },
   "state": {
     "generation": 0,
