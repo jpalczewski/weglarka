@@ -180,6 +180,24 @@ async fn bad_configuration_exits_non_zero_without_leaking_the_secret() {
     assert!(outcome.output().contains(ENV_CLIENT_SECRET));
 }
 
+#[test]
+fn output_larger_than_a_pipe_buffer_does_not_stall_the_child() {
+    // 256 KiB on each stream is four times a typical pipe buffer; undrained, `sh` blocks on the
+    // first write and never exits.
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args([
+        "-c",
+        "head -c 262144 /dev/zero | tr '\\0' o; head -c 262144 /dev/zero | tr '\\0' e >&2",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let outcome = run_to_exit(cmd);
+    assert!(outcome.status.success(), "{:?}", outcome.status);
+    assert_eq!(outcome.stdout.len(), 262_144);
+    assert_eq!(outcome.stderr.len(), 262_144);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_instance_on_the_same_port_fails_cleanly() {
     let daemon = mock(|_, _| (200, "{}".into())).await;

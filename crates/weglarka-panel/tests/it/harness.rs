@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use weglarka_panel::config::{
@@ -46,6 +48,45 @@ impl Outcome {
 pub struct Panel {
     child: Child,
     pub addr: SocketAddr,
+    stdout: Drain,
+    stderr: Drain,
+}
+
+/// Reads a child's pipe on a background thread from the start, so a chatty child never blocks
+/// on a full pipe buffer (~64 KiB) while the test is busy elsewhere. Without it a burst of logs
+/// stalls the panel and the test fails with a misleading timeout.
+struct Drain {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl Drain {
+    fn start(pipe: Option<impl Read + Send + 'static>) -> Self {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let reader = pipe.map(|mut pipe| {
+            let buffer = Arc::clone(&buffer);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                // EOF (the child closed the pipe) or an error ends the thread.
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    buffer.lock().unwrap().extend_from_slice(&chunk[..n]);
+                }
+            })
+        });
+        Self { buffer, reader }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buffer.lock().unwrap()).into_owned()
+    }
+
+    /// Waits for end of stream (the child exited), then returns the whole text.
+    fn finish(&mut self) -> String {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.text()
+    }
 }
 
 /// The command for a valid configuration listening on `addr`; callers override with `.env(..)`
@@ -81,13 +122,21 @@ impl Panel {
     }
 
     /// Spawns `cmd` and waits for it to serve on `addr`; panics if it exits or stays silent.
-    pub fn spawn(mut cmd: Command, addr: SocketAddr) -> Self {
-        let mut panel = Self {
-            child: cmd.spawn().expect("cannot spawn weglarka-panel"),
-            addr,
-        };
+    pub fn spawn(cmd: Command, addr: SocketAddr) -> Self {
+        let mut panel = Self::launch(cmd, addr);
         panel.wait_ready();
         panel
+    }
+
+    /// Spawns `cmd` and starts draining its output, without waiting for it to serve.
+    fn launch(mut cmd: Command, addr: SocketAddr) -> Self {
+        let mut child = cmd.spawn().expect("cannot spawn weglarka-panel");
+        Self {
+            stdout: Drain::start(child.stdout.take()),
+            stderr: Drain::start(child.stderr.take()),
+            child,
+            addr,
+        }
     }
 
     fn wait_ready(&mut self) {
@@ -138,17 +187,10 @@ impl Panel {
     }
 
     fn collect(&mut self, status: ExitStatus) -> Outcome {
-        let read = |pipe: Option<&mut dyn Read>| {
-            let mut text = String::new();
-            if let Some(pipe) = pipe {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        };
         Outcome {
             status,
-            stdout: read(self.child.stdout.as_mut().map(|p| p as &mut dyn Read)),
-            stderr: read(self.child.stderr.as_mut().map(|p| p as &mut dyn Read)),
+            stdout: self.stdout.finish(),
+            stderr: self.stderr.finish(),
         }
     }
 }
@@ -163,12 +205,8 @@ impl Drop for Panel {
 }
 
 /// Runs `cmd` expecting it to stop on its own (bad configuration, port taken).
-pub fn run_to_exit(mut cmd: Command) -> Outcome {
-    let child = cmd.spawn().expect("cannot spawn weglarka-panel");
-    let mut panel = Panel {
-        child,
-        addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-    };
+pub fn run_to_exit(cmd: Command) -> Outcome {
+    let mut panel = Panel::launch(cmd, SocketAddr::from(([127, 0, 0, 1], 0)));
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
         if let Some(status) = panel.child.try_wait().unwrap() {
