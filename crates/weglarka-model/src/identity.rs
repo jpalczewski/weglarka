@@ -146,6 +146,52 @@ pub fn config_sources(command: &[String]) -> Vec<String> {
     out
 }
 
+/// A section of the provider's configuration that Węglarka generates as a whole file, so a copy in
+/// an operator's base file is silently replaced (#242): the provider replaces lists wholesale with
+/// the last source.
+pub const OWNED_SECTIONS: &[&str] = &["access_control", "identity_providers.oidc.clients"];
+
+/// The [`OWNED_SECTIONS`] a base config file (YAML text) still carries, as dotted paths.
+///
+/// A line scan, not a YAML parse: it follows the nesting of `key:` lines by indentation, which is
+/// enough to find a top-level `access_control:` and `identity_providers: oidc: clients:` in the
+/// block style the provider documents. Comments, list items and flow-style mappings are ignored, so
+/// it can miss a section written some unusual way but never reports one that is not there.
+pub fn owned_sections_in(yaml: &str) -> Vec<&'static str> {
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    let mut found = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let Some((key, _)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim_end().trim_matches(['"', '\'']);
+        if key.is_empty() || key.contains([' ', '{', '[']) {
+            continue;
+        }
+        while stack.last().is_some_and(|(i, _)| *i >= indent) {
+            stack.pop();
+        }
+        stack.push((indent, key));
+        let path: Vec<&str> = stack.iter().map(|(_, k)| *k).collect();
+        let hit = match path.as_slice() {
+            ["access_control"] => Some(OWNED_SECTIONS[0]),
+            ["identity_providers", "oidc", "clients"] => Some(OWNED_SECTIONS[1]),
+            _ => None,
+        };
+        if let Some(hit) = hit
+            && !found.contains(&hit)
+        {
+            found.push(hit);
+        }
+    }
+    found
+}
+
 /// Whether `command` loads [`GENERATED_CONFIG`] as its last config source.
 pub fn loads_generated_last(command: &[String]) -> bool {
     config_sources(command).last().map(String::as_str) == Some(GENERATED_CONFIG)
