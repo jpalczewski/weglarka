@@ -5149,6 +5149,303 @@ health = { attempts = 2, window_secs = 2 }
         assert!(h.fake.containers().is_empty());
         assert!(live(&h).is_none());
     }
+
+    fn state_file(h: &Harness) -> GeneratedState {
+        GeneratedState::load(&h.dir.path().join("generated.toml"))
+    }
+
+    fn write_state_file(h: &Harness, state: &GeneratedState) {
+        state.save(&h.dir.path().join("generated.toml")).unwrap();
+    }
+
+    fn rejected(consumer: Option<&str>, g: &TestGen) -> GeneratedState {
+        let mut state = GeneratedState::default();
+        let record = state.entry("test");
+        record.consumer = consumer.map(str::to_owned);
+        record.attempted = Some(g.fingerprint().to_string());
+        record.last_result = LastResult::Invalid;
+        state
+    }
+
+    fn wired(g: &Arc<TestGen>) -> Harness {
+        let h = Harness::build_with(
+            IDP,
+            ReconcilerOptions::default(),
+            crash::Policy::disabled(),
+            Some(wiring(g)),
+        );
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_consumer_removes_its_files_and_record_and_nothing_else() {
+        let g = TestGen::new(true);
+        let h = wired(&g);
+        h.rec.reconcile().await.unwrap();
+        let root = h.rec.generated_dir(&name("idp"));
+        assert!(root.is_dir());
+        assert!(state_file(&h).get("test").is_some());
+        // Not an instance name, so nothing the pipeline wrote.
+        let foreign = root.parent().unwrap().join("Keep_Me");
+        std::fs::create_dir(&foreign).unwrap();
+        let mut state = state_file(&h);
+        state.entry("other").consumer = Some("other".into());
+        let other_dir = h.rec.generated_dir(&name("other"));
+        std::fs::create_dir(&other_dir).unwrap();
+        write_state_file(&h, &state);
+        h.set_apps(&IDP.replace("[apps.idp]", "[apps.other]"));
+
+        h.rec.reconcile().await.unwrap();
+
+        assert!(!root.exists(), "the digests must not outlive the app");
+        assert!(state_file(&h).get("test").is_none());
+        assert!(foreign.is_dir());
+        assert!(other_dir.is_dir(), "another consumer is not touched");
+        assert!(state_file(&h).get("other").is_some());
+        // Idempotent: nothing left to do, nothing to fail on.
+        assert!(h.rec.reconcile().await.unwrap().is_clean());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_app_that_only_lost_its_role_keeps_its_files_until_the_app_goes() {
+        // No wiring: the daemon restarted without `[identity]` or `[metrics] scraper`.
+        let h = deployed().await;
+        let g = TestGen::new(false);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        apply(&h, &g, false).await;
+        let version = live(&h).expect("a live version");
+
+        h.rec.reconcile().await.unwrap();
+
+        assert_eq!(live(&h).as_ref(), Some(&version));
+        assert_eq!(record(&h).last_result, LastResult::Applied);
+
+        // The role comes back: the files are where they were and nothing is applied again.
+        let stops_before = stops(&h);
+        assert_eq!(apply(&h, &g, false).await, GeneratedOutcome::Unchanged);
+        assert_eq!(stops(&h), stops_before);
+
+        // No generator is registered, and the app's removal still cleans up.
+        h.set_apps("");
+        h.rec.reconcile().await.unwrap();
+        assert!(!h.rec.generated_dir(&name("idp")).exists());
+        assert!(state_file(&h).get("test").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_files_stay_while_a_container_of_the_instance_may_mount_them() {
+        let h = deployed().await;
+        let g = TestGen::new(false);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        apply(&h, &g, false).await;
+        let root = h.rec.generated_dir(&name("idp"));
+        h.set_apps("");
+        let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+
+        // The serving container is still there: this is a pass that could not remove it.
+        {
+            let guard = h.rec.acquire().await;
+            h.rec.prune_generated(&guard, &apps).await;
+        }
+        assert!(root.is_dir());
+        assert!(state_file(&h).get("test").is_some());
+
+        h.rec.reconcile().await.unwrap();
+        assert!(!root.exists());
+        assert!(state_file(&h).get("test").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_one_off_container_of_a_removed_app_holds_the_files_back() {
+        let h = deployed().await;
+        let g = TestGen::new(false);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        apply(&h, &g, false).await;
+        let root = h.rec.generated_dir(&name("idp"));
+        let pending = h
+            .rec
+            .prepare_run(
+                &name("idp"),
+                &crate::run::RunOptions {
+                    command: vec!["true".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        h.set_apps("");
+
+        h.rec.reconcile().await.unwrap();
+        assert!(root.is_dir());
+
+        drop(pending);
+        tokio::task::yield_now().await;
+        for c in h.fake.containers() {
+            h.fake.container_remove(&c.name, true).await.unwrap();
+        }
+        h.rec.reconcile().await.unwrap();
+        assert!(!root.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_left_by_a_removed_consumer_does_not_skip_the_re_added_one() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        h.fake.script_next_run(RunScript {
+            output: vec![(LogSource::Stderr, b"bad\n".to_vec())],
+            exit_code: 1,
+            hang: false,
+        });
+        assert!(matches!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Invalid { .. }
+        ));
+
+        h.set_apps("");
+        h.rec.reconcile().await.unwrap();
+        assert!(state_file(&h).get("test").is_none());
+
+        h.set_apps(IDP);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+        let runs = run_specs(&h).len();
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        let GeneratedOutcome::Applied { validated, .. } = apply(&h, &g, false).await else {
+            panic!("the same render must be tried for the new app");
+        };
+        assert!(validated, "and checked by its validator");
+        assert_eq!(run_specs(&h).len(), runs + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_record_whose_version_is_gone_does_not_skip_the_render() {
+        // The record survived its directory (its removal could not be saved).
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        write_state_file(&h, &rejected(Some("idp"), &g));
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        assert!(matches!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Applied {
+                validated: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_of_the_former_consumer_says_nothing_about_the_new_one() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        let mut state = rejected(Some("former"), &g);
+        state.entry("test").applied = Some(g.fingerprint().to_string());
+        write_state_file(&h, &state);
+        // Its version is on disk under this consumer too: only the owner tells them apart.
+        write_version(
+            &h.rec.generated_dir(&name("idp")),
+            &g.fingerprint().version_dir(),
+            &g.files(),
+        )
+        .unwrap();
+        h.fake.script_next_run(RunScript {
+            output: vec![(LogSource::Stderr, b"bad\n".to_vec())],
+            exit_code: 1,
+            hang: false,
+        });
+
+        assert!(matches!(
+            apply(&h, &g, false).await,
+            GeneratedOutcome::Invalid { .. }
+        ));
+
+        let rec = record(&h);
+        assert_eq!(rec.consumer.as_deref(), Some("idp"));
+        assert_eq!(
+            rec.applied, None,
+            "the former consumer's version is not ours"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_re_added_app_does_not_start_on_the_files_of_its_predecessor() {
+        let g = TestGen::new(true);
+        let h = wired(&g);
+        h.rec.reconcile().await.unwrap();
+        let old = live(&h).expect("a live version");
+
+        // Purged and re-added before any pass could prune: state is gone, the files are not.
+        h.rec
+            .remove_app_with_purges(
+                &name("idp"),
+                crate::volumes::RemoveAppOptions {
+                    purge_volumes: true,
+                    purge_secrets: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(live(&h).as_ref(), Some(&old));
+        h.set_apps(IDP);
+        g.set("v2");
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        h.rec.reconcile().await.unwrap();
+
+        assert_eq!(live(&h), Some(g.fingerprint().version_dir()));
+        assert!(
+            !h.rec.generated_dir(&name("idp")).join(&old).exists(),
+            "the predecessor's digests are gone"
+        );
+        assert_eq!(apply(&h, &g, false).await, GeneratedOutcome::Unchanged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deployed_consumer_keeps_its_current_version_across_launches() {
+        let g = TestGen::new(true);
+        let h = wired(&g);
+        h.rec.reconcile().await.unwrap();
+        let first = live(&h);
+        g.set("v2");
+        let events = h.sink.events().len();
+
+        h.rec.bootstrap_generated(&name("idp")).await.unwrap();
+
+        assert_eq!(live(&h), first, "changes go through the validated pipeline");
+        assert_eq!(h.sink.events().len(), events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_from_before_records_named_their_consumer_is_kept_until_the_app_goes() {
+        let h = deployed().await;
+        let g = TestGen::new(false);
+        h.fake.script_health("idp", [HealthStatus::Healthy]);
+        apply(&h, &g, false).await;
+        let mut state = state_file(&h);
+        state.entry("test").consumer = None;
+        write_state_file(&h, &state);
+
+        // An upgrade neither loses the record nor reloads the consumer.
+        h.rec.reconcile().await.unwrap();
+        assert!(state_file(&h).get("test").is_some());
+        let stops_before = stops(&h);
+        assert_eq!(apply(&h, &g, false).await, GeneratedOutcome::Unchanged);
+        assert_eq!(stops(&h), stops_before);
+
+        h.set_apps("");
+        h.rec.reconcile().await.unwrap();
+        assert!(!h.rec.generated_dir(&name("idp")).exists());
+        assert!(state_file(&h).get("test").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_without_a_consumer_or_files_is_dropped() {
+        let h = deployed().await;
+        let g = TestGen::new(true);
+        write_state_file(&h, &rejected(None, &g));
+        h.rec.reconcile().await.unwrap();
+        assert!(state_file(&h).get("test").is_none());
+    }
 }
 
 mod admin_token {

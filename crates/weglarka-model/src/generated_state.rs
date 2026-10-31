@@ -40,6 +40,9 @@ pub enum LastResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneratorRecord {
+    /// The instance the record is about: a generator's id outlives its consumer (the scraper role can
+    /// move). Absent in a record written before this field existed.
+    pub consumer: Option<String>,
     /// Fingerprint of the version the consumer is running (or will read on its next start).
     pub applied: Option<String>,
     /// Fingerprint of the last render the pipeline tried to put live. A failed attempt of the same

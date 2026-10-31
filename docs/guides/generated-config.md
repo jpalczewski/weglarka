@@ -30,12 +30,22 @@ Whenever `apps.toml` changes (and once when the daemon starts), after a 2 second
 
 The first launch of an app whose generator has not run yet writes its files **before** the container is created (the identity provider will not start without its access rules). That version cannot be validated; the app's own start is the validation, and a bad render shows up as a failed deploy with the app's logs.
 
+## When the app or the role goes
+
+**The app is removed from `apps.toml`.** The next reconcile pass after its containers are gone (the app's own, and any `weglarka run` or `weglarka forward` container of it) deletes `<state dir>/generated/<app>/` and the app's tables in `generated.toml`. This is deliberate: the identity provider's files hold credential digests, and nothing else would ever remove them. It happens with or without `--purge-volumes`, and whether or not a generator is still registered. Back up the directory first if you want the files.
+
+**The app stays but loses the role** (`[identity]` or `[metrics] scraper` removed from `weglarka.toml`, or the scraper role moved to another app). Nothing is deleted: the setting may be coming back, and the app still exists. The container is recreated without the mount, and the files and the record wait on disk. When the role returns, the files are mounted again and the next pass renders as usual. If you drop the role for good and want the files gone, delete `<state dir>/generated/<app>/` by hand, or they go when the app does.
+
+**An app of the same name is added later.** It starts clean: its first launch renders new files instead of using an old `current`, and a failure remembered for the old app does not make the same render skip its validator. A `current` is only trusted for an app with a deployed image.
+
+If you remove an app without purging and add it back before the next pass, it is the same app to Węglarka (its state and pinned image are still there), so it keeps its files.
+
 ## Checking
 
 `weglarka doctor` has one check per generator, `generated.<id>`: the live and the applied version, `unvalidated` for a version applied without the validator, and — after a failure — what the validator or the health gate said. A live version that differs from the applied one means a restart interrupted a switch; the next pass finishes it.
 
 ## Rollback
 
-There are no new `apps.toml` or `state.toml` fields and no `schema_version` bump, so nothing has to be removed before downgrading Węglarka. The bookkeeping lives in `generated.toml` in the state directory (0600); an older daemon ignores it.
+There are no new `apps.toml` or `state.toml` fields and no `schema_version` bump, so nothing has to be removed before downgrading Węglarka. The bookkeeping lives in `generated.toml` in the state directory (0600); an older daemon ignores it, including the `consumer` key of its tables, and drops that key when it next writes the file. A table without `consumer` still works after upgrading again: it stays as long as a directory holds the version it names.
 
-An older daemon does not know about the extra mount, so it recreates a generated-config app without it, and an app that depends on the files will then fail to start. Before downgrading, either keep the app stopped, or put the files it needs where the older version expects them (for example under `config_root`, see [host config files](host-configs.md)). The `generated/` directory stays on disk.
+An older daemon does not know about the extra mount, so it recreates a generated-config app without it, and an app that depends on the files will then fail to start. Before downgrading, either keep the app stopped, or put the files it needs where the older version expects them (for example under `config_root`, see [host config files](host-configs.md)). The `generated/` directory stays on disk, and an older daemon does not clean up after a removed app: remove `<state dir>/generated/<app>/` by hand if the app is gone.
