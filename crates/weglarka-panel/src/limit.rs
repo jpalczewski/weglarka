@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -108,6 +109,43 @@ pub fn client_addr(peer: IpAddr, headers: &HeaderMap, trusted: &[ProxyNet]) -> I
         }
     }
     peer
+}
+
+/// Notices, once, a proxy that is not configured as one: a request from a peer outside
+/// `PANEL_TRUSTED_PROXIES` that carries forwarding headers. Behind a proxy that is not listed every
+/// client shares the proxy's address, so the rate limits are one counter for everybody (#339).
+///
+/// Only a warning: the headers stay ignored (any client can write them), so the check is
+/// fail-safe. The log names the peer, never the header values, which the sender controls.
+#[derive(Debug, Default)]
+pub struct UntrustedProxyNotice {
+    warned: AtomicBool,
+}
+
+impl UntrustedProxyNotice {
+    const HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+
+    /// Whether the notice has been logged.
+    pub fn warned(&self) -> bool {
+        self.warned.load(Ordering::Relaxed)
+    }
+
+    /// True the first (and only) time it logs.
+    pub fn note(&self, peer: IpAddr, headers: &HeaderMap, trusted: &[ProxyNet]) -> bool {
+        if trusted.iter().any(|net| net.contains(peer))
+            || !Self::HEADERS.iter().any(|h| headers.contains_key(*h))
+            || self.warned.swap(true, Ordering::Relaxed)
+        {
+            return false;
+        }
+        tracing::warn!(
+            %peer,
+            "a request from a peer that is not in PANEL_TRUSTED_PROXIES carries forwarding headers; \
+             if this address is a reverse proxy, set PANEL_TRUSTED_PROXIES to it, otherwise every \
+             client shares its rate-limit budget"
+        );
+        true
+    }
 }
 
 /// One bucket per address; an IPv6 address counts as its /64, which is what one subscriber holds.
@@ -224,6 +262,34 @@ mod tests {
         assert_eq!(client_addr(ip("198.51.100.1"), &h, &[]), ip("198.51.100.1"));
         let t = nets(&["10.0.0.0/8"]);
         assert_eq!(client_addr(ip("198.51.100.1"), &h, &t), ip("198.51.100.1"));
+    }
+
+    #[test]
+    fn an_unlisted_proxy_is_noticed_once_and_never_believed() {
+        let notice = UntrustedProxyNotice::default();
+        let peer = ip("10.0.0.2");
+        let t = nets(&["192.0.2.0/24"]);
+        // No forwarding headers: a direct client, nothing to say.
+        assert!(!notice.note(peer, &HeaderMap::new(), &[]));
+        // A trusted peer is configured correctly.
+        assert!(!notice.note(ip("192.0.2.5"), &xff(&["198.51.100.7"]), &t));
+        // An unlisted peer that forwards: warn once, the address stays the peer's.
+        let h = xff(&["198.51.100.7"]);
+        assert!(notice.note(peer, &h, &t));
+        assert!(!notice.note(peer, &h, &t));
+        assert_eq!(client_addr(peer, &h, &t), peer);
+    }
+
+    #[test]
+    fn other_forwarding_headers_count_too() {
+        for name in ["forwarded", "x-real-ip"] {
+            let mut h = HeaderMap::new();
+            h.insert(name, "for=198.51.100.7".parse().unwrap());
+            assert!(
+                UntrustedProxyNotice::default().note(ip("10.0.0.2"), &h, &[]),
+                "{name}"
+            );
+        }
     }
 
     #[test]

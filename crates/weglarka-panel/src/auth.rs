@@ -148,7 +148,7 @@ pub async fn callback(State(state): State<AppState>, request: Request) -> Respon
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::from([0, 0, 0, 0]), |c| c.0.ip());
-    let client = limit::client_addr(peer, headers, &state.config.trusted_proxies);
+    let client = state.client_addr(peer, headers);
     if !state.callback_limit.admit(client) {
         tracing::warn!(%client, "too many sign-in callbacks from one address");
         let mut response = failure(

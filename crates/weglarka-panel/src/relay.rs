@@ -35,7 +35,6 @@ use weglarka_unix_http::{Bytes, bearer};
 
 use crate::app::AppState;
 use crate::daemon::{DaemonError, RelayedResponse};
-use crate::limit;
 
 /// Where the relay is mounted; the rest of the path is the daemon's (`/_weglarka/api/v1/apps` →
 /// `/v1/apps`). The ingress knows this prefix too and carves it out of forward auth by itself.
@@ -155,7 +154,7 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::from([0, 0, 0, 0]), |c| c.0.ip());
-    let client = limit::client_addr(peer, request.headers(), &state.config.trusted_proxies);
+    let client = state.client_addr(peer, request.headers());
     if !state.api_limit.admit(client) {
         tracing::warn!(%client, "too many API requests from one address");
         return slow_down();

@@ -34,6 +34,10 @@ lockout that #292 removed.
 - Operators running the panel behind a proxy (Traefik in `behind` mode, Węglarka's nginx in `edge` mode) should set
   `PANEL_TRUSTED_PROXIES` to the proxy's network; otherwise every client shares the proxy's address and therefore one
   bucket (safe, but 20 sign-ins a minute for everybody together). Documented in `docs/guides/admin-panel.md`.
+- A request from a peer outside `PANEL_TRUSTED_PROXIES` that carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP`
+  makes the panel log one warning (per process, naming the peer, never the header values), because that is what an
+  unlisted reverse proxy looks like (#339). The headers stay ignored, so this cannot be used to spoof an address. The
+  panel does not default the variable itself: it cannot know which peer is the ingress network.
 - A user behind a shared address (NAT, office) shares the budget; a person needs one callback per sign-in.
 
 ## Rejected alternatives

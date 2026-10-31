@@ -329,3 +329,30 @@ async fn tokenless_requests_do_not_spend_the_budget_of_authenticated_ones() {
     let (status, _, _) = send(&app, get(true)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
+
+#[tokio::test]
+async fn a_forwarding_proxy_that_is_not_trusted_is_noticed_but_not_believed() {
+    let daemon = mock_seen(|_| Reply::new(200, "{}")).await;
+    let mut state = state_for(&daemon);
+    state.api_limit = Arc::new(AddressLimiter::with_limits(
+        Clock::default(),
+        1,
+        Duration::from_secs(60),
+    ));
+    let notice = state.proxy_notice.clone();
+    let app = router(state);
+    let call = |client: &str| {
+        request(Method::GET, "/_weglarka/api/v1/apps")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header("x-forwarded-for", client.to_owned())
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert!(!notice.warned());
+    let (first, _, _) = send(&app, call("198.51.100.1")).await;
+    assert_eq!(first, StatusCode::OK);
+    assert!(notice.warned());
+    // A different forwarded address does not get a budget of its own: the header is ignored.
+    let (second, _, _) = send(&app, call("198.51.100.2")).await;
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+}
