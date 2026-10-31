@@ -181,6 +181,45 @@ async fn an_admin_token_streams_the_log_and_the_query_reaches_podman() {
 }
 
 #[tokio::test]
+async fn a_line_split_into_records_has_one_timestamp_at_its_start() {
+    let s = setup().await;
+    deployed_app(&s.h).await;
+    let container = container_of(&s.h);
+    s.h.fake.script_logs(
+        &container,
+        script(
+            &[
+                (LogSource::Stdout, "2026-10-31T10:00:00.1Z long "),
+                (LogSource::Stdout, "2026-10-31T10:00:00.1Z line"),
+                (LogSource::Stdout, "2026-10-31T10:00:00.1Z  end\n"),
+                (LogSource::Stdout, "2026-10-31T10:00:01Z next\n"),
+            ],
+            false,
+        ),
+    );
+    let admin_token = s.issuer.token("adam", &["admins"]);
+    let with = |query: &str| format!("{}?{query}", logs_path("web"));
+    let response = open(
+        &s.token_socket,
+        "GET",
+        &with("timestamps=true"),
+        Some(&admin_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        read_log_frames(response, STEP).await,
+        [
+            LogFrame::Stdout(b"2026-10-31T10:00:00.1Z long ".to_vec()),
+            LogFrame::Stdout(b"line".to_vec()),
+            LogFrame::Stdout(b" end\n".to_vec()),
+            LogFrame::Stdout(b"2026-10-31T10:00:01Z next\n".to_vec()),
+            LogFrame::End
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_read_token_is_refused_before_anything_is_read() {
     let s = setup().await;
     deployed_app(&s.h).await;

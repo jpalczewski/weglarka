@@ -763,11 +763,12 @@ async fn restart_count_is_reported_and_grows_after_a_crash() {
     assert!(info.restarts >= 1, "{info:?}");
 }
 
-/// `weglarka logs` always asks for `timestamps=true` and strips the prefix at the start of a line, so
-/// it relies on libpod stamping a *line*, not every record: a line of 64 KiB (longer than the
-/// runtime's record size) must carry exactly one timestamp.
+/// With `timestamps=true` libpod stamps every log *record*, not every line: a line of 64 KiB (more than
+/// the runtime's record size) arrives as several records, each starting with a timestamp. The daemon's
+/// logs endpoint (`Records` in `weglarka-daemon`) relies on exactly this: chunks are records, a record
+/// that follows one without a newline is a continuation, and its stamp is the one to remove.
 #[tokio::test]
-async fn a_long_log_line_carries_one_timestamp() {
+async fn a_long_log_line_is_several_stamped_records() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-longline-{}", run_id());
@@ -813,20 +814,22 @@ async fn a_long_log_line_carries_one_timestamp() {
     .await
     .unwrap()
     .unwrap();
-    let mut text = Vec::new();
+    let mut records = Vec::new();
     while let Some(chunk) = timeout(STEP, logs.next()).await.unwrap() {
-        text.extend_from_slice(&chunk.unwrap().data);
+        records.push(chunk.unwrap().data.to_vec());
     }
-    let text = String::from_utf8(text).unwrap();
-    let lines: Vec<&str> = text.lines().collect();
-    let stamps = text.matches("T").count();
-    // Letters only (`a`), so a `T` can only come from a timestamp.
-    assert_eq!(
-        (lines.len(), stamps),
-        (2, 2),
-        "{} lines, {stamps} timestamps; lengths {:?}",
-        lines.len(),
-        lines.iter().map(|l| l.len()).collect::<Vec<_>>()
-    );
+    // Every record starts with `<RFC 3339 time> `; only the last record of a line ends in a newline.
+    for record in &records {
+        let word = record.split(|&b| b == b' ').next().unwrap();
+        assert!(
+            (20..=35).contains(&word.len()) && word.contains(&b'T') && word.ends_with(b"Z"),
+            "a record without a stamp: {:?}",
+            String::from_utf8_lossy(&record[..record.len().min(60)])
+        );
+    }
+    let ends: Vec<bool> = records.iter().map(|r| r.ends_with(b"\n")).collect();
+    let line_ends = ends.iter().filter(|e| **e).count();
+    assert_eq!(line_ends, 2, "{ends:?}");
+    assert!(records.len() > 2, "the long line was not split: {ends:?}");
     client.container_remove(&name, true).await.unwrap();
 }

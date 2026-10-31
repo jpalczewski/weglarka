@@ -26,7 +26,7 @@ use axum::routing::get;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use weglarka_api::{LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, endpoints};
+use weglarka_api::{LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, endpoints, stamp_len};
 use weglarka_model::app::InstanceName;
 use weglarka_model::labels;
 use weglarka_model::podman::{LogOptions, LogSource, LogStream, PodmanClient};
@@ -95,6 +95,8 @@ struct Audit {
     follow: bool,
     tail: Option<u32>,
     since: Option<SystemTime>,
+    /// The query asked for timestamps: see [`Records`].
+    stamped: bool,
     started: Instant,
     frames: u64,
     bytes: u64,
@@ -108,6 +110,7 @@ impl Audit {
             follow: query.follow,
             tail: query.tail,
             since: query.since_time(),
+            stamped: query.timestamps,
             started: Instant::now(),
             frames: 0,
             bytes: 0,
@@ -130,6 +133,42 @@ impl Audit {
     }
 }
 
+/// With `timestamps=true` libpod stamps every log *record*, and a line longer than its record size
+/// (about 8 KiB) is several records: the stamp of a record that continues a line would land in the
+/// middle of that line. A client reads a stamp as the start of a line, so the stamp is removed from
+/// a record that follows one without a newline. Chunks are records (one mux frame each); this is
+/// exact, not a guess at the content, and the stamp is only removed where it parses as a time.
+#[derive(Debug, Default)]
+struct Records {
+    enabled: bool,
+    /// Per source (stdout, stderr): the last record did not end its line.
+    mid_line: [bool; 2],
+}
+
+impl Records {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            mid_line: [false; 2],
+        }
+    }
+
+    /// `data` as the client should get it.
+    fn deliver(&mut self, source: LogSource, data: Vec<u8>) -> Vec<u8> {
+        let Some(&last) = data.last().filter(|_| self.enabled) else {
+            return data;
+        };
+        let mid = &mut self.mid_line[usize::from(source == LogSource::Stderr)];
+        let skip = if *mid {
+            stamp_len(&data).unwrap_or(0)
+        } else {
+            0
+        };
+        *mid = last != b'\n';
+        data[skip..].to_vec()
+    }
+}
+
 /// Copies `logs` into `frames_tx` as [`LogFrame`]s until the log ends, the client goes away or the
 /// token expires — whichever is first — then writes the audit line. Returns by dropping `logs`, which
 /// closes the Podman connection. The result is what the audit line says (for the tests).
@@ -141,6 +180,7 @@ async fn pump(
 ) -> (Ended, Audit) {
     let expiry = deadline.reached();
     tokio::pin!(expiry);
+    let mut records = Records::new(audit.stamped);
     let mut ended = loop {
         let next = tokio::select! {
             biased;
@@ -153,10 +193,11 @@ async fn pump(
         let frame = match next {
             None => break Ended::Eof,
             Some(Ok(chunk)) => {
-                sent_bytes = chunk.data.len() as u64;
+                let data = records.deliver(chunk.source, chunk.data.to_vec());
+                sent_bytes = data.len() as u64;
                 match chunk.source {
-                    LogSource::Stdout => LogFrame::Stdout(chunk.data.to_vec()),
-                    LogSource::Stderr => LogFrame::Stderr(chunk.data.to_vec()),
+                    LogSource::Stdout => LogFrame::Stdout(data),
+                    LogSource::Stderr => LogFrame::Stderr(data),
                 }
             }
             Some(Err(error)) => {
@@ -244,6 +285,42 @@ mod tests {
         }
         assert!(decoder.is_clean());
         frames
+    }
+
+    #[test]
+    fn a_record_that_continues_a_line_loses_its_stamp() {
+        let mut r = Records::new(true);
+        let mut d = |source, text: &str| text_of(r.deliver(source, text.as_bytes().to_vec()));
+        fn text_of(v: Vec<u8>) -> String {
+            String::from_utf8(v).unwrap()
+        }
+        assert_eq!(
+            d(LogSource::Stdout, "2026-10-31T10:00:00Z aaa"),
+            "2026-10-31T10:00:00Z aaa"
+        );
+        // stderr has its own line state.
+        assert_eq!(
+            d(LogSource::Stderr, "2026-10-31T10:00:01Z err\n"),
+            "2026-10-31T10:00:01Z err\n"
+        );
+        assert_eq!(d(LogSource::Stdout, "2026-10-31T10:00:00.1Z bbb"), "bbb");
+        assert_eq!(
+            d(LogSource::Stdout, "2026-10-31T10:00:00.2Z ccc\n"),
+            "ccc\n"
+        );
+        // A new line keeps its stamp; so does a continuation whose "stamp" does not parse.
+        assert_eq!(
+            d(LogSource::Stdout, "2026-10-31T10:00:02Z next"),
+            "2026-10-31T10:00:02Z next"
+        );
+        assert_eq!(d(LogSource::Stdout, "not a time x\n"), "not a time x\n");
+        // Without timestamps nothing is touched.
+        let mut off = Records::new(false);
+        off.deliver(LogSource::Stdout, b"a".to_vec());
+        assert_eq!(
+            off.deliver(LogSource::Stdout, b"2026-10-31T10:00:00Z b".to_vec()),
+            b"2026-10-31T10:00:00Z b"
+        );
     }
 
     #[tokio::test]
