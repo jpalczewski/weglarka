@@ -19,7 +19,7 @@ use crate::client::{ApiClient, expand_path};
 use crate::commands::{
     apps_reload, apps_remove, build_spec, notify_status, notify_test, read_secret_value,
     remove_dry_run, remove_query, remove_suffix, render_notify_status, render_reload, render_show,
-    secret_remove_dry_run, secrets_remove,
+    secret_name, secret_remove_dry_run, secrets_remove,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -224,6 +224,32 @@ fn secret_value_rules() {
     assert_eq!(read(b"x", true, false).unwrap_err().kind, Kind::Usage);
     assert!(read(b"\n", false, false).is_err());
     assert!(read(&[0xff, 0xfe], false, false).is_err());
+}
+
+#[test]
+fn secret_name_follows_the_models_rule() {
+    use weglarka_model::secret_store::valid_secret_name;
+    let long = "a".repeat(65);
+    let samples = [
+        "cfg",
+        "A_b-9",
+        "",
+        "a.b",
+        "a/b",
+        "a b",
+        "żółw",
+        "..",
+        "a%2Fb",
+        &long[..64],
+        &long,
+    ];
+    for name in samples {
+        let verdict = secret_name(name);
+        assert_eq!(verdict.is_ok(), valid_secret_name(name), "{name:?}");
+        if let Err(e) = verdict {
+            assert_eq!(e.kind, Kind::Usage, "{name:?}");
+        }
+    }
 }
 
 #[test]
