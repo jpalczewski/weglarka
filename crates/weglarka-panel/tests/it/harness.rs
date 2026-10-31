@@ -205,7 +205,7 @@ impl Drop for Panel {
 }
 
 /// Runs `cmd` expecting it to stop on its own (bad configuration, port taken).
-pub fn run_to_exit(mut cmd: Command) -> Outcome {
+pub fn run_to_exit(cmd: Command) -> Outcome {
     let mut panel = Panel::launch(cmd, SocketAddr::from(([127, 0, 0, 1], 0)));
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
