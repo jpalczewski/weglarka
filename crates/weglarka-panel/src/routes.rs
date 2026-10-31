@@ -347,12 +347,15 @@ pub async fn app_stats(req: Req, Path(name): Path<String>) -> Response {
         .await
     {
         Ok(stats) => Some(views::stats_view(&stats)),
-        Err(
-            e @ (DaemonError::Unauthorized
-            | DaemonError::Forbidden
-            | DaemonError::NotFound(_)
-            | DaemonError::InvalidRequest(_)),
-        ) => return req.problem(&e, APPS_STATS.scope),
+        // No access at all ends the session; a poll gets the small stop-polling fragment, not a page.
+        Err(DaemonError::Unauthorized | DaemonError::Forbidden) => {
+            let mut response = crate::auth::poll_ended(false);
+            response.extensions_mut().insert(EndSession);
+            return response;
+        }
+        Err(e @ (DaemonError::NotFound(_) | DaemonError::InvalidRequest(_))) => {
+            return req.problem(&e, APPS_STATS.scope);
+        }
         Err(_) => None,
     };
     respond(&StatsFragment { stats }, StatusCode::OK)

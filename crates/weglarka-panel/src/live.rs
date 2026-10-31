@@ -16,7 +16,8 @@
 //! Every stream is a value owned by the response body: when the browser goes away hyper drops the
 //! body, which drops the upstream connection with it. A stream also ends when its session does.
 //! Stream activity does not count as session activity (only requests through `require_session`
-//! do), so a tab that only watches a stream is signed out when the idle timeout passes.
+//! do), so a tab that only watches a stream is signed out when the idle timeout passes. The app page's
+//! polled "Resources" fragment follows the same rule (`auth::is_passive`).
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;

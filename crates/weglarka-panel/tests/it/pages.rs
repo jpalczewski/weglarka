@@ -1526,3 +1526,64 @@ async fn the_apps_list_shows_usage_and_survives_a_failing_stats_call() {
     assert!(html.contains("<td>—</td><td>—</td>"), "{html}");
     assert!(!html.contains("secret trace"));
 }
+
+// ---- polling is passive -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn polling_the_stats_fragment_does_not_keep_a_session_alive() {
+    use weglarka_panel::config::ENV_SESSION_IDLE_SECS;
+    let daemon = fake_daemon(Script::default()).await;
+    let site = site_with(daemon, &[(ENV_SESSION_IDLE_SECS, "120")]).await;
+    let who = login(&site, "tok-read");
+    // A tab left open polls every 10 s for longer than the idle window: each poll is served...
+    for _ in 0..11 {
+        site.state.clock.advance(Duration::from_secs(10));
+        let (status, _, _) = get(&site, Some(&who), "/apps/web/stats").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // ...but it did not count as activity: past 120 s the next poll is refused with the status
+    // htmx treats as "stop polling", a small fragment and no login page, and so is a normal page.
+    site.state.clock.advance(Duration::from_secs(11));
+    let (status, headers, html) = get(&site, Some(&who), "/apps/web/stats").await;
+    assert_eq!(status.as_u16(), 286);
+    assert!(
+        html.contains("Your session has ended") && !html.contains("<html"),
+        "{html}"
+    );
+    assert!(
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|c| c.to_str().unwrap().contains("Max-Age=0"))
+    );
+    assert_page_is_clean("/apps/web/stats", &headers, &html);
+    let (status, _, _) = get(&site, Some(&who), "/apps").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_normal_page_still_resets_the_idle_timer_and_a_poll_without_a_session_is_refused() {
+    use weglarka_panel::config::ENV_SESSION_IDLE_SECS;
+    let daemon = fake_daemon(Script::default()).await;
+    let site = site_with(daemon, &[(ENV_SESSION_IDLE_SECS, "120")]).await;
+    let who = login(&site, "tok-read");
+    for _ in 0..3 {
+        site.state.clock.advance(Duration::from_secs(100));
+        let (status, _, _) = get(&site, Some(&who), "/apps").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // A poll after a page keeps working inside the window the page renewed.
+    site.state.clock.advance(Duration::from_secs(100));
+    assert_eq!(
+        get(&site, Some(&who), "/apps/web/stats").await.0,
+        StatusCode::OK
+    );
+    // No cookie: refused without a daemon call, as a stop-polling fragment.
+    let (status, _, _) = get(&site, None, "/apps/web/stats").await;
+    assert_eq!(status.as_u16(), 286);
+    // Only the stats poll is passive: look-alike paths are ordinary pages.
+    for path in ["/apps/web/stats/x", "/apps//stats", "/apps/web/logs"] {
+        let (status, _, _) = get(&site, None, path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+    }
+}

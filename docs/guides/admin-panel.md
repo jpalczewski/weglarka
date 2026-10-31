@@ -148,7 +148,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
   control and direction-changing characters and escaped. The page keeps the newest 1000 rows.
 - Resource use (memory, CPU, processes, network and block I/O of each container, the same numbers as
   `weglarka stats`) is `read` scope, so viewers see it too. The app page's "Resources" section reloads a fragment every
-  10 seconds (htmx polling, no stream, so it costs no live-stream slot); the apps list shows memory and CPU per app.
+  10 seconds (htmx polling, no stream, so it costs no live-stream slot). Polling is passive: like the streams it does not count as activity, so a tab left open does not defeat `PANEL_SESSION_IDLE_SECS`, and when the session has ended the section says so and stops polling; the apps list shows memory and CPU per app.
   A value the daemon does not know is `—`, never `0`; the memory bar appears only for a container that has its own
   limit. During a blue/green switch the section has one row per container (`active`, `challenger`, `retiring`). When
   Podman does not answer the section says "Resource data unavailable", and a failing stats call never breaks the apps
