@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.0...weglarka-cli-v0.1.1) - 2026-10-31
+
+### Added
+
+- *(cli)* show container resource usage with weglarka stats ([#431](https://github.com/jpalczewski/weglarka/pull/431))
+- *(engine)* connect the metrics scraper to the metrics networks ([#397](https://github.com/jpalczewski/weglarka/pull/397))
+- *(cli)* expose a stored secret to one run with run --secret ([#396](https://github.com/jpalczewski/weglarka/pull/396))
+- *(cli)* apps update/start/stop --wait for the reconcile ([#395](https://github.com/jpalczewski/weglarka/pull/395))
+- *(cli)* secrets set --env-file for many secrets at once ([#386](https://github.com/jpalczewski/weglarka/pull/386))
+- *(cli)* apps diff and env-removal markers for apps update --spec ([#377](https://github.com/jpalczewski/weglarka/pull/377))
+- *(cli)* document and test apps update --spec - (stdin), share the spec reader with apps add ([#374](https://github.com/jpalczewski/weglarka/pull/374))
+- *(engine)* metrics_port and a per-app metrics network ([#383](https://github.com/jpalczewski/weglarka/pull/383))
+- *(daemon)* host metrics from the daemon without mounts ([#362](https://github.com/jpalczewski/weglarka/pull/362))
+- *(daemon)* stream an app's access log ([#355](https://github.com/jpalczewski/weglarka/pull/355))
+- *(cli)* stream logs of one or many apps ([#346](https://github.com/jpalczewski/weglarka/pull/346))
+
+### Fixed
+
+- *(cli)* let an explicit --host beat WEGLARKA_SOCKET ([#380](https://github.com/jpalczewski/weglarka/pull/380))
+- *(cli)* let apps update --spec run against a redacted view ([#372](https://github.com/jpalczewski/weglarka/pull/372))
+- *(cli)* rename the access domain filter so it stops shadowing --host ([#361](https://github.com/jpalczewski/weglarka/pull/361))
+- *(cli)* keep log history across a token renewal ([#359](https://github.com/jpalczewski/weglarka/pull/359))
+- *(cli)* verify cgroup delegation instead of assuming it ([#347](https://github.com/jpalczewski/weglarka/pull/347))
+
+### Other
+
+- *(api)* share the unsafe-character set for untrusted stream text ([#429](https://github.com/jpalczewski/weglarka/pull/429))
+- *(cli)* reuse the model's secret-name and mount-target rules ([#426](https://github.com/jpalczewski/weglarka/pull/426))
+- *(api)* add DoctorCheck constructors ([#423](https://github.com/jpalczewski/weglarka/pull/423))
+- *(model)* move human_bytes to weglarka-model ([#422](https://github.com/jpalczewski/weglarka/pull/422))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.0.5...weglarka-cli-v0.0.6) - 2026-10-30
 
 ### Other

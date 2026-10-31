@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.5...weglarka-podman-v0.0.6) - 2026-10-31
+
+### Added
+
+- *(engine)* connect the metrics scraper to the metrics networks ([#397](https://github.com/jpalczewski/weglarka/pull/397))
+- *(engine)* metrics_port and a per-app metrics network ([#383](https://github.com/jpalczewski/weglarka/pull/383))
+- *(daemon)* host metrics from the daemon without mounts ([#362](https://github.com/jpalczewski/weglarka/pull/362))
+- *(daemon)* per-app resource metrics labelled with the instance name ([#357](https://github.com/jpalczewski/weglarka/pull/357))
+- *(daemon)* optional /metrics listener on a dedicated network ([#354](https://github.com/jpalczewski/weglarka/pull/354))
+- *(daemon)* report container memory use in doctor ([#348](https://github.com/jpalczewski/weglarka/pull/348))
+
+### Fixed
+
+- *(cli)* keep log history across a token renewal ([#359](https://github.com/jpalczewski/weglarka/pull/359))
+
+### Other
+
+- *(model)* add ContainerSpec::new ([#427](https://github.com/jpalczewski/weglarka/pull/427))
+- *(podman)* run the real-Podman suite against a remote libpod socket ([#378](https://github.com/jpalczewski/weglarka/pull/378))
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.4...weglarka-podman-v0.0.5) - 2026-10-29
 
 ### Added

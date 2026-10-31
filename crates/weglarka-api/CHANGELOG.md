@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.6...weglarka-api-v0.0.7) - 2026-10-31
+
+### Added
+
+- *(api)* add read-scope container resource stats ([#428](https://github.com/jpalczewski/weglarka/pull/428))
+- *(engine)* connect the metrics scraper to the metrics networks ([#397](https://github.com/jpalczewski/weglarka/pull/397))
+- *(cli)* expose a stored secret to one run with run --secret ([#396](https://github.com/jpalczewski/weglarka/pull/396))
+- *(cli)* apps update/start/stop --wait for the reconcile ([#395](https://github.com/jpalczewski/weglarka/pull/395))
+- *(api)* host-wide volume listing and a limit on GET /v1/events ([#384](https://github.com/jpalczewski/weglarka/pull/384))
+- *(daemon)* stream an app's access log ([#355](https://github.com/jpalczewski/weglarka/pull/355))
+- *(daemon)* optional /metrics listener on a dedicated network ([#354](https://github.com/jpalczewski/weglarka/pull/354))
+
+### Fixed
+
+- *(cli)* keep log history across a token renewal ([#359](https://github.com/jpalczewski/weglarka/pull/359))
+
+### Other
+
+- *(panel)* one resumable driver for daemon streams ([#430](https://github.com/jpalczewski/weglarka/pull/430))
+- *(api)* share the unsafe-character set for untrusted stream text ([#429](https://github.com/jpalczewski/weglarka/pull/429))
+- *(api)* add DoctorCheck constructors ([#423](https://github.com/jpalczewski/weglarka/pull/423))
+- *(api)* stop copying frame payloads in the stream codec ([#376](https://github.com/jpalczewski/weglarka/pull/376))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.5...weglarka-api-v0.0.6) - 2026-10-30
 
 ### Fixed
