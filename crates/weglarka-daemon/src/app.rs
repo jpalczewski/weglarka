@@ -45,6 +45,8 @@ pub struct Daemon<P: PodmanClient> {
     pub started: std::time::Instant,
     pub(crate) triggers: mpsc::Sender<Trigger>,
     pub(crate) webhook_addr: OnceLock<SocketAddr>,
+    /// How the `[metrics]` listener started; unset without `[metrics]`.
+    pub(crate) metrics: OnceLock<crate::metrics::ListenerStatus>,
     pub(crate) tasks: Mutex<JoinSet<()>>,
 }
 

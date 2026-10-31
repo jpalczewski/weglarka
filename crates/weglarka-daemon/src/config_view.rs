@@ -13,13 +13,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use weglarka_api::{
     AcmeDnsView, AcmeView, AdminHttpView, AdminView, CdnView, ConfigView, IdentityView,
-    IngressView, MonitorView, NotifyView, NtfyView, PlatformView, RuntimeView, SelfUpdateView,
-    WebhookView, endpoints,
+    IngressView, MetricsView, MonitorView, NotifyView, NtfyView, PlatformView, RuntimeView,
+    SelfUpdateView, WebhookView, endpoints,
 };
 use weglarka_model::config::{
     AcmeConfig, AcmeDnsConfig, AdminConfig, AdminHttpConfig, CdnConfig, ForgejoWebhookConfig,
-    HostConfig, IdentityConfig, IngressConfig, MonitorConfig, NotifyConfig, NtfyConfig,
-    PlatformConfig, RuntimeConfig, SelfUpdateConfig, StateConfig, WebhookConfig,
+    HostConfig, IdentityConfig, IngressConfig, MetricsConfig, MonitorConfig, NotifyConfig,
+    NtfyConfig, PlatformConfig, RuntimeConfig, SelfUpdateConfig, StateConfig, WebhookConfig,
 };
 use weglarka_model::podman::PodmanClient;
 
@@ -48,6 +48,7 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         self_update,
         acme,
         identity,
+        metrics,
     } = host;
     ConfigView {
         runtime: runtime_view(runtime),
@@ -62,6 +63,7 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         self_update: self_update.as_ref().map(self_update_view),
         acme: acme.as_ref().map(acme_view),
         identity: identity.as_ref().map(identity_view),
+        metrics: metrics.as_ref().map(metrics_view),
     }
 }
 
@@ -256,6 +258,14 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
                 propagation_secs: *propagation_secs,
             }
         }),
+    }
+}
+
+fn metrics_view(metrics: &MetricsConfig) -> MetricsView {
+    let MetricsConfig { listen, network } = metrics;
+    MetricsView {
+        listen: *listen,
+        network: network.clone(),
     }
 }
 

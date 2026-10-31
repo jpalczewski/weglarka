@@ -44,6 +44,10 @@ pub struct HostConfig {
     /// is the host's root of trust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
+    /// Prometheus metrics listener on a dedicated Podman network; absent = off, nothing is created
+    /// or bound (issue #350, `docs/decisions/0061-metrics-listener.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsConfig>,
 }
 
 impl HostConfig {
@@ -95,6 +99,45 @@ impl HostConfig {
                         .to_owned(),
                 );
             }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// `[metrics]`: the opt-in `GET /metrics` listener (issue #350, ADR 0061). It is TCP, reachable only
+/// through the Podman network named here, and serves no admin route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Listener address inside the Węglarka container (like `[webhook] listen`). Nothing is published
+    /// on the host; scrapers reach it through [`Self::network`].
+    pub listen: SocketAddr,
+    /// Podman network the daemon creates and joins, and a scraper joins to read the metrics.
+    #[serde(default = "default_metrics_network")]
+    pub network: String,
+}
+
+fn default_metrics_network() -> String {
+    crate::labels::METRICS_NETWORK.to_owned()
+}
+
+impl MetricsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let network = &self.network;
+        // The instance alphabet, so the name is safe in a libpod path.
+        if InstanceName::new(network.clone()).is_err() {
+            return Err(format!(
+                "[metrics] network {network:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-'"
+            ));
+        }
+        // `net-*` are per-app networks and the ingress network, which reconcile may prune.
+        if network.starts_with("net-") {
+            return Err(format!(
+                "[metrics] network {network:?} must not start with `net-`: that prefix belongs to app and ingress networks"
+            ));
         }
         Ok(())
     }

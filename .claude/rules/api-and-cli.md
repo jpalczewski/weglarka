@@ -2,6 +2,7 @@
 paths:
   - "crates/weglarka-api/**"
   - "crates/weglarka-cli/**"
+  - "crates/weglarka-daemon/src/metrics/**"
   - "crates/weglarka-daemon/src/{admin,app,app_view,config_view,certificates,events,logs,stream,doctor,lib,main}.rs"
   - "crates/weglarka-daemon/tests/**"
   - "docs/guides/{apps-update,first-app}.md"
@@ -35,5 +36,6 @@ paths:
 |---|---|
 | contract and API routes | `crates/weglarka-api/src/types.rs` + `crates/weglarka-api/src/endpoints.rs` → `crates/weglarka-daemon/src/admin.rs` (new endpoint: `endpoints.rs` first) |
 | app logs (`GET /v1/apps/{name}/logs`, `admin`) | `LogOptions` + `PodmanClient::container_logs` in `crates/weglarka-model/src/podman.rs` (+ `crates/weglarka-podman/src/{client,wire}.rs`, `FakePodman::script_logs`), `LogsQuery::parse` (strict, protects the libpod query) in `crates/weglarka-api/src/types.rs`, frames `crates/weglarka-api/src/logs.rs` + codec `crates/weglarka-api/src/frame.rs`, `APPS_LOGS` (`Body::Credential`) in `crates/weglarka-api/src/endpoints.rs`, handler and pump (ends at the token's `exp`, an audit line at the end) in `crates/weglarka-daemon/src/logs.rs`, `StreamDeadline`/`stream_response` in `crates/weglarka-daemon/src/stream.rs`, tests `crates/weglarka-daemon/tests/it/logs.rs`, `docs/guides/admin-api-tokens.md` (ADR 0057) |
+| metrics listener (`[metrics]`, #350) | `MetricsConfig` in `crates/weglarka-model/src/config.rs`, `labels::METRICS_NETWORK`, `crates/weglarka-daemon/src/metrics/{mod,encode}.rs` (own router with only `GET /metrics`, `MetricsSource` trait, hand-written encoder; add metrics as sources, keep the label contract of ADR 0061), startup beside the webhook in `crates/weglarka-daemon/src/lib.rs` (a failure is logged, never fatal), doctor `metrics.listener`, `MetricsView` in the config view, tests `crates/weglarka-daemon/tests/it/metrics.rs`, `docs/guides/metrics.md` (ADR 0061) |
 | CLI | `crates/weglarka-cli/src/update.rs` (read-modify-write of the spec: `apps update/start/stop`, `--dry-run`), `crates/weglarka-cli/src/commands.rs` |
 | daemon/API tests | `crates/weglarka-daemon/tests/it/*.rs` — see [testing.md](testing.md) |
