@@ -907,6 +907,28 @@ mod tests {
     }
 
     #[test]
+    fn a_wrongly_typed_azp_or_nonce_fails_an_id_token_but_not_an_access_token() {
+        let issuer = TestIssuer::new("k1");
+        let run = |c: &serde_json::Value| verify_with(&issuer, &id_token(&issuer, c), ID);
+        // Single audience: a wrongly typed `azp` is not "absent".
+        let mut c = id_claims();
+        c["azp"] = json!(["other-client"]);
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        c["azp"] = json!(7);
+        assert_eq!(run(&c), Err(AuthError::WrongAuthorizedParty));
+        let mut c = id_claims();
+        c["nonce"] = json!(7);
+        assert_eq!(run(&c), Err(AuthError::NonceMismatch));
+        c["nonce"] = json!([NONCE]);
+        assert_eq!(run(&c), Err(AuthError::NonceMismatch));
+        // The same values stay harmless on an access token.
+        let mut c = claims();
+        c["azp"] = json!(["other-client"]);
+        c["nonce"] = json!(7);
+        assert!(check(&issuer, &c).is_ok());
+    }
+
+    #[test]
     fn id_check_errors_name_no_token_content() {
         for e in [AuthError::NonceMismatch, AuthError::WrongAuthorizedParty] {
             let text = format!("{e} {e:?}");
