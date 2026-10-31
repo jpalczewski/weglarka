@@ -1837,18 +1837,13 @@ fn notify_status_rendering_covers_off_pending_and_errors() {
 }
 
 #[test]
-fn host_is_a_global_flag_that_excludes_socket() {
-    use clap::Parser;
-    let cli = crate::cli::Cli::try_parse_from([
-        "weglarka",
-        "status",
-        "--host",
-        "https://panel.example.com",
-    ])
-    .unwrap();
+fn host_is_a_global_flag_that_excludes_an_explicit_socket_flag() {
+    let cli =
+        crate::cli::Cli::parse_args(["weglarka", "status", "--host", "https://panel.example.com"])
+            .unwrap();
     assert_eq!(cli.host.as_deref(), Some("https://panel.example.com"));
     assert!(
-        crate::cli::Cli::try_parse_from([
+        crate::cli::Cli::parse_args([
             "weglarka",
             "--host",
             "https://panel.example.com",
@@ -1859,7 +1854,7 @@ fn host_is_a_global_flag_that_excludes_socket() {
         .is_err()
     );
     assert!(
-        crate::cli::Cli::try_parse_from(["weglarka", "login", "--issuer", "a", "--audience", "b"])
+        crate::cli::Cli::parse_args(["weglarka", "login", "--issuer", "a", "--audience", "b"])
             .is_ok()
     );
 }

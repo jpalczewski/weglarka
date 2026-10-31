@@ -26,12 +26,10 @@ mod tests;
 
 use std::process::ExitCode;
 
-use clap::Parser;
-
 use crate::error::exit;
 
 fn main() -> ExitCode {
-    let cli = match cli::Cli::try_parse() {
+    let cli = match cli::Cli::parse_args(std::env::args_os()) {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();

@@ -6,7 +6,7 @@ is what you would want any operator to know before touching a live host.
 
 ## Pick where the commands go
 
-First match wins:
+First match wins; an explicit `--host` still beats `WEGLARKA_SOCKET` (and `--socket` beats `WEGLARKA_HOST`):
 
 1. `--socket` (or `WEGLARKA_SOCKET`): the local daemon, on the host itself.
 2. `--host https://panel.example.com` (or `WEGLARKA_HOST`): a remote host through its admin panel. Sign in first with
