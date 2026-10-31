@@ -766,11 +766,9 @@ async fn run_app<P: PodmanClient + 'static>(
                     tokio::select! {
                         chunk = chunks_rx.recv() => {
                             let Some(chunk) = chunk else { break };
-                            let frame = match chunk.source {
-                                LogSource::Stdout => RunFrame::Stdout(chunk.data.to_vec()),
-                                LogSource::Stderr => RunFrame::Stderr(chunk.data.to_vec()),
-                            };
-                            if frames_tx.send(Bytes::from(frame.encode())).await.is_err() {
+                            let stderr = matches!(chunk.source, LogSource::Stderr);
+                            let frame = RunFrame::encode_output(stderr, &chunk.data);
+                            if frames_tx.send(Bytes::from(frame)).await.is_err() {
                                 break;
                             }
                         }

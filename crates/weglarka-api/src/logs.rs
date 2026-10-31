@@ -6,6 +6,7 @@
 //! a final frame — or the client hanging up.
 
 use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use std::borrow::Cow;
 
 /// `Content-Type` of a logs response stream.
 pub const LOGS_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.logs-stream";
@@ -39,13 +40,13 @@ impl LogFrame {
 }
 
 impl FrameKind for LogFrame {
-    fn parts(&self) -> (u8, Vec<u8>) {
+    fn parts(&self) -> (u8, Cow<'_, [u8]>) {
         match self {
-            Self::Stdout(data) => (STDOUT, data.clone()),
-            Self::Stderr(data) => (STDERR, data.clone()),
-            Self::End => (END, Vec::new()),
-            Self::TokenExpired => (TOKEN_EXPIRED, Vec::new()),
-            Self::Error(message) => (ERROR, message.clone().into_bytes()),
+            Self::Stdout(data) => (STDOUT, Cow::Borrowed(data)),
+            Self::Stderr(data) => (STDERR, Cow::Borrowed(data)),
+            Self::End => (END, Cow::Borrowed(&[])),
+            Self::TokenExpired => (TOKEN_EXPIRED, Cow::Borrowed(&[])),
+            Self::Error(message) => (ERROR, Cow::Borrowed(message.as_bytes())),
         }
     }
 
