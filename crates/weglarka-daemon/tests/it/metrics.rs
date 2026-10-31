@@ -232,3 +232,218 @@ fn an_invalid_network_name_is_rejected() {
     assert_eq!(cfg.network, "metrics");
     assert!(cfg.validate().is_ok());
 }
+
+// Daemon metrics (issue #352): counters from events, certificate expiry, self-update state.
+
+fn digest(c: char) -> weglarka_model::app::Digest {
+    weglarka_model::app::Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
+}
+
+async fn scrape(running: &Running<FakePodman>) -> String {
+    let (status, body) = get(running.metrics_addr.expect("listening"), "GET", "/metrics").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// No family-specific line leaks anything but names and fixed enums.
+fn assert_no_free_text(body: &str) {
+    for leak in ["sha256", "ghcr.io", "DISTINCTIVE"] {
+        assert!(!body.contains(leak), "{leak} in {body}");
+    }
+}
+
+#[tokio::test]
+async fn deploys_and_failed_deploys_move_their_counters_and_no_reason_reaches_a_label() {
+    let h = Builder::new().sections(ON).build().await;
+    add(&h, "web", spec("web.example.com")).await;
+    deployed(&h, "web").await;
+
+    let bad = "ghcr.io/jpalczewski/bad:latest";
+    h.fake
+        .fail_pull(bad, "DISTINCTIVE \"reason\"\nwith a newline");
+    let mut failing = spec("bad.example.com");
+    failing["image"] = bad.into();
+    add(&h, "bad", failing).await;
+
+    eventually("the failed deploy is counted", || async {
+        scrape(&h.running)
+            .await
+            .contains("weglarka_deploys_total{app=\"bad\",result=\"failed\"}")
+    })
+    .await;
+    let body = scrape(&h.running).await;
+    assert!(
+        body.contains("# TYPE weglarka_deploys_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("weglarka_deploys_total{app=\"web\",result=\"ok\"} 1\n"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("weglarka_deploys_total{app=\"web\",result=\"failed\"}"),
+        "{body}"
+    );
+    assert!(!body.contains("# TYPE weglarka_rollbacks_total"), "{body}");
+    // Neither ACME nor self-update is configured.
+    assert!(!body.contains("weglarka_certificate_"), "{body}");
+    assert!(!body.contains("weglarka_self_update_"), "{body}");
+    assert_no_free_text(&body);
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn a_rollback_counts() {
+    let h = Builder::new().sections(ON).build().await;
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake
+        .script_health("web", [weglarka_model::podman::HealthStatus::Healthy]);
+    add(&h, "web", spec("web.example.com")).await;
+    deployed(&h, "web").await;
+
+    // The next version fails its gate; the container restored after it is healthy again.
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_health(
+        "web",
+        [
+            weglarka_model::podman::HealthStatus::Unhealthy,
+            weglarka_model::podman::HealthStatus::Healthy,
+        ],
+    );
+    let (status, body) = admin(
+        &h,
+        "POST",
+        "/v1/apps/web/deploy",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "rolled_back", "{body}");
+
+    let body = scrape(&h.running).await;
+    assert!(
+        body.contains("weglarka_rollbacks_total{app=\"web\",result=\"ok\"} 1\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("weglarka_deploys_total{app=\"web\",result=\"ok\"} 1\n"),
+        "{body}"
+    );
+    assert_no_free_text(&body);
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn self_update_state_appears_only_with_the_section_and_an_unreadable_file_omits_it() {
+    let state = weglarka_model::self_update::SelfUpdateState {
+        pending: Some(digest('c')),
+        pending_at: Some(1_700_000_000),
+        checked_at: Some(1_700_000_100),
+        error: Some(weglarka_model::self_update::SelfUpdateError {
+            message: "DISTINCTIVE signature refused".into(),
+            digest: Some(digest('d')),
+            at: 1_700_000_200,
+        }),
+        ..Default::default()
+    };
+    let section = "\n[self_update]\nimage = \"ghcr.io/jpalczewski/weglarka:latest\"\n";
+    let h = Builder::new()
+        .sections(&format!("{ON}{section}"))
+        .build()
+        .await;
+    weglarka_model::self_update::save(&h.root.join("state"), &state).unwrap();
+    let body = scrape(&h.running).await;
+    assert!(body.contains("weglarka_self_update_pending 1\n"), "{body}");
+    assert!(
+        body.contains("weglarka_self_update_last_check_timestamp_seconds 1700000100\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("weglarka_self_update_last_error_timestamp_seconds 1700000200\n"),
+        "{body}"
+    );
+    assert_no_free_text(&body);
+
+    // A broken state file: the family goes, the page stays.
+    std::fs::write(h.root.join("state/self-update.toml"), "pending = [").unwrap();
+    let body = scrape(&h.running).await;
+    assert!(!body.contains("weglarka_self_update_"), "{body}");
+    assert!(body.contains("weglarka_build_info"), "{body}");
+    h.running.stop().await;
+
+    // Without `[self_update]` the same file adds nothing.
+    let h = Builder::new().sections(ON).build().await;
+    weglarka_model::self_update::save(&h.root.join("state"), &state).unwrap();
+    let body = scrape(&h.running).await;
+    assert!(!body.contains("weglarka_self_update_"), "{body}");
+    h.running.stop().await;
+}
+
+fn edge_settings(root: &std::path::Path, extra: &str) -> weglarka_daemon::Settings {
+    let host = weglarka_model::config::HostConfig::from_toml_str(&format!(
+        r#"
+[ingress]
+mode = "edge"
+bind = "127.0.0.1:18080"
+https_bind = "127.0.0.1:18443"
+
+[admin]
+socket = "{root}/run/admin.sock"
+
+[webhook]
+listen = "127.0.0.1:0"
+domain = "hooks.example.com"
+
+[state]
+dir = "{root}/state"
+{extra}"#,
+        root = root.display()
+    ))
+    .unwrap();
+    weglarka_daemon::Settings::from_host(host, root.join("weglarka.toml"))
+}
+
+#[tokio::test]
+async fn certificate_expiry_is_a_timestamp_per_routed_domain_only_with_acme() {
+    // `openssl x509 -enddate` of the fixture: Oct  1 07:51:01 2126 GMT.
+    const LEAF: &[u8] = include_bytes!("../../../weglarka-acme/tests/fixtures/leaf.crt");
+    const NOT_AFTER: u64 = 4_946_514_661;
+    let acme = "[acme]\naccept_terms = true\ndirectory_url = \"https://acme.invalid/directory\"\n";
+
+    let (_dir, root) = tempdir("wg");
+    let running = weglarka_daemon::start(
+        edge_settings(&root, &format!("{ON}{acme}")),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+    let tls = running.daemon.ingress.tls_dir();
+    std::fs::create_dir_all(&tls).unwrap();
+    std::fs::write(tls.join("hooks.example.com.crt"), LEAF).unwrap();
+    std::fs::write(tls.join("hooks.example.com.key"), "key").unwrap();
+    // Not routed: a stray certificate gets no line.
+    std::fs::write(tls.join("stray.example.org.crt"), LEAF).unwrap();
+    std::fs::write(tls.join("stray.example.org.key"), "key").unwrap();
+
+    let body = scrape(&running).await;
+    assert!(
+        body.contains("# TYPE weglarka_certificate_not_after_seconds gauge"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "weglarka_certificate_not_after_seconds{{domain=\"hooks.example.com\"}} {NOT_AFTER}\n"
+        )),
+        "{body}"
+    );
+    assert!(!body.contains("stray.example.org"), "{body}");
+    running.stop().await;
+
+    // The same files without `[acme]`: no family.
+    let running = weglarka_daemon::start(edge_settings(&root, ON), FakePodman::new())
+        .await
+        .unwrap();
+    let body = scrape(&running).await;
+    assert!(!body.contains("weglarka_certificate_"), "{body}");
+    running.stop().await;
+}

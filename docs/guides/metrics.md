@@ -30,16 +30,68 @@ Run a one-off container on the network and fetch the page (the daemon's containe
 podman run --rm --network metrics docker.io/curlimages/curl:latest -s http://weglarka:9464/metrics
 ```
 
-Expected: exposition text starting with `# HELP weglarka_build_info …` and a `weglarka_build_info{version="…"} 1` line.
+Expected: exposition text with a `weglarka_build_info{version="…"} 1` line (families are sorted by name).
 `weglarka doctor` shows a `metrics.listener` line when `[metrics]` is set; it is `ok` once the network is joined, `warn`
 with the last error while the daemon is still retrying (the page is already served), `fail` when the address could not be
 bound (fix `listen` and restart), and absent when `[metrics]` is not set. `GET /v1/config` shows the section.
 
 ## What is there
 
-Only `weglarka_build_info{version}` so far. Per-app resource use (labelled `app` and `role`), daemon counters and host
-metrics come with #351, #352 and #353; discovery by a Prometheus app comes with #36. Label values are always fixed names
-or validated instance names, never free text.
+All values are computed when the page is scraped; nothing is sampled in the background and no source calls Podman.
+Counters live in memory and start at zero when the daemon starts (Prometheus' `rate()` and `increase()` handle the
+reset). A series appears once it has something to say: an app that never failed has no `result="failed"` line.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `weglarka_build_info` | gauge | `version` | Always 1; the running daemon version. |
+| `weglarka_deploys_total` | counter | `app`, `result` (`ok`, `failed`) | Deploys since the daemon started. A deploy the health gate rejected is counted in `weglarka_rollbacks_total`, not here. |
+| `weglarka_rollbacks_total` | counter | `app`, `result` (`ok`, `failed`) | Rollbacks to the previous digest after a failed health gate. `failed` means the app needs intervention. |
+| `weglarka_app_health_transitions_total` | counter | `app`, `to` (`crash_looping`, `unhealthy`, `recovered`) | Transitions seen by the crash-loop and healthcheck monitor (`[monitor]`). |
+| `weglarka_certificate_not_after_seconds` | gauge | `domain` | Expiry of the certificate nginx serves for a routed domain (the webhook domain and every app domain), as a Unix timestamp; a domain served by an `[acme.dns]` wildcard reports the wildcard's expiry. Only with an enabled `[acme]`; a domain without a readable certificate has no line. Re-read at most every 5 minutes. |
+| `weglarka_self_update_pending` | gauge | — | 1 while a new daemon image is pinned but the daemon has not confirmed it runs it yet. Only with `[self_update]`. |
+| `weglarka_self_update_last_check_timestamp_seconds` | gauge | — | Unix time of the last completed self-update check. |
+| `weglarka_self_update_last_error_timestamp_seconds` | gauge | — | Unix time of the last failed or refused self-update attempt; absent when there is none. |
+
+Labels are only ever validated instance names (`app`), routed domains (`domain`) or the fixed values listed above. A
+failure reason, an error message, a digest or an image reference never becomes a label: read those with
+`weglarka doctor`, `GET /v1/events` or the notifications. Per-app resource use (labelled `app` and `role`) and host
+metrics come with #351 and #353; discovery by a Prometheus app comes with #36. An app removed from `apps.toml` keeps its
+counter lines until the daemon restarts.
+
+If a file behind a family cannot be read (`apps.toml`, `self-update.toml`), that family is left out of the page and
+the page is still served with `200`.
+
+## Suggested alerts
+
+```yaml
+groups:
+  - name: weglarka
+    rules:
+      - alert: WeglarkaCertificateExpiresSoon
+        # The ACME worker renews well before this; 14 days left means renewals are failing.
+        expr: weglarka_certificate_not_after_seconds - time() < 14 * 24 * 3600
+        for: 1h
+        annotations:
+          summary: "Certificate for {{ $labels.domain }} expires in under 14 days"
+      - alert: WeglarkaRollback
+        expr: increase(weglarka_rollbacks_total{result="ok"}[1h]) > 0
+        annotations:
+          summary: "{{ $labels.app }} was rolled back after a failed health gate"
+      - alert: WeglarkaRollbackFailed
+        expr: increase(weglarka_rollbacks_total{result="failed"}[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.app }} failed its health gate and the rollback failed too"
+      - alert: WeglarkaSelfUpdatePending
+        # A pinned image the daemon still does not run after 30 minutes: the switch did not take effect.
+        expr: weglarka_self_update_pending == 1
+        for: 30m
+        annotations:
+          summary: "Self-update on {{ $labels.instance }} is pending for over 30 minutes"
+```
+
+`weglarka doctor` on `myhost` explains each of these in detail (`acme.certs`, the app state, `self_update`).
 
 ## Rollback
 

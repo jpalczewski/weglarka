@@ -313,11 +313,19 @@ pub async fn start_with<P: PodmanClient + 'static>(
         Some(notifier) => notifier.sink(),
         None => Arc::new(weglarka_model::events::TracingSink),
     };
+    // `[metrics]` adds the counters behind `weglarka_deploys_total` and friends (#352); without it
+    // nothing is counted.
+    let counters = host
+        .metrics
+        .as_ref()
+        .map(|_| Arc::new(metrics::daemon::EventCounters::default()));
+    let mut sinks: Vec<Arc<dyn weglarka_model::events::EventSink>> =
+        vec![delivery, history.clone()];
+    if let Some(counters) = &counters {
+        sinks.push(counters.clone());
+    }
     let events: Arc<dyn weglarka_model::events::EventSink> =
-        Arc::new(weglarka_model::history::FanOut::new(vec![
-            delivery,
-            history.clone(),
-        ]));
+        Arc::new(weglarka_model::history::FanOut::new(sinks));
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
@@ -506,7 +514,10 @@ pub async fn start_with<P: PodmanClient + 'static>(
                 let server = spawn_server(
                     "metrics",
                     listener,
-                    metrics::router(Arc::new(metrics::DaemonMetrics)),
+                    metrics::router(Arc::new(metrics::DaemonMetrics::new(
+                        daemon.clone(),
+                        counters.clone().unwrap_or_default(),
+                    ))),
                     shutdown_rx.clone(),
                 );
                 let join = tokio::spawn({

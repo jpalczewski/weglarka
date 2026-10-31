@@ -9,6 +9,7 @@
 //! `active`, `challenger`, `retiring`, one-off containers are skipped, and a label value is never free
 //! text (failure reasons, image references, command lines).
 
+pub mod daemon;
 pub mod encode;
 
 use std::net::SocketAddr;
@@ -23,6 +24,7 @@ use tokio::sync::watch;
 use weglarka_model::config::MetricsConfig;
 use weglarka_model::podman::{NetworkSpec, PodmanClient, PodmanError};
 
+use crate::app::Daemon;
 use crate::service::SERVICE_NAME;
 use encode::{Family, Kind, Sample};
 
@@ -34,13 +36,28 @@ pub trait MetricsSource: Send + Sync + 'static {
     fn collect(&self) -> impl Future<Output = Vec<Family>> + Send;
 }
 
-/// The sources of this daemon. `weglarka_build_info` for now; #351, #352 and #353 add theirs here.
-#[derive(Debug, Default)]
-pub struct DaemonMetrics;
+/// The sources of this daemon: `weglarka_build_info` and the daemon counters (#352); #351 and #353
+/// add theirs here.
+pub struct DaemonMetrics<P: PodmanClient + 'static> {
+    daemon: Arc<Daemon<P>>,
+    daemon_source: daemon::DaemonSource,
+}
 
-impl MetricsSource for DaemonMetrics {
+impl<P: PodmanClient + 'static> DaemonMetrics<P> {
+    /// `counters` must be the sink the daemon's event fan-out feeds.
+    pub fn new(daemon: Arc<Daemon<P>>, counters: Arc<daemon::EventCounters>) -> Self {
+        Self {
+            daemon,
+            daemon_source: daemon::DaemonSource::new(counters),
+        }
+    }
+}
+
+impl<P: PodmanClient + 'static> MetricsSource for DaemonMetrics<P> {
     async fn collect(&self) -> Vec<Family> {
-        vec![build_info()]
+        let mut families = vec![build_info()];
+        families.extend(daemon::families(&self.daemon, &self.daemon_source));
+        families
     }
 }
 
