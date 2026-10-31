@@ -1,0 +1,26 @@
+---
+source: crates/weglarka-daemon/tests/it/stats.rs
+expression: stable(body)
+---
+{
+  "app": "alpha",
+  "available": true,
+  "containers": [
+    {
+      "block_read_bytes": null,
+      "block_write_bytes": null,
+      "cpu_ratio": null,
+      "cpu_seconds_total": null,
+      "cpu_window_secs": null,
+      "memory_bytes": null,
+      "memory_limit_bytes": null,
+      "net_rx_bytes": null,
+      "net_tx_bytes": null,
+      "oom_killed": false,
+      "pids": null,
+      "restarts": 0,
+      "role": "active"
+    }
+  ],
+  "sampled_at": "<time>"
+}

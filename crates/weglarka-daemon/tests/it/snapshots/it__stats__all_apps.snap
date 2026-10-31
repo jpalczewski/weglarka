@@ -1,0 +1,54 @@
+---
+source: crates/weglarka-daemon/tests/it/stats.rs
+expression: stable(body.clone())
+---
+{
+  "apps": [
+    {
+      "app": "alpha",
+      "available": true,
+      "containers": [
+        {
+          "block_read_bytes": 10,
+          "block_write_bytes": 20,
+          "cpu_ratio": null,
+          "cpu_seconds_total": 2.0,
+          "cpu_window_secs": null,
+          "memory_bytes": 1048576,
+          "memory_limit_bytes": null,
+          "net_rx_bytes": 30,
+          "net_tx_bytes": 40,
+          "oom_killed": false,
+          "pids": 3,
+          "restarts": 0,
+          "role": "active"
+        }
+      ],
+      "sampled_at": "<time>"
+    },
+    {
+      "app": "beta",
+      "available": true,
+      "containers": [
+        {
+          "block_read_bytes": 10,
+          "block_write_bytes": 20,
+          "cpu_ratio": null,
+          "cpu_seconds_total": 2.0,
+          "cpu_window_secs": null,
+          "memory_bytes": 2097152,
+          "memory_limit_bytes": null,
+          "net_rx_bytes": 30,
+          "net_tx_bytes": 40,
+          "oom_killed": false,
+          "pids": 3,
+          "restarts": 0,
+          "role": "active"
+        }
+      ],
+      "sampled_at": "<time>"
+    }
+  ],
+  "available": true,
+  "sampled_at": "<time>"
+}

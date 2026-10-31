@@ -17,6 +17,8 @@ expression: list
   "Post /v1/apps/{name}/forward",
   "Get /v1/apps/{name}/logs",
   "Get /v1/apps/{name}/access",
+  "Get /v1/apps/{name}/stats",
+  "Get /v1/stats",
   "Get /v1/apps/{name}/secrets",
   "Put /v1/apps/{name}/secrets/{secret}",
   "Delete /v1/apps/{name}/secrets/{secret}",
