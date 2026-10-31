@@ -119,6 +119,13 @@ pub struct ShowAppResponse {
     /// withheld, so the unredacted answer is unchanged (docs/decisions/0057 decision 8).
     #[serde(default, skip_serializing_if = "is_false")]
     pub redacted: bool,
+    /// Whether the app's container already matches its stored spec (the reconciler has nothing
+    /// left to do for it, issue #298): `false` while a change waits for the next pass, a deploy
+    /// failed or the app waits for a secret. Only `GET /v1/apps/{name}` fills it, and only for a
+    /// caller that sees the real spec (`admin`); absent from a redacted view and from add/update
+    /// answers. `apps update --wait` polls it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled: Option<bool>,
 }
 
 fn is_false(value: &bool) -> bool {

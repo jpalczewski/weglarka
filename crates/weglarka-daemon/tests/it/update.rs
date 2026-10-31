@@ -300,6 +300,8 @@ async fn stop_provisions_and_start_deploys_synchronously() {
     deployed(&h, "ntfy").await;
     let digest = show(&h, "ntfy").await["state"]["current"].clone();
     assert_eq!(show(&h, "ntfy").await["runtime"], "running");
+    // Container and stored spec agree (#298); add/update answers do not carry the field.
+    assert_eq!(show(&h, "ntfy").await["reconciled"], true);
 
     // `apps stop`: PUT with `start = false` — provision (keep the pinned digest) and remove the
     // container right away; the response carries the outcome.
@@ -313,6 +315,8 @@ async fn stop_provisions_and_start_deploys_synchronously() {
     assert_eq!(v["app"]["state"]["current"], digest);
     assert!(h.fake.containers().iter().all(|c| c.name != "ntfy"));
     assert_eq!(show(&h, "ntfy").await["runtime"], "not_started");
+    assert_eq!(show(&h, "ntfy").await["reconciled"], true);
+    assert!(v["app"].get("reconciled").is_none(), "{v}");
 
     // A wake from the update must not bring the container back.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -351,6 +355,7 @@ async fn missing_secret_is_a_waiting_state_not_a_failure() {
     .await;
     let v = show(&h, "ntfy").await;
     assert_eq!(v["runtime"], "waiting_for_secret");
+    assert_eq!(v["reconciled"], false, "{v}");
     assert!(v["state"]["failed"].is_null(), "{v}");
     let (_, list) = admin(&h, "GET", "/v1/apps", None).await;
     assert_eq!(list["apps"][0]["runtime"], "waiting_for_secret");
@@ -398,6 +403,7 @@ async fn missing_secret_is_a_waiting_state_not_a_failure() {
     deployed(&h, "ntfy").await;
     let v = show(&h, "ntfy").await;
     assert_eq!(v["runtime"], "running");
+    assert_eq!(v["reconciled"], true, "{v}");
     assert!(v["state"].get("waiting_for_secrets").is_none(), "{v}");
     h.running.stop().await;
 }

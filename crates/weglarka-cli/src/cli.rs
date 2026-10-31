@@ -173,9 +173,9 @@ pub enum NotifyCommand {
 #[derive(Debug, Subcommand)]
 pub enum AppsCommand {
     /// Add an app instance.
-    Add(AddArgs),
+    Add(Box<AddArgs>),
     /// Change an app's spec (read-modify-write; domains, env, secrets, image…).
-    Update(crate::update::UpdateArgs),
+    Update(Box<crate::update::UpdateArgs>),
     /// Show what `apps update --spec FILE` would change, without sending anything; exits 8 when
     /// the file differs from the live spec (like `diff`), 0 when identical.
     Diff(crate::update::DiffArgs),
@@ -270,6 +270,8 @@ pub struct StartStopArgs {
     /// Send nothing; show the request that would be sent.
     #[arg(long)]
     pub dry_run: bool,
+    #[command(flatten)]
+    pub wait: crate::update::WaitArgs,
 }
 
 /// Flags of `apps reload`: a signal-based reload, or an explicit recreate for editors that save with

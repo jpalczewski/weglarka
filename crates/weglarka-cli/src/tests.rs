@@ -807,6 +807,7 @@ fn show_app(start: bool) -> ShowAppResponse {
         health: None,
         started_at: None,
         redacted: false,
+        reconciled: None,
     }
 }
 
@@ -1234,6 +1235,7 @@ async fn apps_start_puts_start_true_and_renders_the_deploy() {
         StartStopArgs {
             name: "ntfy".into(),
             dry_run: false,
+            wait: Default::default(),
         },
     )
     .await
@@ -1292,6 +1294,7 @@ async fn apps_stop_puts_start_false_and_renders_provisioning() {
         StartStopArgs {
             name: "ntfy".into(),
             dry_run: false,
+            wait: Default::default(),
         },
     )
     .await
@@ -1336,6 +1339,7 @@ async fn start_stop_noop_sends_nothing() {
         StartStopArgs {
             name: "ntfy".into(),
             dry_run: false,
+            wait: Default::default(),
         },
     )
     .await
@@ -1351,6 +1355,7 @@ async fn start_stop_noop_sends_nothing() {
         StartStopArgs {
             name: "ntfy".into(),
             dry_run: false,
+            wait: Default::default(),
         },
     )
     .await
@@ -1369,6 +1374,7 @@ async fn start_dry_run_sends_nothing() {
         StartStopArgs {
             name: "ntfy".into(),
             dry_run: true,
+            wait: Default::default(),
         },
     )
     .await

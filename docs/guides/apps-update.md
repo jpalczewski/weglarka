@@ -25,6 +25,15 @@ When the daemon is busy with another deploy (the health gate can take tens of se
 | `--host-port` (`host_ports` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the published port is recreated together with the container — see [host ports](host-ports.md) |
 | `--config-mount` (`configs` in `--spec`), `--reload-signal` | the `configs` list changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); file **contents** are not in the hash, so apply content changes with `weglarka apps reload`. `reload_signal` is outside the hash and only affects reload — see [host configs](host-configs.md) |
 
+## Waiting for the result: `--wait`
+
+`apps update`, `apps start` and `apps stop` accept `--wait [--timeout SECS]` (default 300). After the change is saved the
+CLI polls `GET /v1/apps/{name}` until the daemon reports `reconciled: true` (the running container carries the hash of the
+stored spec: the reconciler has nothing left to do) and the container health check is no longer `starting`. Exit codes:
+0 reconciled, 6 a deploy failed or rolled back (the daemon's failure text is printed), 9 timeout or the app waits for a
+secret. `reconciled` is part of the `admin` view only (a `read` token never sees it), absent from add/update answers, and
+a `--wait` against an older daemon is refused with a hint. It is not part of `spec-hash` or any state file.
+
 Before downgrading Węglarka, remove the fields these flags set — see [verification and rollback](verify-and-rollback.md).
 
 ## Relation to auto-update

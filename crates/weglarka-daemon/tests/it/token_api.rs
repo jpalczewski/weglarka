@@ -419,6 +419,7 @@ async fn every_app_view_endpoint_answers_read_with_the_redacted_view() {
                 assert_eq!(status, StatusCode::OK, "{what}: {answer}");
                 let v = view(&answer);
                 assert_eq!(v["redacted"], true, "{what}: {answer}");
+                assert!(v.get("reconciled").is_none(), "{what}: {answer}");
                 assert!(!answer.to_string().contains("hunter2"), "{what}: {answer}");
             }
             _ => assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {answer}"),

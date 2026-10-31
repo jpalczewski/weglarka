@@ -523,6 +523,7 @@ pub(crate) fn show_response(
         name,
         spec: redact_spec(access, spec),
         redacted: access == Access::Redacted,
+        reconciled: None,
     }
 }
 
