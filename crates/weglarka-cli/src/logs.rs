@@ -178,10 +178,7 @@ pub(crate) fn sanitize_for_terminal(bytes: &[u8], terminal: bool) -> Cow<'_, [u8
         .chars()
         .map(|c| match c {
             '\t' | '\n' => c,
-            c if c.is_control() => '\u{FFFD}',
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' => {
-                '\u{FFFD}'
-            }
+            c if weglarka_api::is_unsafe_char(c) => '\u{FFFD}',
             c => c,
         })
         .collect();
