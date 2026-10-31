@@ -12,10 +12,10 @@ use weglarka_api::{
     NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
     ReloadRequest, ReloadResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
 };
-use weglarka_engine::images::human_bytes;
 use weglarka_model::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
 };
+use weglarka_model::units::human_bytes;
 
 use crate::cli::{
     AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,

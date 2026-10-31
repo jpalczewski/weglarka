@@ -171,22 +171,6 @@ pub async fn execute<P: PodmanClient>(podman: &P, plan: Plan) -> PruneReport {
     report
 }
 
-/// `1234` → `1.2 KiB`. Used by `doctor` and the CLI so both report sizes the same way.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 impl<P: PodmanClient> Reconciler<P> {
     /// Explicit prune (`POST /v1/images/prune`, `weglarka images prune`): every repository named in
     /// `apps.toml`. `dry_run` plans without removing anything.
@@ -578,14 +562,5 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(plan.reclaimable_bytes(), 2000);
-    }
-
-    #[test]
-    fn human_bytes_is_compact() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 }
