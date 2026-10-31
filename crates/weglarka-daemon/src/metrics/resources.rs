@@ -3,7 +3,8 @@
 //!
 //! Who gets a series:
 //! - a container with a valid `weglarka.instance` label: `app=<instance>`, `role` from its name
-//!   (`<instance>.next` is the challenger, `<instance>.prev` the retiring one, anything else active);
+//!   (`<instance>` is active, `<instance>.next` the challenger, `<instance>.prev` the retiring one; a
+//!   stray copy under any other name gets nothing);
 //! - the ingress, the forwarder and the daemon itself, by their fixed names, with `role="active"`;
 //! - nothing else. One-off `run`, `forward` and import containers are skipped first: their names hold
 //!   tokens, so every run would start new series.
@@ -16,7 +17,7 @@
 //! The result is cached for [`TTL`]: a scrape inside that window, or one that arrives while a refresh
 //! runs, gets the same families without another libpod call. Nothing is sampled in the background.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -34,6 +35,10 @@ use crate::service::SERVICE_NAME;
 
 /// How long one refresh is served.
 pub const TTL: Duration = Duration::from_secs(10);
+
+/// Longest wait for libpod in one refresh; below Prometheus' default 10 s scrape timeout, so a hung
+/// libpod reads as `weglarka_resource_metrics_up 0` rather than a failed scrape.
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The last refresh and when it was made; the lock is held through a refresh, so concurrent scrapes
 /// wait for it instead of starting their own.
@@ -68,7 +73,19 @@ pub async fn collect<P: PodmanClient>(daemon: &Daemon<P>, cache: &Cache) -> Vec<
 
 async fn refresh<P: PodmanClient>(podman: &P) -> Vec<Family> {
     let all = ContainerFilter::default();
-    let (containers, stats) = tokio::join!(podman.container_list(&all), podman.container_stats());
+    // The cache lock is held through the refresh, so a libpod that never answers must not hold every
+    // later scrape with it.
+    let Ok((containers, stats)) = tokio::time::timeout(REFRESH_TIMEOUT, async {
+        tokio::join!(podman.container_list(&all), podman.container_stats())
+    })
+    .await
+    else {
+        tracing::warn!(
+            timeout_secs = REFRESH_TIMEOUT.as_secs(),
+            "resource metrics unavailable: libpod did not answer in time"
+        );
+        return vec![up(false)];
+    };
     match (containers, stats) {
         (Ok(containers), Ok(stats)) => {
             let mut families = families(&containers, &stats);
@@ -88,7 +105,7 @@ async fn refresh<P: PodmanClient>(podman: &P) -> Vec<Family> {
 fn up(ok: bool) -> Family {
     Family {
         name: "weglarka_resource_metrics_up",
-        help: "1 if the last container stats call succeeded, 0 if it failed (the per-container families are then absent).",
+        help: "1 if the last container list and stats calls succeeded, 0 if either failed or timed out (the per-container families are then absent).",
         kind: Kind::Gauge,
         samples: vec![Sample::new(Vec::new(), if ok { 1.0 } else { 0.0 })],
     }
@@ -122,12 +139,17 @@ fn identify(c: &ContainerInfo) -> Option<(String, Role)> {
     if let Some(label) = c.labels.get(labels::INSTANCE) {
         // Only a validated name may become a label value.
         let instance = InstanceName::new(label.as_str()).ok()?;
-        let role = if c.name == labels::challenger_name(&instance) {
+        // Only the three names a deploy gives: a stray copy under another name (a duplicate that
+        // reconcile has not removed yet) must not claim the app's series. The name then determines
+        // `(app, role)`, and container names are unique, so no two containers share a series.
+        let role = if c.name == labels::container_name(&instance) {
+            Role::Active
+        } else if c.name == labels::challenger_name(&instance) {
             Role::Challenger
         } else if c.name == labels::retiring_name(&instance) {
             Role::Retiring
         } else {
-            Role::Active
+            return None;
         };
         return Some((instance.to_string(), role));
     }
@@ -217,18 +239,11 @@ fn families(containers: &[ContainerInfo], stats: &[ContainerStats]) -> Vec<Famil
     let stats: BTreeMap<&str, &ContainerStats> =
         stats.iter().map(|s| (s.name.as_str(), s)).collect();
     let mut out = Builder(BTreeMap::new());
-    // Two containers with the same labels would be a duplicate series, which fails the whole scrape.
-    let mut seen = BTreeSet::new();
-    let mut identified: Vec<_> = containers
+    // `identify` maps each unique container name to its own `(app, role)`, so no series repeats.
+    for (c, (app, role)) in containers
         .iter()
-        .filter_map(|c| identify(c).map(|id| (id, c)))
-        .collect();
-    // Stable: with a duplicate, the same container wins every time.
-    identified.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
-    for ((app, role), c) in identified {
-        if !seen.insert((app.clone(), role)) {
-            continue;
-        }
+        .filter_map(|c| identify(c).map(|id| (c, id)))
+    {
         let labels = [("app", app), ("role", role.as_str().to_owned())];
         out.add(RESTARTS, &labels, Some(f64::from(c.restarts)));
         out.add(
@@ -318,25 +333,26 @@ mod tests {
         // Markers win over the instance label; an invalid instance never becomes a label value.
         for marker in [labels::RUN, labels::FORWARD, labels::IMPORT_FOR] {
             let labels = [(marker, "true"), (labels::INSTANCE, "web")];
-            assert_eq!(id(&container("web-x-1a2b", &labels)), None, "{marker}");
+            assert_eq!(id(&container("web", &labels)), None, "{marker}");
         }
         let bad = [(labels::INSTANCE, "Not A Name\n")];
         assert_eq!(id(&container("odd", &bad)), None);
     }
 
     #[test]
-    fn a_duplicate_identity_yields_one_series() {
-        // A stray copy of an app (a duplicate reconcile has not removed yet) claims the same series.
-        let a = container("web", &[(labels::INSTANCE, "web")]);
-        let mut b = container("web-copy", &[(labels::INSTANCE, "web")]);
-        b.restarts = 5;
-        let families = families(&[b, a], &[]);
+    fn a_stray_copy_does_not_claim_the_apps_series() {
+        // A duplicate reconcile has not removed yet carries the label under another name; it must not
+        // win the app's series even when its name sorts first.
+        let real = container("web", &[(labels::INSTANCE, "web")]);
+        let mut stray = container("aaa-web", &[(labels::INSTANCE, "web")]);
+        stray.restarts = 5;
+        assert_eq!(id(&stray), None);
+        let families = families(&[stray, real], &[]);
         let restarts = families
             .iter()
             .find(|f| f.name == RESTARTS.0)
             .expect("restarts family");
         assert_eq!(restarts.samples.len(), 1);
-        // Sorted by name: `web` wins over `web-copy` whatever the list order.
         assert_eq!(restarts.samples[0].value, 0.0);
     }
 

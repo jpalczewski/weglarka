@@ -68,7 +68,8 @@ the page is still served with `200`.
 Every series carries `app` and `role`:
 
 - an app's container: `app` is the instance name, `role` is `active`, or `challenger`/`retiring` for the `.next`/`.prev`
-  containers of a [blue-green deploy](blue-green.md);
+  containers of a [blue-green deploy](blue-green.md) (a stray copy under another name, which reconcile removes, gets no
+  series);
 - the ingress (`weglarka-nginx`), the `edge` port forwarder (`weglarka-forwarder`) and the daemon itself (`weglarka`):
   `app` is that name, `role="active"`;
 - nothing else. One-off containers (`weglarka run`, `weglarka forward`, volume imports) are skipped: their names carry
@@ -87,7 +88,7 @@ Every series carries `app` and `role`:
 | `weglarka_container_block_write_bytes_total` | counter | as above |
 | `weglarka_container_restarts_total` | counter | restarts by the restart policy (libpod `RestartCount`) |
 | `weglarka_container_oom_killed` | gauge | `1` if libpod recorded an out-of-memory kill of this container |
-| `weglarka_resource_metrics_up` | gauge | `1` if the last stats call worked, `0` if it failed |
+| `weglarka_resource_metrics_up` | gauge | `1` if the last container list and stats calls worked, `0` if either failed or took over 8 s |
 
 Counters restart from zero when a container is recreated (a deploy, a blue-green switch); `rate()` and `increase()`
 handle that as a counter reset. The usage numbers exist only for a running container; restarts, the OOM flag and the
@@ -95,9 +96,9 @@ limit are also reported for a stopped one.
 
 Each scrape is answered from one container list and one libpod stats call for all containers, cached for 10 seconds:
 scrapes within that window, or arriving while a refresh runs, share it. Nothing is sampled between scrapes, so with no
-scraper the daemon does no work. If the stats call fails, the per-container families are absent,
-`weglarka_resource_metrics_up` is `0` and `/metrics` still answers `200`; the error is in the daemon log. Alert on
-`weglarka_resource_metrics_up == 0`.
+scraper the daemon does no work. If the list or the stats call fails, or libpod does not answer within 8 seconds, the
+per-container families are absent, `weglarka_resource_metrics_up` is `0` and `/metrics` still answers `200`; the error
+is in the daemon log. Alert on `weglarka_resource_metrics_up == 0`.
 
 ### Missing data is no sample, never zero
 

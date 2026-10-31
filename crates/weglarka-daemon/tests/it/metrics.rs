@@ -547,12 +547,12 @@ mod resources {
         // Names of one-off containers carry tokens; they also carry the instance as `*-for`.
         labelled(
             &h.fake,
-            "alpha-run-3f9a2c",
+            "wg-run.alpha.3f9a2c",
             &[("weglarka.run", "true"), ("weglarka.run-for", "alpha")],
         );
         labelled(
             &h.fake,
-            "alpha-forward-77ab01",
+            "wg-fwd.alpha.77ab01",
             &[
                 ("weglarka.forward", "true"),
                 ("weglarka.forward-for", "alpha"),
@@ -560,32 +560,32 @@ mod resources {
         );
         labelled(
             &h.fake,
-            "alpha-import-1c2d",
+            "wg-import.alpha",
             &[("weglarka.import-for", "alpha")],
         );
         // Even with the instance label, a run marker wins.
         labelled(
             &h.fake,
-            "alpha-run-b0b0",
+            "wg-run.alpha.b0b0",
             &[("weglarka.run", "true"), ("weglarka.instance", "alpha")],
         );
         h.fake.add_foreign_container("hand-started", IMAGE);
         h.fake.script_stats(
             [
                 "alpha",
-                "alpha-run-3f9a2c",
-                "alpha-forward-77ab01",
-                "alpha-import-1c2d",
-                "alpha-run-b0b0",
+                "wg-run.alpha.3f9a2c",
+                "wg-fwd.alpha.77ab01",
+                "wg-import.alpha",
+                "wg-run.alpha.b0b0",
                 "hand-started",
             ]
             .map(|n| stat(n, 1)),
         );
 
         let body = scrape(&h).await;
-        assert!(!body.contains("run-"), "{body}");
-        assert!(!body.contains("forward-"), "{body}");
-        assert!(!body.contains("import-"), "{body}");
+        assert!(!body.contains("wg-run."), "{body}");
+        assert!(!body.contains("wg-fwd."), "{body}");
+        assert!(!body.contains("wg-import."), "{body}");
         assert!(!body.contains("hand-started"), "{body}");
         assert!(sample(&body, MEMORY, "alpha", "active").is_some(), "{body}");
         assert!(
