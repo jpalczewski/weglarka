@@ -16,7 +16,8 @@ network = "metrics"       # optional; this is the default
 Restart the daemon. It binds the listener at once, then creates the network (if missing; it is `internal`, with no
 route out) and connects its own container to it in the background, retrying every few seconds up to a minute until
 Podman cooperates, so no `platform install` and no second restart is needed. The network name uses lowercase letters, digits and `-`, and must not start with `net-`
-(those names belong to app and ingress networks).
+(those names belong to app and ingress networks) or `metrics-` (the per-app metrics networks, see
+[Opting an app in](#opting-an-app-in)).
 
 The listener serves `GET /metrics` and nothing else: every other path is `404`, and it has no admin route. There is no
 authentication in this version; the network is the boundary, and the text carries no secrets. Put on the `metrics`
@@ -191,6 +192,45 @@ container started by your own unit with the mounts its documentation asks for, a
 `node_*` series then come with an `instance` label of their own, so drop the duplicate families from one of the two
 targets (`metric_relabel_configs`) if both are scraped.
 
+## Opting an app in
+
+An app that serves its own Prometheus endpoint declares the port (and, when it is not `/metrics`, the path):
+
+```toml
+[apps.forge]
+image = "ghcr.io/example/forge:1"
+metrics_port = 9100
+metrics_path = "/internal/metrics"   # optional; the default is /metrics
+```
+
+or with the CLI:
+
+```bash
+weglarka apps update forge --metrics-port 9100 --metrics-path /internal/metrics
+```
+
+On the next deploy the daemon creates an `internal` Podman network `metrics-forge` (no route out, labelled
+`weglarka.metrics-for=forge`) and attaches the app's container to it. Each opted-in app gets its own network, shared
+only with the scraper: on one network for every app, opted-in apps could reach each other, and putting the scraper on
+`net-forge` would expose every port of the app. One-off containers (`weglarka run`, `weglarka forward`) never join it.
+
+- **Setting or changing `metrics_port` recreates the container once** (it changes the container's networks), like
+  joining a shared network. `metrics_path` alone recreates nothing; only the scraper reads it. Apps that do not set
+  either are untouched by the upgrade.
+- `metrics_port` is a non-zero port; `metrics_path` starts with `/`, uses only `[A-Za-z0-9_.-]` segments (no query,
+  fragment, `..` or trailing `/`) and needs `metrics_port`. A `kind = "static"` app has no container and rejects both.
+- **Opting out** (`--metrics-port none`, which also drops the path) recreates the container without the network, and
+  the same reconcile pass removes `metrics-forge`. A removed app takes its network with it. Removal is best effort: a
+  network something is still attached to stays until a later pass.
+- **Blue-green apps** ([blue-green deploys](blue-green.md)): the challenger joins `metrics-<app>` only after its health
+  gate, together with the app network and with the instance name as its alias, so a target `forge:9100` resolves
+  through the whole switch and never reaches a challenger that failed its gate.
+- Nothing checks that the app really listens on the port: a wrong port is a failed scrape later, not a failed deploy.
+- `weglarka apps show forge` lists both fields; a `read` token sees them as well.
+
+**Not there yet:** nothing joins the scraper to these networks and no scrape targets are generated, so opting in alone
+does not get the app scraped. Connecting a Prometheus app comes with #365, and generated targets with #366.
+
 ## Suggested alerts
 
 ```yaml
@@ -242,6 +282,12 @@ groups:
 ## Rollback
 
 `[metrics]` is a new section of `weglarka.toml`, and the file uses `deny_unknown_fields`: an older Węglarka refuses to
-start while it is present. Remove `[metrics]` before downgrading. No `apps.toml` or `state.toml` field is involved, so
-[`schema_version`](state-schema.md) does not change. The network and the membership are not removed by the downgrade;
+start while it is present. Remove `[metrics]` before downgrading. The listener itself adds no `apps.toml` or
+`state.toml` field.
+
+`metrics_port` and `metrics_path` are new `apps.toml` fields, and they bump [`schema_version`](state-schema.md) to 16.
+A daemon from before them refuses an `apps.toml` stamped 16 (and would refuse the fields themselves). Before
+downgrading, opt every app out (`weglarka apps update <app> --metrics-port none`) and restore `apps.toml` and
+`state.toml` from a backup taken before the upgrade, or set `schema_version` back by hand once neither field is
+left; remove the leftover `metrics-<app>` networks with `podman network rm` if the opt-out pass did not. The network and the membership are not removed by the downgrade;
 delete the empty network with `podman network rm metrics` if you no longer need it.

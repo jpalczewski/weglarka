@@ -76,6 +76,14 @@ pub(crate) fn instance_networks(
     (networks, aliases)
 }
 
+/// The per-app metrics network of an opted-in app (issue #364), `None` without `metrics_port`. Only
+/// the app's own container joins it: a one-off `weglarka run` or a `weglarka forward` relay is never
+/// something the scraper should reach, so [`instance_networks`] leaves it out.
+pub(crate) fn metrics_network(instance: &InstanceName, spec: &AppSpec) -> Option<String> {
+    spec.metrics_port
+        .map(|_| labels::metrics_network_name(instance))
+}
+
 /// Host config mounts: always read-only, and the **canonical** path is what mounts, so a symlink
 /// swapped between the check and the mount cannot redirect the bind (ADR 0028).
 pub(crate) fn config_binds(configs: &[crate::config_mounts::Resolved]) -> Vec<BindMount> {
@@ -539,6 +547,20 @@ impl<P: PodmanClient> Reconciler<P> {
                 })
                 .await?;
         }
+        if let Some(name) = metrics_network(instance, spec) {
+            self.podman
+                .network_create(&NetworkSpec {
+                    name,
+                    // Shared with the scraper only, never a route out. Not labelled with the
+                    // instance: `prune_networks` keys this one on its own label.
+                    internal: true,
+                    labels: BTreeMap::from([(
+                        labels::METRICS_FOR.to_owned(),
+                        instance.to_string(),
+                    )]),
+                })
+                .await?;
+        }
         // A changed uid range would make the instance's existing files unreadable
         // (docs/decisions/0017-shared-volumes.md): refuse before creating volumes or touching the
         // old container. The range was assigned by the caller, so `state.toml` already has it.
@@ -572,7 +594,8 @@ impl<P: PodmanClient> Reconciler<P> {
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
-        let (networks, network_aliases) = instance_networks(instance, spec);
+        let (mut networks, network_aliases) = instance_networks(instance, spec);
+        networks.extend(metrics_network(instance, spec));
         let mut container = container_spec(
             name.clone(),
             image,
@@ -657,6 +680,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let retiring = labels::retiring_name(instance);
         let app_net = labels::network_name(instance);
         let staging = labels::staging_network_name(instance);
+        let metrics_net = metrics_network(instance, spec);
 
         // A leftover of a crashed deploy would hold the names.
         self.remove_transient(&next, &retiring).await;
@@ -670,7 +694,9 @@ impl<P: PodmanClient> Reconciler<P> {
 
         // The app network is the one nginx is on and the one that carries the alias: the challenger
         // joins it only after its gate. Shared networks (and their aliases) are joined up front, since
-        // libpod cannot add an alias to a network the container is already on.
+        // libpod cannot add an alias to a network the container is already on. The metrics network
+        // (issue #364) waits for the gate too: a scraper must not reach a challenger that may never
+        // serve, and the instance name there has to move to it in the same switch.
         let (mut networks, network_aliases) = instance_networks(instance, spec);
         networks[0] = staging.clone();
         let mut container = container_spec(
@@ -715,15 +741,29 @@ impl<P: PodmanClient> Reconciler<P> {
             self.abandon_challenger(&next, &staging).await;
             return Ok(failed(format!("cannot join the app network: {e}")));
         }
+        // Same alias on the metrics network: a scrape target `<instance>:<metrics_port>` resolves to
+        // both containers until the old one stops, never to neither.
+        let joined: Vec<&str> = std::iter::once(app_net.as_str())
+            .chain(metrics_net.as_deref())
+            .collect();
+        if let Some(metrics_net) = &metrics_net
+            && let Err(e) = self
+                .podman
+                .network_connect_aliased(metrics_net, &next, &alias)
+                .await
+        {
+            self.back_out_switch(&joined[..1], &next, &staging).await;
+            return Ok(failed(format!("cannot join the metrics network: {e}")));
+        }
         // Names are bookkeeping (libpod keeps the old DNS entry of a renamed container): the old one
         // makes room first, so a container called `<instance>` exists throughout.
         if let Err(e) = self.podman.container_rename(&serving, &retiring).await {
-            self.back_out_switch(&app_net, &next, &staging).await;
+            self.back_out_switch(&joined, &next, &staging).await;
             return Ok(failed(format!("cannot rename the old container: {e}")));
         }
         if let Err(e) = self.podman.container_rename(&next, &serving).await {
             let _ = self.podman.container_rename(&retiring, &serving).await;
-            self.back_out_switch(&app_net, &next, &staging).await;
+            self.back_out_switch(&joined, &next, &staging).await;
             return Ok(failed(format!("cannot rename the new container: {e}")));
         }
 
@@ -783,9 +823,12 @@ impl<P: PodmanClient> Reconciler<P> {
         let _ = self.podman.network_remove(staging).await;
     }
 
-    /// Takes the challenger back out of the app network after a failed rename, then removes it.
-    async fn back_out_switch(&self, app_net: &str, next: &str, staging: &str) {
-        let _ = self.podman.network_disconnect(app_net, next).await;
+    /// Takes the challenger back out of the networks it joined at the switch (the app network and,
+    /// for an opted-in app, the metrics network) after a later step failed, then removes it.
+    async fn back_out_switch(&self, joined: &[&str], next: &str, staging: &str) {
+        for network in joined {
+            let _ = self.podman.network_disconnect(network, next).await;
+        }
         self.abandon_challenger(next, staging).await;
     }
 

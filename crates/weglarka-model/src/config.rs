@@ -139,6 +139,13 @@ impl MetricsConfig {
                 "[metrics] network {network:?} must not start with `net-`: that prefix belongs to app and ingress networks"
             ));
         }
+        // `metrics-<app>` are the per-app metrics networks (issue #364), pruned by reconcile.
+        if network.starts_with(crate::labels::METRICS_APP_NETWORK_PREFIX) {
+            return Err(format!(
+                "[metrics] network {network:?} must not start with `{}`: that prefix belongs to per-app metrics networks",
+                crate::labels::METRICS_APP_NETWORK_PREFIX
+            ));
+        }
         Ok(())
     }
 }

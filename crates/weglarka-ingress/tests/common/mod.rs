@@ -73,6 +73,8 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         reload_signal: None,
         strategy: Default::default(),
         oidc: None,
+        metrics_port: None,
+        metrics_path: None,
     };
     spec.domains.shrink_to_fit();
     BTreeMap::from([(InstanceName::new("app").unwrap(), spec)])

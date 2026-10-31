@@ -222,7 +222,7 @@ async fn a_bind_failure_is_permanent_and_reported_without_stopping_the_daemon() 
 
 #[test]
 fn an_invalid_network_name_is_rejected() {
-    for bad in ["net-foo", "Bad", "-x", ""] {
+    for bad in ["net-foo", "metrics-foo", "metrics-", "Bad", "-x", ""] {
         let toml = format!("listen = \"127.0.0.1:1\"\nnetwork = \"{bad}\"");
         let cfg: weglarka_model::config::MetricsConfig = toml::from_str(&toml).unwrap();
         assert!(cfg.validate().is_err(), "{bad}");

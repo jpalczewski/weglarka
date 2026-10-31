@@ -399,6 +399,8 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         group_add,
         strategy,
         oidc,
+        metrics_port,
+        metrics_path,
     } = spec;
     // `image`, `domains`, `paths`, `depends_on`, `reload_signal` and `group_add` are names the model
     // validates (an image reference, DNS names, path prefixes, instance names, a signal name, group
@@ -432,6 +434,10 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         group_add,
         strategy: read_strategy(strategy),
         oidc: oidc.map(read_oidc),
+        // A port number, and a path the model validates to the `paths` shape (`check_path_prefix`:
+        // `[A-Za-z0-9_.-]` segments, no query or fragment), so neither can carry a credential.
+        metrics_port,
+        metrics_path,
     }
 }
 
@@ -690,6 +696,8 @@ host_ports = [{ host = 9000, container = 80, ip = "127.0.0.1" }]
 configs = [{ source = "app/conf", target = "/etc/app" }]
 host_mounts = [{ source = "/srv/media", target = "/media" }]
 shared_networks = [{ name = "backbone", aliases = ["svc"] }]
+metrics_port = 9100
+metrics_path = "/internal/metrics"
 [env]
 DATABASE_URL = "postgres://u:p@h/db"
 MODE = "prod"

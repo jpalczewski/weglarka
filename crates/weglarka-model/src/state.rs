@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -147,6 +147,13 @@ fn oidc_device_flow_v15(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v15 → v16: per-app metrics (issue #364). `AppSpec::metrics_port` and `AppSpec::metrics_path` are
+/// optional and default to unset, so a v15 document needs no data transformation — the marker records
+/// that the file may carry them. A no-op that must accept a hand-edited file which already has them.
+fn app_metrics_v16(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -165,6 +172,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     site_environments_v13,
     identity_v14,
     oidc_device_flow_v15,
+    app_metrics_v16,
 ];
 
 const _: () = assert!(
@@ -351,7 +359,24 @@ pub fn validate_app(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     validate_strategy(name, spec)?;
     validate_iteration2(name, spec)?;
     validate_static(name, spec)?;
+    validate_metrics(name, spec)?;
     crate::identity::validate_app(name, spec)
+}
+
+/// `metrics_port`/`metrics_path` (issue #364). The path ends up in the scraper's generated config,
+/// so it gets the strict alphabet of a `paths` entry: no query, fragment, spaces or dot segments.
+fn validate_metrics(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    if spec.metrics_port == Some(0) {
+        return Err(format!("{name}: metrics_port must be non-zero"));
+    }
+    if let Some(path) = &spec.metrics_path {
+        if spec.metrics_port.is_none() {
+            return Err(format!("{name}: metrics_path requires metrics_port"));
+        }
+        crate::app::check_path_prefix(path)
+            .map_err(|reason| format!("{name}: invalid metrics_path {path:?}: {reason}"))?;
+    }
+    Ok(())
 }
 
 /// `apps.toml` invariants that span the file and are not about one instance.
@@ -406,6 +431,8 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         ("group_add", !spec.group_add.is_empty()),
         ("strategy", spec.strategy != defaults.strategy),
         ("oidc", spec.oidc.is_some()),
+        ("metrics_port", spec.metrics_port.is_some()),
+        ("metrics_path", spec.metrics_path.is_some()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
         return Err(format!(
@@ -1510,6 +1537,63 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
                 .unwrap()
                 .contains(&format!("schema_version = {SCHEMA_VERSION}"))
         );
+    }
+
+    #[test]
+    fn metrics_port_and_path_are_validated() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!("image = \"i\"\n{extra}")).unwrap()
+        };
+        let check = |extra: &str| validate_app(&name("a"), &spec(extra));
+        assert!(check("metrics_port = 9100").is_ok());
+        assert!(check("metrics_port = 9100\nmetrics_path = \"/metrics\"").is_ok());
+        assert!(check("metrics_port = 9100\nmetrics_path = \"/internal/prom-v1.2\"").is_ok());
+        let err = check("metrics_port = 0").unwrap_err();
+        assert!(err.contains("metrics_port must be non-zero"), "{err}");
+        let err = check("metrics_path = \"/metrics\"").unwrap_err();
+        assert!(err.contains("metrics_path requires metrics_port"), "{err}");
+        for bad in [
+            "metrics",
+            "/metrics?x=1",
+            "/metrics#a",
+            "/a/../b",
+            "/a b",
+            "/a%2f",
+            "/metrics/",
+            "",
+        ] {
+            let err = check(&format!("metrics_port = 9100\nmetrics_path = {bad:?}")).unwrap_err();
+            assert!(err.contains("invalid metrics_path"), "{bad}: {err}");
+        }
+        // A static site has no container to scrape.
+        let err = check("kind = \"static\"\nmetrics_port = 9100").unwrap_err();
+        assert!(err.contains("`metrics_port` does not apply"), "{err}");
+    }
+
+    #[test]
+    fn an_apps_file_with_metrics_fields_round_trips_under_the_current_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        // A v15 file hand-edited to carry the v16 fields: the no-op step accepts it.
+        fs::write(
+            &apps_path,
+            "schema_version = 15\n[apps.a]\nimage = \"x:1\"\nmetrics_port = 9100\nmetrics_path = \"/m\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(apps.apps[&name("a")].metrics_port, Some(9100));
+        save_apps(&apps_path, &apps).unwrap();
+        let text = fs::read_to_string(&apps_path).unwrap();
+        assert!(text.starts_with("schema_version = 16"), "{text}");
+        assert!(
+            text.contains("metrics_port = 9100\nmetrics_path = \"/m\""),
+            "{text}"
+        );
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        // Unset, neither field is written.
+        let plain: AppSpec = toml::from_str("image = \"x:1\"").unwrap();
+        assert!(!toml::to_string(&plain).unwrap().contains("metrics"));
     }
 
     #[test]

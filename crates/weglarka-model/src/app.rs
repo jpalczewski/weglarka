@@ -1027,6 +1027,22 @@ pub struct AppSpec {
     /// the hash through `identity::effective_spec`. Needs `[identity]` in `weglarka.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcClientSpec>,
+    /// Container port that serves Prometheus metrics (issue #364). Setting it opts the app in: the
+    /// container also joins its own internal network `metrics-<instance>`, shared only with the
+    /// scraper. Part of the spec hash while set, because it changes the container's networks; unset
+    /// it hashes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_port: Option<u16>,
+    /// Path of the metrics endpoint on [`AppSpec::metrics_port`]; unset means `/metrics`. Needs
+    /// `metrics_port`, and is checked like a `paths` entry ([`check_path_prefix`]). Outside the spec
+    /// hash: only the scraper reads it, the container is not made of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_path: Option<String>,
+}
+
+impl AppSpec {
+    /// Metrics path a scraper uses when `metrics_path` is unset.
+    pub const DEFAULT_METRICS_PATH: &'static str = "/metrics";
 }
 
 /// Deploy strategy of an app.
