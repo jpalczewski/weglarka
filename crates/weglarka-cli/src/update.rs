@@ -369,17 +369,23 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     Ok(spec)
 }
 
-fn read_spec_file(path: &Path) -> Result<AppSpec, CliError> {
-    let src = if path == Path::new("-") {
-        let mut s = String::new();
-        std::io::stdin()
-            .read_to_string(&mut s)
+/// Reads an `AppSpec` TOML from `path`; `-` is stdin (same convention as `secrets set`), so a spec
+/// kept in a repo can be piped through `ssh host weglarka apps update web --spec - < spec.toml`
+/// without a temp file on the host. Shared by `apps update` and `apps add`.
+pub(crate) fn read_spec_file(path: &Path) -> Result<AppSpec, CliError> {
+    read_spec_from(path, &mut std::io::stdin())
+}
+
+fn read_spec_from(path: &Path, stdin: &mut impl Read) -> Result<AppSpec, CliError> {
+    let mut src = String::new();
+    if path == Path::new("-") {
+        stdin
+            .read_to_string(&mut src)
             .map_err(|e| CliError::usage(format!("cannot read spec from stdin: {e}")))?;
-        s
     } else {
-        std::fs::read_to_string(path)
-            .map_err(|e| CliError::usage(format!("cannot read spec {}: {e}", path.display())))?
-    };
+        src = std::fs::read_to_string(path)
+            .map_err(|e| CliError::usage(format!("cannot read spec {}: {e}", path.display())))?;
+    }
     toml::from_str(&src).map_err(|e| {
         CliError::usage(format!("invalid spec: {e}")).with_hint(
             "format: the AppSpec fields from apps.toml (image, domains, port, env, secrets…)",
@@ -1418,6 +1424,24 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         };
         assert!(apps_start(true, &o, stop).await.is_err());
         assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+    }
+
+    #[test]
+    fn spec_dash_reads_stdin_and_a_file_is_still_a_file() {
+        let toml = toml::to_string(&spec()).unwrap();
+        let got = read_spec_from(Path::new("-"), &mut toml.as_bytes()).unwrap();
+        assert_eq!(got, spec());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spec.toml");
+        std::fs::write(&file, &toml).unwrap();
+        // A real path never touches stdin.
+        assert_eq!(
+            read_spec_from(&file, &mut std::io::empty()).unwrap(),
+            spec()
+        );
+        let err = read_spec_from(Path::new("-"), &mut "image = [".as_bytes()).unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
+        assert!(err.message.contains("invalid spec"), "{}", err.message);
     }
 
     #[tokio::test(flavor = "current_thread")]

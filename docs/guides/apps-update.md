@@ -2,7 +2,8 @@
 
 `weglarka apps update <app> [flags]` reads the current spec, applies the flags and sends the **whole** spec (a full
 replacement; `--spec file.toml` replaces it entirely from a file — a missing `start` in the file means
-`start = true`). `--dry-run` shows the diff and sends nothing.
+`start = true`; `--spec -` reads the file from stdin, e.g. `ssh myhost weglarka apps update web --spec - < web.toml`).
+`--dry-run` shows the diff and sends nothing.
 
 When the daemon is busy with another deploy (the health gate can take tens of seconds), the CLI does not return a
 "busy" error immediately; it retries the request for up to 3 minutes (the message "daemon is busy … waiting…" on stderr).
