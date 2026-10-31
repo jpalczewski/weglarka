@@ -66,5 +66,6 @@ Priorities for every decision: **security → elegant, extensible code (traits/a
 - [crate-map](.claude/rules/crate-map.md) — dependency graph and the crate table.
 
 Contributor docs: [`docs/contributing/agent-workflow.md`](docs/contributing/agent-workflow.md) (parallel sessions, briefs,
-reviews) and [`docs/contributing/issues-and-project.md`](docs/contributing/issues-and-project.md) (labels, project).
+reviews), [`docs/contributing/issues-and-project.md`](docs/contributing/issues-and-project.md) (labels, project) and
+[`docs/contributing/releasing.md`](docs/contributing/releasing.md) (manual release steps).
 Verify this setup with `bash scripts/claude-md-lint.sh`.
