@@ -5,6 +5,11 @@ The `weglarka` CLI stays outside the container: on the host, or on a laptop thro
 Examples assume the host `myhost` (Ubuntu 24.04, `behind` mode, Traefik from Coolify). Decisions:
 [ADR 0005](decisions/0005-ingress-i-platforma.md), [ADR 0006](decisions/0006-pakowanie-obrazy-i-release.md).
 
+Supported hosts: **Ubuntu with systemd** is what this page documents and what the acceptance test runs on.
+**Alpine with OpenRC** is the intended target and is in progress
+([#46](https://github.com/jpalczewski/weglarka/issues/46)); until it lands, the systemd units below have no OpenRC
+equivalent.
+
 This page covers installation only: host requirements, host configuration, binaries, the quadlet, image
 verification, the CLI from a laptop and the acceptance test. Everything else (your first app, volumes, webhooks,
 ports, TLS, self-update, rollback, ...) lives in task-oriented guides in [`docs/guides/`](guides/README.md).
