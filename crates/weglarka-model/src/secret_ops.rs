@@ -135,7 +135,7 @@ pub trait SecretOps: Send + Sync {
 
 /// Where the digest of `name` lives: `<scope>.<stem>-digest` for `<scope>.<stem>-secret`, else
 /// `<name>-digest`.
-fn digest_name(name: &str) -> Result<String, SecretError> {
+pub fn digest_name(name: &str) -> Result<String, SecretError> {
     split_scoped(name)?;
     let base = name.strip_suffix("-secret").unwrap_or(name);
     let digest = format!("{base}-digest");

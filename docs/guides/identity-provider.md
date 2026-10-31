@@ -92,9 +92,13 @@ Apps with `oidc` (or `ingress.auth = "forward"`) start after the provider: Węgl
 weglarka oidc rotate panel
 ```
 
-The secret and digest are replaced, the provider's files are re-rendered, validated and applied, and only then is the app
-recreated. Between the provider restart and the recreate, logins fail. A provider that rejects the new files leaves the
-rotation half done; fix it and run the command again.
+The new secret and digest are staged next to the live pair (`<app>.oidc-client-secret-pending` and its `-digest`), the
+provider's files are re-rendered with the staged digest, validated and applied, and only a successful apply promotes the
+staged pair to the live one; then the app is recreated. Between the provider restart and the recreate, logins fail. A
+provider that rejects the new files (or is unhealthy on them) leaves the old secret and digest in place and answers 409
+with "nothing was rotated": fix the provider and run the command again. The whole sequence runs under the daemon's
+desired-state and engine locks. No state-file field is involved, so there is nothing to do before a downgrade; a pending
+pair left by a crash is overwritten by the next rotation (and removed with the app by `--purge-secrets`).
 
 `weglarka secrets set` and `secrets remove` refuse the two reserved names, so the pair cannot be split by hand.
 

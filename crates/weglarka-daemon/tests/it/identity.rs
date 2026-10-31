@@ -6,6 +6,7 @@ use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
+use weglarka_engine::testing::RunScript;
 
 const IDENTITY: &str = "[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.com\"\n";
 
@@ -112,6 +113,51 @@ async fn rotation_changes_the_digest_and_recreates_the_app() {
         h.fake.created_specs().len() > creates,
         "the app was recreated"
     );
+    h.running.stop().await;
+}
+
+fn secrets_file(h: &Harness) -> String {
+    read(&h.root.join("state/secrets.toml"))
+}
+
+#[tokio::test]
+async fn a_rotation_the_provider_rejects_changes_nothing() {
+    let h = with_provider().await;
+    add(&h, "panel", panel()).await;
+    deployed(&h, "panel").await;
+    eventually("the client in the generated file", || async {
+        clients_file(&h).contains("\"panel\"")
+    })
+    .await;
+    let (files, secrets) = (clients_file(&h), secrets_file(&h));
+
+    // The provider's validation fails, so the new files are not applied.
+    h.fake.script_next_run(RunScript {
+        exit_code: 1,
+        ..Default::default()
+    });
+    let (s, v) = admin(&h, "POST", "/v1/apps/panel/oidc/rotate", None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing was rotated"),
+        "{v}"
+    );
+    assert_eq!(clients_file(&h), files, "the provider keeps the old digest");
+    assert_eq!(
+        secrets_file(&h),
+        secrets,
+        "the live pair and the store are untouched"
+    );
+
+    // Once the provider is back, the same command succeeds and leaves no pending pair behind.
+    let (s, v) = admin(&h, "POST", "/v1/apps/panel/oidc/rotate", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_ne!(clients_file(&h), files);
+    assert_ne!(secrets_file(&h), secrets);
+    assert!(!secrets_file(&h).contains("pending"));
     h.running.stop().await;
 }
 
