@@ -178,6 +178,23 @@ pub const APPS_ACCESS: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::Credential,
 };
+/// `GET` → [`AppStatsResponse`](crate::AppStatsResponse): memory, CPU, pids and I/O of the app's
+/// containers from the daemon's shared snapshot (at most 10 s old). Unknown app: 404; no running
+/// container: 200 with an empty list; libpod failing: 200 with `available: false`
+/// (docs/decisions/0065).
+pub const APPS_STATS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/apps/{name}/stats",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
+/// `GET` → [`StatsResponse`](crate::StatsResponse): the same for every app (system containers: #420).
+pub const STATS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/stats",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
 /// `GET` → [`ListSecretsResponse`](crate::ListSecretsResponse) (without values)
 pub const SECRETS_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -426,6 +443,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_FORWARD,
     APPS_LOGS,
     APPS_ACCESS,
+    APPS_STATS,
+    STATS,
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,

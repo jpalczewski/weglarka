@@ -132,6 +132,17 @@ A value libpod cannot supply is left out rather than reported as `0`, so a dashb
   `cpu memory pids`; add `io` with a `Delegate=` drop-in for `user@.service`). `weglarka doctor --preflight` mentions a
   missing `io` in its `runtime.cgroups` line; the check stays `ok`, since `io` is optional.
 
+## Without Prometheus
+
+The same numbers are available from the admin API without `[metrics]` and without a scraper: `GET /v1/stats` (every
+app) and `GET /v1/apps/{name}/stats` (one app), both at the `read` scope. Each container row has its `role`
+(`active`, `challenger`, `retiring`), `restarts`, `oom_killed`, memory use and limit, CPU, pids and block and network
+I/O. A number that is not known is `null`, never `0`; `memory_limit_bytes` is `null` for a container without a limit.
+`cpu_ratio` is cores over the last `cpu_window_secs` (`1.0` is one full core) and is `null` for the first request
+after a quiet period. Values are at most 10 s old and are shared with the metrics page, so polling costs no extra
+libpod calls. When libpod does not answer the response is `200` with `available: false` and no rows. System containers
+(ingress, forwarder, daemon) are not listed yet. The CLI and the panel will show the same data.
+
 ## Host
 
 The daemon reports the host's memory, CPU, load, disks and pressure itself, with no extra container and no host

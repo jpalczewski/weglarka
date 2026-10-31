@@ -1,0 +1,9 @@
+---
+source: crates/weglarka-daemon/tests/it/stats.rs
+expression: all.clone()
+---
+{
+  "apps": [],
+  "available": false,
+  "sampled_at": null
+}

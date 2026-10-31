@@ -1,0 +1,10 @@
+---
+source: crates/weglarka-daemon/tests/it/stats.rs
+expression: one.clone()
+---
+{
+  "app": "alpha",
+  "available": false,
+  "containers": [],
+  "sampled_at": null
+}

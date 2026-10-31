@@ -52,7 +52,7 @@ use crate::volumes;
 const BODY_LIMIT: usize = 1024 * 1024;
 
 type Shared<P> = State<Arc<Daemon<P>>>;
-type ApiResult<T> = Result<T, Fail>;
+pub(crate) type ApiResult<T> = Result<T, Fail>;
 
 /// API error: domain code + message; the HTTP status derives from `ErrorCode::http_status`.
 #[derive(Debug)]
@@ -160,7 +160,7 @@ impl From<EngineError> for Fail {
     }
 }
 
-fn json<T: Serialize>(v: T) -> Response {
+pub(crate) fn json<T: Serialize>(v: T) -> Response {
     axum::Json(v).into_response()
 }
 
@@ -232,6 +232,7 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         .merge(crate::logs::routes())
         .merge(crate::access::routes())
         .merge(crate::certificates::routes())
+        .merge(crate::stats::routes())
         .merge(crate::config_view::routes())
         .merge(crate::identity::routes())
         .merge(images::routes())
@@ -438,7 +439,7 @@ async fn show_app<P: PodmanClient + 'static>(
     }))
 }
 
-fn load_spec<P: PodmanClient>(d: &Daemon<P>, name: &InstanceName) -> ApiResult<AppSpec> {
+pub(crate) fn load_spec<P: PodmanClient>(d: &Daemon<P>, name: &InstanceName) -> ApiResult<AppSpec> {
     state::load_apps(&d.paths.state.apps)
         .map_err(Fail::internal)?
         .apps
