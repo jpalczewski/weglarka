@@ -28,8 +28,8 @@ const DEFAULT_TAIL: u32 = 100;
 const MAX_LINE: usize = 64 * 1024;
 /// Reopens in a row, with no output in between, after which a stream is given up.
 pub(crate) const MAX_QUIET_REOPENS: u32 = 5;
-/// A reopen starts this much before the last output, so a line that was in flight when the
-/// connection ended is not lost (at the price of a repeat).
+/// A reopen starts this much before the last delivered line's timestamp, so a line that was in
+/// flight when the connection ended is not lost (at the price of a repeat).
 const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
 /// A connection that stayed open at least this long was not a tight loop, however quiet: it does
 /// not count towards [`MAX_QUIET_REOPENS`] (an idle app followed for hours expires many tokens).
@@ -71,8 +71,9 @@ Several apps (or --all) are printed as `app | line`, in the order lines arrive; 
 time. To order them, add --timestamps and sort: `weglarka logs --all --timestamps | sort -t'|' -k2`.
 --all follows the apps that have a running container (at most 32 in one command).
 
-With --follow, a long-lived connection is renewed when its token expires. Lines around the renewal
-can be printed twice (delivery is at-least-once).
+With --follow, a long-lived connection is renewed when its token expires, continuing from the
+timestamp of the last printed line (so a long --since or --tail all read is not cut short). Lines
+around the renewal can be printed twice (delivery is at-least-once).
 
 A stream that fails is reported on stderr while the others go on; the exit code is then 70.
 Log content is untrusted: on a terminal, control characters are replaced with U+FFFD.
@@ -382,8 +383,19 @@ struct AppStream<'a> {
     client: &'a ApiClient,
     query: LogsQuery,
     stream: LogStream,
-    /// When output last arrived: a reopen asks for output since then.
-    last_data: SystemTime,
+    /// When the first request was made: where a reopen of a `--tail 0` follow starts from.
+    started: SystemTime,
+    /// The timestamp of the last delivered line (since the epoch): a reopen asks for output since
+    /// then. Never the local clock, which is far ahead of the lines while history is being read.
+    last_line: Option<Duration>,
+    /// Drop the timestamp prefix from lines (the user did not ask for `--timestamps`).
+    strip: bool,
+    /// Per stream (stdout, stderr): the prefix splitter.
+    stamps: [Stamps; 2],
+    /// Bytes held back by `stamps` when the stream ended, still to be delivered.
+    leftovers: Vec<(bool, Vec<u8>)>,
+    /// The event that ends the stream, once `leftovers` are out.
+    ended: Option<Event>,
     quiet_reopens: u32,
     /// When the current connection was opened.
     opened: Instant,
@@ -394,36 +406,49 @@ impl AppStream<'_> {
     async fn next(mut self) -> Option<(Event, Option<Self>)> {
         let app = self.app;
         loop {
+            if let Some((stderr, bytes)) = self.leftovers.pop() {
+                return Some((Event::Data { app, stderr, bytes }, Some(self)));
+            }
+            if let Some(event) = self.ended.take() {
+                return Some((event, None));
+            }
             match self.stream.next().await {
                 Ok(Some(LogFrame::Stdout(bytes))) => {
                     return Some(self.data(false, bytes));
                 }
                 Ok(Some(LogFrame::Stderr(bytes))) => return Some(self.data(true, bytes)),
-                Ok(Some(LogFrame::End)) => return Some((Event::End(app), None)),
+                Ok(Some(LogFrame::End)) => self.stop(Event::End(app)),
                 Ok(Some(LogFrame::TokenExpired)) => {
                     if let Err(message) = self.reopen().await {
-                        return Some((Event::Failed(app, message), None));
+                        self.stop(Event::Failed(app, message));
                     }
                 }
-                Ok(Some(LogFrame::Error(message))) => {
-                    return Some((
-                        Event::Failed(app, format!("the daemon reported: {message}")),
-                        None,
-                    ));
-                }
-                Ok(None) => {
-                    return Some((
-                        Event::Failed(app, "the stream ended without a final frame".into()),
-                        None,
-                    ));
-                }
-                Err(e) => return Some((Event::Failed(app, e.message), None)),
+                Ok(Some(LogFrame::Error(message))) => self.stop(Event::Failed(
+                    app,
+                    format!("the daemon reported: {message}"),
+                )),
+                Ok(None) => self.stop(Event::Failed(
+                    app,
+                    "the stream ended without a final frame".into(),
+                )),
+                Err(e) => self.stop(Event::Failed(app, e.message)),
             }
         }
     }
 
+    /// The stream is over: deliver what the prefix splitters held back, then `last`.
+    fn stop(&mut self, last: Event) {
+        for stderr in [false, true] {
+            let held = self.stamps[usize::from(stderr)].finish();
+            if !held.is_empty() {
+                self.leftovers.push((stderr, held));
+            }
+        }
+        self.ended = Some(last);
+    }
+
     fn data(mut self, stderr: bool, bytes: Vec<u8>) -> (Event, Option<Self>) {
-        self.last_data = SystemTime::now();
+        let bytes = self.stamps[usize::from(stderr)].feed(&bytes, self.strip, &mut self.last_line);
         self.quiet_reopens = 0;
         (
             Event::Data {
@@ -440,11 +465,9 @@ impl AppStream<'_> {
     async fn reopen(&mut self) -> Result<(), String> {
         self.quiet_reopens = count_reopen(self.quiet_reopens, self.opened.elapsed())
             .ok_or("the stream keeps expiring without output")?;
-        let query = LogsQuery {
-            tail: None,
-            since: Some(since_epoch(self.last_data.checked_sub(REOPEN_OVERLAP))),
-            ..self.query
-        };
+        let query = reopen_query(&self.query, self.last_line, self.started);
+        // A prefix cut by the old connection is read again from the new one.
+        self.stamps = Default::default();
         self.stream = self
             .client
             .open_logs(&self.name, &query)
@@ -453,6 +476,164 @@ impl AppStream<'_> {
         self.opened = Instant::now();
         Ok(())
     }
+}
+
+/// The query that continues a stream whose token expired. It never moves `since` past output that
+/// was not delivered: with no line yet, the first query is repeated unchanged (the tail included);
+/// afterwards it resumes at the last delivered line, without a tail.
+fn reopen_query(first: &LogsQuery, last_line: Option<Duration>, started: SystemTime) -> LogsQuery {
+    match (last_line, first.tail) {
+        (Some(at), _) => LogsQuery {
+            tail: None,
+            since: Some(at.saturating_sub(REOPEN_OVERLAP)),
+            ..*first
+        },
+        // `--tail 0` asks for nothing old, so output since the start is all there can be.
+        (None, Some(0)) => LogsQuery {
+            tail: None,
+            since: Some(
+                first
+                    .since
+                    .unwrap_or_default()
+                    .max(since_epoch(started.checked_sub(REOPEN_OVERLAP))),
+            ),
+            ..*first
+        },
+        (None, _) => *first,
+    }
+}
+
+/// The longest timestamp prefix looked for (`2026-10-31T10:00:00.123456789+01:00` is 35 bytes).
+const MAX_STAMP: usize = 40;
+
+/// Splits the RFC 3339 prefix off the lines of one stream. The daemon is always asked for
+/// `timestamps=true`, because the time of the last line is what a reopen resumes from; the prefix
+/// is dropped again unless the user asked for it. Everything after the prefix passes byte for byte,
+/// and a prefix that does not parse is left in place.
+#[derive(Debug, Default)]
+struct Stamps {
+    /// The start of the current line, held back until its first space or newline.
+    head: Vec<u8>,
+    /// Past the prefix of the current line.
+    in_line: bool,
+}
+
+impl Stamps {
+    /// `chunk` through the splitter; the time of every line seen goes to `last`.
+    fn feed(&mut self, chunk: &[u8], strip: bool, last: &mut Option<Duration>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(chunk.len());
+        let mut rest = chunk;
+        while let Some(&b) = rest.first() {
+            if self.in_line {
+                let end = rest.iter().position(|&c| c == b'\n').map(|i| i + 1);
+                out.extend_from_slice(&rest[..end.unwrap_or(rest.len())]);
+                rest = &rest[end.unwrap_or(rest.len())..];
+                self.in_line = end.is_none();
+                continue;
+            }
+            rest = &rest[1..];
+            match b {
+                b' ' => {
+                    match parse_rfc3339(&self.head) {
+                        Some(at) => {
+                            *last = Some(at);
+                            if !strip {
+                                out.extend_from_slice(&self.head);
+                                out.push(b);
+                            }
+                        }
+                        None => {
+                            out.extend_from_slice(&self.head);
+                            out.push(b);
+                        }
+                    }
+                    self.head.clear();
+                    self.in_line = true;
+                }
+                b'\n' => {
+                    out.append(&mut self.head);
+                    out.push(b);
+                }
+                _ => {
+                    self.head.push(b);
+                    if self.head.len() > MAX_STAMP {
+                        out.append(&mut self.head);
+                        self.in_line = true;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The stream ended inside the start of a line: what was held back.
+    fn finish(&mut self) -> Vec<u8> {
+        self.in_line = false;
+        std::mem::take(&mut self.head)
+    }
+}
+
+/// An RFC 3339 time (`2026-10-31T10:00:00.123456789+01:00`, the fraction optional, `Z` or a
+/// `+hh:mm` offset) as a duration since the unix epoch; `None` for anything else, including times
+/// before 1970. Sub-nanosecond digits are dropped. Shared with `access`.
+pub(crate) fn parse_rfc3339(raw: &[u8]) -> Option<Duration> {
+    fn num(b: &[u8]) -> Option<i64> {
+        (!b.is_empty() && b.iter().all(u8::is_ascii_digit))
+            .then(|| b.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+    }
+    if raw.len() < 20 || raw[4] != b'-' || raw[7] != b'-' || raw[10] != b'T' {
+        return None;
+    }
+    if raw[13] != b':' || raw[16] != b':' {
+        return None;
+    }
+    let (year, month, day) = (num(&raw[0..4])?, num(&raw[5..7])?, num(&raw[8..10])?);
+    let (hour, minute, second) = (num(&raw[11..13])?, num(&raw[14..16])?, num(&raw[17..19])?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut at = 19;
+    let mut nanos = 0u32;
+    if raw[at] == b'.' {
+        let digits = raw[at + 1..]
+            .iter()
+            .take_while(|d| d.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        let kept = &raw[at + 1..at + 1 + digits.min(9)];
+        nanos = u32::try_from(num(kept)?).ok()? * 10u32.pow(9 - kept.len() as u32);
+        at += 1 + digits;
+    }
+    let offset = match raw.get(at..)? {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+            let (h, m) = (num(&[*h1, *h2])?, num(&[*m1, *m2])?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let secs = h * 3600 + m * 60;
+            if *sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's `days_from_civil`).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second.min(59) - offset;
+    Some(Duration::new(u64::try_from(secs).ok()?, nanos))
 }
 
 /// Prints the streams of `names` until all have ended. Everything is opened before anything is
@@ -470,6 +651,12 @@ where
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    // The timestamps are needed to resume after a token renewal, whatever the user asked for.
+    let strip = !query.timestamps;
+    let query = LogsQuery {
+        timestamps: true,
+        ..query
+    };
     let opened =
         futures_util::future::join_all(names.iter().map(|name| client.open_logs(name, &query)))
             .await;
@@ -507,7 +694,12 @@ where
             client,
             query,
             stream,
-            last_data: started,
+            started,
+            last_line: None,
+            strip,
+            stamps: Default::default(),
+            leftovers: Vec::new(),
+            ended: None,
             quiet_reopens: 0,
             opened: Instant::now(),
         };
@@ -906,7 +1098,8 @@ mod tests {
         assert_eq!(got, ["api | hi from api", "web | hi from web"]);
         let seen = mock.seen.lock().unwrap();
         assert!(
-            seen.iter().all(|s| s.uri().ends_with("/logs?tail=100")),
+            seen.iter()
+                .all(|s| s.uri().ends_with("/logs?tail=100&timestamps=true")),
             "{seen:?}"
         );
     }
@@ -1022,7 +1215,7 @@ mod tests {
                 logs_reply(&[LogFrame::Stdout(b"after\n".to_vec()), LogFrame::End])
             } else {
                 logs_reply(&[
-                    LogFrame::Stdout(b"before\n".to_vec()),
+                    LogFrame::Stdout(b"2026-10-31T10:00:00Z before\n".to_vec()),
                     LogFrame::TokenExpired,
                 ])
             }
@@ -1033,7 +1226,7 @@ mod tests {
         assert_eq!(out, "before\nafter\n");
         let seen = mock.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].uri(), "/v1/apps/web/logs?tail=100");
+        assert_eq!(seen[0].uri(), "/v1/apps/web/logs?tail=100&timestamps=true");
         let second = seen[1].uri();
         assert!(second.starts_with("/v1/apps/web/logs?since="), "{second}");
         assert!(!second.contains("tail"), "{second}");
@@ -1049,6 +1242,164 @@ mod tests {
             mock.seen.lock().unwrap().len(),
             1 + MAX_QUIET_REOPENS as usize
         );
+    }
+
+    /// A mock whose first connection gives `first` and whose reopens give `after`; the requests are
+    /// kept in `seen`.
+    async fn expiring(
+        first: Vec<LogFrame>,
+        after: Vec<LogFrame>,
+    ) -> weglarka_unix_http::testing::Mock {
+        mock_seen(move |seen| {
+            if seen.query.as_deref().is_some_and(|q| q.contains("since=")) {
+                logs_reply(&after)
+            } else {
+                logs_reply(&first)
+            }
+        })
+        .await
+    }
+
+    fn since_of(uri: &str) -> f64 {
+        let q = uri.split_once('?').unwrap().1;
+        let v = q
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("since="))
+            .unwrap();
+        v.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn expiry_mid_history_resumes_at_the_last_line_not_at_the_clock() {
+        let mock = expiring(
+            vec![
+                LogFrame::Stdout(b"2026-10-31T10:00:00Z old one\n".to_vec()),
+                LogFrame::Stdout(b"2026-10-31T10:00:05.5+01:00 old two\n".to_vec()),
+                LogFrame::TokenExpired,
+            ],
+            vec![LogFrame::End],
+        )
+        .await;
+        let (code, out, _) = drive(&mock, &["web"], false, Mode::Raw).await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, "old one\nold two\n");
+        let seen = mock.seen.lock().unwrap();
+        // 09:00:05.5Z minus the overlap.
+        let want = 1_793_437_205.5 - REOPEN_OVERLAP.as_secs_f64();
+        assert!(
+            (since_of(&seen[1].uri()) - want).abs() < 1e-6,
+            "{}",
+            seen[1].uri()
+        );
+        assert!(!seen[1].uri().contains("tail"));
+    }
+
+    #[tokio::test]
+    async fn expiry_before_any_line_repeats_the_exact_query() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let mock = mock_seen(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                logs_reply(&[LogFrame::TokenExpired])
+            } else {
+                logs_reply(&[LogFrame::End])
+            }
+        })
+        .await;
+        let (code, _, _) = drive(&mock, &["web"], false, Mode::Raw).await;
+        assert_eq!(code.unwrap(), 0);
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].uri(), seen[1].uri());
+        assert_eq!(seen[1].uri(), "/v1/apps/web/logs?tail=100&timestamps=true");
+    }
+
+    #[tokio::test]
+    async fn the_prefix_is_stripped_unless_timestamps_were_asked_for() {
+        let frames = vec![
+            LogFrame::Stdout(b"2026-10-31T10:00:00Z hello wor".to_vec()),
+            LogFrame::Stdout(b"ld\n2026-10-31T10:00:01".to_vec()),
+            LogFrame::Stdout(b"Z second\n".to_vec()),
+            LogFrame::End,
+        ];
+        let mock = mock_seen(move |_| logs_reply(&frames)).await;
+        let (_, out, _) = drive(&mock, &["web"], false, Mode::Raw).await;
+        assert_eq!(out, "hello world\nsecond\n");
+
+        let frames = vec![
+            LogFrame::Stdout(b"2026-10-31T10:00:00Z hello\n".to_vec()),
+            LogFrame::End,
+        ];
+        let mock = mock_seen(move |_| logs_reply(&frames)).await;
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let q = LogsQuery {
+            timestamps: true,
+            ..query()
+        };
+        stream_logs(
+            &ApiClient::new(&*mock),
+            vec!["web".into()],
+            q,
+            false,
+            Mode::Raw,
+            (
+                (Sink(out.clone()), false),
+                (Sink(Default::default()), false),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text(&out.lock().unwrap()), "2026-10-31T10:00:00Z hello\n");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_timestamp_never_moves_since_forward() {
+        let mock = expiring(
+            vec![
+                LogFrame::Stdout(b"2026-10-31T10:00:00Z good\n".to_vec()),
+                LogFrame::Stdout(b"2099-13-45T99:00:00Z bad\n".to_vec()),
+                LogFrame::Stdout(b"no stamp at all\n".to_vec()),
+                LogFrame::TokenExpired,
+            ],
+            vec![LogFrame::End],
+        )
+        .await;
+        let (_, out, _) = drive(&mock, &["web"], false, Mode::Raw).await;
+        assert_eq!(out, "good\n2099-13-45T99:00:00Z bad\nno stamp at all\n");
+        let seen = mock.seen.lock().unwrap();
+        let want = 1_793_440_800.0 - REOPEN_OVERLAP.as_secs_f64();
+        assert!(
+            (since_of(&seen[1].uri()) - want).abs() < 1e-6,
+            "{}",
+            seen[1].uri()
+        );
+    }
+
+    #[test]
+    fn rfc3339_parsing() {
+        let p = |s: &str| parse_rfc3339(s.as_bytes());
+        assert_eq!(p("1970-01-01T00:00:00Z"), Some(Duration::ZERO));
+        assert_eq!(
+            p("2026-10-31T10:00:00.123456789012+01:00"),
+            Some(Duration::new(1_793_437_200, 123_456_789))
+        );
+        assert_eq!(
+            p("2024-02-29T00:00:00-02:30"),
+            Some(Duration::from_secs(1_709_173_800))
+        );
+        for bad in [
+            "",
+            "x",
+            "2026-10-31 10:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-10-31T24:00:00Z",
+            "2026-10-31T10:00:00",
+            "2026-10-31T10:00:00.Z",
+            "1969-12-31T23:59:59Z",
+            "2026-10-31T10:00:00+0100",
+            "2026-10-31T10:00:00Zjunk",
+        ] {
+            assert_eq!(p(bad), None, "{bad}");
+        }
     }
 
     struct Broken;
