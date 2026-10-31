@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/v0.0.6...v0.0.7) - 2026-10-31
+
+### Added
+
+- *(daemon)* report container memory against limits in doctor ([#432](https://github.com/jpalczewski/weglarka/pull/432))
+- *(api)* add read-scope container resource stats ([#428](https://github.com/jpalczewski/weglarka/pull/428))
+- *(daemon)* generated Prometheus file_sd targets ([#398](https://github.com/jpalczewski/weglarka/pull/398))
+- *(daemon)* doctor identity.base_config warns about replaced sections ([#390](https://github.com/jpalczewski/weglarka/pull/390))
+- *(daemon)* doctor warns about orphaned Podman networks ([#388](https://github.com/jpalczewski/weglarka/pull/388))
+- *(engine)* connect the metrics scraper to the metrics networks ([#397](https://github.com/jpalczewski/weglarka/pull/397))
+- *(cli)* expose a stored secret to one run with run --secret ([#396](https://github.com/jpalczewski/weglarka/pull/396))
+- *(cli)* apps update/start/stop --wait for the reconcile ([#395](https://github.com/jpalczewski/weglarka/pull/395))
+- *(engine)* metrics_port and a per-app metrics network ([#383](https://github.com/jpalczewski/weglarka/pull/383))
+- *(api)* host-wide volume listing and a limit on GET /v1/events ([#384](https://github.com/jpalczewski/weglarka/pull/384))
+- *(daemon)* host metrics from the daemon without mounts ([#362](https://github.com/jpalczewski/weglarka/pull/362))
+- *(daemon)* per-app resource metrics labelled with the instance name ([#357](https://github.com/jpalczewski/weglarka/pull/357))
+- *(daemon)* daemon metrics for deploys, certificates and self-update ([#356](https://github.com/jpalczewski/weglarka/pull/356))
+- *(daemon)* stream an app's access log ([#355](https://github.com/jpalczewski/weglarka/pull/355))
+- *(daemon)* optional /metrics listener on a dedicated network ([#354](https://github.com/jpalczewski/weglarka/pull/354))
+- *(daemon)* report container memory use in doctor ([#348](https://github.com/jpalczewski/weglarka/pull/348))
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
+### Fixed
+
+- *(daemon)* redact doctor's free-form failure text by caller access ([#387](https://github.com/jpalczewski/weglarka/pull/387))
+- *(daemon)* make OIDC secret rotation atomic ([#389](https://github.com/jpalczewski/weglarka/pull/389))
+- *(cli)* keep log history across a token renewal ([#359](https://github.com/jpalczewski/weglarka/pull/359))
+- *(daemon)* exhaustive read-scope projection below the first nesting level ([#333](https://github.com/jpalczewski/weglarka/pull/333))
+
+### Other
+
+- *(model)* add ContainerSpec::new ([#427](https://github.com/jpalczewski/weglarka/pull/427))
+- *(engine)* add not-found helpers for libpod results ([#425](https://github.com/jpalczewski/weglarka/pull/425))
+- *(daemon)* share one resource snapshot between metrics and the API ([#424](https://github.com/jpalczewski/weglarka/pull/424))
+- *(api)* add DoctorCheck constructors ([#423](https://github.com/jpalczewski/weglarka/pull/423))
+- *(model)* move human_bytes to weglarka-model ([#422](https://github.com/jpalczewski/weglarka/pull/422))
+- *(daemon)* GET /v1/certificates with ACME enabled on an edge host ([#392](https://github.com/jpalczewski/weglarka/pull/392))
+- *(daemon)* scan tls/ off the async runtime and once per doctor run ([#391](https://github.com/jpalczewski/weglarka/pull/391))
+- *(api)* stop copying frame payloads in the stream codec ([#376](https://github.com/jpalczewski/weglarka/pull/376))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/v0.0.5...v0.0.6) - 2026-10-30
 
 ### Fixed

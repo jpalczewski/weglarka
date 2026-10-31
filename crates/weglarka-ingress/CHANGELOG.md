@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.5...weglarka-ingress-v0.0.6) - 2026-10-31
+
+### Added
+
+- *(engine)* metrics_port and a per-app metrics network ([#383](https://github.com/jpalczewski/weglarka/pull/383))
+- *(daemon)* stream an app's access log ([#355](https://github.com/jpalczewski/weglarka/pull/355))
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.4...weglarka-ingress-v0.0.5) - 2026-10-30
 
 ### Fixed

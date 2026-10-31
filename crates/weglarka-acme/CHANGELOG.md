@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-acme-v0.0.4...weglarka-acme-v0.0.5) - 2026-10-31
+
+### Other
+
+- *(acme)* drop x509-parser and the hyper client, read notAfter fail-closed ([#385](https://github.com/jpalczewski/weglarka/pull/385))
+
 ## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-acme-v0.0.3...weglarka-acme-v0.0.4) - 2026-10-29
 
 ### Other

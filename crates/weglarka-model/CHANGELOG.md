@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.5...weglarka-model-v0.0.6) - 2026-10-31
+
+### Added
+
+- *(daemon)* generated Prometheus file_sd targets ([#398](https://github.com/jpalczewski/weglarka/pull/398))
+- *(daemon)* doctor identity.base_config warns about replaced sections ([#390](https://github.com/jpalczewski/weglarka/pull/390))
+- *(engine)* connect the metrics scraper to the metrics networks ([#397](https://github.com/jpalczewski/weglarka/pull/397))
+- *(cli)* expose a stored secret to one run with run --secret ([#396](https://github.com/jpalczewski/weglarka/pull/396))
+- *(engine)* metrics_port and a per-app metrics network ([#383](https://github.com/jpalczewski/weglarka/pull/383))
+- *(api)* host-wide volume listing and a limit on GET /v1/events ([#384](https://github.com/jpalczewski/weglarka/pull/384))
+- *(daemon)* host metrics from the daemon without mounts ([#362](https://github.com/jpalczewski/weglarka/pull/362))
+- *(daemon)* per-app resource metrics labelled with the instance name ([#357](https://github.com/jpalczewski/weglarka/pull/357))
+- *(daemon)* optional /metrics listener on a dedicated network ([#354](https://github.com/jpalczewski/weglarka/pull/354))
+- *(daemon)* report container memory use in doctor ([#348](https://github.com/jpalczewski/weglarka/pull/348))
+- *(cli)* sign in to a remote host with the device grant and reach it through the panel relay ([#335](https://github.com/jpalczewski/weglarka/pull/335))
+
+### Fixed
+
+- *(engine)* remove generated config of a removed consumer ([#403](https://github.com/jpalczewski/weglarka/pull/403))
+- *(daemon)* make OIDC secret rotation atomic ([#389](https://github.com/jpalczewski/weglarka/pull/389))
+- *(model)* reject a huge exp as Malformed on purpose and test it ([#375](https://github.com/jpalczewski/weglarka/pull/375))
+
+### Other
+
+- *(model)* add ContainerSpec::new ([#427](https://github.com/jpalczewski/weglarka/pull/427))
+- *(engine)* add not-found helpers for libpod results ([#425](https://github.com/jpalczewski/weglarka/pull/425))
+- *(model)* move human_bytes to weglarka-model ([#422](https://github.com/jpalczewski/weglarka/pull/422))
+- *(model)* pin malformed azp and nonce in id tokens ([#393](https://github.com/jpalczewski/weglarka/pull/393))
+- *(model)* take an id token's audience from the client id in verify ([#382](https://github.com/jpalczewski/weglarka/pull/382))
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.4...weglarka-model-v0.0.5) - 2026-10-29
 
 ### Added

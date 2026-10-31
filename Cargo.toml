@@ -21,7 +21,7 @@ all = { level = "warn", priority = -1 }
 # `weglarka-api`, the CLI/daemon contract: its requirement is the exact current version on purpose, so every
 # release of the contract releases its consumers (`weglarka-cli`, `weglarka-daemon`).
 weglarka-acme = { path = "crates/weglarka-acme", version = "0.0" }
-weglarka-api = { path = "crates/weglarka-api", version = "0.0.6" }
+weglarka-api = { path = "crates/weglarka-api", version = "0.0.7" }
 weglarka-dns = { path = "crates/weglarka-dns", version = "0.0" }
 weglarka-engine = { path = "crates/weglarka-engine", version = "0.0" }
 weglarka-panel = { path = "crates/weglarka-panel", version = "0.1" }
