@@ -21,13 +21,13 @@ use weglarka_engine::testing::{Call, LogScript, RunScript};
 use weglarka_model::admin_auth::testing::{AUDIENCE, ISSUER};
 use weglarka_model::podman::{LogOptions, LogSource};
 
-const STEP: Duration = Duration::from_secs(10);
+pub(crate) const STEP: Duration = Duration::from_secs(10);
 
 fn logs_path(app: &str) -> String {
     endpoints::APPS_LOGS.path.replace("{name}", app)
 }
 
-fn script(output: &[(LogSource, &str)], hold_open: bool) -> LogScript {
+pub(crate) fn script(output: &[(LogSource, &str)], hold_open: bool) -> LogScript {
     LogScript {
         output: output
             .iter()
@@ -39,7 +39,7 @@ fn script(output: &[(LogSource, &str)], hold_open: bool) -> LogScript {
 
 /// Opens a request on `socket` and returns the response as soon as its headers are there; the body
 /// is read by the caller, a frame at a time.
-async fn open(
+pub(crate) async fn open(
     socket: &Path,
     method: &str,
     path: &str,
@@ -69,7 +69,7 @@ async fn open(
 }
 
 /// Reads `response` to its end and decodes it with `decode`; panics if it does not end within `within`.
-async fn read_all<T>(
+pub(crate) async fn read_all<T>(
     mut response: Response<Incoming>,
     within: Duration,
     mut decode: impl FnMut(&[u8]) -> Vec<T>,
@@ -93,7 +93,7 @@ async fn read_log_frames(response: Response<Incoming>, within: Duration) -> Vec<
     read_all(response, within, |data| decoder.push(data).unwrap()).await
 }
 
-fn log_calls(h: &Harness) -> Vec<(String, LogOptions)> {
+pub(crate) fn log_calls(h: &Harness) -> Vec<(String, LogOptions)> {
     h.fake
         .calls()
         .into_iter()
@@ -105,7 +105,7 @@ fn log_calls(h: &Harness) -> Vec<(String, LogOptions)> {
 }
 
 /// A token with `groups` that expires `lifetime` from now.
-fn token_for(s: &Setup, sub: &str, groups: &[&str], lifetime: Duration) -> String {
+pub(crate) fn token_for(s: &Setup, sub: &str, groups: &[&str], lifetime: Duration) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     s.issuer.sign(&json!({
         "iss": ISSUER, "aud": [AUDIENCE], "sub": sub,
@@ -113,7 +113,7 @@ fn token_for(s: &Setup, sub: &str, groups: &[&str], lifetime: Duration) -> Strin
     }))
 }
 
-async fn deployed_app(h: &Harness) -> String {
+pub(crate) async fn deployed_app(h: &Harness) -> String {
     add(h, "web", spec("web.example.com")).await;
     deployed(h, "web").await;
     "wg-web".to_owned()
