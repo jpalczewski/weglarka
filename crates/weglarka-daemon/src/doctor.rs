@@ -28,11 +28,10 @@ fn check(
     message: impl Into<String>,
     hint: Option<&str>,
 ) -> DoctorCheck {
-    DoctorCheck {
-        id: id.to_owned(),
-        status,
-        message: message.into(),
-        hint: hint.map(str::to_owned),
+    let check = DoctorCheck::new(id, status, message);
+    match hint {
+        Some(hint) => check.with_hint(hint),
+        None => check,
     }
 }
 

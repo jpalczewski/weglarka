@@ -233,10 +233,9 @@ pub(crate) fn doctor_check<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
             )),
         )
     };
-    out.push(DoctorCheck {
-        id: "state.waiting_for_secrets".to_owned(),
-        status,
-        message,
-        hint,
+    let check = DoctorCheck::new("state.waiting_for_secrets", status, message);
+    out.push(match hint {
+        Some(hint) => check.with_hint(hint),
+        None => check,
     });
 }

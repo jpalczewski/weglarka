@@ -518,12 +518,10 @@ fn preflight_json_uses_api_types() {
 #[test]
 fn render_reports_info_checks_without_alarming() {
     let report = DoctorReport {
-        checks: vec![DoctorCheck {
-            id: "state.deploying".into(),
-            status: CheckStatus::Info,
-            message: "deploy w toku: ntfy (recreate)".into(),
-            hint: None,
-        }],
+        checks: vec![DoctorCheck::info(
+            "state.deploying",
+            "deploy w toku: ntfy (recreate)",
+        )],
     };
     let text = render(&report);
     assert!(text.contains("[INFO] state.deploying"), "{text}");
