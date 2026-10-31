@@ -3,7 +3,6 @@
 //! (docs/decisions/0002-podman-in-ci.md). Containers go through the typed client, so the assertions
 //! check what libpod *stored* (`inspect`) — it ignores unknown create-body fields silently.
 
-use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +10,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use weglarka_model::app::{CpuLimit, MemoryLimit, Resources};
 use weglarka_model::limits::container_healthcheck;
-use weglarka_model::podman::{ContainerSpec, HealthStatus, PodmanClient, RestartPolicy};
+use weglarka_model::podman::{ContainerSpec, HealthStatus, PodmanClient};
 use weglarka_podman::LibpodClient;
 
 /// The pause image has no HEALTHCHECK of its own; `/pause -v` prints its version and exits 0.
@@ -72,25 +71,9 @@ impl Drop for Cleanup {
 
 fn spec(name: &str) -> ContainerSpec {
     ContainerSpec {
-        name: name.into(),
-        image: IMAGE.into(),
-        command: vec![],
-        entrypoint: None,
-        labels: BTreeMap::new(),
-        env: BTreeMap::new(),
-        networks: vec![],
-        network_aliases: Default::default(),
-        secrets: vec![],
-        publish: vec![],
-        restart: RestartPolicy::No,
         userns_auto: true,
-        mounts: vec![],
-        volumes: vec![],
         resources: Resources::default(),
-        healthcheck: None,
-        id_mapping: None,
-        keep_groups: false,
-        security: Default::default(),
+        ..ContainerSpec::new(name, IMAGE)
     }
 }
 

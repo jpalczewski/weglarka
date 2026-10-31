@@ -151,27 +151,7 @@ async fn not_found_and_name_conflict() {
     assert!(
         matches!(client.container_inspect("nope").await, Err(PodmanError::NotFound(m)) if m.contains("no container"))
     );
-    let spec = weglarka_model::podman::ContainerSpec {
-        name: "x".into(),
-        image: "i".into(),
-        command: vec![],
-        entrypoint: None,
-        labels: Default::default(),
-        env: Default::default(),
-        networks: vec![],
-        network_aliases: Default::default(),
-        secrets: vec![],
-        publish: vec![],
-        restart: weglarka_model::podman::RestartPolicy::No,
-        userns_auto: false,
-        mounts: vec![],
-        volumes: vec![],
-        resources: Default::default(),
-        healthcheck: None,
-        id_mapping: None,
-        keep_groups: false,
-        security: Default::default(),
-    };
+    let spec = weglarka_model::podman::ContainerSpec::new("x", "i");
     assert!(
         matches!(client.container_create(&spec).await, Err(PodmanError::Conflict(m)) if m.contains("already in use"))
     );

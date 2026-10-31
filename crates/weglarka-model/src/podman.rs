@@ -237,6 +237,39 @@ pub struct ContainerSpec {
     pub security: crate::app::Security,
 }
 
+impl ContainerSpec {
+    /// A spec with only the identity set; every other field is empty, `false`, `None`, or
+    /// [`RestartPolicy::No`], so it creates the bare container libpod would build for the image
+    /// alone. Callers overwrite what they need, usually with struct update syntax:
+    /// `ContainerSpec { restart: RestartPolicy::Always, ..ContainerSpec::new(name, image) }`.
+    ///
+    /// A constructor rather than `impl Default`: a spec without a name and image is not a valid
+    /// container, so no such value should be spellable by accident.
+    pub fn new(name: impl Into<String>, image: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            image: image.into(),
+            command: Vec::new(),
+            entrypoint: None,
+            labels: BTreeMap::new(),
+            env: BTreeMap::new(),
+            networks: Vec::new(),
+            network_aliases: BTreeMap::new(),
+            secrets: Vec::new(),
+            publish: Vec::new(),
+            restart: RestartPolicy::No,
+            userns_auto: false,
+            mounts: Vec::new(),
+            volumes: Vec::new(),
+            resources: Resources::default(),
+            healthcheck: None,
+            id_mapping: None,
+            keep_groups: false,
+            security: crate::app::Security::default(),
+        }
+    }
+}
+
 /// Named volume to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSpec {

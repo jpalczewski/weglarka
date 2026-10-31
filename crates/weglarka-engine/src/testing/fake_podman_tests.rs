@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use futures_util::StreamExt;
     use weglarka_model::app::Resources;
@@ -12,25 +11,10 @@ mod tests {
 
     fn spec(name: &str, image: &str) -> ContainerSpec {
         ContainerSpec {
-            name: name.into(),
-            image: image.into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
             resources: Resources::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new(name, image)
         }
     }
 

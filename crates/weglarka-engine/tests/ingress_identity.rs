@@ -8,7 +8,6 @@
 //! accepts that two-line map rootless and that it has the intended effect; without
 //! `WEGLARKA_PODMAN_SOCKET` it is skipped (`docs/decisions/0002-podman-in-ci.md`).
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -16,9 +15,7 @@ use std::process::Command;
 
 use futures_util::StreamExt;
 use weglarka_engine::volumes::{id_mapping, ingress_id_mapping};
-use weglarka_model::podman::{
-    BindMount, ContainerSpec, IdMapping, PodmanClient, PullEvent, RestartPolicy,
-};
+use weglarka_model::podman::{BindMount, ContainerSpec, IdMapping, PodmanClient, PullEvent};
 use weglarka_model::uid_range::allocate;
 use weglarka_podman::LibpodClient;
 
@@ -96,29 +93,14 @@ impl Env {
         self.containers.push(name.to_owned());
         self.client
             .container_create(&ContainerSpec {
-                name: name.to_owned(),
-                image: ALPINE.to_owned(),
                 command: vec!["sleep".into(), "300".into()],
-                entrypoint: None,
-                labels: BTreeMap::new(),
-                env: BTreeMap::new(),
-                networks: vec![],
-                network_aliases: Default::default(),
-                secrets: vec![],
-                publish: vec![],
-                restart: RestartPolicy::No,
-                userns_auto: false,
                 mounts: vec![BindMount {
                     source: dir.display().to_string(),
                     target: "/tls".to_owned(),
                     read_only: true,
                 }],
-                volumes: vec![],
-                resources: Default::default(),
-                healthcheck: None,
                 id_mapping: Some(mapping),
-                keep_groups: false,
-                security: Default::default(),
+                ..ContainerSpec::new(name, ALPINE)
             })
             .await
             .unwrap();
