@@ -115,7 +115,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
-    acme(d, &mut checks);
+    acme(d, scan_certificates(d).await.as_deref(), &mut checks);
     generated(d, &mut checks);
     identity_provider(d, &mut checks).await;
     identity_base_config(d, &mut checks);
@@ -1475,7 +1475,26 @@ fn generated<P: PodmanClient + 'static>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
     }
 }
 
-fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+/// One scan of `tls/` for the whole run, on the blocking pool, shared by `acme` and `acme_dns`.
+/// `None` when ACME is off or the scan failed (`acme` then skips the certificate rows).
+async fn scan_certificates<P: PodmanClient>(d: &Daemon<P>) -> Option<Vec<certificates::Cert>> {
+    let config = d.host.acme.as_ref().filter(|c| c.enabled)?;
+    // Without a readable `apps.toml` only the wildcard rows (no routed domains) are of use.
+    let domains = routed_domains(d).unwrap_or_default();
+    certificates::collect_blocking(
+        d.ingress.tls_dir(),
+        config.clone(),
+        domains,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+fn acme<P: PodmanClient>(
+    d: &Daemon<P>,
+    certs: Option<&[certificates::Cert]>,
+    out: &mut Vec<DoctorCheck>,
+) {
     let Some(config) = &d.host.acme else {
         return;
     };
@@ -1539,15 +1558,17 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
 
     if let Some(dns) = &config.dns {
-        acme_dns(d, config, dns, out);
+        acme_dns(config, dns, certs, out);
     }
 
     let Some(domains) = routed_domains(d) else {
         return; // `state.apps` already reports this
     };
+    let Some(certs) = certs else {
+        return; // the scan failed and was logged
+    };
     let now = std::time::SystemTime::now();
     let window = certificates::window(config);
-    let certs = certificates::collect(&d.ingress.tls_dir(), config, &domains, now);
     let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
     let mut soonest: Option<u64> = None;
     let mut covered = 0usize;
@@ -1619,10 +1640,10 @@ fn acme<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 /// `[acme.dns]` (issue #97): the provider, the token file and the state of every wildcard
 /// certificate (`tls/_wildcard.<apex>.crt`). The ingress does not serve the wildcard certificates
 /// yet, so a missing one is a warning like a missing domain certificate.
-fn acme_dns<P: PodmanClient>(
-    d: &Daemon<P>,
+fn acme_dns(
     config: &weglarka_model::config::AcmeConfig,
     dns: &weglarka_model::config::AcmeDnsConfig,
+    certs: Option<&[certificates::Cert]>,
     out: &mut Vec<DoctorCheck>,
 ) {
     let token = &dns.token_file;
@@ -1661,7 +1682,10 @@ fn acme_dns<P: PodmanClient>(
     let window = certificates::window(config);
     let (mut missing, mut expired, mut due) = (Vec::new(), Vec::new(), Vec::new());
     let mut soonest: Option<u64> = None;
-    for cert in certificates::collect(&d.ingress.tls_dir(), config, &[], now) {
+    let Some(certs) = certs else {
+        return; // the scan failed and was logged
+    };
+    for cert in certs.iter().filter(|c| c.wildcard) {
         let status = cert.status(now, window);
         let days = cert.days_left(now).and_then(|d| u64::try_from(d).ok());
         let name = cert.label().to_owned();
