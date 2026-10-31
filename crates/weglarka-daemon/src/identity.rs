@@ -73,31 +73,30 @@ async fn remove_client<P: PodmanClient + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// rotate → render → validate → apply to the provider → recreate the app. A provider that rejects
-/// the new files leaves the app untouched (still holding a secret the provider does not know: the
-/// old secret is gone, so the operator fixes the provider and retries — the response says so).
+/// rotate → render with the pending digest → validate → apply to the provider → promote → recreate
+/// the app. A provider that rejects the new files leaves everything as it was (the new pair is
+/// discarded, the old secret and digest stay live), so the operator can fix the provider and retry.
 async fn rotate<P: PodmanClient + 'static>(
     State(d): Shared<P>,
     Path(raw): Path<String>,
 ) -> Result<Response, Fail> {
     let name = parse_name(&raw)?;
-    crate::admin::mutating(d.engine.rotate_oidc_secret(&name)).await?;
-    if let Some(worker) = &d.generated {
-        let wiring = worker.wiring();
-        for generator in &wiring.generators {
-            d.engine
-                .apply_generated(&**generator, &*wiring.digests, true)
-                .await
-                .map_err(|e| {
-                    Fail(
-                        ErrorCode::Conflict,
-                        format!(
-                            "the secret was rotated but the provider config could not be applied: {e}; \
-                             fix it and re-run `weglarka oidc rotate {name}`"
-                        ),
-                    )
-                })?;
-        }
+    {
+        let _g = d.desired_lock.lock().await;
+        let wiring = d.generated.as_ref().map(|worker| worker.wiring());
+        d.engine
+            .rotate_oidc_secret(&name, wiring.as_ref())
+            .await
+            .map_err(|e| match e {
+                weglarka_engine::reconcile::EngineError::Generated { message, .. } => Fail(
+                    ErrorCode::Conflict,
+                    format!(
+                        "the provider config could not be applied: {message}; nothing was rotated, \
+                         fix it and re-run `weglarka oidc rotate {name}`"
+                    ),
+                ),
+                other => Fail::from(other),
+            })?;
     }
     let running = matches!(
         d.engine

@@ -2,11 +2,15 @@
 //! and rotation of an app's client secret. Rendering and applying the provider's files is the
 //! generated config pipeline ([`crate::generated`]); this module only changes inputs.
 
-use weglarka_model::app::InstanceName;
+use std::sync::Arc;
+
+use weglarka_model::app::{AppsFile, InstanceName};
 use weglarka_model::identity::{ClientId, ExternalClientSpec};
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state;
 
+use crate::generated::{GeneratedOutcome, GeneratedWiring};
+use crate::oidc_credentials;
 use crate::reconcile::{EngineError, Reconciler};
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -39,11 +43,18 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
-    /// Replaces the client secret (and its digest) of `instance`. The caller then applies the
-    /// provider's files and recreates the app — in that order, or the app holds a stale secret
-    /// while the provider still knows the old digest (a window the guide documents).
-    pub async fn rotate_oidc_secret(&self, instance: &InstanceName) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
+    /// Rotates the client secret (and its digest) of `instance` without ever leaving the app and the
+    /// provider disagreeing about the live pair: the new pair is staged under a pending name, the
+    /// provider's files are rendered with the pending digest and applied, and only a successful
+    /// apply promotes the pair to the live name. A failure discards it, so nothing changed. The
+    /// whole sequence holds the engine lock, so no reconcile pass renders the old digest in between.
+    /// The caller then recreates the app, which mounts the new secret.
+    pub async fn rotate_oidc_secret(
+        self: &Arc<Self>,
+        instance: &InstanceName,
+        wiring: Option<&GeneratedWiring>,
+    ) -> Result<(), EngineError> {
+        let guard = self.acquire().await;
         let apps = state::load_apps(&self.paths.apps)?;
         let spec = apps
             .apps
@@ -59,10 +70,73 @@ impl<P: PodmanClient> Reconciler<P> {
                 "{instance} has no confidential OIDC client to rotate"
             )));
         }
-        let instance = instance.clone();
-        crate::secrets::blocking(&self.secrets, move |store| {
-            crate::oidc_credentials::rotate(store, &instance).map(drop)
+        let name = instance.clone();
+        let staged = crate::secrets::blocking(&self.secrets, move |store| {
+            oidc_credentials::stage_rotation(store, &name)
         })
-        .await
+        .await?;
+
+        let applied = match wiring {
+            Some(wiring) => {
+                let (base, owner, staged) =
+                    (wiring.digests.clone(), instance.clone(), staged.clone());
+                let digests = move |apps: &AppsFile| {
+                    let mut digests = base(apps);
+                    digests.insert(owner.clone(), staged.clone());
+                    digests
+                };
+                let mut result = Ok(());
+                for generator in &wiring.generators {
+                    let outcome = self
+                        .apply_generated_locked(&guard, &**generator, &digests, true)
+                        .await;
+                    // Invalid and rolled-back renders are outcomes, not errors: the provider still
+                    // runs the old files, so for a rotation they are failures all the same.
+                    let failure = match outcome {
+                        Ok(GeneratedOutcome::Applied { .. } | GeneratedOutcome::Unchanged) => {
+                            continue;
+                        }
+                        Ok(GeneratedOutcome::Invalid { output }) => {
+                            format!("the provider rejected the new config: {output}")
+                        }
+                        Ok(GeneratedOutcome::RolledBack { reason, .. }) => {
+                            format!("the provider was unhealthy on the new config: {reason}")
+                        }
+                        Ok(GeneratedOutcome::Skipped { .. }) => {
+                            "the provider config was not applied".to_owned()
+                        }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    };
+                    result = Err(EngineError::Generated {
+                        consumer: generator.consumer().clone(),
+                        message: failure,
+                    });
+                    break;
+                }
+                result
+            }
+            None => Ok(()),
+        };
+
+        let name = instance.clone();
+        match applied {
+            Ok(()) => {
+                crate::secrets::blocking(&self.secrets, move |store| {
+                    oidc_credentials::promote_rotation(store, &name)
+                })
+                .await
+            }
+            Err(e) => {
+                // Best effort: a pending pair that stays is overwritten by the next rotation.
+                let _ = crate::secrets::blocking(&self.secrets, move |store| {
+                    oidc_credentials::discard_rotation(store, &name)
+                })
+                .await;
+                Err(e)
+            }
+        }
     }
 }
