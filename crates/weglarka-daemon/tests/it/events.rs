@@ -72,6 +72,36 @@ async fn a_deploy_shows_up_in_the_history_and_since_pages_through_it() {
 }
 
 #[tokio::test]
+async fn limit_keeps_the_newest_events_oldest_first() {
+    let h = harness().await;
+    add(&h, "x", spec("x.example.com")).await;
+    deployed(&h, "x").await;
+    add(&h, "y", spec("y.example.com")).await;
+    deployed(&h, "y").await;
+    let (_, all) = admin(&h, "GET", "/v1/events", None).await;
+    let all_events = all["events"].as_array().unwrap();
+    assert!(all_events.len() >= 2, "{all}");
+
+    let (status, one) = admin(&h, "GET", "/v1/events?limit=1", None).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["events"], json!([all_events.last().unwrap()]));
+    // The cursor and the history bounds still describe everything, not the slice.
+    assert_eq!(one["next_seq"], all["next_seq"]);
+    assert_eq!(one["oldest_seq"], all["oldest_seq"]);
+
+    let (_, big) = admin(&h, "GET", "/v1/events?limit=1000", None).await;
+    assert_eq!(big["events"], all["events"]);
+
+    // `since` selects first, `limit` then keeps the newest of those.
+    let (_, after_first) = admin(&h, "GET", "/v1/events?since=1&limit=1", None).await;
+    assert_eq!(after_first["events"], json!([all_events.last().unwrap()]));
+
+    let (status, bad) = admin(&h, "GET", "/v1/events?limit=0", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn a_read_token_may_read_events_and_a_missing_one_may_not() {
     let s = setup().await;
     let sock = &s.token_socket;

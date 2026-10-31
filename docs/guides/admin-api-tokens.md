@@ -90,6 +90,11 @@ message built from structured fields only: the engine's free-form failure text (
 included, it stays in the daemon log. Pass the answer's `next_seq` as `since` and its `boot_id` as `boot` to get only
 newer events. `dropped` is `true` when events after `since` were evicted. The history is not persisted: a restart begins
 again at `seq` 1 with a new `boot_id`, and a request carrying the old one gets everything retained with `reset: true`.
+`limit=<n>` keeps only the newest `n` events of the answer (still oldest first); `next_seq` is unchanged, so it is for
+showing the latest rows, not for paging.
+
+`GET /v1/app-volumes` (`read`) lists the volumes of every app in one call, each row naming its `app` (the per-app
+`GET /v1/apps/{name}/volumes` stays).
 
 `GET /v1/certificates` (`read`) lists the certificates the ACME worker looks after, one row per routed domain and per
 wildcard: the names covered, `not_after` (UTC), whole `days_left` (negative once expired), a `status` (`valid`,

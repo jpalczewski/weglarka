@@ -211,6 +211,14 @@ pub const VOLUMES_LIST: Endpoint = Endpoint {
     scope: Some(Scope::Read),
     body: Body::NoAppData,
 };
+/// `GET` → [`ListAppVolumesResponse`](crate::ListAppVolumesResponse): the volumes of every app in one
+/// call, each row naming its app (replaces one `VOLUMES_LIST` call per app).
+pub const APP_VOLUMES_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/app-volumes",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
 /// `GET` → `application/x-tar`, streamed. `{volume}` is the volume's name within the instance.
 pub const VOLUMES_EXPORT: Endpoint = Endpoint {
     method: Method::Get,
@@ -317,7 +325,8 @@ pub const SITES_PROMOTE: Endpoint = Endpoint {
     body: Body::NoAppData,
 };
 /// `GET` → [`EventsResponse`](crate::EventsResponse). Query [`EventsQuery`](crate::EventsQuery):
-/// recent domain events from a bounded in-memory history (docs/decisions/0057), newer than `since`.
+/// recent domain events from a bounded in-memory history (docs/decisions/0057), newer than `since`,
+/// at most the newest `limit`.
 pub const EVENTS_RECENT: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/events",
@@ -421,6 +430,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SECRETS_SET,
     SECRETS_REMOVE,
     VOLUMES_LIST,
+    APP_VOLUMES_LIST,
     VOLUMES_EXPORT,
     VOLUMES_IMPORT,
     SHARED_VOLUMES_LIST,
