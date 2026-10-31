@@ -956,7 +956,8 @@ pub struct AccessQuery {
     pub status: Option<StatusFilter>,
     /// Exact request method, upper case.
     pub method: Option<String>,
-    /// A prefix of the request path (`$uri`, which is not percent-decoded).
+    /// A prefix of the request path as nginx logs it (`$uri`: percent-decoded, after any `strip_prefix`
+    /// rewrite). The filter value itself accepts no `%`.
     pub path: Option<String>,
     /// Exact host.
     pub host: Option<String>,

@@ -56,7 +56,7 @@ terminal control characters are replaced and a path can never start a line of it
 | `--since DUR` | only newer requests (`90`, `10m`, `2h`); default window: the last hour |
 | `--status` | one status (`404`) or a class (`5xx`) |
 | `--method`, `--host` | exact match |
-| `--path` | a prefix of the path (`$uri`: no query string, not percent-decoded) |
+| `--path` | a prefix of the path as nginx logs it (`$uri`: no query string, percent-decoded, after any `strip_prefix` rewrite); the value itself accepts no `%` |
 
 - **By app, not by host.** With [path routing](path-routing.md) one domain serves several apps, so the filter is the
   app nginx attributed the request to.

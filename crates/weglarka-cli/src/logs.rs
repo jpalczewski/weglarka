@@ -30,7 +30,7 @@ const MAX_LINE: usize = 64 * 1024;
 pub(crate) const MAX_QUIET_REOPENS: u32 = 5;
 /// A reopen starts this much before the last output, so a line that was in flight when the
 /// connection ended is not lost (at the price of a repeat).
-pub(crate) const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
+const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
 /// A connection that stayed open at least this long was not a tight loop, however quiet: it does
 /// not count towards [`MAX_QUIET_REOPENS`] (an idle app followed for hours expires many tokens).
 pub(crate) const STABLE_FOR: Duration = Duration::from_secs(60);

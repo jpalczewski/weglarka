@@ -15,7 +15,7 @@ use weglarka_api::{AccessEntry, AccessFrame, AccessQuery, MAX_ACCESS_TAIL};
 use crate::client::ApiClient;
 use crate::commands::{client, instance};
 use crate::error::{CliError, exit};
-use crate::logs::{REOPEN_OVERLAP, count_reopen, sanitize_for_terminal, since_epoch};
+use crate::logs::{count_reopen, sanitize_for_terminal, since_epoch};
 use crate::run::parse_timeout;
 use crate::settings::Overrides;
 
@@ -149,6 +149,69 @@ fn json_line(entry: &AccessEntry, terminal: bool) -> String {
     line
 }
 
+/// Seconds since the epoch of an nginx `$time_iso8601` (`2026-10-31T12:00:00+01:00`, offset included; `Z`
+/// is accepted too). `None` for anything else: the caller must then not move a resume point forward.
+fn parse_log_time(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let digits = b.get(from..from + len)?;
+        digits
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| digits.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+    };
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if b.len() < 19 || separators.iter().any(|&(at, c)| b[at] != c) {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let offset = match &b[19..] {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), ..] if b.len() == 25 && b[22] == b':' => {
+            let (h, m) = (num(20, 2)?, num(23, 2)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let secs = h * 3600 + m * 60;
+            if *sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+    // Days from civil (proleptic Gregorian), counted from 1970-01-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
+}
+
+/// The query that continues a stream whose token expired. Before any entry arrived nothing was
+/// printed, so the original query is repeated whole (`tail` and `since` included: the history read, or
+/// its ring, may still have been running). Afterwards: from the second of the last entry (`since` is
+/// inclusive, so no overlap is needed) without `tail`. An entry time that does not parse leaves the
+/// resume point where it was, so the failure is repeated lines, never a gap.
+fn resume_query(query: &AccessQuery, resume: Option<Duration>, received_any: bool) -> AccessQuery {
+    if !received_any {
+        return query.clone();
+    }
+    AccessQuery {
+        tail: None,
+        since: resume.or(query.since),
+        ..query.clone()
+    }
+}
+
 /// Prints the app's access stream until it ends. A token that expires reopens the stream from the
 /// last request; one that does so in a tight loop is given up.
 pub(crate) async fn stream_access<O: AsyncWrite + Unpin>(
@@ -160,13 +223,17 @@ pub(crate) async fn stream_access<O: AsyncWrite + Unpin>(
 ) -> Result<i32, CliError> {
     let io = |e: std::io::Error| CliError::internal(format!("cannot write the output: {e}"));
     let mut stream = client.open_access(name, &query).await?;
-    let mut last_data = SystemTime::now();
+    let mut resume: Option<Duration> = None;
+    let mut received_any = false;
     let mut opened = Instant::now();
     let mut quiet_reopens = 0;
     loop {
         match stream.next().await? {
             Some(AccessFrame::Entry(entry)) => {
-                last_data = SystemTime::now();
+                received_any = true;
+                if let Some(secs) = parse_log_time(&entry.time) {
+                    resume = Some(Duration::from_secs(secs));
+                }
                 quiet_reopens = 0;
                 let line = if json {
                     json_line(&entry, terminal)
@@ -190,11 +257,7 @@ pub(crate) async fn stream_access<O: AsyncWrite + Unpin>(
                 quiet_reopens = count_reopen(quiet_reopens, opened.elapsed()).ok_or_else(|| {
                     CliError::internal("the stream keeps expiring without output")
                 })?;
-                let again = AccessQuery {
-                    tail: None,
-                    since: Some(since_epoch(last_data.checked_sub(REOPEN_OVERLAP))),
-                    ..query.clone()
-                };
+                let again = resume_query(&query, resume, received_any);
                 stream = client.open_access(name, &again).await.map_err(|mut e| {
                     e.message = format!("cannot reopen the stream: {}", e.message);
                     e
@@ -320,6 +383,70 @@ mod tests {
         }
         assert!(parse(&["web", "-n", "1000", "--status", "404"]).is_ok());
         assert_eq!(instance("Web!").unwrap_err().kind, Kind::Usage);
+    }
+
+    // ---- resuming
+
+    #[test]
+    fn log_times_are_parsed_with_their_offset() {
+        assert_eq!(parse_log_time("1970-01-01T00:00:00+00:00"), Some(0));
+        assert_eq!(
+            parse_log_time("2026-10-31T12:00:00+00:00"),
+            Some(1_793_448_000)
+        );
+        assert_eq!(parse_log_time("2026-10-31T12:00:00Z"), Some(1_793_448_000));
+        assert_eq!(
+            parse_log_time("2026-10-31T13:30:00+01:30"),
+            Some(1_793_448_000)
+        );
+        assert_eq!(
+            parse_log_time("2026-10-31T07:00:00-05:00"),
+            Some(1_793_448_000)
+        );
+        // Leap day, and a date past the 2038 boundary.
+        assert_eq!(
+            parse_log_time("2024-02-29T00:00:00+00:00"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(
+            parse_log_time("2100-03-01T00:00:00+00:00"),
+            Some(4_107_542_400)
+        );
+        for bad in [
+            "",
+            "-",
+            "2026-10-31",
+            "2026-10-31 12:00:00+00:00",
+            "2026-13-31T12:00:00+00:00",
+            "2026-10-31T24:00:00+00:00",
+            "2026-10-31T12:00:00",
+            "2026-10-31T12:00:00+0000",
+            "2026-10-31T12:00:00+25:00",
+            "202a-10-31T12:00:00+00:00",
+            "1969-12-31T00:00:00+00:00",
+            "2026-10-31T12:00:00+00:00x",
+        ] {
+            assert_eq!(parse_log_time(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn resuming_never_leaves_a_gap() {
+        let original =
+            AccessQuery::parse(Some("follow=true&tail=100&since=1700000000&status=5xx")).unwrap();
+        // Nothing received yet: exactly the original query, tail and since included.
+        assert_eq!(resume_query(&original, None, false), original);
+        // After entries: from the last entry's second, no tail, filters kept.
+        let again = resume_query(&original, Some(Duration::from_secs(1_700_000_500)), true);
+        assert_eq!(again.since, Some(Duration::from_secs(1_700_000_500)));
+        assert_eq!(
+            (again.tail, again.follow, again.status),
+            (None, true, original.status)
+        );
+        // An unparseable time keeps the earlier resume point, or else the original since.
+        assert_eq!(resume_query(&original, None, true).since, original.since);
+        let open = AccessQuery::parse(Some("follow=true")).unwrap();
+        assert_eq!(resume_query(&open, None, true).since, None);
     }
 
     // ---- output
