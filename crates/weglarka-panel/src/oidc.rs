@@ -286,7 +286,6 @@ impl OidcClient {
                 id_token,
                 keys,
                 &oidc.issuer,
-                &oidc.client_id,
                 TokenKind::Id {
                     client_id: &oidc.client_id,
                     nonce,
