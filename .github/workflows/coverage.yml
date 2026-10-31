@@ -49,7 +49,7 @@ jobs:
           pct=$(jq -r '.data[0].totals.lines.percent' summary.json)
           pct=$(printf '%.1f' "$pct")
           color=$(awk -v p="$pct" 'BEGIN { print (p >= 80 ? "brightgreen" : p >= 60 ? "yellow" : "red") }')
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > site/badge.json
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > site/html/badge.json
           echo "Line coverage: ${pct}%" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v3
