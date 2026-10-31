@@ -13,6 +13,13 @@ weglarka run gitea --entrypoint /bin/sh -- -c 'ls -l /data'
 - **What the container gets:** the app's pinned image digest (never a newer one from the tag), its `env` (the
   `--env`/`-e` flag adds to and overrides it for this one run), secrets, volumes (private and shared, writable),
   host configs (read-only), the app's network and the shared network. Resource limits and hardening as in the app.
+- **A secret for this run only:** `--secret SECRET=VARIABLE` (repeatable) exposes a stored secret of the app
+  (`weglarka secrets set`) as that environment variable of the one-off container. It does not need to be bound in the
+  spec, nothing is written to `apps.toml` and the app is not recreated, so a one-off admin command can read S3
+  credentials without a binding that restarts production. The value is read by the daemon and handed over as a Podman
+  secret: it is never on a command line, in the request, in a log or in `Debug` (only the secret *name* is sent). It
+  wins over `--env` (giving both for one variable is an error) and over a binding of the app on that variable. A secret
+  that is not stored is refused before the command starts. The Podman secret stays in the store like the app's own.
 - **What it does not get:** `host_ports`, ingress routing or the app's DNS aliases — it does not answer under the
   app's name. Reconcile and `doctor` do not see it (label `weglarka.run`, no `weglarka.instance`).
 - **Arguments:** everything after `--` is arguments to the image entrypoint (like `command`, see

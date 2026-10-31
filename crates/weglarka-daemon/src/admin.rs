@@ -759,6 +759,7 @@ async fn run_app<P: PodmanClient + 'static>(
         command: req.command,
         entrypoint: req.entrypoint,
         env: req.env,
+        secrets: req.secrets,
         timeout: req.timeout_secs.map(|s| Duration::from_secs(s.into())),
     };
     let pending = mutating(d.engine.prepare_run(&name, &options)).await?;

@@ -121,6 +121,81 @@ async fn what_cannot_run_is_refused_with_a_json_error_before_any_stream() {
     );
 }
 
+/// Issue #297: a stored secret reaches one run as an env variable, without being bound in the spec,
+/// without a restart, and without its value in the container spec.
+#[tokio::test]
+async fn a_run_can_take_a_stored_secret_for_itself_only() {
+    let h = deployed_app().await;
+    let (s, _) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/ntfy/secrets/s3key",
+        Some(json!({ "value": "hunter2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let creates = h
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, Call::ContainerCreate(n) if n == "ntfy"))
+        .count();
+    let spec_before = show(&h, "ntfy").await["spec"].clone();
+
+    h.fake.script_next_run(RunScript {
+        output: vec![(LogSource::Stdout, b"ok\n".to_vec())],
+        exit_code: 0,
+        hang: false,
+    });
+    let (status, body) = raw(
+        &h,
+        "POST",
+        "/v1/apps/ntfy/run",
+        json!({ "command": ["migrate"], "secrets": { "S3_KEY": "s3key" } })
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(frames(&body).last(), Some(&RunFrame::Exit(0)));
+
+    let run = h
+        .fake
+        .created_specs()
+        .into_iter()
+        .find(|s| s.name.starts_with("wg-run."))
+        .expect("a run container was created");
+    assert!(
+        run.secrets.iter().any(|a| matches!(
+            &a.target,
+            weglarka_model::app::SecretTarget::Env { var } if var == "S3_KEY"
+        )),
+        "{:?}",
+        run.secrets
+    );
+    assert!(!format!("{run:?}").contains("hunter2"));
+    // The app: same spec, not recreated.
+    assert_eq!(show(&h, "ntfy").await["spec"], spec_before);
+    let after = h
+        .fake
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, Call::ContainerCreate(n) if n == "ntfy"))
+        .count();
+    assert_eq!(after, creates);
+
+    // A secret that is not stored, or a variable given twice, is refused before any stream.
+    for body in [
+        json!({ "command": ["x"], "secrets": { "V": "nope" } }),
+        json!({ "command": ["x"], "env": { "V": "1" }, "secrets": { "V": "s3key" } }),
+        json!({ "command": ["x"], "secrets": { "V": "bad name" } }),
+    ] {
+        let (status, v) = admin(&h, "POST", "/v1/apps/ntfy/run", Some(body)).await;
+        assert!(status.is_client_error(), "{status} {v}");
+    }
+    assert!(run_containers(&h).is_empty());
+}
+
 /// A provisioned app (`start = false`) has a pinned image and its volumes but no container: the
 /// case for running a migration *before* the first start.
 #[tokio::test]

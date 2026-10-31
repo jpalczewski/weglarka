@@ -10,7 +10,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use weglarka_api::{RunFrame, RunRequest};
 
 use crate::cli::parse_pair;
-use crate::commands::{client, instance};
+use crate::commands::{client, instance, secret_name};
 use crate::error::CliError;
 use crate::settings::Overrides;
 
@@ -28,6 +28,7 @@ A command killed by --timeout exits with 124.
 Examples:
   weglarka run ntfy -- ntfy user list
   weglarka run gitea --env LOG_LEVEL=debug -- gitea admin user list
+  weglarka run gitea --secret s3-key=AWS_ACCESS_KEY_ID -- gitea migrate-storage
   weglarka run gitea --entrypoint /bin/sh -- -c 'ls /data'")]
 pub struct RunArgs {
     /// Instance name.
@@ -35,6 +36,11 @@ pub struct RunArgs {
     /// Environment variable KEY=VALUE for this run only (repeatable); wins over the app's own.
     #[arg(short = 'e', long = "env", value_name = "K=V", value_parser = parse_pair)]
     pub env: Vec<(String, String)>,
+    /// Expose a stored secret of the app as an environment variable for this run only:
+    /// SECRET=VARIABLE (repeatable). The value never touches a command line or the app's spec, and
+    /// the app is not restarted.
+    #[arg(long = "secret", value_name = "SECRET=VAR", value_parser = parse_pair)]
+    pub secrets: Vec<(String, String)>,
     /// Replace the image's entrypoint with this executable; the words after `--` become its arguments.
     #[arg(long, value_name = "PATH")]
     pub entrypoint: Option<String>,
@@ -83,10 +89,25 @@ impl RunArgs {
                     .map_err(|_| CliError::usage("--timeout is longer than 24 hours"))
             })
             .transpose()?;
+        let mut secrets = BTreeMap::new();
+        for (secret, var) in &self.secrets {
+            secret_name(secret)?;
+            if var.is_empty() || secrets.insert(var.clone(), secret.clone()).is_some() {
+                return Err(CliError::usage(format!(
+                    "--secret: {var:?} is empty or given twice"
+                )));
+            }
+            if self.env.iter().any(|(k, _)| k == var) {
+                return Err(CliError::usage(format!(
+                    "{var} is given both with --env and with --secret"
+                )));
+            }
+        }
         Ok(RunRequest {
             command: self.command.clone(),
             entrypoint: self.entrypoint.clone().map(|e| vec![e]),
             env: self.env.iter().cloned().collect::<BTreeMap<_, _>>(),
+            secrets,
             timeout_secs,
         })
     }
@@ -216,6 +237,31 @@ mod tests {
 
     fn parse(argv: &[&str]) -> RunArgs {
         W::try_parse_from(argv).unwrap().a
+    }
+
+    #[test]
+    fn secret_flag_maps_variables_to_stored_secret_names() {
+        let a = parse(&[
+            "w",
+            "web",
+            "--secret",
+            "s3-key=AWS_KEY",
+            "--secret",
+            "s3-sec=AWS_SEC",
+            "--",
+            "x",
+        ]);
+        let req = a.request().unwrap();
+        assert_eq!(req.secrets["AWS_KEY"], "s3-key");
+        assert_eq!(req.secrets["AWS_SEC"], "s3-sec");
+        for bad in [
+            &["w", "web", "--secret", "a=V", "--secret", "b=V", "--", "x"][..],
+            &["w", "web", "--secret", "a=V", "-e", "V=1", "--", "x"],
+            &["w", "web", "--secret", "bad name=V", "--", "x"],
+        ] {
+            let e = parse(bad).request().unwrap_err();
+            assert_eq!(e.exit_code(), crate::error::exit::USAGE, "{bad:?}");
+        }
     }
 
     #[test]
