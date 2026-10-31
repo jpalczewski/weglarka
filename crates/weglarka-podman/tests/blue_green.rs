@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use weglarka_model::app::Resources;
 use weglarka_model::labels;
-use weglarka_model::podman::{ContainerSpec, NetworkSpec, PodmanClient, RestartPolicy};
+use weglarka_model::podman::{ContainerSpec, NetworkSpec, PodmanClient};
 use weglarka_podman::LibpodClient;
 
 const BUSYBOX: &str = "docker.io/library/busybox:latest";
@@ -70,28 +70,15 @@ fn spec(
     command: &[&str],
 ) -> ContainerSpec {
     ContainerSpec {
-        name: name.into(),
-        image: BUSYBOX.into(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
-        entrypoint: None,
-        labels: BTreeMap::new(),
-        env: BTreeMap::new(),
         networks: networks.iter().map(|s| (*s).to_owned()).collect(),
         network_aliases: aliases
             .iter()
             .map(|(n, a)| ((*n).to_owned(), a.iter().map(|s| (*s).to_owned()).collect()))
             .collect(),
-        secrets: vec![],
-        publish: vec![],
-        restart: RestartPolicy::No,
         userns_auto: true,
-        mounts: vec![],
-        keep_groups: false,
-        volumes: vec![],
         resources: Resources::default(),
-        healthcheck: None,
-        id_mapping: None,
-        security: Default::default(),
+        ..ContainerSpec::new(name, BUSYBOX)
     }
 }
 

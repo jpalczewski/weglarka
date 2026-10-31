@@ -1525,25 +1525,11 @@ mod tests {
     #[test]
     fn network_aliases_are_sent_per_network() {
         let mut spec = ContainerSpec {
-            name: "api".into(),
-            image: "img".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
             networks: vec!["net-api".into(), "net-shared-kajet".into()],
             network_aliases: BTreeMap::from([("net-shared-kajet".into(), vec!["gateway".into()])]),
-            secrets: vec![],
-            publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("api", "img")
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         // A network without extras stays an empty object, as before aliases existed.
@@ -1567,14 +1553,9 @@ mod tests {
     #[test]
     fn create_container_body_snapshot() {
         let spec = ContainerSpec {
-            name: "ntfy-1".into(),
-            image: "ghcr.io/jpalczewski/ntfy.zig@sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
-            command: vec![],
-            entrypoint: None,
             labels: BTreeMap::from([("weglarka.instance".into(), "ntfy".into())]),
             env: BTreeMap::from([("CONFIG_FILE".into(), "/config.json".into())]),
             networks: vec!["net-ntfy".into()],
-            network_aliases: Default::default(),
             secrets: vec![
                 SecretAttachment {
                     secret: "ntfy-config".into(),
@@ -1587,19 +1568,22 @@ mod tests {
                 },
                 SecretAttachment {
                     secret: "ntfy-token".into(),
-                    target: SecretTarget::Env { var: "TOKEN".into() },
+                    target: SecretTarget::Env {
+                        var: "TOKEN".into(),
+                    },
                 },
             ],
-            publish: vec![DomainPort { host_ip: Some("172.17.0.1".into()), host_port: 8085, container_port: 8085 }],
+            publish: vec![DomainPort {
+                host_ip: Some("172.17.0.1".into()),
+                host_port: 8085,
+                container_port: 8085,
+            }],
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new(
+                "ntfy-1",
+                "ghcr.io/jpalczewski/ntfy.zig@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            )
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1609,25 +1593,9 @@ mod tests {
     #[test]
     fn create_container_command_arguments() {
         let spec = ContainerSpec {
-            name: "ntfy".into(),
-            image: "docker.io/binwiederhier/ntfy:latest".into(),
             command: vec!["serve".into(), "--no-log".into()],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("ntfy", "docker.io/binwiederhier/ntfy:latest")
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1637,25 +1605,10 @@ mod tests {
     #[test]
     fn entrypoint_is_sent_only_when_set() {
         let mut spec = ContainerSpec {
-            name: "wg-run.a.1".into(),
-            image: "i".into(),
             command: vec!["-c".into(), "env".into()],
             entrypoint: Some(vec!["/bin/sh".into()]),
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
             userns_auto: true,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("wg-run.a.1", "i")
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         assert_eq!(body["entrypoint"], serde_json::json!(["/bin/sh"]));
@@ -1743,25 +1696,7 @@ mod tests {
     #[test]
     fn security_maps_to_libpod_fields_and_is_omitted_when_unset() {
         let mut spec = ContainerSpec {
-            name: "a".into(),
-            image: "i".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("a", "i")
         };
         let plain = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         for key in [
@@ -1795,14 +1730,6 @@ mod tests {
     #[test]
     fn mounted_secret_mode_and_ownership_reach_libpod() {
         let mut spec = ContainerSpec {
-            name: "a".into(),
-            image: "i".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
             secrets: vec![SecretAttachment {
                 secret: "a.config".into(),
                 target: SecretTarget::Mount {
@@ -1812,16 +1739,7 @@ mod tests {
                     gid: None,
                 },
             }],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("a", "i")
         };
         // Unset: the world-readable mode and root-in-the-container owner, like `podman run --secret`.
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
@@ -1850,19 +1768,8 @@ mod tests {
             size: 65_536,
         };
         let spec = ContainerSpec {
-            name: "pogoda".into(),
-            image: "i".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
             restart: RestartPolicy::Always,
             userns_auto: true,
-            mounts: vec![],
             volumes: vec![
                 VolumeAttachment {
                     volume: "pogoda.data".into(),
@@ -1875,14 +1782,11 @@ mod tests {
                     read_only: true,
                 },
             ],
-            resources: Default::default(),
-            healthcheck: None,
             id_mapping: Some(IdMapping {
                 uid_map: vec![range],
                 gid_map: vec![range],
             }),
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("pogoda", "i")
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1892,20 +1796,6 @@ mod tests {
         use weglarka_model::app::{CpuLimit, MemoryLimit};
         use weglarka_model::podman::ContainerHealthcheck;
         let spec = ContainerSpec {
-            name: "a".into(),
-            image: "i".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
-            volumes: vec![],
             resources: Resources {
                 memory: Some(MemoryLimit::parse("256m").unwrap()),
                 pids_limit: Some(200),
@@ -1917,9 +1807,7 @@ mod tests {
                 timeout_secs: 5,
                 retries: 3,
             }),
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("a", "i")
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1939,25 +1827,7 @@ mod tests {
     #[test]
     fn create_container_minimal_omits_empty_fields() {
         let spec = ContainerSpec {
-            name: "a".into(),
-            image: "i".into(),
-            command: vec![],
-            entrypoint: None,
-            labels: BTreeMap::new(),
-            env: BTreeMap::new(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
-            keep_groups: false,
-            security: Default::default(),
+            ..ContainerSpec::new("a", "i")
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
     }
@@ -1965,25 +1835,10 @@ mod tests {
     #[test]
     fn keep_groups_sets_the_crun_annotation_and_nothing_else() {
         let mut spec = ContainerSpec {
-            name: "alloy".into(),
-            image: "ghcr.io/example/alloy@sha256:aaaa".into(),
-            command: vec![],
-            entrypoint: None,
             labels: Default::default(),
             env: Default::default(),
-            networks: vec![],
-            network_aliases: Default::default(),
-            secrets: vec![],
-            publish: vec![],
-            restart: RestartPolicy::No,
-            userns_auto: false,
-            mounts: vec![],
-            volumes: vec![],
-            resources: Default::default(),
-            healthcheck: None,
-            id_mapping: None,
             keep_groups: true,
-            security: Default::default(),
+            ..ContainerSpec::new("alloy", "ghcr.io/example/alloy@sha256:aaaa")
         };
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         assert_eq!(
