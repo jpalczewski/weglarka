@@ -39,6 +39,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Apps(AppsCommand::Update(a)) => {
             crate::update::apps_update(json, &overrides, a).await
         }
+        Command::Apps(AppsCommand::Diff(a)) => crate::update::apps_diff(json, &overrides, a).await,
         Command::Apps(AppsCommand::Start(a)) => {
             crate::update::apps_start(json, &overrides, a).await
         }

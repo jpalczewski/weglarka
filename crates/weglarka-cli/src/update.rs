@@ -436,8 +436,31 @@ struct UpdateDryRun {
     /// placeholders, so `env` values and `command` elements show as changed.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     redacted_base: bool,
+    /// `env` keys the live spec has and the new one drops (`--spec` is a full replacement).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removes_env: Vec<String>,
     diff: String,
     body: UpdateAppRequest,
+}
+
+/// `env` keys present in `old` and absent from `new`: the silent casualties of a full replacement
+/// (a variable set by hand and missing from the spec file).
+fn removed_env_keys(old: &AppSpec, new: &AppSpec) -> Vec<String> {
+    old.env
+        .keys()
+        .filter(|k| !new.env.contains_key(*k))
+        .cloned()
+        .collect()
+}
+
+const REDACTED_BASE_NOTE: &str = "note: the current spec is a redacted view; env values and command \
+     elements below differ only because they are withheld from this token\n";
+
+fn render_removals(keys: &[String]) -> String {
+    if keys.is_empty() {
+        return String::new();
+    }
+    format!("removes env only in the live spec: {}\n", keys.join(", "))
 }
 
 #[derive(Debug, Serialize)]
@@ -464,6 +487,7 @@ fn emit_update_dry_run(
     json: bool,
     params: &[(&str, &str)],
     redacted_base: bool,
+    current: &AppSpec,
     diff: String,
     req: UpdateAppRequest,
 ) {
@@ -473,19 +497,21 @@ fn emit_update_dry_run(
         path: expand_path(endpoints::APPS_UPDATE, params),
         changed: !diff.is_empty(),
         redacted_base,
+        removes_env: removed_env_keys(current, &req.spec),
         diff,
         body: req,
     };
     emit(json, &out, || {
         let mut s = format!("dry-run: {} {}\n", out.method, out.path);
         if out.redacted_base {
-            s.push_str(
-                "note: the current spec is a redacted view; env values and command elements \
-                 below differ only because they are withheld from this token\n",
-            );
+            s.push_str(REDACTED_BASE_NOTE);
         }
         s.push_str(&if out.changed {
-            format!("spec changes:\n{}", out.diff)
+            format!(
+                "spec changes:\n{}{}",
+                out.diff,
+                render_removals(&out.removes_env)
+            )
         } else {
             "no changes to the spec\n".to_owned()
         });
@@ -519,7 +545,7 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
     let req = UpdateAppRequest { spec: new_spec };
 
     if a.dry_run {
-        emit_update_dry_run(json, &params, current.redacted, diff, req);
+        emit_update_dry_run(json, &params, current.redacted, &current.spec, diff, req);
         return Ok(exit::OK);
     }
     if diff.is_empty() {
@@ -539,6 +565,59 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
         Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
         _ => exit::OK,
     })
+}
+
+/// Flags of `apps diff`.
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// Instance name.
+    pub name: String,
+    /// The AppSpec TOML file to compare with the live spec; `-` = stdin.
+    #[arg(long, value_name = "FILE")]
+    pub spec: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct SpecDiff {
+    changed: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    redacted_base: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removes_env: Vec<String>,
+    diff: String,
+}
+
+/// `apps diff <name> --spec FILE`: the plan half of plan/apply. Same diff as `apps update --spec FILE
+/// --dry-run`, but the exit code carries the answer: 0 identical, 8 differs.
+pub async fn apps_diff(json: bool, o: &Overrides, a: DiffArgs) -> Result<i32, CliError> {
+    let name = instance(&a.name)?;
+    let params = [("name", name.as_str())];
+    let new_spec = read_spec_file(&a.spec)?;
+    let current: ShowAppResponse = client(o)?
+        .call(endpoints::APPS_SHOW, &params, None::<&()>)
+        .await?;
+    let out = SpecDiff {
+        changed: false,
+        redacted_base: current.redacted,
+        removes_env: removed_env_keys(&current.spec, &new_spec),
+        diff: spec_diff(&current.spec, &new_spec),
+    };
+    let out = SpecDiff {
+        changed: !out.diff.is_empty(),
+        ..out
+    };
+    emit(json, &out, || {
+        if !out.changed {
+            return format!("{name}: the spec file matches the live spec\n");
+        }
+        let note = if out.redacted_base {
+            REDACTED_BASE_NOTE
+        } else {
+            ""
+        };
+        format!("{note}{}{}", out.diff, render_removals(&out.removes_env))
+    });
+    Ok(if out.changed { exit::DIFFERS } else { exit::OK })
 }
 
 fn render_update(r: &UpdateAppResponse, diff: &str) -> String {
@@ -610,7 +689,7 @@ async fn set_start(
     let diff = spec_diff(&current.spec, &new_spec);
     let req = UpdateAppRequest { spec: new_spec };
     if a.dry_run {
-        emit_update_dry_run(json, &params, false, diff, req);
+        emit_update_dry_run(json, &params, false, &current.spec, diff, req);
         return Ok(exit::OK);
     }
     let resp: UpdateAppResponse = client
@@ -1442,6 +1521,41 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         let err = read_spec_from(Path::new("-"), &mut "image = [".as_bytes()).unwrap_err();
         assert_eq!(err.exit_code(), exit::USAGE);
         assert!(err.message.contains("invalid spec"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diff_exits_8_when_the_file_differs_and_flags_dropped_env_keys() {
+        let mut live = spec();
+        live.env.insert("HAND_SET".into(), "1".into());
+        let mut view: serde_json::Value = serde_json::from_str(&show_json()).unwrap();
+        view["spec"] = serde_json::to_value(&live).unwrap();
+        let show = view.to_string();
+        let m = mock(move |_, _| (200, show.clone())).await;
+        let o = Overrides {
+            config: None,
+            socket: Some(m.socket.clone()),
+            host: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spec.toml");
+        std::fs::write(&file, toml::to_string(&spec()).unwrap()).unwrap();
+        let d = DiffArgs {
+            name: "ntfy".into(),
+            spec: file.clone(),
+        };
+        assert_eq!(apps_diff(true, &o, d).await.unwrap(), exit::DIFFERS);
+        assert_eq!(
+            removed_env_keys(&live, &spec()),
+            vec!["HAND_SET".to_owned()]
+        );
+        assert!(render_removals(&["HAND_SET".into()]).contains("HAND_SET"));
+        std::fs::write(&file, toml::to_string(&live).unwrap()).unwrap();
+        let d = DiffArgs {
+            name: "ntfy".into(),
+            spec: file,
+        };
+        assert_eq!(apps_diff(true, &o, d).await.unwrap(), exit::OK);
+        assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
     }
 
     #[tokio::test(flavor = "current_thread")]
