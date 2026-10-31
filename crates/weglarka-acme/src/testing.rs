@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_certificate_on_disk_is_a_failure_not_a_reissue() {
+    async fn corrupt_certificate_on_disk_is_replaced_as_expired() {
         let rig = rig();
         let s = spec("app.example.eu");
         std::fs::create_dir_all(rig.store.cert_path(s.id()).parent().unwrap()).unwrap();
@@ -297,8 +297,11 @@ mod tests {
         let report = rig.manager.pass(rig.now, &[s]).await;
         assert!(matches!(
             report.outcomes[0].1,
-            Outcome::Failed(AcmeError::Expiry(_))
+            Outcome::Renewed {
+                was_expired: true,
+                ..
+            }
         ));
-        assert!(rig.fake.orders().is_empty());
+        assert_eq!(rig.fake.orders().len(), 1);
     }
 }

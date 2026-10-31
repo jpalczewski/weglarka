@@ -17,21 +17,20 @@ testing = []
 
 [dependencies]
 base64.workspace = true
-hyper-rustls.workspace = true
-hyper-util.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 instant-acme.workspace = true
-rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
-webpki-roots.workspace = true
-weglarka-model.workspace = true
 weglarka-dns.workspace = true
-x509-parser.workspace = true
+weglarka-http.workspace = true
+weglarka-model.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 weglarka-dns = { workspace = true, features = ["testing"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt"] }
