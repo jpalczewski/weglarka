@@ -69,6 +69,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | Guide | Covers |
 |---|---|
 | [Metrics](metrics.md) | The opt-in Prometheus `/metrics` listener on a dedicated network (`[metrics]`), opting an app in (`metrics_port`), and generated scrape targets (`scraper`) |
+| [A managed Prometheus](managed-prometheus.md) | A worked example: Prometheus as an app, opting apps in, what each network can reach, the UI, migrating from a host Prometheus |
 | [Notifications](notifications.md) | ntfy notifications, outbox, deduplication |
 | [Crash detection](crash-detection.md) | Crash loops and unhealthy apps (`[monitor]`) |
 | [Self-update](self-update.md) | Signed image updates, watchdog and automatic fallback |

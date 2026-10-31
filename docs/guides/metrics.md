@@ -222,6 +222,9 @@ admin port, a debug endpoint): bind those to `127.0.0.1` inside the container, o
 authentication. What the network does keep apart is the opted-in apps from each other, and the scraper from the
 ingress nginx and from apps that did not opt in.
 
+It works in both directions: an opted-in app can reach every port of the scraper over the network they share, and so can
+read whatever the scraper's API serves. [A managed Prometheus](managed-prometheus.md) says what to do about it.
+
 - **Setting or changing `metrics_port` recreates the container once** (it changes the container's networks), like
   joining a shared network. `metrics_path` alone recreates nothing; only the scraper reads it. Apps that do not set
   either are untouched by the upgrade.
@@ -241,8 +244,8 @@ joins it to these networks and lists the app in its generated [scrape targets](#
 
 ## Connecting the scraper
 
-Prometheus (or any other scraper) runs as an ordinary managed app: a host service cannot join a Podman network. Name it
-in `weglarka.toml`:
+Prometheus (or any other scraper) runs as an ordinary managed app: a host service cannot join a Podman network. For a
+worked example, see [a managed Prometheus](managed-prometheus.md). Name it in `weglarka.toml`:
 
 ```toml
 [metrics]
