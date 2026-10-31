@@ -7,18 +7,20 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Args;
 use serde::Serialize;
 use weglarka_api::endpoints;
 use weglarka_api::{
-    DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest, UpdateAppResponse,
+    ContainerHealth, DeployOutcome, RuntimeState, ShowAppResponse, UpdateAppRequest,
+    UpdateAppResponse,
 };
 use weglarka_model::app::{
     AppIngress, AppSpec, BodySizeLimit, InstanceName, SecretBinding, SecretTarget,
     SharedVolumeName, valid_volume_name,
 };
-use weglarka_model::state::AppState;
+use weglarka_model::state::{AppState, FailedDeploy};
 
 use crate::cli::{StartStopArgs, parse_pair};
 use crate::client::{ApiClient, expand_path};
@@ -150,6 +152,153 @@ pub struct UpdateArgs {
     /// Send nothing; show the diff of the spec and the request that would be sent.
     #[arg(long)]
     pub dry_run: bool,
+    #[command(flatten)]
+    pub wait: WaitArgs,
+}
+
+/// `--wait [--timeout SECS]` of `apps update/start/stop` (issue #298).
+#[derive(Debug, Clone, Default, Args)]
+pub struct WaitArgs {
+    /// After saving, wait until the daemon reports the container matches the spec and its health
+    /// check settled (a deploy that failed or was rolled back exits 6, a timeout 9).
+    #[arg(long, conflicts_with = "dry_run")]
+    pub wait: bool,
+    /// How long `--wait` waits, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_WAIT_SECS, requires = "wait")]
+    pub timeout: u64,
+}
+
+const DEFAULT_WAIT_SECS: u64 = 300;
+const WAIT_POLL: Duration = Duration::from_secs(1);
+
+/// How `--wait` ended.
+#[derive(Debug)]
+enum Settled {
+    /// The container matches the spec and is not starting any more.
+    Reconciled(Box<ShowAppResponse>),
+    /// A deploy failed after the change (the failure text is the daemon's, `admin` only).
+    Failed(String),
+    /// The app waits for secrets that must be set first.
+    NeedsSecrets(Vec<String>),
+    TimedOut,
+}
+
+#[derive(Debug, Serialize)]
+struct WaitReport {
+    waited: bool,
+    /// `reconciled`, `failed`, `waiting-for-secret` or `timed-out`.
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// Polls `GET /v1/apps/{name}` until the app settles. `baseline` is the failure recorded before the
+/// change, so an old failure is not blamed on it.
+async fn wait_reconciled(
+    client: &ApiClient,
+    params: &[(&str, &str)],
+    baseline: Option<FailedDeploy>,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<Settled, CliError> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let app = fetch_app(client, params).await?;
+        let Some(reconciled) = app.reconciled else {
+            return Err(CliError::internal("the daemon does not report reconciliation")
+                .with_hint("--wait needs an `admin` token or the socket, and a daemon of this CLI's version"));
+        };
+        let starting = app.health == Some(ContainerHealth::Starting);
+        if reconciled && !starting {
+            return Ok(Settled::Reconciled(Box::new(app)));
+        }
+        if let Some(f) = &app.state.failed
+            && baseline.as_ref() != Some(f)
+        {
+            return Ok(Settled::Failed(f.reason.clone()));
+        }
+        if !app.state.waiting_for_secrets.is_empty() {
+            return Ok(Settled::NeedsSecrets(app.state.waiting_for_secrets.clone()));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(Settled::TimedOut);
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// The `--wait` tail of a successful change: nothing to do without the flag, or after a deploy that
+/// already rolled back (`code != OK`); otherwise wait and turn the result into an exit code.
+async fn finish_wait(
+    json: bool,
+    client: &ApiClient,
+    params: &[(&str, &str)],
+    wait: &WaitArgs,
+    baseline: Option<FailedDeploy>,
+    code: i32,
+) -> Result<i32, CliError> {
+    if !wait.wait || code != exit::OK {
+        return Ok(code);
+    }
+    let name = params
+        .iter()
+        .find(|(k, _)| *k == "name")
+        .map_or("", |(_, v)| *v);
+    eprintln!("waiting for {name} to reconcile (up to {}s)…", wait.timeout);
+    let settled = wait_reconciled(
+        client,
+        params,
+        baseline,
+        Duration::from_secs(wait.timeout),
+        WAIT_POLL,
+    )
+    .await?;
+    let (code, report, text) = match settled {
+        Settled::Reconciled(app) => (
+            exit::OK,
+            WaitReport {
+                waited: true,
+                outcome: "reconciled",
+                generation: Some(app.state.generation),
+                detail: None,
+            },
+            format!("{name}: reconciled (generation {})\n", app.state.generation),
+        ),
+        Settled::Failed(reason) => (
+            exit::ROLLED_BACK,
+            WaitReport {
+                waited: true,
+                outcome: "failed",
+                generation: None,
+                detail: Some(reason.clone()),
+            },
+            format!("{name}: the deploy failed: {reason}\n"),
+        ),
+        Settled::NeedsSecrets(missing) => (
+            exit::WAIT_GAVE_UP,
+            WaitReport {
+                waited: true,
+                outcome: "waiting-for-secret",
+                generation: None,
+                detail: Some(missing.join(", ")),
+            },
+            format!("{name}: waiting for secrets: {}\n", missing.join(", ")),
+        ),
+        Settled::TimedOut => (
+            exit::WAIT_GAVE_UP,
+            WaitReport {
+                waited: true,
+                outcome: "timed-out",
+                generation: None,
+                detail: None,
+            },
+            format!("{name}: not reconciled after {}s\n", wait.timeout),
+        ),
+    };
+    emit(json, &report, || text);
+    Ok(code)
 }
 
 impl UpdateArgs {
@@ -575,7 +724,16 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
         .call(endpoints::APPS_UPDATE, &params, Some(&req))
         .await?;
     emit(json, &resp, || render_update(&resp, &diff));
-    Ok(deploy_exit(&resp))
+    let baseline = current.state.failed.clone();
+    finish_wait(
+        json,
+        &client,
+        &params,
+        &a.wait,
+        baseline,
+        deploy_exit(&resp),
+    )
+    .await
 }
 
 /// Flags of `apps diff`.
@@ -711,7 +869,16 @@ async fn set_start(
              the missing secrets are set)\n",
         )
     });
-    Ok(deploy_exit(&resp))
+    let baseline = current.state.failed.clone();
+    finish_wait(
+        json,
+        &client,
+        &params,
+        &a.wait,
+        baseline,
+        deploy_exit(&resp),
+    )
+    .await
 }
 
 /// `apps start`: `start = true` and a deploy (a provisioned app gets its container).
@@ -775,7 +942,7 @@ mod tests {
     use weglarka_api::DeployResponse;
     use weglarka_model::app::{InstanceName, SharedVolumeRef, VolumeMount};
 
-    fn args(extra: &[&str]) -> UpdateArgs {
+    fn try_args(extra: &[&str]) -> Result<UpdateArgs, clap::Error> {
         #[derive(Parser)]
         struct W {
             #[command(flatten)]
@@ -783,7 +950,11 @@ mod tests {
         }
         let mut argv = vec!["w", "ntfy"];
         argv.extend_from_slice(extra);
-        W::try_parse_from(argv).unwrap().a
+        W::try_parse_from(argv).map(|w| w.a)
+    }
+
+    fn args(extra: &[&str]) -> UpdateArgs {
+        try_args(extra).unwrap()
     }
 
     fn spec() -> AppSpec {
@@ -1435,6 +1606,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             health: None,
             started_at: None,
             redacted: false,
+            reconciled: None,
         })
         .unwrap()
     }
@@ -1504,6 +1676,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         let stop = StartStopArgs {
             name: "ntfy".into(),
             dry_run: false,
+            wait: Default::default(),
         };
         assert!(apps_start(true, &o, stop).await.is_err());
         assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
@@ -1593,6 +1766,123 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         assert!(!err.message.contains("redacted"), "{}", err.message);
         let seen = m.seen.lock().unwrap();
         assert_eq!(seen.last().unwrap().method, "PUT");
+    }
+
+    fn view_with(patch: serde_json::Value) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&show_json()).unwrap();
+        for (k, val) in patch.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        v.to_string()
+    }
+
+    fn overrides(m: &crate::tests::Mock) -> Overrides {
+        Overrides {
+            config: None,
+            socket: Some(m.socket.clone()),
+            host: None,
+        }
+    }
+
+    async fn settle(
+        views: Vec<String>,
+        baseline: Option<FailedDeploy>,
+        timeout_ms: u64,
+    ) -> Result<Settled, CliError> {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let m = mock(move |_, _| {
+            let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (200, views[i.min(views.len() - 1)].clone())
+        })
+        .await;
+        let c = ApiClient::new(m.socket.clone());
+        wait_reconciled(
+            &c,
+            &[("name", "ntfy")],
+            baseline,
+            Duration::from_millis(timeout_ms),
+            Duration::from_millis(5),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_polls_until_the_container_matches_and_the_health_check_settled() {
+        let drifted = view_with(serde_json::json!({"reconciled": false}));
+        let starting = view_with(serde_json::json!({"reconciled": true, "health": "starting"}));
+        let done = view_with(serde_json::json!({"reconciled": true, "health": "healthy"}));
+        let got = settle(vec![drifted, starting, done], None, 5000)
+            .await
+            .unwrap();
+        assert!(matches!(got, Settled::Reconciled(_)), "{got:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_reports_a_new_failure_but_not_an_old_one() {
+        let failure = serde_json::json!({
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "reason": "health gate failed",
+        });
+        let failed = view_with(
+            serde_json::json!({"reconciled": false, "state": {"failed": failure.clone()}}),
+        );
+        let got = settle(vec![failed.clone()], None, 5000).await.unwrap();
+        assert!(
+            matches!(&got, Settled::Failed(r) if r == "health gate failed"),
+            "{got:?}"
+        );
+        // The same failure was already there before the change: only the timeout ends the wait.
+        let old = serde_json::from_value(failure).unwrap();
+        let got = settle(vec![failed], Some(old), 30).await.unwrap();
+        assert!(matches!(got, Settled::TimedOut), "{got:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_stops_for_secrets_and_refuses_a_daemon_without_the_field() {
+        let waiting = view_with(serde_json::json!({
+            "reconciled": false,
+            "state": {"waiting_for_secrets": ["token"]},
+        }));
+        let got = settle(vec![waiting], None, 5000).await.unwrap();
+        assert!(
+            matches!(&got, Settled::NeedsSecrets(s) if s == &["token"]),
+            "{got:?}"
+        );
+        let err = settle(vec![show_json()], None, 5000).await.unwrap_err();
+        assert!(err.message.contains("reconciliation"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_with_wait_returns_once_reconciled_and_start_stop_take_the_flag() {
+        let done = view_with(serde_json::json!({"reconciled": true, "health": "healthy"}));
+        let put = serde_json::to_string(&UpdateAppResponse {
+            app: serde_json::from_str(&show_json()).unwrap(),
+            deploy: None,
+        })
+        .unwrap();
+        let m = mock(move |method, _| match method {
+            "GET" => (200, done.clone()),
+            _ => (200, put.clone()),
+        })
+        .await;
+        let o = overrides(&m);
+        let mut a = args(&["--domain", "new.example.eu"]);
+        a.wait = WaitArgs {
+            wait: true,
+            timeout: 5,
+        };
+        assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);
+        let methods: Vec<String> = m
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.method.clone())
+            .collect();
+        assert_eq!(methods, ["GET", "PUT", "GET"]);
+        // --wait and --dry-run exclude each other.
+        assert!(try_args(&["--env", "A=1", "--wait", "--dry-run"]).is_err());
+        assert!(try_args(&["--env", "A=1", "--timeout", "5"]).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

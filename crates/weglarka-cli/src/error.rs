@@ -16,6 +16,8 @@ pub mod exit {
     pub const ROLLED_BACK: i32 = 6;
     /// `notify test`: the notification channel refused the test notification.
     pub const NOTIFY_FAILED: i32 = 7;
+    /// `--wait` gave up: the timeout passed, or the app waits for a secret that only a person can set.
+    pub const WAIT_GAVE_UP: i32 = 9;
     /// `apps diff`: the spec file differs from the live spec.
     pub const DIFFERS: i32 = 8;
     /// Invalid invocation, or input rejected locally.
@@ -38,6 +40,7 @@ Exit codes:
    6  deploy: rolled back to the previous version (rolled_back)
    7  notify test: the channel refused the test notification
    8  apps diff: the spec file differs from the live spec
+   9  --wait: timed out, or the app waits for a secret
   64  invalid invocation or input
   69  daemon unreachable (admin API socket)
   70  internal error (I/O, protocol, daemon error)

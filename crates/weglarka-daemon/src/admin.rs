@@ -421,9 +421,19 @@ async fn show_app<P: PodmanClient + 'static>(
         }
     }
     let app_state = st.apps.get(&name);
+    // Only an `admin` caller learns it (the redacted view is the read-scope allowlist).
+    let reconciled = match access {
+        Access::Redacted => None,
+        _ => Some(
+            d.engine
+                .is_reconciled(&name, &spec, app_state, container.as_ref())
+                .await,
+        ),
+    };
     Ok(json(ShowAppResponse {
         configs,
         host_mounts,
+        reconciled,
         ..show_response(access, name.clone(), spec, app_state, container.as_ref())
     }))
 }

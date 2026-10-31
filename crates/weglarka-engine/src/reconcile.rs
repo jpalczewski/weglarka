@@ -744,6 +744,41 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
+    /// Whether the running container already matches the stored spec (`reconciled` in
+    /// `GET /v1/apps/{name}`, issue #298): the same comparison the reconciler makes, so `false`
+    /// means the next pass still has something to do (or the app waits for a secret).
+    pub async fn is_reconciled(
+        &self,
+        name: &InstanceName,
+        spec: &AppSpec,
+        app_state: Option<&state::AppState>,
+        container: Option<&ContainerInfo>,
+    ) -> bool {
+        let pinned = app_state.and_then(|s| s.current.as_ref());
+        if spec.kind == AppKind::Static {
+            return pinned.is_some();
+        }
+        if !spec.start {
+            return pinned.is_some() && container.is_none();
+        }
+        if app_state.is_some_and(|s| !s.waiting_for_secrets.is_empty()) {
+            return false;
+        }
+        let (Some(digest), Some(c)) = (pinned, container) else {
+            return false;
+        };
+        if matches!(
+            c.state,
+            ContainerState::Created | ContainerState::Stopped | ContainerState::Exited
+        ) {
+            return false;
+        }
+        match self.desired_hash(name, spec, digest).await {
+            Ok(h) => c.labels.get(labels::SPEC_HASH).map(String::as_str) == Some(h.as_str()),
+            Err(_) => false,
+        }
+    }
+
     /// `apps remove` without purging: the instance's volumes (and their data) and secrets stay, so a
     /// re-added app finds them again. The lock moves into [`Self::remove_app_with_purges`].
     pub async fn remove_app(&self, name: &InstanceName) -> Result<(), EngineError> {
