@@ -59,7 +59,7 @@ reset). A series appears once it has something to say: an app that never failed 
 Labels are only ever validated instance names (`app`), routed domains (`domain`) or the fixed values listed above. A
 failure reason, an error message, a digest or an image reference never becomes a label: read those with
 `weglarka doctor`, `GET /v1/events` or the notifications. Per-app resource use and host metrics are described below;
-discovery by a Prometheus app comes with #36. An app removed from `apps.toml` keeps its counter lines until the
+connecting a Prometheus app is described in [Connecting the scraper](#connecting-the-scraper). An app removed from `apps.toml` keeps its counter lines until the
 daemon restarts.
 
 If a file behind a family cannot be read (`apps.toml`, `self-update.toml`), that family is left out of the page and
@@ -228,8 +228,45 @@ only with the scraper: on one network for every app, opted-in apps could reach e
 - Nothing checks that the app really listens on the port: a wrong port is a failed scrape later, not a failed deploy.
 - `weglarka apps show forge` lists both fields; a `read` token sees them as well.
 
-**Not there yet:** nothing joins the scraper to these networks and no scrape targets are generated, so opting in alone
-does not get the app scraped. Connecting a Prometheus app comes with #365, and generated targets with #366.
+The scraper reaches these networks once it is named in `[metrics] scraper` (see
+[Connecting the scraper](#connecting-the-scraper)). **Not there yet:** no scrape targets are generated, so the scraper's
+configuration still has to list `forge:9100` itself; generated targets come with #366.
+
+## Connecting the scraper
+
+Prometheus (or any other scraper) runs as an ordinary managed app: a host service cannot join a Podman network. Name it
+in `weglarka.toml`:
+
+```toml
+[metrics]
+listen = "0.0.0.0:9464"
+scraper = "prometheus"    # an app in apps.toml
+```
+
+and restart the daemon. From then on reconcile keeps that app's container on the daemon's network (`[metrics] network`,
+so it can scrape `weglarka:9464`) and on the `metrics-<app>` network of every opted-in app, never on `net-<app>`:
+
+- The membership is live (`podman network connect`/`disconnect`): **opting an app in or out never restarts the
+  scraper**. A late opt-in is joined during the deploy that creates the app's network; every reconcile pass checks the
+  rest.
+- A recreated scraper (a new image, a spec change) is created on its networks, and a recreated app keeps its network,
+  so the scraper stays on it. A [blue-green](blue-green.md) scraper's challenger is created on the metrics networks
+  before its health gate: it only reads, so scraping early is harmless, and the serving scraper is on them through the
+  whole switch.
+- Opting an app out detaches the scraper from `metrics-<app>` in the same pass that removes the network.
+- The role is host config, like `[admin.http] clients`: no app can grant it to itself. One-off containers of the
+  scraper (`weglarka run`, `weglarka forward`) never join.
+- **Removing or moving the role** (deleting `scraper`, or naming another app) detaches the former scraper on the next
+  pass after the restart. The engine owns the membership of managed app containers on the metrics networks: an app's
+  own containers stay on its own `metrics-<app>`, the scraper stays where it should be, and any other managed app
+  container is detached. A container Węglarka does not manage (no `weglarka.instance` label, such as the one-off
+  `podman run --network metrics` in [Checking it](#checking-it)) is never touched.
+- Without `scraper` nothing joins automatically.
+
+`weglarka doctor` shows a `metrics.scraper` line when `scraper` is set: `ok` with the networks the scraper is on, `warn`
+when the app is not in `apps.toml`, has no running container, or is missing from a network it should be on (the next
+pass connects it; the daemon log says why it could not). It is never `fail`, and absent without `scraper`.
+`GET /v1/config` shows the field.
 
 ## Suggested alerts
 
@@ -284,6 +321,12 @@ groups:
 `[metrics]` is a new section of `weglarka.toml`, and the file uses `deny_unknown_fields`: an older Węglarka refuses to
 start while it is present. Remove `[metrics]` before downgrading. The listener itself adds no `apps.toml` or
 `state.toml` field.
+
+`[metrics] scraper` is a newer field of that section: a Węglarka from before it refuses the file while the field is
+there, even if it knows `[metrics]`. Remove the line before downgrading (the section can stay for a version that has
+it). The scraper's network membership is not undone by the downgrade: detach it by hand if you no longer want it
+(`podman network disconnect metrics-<app> <scraper>`, and the same for the daemon's network); it ends anyway when the
+scraper's container is recreated. The field adds nothing to `apps.toml` or `state.toml`.
 
 `metrics_port` and `metrics_path` are new `apps.toml` fields, and they bump [`schema_version`](state-schema.md) to 16.
 A daemon from before them refuses an `apps.toml` stamped 16 (and would refuse the fields themselves). Before

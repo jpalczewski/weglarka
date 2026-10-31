@@ -73,6 +73,14 @@ pub const INGRESS_NETWORK: &str = "net-weglarka";
 /// Deliberately not `net-*`: reconcile prunes unused `net-<instance>` networks it created.
 pub const METRICS_NETWORK: &str = "metrics";
 
+/// Label on networks Węglarka itself owns (the ingress network, the daemon's metrics network); the
+/// value says which one.
+pub const MANAGED: &str = "weglarka.managed";
+
+/// [`MANAGED`] value of the daemon's metrics network (`[metrics] network`). Reconcile finds that
+/// network by this label, so a renamed `[metrics] network` still has its old network recognised.
+pub const MANAGED_METRICS: &str = "metrics";
+
 /// Prefix of the per-app metrics networks ([`metrics_network_name`]); `[metrics] network` may not
 /// start with it, so the daemon's network never collides with an app's.
 pub const METRICS_APP_NETWORK_PREFIX: &str = "metrics-";

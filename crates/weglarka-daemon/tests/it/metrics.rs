@@ -230,7 +230,22 @@ fn an_invalid_network_name_is_rejected() {
     let cfg: weglarka_model::config::MetricsConfig =
         toml::from_str("listen = \"127.0.0.1:1\"").unwrap();
     assert_eq!(cfg.network, "metrics");
+    assert_eq!(cfg.scraper, None);
     assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn the_scraper_must_be_an_instance_name() {
+    let cfg: weglarka_model::config::MetricsConfig =
+        toml::from_str("listen = \"127.0.0.1:1\"\nscraper = \"prometheus\"").unwrap();
+    assert_eq!(cfg.scraper.unwrap().as_str(), "prometheus");
+    for bad in ["Prom", "-x", "", "a.b"] {
+        let toml = format!("listen = \"127.0.0.1:1\"\nscraper = \"{bad}\"");
+        assert!(
+            toml::from_str::<weglarka_model::config::MetricsConfig>(&toml).is_err(),
+            "{bad}"
+        );
+    }
 }
 
 // Daemon metrics (issue #352): counters from events, certificate expiry, self-update state.
@@ -873,6 +888,102 @@ mod host {
         };
         assert_eq!(storage(&first), storage(&second));
         assert!(!storage(&first).is_empty());
+        h.running.stop().await;
+    }
+}
+
+// ── `[metrics] scraper` (issue #365) ────────────────────────────────────────
+
+mod scraper {
+    use super::*;
+
+    const WITH_SCRAPER: &str = "\n[runtime]\nreconcile_interval_secs = 3600\n\n[metrics]\nlisten = \"127.0.0.1:0\"\nnetwork = \"scrape\"\nscraper = \"prom\"\n";
+
+    async fn scraper_check(running: &Running<FakePodman>) -> Option<Value> {
+        doctor(running)
+            .await
+            .into_iter()
+            .find(|c| c["id"] == "metrics.scraper")
+    }
+
+    async fn with_scraper() -> Harness {
+        let h = Builder::new().sections(WITH_SCRAPER).build().await;
+        own_container(&h.fake).await;
+        h
+    }
+
+    #[tokio::test]
+    async fn absent_without_a_scraper() {
+        let (_dir, _fake, running) = start_daemon(ON, true).await;
+        assert!(scraper_check(&running).await.is_none());
+        let (_, config) = admin_running(&running, "GET", "/v1/config", None).await;
+        assert!(config["metrics"].get("scraper").is_none(), "{config}");
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scraper_is_a_warning() {
+        let h = with_scraper().await;
+        let check = scraper_check(&h.running).await.expect("the check");
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("not an app"),
+            "{check}"
+        );
+        let (_, config) = admin(&h, "GET", "/v1/config", None).await;
+        assert_eq!(config["metrics"]["scraper"], "prom");
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_scraper_without_a_running_container_is_a_warning() {
+        let h = with_scraper().await;
+        let mut prom = spec("prom.example.com");
+        prom["start"] = false.into();
+        add(&h, "prom", prom).await;
+        let check = scraper_check(&h.running).await.expect("the check");
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("no running container"),
+            "{check}"
+        );
+        h.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_joined_scraper_is_ok_and_a_missing_membership_is_a_warning() {
+        let h = with_scraper().await;
+        let mut web = spec("web.example.com");
+        web["metrics_port"] = 9100.into();
+        add(&h, "web", web).await;
+        deployed(&h, "web").await;
+        add(&h, "prom", spec("prom.example.com")).await;
+        deployed(&h, "prom").await;
+        eventually("the scraper joins its networks", || async {
+            scraper_check(&h.running).await.unwrap()["status"] == "ok"
+        })
+        .await;
+        let check = scraper_check(&h.running).await.unwrap();
+        let message = check["message"].as_str().unwrap();
+        assert!(
+            message.contains("scrape") && message.contains("metrics-web"),
+            "{check}"
+        );
+
+        // Detached behind the daemon's back: reported, never fatal.
+        h.fake
+            .network_disconnect("metrics-web", "prom")
+            .await
+            .unwrap();
+        let check = scraper_check(&h.running).await.unwrap();
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["message"].as_str().unwrap().contains("metrics-web"),
+            "{check}"
+        );
         h.running.stop().await;
     }
 }

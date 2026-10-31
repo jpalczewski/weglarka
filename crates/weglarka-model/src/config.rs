@@ -118,6 +118,12 @@ pub struct MetricsConfig {
     /// Podman network the daemon creates and joins, and a scraper joins to read the metrics.
     #[serde(default = "default_metrics_network")]
     pub network: String,
+    /// The managed app that scrapes (issue #365): its container is kept on [`Self::network`] and on
+    /// every per-app `metrics-<app>` network, with live connects, so opting an app in never restarts
+    /// it. Host config, like `[admin.http] clients`, so no app can grant itself the role. `None` =
+    /// nothing joins automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scraper: Option<InstanceName>,
 }
 
 fn default_metrics_network() -> String {

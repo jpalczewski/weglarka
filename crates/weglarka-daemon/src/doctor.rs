@@ -79,6 +79,7 @@ pub async fn run<P: PodmanClient + 'static>(d: &Daemon<P>) -> DoctorReport {
     admin_http(d, &mut checks).await;
     webhook(d, &mut checks).await;
     metrics(d, &mut checks);
+    metrics_scraper(d, &mut checks).await;
     DoctorReport { checks }
 }
 
@@ -116,6 +117,104 @@ fn metrics<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ),
         None => check("metrics.listener", CheckStatus::Warn, "starting", None),
     });
+}
+
+/// `metrics.scraper` (issue #365): only with `[metrics] scraper`. Never `fail`: an unknown or stopped
+/// scraper or a missing network membership is a `warn`, since the daemon itself keeps working.
+async fn metrics_scraper<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    const ID: &str = "metrics.scraper";
+    let Some((instance, network)) = d
+        .host
+        .metrics
+        .as_ref()
+        .and_then(|m| m.scraper.as_ref().map(|s| (s, &m.network)))
+    else {
+        return;
+    };
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // already reported as `state.apps_file`
+    };
+    if !apps.apps.contains_key(instance) {
+        out.push(check(
+            ID,
+            CheckStatus::Warn,
+            format!("[metrics] scraper {instance} is not an app in apps.toml"),
+            Some(
+                "add the app, or point [metrics] scraper at an existing one and restart the daemon",
+            ),
+        ));
+        return;
+    }
+    let podman = d.engine.podman();
+    let (networks, containers) = match (
+        podman.network_list().await,
+        podman.container_list(&ContainerFilter::default()).await,
+    ) {
+        (Ok(n), Ok(c)) => (n, c),
+        (Err(e), _) | (_, Err(e)) => {
+            out.push(check(
+                ID,
+                CheckStatus::Warn,
+                format!("cannot list Podman networks or containers: {e}"),
+                None,
+            ));
+            return;
+        }
+    };
+    let name = labels::container_name(instance);
+    let running = containers
+        .iter()
+        .any(|c| c.name == name && c.state == ContainerState::Running);
+    if !running {
+        out.push(check(
+            ID,
+            CheckStatus::Warn,
+            format!("scraper {instance} has no running container"),
+            Some("start or deploy it (`weglarka apps start <app>`); it joins its networks when it runs"),
+        ));
+        return;
+    }
+    let scraper = weglarka_engine::scraper::MetricsScraper {
+        instance: instance.clone(),
+        network: network.clone(),
+    };
+    let wanted = weglarka_engine::scraper::wanted_networks(&scraper, &apps, &networks);
+    let mut missing: Vec<String> =
+        weglarka_engine::scraper::plan_membership(Some(&scraper), &apps, &networks, &containers)
+            .into_iter()
+            .filter_map(|change| match change {
+                weglarka_engine::scraper::MembershipChange::Connect { network, container }
+                    if container == name =>
+                {
+                    Some(network)
+                }
+                _ => None,
+            })
+            .collect();
+    // The daemon's own network is created by the listener; until it exists nothing can join it.
+    if !networks.iter().any(|n| &n.name == network) {
+        missing.insert(0, network.clone());
+    }
+    if missing.is_empty() {
+        out.push(ok(
+            ID,
+            format!(
+                "scraper {instance} is on {} metrics network(s): {}",
+                wanted.len(),
+                wanted.join(", ")
+            ),
+        ));
+    } else {
+        out.push(check(
+            ID,
+            CheckStatus::Warn,
+            format!(
+                "scraper {instance} is not on network(s): {}",
+                missing.join(", ")
+            ),
+            Some("the next reconcile pass connects it; if this persists, see the daemon log (and `metrics.listener` for the daemon's network)"),
+        ));
+    }
 }
 
 /// Self-update (issue #99): configured or not, the digest the switcher pinned, and whether the

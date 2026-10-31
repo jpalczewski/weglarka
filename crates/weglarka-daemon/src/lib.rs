@@ -343,6 +343,15 @@ pub async fn start_with<P: PodmanClient + 'static>(
                 clients: http.clients.iter().cloned().collect(),
             }
         }),
+        // The scraper app kept on the metrics networks (issue #365); host policy, like the above.
+        metrics_scraper: host.metrics.as_ref().and_then(|m| {
+            m.scraper
+                .clone()
+                .map(|instance| weglarka_engine::scraper::MetricsScraper {
+                    instance,
+                    network: m.network.clone(),
+                })
+        }),
         dependency_wait_secs: host
             .runtime
             .dependency_wait_secs
