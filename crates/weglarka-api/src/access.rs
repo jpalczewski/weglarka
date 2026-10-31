@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use std::borrow::Cow;
 
 /// `Content-Type` of an access response stream.
 pub const ACCESS_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.access-stream";
@@ -67,15 +68,15 @@ impl AccessFrame {
 }
 
 impl FrameKind for AccessFrame {
-    fn parts(&self) -> (u8, Vec<u8>) {
+    fn parts(&self) -> (u8, Cow<'_, [u8]>) {
         match self {
             Self::Entry(entry) => (
                 ENTRY,
-                serde_json::to_vec(entry).expect("an AccessEntry serialises"),
+                Cow::Owned(serde_json::to_vec(entry).expect("an AccessEntry serialises")),
             ),
-            Self::End => (END, Vec::new()),
-            Self::TokenExpired => (TOKEN_EXPIRED, Vec::new()),
-            Self::Error(message) => (ERROR, message.clone().into_bytes()),
+            Self::End => (END, Cow::Borrowed(&[])),
+            Self::TokenExpired => (TOKEN_EXPIRED, Cow::Borrowed(&[])),
+            Self::Error(message) => (ERROR, Cow::Borrowed(message.as_bytes())),
         }
     }
 

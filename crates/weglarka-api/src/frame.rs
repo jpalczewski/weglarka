@@ -5,6 +5,7 @@
 //! lines. Each endpoint defines its own frame enum and implements [`FrameKind`]; encoding and the
 //! chunk-tolerant decoding live here once.
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 /// Longest payload of one frame the decoder accepts; the daemon sends far smaller ones.
@@ -32,8 +33,9 @@ pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
 
 /// A frame enum of one stream: how it maps to and from `(kind, payload)`.
 pub trait FrameKind: Sized {
-    /// The kind byte and the payload of this frame.
-    fn parts(&self) -> (u8, Vec<u8>);
+    /// The kind byte and the payload of this frame; borrowed from the frame where it can be, so
+    /// encoding a log chunk copies it once, into the output buffer.
+    fn parts(&self) -> (u8, Cow<'_, [u8]>);
 
     /// The frame for a kind byte and payload, or [`FrameError`] for an unknown kind or a bad payload.
     fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError>;
@@ -90,12 +92,23 @@ mod tests {
 
     // Deliberately not `Default`: the decoder must not ask for it.
     impl FrameKind for Raw {
-        fn parts(&self) -> (u8, Vec<u8>) {
-            (self.0, self.1.clone())
+        fn parts(&self) -> (u8, Cow<'_, [u8]>) {
+            (self.0, Cow::Borrowed(&self.1))
         }
         fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError> {
             Ok(Self(kind, payload))
         }
+    }
+
+    #[test]
+    fn parts_borrow_the_payload_and_the_wire_bytes_are_unchanged() {
+        let frame = Raw(9, b"payload".to_vec());
+        assert!(matches!(frame.parts().1, Cow::Borrowed(_)));
+        let (kind, payload) = frame.parts();
+        assert_eq!(
+            encode_frame(kind, &payload),
+            [&[9, 0, 0, 0, 7][..], b"payload"].concat()
+        );
     }
 
     #[test]

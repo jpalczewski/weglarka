@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use std::borrow::Cow;
 
 /// `Content-Type` of a run response stream.
 pub const RUN_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.run-stream";
@@ -58,16 +59,22 @@ impl RunFrame {
         let (kind, payload) = self.parts();
         encode_frame(kind, &payload)
     }
+
+    /// The encoding of `Stdout`/`Stderr` carrying `data`, without building the frame (and so
+    /// without copying a chunk into a `Vec` first); byte-identical to `encode()` of the frame.
+    pub fn encode_output(stderr: bool, data: &[u8]) -> Vec<u8> {
+        encode_frame(if stderr { STDERR } else { STDOUT }, data)
+    }
 }
 
 impl FrameKind for RunFrame {
-    fn parts(&self) -> (u8, Vec<u8>) {
+    fn parts(&self) -> (u8, Cow<'_, [u8]>) {
         match self {
-            Self::Stdout(data) => (STDOUT, data.clone()),
-            Self::Stderr(data) => (STDERR, data.clone()),
-            Self::Exit(code) => (EXIT, code.to_be_bytes().to_vec()),
-            Self::TimedOut => (TIMED_OUT, Vec::new()),
-            Self::Error(message) => (ERROR, message.clone().into_bytes()),
+            Self::Stdout(data) => (STDOUT, Cow::Borrowed(data)),
+            Self::Stderr(data) => (STDERR, Cow::Borrowed(data)),
+            Self::Exit(code) => (EXIT, Cow::Owned(code.to_be_bytes().to_vec())),
+            Self::TimedOut => (TIMED_OUT, Cow::Borrowed(&[])),
+            Self::Error(message) => (ERROR, Cow::Borrowed(message.as_bytes())),
         }
     }
 
@@ -103,6 +110,20 @@ mod tests {
             RunFrame::TimedOut,
             RunFrame::Error("cannot start container".into()),
         ]
+    }
+
+    #[test]
+    fn encode_output_is_byte_identical_to_encoding_the_frame() {
+        let data = b"out \xff\n";
+        assert_eq!(
+            RunFrame::encode_output(false, data),
+            RunFrame::Stdout(data.to_vec()).encode()
+        );
+        assert_eq!(
+            RunFrame::encode_output(true, data),
+            RunFrame::Stderr(data.to_vec()).encode()
+        );
+        assert_eq!(RunFrame::encode_output(false, data)[..5], [1, 0, 0, 0, 6]);
     }
 
     #[test]

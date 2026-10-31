@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{FrameDecoder, FrameError, FrameKind, encode_frame};
+use std::borrow::Cow;
 
 /// `Content-Type` of a forward response stream.
 pub const FORWARD_STREAM_CONTENT_TYPE: &str = "application/vnd.weglarka.forward-stream";
@@ -54,13 +55,13 @@ impl ForwardFrame {
 }
 
 impl FrameKind for ForwardFrame {
-    fn parts(&self) -> (u8, Vec<u8>) {
+    fn parts(&self) -> (u8, Cow<'_, [u8]>) {
         match self {
-            Self::Ready { host_port } => (READY, host_port.to_be_bytes().to_vec()),
-            Self::Keepalive => (KEEPALIVE, Vec::new()),
-            Self::TimedOut => (TIMED_OUT, Vec::new()),
-            Self::TokenExpired => (TOKEN_EXPIRED, Vec::new()),
-            Self::Error(message) => (ERROR, message.clone().into_bytes()),
+            Self::Ready { host_port } => (READY, Cow::Owned(host_port.to_be_bytes().to_vec())),
+            Self::Keepalive => (KEEPALIVE, Cow::Borrowed(&[])),
+            Self::TimedOut => (TIMED_OUT, Cow::Borrowed(&[])),
+            Self::TokenExpired => (TOKEN_EXPIRED, Cow::Borrowed(&[])),
+            Self::Error(message) => (ERROR, Cow::Borrowed(message.as_bytes())),
         }
     }
 
