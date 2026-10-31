@@ -71,3 +71,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0062](0062-publish-main-image-from-ci.md) | Publish the main image from CI through a reusable release workflow |
 | [0063](0063-app-access-log-stream.md) | An app's access log as a filtered stream |
 | [0064](0064-consumer-watched-generated-config.md) | Generated config a consumer watches by itself |
+| [0065](0065-container-resource-usage-in-the-admin-api.md) | Container resource usage in the admin API |
