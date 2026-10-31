@@ -9,7 +9,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 
 | Guide | Covers |
 |---|---|
-| [First app](first-app.md) | Adding an app, secrets basics, mounted secret owner, private registries, switching over from Coolify |
+| [First app](first-app.md) | Adding an app, secrets basics, mounted secret owner, images that persist env into config, private registries, switching over from Coolify |
 | [Webhooks](webhooks.md) | GitHub and Forgejo webhooks for auto-update, redelivery deduplication |
 | [Verification and rollback](verify-and-rollback.md) | Checking a deployment, rolling an app back, downgrading Węglarka |
 

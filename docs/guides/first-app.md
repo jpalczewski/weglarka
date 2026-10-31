@@ -70,6 +70,23 @@ caller's permissions) and passes a ready descriptor, so it works with
 `sudo -u weglarka weglarka secrets set ntfy config < config.json` too. `--from-file path` is fine only for a file
 readable by the user running the CLI. The secret never ends up in arguments (`ps`, shell history).
 
+## Images that write env vars into their own config
+
+Some images turn environment variables into a config file on start. The rootless Forgejo image does: `FORGEJO__section__KEY`
+is written into `app.ini` inside the app's volume. A secret bound as `kind = "env"` then ends up **in plaintext in the
+volume** (and in every `weglarka volumes export` or backup) even though it never appears in the spec, and removing the
+variable from the spec later does not remove it from the file — edit the stale value out by hand.
+
+A file mount does not avoid this. Forgejo's `FORGEJO__SECTION__KEY__FILE=/path` reads the value from a file, but the value
+read is written into the ini file too (same behaviour reported for Gitea, go-gitea/gitea#19856): `kind = "mount"` combined
+with `…__FILE` changes where the value comes from, not where it ends up. If the application has a setting that stores only
+a *path* (Forgejo has `*_URI` keys for some secrets, e.g. `SECRET_KEY_URI = file:/path`; not checked for every key), use
+that and mount the secret at the path.
+
+`weglarka run <app> -- …` starts a container with the app's **whole** env, secrets included, so running such an
+env-to-config tool (or anything that dumps the config) inside it writes every bound secret into the file or output it
+produces.
+
 ## Private images (registry-auth)
 
 Credentials for a pull are an ordinary app secret with the reserved name `registry-auth`, in the format
