@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod platform;
 /// `PUT /v1/apps/{name}/image`: deploy an image archive built elsewhere (issue #109).
 pub mod push;
+pub mod resources;
 /// Host-side switcher of Węglarka's own image (issue #99, `docs/decisions/0027`).
 pub mod self_update;
 /// The service description shared by `platform install` and the switcher.
@@ -455,6 +456,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         triggers: trigger_tx,
         webhook_addr: OnceLock::new(),
         metrics: metrics::StatusCell::default(),
+        resources: resources::SnapshotCache::default(),
         tasks: Mutex::new(JoinSet::new()),
     });
 

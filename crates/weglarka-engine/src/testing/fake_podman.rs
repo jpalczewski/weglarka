@@ -136,6 +136,7 @@ struct State {
     /// Scripted `container_stats` ([`FakePodman::script_stats`]).
     stats_script: Option<Vec<ContainerStats>>,
     stats_error: Option<String>,
+    list_calls: usize,
     /// Scripted `storage_info` (`None` = [`DEFAULT_STORAGE`]) and its injected failure.
     storage: Option<StorageInfo>,
     storage_error: Option<String>,
@@ -431,6 +432,12 @@ impl FakePodman {
 
     pub fn calls(&self) -> Vec<Call> {
         self.lock().calls.clone()
+    }
+
+    /// How many times `container_list` was called (kept out of [`Call`] so existing call-log assertions
+    /// do not change).
+    pub fn container_list_calls(&self) -> usize {
+        self.lock().list_calls
     }
 
     pub fn containers(&self) -> Vec<ContainerInfo> {
@@ -848,7 +855,8 @@ impl PodmanClient for FakePodman {
     }
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
-        let s = self.lock();
+        let mut s = self.lock();
+        s.list_calls += 1;
         Ok(s.containers
             .values()
             .filter(|c| {

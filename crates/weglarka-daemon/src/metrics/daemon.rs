@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use weglarka_model::app::InstanceName;
 use weglarka_model::config::wildcard_cert_stem;
@@ -22,6 +22,7 @@ use weglarka_model::podman::PodmanClient;
 use super::encode::{Family, Kind, Sample};
 use crate::app::Daemon;
 use crate::certificates;
+use crate::resources::TtlCell;
 
 /// How long certificate expiry is reused: `collect` reads `apps.toml` and parses every chain in
 /// `tls/`, which a scrape every few seconds should not repeat. Expiry moves in days, renewals in hours.
@@ -137,22 +138,25 @@ impl EventCounters {
 #[derive(Debug, Default)]
 pub struct DaemonSource {
     pub counters: std::sync::Arc<EventCounters>,
-    certs: Mutex<Option<(Instant, Vec<Sample>)>>,
+    certs: TtlCell<Vec<Sample>>,
 }
 
 impl DaemonSource {
     pub fn new(counters: std::sync::Arc<EventCounters>) -> Self {
         Self {
             counters,
-            certs: Mutex::default(),
+            certs: TtlCell::default(),
         }
     }
 }
 
 /// Every family of this source.
-pub fn families<P: PodmanClient + 'static>(d: &Daemon<P>, source: &DaemonSource) -> Vec<Family> {
+pub async fn families<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    source: &DaemonSource,
+) -> Vec<Family> {
     let mut out = source.counters.families();
-    if let Some(family) = certificate_family(d, source) {
+    if let Some(family) = certificate_family(d, source).await {
         out.push(family);
     }
     out.extend(self_update_families(d));
@@ -160,28 +164,22 @@ pub fn families<P: PodmanClient + 'static>(d: &Daemon<P>, source: &DaemonSource)
 }
 
 /// `weglarka_certificate_not_after_seconds{domain}`; `None` without an enabled `[acme]`.
-fn certificate_family<P: PodmanClient + 'static>(
+async fn certificate_family<P: PodmanClient + 'static>(
     d: &Daemon<P>,
     source: &DaemonSource,
 ) -> Option<Family> {
     let config = d.host.acme.as_ref().filter(|c| c.enabled)?;
-    let mut cache = source.certs.lock().unwrap_or_else(|e| e.into_inner());
-    let fresh = cache
-        .as_ref()
-        .filter(|(at, _)| at.elapsed() < CERT_CACHE_TTL)
-        .map(|(_, samples)| samples.clone());
-    let samples = match fresh {
-        Some(samples) => samples,
-        None => {
-            // `apps.toml` unreadable: no family this time, and the next scrape tries again.
+    // `apps.toml` unreadable: no family this time (the miss is not cached), and the next scrape tries
+    // again.
+    let samples = source
+        .certs
+        .get_or_try_refresh(CERT_CACHE_TTL, async {
             let domains = certificates::routed_domains(d)?;
             let certs =
                 certificates::collect(&d.ingress.tls_dir(), config, &domains, SystemTime::now());
-            let samples = certificate_samples(&certs);
-            *cache = Some((Instant::now(), samples.clone()));
-            samples
-        }
-    };
+            Some(certificate_samples(&certs))
+        })
+        .await?;
     Some(Family {
         name: "weglarka_certificate_not_after_seconds",
         help: "Expiry (notAfter) of the certificate nginx serves for a routed domain, as a Unix \
