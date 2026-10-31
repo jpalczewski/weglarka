@@ -289,3 +289,113 @@ async fn forward_auth_policy_and_groups_become_access_rules() {
     assert_eq!(clients_file(&h), clients);
     h.running.stop().await;
 }
+
+fn base_config_check(report: &Value) -> Vec<&Value> {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"] == "identity.base_config")
+        .collect()
+}
+
+#[tokio::test]
+async fn doctor_warns_about_sections_a_base_config_would_lose() {
+    let builder = Builder::new();
+    let config_root = builder.root().join("config");
+    std::fs::create_dir_all(config_root.join("authelia")).unwrap();
+    let file = config_root.join("authelia/configuration.yml");
+    std::fs::write(&file, "server:\n  address: tcp://:9091\n").unwrap();
+    let h = builder
+        .top_level(&format!(
+            "config_root = {:?}\n",
+            config_root.display().to_string()
+        ))
+        .sections(IDENTITY)
+        .build()
+        .await;
+    let mut p = provider();
+    p["configs"] = json!([{
+        "source": "authelia/configuration.yml",
+        "target": "/config/configuration.yml"
+    }]);
+    add(&h, "authelia", p).await;
+    deployed(&h, "authelia").await;
+
+    // A clean base file adds no line.
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert!(base_config_check(&report).is_empty(), "{report}");
+
+    std::fs::write(
+        &file,
+        "access_control:\n  default_policy: one_factor\nidentity_providers:\n  oidc:\n    clients: []\n",
+    )
+    .unwrap();
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let found = base_config_check(&report);
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["status"], "warn");
+    let message = found[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("access_control") && message.contains("oidc.clients"),
+        "{message}"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn a_base_config_delivered_as_a_secret_cannot_be_verified() {
+    let h = Builder::new().sections(IDENTITY).build().await;
+    let mut p = provider();
+    p["secrets"] = json!([{
+        "secret": "base",
+        "kind": "mount",
+        "path": "/config/configuration.yml"
+    }]);
+    add(&h, "authelia", p).await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let found = base_config_check(&report);
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["status"], "info");
+    assert!(
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot verify")
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn the_base_config_scan_stays_inside_the_mount() {
+    let builder = Builder::new();
+    let config_root = builder.root().join("config");
+    std::fs::create_dir_all(config_root.join("authelia")).unwrap();
+    let outside = config_root.join("other.yml");
+    std::fs::write(&outside, "access_control:\n  default_policy: deny\n").unwrap();
+    std::fs::write(config_root.join("authelia/base.yml"), "server: {}\n").unwrap();
+    // A symlink inside the mount that points out of it.
+    std::os::unix::fs::symlink(&outside, config_root.join("authelia/escape.yml")).unwrap();
+    let h = builder
+        .top_level(&format!(
+            "config_root = {:?}\n",
+            config_root.display().to_string()
+        ))
+        .sections(IDENTITY)
+        .build()
+        .await;
+    let mut p = provider();
+    p["command"] = json!([
+        "authelia",
+        "--config=/config/../other.yml",
+        "--config=/config/escape.yml",
+        "--config=/config/base.yml",
+        "--config=/weglarka/generated/current"
+    ]);
+    // The mount is a directory, so `escape.yml` is a path inside it.
+    p["configs"] = json!([{ "source": "authelia", "target": "/config" }]);
+    add(&h, "authelia", p).await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert!(base_config_check(&report).is_empty(), "{report}");
+    h.running.stop().await;
+}

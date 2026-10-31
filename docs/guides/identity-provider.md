@@ -43,7 +43,8 @@ generated directory could re-open `access_control.default_policy`.
 
 Two sections of Authelia's configuration are generated as whole files in `/weglarka/generated/current`:
 `identity_providers.oidc.clients` (with `claims_policies`) and `access_control`. Delete both from your base
-configuration; a copy left there is silently replaced. The access control file always has `default_policy: deny`, a
+configuration; a copy left there is silently replaced. `weglarka doctor` (`identity.base_config`) warns when a base file delivered
+through `configs` still carries either section; a base file delivered as a secret cannot be inspected, and doctor says so. The access control file always has `default_policy: deny`, a
 constant `bypass` rule for the portal host and one rule per forward-auth app, so the provider can start before any app
 exists.
 

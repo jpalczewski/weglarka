@@ -841,3 +841,29 @@ fn device_flow_is_the_only_way_to_have_no_redirect_uris() {
     assert!(!oidc.device_flow);
     assert!(!toml::to_string(&oidc).unwrap().contains("device_flow"));
 }
+
+#[test]
+fn owned_sections_are_found_by_nesting() {
+    let yaml = "\
+# a comment\n\
+server:\n  address: tcp://:9091\n\
+access_control:\n  default_policy: one_factor\n\
+identity_providers:\n  oidc:\n    hmac_secret: x\n    clients:\n      - client_id: a\n";
+    assert_eq!(
+        owned_sections_in(yaml),
+        ["access_control", "identity_providers.oidc.clients"]
+    );
+}
+
+#[test]
+fn owned_sections_ignore_lookalikes() {
+    let yaml = "\
+# access_control:\n\
+notes:\n  access_control: not the section\n\
+identity_providers:\n  oidc:\n    hmac_secret: x\n    claims_policies: {}\n\
+other:\n  clients: []\n\
+- access_control:\n\
+text: \"access_control: inline\"\n";
+    assert!(owned_sections_in(yaml).is_empty());
+    assert!(owned_sections_in("").is_empty());
+}

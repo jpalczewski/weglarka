@@ -118,6 +118,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     acme(d, &mut checks);
     generated(d, &mut checks);
     identity_provider(d, &mut checks).await;
+    identity_base_config(d, &mut checks);
     oidc_credentials(d, &mut checks);
     identity_forward(d, &mut checks).await;
     admin_http(d, &mut checks).await;
@@ -2151,6 +2152,131 @@ async fn identity_provider<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorC
             ),
         },
     );
+}
+
+/// Largest base config file `identity.base_config` reads.
+const BASE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The file's text when it is a regular file of at most `cap` bytes (read bounded, whatever the
+/// metadata claimed), else `None`.
+fn read_capped(path: &std::path::Path, cap: u64) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(cap + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= cap).then_some(text)
+}
+
+/// `identity.base_config` (#242): sections of the provider's own base config that the generated config
+/// silently replaces (`access_control`, `identity_providers.oidc.clients`; ADR 0055). Scans only host
+/// files delivered through the provider's `configs` (never a secret's value); a base file delivered
+/// as a secret can only be flagged as unverifiable. Silent when nothing is wrong.
+fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    use weglarka_model::app::SecretTarget;
+    use weglarka_model::identity::{GENERATED_CONFIG, config_sources, owned_sections_in};
+    let Some(identity) = &d.host.identity else {
+        return;
+    };
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let Some(spec) = apps.apps.get(&identity.instance) else {
+        return; // `identity.provider` reports it
+    };
+    // An unresolvable mount is `configs.mounts`' business.
+    let Ok(mounts) = config_mounts::resolve_all(d.host.config_root.as_deref(), spec) else {
+        return;
+    };
+    let mut found = Vec::new();
+    let mut unverifiable = Vec::new();
+    for source in config_sources(&spec.command)
+        .into_iter()
+        .filter(|s| s != GENERATED_CONFIG)
+    {
+        // `source` comes from the provider's command: never follow a `..` out of the mount.
+        if source.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        // The mount whose target is `source` or a directory holding it.
+        let host = mounts.iter().find_map(|m| {
+            let rest = source.strip_prefix(m.target.as_str())?;
+            match rest {
+                "" => Some(m.source.clone()),
+                r if r.starts_with('/') => Some(m.source.join(r.trim_start_matches('/'))),
+                _ => None,
+            }
+        });
+        let Some(host) = host else {
+            let is_secret = spec
+                .secrets
+                .iter()
+                .any(|b| matches!(&b.target, SecretTarget::Mount { path, .. } if *path == source));
+            if is_secret {
+                unverifiable.push(source);
+            }
+            continue; // otherwise part of the image
+        };
+        let files = if host.is_dir() {
+            std::fs::read_dir(&host)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            matches!(p.extension().and_then(|e| e.to_str()), Some("yml" | "yaml"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![host]
+        };
+        for file in files {
+            // A symlink must not lead out of the mount either.
+            let (Ok(real), Some(mount)) = (
+                file.canonicalize(),
+                mounts.iter().find(|m| file.starts_with(&m.source)),
+            ) else {
+                continue;
+            };
+            if !real.starts_with(&mount.source) {
+                continue;
+            }
+            let Some(text) = read_capped(&real, BASE_CONFIG_MAX_BYTES) else {
+                continue;
+            };
+            for section in owned_sections_in(&text) {
+                let entry = format!("{section} in {}", detail(&source));
+                if !found.contains(&entry) {
+                    found.push(entry);
+                }
+            }
+        }
+    }
+    if !found.is_empty() {
+        out.push(check(
+            "identity.base_config",
+            CheckStatus::Warn,
+            format!(
+                "the base config sets sections that the generated config replaces: {}",
+                found.join(", ")
+            ),
+            Some("delete them from the base file (see docs/guides/identity-provider.md, \"What Węglarka owns\")"),
+        ));
+    }
+    if !unverifiable.is_empty() {
+        out.push(check(
+            "identity.base_config",
+            CheckStatus::Info,
+            format!(
+                "cannot verify {} (delivered as a secret): make sure it has no access_control or identity_providers.oidc.clients",
+                detail(unverifiable.join(", "))
+            ),
+            Some("see docs/guides/identity-provider.md"),
+        ));
+    }
 }
 
 /// `admin.http` (ADR 0056): the token listener runs, its clients exist, and the provider's signing keys
