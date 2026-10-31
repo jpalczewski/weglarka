@@ -28,6 +28,9 @@ paths:
   and `oidc.audience` lose their query (their path stays visible on purpose: public registration data, a credential there is unsupported). A new free-text field needs an explicit decision
   there, not a pass-through. `ShowAppResponse` carries `redacted: true` whenever this applies, and
   the CLI refuses to write such a spec back.
+- **Doctor free-form text (#272/#276):** `doctor::run` takes the caller's `Access`; a check interpolates any error text it
+  does not author itself (engine, Podman, I/O, the first-deploy reason) through `doctor::detail(..)`, and `apply_access`
+  keeps it for `Full` callers and replaces it with a marker for `Redacted` ones. A new check follows the same rule.
 - **A stream ends with its token:** streaming handlers stop at the verified principal's `exp` (`StreamDeadline`).
 - Contract changes (`app.rs`, `podman.rs`, `weglarka-api`) are additive only and always update `FakePodman`.
 

@@ -912,6 +912,9 @@ async fn remove_secret<P: PodmanClient + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn run_doctor<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
-    Ok(json(doctor::run(&d).await))
+async fn run_doctor<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    access: Access,
+) -> ApiResult<Response> {
+    Ok(json(doctor::run(&d, access).await))
 }
