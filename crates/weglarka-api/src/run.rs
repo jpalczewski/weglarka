@@ -28,6 +28,12 @@ pub struct RunRequest {
     /// Added to the app's `env` for this run only; wins over a key the app sets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Stored secrets for this run only, as `VARIABLE -> secret name`: the daemon reads each
+    /// secret of the app from its store and passes it to the one-off container as an environment
+    /// variable (a Podman secret, never a command line or the spec). Wins over `env` and over a
+    /// binding of the app on the same variable; the app's spec is not touched (issue #297).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     /// Kill the process after this many seconds (default and maximum: 24 hours).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u32>,

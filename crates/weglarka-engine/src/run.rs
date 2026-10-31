@@ -17,17 +17,20 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use crate::deploy::{app_container_base, instance_networks};
 use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use crate::secrets::materialize;
-use weglarka_model::app::InstanceName;
+use weglarka_model::app::{InstanceName, SecretBinding, SecretTarget};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerSpec, LogChunk, LogOptions, PodmanClient, PodmanError,
 };
+use weglarka_model::secret_store::{is_daemon_managed, valid_secret_name};
 use weglarka_model::state;
 
 /// How many one-off containers may run at once, across all apps.
 pub const MAX_CONCURRENT_RUNS: usize = 4;
 /// Longest a run may take when the request names no timeout (a day), and the longest it may ask for.
 pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most secrets one run may bind.
+pub const MAX_RUN_SECRETS: usize = 32;
 /// How long output still in flight is read after the process has exited.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// A run that is cancelled or timed out is killed outright: it is a throwaway process.
@@ -40,6 +43,9 @@ pub struct RunOptions {
     pub entrypoint: Option<Vec<String>>,
     /// Added to the app's `env`; a key set in both takes this value. Secrets stay bound by the spec.
     pub env: BTreeMap<String, String>,
+    /// `variable -> secret name`: stored secrets of the app exposed as env for this run only
+    /// (on top of the spec's own bindings; a binding on the same variable is replaced).
+    pub secrets: BTreeMap<String, String>,
     /// Kill the process after this long. `None` = [`MAX_RUN_TIMEOUT`].
     pub timeout: Option<Duration>,
 }
@@ -67,6 +73,27 @@ impl RunOptions {
         for (key, value) in &self.env {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
                 return invalid(format!("invalid environment variable {key:?}"));
+            }
+        }
+        if self.secrets.len() > MAX_RUN_SECRETS {
+            return invalid(format!("at most {MAX_RUN_SECRETS} secrets per run"));
+        }
+        for (var, secret) in &self.secrets {
+            if var.is_empty() || var.contains(['=', '\0']) {
+                return invalid(format!("invalid environment variable {var:?}"));
+            }
+            if !valid_secret_name(secret) {
+                return invalid(format!("invalid secret name {secret:?}"));
+            }
+            if is_daemon_managed(secret) {
+                return invalid(format!(
+                    "secret {secret:?} is managed by Węglarka and cannot be given to a run"
+                ));
+            }
+            if self.env.contains_key(var) {
+                return invalid(format!(
+                    "{var} is given both as a plain value and as a secret"
+                ));
             }
         }
         if self
@@ -167,7 +194,17 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         // A run must see the same injected OIDC env and secret as the serving container.
         self.ensure_oidc_credential(instance, &spec).await?;
-        let spec = self.effective(instance, &spec).into_owned();
+        let mut spec = self.effective(instance, &spec).into_owned();
+        // Run-only secrets: bindings on the in-memory copy, so they are materialized like the app's
+        // own and never reach the stored spec. One on the same variable replaces the app's.
+        for (var, secret) in &options.secrets {
+            spec.secrets
+                .retain(|b| !matches!(&b.target, SecretTarget::Env { var: v } if v == var));
+            spec.secrets.push(SecretBinding {
+                secret: secret.clone(),
+                target: SecretTarget::Env { var: var.clone() },
+            });
+        }
         let digest = state::load_state(&self.paths.state)?
             .apps
             .get(instance)

@@ -77,6 +77,17 @@ pub fn is_oidc_reserved(name: &str) -> bool {
     name == OIDC_CLIENT_SECRET || name == OIDC_CLIENT_DIGEST
 }
 
+/// Reserved app secret holding the HMAC key of the app's webhook (`<instance>.webhook-hmac`); the
+/// daemon verifies deliveries with it and it is never handed to a container.
+pub const WEBHOOK_HMAC_SECRET: &str = "webhook-hmac";
+
+/// Whether `name` (the `<name>` part) is a secret Węglarka manages for itself — registry
+/// credentials, the webhook key, the OIDC pair. None of them may be handed to a container that
+/// the spec does not already give it (for example by `run --secret`).
+pub fn is_daemon_managed(name: &str) -> bool {
+    name == REGISTRY_AUTH_SECRET || name == WEBHOOK_HMAC_SECRET || is_oidc_reserved(name)
+}
+
 /// Secret name in Podman and in the store: `<instance>.<name>` (a dot is not allowed in an
 /// instance name, so the composition is unambiguous).
 pub fn scoped_name(instance: &InstanceName, name: &str) -> String {

@@ -17,7 +17,7 @@ use crate::ingress::IngressManager;
 use crate::settings::Paths;
 
 /// Name of the app secret holding the webhook HMAC key (stored as `<instance>.webhook-hmac`).
-pub const WEBHOOK_SECRET: &str = "webhook-hmac";
+pub const WEBHOOK_SECRET: &str = weglarka_model::secret_store::WEBHOOK_HMAC_SECRET;
 
 /// How long a mutating operation waits for the engine mutex (a deploy holds it through the health gate).
 pub const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
