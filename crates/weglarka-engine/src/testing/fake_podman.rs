@@ -278,6 +278,7 @@ impl FakePodman {
                 restarts: 0,
                 started_at: Some(FAKE_STARTED_AT.to_owned()),
                 memory_limit: None,
+                oom_killed: false,
             },
         );
     }
@@ -314,6 +315,13 @@ impl FakePodman {
     pub fn set_restarts(&self, name: &str, restarts: u32) {
         if let Some(c) = self.lock().containers.get_mut(name) {
             c.restarts = restarts;
+        }
+    }
+
+    /// libpod's `State.OOMKilled` seen by `container_inspect`/`container_list`.
+    pub fn set_oom_killed(&self, name: &str, killed: bool) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.oom_killed = killed;
         }
     }
 
@@ -615,6 +623,7 @@ impl PodmanClient for FakePodman {
                 addresses: Vec::new(),
                 published_ports: spec.publish.clone(),
                 memory_limit: spec.resources.memory.map(|m| m.bytes()),
+                oom_killed: false,
             },
         );
         Ok(id)
@@ -722,7 +731,7 @@ impl PodmanClient for FakePodman {
                 .filter(|c| c.state == ContainerState::Running)
                 .map(|c| ContainerStats {
                     name: c.name.clone(),
-                    memory_usage: 0,
+                    ..Default::default()
                 })
                 .collect(),
         })

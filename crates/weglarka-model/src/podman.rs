@@ -331,16 +331,41 @@ pub struct ContainerInfo {
     /// Memory limit in bytes as libpod stored it (`HostConfig.Memory`); `None` for an unlimited container
     /// (libpod reports `0`).
     pub memory_limit: Option<u64>,
+    /// libpod recorded an out-of-memory kill when the container last exited (`State.OOMKilled`). libpod
+    /// sets it on exit and does not clear it on restart, so it reads "killed for memory at least once
+    /// since this container was created". There is no cumulative counter.
+    pub oom_killed: bool,
 }
 
 /// One running container's resource use as `PodmanClient::container_stats` reports it. Only the fields a
-/// consumer reads; later metrics add more.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// consumer reads. libpod fills a field it cannot read (a cgroup controller that is not delegated) with
+/// `0`, so a `0` here is "no data" wherever a running container cannot honestly report zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerStats {
     pub name: String,
     /// Working set in bytes (libpod `MemUsage`: `memory.current` minus inactive file cache). `0` means
     /// libpod had no data (typically no cgroup controller delegation), not an idle container.
     pub memory_usage: u64,
+    /// CPU time used since the container started, in nanoseconds (libpod `CPUNano`, cgroup
+    /// `usage_usec`); a counter that restarts with the container.
+    pub cpu_nanos: u64,
+    /// Processes and threads in the container's cgroup (libpod `PIDs`); `0` = no data (no `pids`
+    /// controller), since a running container has at least one.
+    pub pids: u64,
+    /// Bytes read from and written to block devices (libpod `BlockInput`/`BlockOutput`, from `io.stat`).
+    /// Both are `0` without the `io` controller, which libpod does not tell apart from no I/O yet.
+    pub block_read_bytes: u64,
+    pub block_write_bytes: u64,
+    /// Network bytes summed over the container's interfaces (libpod `Network`, loopback excluded);
+    /// `None` when libpod reports no interface (`--network none`, or no data).
+    pub network: Option<NetworkIo>,
+}
+
+/// Received and transmitted bytes of a container's network interfaces, summed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkIo {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 /// Repository from an image reference — without tag and digest but **with** the registry port:

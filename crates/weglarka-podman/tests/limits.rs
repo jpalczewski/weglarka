@@ -269,3 +269,46 @@ async fn stats_report_running_containers_with_usage_and_the_limit_comes_from_ins
         "a stopped container must not appear in stats: {stats:?}"
     );
 }
+
+/// The fields the resource metrics (#351) read, from Podman 6 itself. Block I/O depends on the `io`
+/// controller being delegated to the runner's user, a host property, so it is printed, not asserted.
+#[tokio::test]
+async fn stats_report_cpu_pids_network_and_block_io() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(&socket);
+    let name = format!("weglarka-it-stx-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+    };
+    pull(&client).await;
+    client.container_create(&spec(&name)).await.unwrap();
+    client.container_start(&name).await.unwrap();
+
+    let stats = client.container_stats().await.unwrap();
+    let entry = stats
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("{name} missing from {stats:?}"));
+    eprintln!("stats of a running pause container: {entry:?}");
+    assert!(
+        entry.cpu_nanos > 0,
+        "starting a process costs CPU: {entry:?}"
+    );
+    assert!(
+        entry.pids >= 1,
+        "a running container has a process: {entry:?}"
+    );
+    assert!(
+        entry.network.is_some(),
+        "the default network gives the container an interface: {entry:?}"
+    );
+    // Both 0 without the `io` controller (libpod sums an empty `io.stat`).
+    eprintln!(
+        "block I/O read={} write={}",
+        entry.block_read_bytes, entry.block_write_bytes
+    );
+
+    let info = client.container_inspect(&name).await.unwrap();
+    assert!(!info.oom_killed, "never killed: {info:?}");
+}

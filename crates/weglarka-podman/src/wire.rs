@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use weglarka_model::app::{Digest, Resources, SecretTarget};
 use weglarka_model::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, ContainerStats, EventKind,
-    HealthStatus, IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkSpec,
+    HealthStatus, IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkIo, NetworkSpec,
     NetworkSummary, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
     VolumeInfo, VolumeSpec, image_repo,
 };
@@ -521,6 +521,8 @@ struct InspectState {
     health: Option<InspectHealth>,
     /// RFC 3339; libpod reports the zero time (`0001-01-01T00:00:00Z`) for a container that never ran.
     started_at: String,
+    #[serde(rename = "OOMKilled")]
+    oom_killed: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -596,6 +598,7 @@ impl InspectContainer {
             addresses: addresses.into_iter().collect(),
             published_ports,
             memory_limit: (self.host_config.memory > 0).then_some(self.host_config.memory),
+            oom_killed: self.state.oom_killed,
         }
     }
 }
@@ -612,11 +615,27 @@ pub(crate) struct StatsReport {
     stats: Option<Vec<WireStats>>,
 }
 
+/// libpod `define.ContainerStats` (no JSON tags, so the Go field names). Only the used fields.
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "PascalCase")]
 struct WireStats {
     name: String,
     mem_usage: u64,
+    #[serde(rename = "CPUNano")]
+    cpu_nano: u64,
+    #[serde(rename = "PIDs")]
+    pids: u64,
+    block_input: u64,
+    block_output: u64,
+    /// Interface name → counters; `null` for a container without a network namespace.
+    network: Option<BTreeMap<String, WireNetworkStats>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct WireNetworkStats {
+    rx_bytes: u64,
+    tx_bytes: u64,
 }
 
 impl StatsReport {
@@ -632,6 +651,16 @@ impl StatsReport {
             .map(|s| ContainerStats {
                 name: s.name.trim_start_matches('/').to_owned(),
                 memory_usage: s.mem_usage,
+                cpu_nanos: s.cpu_nano,
+                pids: s.pids,
+                block_read_bytes: s.block_input,
+                block_write_bytes: s.block_output,
+                network: s.network.filter(|n| !n.is_empty()).map(|n| {
+                    n.values().fold(NetworkIo::default(), |sum, i| NetworkIo {
+                        rx_bytes: sum.rx_bytes.saturating_add(i.rx_bytes),
+                        tx_bytes: sum.tx_bytes.saturating_add(i.tx_bytes),
+                    })
+                }),
             })
             .collect())
     }
@@ -1143,14 +1172,57 @@ mod tests {
             vec![
                 ContainerStats {
                     name: "app-1".into(),
-                    memory_usage: 1_048_576
+                    memory_usage: 1_048_576,
+                    ..Default::default()
                 },
                 ContainerStats {
                     name: "b".into(),
-                    memory_usage: 0
+                    memory_usage: 0,
+                    ..Default::default()
                 },
             ]
         );
+    }
+
+    /// One entry as Podman 6 sends it (`define.ContainerStats`, Go field names, loopback already
+    /// excluded from `Network`).
+    #[test]
+    fn stats_report_reads_cpu_pids_block_io_and_summed_network() {
+        let stats = decode::<StatsReport>(
+            br#"{"Error":null,"Stats":[{"AvgCPU":0.1,"ContainerID":"c0ffee","Name":"web","CPU":0.2,"CPUNano":2500000000,"CPUSystemNano":100,"SystemNano":1761868800000000000,"MemUsage":4194304,"MemLimit":8589934592,"MemPerc":0.05,"Network":{"eth0":{"RxBytes":1000,"RxDropped":0,"RxErrors":0,"RxPackets":10,"TxBytes":200,"TxDropped":0,"TxErrors":0,"TxPackets":2},"eth1":{"RxBytes":24,"TxBytes":6}},"BlockInput":8192,"BlockOutput":4096,"PIDs":7,"UpTime":2500000000,"Duration":2500000000},{"Name":"isolated","MemUsage":1,"Network":null},{"Name":"empty","MemUsage":1,"Network":{}}]}"#,
+        )
+        .unwrap()
+        .into_domain()
+        .unwrap();
+        assert_eq!(
+            stats[0],
+            ContainerStats {
+                name: "web".into(),
+                memory_usage: 4_194_304,
+                cpu_nanos: 2_500_000_000,
+                pids: 7,
+                block_read_bytes: 8192,
+                block_write_bytes: 4096,
+                network: Some(NetworkIo {
+                    rx_bytes: 1024,
+                    tx_bytes: 206
+                }),
+            }
+        );
+        assert_eq!(stats[1].network, None, "`null`: no network namespace");
+        assert_eq!(stats[2].network, None, "no interface: no data");
+    }
+
+    #[test]
+    fn inspect_reads_oom_killed() {
+        let killed = decode::<InspectContainer>(br#"{"Id":"1","State":{"OOMKilled":true}}"#)
+            .unwrap()
+            .into_domain();
+        assert!(killed.oom_killed);
+        let absent = decode::<InspectContainer>(br#"{"Id":"1"}"#)
+            .unwrap()
+            .into_domain();
+        assert!(!absent.oom_killed);
     }
 
     #[test]
