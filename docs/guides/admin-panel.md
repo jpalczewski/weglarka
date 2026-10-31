@@ -130,7 +130,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | Scope (from the token's groups) | Pages |
 |---|---|
 | none | Signed in, but every page says "No access" and the session ends. |
-| `read` (viewers) | Dashboard, apps and app detail, `doctor`, volumes, networks, sites, notifications, certificates, recent events (with a live feed), and the allowlisted host config view. |
+| `read` (viewers) | Dashboard, apps and app detail, `doctor`, volumes, networks, sites, notifications, certificates, recent events (with a live feed), the allowlisted host config view, and the resource use of each app's containers. |
 | `admin` | Everything a viewer sees, plus live logs and the live access log on each app page. |
 
 - App detail is the daemon's *redacted* view for viewers: environment **values are never shown, only the keys** (and not
@@ -146,6 +146,13 @@ value (look in `podman logs` for the panel container). Empty values count as uns
   parses the filter itself and forwards only what it parsed (a filter it does not accept is answered `400` without
   repeating the input); every field of an entry (path, user agent and the rest come from clients) is cut, stripped of
   control and direction-changing characters and escaped. The page keeps the newest 1000 rows.
+- Resource use (memory, CPU, processes, network and block I/O of each container, the same numbers as
+  `weglarka stats`) is `read` scope, so viewers see it too. The app page's "Resources" section reloads a fragment every
+  10 seconds (htmx polling, no stream, so it costs no live-stream slot); the apps list shows memory and CPU per app.
+  A value the daemon does not know is `—`, never `0`; the memory bar appears only for a container that has its own
+  limit. During a blue/green switch the section has one row per container (`active`, `challenger`, `retiring`). When
+  Podman does not answer the section says "Resource data unavailable", and a failing stats call never breaks the apps
+  list or the rest of the app page.
 - Events are polled from the daemon every few seconds and pushed to the page as server-sent events; a reconnect resumes
   where it stopped. A session may hold at most four live streams.
 - The panel never decides access itself: a `403` from the daemon is the answer.

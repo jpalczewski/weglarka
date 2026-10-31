@@ -95,6 +95,9 @@ struct Script {
     logs: Vec<(Vec<LogFrame>, bool)>,
     /// The same for the access stream.
     access: Vec<(Vec<AccessFrame>, bool)>,
+    /// The containers of `web` in `/v1/apps/web/stats` and `/v1/stats`.
+    stats: Vec<Value>,
+    stats_available: bool,
 }
 
 impl Default for Script {
@@ -108,8 +111,37 @@ impl Default for Script {
                 vec![AccessFrame::Entry(entry("/index.html", "curl/8"))],
                 true,
             )],
+            stats: vec![container_stats("active")],
+            stats_available: true,
         }
     }
+}
+
+fn container_stats(role: &str) -> Value {
+    json!({
+        "role": role, "restarts": 2, "oom_killed": false,
+        "memory_bytes": 268_435_456_u64, "memory_limit_bytes": 536_870_912_u64,
+        "cpu_ratio": 0.123, "cpu_window_secs": 10.0, "cpu_seconds_total": 42.0,
+        "pids": 7, "block_read_bytes": 1024, "block_write_bytes": 2048,
+        "net_rx_bytes": 1_048_576, "net_tx_bytes": 5120,
+    })
+}
+
+/// A container that reports nothing (stopped): every number is `null`.
+fn empty_stats(role: &str) -> Value {
+    json!({ "role": role, "restarts": 0, "oom_killed": true, "memory_bytes": null,
+        "memory_limit_bytes": null, "cpu_ratio": null, "cpu_window_secs": null,
+        "cpu_seconds_total": null, "pids": null, "block_read_bytes": null,
+        "block_write_bytes": null, "net_rx_bytes": null, "net_tx_bytes": null })
+}
+
+fn app_stats_json(script: &Script) -> Value {
+    json!({
+        "app": "web",
+        "sampled_at": script.stats_available.then_some("2026-10-31T12:00:00Z"),
+        "available": script.stats_available,
+        "containers": if script.stats_available { script.stats.clone() } else { vec![] },
+    })
 }
 
 fn event(seq: u64, kind: &str) -> Value {
@@ -162,6 +194,11 @@ async fn fake_daemon(script: Script) -> Mock {
                 { "name": "web", "image": "ghcr.io/example/web:1", "domains": ["web.example.com"], "runtime": "running",
                   "digest": format!("sha256:{}", "a".repeat(64)) }]})),
             "/v1/apps/web" => json_reply(app_json(token)),
+            "/v1/apps/web/stats" => json_reply(app_stats_json(&script)),
+            "/v1/stats" => json_reply(json!({
+                "sampled_at": "2026-10-31T12:00:00Z", "available": script.stats_available,
+                "apps": [app_stats_json(&script)],
+            })),
             "/v1/apps/web/volumes" => json_reply(json!({"volumes": [
                 { "name": "data", "target": "/data", "podman_name": "web.data", "exists": true }]})),
             "/v1/volumes" => json_reply(json!({"volumes": [
@@ -560,7 +597,7 @@ async fn daemon_failures_map_to_pages_and_never_leak_bodies() {
     assert!(who.session.is_ended() && site1.state.sessions.is_empty());
 
     // 403 on an `admin` call: a polite page that keeps the navigation and the session.
-    let site1 = site(Script::default()).await;
+    let site1 = self::site(Script::default()).await;
     let who = login(&site1, "tok-read");
     let (status, headers, html) = get(&site1, Some(&who), "/apps/web/logs/stream").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1334,4 +1371,158 @@ async fn an_access_log_error_is_shown_sanitized_and_ends_the_stream() {
         text.contains("event: status") && text.contains("nginx &lt;log&gt; gone"),
         "{text}"
     );
+}
+
+// ---- resources ------------------------------------------------------------------------------
+
+async fn stats_fragment(script: Script, token: &str) -> (StatusCode, String) {
+    let site = site(script).await;
+    let who = login(&site, token);
+    let (status, headers, html) = get(&site, Some(&who), "/apps/web/stats").await;
+    assert_page_is_clean("/apps/web/stats", &headers, &html);
+    (status, html)
+}
+
+#[tokio::test]
+async fn the_resources_section_polls_a_fragment_and_is_shown_to_read_sessions() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (_, _, html) = get(&site, Some(&who), "/apps/web").await;
+    assert!(html.contains("Redacted view"));
+    assert!(html.contains("hx-get=\"/apps/web/stats\""), "{html}");
+    assert!(html.contains("hx-trigger=\"load, every 10s\""), "{html}");
+    // The page itself asks the daemon for no stats; the fragment does.
+    assert!(
+        !site
+            .daemon
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.path.ends_with("/stats"))
+    );
+    let (status, _, _) = get(&site, Some(&who), "/apps/web/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        site.daemon
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| bearer(s) == "tok-read")
+    );
+}
+
+#[tokio::test]
+async fn the_stats_fragment_formats_numbers_like_the_cli() {
+    let (status, html) = stats_fragment(Script::default(), "tok-read").await;
+    assert_eq!(status, StatusCode::OK);
+    insta::assert_snapshot!("stats_fragment_single", html);
+}
+
+#[tokio::test]
+async fn null_numbers_show_a_dash_and_no_limit_means_no_meter() {
+    let script = Script {
+        stats: vec![empty_stats("active")],
+        ..Script::default()
+    };
+    let (_, html) = stats_fragment(script, "tok-read").await;
+    assert!(!html.contains("<meter"), "{html}");
+    assert!(html.contains("(no limit)"));
+    assert!(
+        !html.contains("0 B"),
+        "a null must not look like zero: {html}"
+    );
+    insta::assert_snapshot!("stats_fragment_null", html);
+}
+
+#[tokio::test]
+async fn a_blue_green_switch_shows_two_rows() {
+    let script = Script {
+        stats: vec![container_stats("active"), container_stats("challenger")],
+        ..Script::default()
+    };
+    let (_, html) = stats_fragment(script, "tok-read").await;
+    insta::assert_snapshot!("stats_fragment_blue_green", html);
+}
+
+#[tokio::test]
+async fn unavailable_stats_are_said_so_and_an_empty_app_has_no_container() {
+    let (status, html) = stats_fragment(
+        Script {
+            stats_available: false,
+            ..Script::default()
+        },
+        "tok-read",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Resource data unavailable"), "{html}");
+    let (_, html) = stats_fragment(
+        Script {
+            stats: vec![],
+            ..Script::default()
+        },
+        "tok-read",
+    )
+    .await;
+    assert!(html.contains("No running container"), "{html}");
+}
+
+#[tokio::test]
+async fn the_stats_fragment_degrades_inside_itself_and_unknown_apps_get_the_problem_page() {
+    // A daemon 5xx keeps the page: a muted line, status 200, nothing from the body.
+    for (status, code) in [(500, "html"), (502, "internal")] {
+        let script = Script {
+            fail: vec![("/v1/apps/web/stats", status, code)],
+            ..Script::default()
+        };
+        let (st, html) = stats_fragment(script, "tok-read").await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(html.contains("could not be loaded"), "{html}");
+        assert!(
+            !html.contains("secret trace") && !html.contains("<table"),
+            "{html}"
+        );
+    }
+    let script = Script {
+        fail: vec![("/v1/apps/web/stats", 404, "not_found")],
+        ..Script::default()
+    };
+    let (st, html) = stats_fragment(script, "tok-read").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert!(html.contains("Not found"));
+    // A name that is not an app name is refused without a daemon call.
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (st, _, _) = get(&site, Some(&who), "/apps/Bad%20Name/stats").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert!(site.daemon.seen.lock().unwrap().is_empty());
+    // No session: refused before any handler.
+    let (st, _, _) = get(&site, None, "/apps/web/stats").await;
+    assert_ne!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_apps_list_shows_usage_and_survives_a_failing_stats_call() {
+    let site1 = self::site(Script::default()).await;
+    let who = login(&site1, "tok-read");
+    let (status, _, html) = get(&site1, Some(&who), "/apps").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("256.0 MiB") && html.contains("12.3%"),
+        "{html}"
+    );
+
+    let script = Script {
+        fail: vec![("/v1/stats", 500, "html")],
+        ..Script::default()
+    };
+    let site2 = self::site(script).await;
+    let who = login(&site2, "tok-read");
+    let (status, _, html) = get(&site2, Some(&who), "/apps").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("ghcr.io/example/web:1"));
+    assert!(html.contains("<td>—</td><td>—</td>"), "{html}");
+    assert!(!html.contains("secret trace"));
 }

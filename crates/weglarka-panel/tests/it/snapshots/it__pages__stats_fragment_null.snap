@@ -1,0 +1,14 @@
+---
+source: crates/weglarka-panel/tests/it/pages.rs
+expression: html
+---
+<div class="scroll">
+<table>
+  <caption class="sr">Resource use per container</caption>
+  <thead><tr><th scope="col">Role</th><th scope="col">Memory</th><th scope="col">CPU</th><th scope="col">PIDs</th><th scope="col">Net rx / tx</th><th scope="col">Block read / write</th><th scope="col">Restarts</th><th scope="col">OOM</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">active</th><td>— <span class="muted">(no limit)</span></td><td>—</td><td>—</td><td>— / —</td><td>— / —</td><td>0</td><td>yes</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="muted">Sampled 2026-10-31T12:00:00Z. Updates every 10 seconds.</p>

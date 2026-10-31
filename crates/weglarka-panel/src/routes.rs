@@ -12,13 +12,15 @@ use axum::response::Response;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use weglarka_api::endpoints::{
-    APPS_LIST, APPS_SHOW, CERTIFICATES, CONFIG, DOCTOR, EVENTS_RECENT, NOTIFICATIONS_STATUS,
-    SHARED_NETWORKS_LIST, SHARED_VOLUMES_LIST, SITES_LIST, STATUS, VOLUMES_LIST,
+    APPS_LIST, APPS_SHOW, APPS_STATS, CERTIFICATES, CONFIG, DOCTOR, EVENTS_RECENT,
+    NOTIFICATIONS_STATUS, SHARED_NETWORKS_LIST, SHARED_VOLUMES_LIST, SITES_LIST, STATS, STATUS,
+    VOLUMES_LIST,
 };
 use weglarka_api::{
-    CertificatesResponse, ConfigView, DoctorReport, EventsResponse, ListAppsResponse,
-    ListSharedNetworksResponse, ListSharedVolumesResponse, ListSitesResponse, ListVolumesResponse,
-    NotifyStatusResponse, RuntimeState, ShowAppResponse, StatusResponse,
+    AppStatsResponse, CertificatesResponse, ConfigView, DoctorReport, EventsResponse,
+    ListAppsResponse, ListSharedNetworksResponse, ListSharedVolumesResponse, ListSitesResponse,
+    ListVolumesResponse, NotifyStatusResponse, RuntimeState, ShowAppResponse, StatsResponse,
+    StatusResponse,
 };
 
 use crate::app::AppState;
@@ -27,7 +29,7 @@ use crate::daemon::{Call, DaemonError};
 use crate::pages::{
     AppPage, AppVolumeRow, AppsPage, CertificatesPage, ConfigPage, DashboardPage, DoctorPage,
     ErrorPage, EventsPage, NetworkRow, NetworksPage, NotificationsPage, ProblemPage,
-    SharedVolumeRow, Shell, SitesPage, VolumesPage, respond,
+    SharedVolumeRow, Shell, SitesPage, StatsFragment, VolumesPage, respond,
 };
 use crate::session::{Session, SessionView};
 use crate::views::{self, field, yes_no};
@@ -284,10 +286,23 @@ pub async fn apps(req: Req) -> Response {
         Ok(list) => list,
         Err(r) => return *r,
     };
+    // The usage columns are a courtesy: a failing stats call leaves them at `—`, not the page broken.
+    let call = Call::new(&STATS);
+    let usage = req
+        .state
+        .daemon
+        .send::<StatsResponse>(&req.view.token, &call)
+        .await
+        .map(|s| views::usage_by_app(&s))
+        .unwrap_or_default();
     respond(
         &AppsPage {
             shell: req.shell("apps"),
-            apps: list.apps.iter().map(views::app_row).collect(),
+            apps: list
+                .apps
+                .iter()
+                .map(|a| views::app_row(a, usage.get(a.name.as_str())))
+                .collect(),
         },
         StatusCode::OK,
     )
@@ -314,6 +329,33 @@ pub async fn app(req: Req, Path(name): Path<String>) -> Response {
         },
         StatusCode::OK,
     )
+}
+
+/// `GET /apps/{name}/stats`: the "Resources" fragment the app page polls every 10 s. An unknown app
+/// or a refused session is the usual page; any other daemon failure is a muted line inside the
+/// fragment (status 200), so one bad poll does not replace the page the user is reading.
+pub async fn app_stats(req: Req, Path(name): Path<String>) -> Response {
+    let name = match req.app_name(&name) {
+        Ok(name) => name,
+        Err(r) => return *r,
+    };
+    let call = Call::new(&APPS_STATS).param("name", name);
+    let stats = match req
+        .state
+        .daemon
+        .send::<AppStatsResponse>(&req.view.token, &call)
+        .await
+    {
+        Ok(stats) => Some(views::stats_view(&stats)),
+        Err(
+            e @ (DaemonError::Unauthorized
+            | DaemonError::Forbidden
+            | DaemonError::NotFound(_)
+            | DaemonError::InvalidRequest(_)),
+        ) => return req.problem(&e, APPS_STATS.scope),
+        Err(_) => None,
+    };
+    respond(&StatsFragment { stats }, StatusCode::OK)
 }
 
 pub async fn doctor(req: Req) -> Response {

@@ -4,11 +4,13 @@
 
 use serde::Serialize;
 use weglarka_api::{
-    AppSummary, CertStatus, CertificateRecord, CertificatesResponse, CheckStatus,
-    ConfigMountStatus, ConfigView, ContainerHealth, DoctorCheck, EventRecord, HostMountStatus,
-    NotifyStatusResponse, RuntimeState, ShowAppResponse, SiteSummary,
+    AppStatsResponse, AppSummary, CertStatus, CertificateRecord, CertificatesResponse, CheckStatus,
+    ConfigMountStatus, ConfigView, ContainerHealth, ContainerStatsView, DoctorCheck, EventRecord,
+    HostMountStatus, NotifyStatusResponse, RuntimeState, ShowAppResponse, SiteSummary,
+    StatsResponse, StatsRole,
 };
 use weglarka_model::events::Severity;
+use weglarka_model::units::human_bytes;
 
 /// A status label: `class` picks the style, `text` is always shown.
 #[derive(Debug, Clone)]
@@ -97,10 +99,14 @@ pub struct AppRow {
     pub runtime: Badge,
     pub digest: String,
     pub site: String,
+    pub memory: String,
+    pub cpu: String,
 }
 
-pub fn app_row(app: &AppSummary) -> AppRow {
+pub fn app_row(app: &AppSummary, usage: Option<&Usage>) -> AppRow {
     AppRow {
+        memory: usage.map_or_else(|| NONE.to_owned(), |u| u.memory.clone()),
+        cpu: usage.map_or_else(|| NONE.to_owned(), |u| u.cpu.clone()),
         name: app.name.to_string(),
         image: app.image.clone(),
         domains: app.domains.clone(),
@@ -781,4 +787,122 @@ pub fn config_sections(config: &ConfigView) -> Vec<ConfigSection> {
         });
     }
     sections
+}
+
+// ---- resource use ---------------------------------------------------------------------------
+
+/// A value the daemon does not know (the CLI prints the same character).
+pub const NONE: &str = "—";
+
+/// One container's resource use, preformatted like `weglarka stats`.
+#[derive(Debug)]
+pub struct StatsRow {
+    pub role: &'static str,
+    pub memory: String,
+    pub limit: String,
+    pub percent: String,
+    /// `value`/`max` of the `<meter>`; only when the container has a limit.
+    pub meter: Option<(u64, u64)>,
+    pub cpu: String,
+    pub pids: String,
+    pub net_rx: String,
+    pub net_tx: String,
+    pub block_read: String,
+    pub block_write: String,
+    pub restarts: u32,
+    pub oom_killed: bool,
+}
+
+/// The "Resources" fragment: rows, or the reason there are none.
+#[derive(Debug)]
+pub struct StatsView {
+    pub sampled_at: String,
+    pub available: bool,
+    pub rows: Vec<StatsRow>,
+}
+
+fn bytes(v: Option<u64>) -> String {
+    v.map_or_else(|| NONE.to_owned(), human_bytes)
+}
+
+fn cpu_percent(ratio: Option<f64>) -> String {
+    ratio.map_or_else(|| NONE.to_owned(), |r| format!("{:.1}%", r * 100.0))
+}
+
+/// Memory as a share of the container's own limit; unknown without both numbers or with a zero limit.
+fn percent_of_limit(used: Option<u64>, limit: Option<u64>) -> String {
+    match (used, limit) {
+        (Some(used), Some(limit)) if limit > 0 => {
+            format!("{:.1}%", used as f64 / limit as f64 * 100.0)
+        }
+        _ => NONE.to_owned(),
+    }
+}
+
+fn stats_role(role: StatsRole) -> &'static str {
+    match role {
+        StatsRole::Active => "active",
+        StatsRole::Challenger => "challenger",
+        StatsRole::Retiring => "retiring",
+    }
+}
+
+fn stats_row(c: &ContainerStatsView) -> StatsRow {
+    StatsRow {
+        role: stats_role(c.role),
+        memory: bytes(c.memory_bytes),
+        limit: bytes(c.memory_limit_bytes),
+        percent: percent_of_limit(c.memory_bytes, c.memory_limit_bytes),
+        meter: match (c.memory_bytes, c.memory_limit_bytes) {
+            (Some(used), Some(limit)) if limit > 0 => Some((used.min(limit), limit)),
+            _ => None,
+        },
+        cpu: cpu_percent(c.cpu_ratio),
+        pids: c.pids.map_or_else(|| NONE.to_owned(), |p| p.to_string()),
+        net_rx: bytes(c.net_rx_bytes),
+        net_tx: bytes(c.net_tx_bytes),
+        block_read: bytes(c.block_read_bytes),
+        block_write: bytes(c.block_write_bytes),
+        restarts: c.restarts,
+        oom_killed: c.oom_killed,
+    }
+}
+
+pub fn stats_view(resp: &AppStatsResponse) -> StatsView {
+    StatsView {
+        sampled_at: resp.sampled_at.clone().unwrap_or_default(),
+        available: resp.available,
+        rows: resp.containers.iter().map(stats_row).collect(),
+    }
+}
+
+/// An app's memory and CPU for the apps list: the sum over its containers (two during a
+/// blue/green switch); a column is `—` when no container reports it.
+#[derive(Debug, Clone)]
+pub struct Usage {
+    pub memory: String,
+    pub cpu: String,
+}
+
+pub fn usage_by_app(resp: &StatsResponse) -> std::collections::HashMap<String, Usage> {
+    fn sum<T: Copy + std::iter::Sum<T>>(
+        rows: &[ContainerStatsView],
+        f: impl Fn(&ContainerStatsView) -> Option<T>,
+    ) -> Option<T> {
+        let mut seen = rows.iter().filter_map(f).peekable();
+        seen.peek()?;
+        Some(seen.sum())
+    }
+    resp.apps
+        .iter()
+        .map(|a| {
+            (
+                a.app.clone(),
+                Usage {
+                    memory: bytes(sum(&a.containers, |c| c.memory_bytes)),
+                    cpu: cpu_percent(sum(&a.containers, |c| c.cpu_ratio)),
+                },
+            )
+        })
+        .collect()
 }

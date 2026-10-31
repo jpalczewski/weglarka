@@ -1,0 +1,14 @@
+---
+source: crates/weglarka-panel/tests/it/pages.rs
+expression: html
+---
+<div class="scroll">
+<table>
+  <caption class="sr">Resource use per container</caption>
+  <thead><tr><th scope="col">Role</th><th scope="col">Memory</th><th scope="col">CPU</th><th scope="col">PIDs</th><th scope="col">Net rx / tx</th><th scope="col">Block read / write</th><th scope="col">Restarts</th><th scope="col">OOM</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">active</th><td>256.0 MiB of 512.0 MiB (50.0%) <meter value="268435456" min="0" max="536870912">50.0%</meter></td><td>12.3%</td><td>7</td><td>1.0 MiB / 5.0 KiB</td><td>1.0 KiB / 2.0 KiB</td><td>2</td><td>no</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="muted">Sampled 2026-10-31T12:00:00Z. Updates every 10 seconds.</p>
