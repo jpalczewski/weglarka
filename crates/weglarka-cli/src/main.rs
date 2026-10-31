@@ -1,5 +1,6 @@
 //! The `weglarka` CLI. A thin admin API client; `doctor --preflight` runs locally, no daemon needed.
 
+mod access;
 mod cli;
 mod client;
 mod commands;

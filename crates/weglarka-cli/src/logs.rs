@@ -27,17 +27,17 @@ const DEFAULT_TAIL: u32 = 100;
 /// A line longer than this is written in parts, so memory stays bounded.
 const MAX_LINE: usize = 64 * 1024;
 /// Reopens in a row, with no output in between, after which a stream is given up.
-const MAX_QUIET_REOPENS: u32 = 5;
+pub(crate) const MAX_QUIET_REOPENS: u32 = 5;
 /// A reopen starts this much before the last output, so a line that was in flight when the
 /// connection ended is not lost (at the price of a repeat).
-const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
+pub(crate) const REOPEN_OVERLAP: Duration = Duration::from_secs(2);
 /// A connection that stayed open at least this long was not a tight loop, however quiet: it does
 /// not count towards [`MAX_QUIET_REOPENS`] (an idle app followed for hours expires many tokens).
-const STABLE_FOR: Duration = Duration::from_secs(60);
+pub(crate) const STABLE_FOR: Duration = Duration::from_secs(60);
 
 /// The count of quick reopens after one more, given how long the connection being replaced lived;
 /// `None` when the stream expires in a tight loop and should be given up.
-fn count_reopen(quick_reopens: u32, lived: Duration) -> Option<u32> {
+pub(crate) fn count_reopen(quick_reopens: u32, lived: Duration) -> Option<u32> {
     let before = if lived >= STABLE_FOR {
         0
     } else {
@@ -147,7 +147,7 @@ impl LogsArgs {
     }
 }
 
-fn since_epoch(t: Option<SystemTime>) -> Duration {
+pub(crate) fn since_epoch(t: Option<SystemTime>) -> Duration {
     t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .unwrap_or_default()
 }

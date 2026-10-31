@@ -13,8 +13,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use weglarka_api::{
-    ApiError, Endpoint, FrameDecoder, FrameKind, LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery,
-    Method, RUN_STREAM_CONTENT_TYPE, RunFrame, RunRequest, endpoints,
+    ACCESS_STREAM_CONTENT_TYPE, AccessFrame, AccessQuery, ApiError, Endpoint, FrameDecoder,
+    FrameKind, LOGS_STREAM_CONTENT_TYPE, LogFrame, LogsQuery, Method, RUN_STREAM_CONTENT_TYPE,
+    RunFrame, RunRequest, endpoints,
 };
 use weglarka_unix_http::{StreamingResponse, UnixClient};
 
@@ -42,6 +43,7 @@ pub struct FrameStream<F> {
 
 pub type RunStream = FrameStream<RunFrame>;
 pub type LogStream = FrameStream<LogFrame>;
+pub type AccessStream = FrameStream<AccessFrame>;
 
 impl<F: FrameKind> FrameStream<F> {
     fn new(response: StreamingResponse<Full<Bytes>>, what: &'static str) -> Self {
@@ -434,6 +436,28 @@ impl ApiClient {
             .open_stream(req, LOGS_STREAM_CONTENT_TYPE, "logs")
             .await?;
         Ok(FrameStream::new(response, "logs"))
+    }
+
+    /// `GET /v1/apps/{name}/access`: opens the response stream of an app's access log. Like
+    /// [`Self::open_logs`]: no overall timeout, and an error before the stream is an ordinary API error.
+    pub async fn open_access(
+        &self,
+        name: &str,
+        query: &AccessQuery,
+    ) -> Result<AccessStream, CliError> {
+        let req = Request::builder()
+            .method(method_str(endpoints::APPS_ACCESS.method))
+            .uri(request_path(
+                endpoints::APPS_ACCESS,
+                &[("name", name)],
+                &query.to_query_string(),
+            ))
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let response = self
+            .open_stream(req, ACCESS_STREAM_CONTENT_TYPE, "access")
+            .await?;
+        Ok(FrameStream::new(response, "access"))
     }
 
     /// Sends `req` and returns the response head with the body still unread.
