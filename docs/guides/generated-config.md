@@ -25,7 +25,7 @@ Whenever `apps.toml` changes (and once when the daemon starts), after a 2 second
 2. The new version is written next to the live one.
 3. The app's validator runs in a one-off container of the app against the new version (skipped when the app was never deployed). If it rejects the files, the live version stays and you get a `GeneratedConfigInvalid` notification with the end of its output (secret values masked).
 4. `current` is switched to the new version in one step.
-5. A **running** app is reloaded — with its `reload_signal`, otherwise restarted — and must pass its health gate. A stopped or never-deployed app simply reads the files on its next start.
+5. A **running** app is reloaded — with its `reload_signal`, otherwise restarted — and must pass its health gate. A stopped or never-deployed app simply reads the files on its next start. An app that re-reads its files by itself (the Prometheus scraper's [scrape targets](metrics.md)) is neither signalled nor restarted, and has no health gate to fail, so step 6 does not apply to it ([ADR 0064](../decisions/0064-consumer-watched-generated-config.md)).
 6. If the health gate fails, `current` goes back to the previous version once, the app is reloaded again and you get `GeneratedConfigRolledBack`. There is no retry loop: the same rejected render is not tried again until the render changes.
 
 The first launch of an app whose generator has not run yet writes its files **before** the container is created (the identity provider will not start without its access rules). That version cannot be validated; the app's own start is the validation, and a bad render shows up as a failed deploy with the app's logs.

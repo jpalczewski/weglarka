@@ -1,6 +1,6 @@
 # 0055 — Generated config pipeline
 
-Status: accepted (2026-10-28, issue #212). Builds on ADR 0028 (host config mounts) and ADR 0051 (identity provider integration).
+Status: accepted (2026-10-28, issue #212). Builds on ADR 0028 (host config mounts) and ADR 0051 (identity provider integration). Amended by ADR 0064 (a consumer that re-reads its files is not reloaded).
 
 ## Problem
 

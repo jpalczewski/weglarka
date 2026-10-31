@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod encode;
 pub mod host;
 pub mod resources;
+pub mod targets;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

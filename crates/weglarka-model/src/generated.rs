@@ -106,6 +106,19 @@ pub struct RenderInput<'a> {
     pub digests: &'a BTreeMap<InstanceName, Pbkdf2Digest>,
 }
 
+/// How a consumer learns that `current` points at a new version (ADR 0064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApplyMode {
+    /// A running consumer is reloaded (its `reload_signal`, otherwise a restart) and must pass its
+    /// health gate; a failed gate swaps `current` back (ADR 0055).
+    #[default]
+    Reload,
+    /// The consumer re-reads the files by itself (Prometheus `file_sd`): nothing is signalled or
+    /// restarted, there is no health gate to fail and therefore no rollback. Validation is the only
+    /// guard, so a generator that returns this must have a real validator.
+    ConsumerWatches,
+}
+
 /// Renders the files of one consumer. Synchronous and `dyn`-safe, like `SecretStore`.
 pub trait ConfigGenerator: Send + Sync {
     /// Stable id used in events, `doctor` and the state file, e.g. `"identity"`.
@@ -122,6 +135,12 @@ pub trait ConfigGenerator: Send + Sync {
     /// engine runs it in a one-off container of the consumer with `argv[0]` as the entrypoint.
     /// `None` = nothing to run.
     fn validate_argv(&self, consumer: &AppSpec, dir: &str) -> Option<Vec<String>>;
+
+    /// How the consumer picks up a new version; [`ApplyMode::Reload`] unless the consumer watches
+    /// its files itself.
+    fn apply_mode(&self) -> ApplyMode {
+        ApplyMode::Reload
+    }
 }
 
 /// sha256 over the files, hex. Equal fingerprints mean byte-identical output.

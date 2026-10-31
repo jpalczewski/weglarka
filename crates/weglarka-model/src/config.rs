@@ -120,8 +120,9 @@ pub struct MetricsConfig {
     pub network: String,
     /// The managed app that scrapes (issue #365): its container is kept on [`Self::network`] and on
     /// every per-app `metrics-<app>` network, with live connects, so opting an app in never restarts
-    /// it. Host config, like `[admin.http] clients`, so no app can grant itself the role. `None` =
-    /// nothing joins automatically.
+    /// it. It also gets the generated `file_sd` targets (issue #366). Host config, like
+    /// `[admin.http] clients`, so no app can grant itself the role. `None` = nothing joins
+    /// automatically and no targets are generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scraper: Option<InstanceName>,
 }

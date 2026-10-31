@@ -17,7 +17,9 @@ paths:
 
 - **Generated configs (ADR 0055):** `apply_generated` renders → versions in `v-<fp12>/` →
   validates in a one-off container → swaps the `current` symlink → reload + health gate → rollback. The generator
-  registry is `daemon/src/generated.rs::registered`; it registers the Authelia generator when `[identity]` is present.
+  registry is `daemon/src/generated.rs::registered`; it registers the Authelia generator when `[identity]` is present and the Prometheus targets
+  generator when `[metrics] scraper` is set. A generator whose consumer re-reads its files returns
+  `ApplyMode::ConsumerWatches` and is never reloaded or rolled back (ADR 0064).
 - **`effective_spec`** (`crates/weglarka-model/src/identity.rs`) is the only overlay of injected env/secrets/`depends_on`
   (hash, materialize, container, `weglarka run`).
 - Identity config renderers are pure, deterministic and snapshot-tested; the access-control file always has

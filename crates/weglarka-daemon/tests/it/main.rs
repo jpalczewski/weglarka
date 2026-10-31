@@ -23,6 +23,7 @@ mod memory;
 mod metrics;
 mod notify;
 mod oidc_credentials;
+mod promtool;
 mod push;
 mod run;
 mod secrets;

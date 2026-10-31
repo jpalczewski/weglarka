@@ -1,0 +1,10 @@
+---
+source: crates/weglarka-daemon/src/metrics/targets.rs
+expression: "String::from_utf8(check.bytes().to_vec()).unwrap()"
+---
+# Only for `promtool check config`; Prometheus does not read this file.
+scrape_configs:
+  - job_name: "weglarka-check"
+    file_sd_configs:
+      - files:
+          - "targets.yml"

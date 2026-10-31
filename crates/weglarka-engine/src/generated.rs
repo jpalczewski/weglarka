@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::events::Event;
 use weglarka_model::generated::{
-    CURRENT_LINK, ConfigGenerator, Fingerprint, GeneratedFile, RenderInput, VERSION_PREFIX,
+    ApplyMode, CURRENT_LINK, ConfigGenerator, Fingerprint, GeneratedFile, RenderInput,
+    VERSION_PREFIX,
 };
 use weglarka_model::generated_state::{self, GeneratedState, GeneratorRecord, LastResult, tail};
 use weglarka_model::labels;
@@ -71,7 +72,8 @@ pub enum GeneratedOutcome {
         fingerprint: Fingerprint,
         /// The validator ran and passed (`false` for a consumer with no deployed digest or no validator).
         validated: bool,
-        /// The consumer was running and was told to reload; `false` = it picks the files up on start.
+        /// The consumer was running and was told to reload; `false` = it picks the files up on start,
+        /// or by itself ([`ApplyMode::ConsumerWatches`]).
         reloaded: bool,
     },
     /// The validator rejected the render; the live version is unchanged.
@@ -197,8 +199,12 @@ impl<P: PodmanClient> Reconciler<P> {
                 .map_err(|e| fail(format!("cannot switch {CURRENT_LINK}: {e}")))?;
         }
 
-        // 5. Apply.
-        let (reloaded, health) = self.apply_to_consumer(guard, &consumer, &spec).await?;
+        // 5. Apply. A consumer that watches its files (ADR 0064) has already seen the swap: telling
+        // it again would restart it on every `apps.toml` change, and there is no gate to fail.
+        let (reloaded, health) = match generator.apply_mode() {
+            ApplyMode::Reload => self.apply_to_consumer(guard, &consumer, &spec).await?,
+            ApplyMode::ConsumerWatches => (false, Ok(())),
+        };
         match health {
             Ok(()) => {
                 self.record_generated(&mut gstate, id, |r| {
@@ -273,10 +279,19 @@ impl<P: PodmanClient> Reconciler<P> {
         version: &str,
     ) -> Result<Option<Result<(), String>>, EngineError> {
         let dir = format!("{MOUNT_TARGET}/{version}");
-        let Some(argv) = generator.validate_argv(spec, &dir) else {
-            return Ok(None);
-        };
+        let argv = generator.validate_argv(spec, &dir).unwrap_or_default();
         let Some((program, args)) = argv.split_first() else {
+            // Validation is the only guard of a consumer that is never reloaded (no health gate, no
+            // rollback, ADR 0064): such a generator without a validator is a bug, not a render to swap in.
+            if generator.apply_mode() == ApplyMode::ConsumerWatches {
+                return Err(EngineError::Generated {
+                    consumer: consumer.clone(),
+                    message: format!(
+                        "generator {} does not reload its consumer and has no validator",
+                        generator.id()
+                    ),
+                });
+            }
             return Ok(None);
         };
         let deployed = state::load_state(&self.paths.state)?
