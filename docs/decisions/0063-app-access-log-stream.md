@@ -1,4 +1,4 @@
-# 0062 — An app's access log as a filtered stream
+# 0063 — An app's access log as a filtered stream
 
 Status: proposed (2026-10-31, issue #52). Builds on ADR 0057 (the framed log stream, `admin` scope, streams that end
 with their token) and ADR 0056 (token listener).

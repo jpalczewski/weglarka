@@ -1,4 +1,4 @@
-//! `GET /v1/apps/{name}/access` (`admin` scope, docs/decisions/0062): the requests that reached an app
+//! `GET /v1/apps/{name}/access` (`admin` scope, docs/decisions/0063): the requests that reached an app
 //! through its domains, as a stream of [`AccessFrame`]s.
 //!
 //! nginx writes one JSON line per request to its stdout, in **one log shared by all apps**. The daemon

@@ -1,5 +1,5 @@
 //! `GET /v1/apps/{name}/access`: an app's access log as a framed stream (query:
-//! [`AccessQuery`](crate::AccessQuery), docs/decisions/0062).
+//! [`AccessQuery`](crate::AccessQuery), docs/decisions/0063).
 //!
 //! The daemon reads the ingress nginx's JSON log, keeps the lines of one app and sends each as an
 //! [`AccessEntry`]. The entry has no `app` field (the client named it and the daemon checked it) and

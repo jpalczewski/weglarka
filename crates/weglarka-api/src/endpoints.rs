@@ -171,7 +171,7 @@ pub const APPS_LOGS: Endpoint = Endpoint {
 };
 /// `GET` → a stream of [`AccessFrame`](crate::AccessFrame)s: the requests that reached the app through its
 /// domains (query: [`AccessQuery`](crate::AccessQuery)). `admin`: addresses and paths can be sensitive and
-/// cannot be redacted ([`Body::Credential`], docs/decisions/0062). The daemon filters the shared nginx log.
+/// cannot be redacted ([`Body::Credential`], docs/decisions/0063). The daemon filters the shared nginx log.
 pub const APPS_ACCESS: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/apps/{name}/access",

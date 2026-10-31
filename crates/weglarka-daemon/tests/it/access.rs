@@ -1,4 +1,4 @@
-//! `GET /v1/apps/{name}/access` (docs/decisions/0062) over the real admin sockets on `FakePodman`:
+//! `GET /v1/apps/{name}/access` (docs/decisions/0063) over the real admin sockets on `FakePodman`:
 //! the boundary between apps, the `admin` scope, errors before the stream starts, the two-phase read
 //! and where a stream ends. The fake ignores `since` and answers every read with the same script, so
 //! with `follow` every entry shows up twice (history, then the live read) — asserted below on purpose.

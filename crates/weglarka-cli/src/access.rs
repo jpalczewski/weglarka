@@ -1,5 +1,5 @@
 //! `weglarka access <app>`: the requests that reached an app through its domains
-//! (`GET /v1/apps/{name}/access`, docs/decisions/0062), the second view next to `weglarka logs`.
+//! (`GET /v1/apps/{name}/access`, docs/decisions/0063), the second view next to `weglarka logs`.
 //!
 //! The daemon filters the ingress log down to one app; this side only prints. A request's path, host
 //! and user agent are chosen by whoever made the request, so on a terminal they go through the same
