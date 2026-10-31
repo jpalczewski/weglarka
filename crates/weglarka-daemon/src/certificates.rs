@@ -1,7 +1,7 @@
 //! `GET /v1/certificates` (`read` scope): expiry of every certificate the ACME worker looks after.
 //!
 //! [`collect`] is the single reader of `tls/`: the endpoint renders its rows and `doctor`'s `acme.*`
-//! checks judge the same rows, so the two cannot disagree. Only `notAfter` is read from a chain —
+//! checks judge the same rows (`doctor` scans once per run and shares them), so the two cannot disagree. Only `notAfter` is read from a chain —
 //! key files, the account key and the DNS token file are never opened here.
 
 use std::path::Path;
@@ -98,6 +98,20 @@ pub(crate) fn collect(
     collect_with(tls, config, domains, now, &crate::acme::real_not_after)
 }
 
+/// [`collect`] on the blocking pool: it reads and x509-parses every chain under `tls/`, which must
+/// not hold an async worker for the whole scan. `None` when the scan task failed.
+pub(crate) async fn collect_blocking(
+    tls: std::path::PathBuf,
+    config: AcmeConfig,
+    domains: Vec<String>,
+    now: SystemTime,
+) -> Option<Vec<Cert>> {
+    tokio::task::spawn_blocking(move || collect(&tls, &config, &domains, now))
+        .await
+        .map_err(|e| tracing::error!(error = %e, "certificate scan failed"))
+        .ok()
+}
+
 /// [`collect`] with the reader of a chain's `notAfter` injected.
 fn collect_with(
     tls: &Path,
@@ -152,7 +166,10 @@ async fn list<P: PodmanClient + 'static>(State(d): Shared<P>) -> Result<Response
     let domains = routed_domains(&d).ok_or_else(|| Fail::internal("apps.toml cannot be read"))?;
     let now = SystemTime::now();
     let window = window(config);
-    let certificates: Vec<CertificateRecord> = collect(&d.ingress.tls_dir(), config, &domains, now)
+    let scanned = collect_blocking(d.ingress.tls_dir(), config.clone(), domains, now)
+        .await
+        .ok_or_else(|| Fail::internal("the certificate scan failed"))?;
+    let certificates: Vec<CertificateRecord> = scanned
         .into_iter()
         .map(|cert| CertificateRecord {
             status: cert.status(now, window),
