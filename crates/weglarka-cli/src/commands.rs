@@ -15,6 +15,7 @@ use weglarka_api::{
 use weglarka_model::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
 };
+use weglarka_model::secret_store::valid_secret_name;
 use weglarka_model::units::human_bytes;
 
 use crate::cli::{
@@ -89,13 +90,10 @@ pub(crate) fn instance(name: &str) -> Result<InstanceName, CliError> {
     })
 }
 
-/// The secret name ends up in a URL path, so we restrict the alphabet (no percent-encoding).
+/// The secret name ends up in a URL path, so we restrict the alphabet (no percent-encoding). The
+/// rule itself is the model's, so the CLI and the daemon cannot drift apart.
 pub(crate) fn secret_name(name: &str) -> Result<&str, CliError> {
-    let ok = (1..=64).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if ok {
+    if valid_secret_name(name) {
         Ok(name)
     } else {
         Err(CliError::usage(format!("invalid secret name {name:?}"))

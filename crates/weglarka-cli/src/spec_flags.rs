@@ -377,7 +377,7 @@ fn parse_config(s: &str) -> Result<ConfigFlag, String> {
              segments"
         ));
     }
-    if !target.starts_with('/') {
+    if !valid_mount_target(target) {
         return Err(format!(
             "config target must be an absolute path in the container, got {target:?}"
         ));
@@ -520,7 +520,7 @@ fn parse_volume(s: &str) -> Result<VolumeMount, String> {
             "invalid volume name {name:?}: [a-z0-9-], 1–63 characters"
         ));
     }
-    if !target.starts_with('/') {
+    if !valid_mount_target(target) {
         return Err(format!("volume path must be absolute, got {target:?}"));
     }
     Ok(VolumeMount {
@@ -551,7 +551,7 @@ fn parse_shared_network(s: &str) -> Result<SharedNetworkFlag, String> {
 fn parse_shared_volume(s: &str) -> Result<SharedVolumeRef, String> {
     let (name, target, read_only) = split_mount(s)?;
     let name = SharedVolumeName::new(name).map_err(|e| e.to_string())?;
-    if !target.starts_with('/') {
+    if !valid_mount_target(target) {
         return Err(format!(
             "shared volume path must be absolute, got {target:?}"
         ));
@@ -662,6 +662,17 @@ mod tests {
         assert!(parse_volume("Data=/data").is_err());
         assert!(parse_volume("data=relative").is_err());
         assert!(parse_volume("/data").is_err());
+        // Absolute is not enough: the daemon's `valid_mount_target` also rejects these.
+        for bad in ["/", "/a/../b", "/a/./b", "/a,b", "/a:b"] {
+            assert!(!valid_mount_target(bad), "{bad:?}");
+            assert!(parse_volume(&format!("data={bad}")).is_err(), "{bad:?}");
+            assert!(
+                parse_shared_volume(&format!("kajet-data={bad}")).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(parse_config("app/config.yml:/a/../b").is_err());
+        assert!(parse_config("app/config.yml:/").is_err());
     }
 
     #[test]
