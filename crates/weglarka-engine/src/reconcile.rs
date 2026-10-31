@@ -986,6 +986,7 @@ impl<P: PodmanClient> Reconciler<P> {
             state::save_state(&self.paths.state, &st)?;
         }
         self.prune_networks(&apps).await;
+        self.prune_generated(&guard, &apps).await;
         Ok(report)
     }
 

@@ -206,7 +206,8 @@ Prometheus against it when needed.
 
 1. Remove `scraper` from `[metrics]` and restart the daemon. The app is recreated without its generated mount and leaves
    the metrics networks, so its `file_sd_configs` entry now points at nothing.
-2. Remove the app. `--purge-volumes` also deletes the stored metrics; `apps remove` has no undo.
+2. Remove the app. `--purge-volumes` also deletes the stored metrics; `apps remove` has no undo. Its generated targets
+   directory goes on the next reconcile pass, with or without that flag.
 
    ```bash
    weglarka apps remove prometheus --purge-volumes

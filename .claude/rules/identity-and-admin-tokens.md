@@ -20,6 +20,8 @@ paths:
   registry is `daemon/src/generated.rs::registered`; it registers the Authelia generator when `[identity]` is present and the Prometheus targets
   generator when `[metrics] scraper` is set. A generator whose consumer re-reads its files returns
   `ApplyMode::ConsumerWatches` and is never reloaded or rolled back (ADR 0064).
+  `prune_generated` (each reconcile pass) removes `generated/<app>/` and its records only once the app is out of
+  `apps.toml` and has no container, never because a generator is unregistered (ADR 0055, addendum).
 - **`effective_spec`** (`crates/weglarka-model/src/identity.rs`) is the only overlay of injected env/secrets/`depends_on`
   (hash, materialize, container, `weglarka run`).
 - Identity config renderers are pure, deterministic and snapshot-tested; the access-control file always has

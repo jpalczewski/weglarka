@@ -271,6 +271,8 @@ so it can scrape `weglarka:9464`) and on the `metrics-<app>` network of every op
   own containers stay on its own `metrics-<app>`, the scraper stays where it should be, and any other managed app
   container is detached. A container Węglarka does not manage (no `weglarka.instance` label, such as the one-off
   `podman run --network metrics` in [Checking it](#checking-it)) is never touched.
+  The former scraper's `<state dir>/generated/<scraper>/` stays while the app exists, and is removed with the app
+  ([generated config files](generated-config.md)).
 - Without `scraper` nothing joins automatically.
 
 `weglarka doctor` shows a `metrics.scraper` line when `scraper` is set: `ok` with the networks the scraper is on, `warn`
@@ -401,7 +403,8 @@ start while it is present. Remove `[metrics]` before downgrading. The listener i
 `[metrics] scraper` is a newer field of that section: a Węglarka from before it refuses the file while the field is
 there, even if it knows `[metrics]`. Remove the line before downgrading (the section can stay for a version that has
 it). Point the scraper's `file_sd_configs` at a file of your own first: once the field is gone the scraper is recreated
-without the `/weglarka/generated` mount, and `<state dir>/generated/<scraper>/` stays on disk. The scraper's network
+without the `/weglarka/generated` mount, and `<state dir>/generated/<scraper>/` stays on disk (an older daemon never
+removes it). The scraper's network
 membership is not undone by the downgrade: detach it by hand if you no longer want it
 (`podman network disconnect metrics-<app> <scraper>`, and the same for the daemon's network); it ends anyway when the
 scraper's container is recreated. The field adds nothing to `apps.toml` or `state.toml`.

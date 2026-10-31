@@ -26,7 +26,7 @@ use weglarka_model::generated::{
 };
 use weglarka_model::generated_state::{self, GeneratedState, GeneratorRecord, LastResult, tail};
 use weglarka_model::labels;
-use weglarka_model::podman::{ContainerState, PodmanClient, PodmanError};
+use weglarka_model::podman::{ContainerFilter, ContainerState, PodmanClient, PodmanError};
 use weglarka_model::secret_ops::Pbkdf2Digest;
 use weglarka_model::state;
 
@@ -131,13 +131,23 @@ impl<P: PodmanClient> Reconciler<P> {
         let want = fp.version_dir();
         let root = self.generated_dir(&consumer);
         let mut gstate = GeneratedState::load(&self.generated_state_path());
-        let record = gstate.get(id).cloned().unwrap_or_default();
         let live = current_target(&root);
+        // A record of another consumer (the role moved) says nothing about this one; dropping it here
+        // also keeps its `applied` out of whatever this pass records.
+        let record = gstate
+            .get(id)
+            .filter(|r| record_belongs(r, &consumer, live.as_deref()))
+            .cloned()
+            .unwrap_or_default();
+        *gstate.entry(id) = record.clone();
 
         if record.applied_fingerprint().as_ref() == Some(&fp) && live.as_deref() == Some(&want) {
             return Ok(GeneratedOutcome::Unchanged);
         }
+        // A failure is remembered next to the version it rejected: without that directory the record
+        // outlived its files, and this render has not failed for the consumer that exists now.
         if !force
+            && root.join(&want).is_dir()
             && record.attempted.as_deref() == Some(fp.as_str())
             && matches!(
                 record.last_result,
@@ -177,7 +187,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     // the consumer's secrets bound, so a value it echoes must not reach the state
                     // file, the log or a notification channel.
                     let output = tail(&output).to_owned();
-                    self.record_generated(&mut gstate, id, |r| {
+                    self.record_generated(&mut gstate, id, &consumer, |r| {
                         r.attempted = Some(fp.to_string());
                         r.last_result = LastResult::Invalid;
                         r.last_error = Some(output.clone());
@@ -207,7 +217,7 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         match health {
             Ok(()) => {
-                self.record_generated(&mut gstate, id, |r| {
+                self.record_generated(&mut gstate, id, &consumer, |r| {
                     r.applied = Some(fp.to_string());
                     r.attempted = Some(fp.to_string());
                     r.validated = validated;
@@ -230,7 +240,7 @@ impl<P: PodmanClient> Reconciler<P> {
             // 6. The consumer is unhealthy on the new version: one attempt to go back, no loop.
             Err(reason) => {
                 let Some(prev) = previous else {
-                    self.record_generated(&mut gstate, id, |r| {
+                    self.record_generated(&mut gstate, id, &consumer, |r| {
                         r.attempted = Some(fp.to_string());
                         r.last_result = LastResult::Failed;
                         r.last_error = Some(tail(&reason).to_owned());
@@ -249,7 +259,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     }
                     Err(e) => note = format!("{note}; cannot reload after going back: {e}"),
                 }
-                self.record_generated(&mut gstate, id, |r| {
+                self.record_generated(&mut gstate, id, &consumer, |r| {
                     r.attempted = Some(fp.to_string());
                     r.last_result = LastResult::RolledBack;
                     r.last_error = Some(tail(&note).to_owned());
@@ -385,10 +395,12 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Bootstrap: the files exist before the consumer's **first** start (the identity provider
-    /// refuses to start without its access rules). Renders, writes and swaps only when `current` does
-    /// not exist yet; validation is impossible without a deployed digest, so the version is recorded
-    /// as unvalidated — the consumer's own start is the validation, and a bad render shows up as a
-    /// failed deploy with the provider's logs. Called under the engine lock from the launch paths.
+    /// refuses to start without its access rules). Renders, writes and swaps unless `current` exists
+    /// and the consumer has a deployed digest; a `current` without one may be what an app of the same
+    /// name left behind before [`Self::prune_generated`] ran, so it is replaced, never trusted.
+    /// Validation is impossible without a deployed digest, so the version is recorded as unvalidated
+    /// — the consumer's own start is the validation, and a bad render shows up as a failed deploy
+    /// with the provider's logs. Called under the engine lock from the launch paths.
     pub(crate) async fn bootstrap_generated(
         &self,
         instance: &InstanceName,
@@ -402,7 +414,11 @@ impl<P: PodmanClient> Reconciler<P> {
             .filter(|g| g.consumer() == instance)
         {
             let root = self.generated_dir(instance);
-            if current_target(&root).is_some() {
+            let deployed = state::load_state(&self.paths.state)?
+                .apps
+                .get(instance)
+                .is_some_and(|s| s.current.is_some());
+            if deployed && current_target(&root).is_some() {
                 continue;
             }
             let id = generator.id();
@@ -419,8 +435,9 @@ impl<P: PodmanClient> Reconciler<P> {
             };
             write_version(&root, &fp.version_dir(), &files).map_err(|e| fail(e.to_string()))?;
             swap_current(&root, &fp.version_dir()).map_err(|e| fail(e.to_string()))?;
+            retain_versions(&root, &[Some(&fp.version_dir())]);
             let mut gstate = GeneratedState::load(&self.generated_state_path());
-            self.record_generated(&mut gstate, id, |r| {
+            self.record_generated(&mut gstate, id, instance, |r| {
                 r.applied = Some(fp.to_string());
                 r.attempted = Some(fp.to_string());
                 r.validated = false;
@@ -471,6 +488,59 @@ impl<P: PodmanClient> Reconciler<P> {
         }])
     }
 
+    /// Removes the generated files and records of consumers that are gone from `apps.toml`: their
+    /// files may hold credential digests, and nothing else ever would. The test is the app, not the
+    /// generator: an app that merely lost its role (`[identity]` or `[metrics] scraper` removed, for
+    /// good or for one restart) keeps both, and they go when the app does. A directory stays while a
+    /// container of the instance exists, as it may mount it; the pass that removed the container only
+    /// finds it gone here. Best effort and idempotent: what fails is retried by the next pass.
+    pub(crate) async fn prune_generated(&self, _held: &EngineGuard<'_>, apps: &AppsFile) {
+        let base = self.state_dir().join("generated");
+        let orphans: Vec<InstanceName> = fs::read_dir(&base)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| InstanceName::new(e.file_name().to_string_lossy()).ok())
+            .filter(|name| !apps.apps.contains_key(name))
+            .collect();
+        if !orphans.is_empty() {
+            let containers = match self
+                .podman
+                .container_list(&ContainerFilter::default())
+                .await
+            {
+                Ok(containers) => containers,
+                Err(e) => {
+                    // Cannot tell whether one is still mounted: keep everything for a later pass.
+                    tracing::debug!(error = %e, "cannot list containers; skipping generated config cleanup");
+                    return;
+                }
+            };
+            for name in &orphans {
+                let in_use = containers.iter().any(|c| {
+                    [labels::INSTANCE, labels::RUN_FOR, labels::FORWARD_FOR]
+                        .iter()
+                        .any(|key| c.labels.get(*key).map(String::as_str) == Some(name.as_str()))
+                });
+                if !in_use {
+                    remove_consumer_dir(&self.generated_dir(name), name);
+                }
+            }
+        }
+        let path = self.generated_state_path();
+        let mut gstate = GeneratedState::load(&path);
+        let before = gstate.generators.len();
+        gstate
+            .generators
+            .retain(|_, record| record_is_needed(record, &base, apps));
+        if gstate.generators.len() != before
+            && let Err(e) = gstate.save(&path)
+        {
+            tracing::warn!(error = %e, "cannot persist the generated-config state");
+        }
+    }
+
     /// The version directory `current` points at for `consumer` (`v-<fingerprint12>`), for `doctor`.
     pub fn generated_live_version(&self, consumer: &InstanceName) -> Option<String> {
         current_target(&self.generated_dir(consumer))
@@ -497,11 +567,60 @@ impl<P: PodmanClient> Reconciler<P> {
         &self,
         gstate: &mut GeneratedState,
         id: &str,
+        consumer: &InstanceName,
         update: impl FnOnce(&mut GeneratorRecord),
     ) {
-        update(gstate.entry(id));
+        let record = gstate.entry(id);
+        record.consumer = Some(consumer.to_string());
+        update(record);
         if let Err(e) = gstate.save(&self.generated_state_path()) {
             tracing::warn!(generator = id, error = %e, "cannot persist the generated-config state");
+        }
+    }
+}
+
+/// Whether `record` describes `consumer`. A record from before records named their consumer belongs
+/// to whoever runs the version it says was applied.
+fn record_belongs(record: &GeneratorRecord, consumer: &InstanceName, live: Option<&str>) -> bool {
+    match &record.consumer {
+        Some(owner) => owner == consumer.as_str(),
+        None => record
+            .applied_fingerprint()
+            .is_some_and(|f| live == Some(f.version_dir().as_str())),
+    }
+}
+
+/// Whether a record still has anything to describe: its consumer is declared or its directory is
+/// still there. A record that names no consumer stays while some directory holds a version it names.
+fn record_is_needed(record: &GeneratorRecord, base: &Path, apps: &AppsFile) -> bool {
+    if let Some(owner) = &record.consumer {
+        return InstanceName::new(owner.as_str())
+            .is_ok_and(|name| apps.apps.contains_key(&name) || base.join(name.as_str()).is_dir());
+    }
+    let versions: Vec<String> = [record.applied.as_deref(), record.attempted.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(Fingerprint::parse)
+        .map(|f| f.version_dir())
+        .collect();
+    fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|consumer| versions.iter().any(|v| consumer.path().join(v).is_dir()))
+}
+
+/// Removes a gone consumer's directory, `current` first: if this stops halfway, a re-added app of
+/// the same name finds no link into a partial version and renders afresh. Never reads the files.
+fn remove_consumer_dir(root: &Path, consumer: &InstanceName) {
+    let removed = match fs::remove_file(root.join(CURRENT_LINK)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => remove_dir_if_exists(root),
+    };
+    match removed {
+        Ok(()) => tracing::info!(%consumer, "removed the generated config of a removed app"),
+        Err(e) => {
+            tracing::warn!(%consumer, error = %e, "cannot remove the generated config of a removed app");
         }
     }
 }

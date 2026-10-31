@@ -1,6 +1,6 @@
 # 0055 — Generated config pipeline
 
-Status: accepted (2026-10-28, issue #212). Builds on ADR 0028 (host config mounts) and ADR 0051 (identity provider integration). Amended by ADR 0064 (a consumer that re-reads its files is not reloaded).
+Status: accepted (2026-10-28, issue #212). Builds on ADR 0028 (host config mounts) and ADR 0051 (identity provider integration). Amended by ADR 0064 (a consumer that re-reads its files is not reloaded) and by the addendum below (cleanup after a removed consumer).
 
 ## Problem
 
@@ -81,6 +81,34 @@ app that is not a consumer; a failed render is not retried unprompted.
   queue behind it; the validator is a config parse, so this is a hang guard, not an expected wait.
 * No generator is registered yet (`generated::registered` is empty): the feature is dormant until the identity
   renderer is wired (#42). Tests use a fake generator against `FakePodman`.
+
+## Addendum: removing what a gone consumer left (2026-10-31)
+
+Nothing removed `<state dir>/generated/<consumer>/` or the consumer's table in `generated.toml`, and the files can hold
+credential digests. `Reconciler::prune_generated`, at the end of every reconcile pass under the engine lock, now does.
+
+* **The test is the app, not the generator.** A directory goes when its name is not in `apps.toml` and no container of
+  the instance exists (`weglarka.instance`, `run-for`, `forward-for`): one may still mount it. Registration plays no
+  part, so a daemon restarted without `[identity]` or `[metrics] scraper` deletes nothing while the app exists, and an
+  app removed while unregistered is still cleaned up. Losing the role for good leaves the files until the app goes; that
+  is the price of not deleting what the operator may want back, and the guide says so.
+* **Records name their consumer.** `GeneratorRecord.consumer` is new because a record is keyed by generator id, which
+  outlives its consumer when the scraper role moves. A record of another consumer is ignored by the pipeline. One written
+  before the field existed belongs to the consumer running the version it applied, and is swept once no directory holds
+  a version it names, so an upgrade neither reloads a consumer nor strands a record. The exception is a record of a
+  failure with nothing applied: it matches no consumer, so that render is validated once more after the upgrade.
+  `generated.toml` stays outside the schema (tolerant serde), so there is no bump.
+* **A failure is remembered next to its version.** The "same render, do not retry" skip now also requires that version's
+  directory: a record that outlived its files cannot stop a re-added consumer from being applied and validated.
+* **A `current` is only trusted for a deployed consumer.** `bootstrap_generated` used to skip whenever `current` existed,
+  so an app purged and re-added before a pass started on its predecessor's files. It now renders unless the consumer has a
+  pinned digest, and drops the versions it replaces. A non-purging remove plus add before a pass keeps state and files
+  together: it is the same app. `current` goes first when a directory is removed, so a stop halfway leaves no link into a
+  partial version.
+
+Rejected: **removing in `remove_app_with_purges`.** A non-purging removal leaves the container to the next pass, so the
+mount source would vanish under a running consumer; hand-edited `apps.toml` would still need the sweep. **Removing when
+the generator is unregistered.** It cannot tell a temporary edit from a decision, and this deletes files with no way back.
 
 ## Rejected alternatives
 
