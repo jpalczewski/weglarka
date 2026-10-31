@@ -55,6 +55,8 @@ pub enum Command {
     Logs(crate::logs::LogsArgs),
     /// Print the requests that reached one app through its domains (the ingress access log), optionally following.
     Access(crate::access::AccessArgs),
+    /// Show memory, CPU, pids and I/O of the app containers (a cached snapshot, no Prometheus needed).
+    Stats(crate::stats::StatsArgs),
     /// Temporarily forward a port of an app to this machine: a short-lived relay container on the
     /// app's network plus an SSH tunnel, both removed when the command ends.
     Forward(crate::forward::ForwardArgs),
