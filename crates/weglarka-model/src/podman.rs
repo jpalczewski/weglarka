@@ -112,6 +112,16 @@ pub struct VersionInfo {
     pub api_version: String,
 }
 
+/// The filesystem holding container storage (libpod `GET /info`, `store.graphRoot*`). A field libpod
+/// does not report is `None`, never `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageInfo {
+    /// Size of the filesystem under the graph root in bytes (`graphRootAllocated`).
+    pub size_bytes: Option<u64>,
+    /// Bytes used on that filesystem, by anything, not only by Podman (`graphRootUsed`).
+    pub used_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     No,
@@ -484,6 +494,10 @@ pub trait PodmanClient: Send + Sync {
     /// `host.idMappings.uidmap` in `GET /info`). The daemon runs in a container and cannot read the
     /// host's `/etc/subuid`, so the pool is asked of Podman itself. Feeds [`crate::uid_range::allocate`].
     fn subuid_pool(&self) -> impl Future<Output = Result<u64>> + Send;
+
+    /// Size and use of the filesystem under Podman's graph root (`GET /info`, `store`). The host's
+    /// free memory from the same call is deliberately not exposed: it is free, not available, memory.
+    fn storage_info(&self) -> impl Future<Output = Result<StorageInfo>> + Send;
 
     // Containers
     fn container_create(&self, spec: &ContainerSpec)

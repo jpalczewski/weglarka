@@ -2,8 +2,8 @@
 //!
 //! It is built from its own router with exactly one route and shares nothing with the admin route
 //! table, so it can never serve an admin endpoint. Values are computed at scrape time by a
-//! [`MetricsSource`]; later sources (per-app resources, daemon counters, host numbers) are added
-//! there without touching the encoder or the listener.
+//! [`MetricsSource`]; its sources (daemon counters, per-app resources, host numbers) are added there
+//! without touching the encoder or the listener.
 //!
 //! Label contract (ADR 0061, decision 8): `app` is a validated instance name, `role` is one of
 //! `active`, `challenger`, `retiring`, one-off containers are skipped, and a label value is never free
@@ -11,6 +11,7 @@
 
 pub mod daemon;
 pub mod encode;
+pub mod host;
 pub mod resources;
 
 use std::net::SocketAddr;
@@ -37,30 +38,41 @@ pub trait MetricsSource: Send + Sync + 'static {
     fn collect(&self) -> impl Future<Output = Vec<Family>> + Send;
 }
 
-/// The sources of this daemon: `weglarka_build_info`, the daemon counters (#352) and per-app
-/// resources (#351); #353 adds its own here.
-pub struct DaemonMetrics<P: PodmanClient + 'static> {
+/// The sources of this daemon: `weglarka_build_info`, the daemon counters (#352), per-app
+/// resources (#351), and the host (#353): `host` for the machine, libpod `/info` for container storage.
+pub struct DaemonMetrics<P: PodmanClient + 'static, H: host::HostSource = host::ProcSource> {
     daemon: Arc<Daemon<P>>,
     daemon_source: daemon::DaemonSource,
     resources: resources::Cache,
+    host: H,
+    storage: resources::Cache,
 }
 
-impl<P: PodmanClient + 'static> DaemonMetrics<P> {
+impl<P: PodmanClient + 'static, H: host::HostSource> DaemonMetrics<P, H> {
     /// `counters` must be the sink the daemon's event fan-out feeds.
-    pub fn new(daemon: Arc<Daemon<P>>, counters: Arc<daemon::EventCounters>) -> Self {
+    pub fn new(daemon: Arc<Daemon<P>>, counters: Arc<daemon::EventCounters>, host: H) -> Self {
         Self {
             daemon,
             daemon_source: daemon::DaemonSource::new(counters),
             resources: resources::Cache::default(),
+            host,
+            storage: resources::Cache::default(),
         }
     }
 }
 
-impl<P: PodmanClient + 'static> MetricsSource for DaemonMetrics<P> {
+impl<P: PodmanClient + 'static, H: host::HostSource> MetricsSource for DaemonMetrics<P, H> {
     async fn collect(&self) -> Vec<Family> {
         let mut families = vec![build_info()];
         families.extend(daemon::families(&self.daemon, &self.daemon_source));
-        families.extend(resources::collect(&self.daemon, &self.resources).await);
+        let (resources, host, storage) = tokio::join!(
+            resources::collect(&self.daemon, &self.resources),
+            self.host.collect(),
+            host::storage(self.daemon.engine.podman(), &self.storage),
+        );
+        families.extend(resources);
+        families.extend(host);
+        families.extend(storage);
         families
     }
 }

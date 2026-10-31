@@ -17,13 +17,14 @@ use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerState, ContainerStats, EventFilter,
     HealthStatus, ImageInfo, LoadedImage, LogChunk, LogOptions, LogSource, LogStream, NetworkInfo,
     NetworkSpec, NetworkSummary, PodmanClient, PodmanError, PodmanEvent, PullEvent, RegistryAuth,
-    Result, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
+    Result, StorageInfo, TarStream, VersionInfo, VolumeFilter, VolumeInfo, VolumeSpec, image_repo,
 };
 
 /// Record of a call — for asserting operation order in reconcile/deploy tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     ContainerStats,
+    StorageInfo,
     ContainerCreate(String),
     ContainerStart(String),
     ContainerStop(String),
@@ -135,6 +136,9 @@ struct State {
     /// Scripted `container_stats` ([`FakePodman::script_stats`]).
     stats_script: Option<Vec<ContainerStats>>,
     stats_error: Option<String>,
+    /// Scripted `storage_info` (`None` = [`DEFAULT_STORAGE`]) and its injected failure.
+    storage: Option<StorageInfo>,
+    storage_error: Option<String>,
     /// Held-open follow streams that have not been dropped yet.
     open_log_streams: Arc<AtomicUsize>,
     containers: BTreeMap<String, ContainerInfo>,
@@ -177,6 +181,12 @@ struct State {
 
 /// Production-sized subuid pool (production host: `1000000:2000000`).
 pub const DEFAULT_SUBUID_POOL: u64 = 2_000_000;
+
+/// Container storage reported by `storage_info` unless scripted: a 100 GiB disk, a quarter used.
+pub const DEFAULT_STORAGE: StorageInfo = StorageInfo {
+    size_bytes: Some(100 * 1024 * 1024 * 1024),
+    used_bytes: Some(25 * 1024 * 1024 * 1024),
+};
 
 /// Size every pulled image reports (10 MiB), so retention/`doctor` sizes are predictable in tests.
 pub const DEFAULT_IMAGE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
@@ -355,6 +365,16 @@ impl FakePodman {
     /// Makes `container_stats` fail (a protocol error with this text) until cleared with `None`.
     pub fn fail_stats(&self, error: Option<&str>) {
         self.lock().stats_error = error.map(str::to_owned);
+    }
+
+    /// What `storage_info` reports (default [`DEFAULT_STORAGE`]).
+    pub fn set_storage_info(&self, storage: StorageInfo) {
+        self.lock().storage = Some(storage);
+    }
+
+    /// Makes `storage_info` fail (a protocol error with this text) until cleared with `None`.
+    pub fn fail_storage_info(&self, error: Option<&str>) {
+        self.lock().storage_error = error.map(str::to_owned);
     }
 
     /// How many held-open `follow` log streams ([`LogScript::hold_open`]) are alive: a consumer that
@@ -549,6 +569,15 @@ impl PodmanClient for FakePodman {
 
     async fn subuid_pool(&self) -> Result<u64> {
         Ok(self.lock().uid_pool.unwrap_or(DEFAULT_SUBUID_POOL))
+    }
+
+    async fn storage_info(&self) -> Result<StorageInfo> {
+        let mut s = self.lock();
+        s.calls.push(Call::StorageInfo);
+        if let Some(error) = s.storage_error.clone() {
+            return Err(PodmanError::Protocol(error));
+        }
+        Ok(s.storage.unwrap_or(DEFAULT_STORAGE))
     }
 
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {

@@ -10,8 +10,8 @@ use weglarka_model::app::{Digest, Resources, SecretTarget};
 use weglarka_model::podman::{
     ContainerHealthcheck, ContainerInfo, ContainerSpec, ContainerState, ContainerStats, EventKind,
     HealthStatus, IdRange, ImageInfo, LogChunk, LogSource, NetworkInfo, NetworkIo, NetworkSpec,
-    NetworkSummary, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, VersionInfo,
-    VolumeInfo, VolumeSpec, image_repo,
+    NetworkSummary, PodmanError, PodmanEvent, PullEvent, RestartPolicy, Result, StorageInfo,
+    VersionInfo, VolumeInfo, VolumeSpec, image_repo,
 };
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -35,11 +35,21 @@ struct Component {
     details: BTreeMap<String, String>,
 }
 
-/// `GET /info`: only the rootless uid map is used.
+/// `GET /info`: only the rootless uid map and the graph root's filesystem size are used.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct Info {
     host: InfoHost,
+    store: InfoStore,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InfoStore {
+    #[serde(rename = "graphRootAllocated")]
+    graph_root_allocated: Option<u64>,
+    #[serde(rename = "graphRootUsed")]
+    graph_root_used: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -72,6 +82,15 @@ impl Info {
             .filter(|r| r.container_id >= 1)
             .map(|r| r.size)
             .sum()
+    }
+
+    /// The graph root's filesystem; a `0` size means libpod could not stat it and is reported as none.
+    pub(crate) fn storage(&self) -> StorageInfo {
+        let size_bytes = self.store.graph_root_allocated.filter(|&n| n > 0);
+        StorageInfo {
+            size_bytes,
+            used_bytes: size_bytes.and(self.store.graph_root_used),
+        }
     }
 }
 
@@ -1457,6 +1476,30 @@ mod tests {
         assert_eq!(info.subuid_pool(), 1_000_000);
         // Rootful or unknown layout: no pool rather than a guess.
         assert_eq!(decode::<Info>(b"{}").unwrap().subuid_pool(), 0);
+    }
+
+    #[test]
+    fn storage_reads_the_graph_root_and_never_guesses() {
+        let info: Info = decode(
+            br#"{"host":{"memFree":1},"store":{"graphRoot":"/x","graphRootAllocated":1000,
+                "graphRootUsed":400,"imageStore":{"number":3}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            info.storage(),
+            StorageInfo {
+                size_bytes: Some(1000),
+                used_bytes: Some(400)
+            }
+        );
+        assert_eq!(
+            decode::<Info>(b"{}").unwrap().storage(),
+            StorageInfo::default()
+        );
+        // A filesystem libpod could not stat reports 0 for both: no data, not an empty disk.
+        let unknown: Info =
+            decode(br#"{"store":{"graphRootAllocated":0,"graphRootUsed":0}}"#).unwrap();
+        assert_eq!(unknown.storage(), StorageInfo::default());
     }
 
     #[test]

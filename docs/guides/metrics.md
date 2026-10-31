@@ -39,7 +39,8 @@ bound (fix `listen` and restart), and absent when `[metrics]` is not set. `GET /
 ## What is there
 
 All values are computed when the page is scraped; nothing is sampled in the background, and only the per-app
-resources call Podman (see [Per-app resources](#per-app-resources)).
+resources and the container storage size call Podman (see [Per-app resources](#per-app-resources) and
+[Host](#host)).
 Counters live in memory and start at zero when the daemon starts (Prometheus' `rate()` and `increase()` handle the
 reset). A series appears once it has something to say: an app that never failed has no `result="failed"` line.
 
@@ -56,8 +57,8 @@ reset). A series appears once it has something to say: an app that never failed 
 
 Labels are only ever validated instance names (`app`), routed domains (`domain`) or the fixed values listed above. A
 failure reason, an error message, a digest or an image reference never becomes a label: read those with
-`weglarka doctor`, `GET /v1/events` or the notifications. Per-app resource use is described below; host metrics come
-with #353 and discovery by a Prometheus app with #36. An app removed from `apps.toml` keeps its counter lines until the
+`weglarka doctor`, `GET /v1/events` or the notifications. Per-app resource use and host metrics are described below;
+discovery by a Prometheus app comes with #36. An app removed from `apps.toml` keeps its counter lines until the
 daemon restarts.
 
 If a file behind a family cannot be read (`apps.toml`, `self-update.toml`), that family is left out of the page and
@@ -127,7 +128,68 @@ A value libpod cannot supply is left out rather than reported as `0`, so a dashb
   ```
 
   Without `io` in the list the block series are absent (systemd's default delegation for user managers is
-  `cpu memory pids`; add `io` with a `Delegate=` drop-in for `user@.service`).
+  `cpu memory pids`; add `io` with a `Delegate=` drop-in for `user@.service`). `weglarka doctor --preflight` mentions a
+  missing `io` in its `runtime.cgroups` line; the check stays `ok`, since `io` is optional.
+
+## Host
+
+The daemon reports the host's memory, CPU, load, disks and pressure itself, with no extra container and no host
+mount. An unprivileged container sees host-wide values in its own `/proc/meminfo`, `/proc/stat`, `/proc/loadavg` and
+`/proc/diskstats` (the kernel does not namespace them), while it still sees only its own processes. The files are
+read when the page is scraped. Names and units match [`node_exporter`](https://github.com/prometheus/node_exporter)
+where the meaning is exactly the same, so its dashboards and alerts work for these series.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `node_memory_MemTotal_bytes` | gauge | — | `/proc/meminfo` `MemTotal` |
+| `node_memory_MemAvailable_bytes` | gauge | — | `/proc/meminfo` `MemAvailable` (what new work can get without swapping) |
+| `node_memory_SwapTotal_bytes` | gauge | — | `/proc/meminfo` `SwapTotal` |
+| `node_memory_SwapFree_bytes` | gauge | — | `/proc/meminfo` `SwapFree` |
+| `node_cpu_seconds_total` | counter | `cpu` (`0`, `1`, …), `mode` (`user`, `nice`, `system`, `idle`, `iowait`, `irq`, `softirq`, `steal`) | `/proc/stat`, per CPU |
+| `node_boot_time_seconds` | gauge | — | `/proc/stat` `btime`, a Unix timestamp |
+| `node_load1`, `node_load5`, `node_load15` | gauge | — | `/proc/loadavg` |
+| `node_disk_read_bytes_total` | counter | `device` | `/proc/diskstats`, sectors read × 512 |
+| `node_disk_written_bytes_total` | counter | `device` | `/proc/diskstats`, sectors written × 512 |
+| `node_pressure_cpu_waiting_seconds_total` | counter | — | `/proc/pressure/cpu`, `some` |
+| `node_pressure_memory_waiting_seconds_total` | counter | — | `/proc/pressure/memory`, `some` |
+| `node_pressure_memory_stalled_seconds_total` | counter | — | `/proc/pressure/memory`, `full` |
+| `node_pressure_io_waiting_seconds_total` | counter | — | `/proc/pressure/io`, `some` |
+| `node_pressure_io_stalled_seconds_total` | counter | — | `/proc/pressure/io`, `full` |
+| `node_vmstat_oom_kill` | counter | — | `/proc/vmstat` `oom_kill`: out-of-memory kills on the host since boot |
+| `node_filefd_allocated` | gauge | — | `/proc/sys/fs/file-nr`, first field |
+| `node_filefd_maximum` | gauge | — | `/proc/sys/fs/file-nr`, third field |
+| `weglarka_storage_size_bytes` | gauge | — | libpod `GET /info` `store.graphRootAllocated`: the filesystem holding container storage |
+| `weglarka_storage_used_bytes` | gauge | — | libpod `GET /info` `store.graphRootUsed`: bytes used on it, by anything |
+
+Details:
+
+- The `cpu` label counts CPUs the host has, not the CPUs the daemon's container may use. `guest` time is already
+  included in `user` and `nice`; there is no `node_cpu_guest_seconds_total`.
+- Disks: `node_exporter`'s default filter applies (no `loop`, `ram`, `zram` or `fd` devices and no `sdXN`, `vdXN`,
+  `xvdXN`, `hdXN` or `nvmeXnYpZ` partitions), plus `mmcblkXpY` partitions, so a host has one series per disk and
+  device-mapper volume, not one per partition and loop mount. Host disk counters come from the kernel and do not need
+  the `io` controller; the per-app block I/O series do.
+- Pressure (PSI) needs a kernel with `CONFIG_PSI` and PSI enabled; without `/proc/pressure` those families are absent.
+- Container storage is one `/info` call, cached for 60 seconds: the call is slower than stats and disk use moves
+  slowly. It uses `weglarka_` names rather than `node_filesystem_*` because there is no real mount point to put in a
+  `mountpoint` label. The host's free memory from the same call is not used: it is free memory, not available memory.
+- A file that is missing or cannot be parsed drops only its own families (logged at debug level), and a failed or slow
+  `/info` call drops only the storage families; `/metrics` still answers `200`.
+
+### Deliberately missing
+
+- **Host network traffic.** `/proc/net` belongs to a network namespace: in the daemon's container it would describe the
+  daemon's own interfaces, so no `node_network_*` family is exported. Per-app traffic is in
+  `weglarka_container_network_*`.
+- **Other mount points.** Only the container storage filesystem is known (from libpod); the daemon cannot see the
+  host's other filesystems without a mount.
+- **Hardware** (`hwmon`, temperatures, SMART), **`systemd`** unit state and **`textfile`** collectors: they need host
+  `/sys`, the host's D-Bus or a host directory.
+
+If you need those, run a full `node_exporter` as an ordinary option next to Węglarka, for example as a host service or a
+container started by your own unit with the mounts its documentation asks for, and scrape it as a second target. Its
+`node_*` series then come with an `instance` label of their own, so drop the duplicate families from one of the two
+targets (`metric_relabel_configs`) if both are scraped.
 
 ## Suggested alerts
 
@@ -157,6 +219,16 @@ groups:
         for: 5m
         annotations:
           summary: "Per-app resource metrics on {{ $labels.instance }} are unavailable"
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+        for: 10m
+        annotations:
+          summary: "Under 10% memory available on {{ $labels.instance }}"
+      - alert: ContainerStorageFull
+        expr: weglarka_storage_used_bytes / weglarka_storage_size_bytes > 0.9
+        for: 30m
+        annotations:
+          summary: "Container storage on {{ $labels.instance }} is over 90% full"
       - alert: WeglarkaSelfUpdatePending
         # A pinned image the daemon still does not run after 30 minutes: the switch did not take effect.
         expr: weglarka_self_update_pending == 1

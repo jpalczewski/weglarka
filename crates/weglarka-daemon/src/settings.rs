@@ -36,6 +36,9 @@ pub struct Paths {
     /// Directory of the token admin listener's socket (`[admin.http]`, docs/decisions/0056); mounted
     /// only into the configured clients.
     pub admin_token_dir: PathBuf,
+    /// Where host metrics are read (`[metrics]`, #353): always `/proc`, not configurable; tests point
+    /// it at a fixture directory so they do not depend on the machine they run on.
+    pub proc_root: PathBuf,
 }
 
 impl Paths {
@@ -73,6 +76,7 @@ impl Paths {
             cdn_ranges: state_dir.join("cdn-ranges.toml"),
             config_root,
             admin_token_dir: state_dir.join(weglarka_model::admin_auth::SOCKET_SUBDIR),
+            proc_root: PathBuf::from(crate::metrics::host::PROC_ROOT),
             state_dir,
         }
     }

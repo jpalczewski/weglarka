@@ -7,7 +7,7 @@ expression: render(&r)
 [FAIL] runtime.subuid           only 1000 ids for weglarka in /etc/subuid (need ≥ 65536)
                                 hint: add a range: `usermod --add-sub-uids <start>-<end> weglarka` (≥ 1000000 ids recommended, 65536 minimum)
 [ OK ] runtime.subgid           2000000 ids for weglarka in /etc/subgid
-[ OK ] runtime.cgroups          cgroups v2
+[ OK ] runtime.cgroups          cgroups v2 (io not delegated to weglarka: no per-app block I/O metrics; optional, add io to Delegate=)
 [FAIL] runtime.linger           linger disabled for weglarka
                                 hint: `loginctl enable-linger weglarka` — without it the user's services stop on logout
 [ OK ] runtime.socket           podman socket /run/user/1001/podman/podman.sock responds

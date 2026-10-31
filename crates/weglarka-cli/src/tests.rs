@@ -431,6 +431,18 @@ fn preflight_cgroups_requires_cpu_memory_and_pids() {
 }
 
 #[test]
+fn preflight_cgroups_mentions_a_missing_io_controller_but_stays_ok() {
+    // The healthy fixture delegates `cpu memory pids`, systemd's default: `io` is optional.
+    let c = cgroups_check(&FakeHost::healthy());
+    assert_eq!(c.status, weglarka_api::CheckStatus::Ok);
+    assert!(c.message.contains("io not delegated"), "{}", c.message);
+    assert!(c.message.contains("block I/O metrics"), "{}", c.message);
+    let c = cgroups_check(&FakeHost::healthy().file(USER_CGROUP, "cpu io memory pids\n"));
+    assert_eq!(c.status, weglarka_api::CheckStatus::Ok);
+    assert_eq!(c.message, "cgroups v2");
+}
+
+#[test]
 fn preflight_broken_host() {
     let mut h = FakeHost::healthy()
         .file("/etc/subuid", "weglarka:165536:1000\n")

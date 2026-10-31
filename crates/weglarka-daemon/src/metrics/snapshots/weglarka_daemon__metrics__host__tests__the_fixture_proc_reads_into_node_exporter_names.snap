@@ -1,0 +1,78 @@
+---
+source: crates/weglarka-daemon/src/metrics/host.rs
+expression: text
+---
+# HELP node_boot_time_seconds Unix time the host booted (/proc/stat btime).
+# TYPE node_boot_time_seconds gauge
+node_boot_time_seconds 1767225600
+# HELP node_cpu_seconds_total Seconds the host's CPUs spent in each mode (/proc/stat).
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 400
+node_cpu_seconds_total{cpu="0",mode="iowait"} 1.5
+node_cpu_seconds_total{cpu="0",mode="irq"} 0
+node_cpu_seconds_total{cpu="0",mode="nice"} 0.1
+node_cpu_seconds_total{cpu="0",mode="softirq"} 0.25
+node_cpu_seconds_total{cpu="0",mode="steal"} 0.05
+node_cpu_seconds_total{cpu="0",mode="system"} 5
+node_cpu_seconds_total{cpu="0",mode="user"} 15
+node_cpu_seconds_total{cpu="1",mode="idle"} 400
+node_cpu_seconds_total{cpu="1",mode="iowait"} 1.5
+node_cpu_seconds_total{cpu="1",mode="irq"} 0
+node_cpu_seconds_total{cpu="1",mode="nice"} 0.1
+node_cpu_seconds_total{cpu="1",mode="softirq"} 0.25
+node_cpu_seconds_total{cpu="1",mode="steal"} 0.05
+node_cpu_seconds_total{cpu="1",mode="system"} 5
+node_cpu_seconds_total{cpu="1",mode="user"} 15
+# HELP node_disk_read_bytes_total Bytes read from the host's block device (/proc/diskstats, 512-byte sectors).
+# TYPE node_disk_read_bytes_total counter
+node_disk_read_bytes_total{device="nvme0n1"} 102400000
+node_disk_read_bytes_total{device="sda"} 409600000
+# HELP node_disk_written_bytes_total Bytes written to the host's block device (/proc/diskstats, 512-byte sectors).
+# TYPE node_disk_written_bytes_total counter
+node_disk_written_bytes_total{device="nvme0n1"} 51200000
+node_disk_written_bytes_total{device="sda"} 204800000
+# HELP node_filefd_allocated File handles allocated on the host (/proc/sys/fs/file-nr).
+# TYPE node_filefd_allocated gauge
+node_filefd_allocated 3000
+# HELP node_filefd_maximum Most file handles the host allows (/proc/sys/fs/file-nr).
+# TYPE node_filefd_maximum gauge
+node_filefd_maximum 1000000
+# HELP node_load1 1m load average of the host.
+# TYPE node_load1 gauge
+node_load1 0.25
+# HELP node_load15 15m load average of the host.
+# TYPE node_load15 gauge
+node_load15 0.75
+# HELP node_load5 5m load average of the host.
+# TYPE node_load5 gauge
+node_load5 0.5
+# HELP node_memory_MemAvailable_bytes Memory the host can give to new work without swapping, in bytes (/proc/meminfo MemAvailable).
+# TYPE node_memory_MemAvailable_bytes gauge
+node_memory_MemAvailable_bytes 6144000000
+# HELP node_memory_MemTotal_bytes Usable RAM of the host in bytes (/proc/meminfo MemTotal).
+# TYPE node_memory_MemTotal_bytes gauge
+node_memory_MemTotal_bytes 8192000000
+# HELP node_memory_SwapFree_bytes Unused swap space of the host in bytes (/proc/meminfo SwapFree).
+# TYPE node_memory_SwapFree_bytes gauge
+node_memory_SwapFree_bytes 1536000000
+# HELP node_memory_SwapTotal_bytes Swap space of the host in bytes (/proc/meminfo SwapTotal).
+# TYPE node_memory_SwapTotal_bytes gauge
+node_memory_SwapTotal_bytes 2048000000
+# HELP node_pressure_cpu_waiting_seconds_total Total time in seconds that processes on the host have waited for CPU time (PSI some).
+# TYPE node_pressure_cpu_waiting_seconds_total counter
+node_pressure_cpu_waiting_seconds_total 1.5
+# HELP node_pressure_io_stalled_seconds_total Total time in seconds no process on the host could make progress due to IO congestion (PSI full).
+# TYPE node_pressure_io_stalled_seconds_total counter
+node_pressure_io_stalled_seconds_total 1
+# HELP node_pressure_io_waiting_seconds_total Total time in seconds that processes on the host have waited due to IO congestion (PSI some).
+# TYPE node_pressure_io_waiting_seconds_total counter
+node_pressure_io_waiting_seconds_total 3
+# HELP node_pressure_memory_stalled_seconds_total Total time in seconds no process on the host could make progress for lack of memory (PSI full).
+# TYPE node_pressure_memory_stalled_seconds_total counter
+node_pressure_memory_stalled_seconds_total 0.5
+# HELP node_pressure_memory_waiting_seconds_total Total time in seconds that processes on the host have waited for memory (PSI some).
+# TYPE node_pressure_memory_waiting_seconds_total counter
+node_pressure_memory_waiting_seconds_total 2
+# HELP node_vmstat_oom_kill Out-of-memory kills on the host since boot (/proc/vmstat oom_kill).
+# TYPE node_vmstat_oom_kill counter
+node_vmstat_oom_kill 2
