@@ -771,6 +771,91 @@ async fn open_stream(
         .unwrap()
 }
 
+/// Like [`open_stream`], as an `EventSource` asks for it.
+async fn open_event_source(site: &Site, who: &Login, path: &str) -> axum::response::Response {
+    site.app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::COOKIE, &who.cookie)
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A refusal shown to an `EventSource`: 200, one `status` line, then `done`.
+async fn assert_status_then_done(response: axum::response::Response, text: &str) {
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let read = read_until(&mut body, "event: done", WAIT).await.unwrap();
+    assert!(read.contains("event: status"), "{read}");
+    assert!(read.contains(text), "{read}");
+    assert!(
+        read.find("event: status") < read.find("event: done"),
+        "{read}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_cannot_start_explains_itself_to_an_event_source() {
+    // Too many live views: the fifth stream, and the one-shot answer holds no slot.
+    let site1 = site(Script::default()).await;
+    let admin = login(&site1, "tok-admin");
+    let mut held = Vec::new();
+    for _ in 0..weglarka_panel::live::MAX_STREAMS_PER_SESSION {
+        let r = open_stream(&site1, &admin, "/apps/web/logs/stream", None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        held.push(r);
+    }
+    let r = open_event_source(&site1, &admin, "/apps/web/logs/stream").await;
+    assert_status_then_done(r, "Too many live views").await;
+    assert_eq!(
+        site1.state.streams.open_streams(),
+        weglarka_panel::live::MAX_STREAMS_PER_SESSION
+    );
+    // Without the header the status code stays.
+    let r = open_stream(&site1, &admin, "/apps/web/logs/stream", None).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A user below admin: the daemon's 403.
+    let site2 = site(Script::default()).await;
+    let read = login(&site2, "tok-read");
+    for path in ["/apps/web/logs/stream", "/apps/web/access/stream"] {
+        let r = open_event_source(&site2, &read, path).await;
+        assert_status_then_done(r, "only available to administrators").await;
+        let r = open_stream(&site2, &read, path, None).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(site2.state.streams.open_streams(), 0);
+
+    // The daemon refuses the request (400): a fixed text, nothing of its message.
+    let site3 = site(Script {
+        fail: vec![("/v1/apps/web/logs", 400, "bad_request")],
+        ..Script::default()
+    })
+    .await;
+    let admin3 = login(&site3, "tok-admin");
+    let r = open_event_source(&site3, &admin3, "/apps/web/logs/stream").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let text = read_until(&mut r.into_body(), "event: done", WAIT)
+        .await
+        .unwrap();
+    assert!(text.contains("The daemon refused this view."), "{text}");
+    assert!(!text.contains("from the daemon"), "{text}");
+    let r = open_stream(&site3, &admin3, "/apps/web/logs/stream", None).await;
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+
+    // A bad filter, before the daemon is asked.
+    let r = open_event_source(&site3, &admin3, "/apps/web/access/stream?status=1").await;
+    assert_status_then_done(r, "This filter is not valid.").await;
+    let r = open_stream(&site3, &admin3, "/apps/web/access/stream?status=1", None).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
 const WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::test]

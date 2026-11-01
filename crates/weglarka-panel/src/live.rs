@@ -127,13 +127,59 @@ impl Drop for StreamGuard {
     }
 }
 
-fn too_many() -> Response {
+const TOO_MANY_TEXT: &str =
+    "Too many live views. Close another tab with a live view and try again.";
+
+fn too_many(req: &Req) -> Response {
+    if wants_event_stream(&req.headers) {
+        return one_shot(TOO_MANY_TEXT);
+    }
     ErrorPage {
         title: "Too many live views",
         message: "Close another tab with a live view and try again.",
         sign_in: None,
     }
     .respond(StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// Does the caller ask for `text/event-stream` (an `EventSource`, which htmx's `sse` extension uses)?
+/// This only selects the presentation of a refusal: it never changes who may see what.
+fn wants_event_stream(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|media| {
+            media
+                .split(';')
+                .next()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+/// A stream that cannot start, as the one thing an `EventSource` can show: 200, one fixed `status`
+/// line and `done` (the page's `sse-close="done"` then closes it without a reconnect). It holds no
+/// stream slot and echoes nothing from the request or the daemon.
+fn one_shot(text: &str) -> Response {
+    let events: [Result<Event, Infallible>; 2] = [Ok(status_event(text)), Ok(done_event())];
+    sse(stream::iter(events))
+}
+
+/// The fixed status line for a daemon failure on a stream's first request, or `None` when the
+/// ordinary answer must stay (the session is over: `401`).
+fn refusal_text<F: UpstreamFeed>(err: &DaemonError) -> Option<&'static str> {
+    Some(match err {
+        DaemonError::Unauthorized => return None,
+        DaemonError::Forbidden => F::NOTICES.forbidden,
+        DaemonError::NotFound(_) | DaemonError::InvalidRequest(_) => F::NOTICES.not_found,
+        DaemonError::Rejected { .. } => "The daemon refused this view.",
+        DaemonError::Server { .. } | DaemonError::Decode { .. } => {
+            "The daemon had a problem. Try again in a moment."
+        }
+        DaemonError::Unreachable => "The panel cannot reach the daemon right now.",
+        DaemonError::Timeout => "The daemon did not answer in time. Try again in a moment.",
+    })
 }
 
 fn sse<S>(stream: S) -> Response
@@ -203,7 +249,7 @@ struct EventsState {
 /// `GET /events/stream`.
 pub async fn events_stream(req: Req) -> Response {
     let Some(slot) = req.state.streams.acquire(&req.session) else {
-        return too_many();
+        return too_many(&req);
     };
     let last_id = req
         .headers
@@ -494,7 +540,7 @@ pub async fn logs_stream(req: Req, Path(name): Path<String>) -> Response {
 /// connection to a [`Driver`]. A refusal from the daemon is the answer to the browser.
 async fn serve<F: UpstreamFeed>(req: Req, feed: F, scope: Option<Scope>) -> Response {
     let Some(slot) = req.state.streams.acquire(&req.session) else {
-        return too_many();
+        return too_many(&req);
     };
     let started = SystemTime::now();
     let upstream = match req
@@ -504,7 +550,18 @@ async fn serve<F: UpstreamFeed>(req: Req, feed: F, scope: Option<Scope>) -> Resp
         .await
     {
         Ok(upstream) => upstream,
-        Err(e) => return req.problem(&e, scope),
+        Err(e) => {
+            // A 403 on a `read` call ends the session, so `problem` keeps that case.
+            let ended = matches!(e, DaemonError::Forbidden) && scope == Some(Scope::Read);
+            if wants_event_stream(&req.headers)
+                && !ended
+                && let Some(text) = refusal_text::<F>(&e)
+            {
+                drop(slot);
+                return one_shot(text);
+            }
+            return req.problem(&e, scope);
+        }
     };
     let link = PanelLink {
         app: req.state.clone(),
@@ -562,6 +619,15 @@ struct InvalidFilter;
 
 fn invalid_filter() -> Response {
     respond(&FilterError, StatusCode::BAD_REQUEST)
+}
+
+/// The stream route's refusal of a bad filter: the status line for an `EventSource`, the 400 page
+/// for everyone else.
+fn invalid_filter_for(req: &Req) -> Response {
+    if wants_event_stream(&req.headers) {
+        return one_shot("This filter is not valid.");
+    }
+    invalid_filter()
 }
 
 /// Turns the browser's query string into the query the panel is willing to forward.
@@ -747,7 +813,7 @@ pub async fn access_stream(req: Req, Path(name): Path<String>) -> Response {
         Err(r) => return *r,
     };
     let Ok(filter) = access_filter(req.uri.query()) else {
-        return invalid_filter();
+        return invalid_filter_for(&req);
     };
     serve(req, AccessFeed::new(name, filter), APPS_ACCESS.scope).await
 }

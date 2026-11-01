@@ -154,7 +154,7 @@ value (look in `podman logs` for the panel container). Empty values count as uns
   Podman does not answer the section says "Resource data unavailable", and a failing stats call never breaks the apps
   list or the rest of the app page.
 - Events are polled from the daemon every few seconds and pushed to the page as server-sent events; a reconnect resumes
-  where it stopped. A session may hold at most four live streams.
+  where it stopped. A session may hold at most four live streams. A live view that cannot start (too many streams, no access, a daemon error) shows a short fixed message in its section instead of staying empty.
 - The panel never decides access itself: a `403` from the daemon is the answer.
 
 ## Login and sessions
