@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use http_body_util::Empty;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::de::DeserializeOwned;
 use weglarka_api::{ApiError, Endpoint, ErrorCode, Method};
 use weglarka_model::admin_auth::Scope;
@@ -99,7 +100,7 @@ impl Call {
         self
     }
 
-    /// Adds `?name=value` (percent-encoded).
+    /// Adds `?name=value` (value percent-encoded, `/` and RFC 3986 unreserved characters kept).
     pub fn query(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.query.push((name, value.into()));
         self
@@ -136,16 +137,32 @@ impl Call {
             )));
         }
         if !self.query.is_empty() {
-            let mut q = url::form_urlencoded::Serializer::new(String::new());
-            for (name, value) in &self.query {
-                q.append_pair(name, value);
-            }
             path.push('?');
-            path.push_str(&q.finish());
+            for (i, (name, value)) in self.query.iter().enumerate() {
+                if i > 0 {
+                    path.push('&');
+                }
+                path.push_str(name);
+                path.push('=');
+                // A space stays `+` as before (form encoding); a literal `+` is `%2B`.
+                for chunk in utf8_percent_encode(value, QUERY_VALUE) {
+                    path.push_str(&chunk.replace("%20", "+"));
+                }
+            }
         }
         Ok(path)
     }
 }
+
+/// Query values keep RFC 3986 unreserved characters and `/` as they are; the daemon's strict
+/// parsers (`AccessQuery::parse`) reject `%`, so `/` must not become `%2F`. Everything else
+/// (`&`, `=`, `%`, `+`, `#`, space, non-ASCII) is encoded.
+const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
 
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -282,6 +299,25 @@ mod tests {
             .param("name", "my-app.1")
             .query("since", "a b&c");
         assert_eq!(call.target().unwrap(), "/v1/apps/my-app.1?since=a+b%26c");
+    }
+
+    #[test]
+    fn target_keeps_slash_and_encodes_the_rest() {
+        let target = |v: &str| {
+            Call::new(&weglarka_api::endpoints::APPS_LIST)
+                .query("path", v)
+                .target()
+                .unwrap()
+        };
+        assert_eq!(target("/"), "/v1/apps?path=/");
+        assert_eq!(target("/a/b-c._~"), "/v1/apps?path=/a/b-c._~");
+        assert_eq!(target("&"), "/v1/apps?path=%26");
+        assert_eq!(target("="), "/v1/apps?path=%3D");
+        assert_eq!(target("%"), "/v1/apps?path=%25");
+        assert_eq!(target(" "), "/v1/apps?path=+");
+        assert_eq!(target("+"), "/v1/apps?path=%2B");
+        assert_eq!(target("#"), "/v1/apps?path=%23");
+        assert_eq!(target("ż"), "/v1/apps?path=%C5%BC");
     }
 
     #[test]

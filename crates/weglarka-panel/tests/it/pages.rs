@@ -1242,7 +1242,7 @@ async fn the_daemon_gets_only_the_reencoded_query_with_follow() {
     assert_eq!(bearer(&opens[0]), "tok-admin");
     assert_eq!(
         opens[0].query.as_deref(),
-        Some("follow=true&tail=100&status=5xx&method=POST&path=%2Fapi")
+        Some("follow=true&tail=100&status=5xx&method=POST&path=/api")
     );
 
     // An explicit tail is kept (bounded by the parser), without a filter nothing else is sent.
