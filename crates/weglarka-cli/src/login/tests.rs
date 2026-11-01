@@ -21,6 +21,7 @@ impl Provider {
         self.answers.lock().unwrap().push_back(Ok(HttpResponse {
             status,
             body: body.as_bytes().to_vec(),
+            retry_after: None,
         }));
         self
     }
@@ -118,7 +119,7 @@ fn signed_in(store: &Store, expires: u64, refresh: Option<&str>) {
 async fn no_wait(_: Duration) {}
 
 async fn run_login(provider: &Provider, store: &Store) -> Result<Session, CliError> {
-    device_login(provider, store, &request(), 1_000, no_wait, |_| {}).await
+    device_login(provider, store, &request(), 1_000, no_wait, |_| {}, |_| {}).await
 }
 
 #[tokio::test]
@@ -143,6 +144,7 @@ async fn login_waits_through_pending_and_stores_the_tokens() {
             async {}
         },
         |d| *shown.lock().unwrap() = format!("{} {}", d.user_code, d.verification_uri),
+        |_| {},
     )
     .await
     .unwrap();
@@ -173,6 +175,65 @@ async fn login_waits_through_pending_and_stores_the_tokens() {
             .contains("audience=https%3A%2F%2Fadmin.example.com%2Fapi%2F")
     );
     assert!(requests[2].1.contains("device_code=DEVCODE"));
+}
+
+#[tokio::test]
+async fn login_keeps_polling_through_rate_limiting() {
+    let provider = Provider::default();
+    provider
+        .say(200, &discovery(true, false))
+        .say(200, DEVICE)
+        .say(429, "")
+        .say(429, "")
+        .say(400, r#"{"error":"authorization_pending"}"#)
+        .say(503, "")
+        .say(200, TOKENS);
+    let (_dir, store) = store();
+    let waits = Mutex::new(Vec::new());
+    let notes = Mutex::new(Vec::new());
+    let session = device_login(
+        &provider,
+        &store,
+        &request(),
+        1_000,
+        |d| {
+            waits.lock().unwrap().push(d.as_secs());
+            async {}
+        },
+        |_| {},
+        |line| notes.lock().unwrap().push(line.to_owned()),
+    )
+    .await
+    .unwrap();
+    assert!(session.refreshable);
+    // Each throttled answer lengthens the pace by five seconds and the pace never shrinks back.
+    assert_eq!(*waits.lock().unwrap(), [5, 10, 15, 15, 20]);
+    // One note per streak: the 429 pair, then (after a pending poll) the 503.
+    let notes = notes.lock().unwrap();
+    assert_eq!(notes.len(), 2);
+    for note in notes.iter() {
+        assert!(note.contains("rate limiting"));
+        assert!(!note.contains("DEVCODE") && !note.contains("ACCESS1"));
+    }
+    // The token is stamped with the real time spent waiting (5 + 10 + 15 + 15 + 20).
+    assert_eq!(
+        store.read().unwrap().hosts[HOST].access_expires,
+        1_065 + 900
+    );
+}
+
+#[tokio::test]
+async fn rate_limiting_cannot_outlast_the_code() {
+    let provider = Provider::default();
+    provider.say(200, &discovery(true, false)).say(
+        200,
+        r#"{"device_code":"D","user_code":"U","verification_uri":"https://auth.example.com/device","expires_in":10,"interval":5}"#,
+    );
+    provider.say(429, "").say(429, "");
+    let (_dir, store) = store();
+    let err = run_login(&provider, &store).await.unwrap_err();
+    assert!(err.message.contains("expired"));
+    assert!(store.read().unwrap().hosts.is_empty());
 }
 
 #[tokio::test]
