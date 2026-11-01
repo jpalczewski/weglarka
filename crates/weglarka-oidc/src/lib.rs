@@ -83,6 +83,9 @@ pub(crate) fn status_error(status: u16) -> Error {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The raw `Retry-After` header value, if the answer carried one (kept as text: the device
+    /// grant parses only the delta-seconds form and ignores anything else).
+    pub retry_after: Option<String>,
 }
 
 /// How bytes reach the provider. Implementations enforce the `limit` while reading (a lying
@@ -152,6 +155,15 @@ pub(crate) mod testing {
             self.answers.lock().unwrap().push(Ok(HttpResponse {
                 status,
                 body: body.as_bytes().to_vec(),
+                retry_after: None,
+            }));
+        }
+
+        pub fn push_with_retry_after(&self, status: u16, body: &str, retry_after: &str) {
+            self.answers.lock().unwrap().push(Ok(HttpResponse {
+                status,
+                body: body.as_bytes().to_vec(),
+                retry_after: Some(retry_after.to_owned()),
             }));
         }
     }

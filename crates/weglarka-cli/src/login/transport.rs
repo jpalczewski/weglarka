@@ -218,6 +218,12 @@ where
         .await
         .map_err(|e| network(&format!("the request failed: {e}")))?;
     let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() <= 64)
+        .map(str::to_owned);
     // `Limited` stops reading at the cap, so a lying `Content-Length` (or a endless chunked
     // stream) cannot make the CLI allocate more.
     let body = Limited::new(response.into_body(), limit)
@@ -228,6 +234,7 @@ where
     Ok(HttpResponse {
         status,
         body: body.to_vec(),
+        retry_after,
     })
 }
 

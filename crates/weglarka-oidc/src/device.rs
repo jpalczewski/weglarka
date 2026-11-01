@@ -57,6 +57,9 @@ pub enum DevicePoll {
     Approved(TokenSet),
     /// Not yet; ask again after the (possibly lengthened) `interval`.
     Pending { interval: Duration },
+    /// The provider is rate limiting the polls (HTTP 429 or 503): keep waiting, but at least
+    /// `interval`. Kept apart from `Pending` so the caller can tell the person why it is slow.
+    Throttled { interval: Duration },
     /// The person said no.
     Denied,
     /// The device code lapsed.
@@ -144,7 +147,26 @@ pub async fn poll_device_token<T: Transport>(
             _ => Err(status_error(400)),
         };
     }
+    if matches!(response.status, 429 | 503) {
+        // Providers that regulate polling (Authelia) lengthen the penalty on every further
+        // rejected request, so give up neither the login nor the pace: wait and ask later.
+        let wanted =
+            retry_after_delta(response.retry_after.as_deref()).unwrap_or(interval + SLOW_DOWN_STEP);
+        return Ok(DevicePoll::Throttled {
+            interval: wanted.max(interval).min(MAX_INTERVAL),
+        });
+    }
     Err(status_error(response.status))
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110 10.2.3). An HTTP-date or anything malformed is
+/// ignored, as is a value with a sign, a fraction or whitespace inside.
+fn retry_after_delta(value: Option<&str>) -> Option<Duration> {
+    let digits = value?.trim();
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -224,5 +246,66 @@ mod tests {
         };
         assert_eq!(tokens.refresh.unwrap().expose(), "r");
         assert!(script.seen.lock().unwrap()[0].2.contains("device_code=dc"));
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_means_keep_waiting_more_slowly() {
+        let script = Script::default();
+        script.push(429, "");
+        script.push_with_retry_after(429, "", "30");
+        script.push_with_retry_after(429, "", "99999");
+        script.push_with_retry_after(429, "", "2");
+        script.push_with_retry_after(429, "", "Wed, 21 Oct 2026 07:28:00 GMT");
+        script.push_with_retry_after(429, "", "-5");
+        script.push(503, "<html>");
+        script.push(
+            200,
+            r#"{"access_token":"a","token_type":"Bearer","refresh_token":"r"}"#,
+        );
+        let code = Secret::new("dc");
+        let url = endpoint();
+        let poll = |i| poll_device_token(&script, &url, "cli", &code, i);
+        let secs = Duration::from_secs;
+        let throttled = |p: DevicePoll| match p {
+            DevicePoll::Throttled { interval } => interval,
+            other => panic!("expected throttling, got {other:?}"),
+        };
+        // No header: the slow_down step.
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(30));
+        // A huge value is clamped so the caller still checks its deadline.
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), MAX_INTERVAL);
+        // Never shorter than the current interval.
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(5));
+        // An HTTP-date or a malformed value falls back to the step.
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        assert!(matches!(
+            poll(secs(5)).await.unwrap(),
+            DevicePoll::Approved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn other_failures_stay_errors() {
+        let script = Script::default();
+        for status in [401, 403, 404, 500, 502] {
+            script.push(status, "");
+        }
+        let code = Secret::new("dc");
+        let url = endpoint();
+        for status in [401, 403, 404] {
+            assert!(matches!(
+                poll_device_token(&script, &url, "cli", &code, MIN_INTERVAL).await,
+                Err(Error::Refused(s)) if s == status
+            ));
+        }
+        for status in [500, 502] {
+            assert!(matches!(
+                poll_device_token(&script, &url, "cli", &code, MIN_INTERVAL).await,
+                Err(Error::ProviderFailed(s)) if s == status
+            ));
+        }
     }
 }

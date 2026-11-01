@@ -108,6 +108,7 @@ pub async fn login(json: bool, host: Option<&str>, args: LoginArgs) -> Result<i3
         now_secs(),
         tokio::time::sleep,
         show_instructions,
+        |line| eprintln!("{line}"),
     )
     .await?;
     emit(json, &session, || {
@@ -135,6 +136,7 @@ async fn device_login<T, F>(
     now: u64,
     sleep: impl Fn(Duration) -> F,
     show: impl FnOnce(&DeviceAuthorization),
+    note: impl Fn(&str),
 ) -> Result<Session, CliError>
 where
     T: Transport,
@@ -174,9 +176,11 @@ where
 
     let mut interval = auth.interval;
     let mut waited = Duration::ZERO;
+    let mut throttled = false;
     let tokens = loop {
-        sleep(interval).await;
-        waited += interval;
+        let slept = interval;
+        sleep(slept).await;
+        waited += slept;
         match weglarka_oidc::poll_device_token(
             transport,
             &endpoints.token,
@@ -188,7 +192,19 @@ where
         .map_err(provider_error)?
         {
             DevicePoll::Approved(tokens) => break tokens,
-            DevicePoll::Pending { interval: next } => interval = next,
+            DevicePoll::Pending { interval: next } => {
+                interval = next;
+                throttled = false;
+            }
+            DevicePoll::Throttled { interval: next } => {
+                interval = next;
+                // One note per streak: the person is told once, the log is not flooded.
+                if !std::mem::replace(&mut throttled, true) {
+                    note(
+                        "The identity provider is rate limiting the sign-in; still waiting, polling more slowly…",
+                    );
+                }
+            }
             DevicePoll::Denied => {
                 return Err(CliError::internal("the sign-in was denied"));
             }

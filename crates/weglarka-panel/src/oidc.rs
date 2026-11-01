@@ -81,7 +81,11 @@ impl ReqwestTransport {
         let body = read_capped(response, limit)
             .await
             .map_err(|e| weglarka_oidc::Error::Network(e.to_string()))?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            retry_after: None,
+        })
     }
 }
 
