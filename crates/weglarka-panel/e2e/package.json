@@ -1,0 +1,15 @@
+{
+  "name": "weglarka-panel-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser tests of the panel's client-side behaviour (Playwright on Bun).",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "scripts": {
+    "test": "bun --bun playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

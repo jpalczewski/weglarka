@@ -7,6 +7,8 @@ paths:
   - ".github/scripts/*.sh"
   - "scripts/acceptance.sh"
   - ".github/workflows/ci.yml"
+  - "crates/weglarka-panel/e2e/**"
+  - "crates/weglarka-panel/assets/app.js"
 ---
 
 # Testing
@@ -38,6 +40,13 @@ paths:
   The subuid pool comes from the server (`PodmanClient::subuid_pool`), and `version_is_podman_6` is only enforced with
   `WEGLARKA_PODMAN_EXPECT_V6=1` (CI sets it), so the suite can run against a remote libpod socket; tests that read a
   volume mountpoint on the runner's filesystem still need the Podman host to be local.
+- **Browser tests of the panel** (`crates/weglarka-panel/e2e/`, CI job `panel-e2e`): Playwright on the **Bun** runtime,
+  versions pinned exactly (`package.json`, `bun.lock`). Run `bun install && bun run test` there; the script is
+  `bun --bun playwright test` because without `--bun` Playwright's shebang silently runs on Node (a test asserts the
+  runtime). `fixture.ts` serves the real template section, `assets/app.js`, the vendored htmx and the panel's CSP, so
+  a change to `app.js` or the polled markup needs a browser test there; the Rust side of a fragment stays in
+  `tests/it/`. In agent containers the preinstalled Chromium is found through `PLAYWRIGHT_BROWSERS_PATH`; this is the
+  only JavaScript tooling in the repo (Cargo's `[workspace.dependencies]` rule is about Rust crates).
 - Static build: `cargo build --release --target x86_64-unknown-linux-musl` (CI: job `musl`).
 - **Tests run in CI the way production does:** the smoke test starts the daemon from the quadlet's arguments (no
   `/etc/passwd`, no `/etc/subuid` in the `scratch` image).
@@ -46,7 +55,7 @@ paths:
   `.github/scripts/smoke-image.sh` and `smoke-quadlet.sh` (arguments from `platform install`).
 - PRs build with the `ci` profile (thin LTO); `main` and tags with the full `release` (`docs/decisions/0008`). A PR
   changing only documentation (`docs/**`, `*.md`, `.gitignore`) runs no builds — the job `changes` skips
-  `check`/`nginx-e2e`/`musl`/`podman-tests`/`smoke-behind`/`smoke-edge`; `changes` and `pr-title` always run. A push to
+  `check`/`nginx-e2e`/`musl`/`podman-tests`/`smoke-behind`/`smoke-edge`/`panel-e2e`; `changes` and `pr-title` always run. A push to
   `main` with documentation only runs neither CI nor Release (`paths-ignore`) — the image is not rebuilt then; `v*` tags
   always build.
 

@@ -111,6 +111,39 @@ jobs:
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
 
+  # The panel's client-side scripts (crates/weglarka-panel/assets/app.js) in a real browser: Playwright
+  # on the Bun runtime against a fixture server that serves the real template section, app.js and the
+  # vendored htmx under the panel's CSP (crates/weglarka-panel/e2e). No Rust build, so it runs in parallel.
+  panel-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/weglarka-panel/e2e
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Cache the Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/weglarka-panel/e2e/bun.lock') }}
+      # The browser itself is cached; its system libraries are installed on every run.
+      - run: bun --bun playwright install --with-deps chromium
+      - run: bun run test
+        env:
+          CI: "true"
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: panel-e2e-traces
+          path: crates/weglarka-panel/e2e/test-results
+          retention-days: 7
+
   # The Authelia files weglarka-identity renders (#42 P3) must pass the provider's own validator: a renamed or
   # misspelled field shows up here, not in production. The image tag is pinned exactly (with its digest), so a
   # new Authelia release changes nothing until someone bumps it on purpose. The fixtures come from the same
