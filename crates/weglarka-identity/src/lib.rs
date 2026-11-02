@@ -52,6 +52,15 @@ pub enum RenderError {
     InvalidPath(String, String, &'static str),
 }
 
+/// The name Authelia uses for a factor policy, in access rules and on OIDC clients alike.
+fn factor_policy(policy: weglarka_model::identity::AuthorizationPolicy) -> &'static str {
+    use weglarka_model::identity::AuthorizationPolicy;
+    match policy {
+        AuthorizationPolicy::OneFactor => "one_factor",
+        AuthorizationPolicy::TwoFactor => "two_factor",
+    }
+}
+
 fn to_text<T: serde::Serialize>(value: &T) -> String {
     // Maps and structs with string keys cannot fail to serialize.
     let mut text = serde_json::to_string_pretty(value).expect("string-keyed JSON");

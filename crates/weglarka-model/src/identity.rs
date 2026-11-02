@@ -159,8 +159,7 @@ pub const OWNED_SECTIONS: &[&str] = &[
 ///
 /// A line scan, not a YAML parse: it follows the nesting of `key:` lines by indentation, which is
 /// enough to find a top-level `access_control:` and `identity_providers: oidc: clients:` (or
-/// `authorization_policies:`) in the
-/// block style the provider documents. Comments, list items and flow-style mappings are ignored, so
+/// `authorization_policies:`) in the block style the provider documents. Comments, list items and flow-style mappings are ignored, so
 /// it can miss a section written some unusual way but never reports one that is not there.
 pub fn owned_sections_in(yaml: &str) -> Vec<&'static str> {
     let mut stack: Vec<(usize, &str)> = Vec::new();
@@ -594,8 +593,9 @@ pub fn valid_secret_digest(digest: &str) -> bool {
         })
 }
 
-/// Checks an `allowed_groups` list; `label` names the field in the message.
-fn check_allowed_groups(groups: &[String], label: &str) -> Result<(), String> {
+/// Checks a list of group names (`ingress.auth_groups`, `allowed_groups`): each a valid group, no
+/// duplicates. `label` names the field in the message.
+fn check_group_list(groups: &[String], label: &str) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for group in groups {
         if !valid_auth_group(group) {
@@ -678,7 +678,7 @@ fn validate_oidc(spec: &AppSpec, oidc: &OidcClientSpec) -> Result<(), String> {
         return Err("needs at least one domain on the app".to_owned());
     }
     check_common(&oidc.into())?;
-    check_allowed_groups(&oidc.allowed_groups, "oidc.allowed_groups")?;
+    check_group_list(&oidc.allowed_groups, "oidc.allowed_groups")?;
     for uri in &oidc.redirect_uris {
         // Already shaped by `check_common`; an app may only register callbacks on its own hosts.
         let host = https_host(uri).map_err(str::to_owned)?;
@@ -784,17 +784,7 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
         }
         return Ok(());
     }
-    let mut seen = BTreeSet::new();
-    for group in &ingress.auth_groups {
-        if !valid_auth_group(group) {
-            return Err(format!(
-                "invalid ingress.auth_groups entry {group:?}: expected 1-128 chars of [A-Za-z0-9._-]"
-            ));
-        }
-        if !seen.insert(group) {
-            return Err(format!("duplicate ingress.auth_groups entry {group:?}"));
-        }
-    }
+    check_group_list(&ingress.auth_groups, "ingress.auth_groups")?;
     let mut seen = BTreeSet::new();
     for path in &ingress.auth_exempt_paths {
         check_skip_path(path)
@@ -835,7 +825,7 @@ pub fn validate_external_client(id: &ClientId, client: &ExternalClientSpec) -> R
         ));
     }
     check_common(&ClientCommon::from(client)).map_err(fail)?;
-    check_allowed_groups(&client.allowed_groups, "allowed_groups").map_err(fail)?;
+    check_group_list(&client.allowed_groups, "allowed_groups").map_err(fail)?;
     match (&client.secret_digest, client.public) {
         (Some(_), true) => {
             return Err(fail(

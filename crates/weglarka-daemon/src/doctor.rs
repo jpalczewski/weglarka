@@ -2300,7 +2300,7 @@ fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChec
             "identity.base_config",
             CheckStatus::Warn,
             format!(
-                "the base config sets sections that the generated config replaces: {}",
+                "the base config sets sections that Węglarka generates (a copy is replaced or merged with the generated one): {}",
                 found.join(", ")
             ),
             Some("delete them from the base file (see docs/guides/identity-provider.md, \"What Węglarka owns\")"),

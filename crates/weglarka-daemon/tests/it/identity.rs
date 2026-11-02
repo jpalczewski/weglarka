@@ -433,6 +433,11 @@ async fn allowed_groups_become_an_authorization_policy_in_the_generated_file() {
     bad["oidc"]["allowed_groups"] = json!(["has space"]);
     let (s, v) = post_app(&h, "other", bad).await;
     assert!(s.is_client_error(), "{s} {v}");
+    // Refused for the group, not for anything else the copied spec might collide on.
+    assert!(
+        v.to_string().contains("invalid oidc.allowed_groups entry"),
+        "{s} {v}"
+    );
     h.running.stop().await;
 }
 

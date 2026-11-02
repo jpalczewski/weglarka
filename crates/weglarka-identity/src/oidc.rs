@@ -10,7 +10,7 @@ use weglarka_model::identity::{
     OidcClientSpec, Pkce, TokenEndpointAuthMethod, valid_auth_group, valid_secret_digest,
 };
 
-use crate::{RenderError, to_text};
+use crate::{RenderError, factor_policy, to_text};
 
 /// An app's client plus the stored digest of its secret (`<instance>.oidc-client-digest`, P1). The
 /// client id is the instance name. `secret_digest` is `None` exactly for a public client.
@@ -219,10 +219,7 @@ pub fn render_oidc_clients(
                 grant_types.push("refresh_token");
             }
         }
-        let factor = match c.authorization_policy {
-            AuthorizationPolicy::OneFactor => "one_factor",
-            AuthorizationPolicy::TwoFactor => "two_factor",
-        };
+        let factor = factor_policy(c.authorization_policy);
         // A group gate becomes a policy of its own: deny by default, one rule with every group as an
         // alternative. Re-checked here so a bad name fails closed instead of reaching the file.
         let authorization_policy = if c.allowed_groups.is_empty() {
