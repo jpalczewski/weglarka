@@ -22,4 +22,10 @@ publish operators cannot pull it anonymously: `docker pull`/`podman pull` fails 
    podman pull ghcr.io/jpalczewski/weglarka-panel:latest
    ```
 
-Repeat the visibility check for any new image the release workflow starts publishing.
+Repeat the visibility check for any new image the release workflow starts publishing. The release-set repository
+`ghcr.io/jpalczewski/weglarka-releases` is an OCI artifact repository, not an image, but GHCR creates it private on
+first push in the same way. The runtime user pulls it without credentials, so before the first coordinated update:
+
+1. Make `weglarka-releases` public (Packages → `weglarka-releases` → Package settings → Change visibility → Public).
+2. Keep its **Manage Actions access** link so `GITHUB_TOKEN` with `packages: write` can publish later sets.
+3. Verify anonymously that both the channel manifest and the immutable `set-<channel>-<sequence>` tag resolve.

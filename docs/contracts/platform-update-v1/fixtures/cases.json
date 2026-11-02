@@ -1,0 +1,93 @@
+[
+  {
+    "file": "release-valid.json",
+    "result": "valid_descriptor"
+  },
+  {
+    "file": "release-unsupported-format.json",
+    "result": "UnsupportedFormat"
+  },
+  {
+    "file": "release-invalid-digest.json",
+    "result": "InvalidDigest"
+  },
+  {
+    "file": "release-uppercase-digest.json",
+    "result": "InvalidDigest"
+  },
+  {
+    "file": "release-unsupported-target.json",
+    "result": "UnsupportedTarget"
+  },
+  {
+    "file": "release-unlisted-panel.json",
+    "result": "IncompatibleSelectedPanel"
+  },
+  {
+    "file": "release-unexpected-image-path.json",
+    "result": "UnexpectedImagePath"
+  },
+  {
+    "file": "release-foreign-host-image.json",
+    "result": "HostImageMismatch"
+  },
+  {
+    "file": "release-missing-sequence.json",
+    "result": "MissingField"
+  },
+  {
+    "file": "release-duplicate-key.json",
+    "result": "DuplicateField"
+  },
+  {
+    "file": "release-duplicate-nested.json",
+    "result": "DuplicateField"
+  },
+  {
+    "file": "release-wrong-channel.json",
+    "result": "ChannelMismatch",
+    "context": {
+      "channel": "stable"
+    }
+  },
+  {
+    "file": "oci-manifest-valid.json",
+    "result": "valid_blobs",
+    "layer_file": "release-valid.json",
+    "config_file": "oci-empty-config.json"
+  },
+  {
+    "file": "oci-manifest-extra-layer.json",
+    "result": "ExtraLayer"
+  },
+  {
+    "file": "oci-manifest-foreign-url.json",
+    "result": "ForeignUrl"
+  },
+  {
+    "file": "oci-manifest-wrong-layer-type.json",
+    "result": "LayerMediaTypeMismatch"
+  },
+  {
+    "file": "oci-manifest-wrong-artifact-type.json",
+    "result": "UnsupportedArtifactType"
+  },
+  {
+    "file": "oci-manifest-index.json",
+    "result": "NotAnImageManifest"
+  },
+  {
+    "file": "oci-manifest-nonempty-config.json",
+    "result": "NonEmptyConfig",
+    "config_file": "oci-nonempty-config.json"
+  },
+  {
+    "file": "oci-manifest-size-mismatch.json",
+    "result": "SizeMismatch",
+    "layer_file": "release-valid.json"
+  },
+  {
+    "file": "oci-manifest-wrong-config-type.json",
+    "result": "ConfigMediaTypeMismatch"
+  }
+]
