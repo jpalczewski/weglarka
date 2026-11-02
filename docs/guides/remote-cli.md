@@ -78,9 +78,10 @@ the file like an SSH key. Tokens are never printed, logged or put in an error me
 minutes (the provider's `lifespans.access_token`, see [admin API tokens](admin-api-tokens.md)); it is refreshed on use under a
 file lock, so two commands running at once do not spend the same rotating refresh token. If the provider refuses a
 refresh with `400` or `401` (the grant is revoked, expired or rotated elsewhere) the stored session is deleted and the
-CLI asks you to sign in again. Any other failure keeps it: a provider that is unreachable, answers `408`, `429` or `503`
-(rate limiting or a short outage; the command fails with *the identity provider asked to retry later* and, when the
-provider sent `Retry-After`, how long to wait), or a proxy in front of it that answers another 4xx.
+CLI asks you to sign in again; so is an answer that is not a usable token response. Any other failure keeps it: a
+provider that is unreachable, answers `408`, `429` or `503` (rate limiting or a short outage; the command fails with
+*the identity provider asked to retry later* and, when the provider sent `Retry-After`, how long to wait), or any other
+error status, such as a proxy in front of it answering another 4xx.
 
 `logout` deletes the local copy first, then tells the provider to revoke the refresh token (when its discovery document
 lists a `revocation_endpoint`); a provider that is down never leaves tokens behind.

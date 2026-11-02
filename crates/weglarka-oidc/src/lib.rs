@@ -81,6 +81,14 @@ impl Error {
     pub fn is_definitive(&self) -> bool {
         matches!(self, Self::Refused(400 | 401) | Self::BadResponse(_))
     }
+
+    /// How long the provider asked to be left alone, when it said so ([`Error::Throttled`]).
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Throttled { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Statuses that mean "ask again later" (RFC 9110 15.5.9, 15.6.4; RFC 6585 4).

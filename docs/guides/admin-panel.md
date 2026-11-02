@@ -166,8 +166,10 @@ value (look in `podman logs` for the panel container). Empty values count as uns
    `nonce`) and creates a session with a fresh id. The browser receives only that id in `__Host-weglarka-session`:
    `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`.
 3. The access and refresh tokens stay in the panel's memory. The panel refreshes the access token when less than a minute
-   is left; if the provider refuses the refresh (`400` or `401`), the session ends. A rate limit (`429`), a short outage
-   (`408`, `503`) or any other failure keeps the session while the current token still works and retries 10 seconds later. Keep the provider's access token lifetime short (15
+   is left; if the provider refuses the refresh (`400` or `401`) or its answer is not a usable token response, the
+   session ends. A rate limit (`429`), a short outage (`408`, `503`), any other error status or an unreachable provider
+   keeps the session while the current token still works and retries 10 seconds later, or after the provider's
+   `Retry-After` when that is longer. Keep the provider's access token lifetime short (15
    minutes at most, see [admin API tokens](admin-api-tokens.md)); a stream ends with its token and reconnects with a
    fresh one.
 4. A session ends after `PANEL_SESSION_IDLE_SECS` without a request or `PANEL_SESSION_MAX_SECS` after login, whichever

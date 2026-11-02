@@ -17,22 +17,21 @@ struct Provider {
 }
 
 impl Provider {
-    fn say(&self, status: u16, body: &str) -> &Self {
+    fn answer(&self, status: u16, body: &str, retry_after: Option<&str>) -> &Self {
         self.answers.lock().unwrap().push_back(Ok(HttpResponse {
             status,
             body: body.as_bytes().to_vec(),
-            retry_after: None,
+            retry_after: retry_after.map(str::to_owned),
         }));
         self
     }
 
+    fn say(&self, status: u16, body: &str) -> &Self {
+        self.answer(status, body, None)
+    }
+
     fn say_later(&self, status: u16, retry_after: &str) -> &Self {
-        self.answers.lock().unwrap().push_back(Ok(HttpResponse {
-            status,
-            body: Vec::new(),
-            retry_after: Some(retry_after.to_owned()),
-        }));
-        self
+        self.answer(status, "", Some(retry_after))
     }
 
     fn fail(&self) -> &Self {

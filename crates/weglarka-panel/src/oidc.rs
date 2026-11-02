@@ -55,6 +55,14 @@ impl OidcError {
     pub fn is_definitive(&self) -> bool {
         matches!(self, Self::Provider(e) if e.is_definitive())
     }
+
+    /// The provider's `Retry-After`, when it rate limited the request.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider(e) => e.retry_after(),
+            Self::IdToken(_) => None,
+        }
+    }
 }
 
 impl From<BodyError> for OidcError {
@@ -78,13 +86,20 @@ impl ReqwestTransport {
             .await
             .map_err(|e| weglarka_oidc::Error::Network(error_chain(&e)))?;
         let status = response.status().as_u16();
+        // Kept as text and length-capped; `weglarka-oidc` parses only strict delta-seconds.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.len() <= 64)
+            .map(str::to_owned);
         let body = read_capped(response, limit)
             .await
             .map_err(|e| weglarka_oidc::Error::Network(e.to_string()))?;
         Ok(HttpResponse {
             status,
             body,
-            retry_after: None,
+            retry_after,
         })
     }
 }
