@@ -867,3 +867,67 @@ text: \"access_control: inline\"\n";
     assert!(owned_sections_in(yaml).is_empty());
     assert!(owned_sections_in("").is_empty());
 }
+
+// --- allowed_groups (#446) ----------------------------------------------------------------------
+
+#[test]
+fn allowed_groups_of_an_app_client_are_validated() {
+    lexical(&oidc(
+        "allowed_groups = [\"viewers\", \"weglarka-admins\", \"a.b_c\"]",
+    ))
+    .unwrap();
+    for bad in ["", "has space", "a/b", "a:b", "ł"] {
+        let err = lexical_err(&oidc(&format!("allowed_groups = [{bad:?}]")));
+        assert!(
+            err.contains("invalid oidc.allowed_groups entry"),
+            "{bad:?}: {err}"
+        );
+    }
+    let err = lexical_err(&oidc("allowed_groups = [\"g\", \"g\"]"));
+    assert!(
+        err.contains("duplicate oidc.allowed_groups entry \"g\""),
+        "{err}"
+    );
+}
+
+#[test]
+fn allowed_groups_of_an_external_client_are_validated() {
+    let mut c = external();
+    c.allowed_groups = vec!["developers".into(), "ops".into()];
+    validate_external_client(&id("forge"), &c).unwrap();
+    c.allowed_groups = vec!["bad group".into()];
+    let err = validate_external_client(&id("forge"), &c).unwrap_err();
+    assert!(
+        err.contains("oidc_clients.forge") && err.contains("allowed_groups"),
+        "{err}"
+    );
+    c.allowed_groups = vec!["g".into(), "g".into()];
+    let err = validate_external_client(&id("forge"), &c).unwrap_err();
+    assert!(err.contains("duplicate allowed_groups entry"), "{err}");
+}
+
+#[test]
+fn allowed_groups_are_outside_the_spec_hash_and_omitted_when_empty() {
+    let digest = crate::app::Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+    let plain = oidc("");
+    let gated = oidc("allowed_groups = [\"viewers\", \"admins\"]");
+    assert_eq!(
+        gated.oidc.as_ref().unwrap().allowed_groups,
+        ["viewers", "admins"]
+    );
+    assert_eq!(spec_hash(&plain, &digest), spec_hash(&gated, &digest));
+    assert!(
+        !toml::to_string(plain.oidc.as_ref().unwrap())
+            .unwrap()
+            .contains("allowed_groups")
+    );
+}
+
+#[test]
+fn owned_sections_find_authorization_policies() {
+    let yaml = "identity_providers:\n  oidc:\n    authorization_policies:\n      x:\n        default_policy: deny\n";
+    assert_eq!(
+        owned_sections_in(yaml),
+        ["identity_providers.oidc.authorization_policies"]
+    );
+}

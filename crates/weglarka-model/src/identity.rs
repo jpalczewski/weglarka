@@ -149,13 +149,17 @@ pub fn config_sources(command: &[String]) -> Vec<String> {
 /// A section of the provider's configuration that Węglarka generates as a whole file, so a copy in
 /// an operator's base file is silently replaced (#242): the provider replaces lists wholesale with
 /// the last source.
-pub const OWNED_SECTIONS: &[&str] = &["access_control", "identity_providers.oidc.clients"];
+pub const OWNED_SECTIONS: &[&str] = &[
+    "access_control",
+    "identity_providers.oidc.clients",
+    "identity_providers.oidc.authorization_policies",
+];
 
 /// The [`OWNED_SECTIONS`] a base config file (YAML text) still carries, as dotted paths.
 ///
 /// A line scan, not a YAML parse: it follows the nesting of `key:` lines by indentation, which is
-/// enough to find a top-level `access_control:` and `identity_providers: oidc: clients:` in the
-/// block style the provider documents. Comments, list items and flow-style mappings are ignored, so
+/// enough to find a top-level `access_control:` and `identity_providers: oidc: clients:` (or
+/// `authorization_policies:`) in the block style the provider documents. Comments, list items and flow-style mappings are ignored, so
 /// it can miss a section written some unusual way but never reports one that is not there.
 pub fn owned_sections_in(yaml: &str) -> Vec<&'static str> {
     let mut stack: Vec<(usize, &str)> = Vec::new();
@@ -181,6 +185,7 @@ pub fn owned_sections_in(yaml: &str) -> Vec<&'static str> {
         let hit = match path.as_slice() {
             ["access_control"] => Some(OWNED_SECTIONS[0]),
             ["identity_providers", "oidc", "clients"] => Some(OWNED_SECTIONS[1]),
+            ["identity_providers", "oidc", "authorization_policies"] => Some(OWNED_SECTIONS[2]),
             _ => None,
         };
         if let Some(hit) = hit
@@ -281,6 +286,10 @@ pub struct OidcClientSpec {
     pub scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "AuthorizationPolicy::is_default")]
     pub authorization_policy: AuthorizationPolicy,
+    /// Only members of one of these groups may complete the authorization request; anyone else gets
+    /// `access_denied` from the provider. Empty: no group gate (the provider's default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "TokenEndpointAuthMethod::is_default")]
     pub token_endpoint_auth_method: TokenEndpointAuthMethod,
     /// RFC 8707 audiences, matched byte for byte (a trailing slash counts).
@@ -374,6 +383,10 @@ pub struct ExternalClientSpec {
     pub scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "AuthorizationPolicy::is_default")]
     pub authorization_policy: AuthorizationPolicy,
+    /// Only members of one of these groups may complete the authorization request; anyone else gets
+    /// `access_denied` from the provider. Empty: no group gate (the provider's default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_groups: Vec<String>,
     /// Operator-supplied digest of the client secret (argon2id or pbkdf2); required unless
     /// `public`, forbidden with it. Plaintext and bare values are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,6 +593,23 @@ pub fn valid_secret_digest(digest: &str) -> bool {
         })
 }
 
+/// Checks a list of group names (`ingress.auth_groups`, `allowed_groups`): each a valid group, no
+/// duplicates. `label` names the field in the message.
+fn check_group_list(groups: &[String], label: &str) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for group in groups {
+        if !valid_auth_group(group) {
+            return Err(format!(
+                "invalid {label} entry {group:?}: expected 1-128 chars of [A-Za-z0-9._-]"
+            ));
+        }
+        if !seen.insert(group) {
+            return Err(format!("duplicate {label} entry {group:?}"));
+        }
+    }
+    Ok(())
+}
+
 fn check_common(c: &ClientCommon<'_>) -> Result<(), String> {
     if c.redirect_uris.is_empty() && !c.device_flow {
         return Err("redirect_uris needs at least one entry (or device_flow = true)".to_owned());
@@ -648,6 +678,7 @@ fn validate_oidc(spec: &AppSpec, oidc: &OidcClientSpec) -> Result<(), String> {
         return Err("needs at least one domain on the app".to_owned());
     }
     check_common(&oidc.into())?;
+    check_group_list(&oidc.allowed_groups, "oidc.allowed_groups")?;
     for uri in &oidc.redirect_uris {
         // Already shaped by `check_common`; an app may only register callbacks on its own hosts.
         let host = https_host(uri).map_err(str::to_owned)?;
@@ -753,17 +784,7 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
         }
         return Ok(());
     }
-    let mut seen = BTreeSet::new();
-    for group in &ingress.auth_groups {
-        if !valid_auth_group(group) {
-            return Err(format!(
-                "invalid ingress.auth_groups entry {group:?}: expected 1-128 chars of [A-Za-z0-9._-]"
-            ));
-        }
-        if !seen.insert(group) {
-            return Err(format!("duplicate ingress.auth_groups entry {group:?}"));
-        }
-    }
+    check_group_list(&ingress.auth_groups, "ingress.auth_groups")?;
     let mut seen = BTreeSet::new();
     for path in &ingress.auth_exempt_paths {
         check_skip_path(path)
@@ -804,6 +825,7 @@ pub fn validate_external_client(id: &ClientId, client: &ExternalClientSpec) -> R
         ));
     }
     check_common(&ClientCommon::from(client)).map_err(fail)?;
+    check_group_list(&client.allowed_groups, "allowed_groups").map_err(fail)?;
     match (&client.secret_digest, client.public) {
         (Some(_), true) => {
             return Err(fail(

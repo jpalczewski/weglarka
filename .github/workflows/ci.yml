@@ -185,6 +185,13 @@ jobs:
             echo "::error::authelia config validate printed warnings"
             exit 1
           fi
+          # The group-gated clients and their authorization policies (#446).
+          out=$(validate /config/oidc-clients-gated.yml,/config/access-control.yml 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if grep -qi 'warn' <<< "$out"; then
+            echo "::error::authelia config validate printed warnings for oidc-clients-gated.yml"
+            exit 1
+          fi
           # Negative control: a misspelled field must fail, or the validator would prove nothing.
           sed 's/"claims_policy"/"claims_polcy"/' "$conf/oidc-clients.yml" > "$conf/broken.yml"
           if validate /config/broken.yml,/config/access-control.yml >/dev/null 2>&1; then

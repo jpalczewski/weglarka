@@ -24,7 +24,7 @@ paths:
   function with an exhaustive `match` and no wildcard arm; validated newtypes (`MemoryLimit`, `CpuLimit`, `Digest`,
   `InstanceName`) pass through whole; pass-through structs bind every field (`field: _`, no `..`); path and name lists
   the model validates to identifier shapes (`domains`, `paths`, `streaming_paths`, `auth_exempt_paths`,
-  `access_log_skip_paths`, `auth_groups`, `security.tmpfs`, `cap_add/cap_drop`, `group_add`, `aliases`, `scopes`,
+  `access_log_skip_paths`, `auth_groups`, `oidc.allowed_groups`, `security.tmpfs`, `cap_add/cap_drop`, `group_add`, `aliases`, `scopes`,
   `metrics_path` — the `paths` shape, no query or fragment, #364) are shown, as is `metrics_port`; `oidc.redirect_uris`
   and `oidc.audience` lose their query (their path stays visible on purpose: public registration data, a credential there is unsupported). A new free-text field needs an explicit decision
   there, not a pass-through. `ShowAppResponse` carries `redacted: true` whenever this applies, and

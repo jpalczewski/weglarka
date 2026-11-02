@@ -116,6 +116,49 @@ pub fn clients() -> Clients {
     }
 }
 
+/// Group-gated clients (#446): a one-factor app client with two groups, an ungated one next to it, and an
+/// external client with a gate and the default (two-factor) policy. Kept apart from [`clients`] so the
+/// snapshots of the ungated flavours stay as they are.
+pub fn gated_clients() -> Clients {
+    Clients {
+        apps: vec![
+            (
+                name("panel"),
+                oidc(
+                    r#"
+                    redirect_uris = ["https://admin.example.com/auth/callback"]
+                    authorization_policy = "one_factor"
+                    allowed_groups = ["viewers", "admins"]
+                    client_secret = { kind = "env", var = "OIDC_CLIENT_SECRET" }
+                    "#,
+                ),
+                Some(DIGEST),
+            ),
+            (
+                name("wiki"),
+                oidc(
+                    r#"
+                    redirect_uris = ["https://wiki.example.com/callback"]
+                    client_secret = { kind = "env", var = "OIDC_CLIENT_SECRET" }
+                    "#,
+                ),
+                Some(DIGEST),
+            ),
+        ],
+        external: BTreeMap::from([(
+            ClientId::new("forge").unwrap(),
+            external(&format!(
+                r#"
+                name = "Forge"
+                redirect_uris = ["https://git.example.com/user/oauth2/authelia/callback"]
+                allowed_groups = ["developers"]
+                secret_digest = "{DIGEST}"
+                "#
+            )),
+        )]),
+    }
+}
+
 pub struct Forward {
     pub name: InstanceName,
     pub spec: AppSpec,

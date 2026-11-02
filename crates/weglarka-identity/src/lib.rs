@@ -46,8 +46,19 @@ pub enum RenderError {
     GroupsInOpaqueToken(String),
     #[error("{0}: invalid auth group {1:?}")]
     InvalidGroup(String, String),
+    #[error("OIDC client {0:?}: invalid allowed_groups entry {1:?}")]
+    InvalidAllowedGroup(String, String),
     #[error("{0}: invalid path prefix {1:?}: {2}")]
     InvalidPath(String, String, &'static str),
+}
+
+/// The name Authelia uses for a factor policy, in access rules and on OIDC clients alike.
+fn factor_policy(policy: weglarka_model::identity::AuthorizationPolicy) -> &'static str {
+    use weglarka_model::identity::AuthorizationPolicy;
+    match policy {
+        AuthorizationPolicy::OneFactor => "one_factor",
+        AuthorizationPolicy::TwoFactor => "two_factor",
+    }
 }
 
 fn to_text<T: serde::Serialize>(value: &T) -> String {

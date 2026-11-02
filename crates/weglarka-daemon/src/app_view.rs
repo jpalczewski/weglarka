@@ -339,6 +339,7 @@ fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
         redirect_uris,
         scopes,
         authorization_policy,
+        allowed_groups,
         token_endpoint_auth_method,
         audience,
         groups_in_id_token,
@@ -355,6 +356,8 @@ fn read_oidc(oidc: OidcClientSpec) -> OidcClientSpec {
         redirect_uris: redirect_uris.iter().map(|uri| redact_url(uri)).collect(),
         scopes,
         authorization_policy: read_authorization_policy(authorization_policy),
+        // Group names, validated to the same identifier shape as `ingress.auth_groups`.
+        allowed_groups,
         token_endpoint_auth_method: read_token_endpoint_auth_method(token_endpoint_auth_method),
         audience: audience.iter().map(|uri| redact_url(uri)).collect(),
         groups_in_id_token,
@@ -771,6 +774,26 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             assert!(!text.contains(secret), "{secret}");
         }
         insta::assert_json_snapshot!(shown);
+    }
+
+    #[test]
+    fn a_read_caller_sees_the_allowed_groups_of_a_client() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+image = "x:1"
+domains = ["a.example.com"]
+[oidc]
+redirect_uris = ["https://a.example.com/callback"]
+allowed_groups = ["viewers", "admins"]
+client_secret = { kind = "env", var = "OIDC_SECRET" }
+"#,
+        )
+        .expect("spec");
+        let shown = show_response(Access::Redacted, name(), spec, None, None);
+        assert_eq!(
+            shown.spec.oidc.unwrap().allowed_groups,
+            ["viewers", "admins"]
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use weglarka_model::identity::{
     AuthorizationPolicy, issuer_host, valid_auth_group, valid_dns_name,
 };
 
-use crate::{RenderError, to_text};
+use crate::{RenderError, factor_policy, to_text};
 
 /// An app with `ingress.auth = "forward"`, reduced to what the rule needs.
 #[derive(Debug, Clone, Copy)]
@@ -84,10 +84,7 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
         let whole_domain = app.paths.is_empty() || app.paths.iter().any(|p| p == "/");
         let rule = Rule {
             domain: app.domains,
-            policy: match app.policy.unwrap_or_default() {
-                AuthorizationPolicy::OneFactor => "one_factor",
-                AuthorizationPolicy::TwoFactor => "two_factor",
-            },
+            policy: factor_policy(app.policy.unwrap_or_default()),
             subject: app.groups.iter().map(|g| [format!("group:{g}")]).collect(),
             resources: if whole_domain {
                 Vec::new()
