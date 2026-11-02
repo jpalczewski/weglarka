@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "artifactType": "application/vnd.weglarka.release.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22",
+    "size": 7
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.weglarka.release.v1+json",
+      "digest": "sha256:76714f29c286d0861f302fa742215bcbddfa664aeb16f27b3515fdbd391bfcd2",
+      "size": 1526
+    }
+  ]
+}

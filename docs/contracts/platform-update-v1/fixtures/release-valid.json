@@ -1,0 +1,52 @@
+{
+  "format_version": 1,
+  "channel": "stable",
+  "sequence": 42,
+  "revision": "0123456789abcdef0123456789abcdef01234567",
+  "target": {
+    "os": "linux",
+    "architecture": "amd64",
+    "abi": "musl"
+  },
+  "daemon": {
+    "repository": "ghcr.io/example/weglarka",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "0.9.0"
+  },
+  "panel": {
+    "repository": "ghcr.io/example/weglarka-panel",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "version": "0.3.1"
+  },
+  "host_tools": {
+    "repository": "ghcr.io/example/weglarka",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "files": [
+      {
+        "name": "weglarka-daemon",
+        "path": "/usr/local/bin/weglarka-daemon",
+        "version": "0.9.0",
+        "size": 4000000,
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      {
+        "name": "weglarka",
+        "path": "/usr/local/bin/weglarka",
+        "version": "0.8.0",
+        "size": 3000000,
+        "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ]
+  },
+  "compatibility": {
+    "host_protocol": 1,
+    "state_read": [
+      17
+    ],
+    "state_write": 17,
+    "panel_digests": [
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    ]
+  }
+}
