@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.1...weglarka-cli-v0.1.2) - 2026-11-02
+
+### Fixed
+
+- *(oidc)* treat a rate-limited token request as transient ([#448](https://github.com/jpalczewski/weglarka/pull/448))
+- *(cli)* keep polling the device grant through rate limiting ([#438](https://github.com/jpalczewski/weglarka/pull/438))
+
 ## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.0...weglarka-cli-v0.1.1) - 2026-10-31
 
 ### Added

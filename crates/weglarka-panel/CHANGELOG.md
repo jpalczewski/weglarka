@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.1...weglarka-panel-v0.1.2) - 2026-11-02
+
+### Fixed
+
+- *(panel)* end the resources poll when forward auth answers it ([#449](https://github.com/jpalczewski/weglarka/pull/449))
+- *(oidc)* treat a rate-limited token request as transient ([#448](https://github.com/jpalczewski/weglarka/pull/448))
+- *(panel)* send the access-log path filter unencoded ([#440](https://github.com/jpalczewski/weglarka/pull/440))
+- *(cli)* keep polling the device grant through rate limiting ([#438](https://github.com/jpalczewski/weglarka/pull/438))
+- *(panel)* explain a live view that cannot start ([#439](https://github.com/jpalczewski/weglarka/pull/439))
+
 ## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.0...weglarka-panel-v0.1.1) - 2026-10-31
 
 ### Added

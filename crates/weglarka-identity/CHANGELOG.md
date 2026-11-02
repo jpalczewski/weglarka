@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.2...weglarka-identity-v0.0.3) - 2026-11-02
+
+### Added
+
+- *(identity)* gate an OIDC client on groups through Authelia authorization policies ([#456](https://github.com/jpalczewski/weglarka/pull/456))
+
 ## [0.0.2](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.1...weglarka-identity-v0.0.2) - 2026-10-31
 
 ### Added
