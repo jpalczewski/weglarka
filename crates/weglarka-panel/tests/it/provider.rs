@@ -29,6 +29,8 @@ pub enum Refresh {
     Revoked,
     /// `503`: the provider is down.
     Down,
+    /// `429` with `Retry-After`: the provider is rate limiting the client.
+    RateLimited,
 }
 
 /// Knobs a test turns before (or between) logins.
@@ -318,6 +320,9 @@ async fn token(
             match b.refresh {
                 Refresh::Revoked => error(StatusCode::BAD_REQUEST, "invalid_grant"),
                 Refresh::Down => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Refresh::RateLimited => {
+                    (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response()
+                }
                 Refresh::Ok => {
                     let refresh = format!("refresh-token-{n}");
                     inner.refresh_tokens.lock().unwrap().push(refresh.clone());

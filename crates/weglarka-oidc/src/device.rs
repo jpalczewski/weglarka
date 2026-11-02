@@ -6,7 +6,10 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::token::{ClientAuth, TokenSet, parse_tokens, signed_form};
-use crate::{Error, MAX_BODY, Secret, Transport, status_error};
+use crate::{
+    Error, MAX_BODY, Secret, Transport, is_throttle, response_error, retry_after_delta,
+    status_error,
+};
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -57,7 +60,7 @@ pub enum DevicePoll {
     Approved(TokenSet),
     /// Not yet; ask again after the (possibly lengthened) `interval`.
     Pending { interval: Duration },
-    /// The provider is rate limiting the polls (HTTP 429 or 503): keep waiting, but at least
+    /// The provider is rate limiting the polls (HTTP 408, 429 or 503): keep waiting, but at least
     /// `interval`. Kept apart from `Pending` so the caller can tell the person why it is slow.
     Throttled { interval: Duration },
     /// The person said no.
@@ -82,7 +85,7 @@ pub async fn device_authorization<T: Transport>(
         .post_form(endpoint, header.as_ref(), body, MAX_BODY)
         .await?;
     if !(200..300).contains(&response.status) {
-        return Err(status_error(response.status));
+        return Err(response_error(&response));
     }
     let raw: RawDevice = serde_json::from_slice(&response.body)
         .map_err(|_| Error::BadResponse("the device authorization response is not JSON"))?;
@@ -147,7 +150,7 @@ pub async fn poll_device_token<T: Transport>(
             _ => Err(status_error(400)),
         };
     }
-    if matches!(response.status, 429 | 503) {
+    if is_throttle(response.status) {
         // Providers that regulate polling (Authelia) lengthen the penalty on every further
         // rejected request, so give up neither the login nor the pace: wait and ask later.
         let wanted =
@@ -157,16 +160,6 @@ pub async fn poll_device_token<T: Transport>(
         });
     }
     Err(status_error(response.status))
-}
-
-/// `Retry-After` as delta-seconds (RFC 9110 10.2.3). An HTTP-date or anything malformed is
-/// ignored, as is a value with a sign, a fraction or whitespace inside.
-fn retry_after_delta(value: Option<&str>) -> Option<Duration> {
-    let digits = value?.trim();
-    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -201,6 +194,19 @@ mod tests {
             script.seen.lock().unwrap()[0].2,
             "client_id=cli&scope=openid&audience=https%3A%2F%2Fadmin.example.com%2Fapi%2F"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_start_is_throttling_not_a_refusal() {
+        let script = Script::default();
+        script.push_with_retry_after(429, "", "12");
+        let err = device_authorization(&script, &endpoint(), "cli", "openid", "a")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Throttled { status: 429, retry_after: Some(d) } if d == Duration::from_secs(12)
+        ));
     }
 
     #[tokio::test]
@@ -258,6 +264,7 @@ mod tests {
         script.push_with_retry_after(429, "", "Wed, 21 Oct 2026 07:28:00 GMT");
         script.push_with_retry_after(429, "", "-5");
         script.push(503, "<html>");
+        script.push(408, "");
         script.push(
             200,
             r#"{"access_token":"a","token_type":"Bearer","refresh_token":"r"}"#,
@@ -279,6 +286,8 @@ mod tests {
         assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(5));
         // An HTTP-date or a malformed value falls back to the step.
         assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
+        // 503 and 408 are "later" too.
         assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
         assert_eq!(throttled(poll(secs(5)).await.unwrap()), secs(10));
         assert!(matches!(
