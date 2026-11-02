@@ -225,6 +225,15 @@ impl PodmanClient for LibpodClient {
         Ok(())
     }
 
+    async fn container_archive_get(&self, name: &str, path: &str) -> Result<TarStream> {
+        let path = format!(
+            "/containers/{}/archive?path={}",
+            path_name(name)?,
+            encode_component(path)
+        );
+        self.transport.bytes_stream(Method::GET, &path).await
+    }
+
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
         self.inspect_container(name).await
     }

@@ -85,6 +85,10 @@ pub enum Call {
         name: String,
         path: String,
     },
+    ContainerArchiveGet {
+        name: String,
+        path: String,
+    },
 }
 
 /// What a one-off container prints and how it ends; scripted with
@@ -165,6 +169,8 @@ struct State {
     volumes: BTreeMap<String, (VolumeInfo, Vec<u8>)>,
     /// The spec each live container was created from.
     container_specs: BTreeMap<String, ContainerSpec>,
+    /// Archives returned by `container_archive_get`, keyed by `(container, path)`.
+    archive_gets: BTreeMap<(String, String), Bytes>,
     /// Every spec ever created, including containers removed since (tests that inspect a short-lived
     /// helper container after it was cleaned up).
     create_history: Vec<ContainerSpec>,
@@ -398,6 +404,15 @@ impl FakePodman {
         self.lock()
             .image_archives
             .insert(digest.clone(), Bytes::from(archive));
+    }
+
+    /// `container_archive_get` of `path` in `container` returns `archive`; without a script the
+    /// call returns an empty archive once the container exists.
+    pub fn script_container_archive_get(&self, container: &str, path: &str, archive: Vec<u8>) {
+        self.lock().archive_gets.insert(
+            (container.to_owned(), path.to_owned()),
+            Bytes::from(archive),
+        );
     }
 
     /// The next `image_load` fails with `message` (a corrupt or unsupported archive).
@@ -852,6 +867,22 @@ impl PodmanClient for FakePodman {
         });
         s.container_mut(name)?;
         Ok(())
+    }
+
+    async fn container_archive_get(&self, name: &str, path: &str) -> Result<TarStream> {
+        let bytes = {
+            let mut s = self.lock();
+            s.calls.push(Call::ContainerArchiveGet {
+                name: name.to_owned(),
+                path: path.to_owned(),
+            });
+            s.container_mut(name)?;
+            s.archive_gets
+                .get(&(name.to_owned(), path.to_owned()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(Box::pin(stream::once(async move { Ok(bytes) })))
     }
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {

@@ -13,10 +13,14 @@
 //! use is the last line of defence.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 
 use crate::deploy::normalize_image;
 use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
+use weglarka_model::image_inventory::{
+    Inventory, ManagedImage, OperationId, Protection, Reservation, ReservationPhase, RetentionScope,
+};
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
 };
@@ -69,6 +73,79 @@ pub struct PruneReport {
     pub reclaimed_bytes: u64,
     /// The removals were only planned, nothing was removed.
     pub dry_run: bool,
+}
+
+/// Proof that the engine's image lock is held while a retention plan is executed.
+///
+/// [`execute`] takes a `&ImageGuard`, so a plan computed under the lock cannot be applied after the
+/// lock was dropped (and a fresh observation replaced the one the plan was built from). The field is
+/// private and the constructor is crate-visible: only code that already holds the engine guard can
+/// produce one.
+pub struct ImageGuard<'a> {
+    _engine: &'a EngineGuard<'a>,
+}
+
+impl<'a> ImageGuard<'a> {
+    pub(crate) fn new(engine: &'a EngineGuard<'a>) -> Self {
+        Self { _engine: engine }
+    }
+}
+
+/// The contract's retention input: observed images/containers, durable provenance, protections and
+/// the requested scope. Planning is pure; the engine implements this in brief A.
+pub struct RetentionInput<'a> {
+    pub images: &'a [ImageInfo],
+    pub containers: &'a [ContainerInfo],
+    pub inventory: &'a Inventory,
+    pub protections: &'a BTreeSet<Protection>,
+    pub scope: RetentionScope,
+}
+
+/// Contract signature `plan(&RetentionInput) -> Plan`. Kept as a trait because the engine already
+/// has the repository-scoped [`plan`] above; a future implementation can live next to it without
+/// breaking existing callers.
+pub trait RetentionPlanner {
+    fn plan(&self, input: &RetentionInput<'_>) -> Plan;
+}
+
+/// Durable provenance store (`managed-images.toml`). `record` is an upsert that unions digests and
+/// associations and rejects conflicting identities; it never replaces another owner's association.
+pub trait InventoryStore {
+    fn load(
+        &self,
+        guard: &ImageGuard<'_>,
+    ) -> impl Future<Output = Result<Inventory, EngineError>> + Send;
+
+    fn record(
+        &self,
+        guard: &ImageGuard<'_>,
+        image: ManagedImage,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
+}
+
+/// Durable reservation store (`image-reservations.toml`). A reservation is published before
+/// `image_load` (phase `loading`) and advanced to `loaded` before any `image_tag`.
+pub trait ReservationStore {
+    fn reserve(
+        &self,
+        guard: &ImageGuard<'_>,
+        operation: OperationId,
+        reservation: &Reservation,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
+
+    fn advance(
+        &self,
+        guard: &ImageGuard<'_>,
+        operation: OperationId,
+        phase: ReservationPhase,
+        protections: &BTreeSet<Protection>,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
+
+    fn finish(
+        &self,
+        guard: &ImageGuard<'_>,
+        operation: OperationId,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
 }
 
 /// Which images to keep and which to remove.
@@ -157,7 +234,14 @@ pub fn plan(
 
 /// Removes the planned images, best effort: an image that is already gone counts as removed, any
 /// other error is collected and the remaining images are still processed. Never forces.
-pub async fn execute<P: PodmanClient>(podman: &P, plan: Plan) -> PruneReport {
+///
+/// The guard cannot be constructed without the engine lock, so a stale plan cannot be executed
+/// after the lock was released.
+pub async fn execute<P: PodmanClient>(
+    podman: &P,
+    _guard: &ImageGuard<'_>,
+    plan: Plan,
+) -> PruneReport {
     let mut report = PruneReport::default();
     for image in plan.remove {
         match podman.image_remove(&image.id).await {
@@ -182,7 +266,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// The body of [`Self::prune_images`], under the engine lock.
     pub(crate) async fn prune_images_locked(
         &self,
-        _held: &EngineGuard<'_>,
+        held: &EngineGuard<'_>,
         dry_run: bool,
         scope: Option<&str>,
     ) -> Result<PruneReport, EngineError> {
@@ -202,7 +286,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 dry_run: true,
             });
         }
-        Ok(execute(&self.podman, plan).await)
+        let guard = ImageGuard::new(held);
+        Ok(execute(&self.podman, &guard, plan).await)
     }
 
     /// Best effort housekeeping after a successful deploy of `repo`: removes the app's images older
