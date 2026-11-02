@@ -17,7 +17,11 @@ Rejection names: `UnsupportedFormat`, `MissingField`, `DuplicateField`, `Invalid
 `ChannelMismatch`, `IncompatibleSelectedPanel`, `UnexpectedImagePath`, `HostImageMismatch`, `UnsupportedArtifactType`,
 `ExtraLayer`, `ForeignUrl`, `NotAnImageManifest`, `ConfigMediaTypeMismatch`, `NonEmptyConfig`,
 `LayerMediaTypeMismatch`, `SizeMismatch`. A parser may report an earlier structural failure before a later semantic
-one only when the fixture violates exactly one rule; it must not invent names outside this list.
+one only when the fixture violates exactly one rule; it must not invent names outside this list. In v1 the names are
+deliberately coarse: `MissingField` also covers a present but invalid or unknown descriptor value, and `SizeMismatch`
+also covers content that disagrees with its declared digest. A parser may attach detail text but not a new result
+name. Sequence high-water comparison is not a parser rule; it belongs to the coordinator, which has the durable
+per-channel pointer.
 
 ## Transport and identity
 
@@ -71,7 +75,8 @@ without relabeling.
   lower-case source commit ID.
 - `target`: exact `linux`, `amd64`, `musl` in v1. Unsupported targets fail before activation.
 - `daemon` and `panel`: tag-free repository, SHA-256 manifest digest and real semver crate version.
-- `host_tools`: source image repository/digest and exactly two file records with `name`, `size` and SHA-256.
+- `host_tools`: source image repository/digest and exactly two file records with `name`, in-image `path`, `version`,
+  `size` and SHA-256.
 - `compatibility`: host protocol version, state schemas readable by the target daemon, the schema it writes, and
   the exact panel digests tested with that daemon. The selected panel must be listed.
 
