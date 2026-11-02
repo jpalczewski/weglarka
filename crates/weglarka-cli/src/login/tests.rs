@@ -17,13 +17,21 @@ struct Provider {
 }
 
 impl Provider {
-    fn say(&self, status: u16, body: &str) -> &Self {
+    fn answer(&self, status: u16, body: &str, retry_after: Option<&str>) -> &Self {
         self.answers.lock().unwrap().push_back(Ok(HttpResponse {
             status,
             body: body.as_bytes().to_vec(),
-            retry_after: None,
+            retry_after: retry_after.map(str::to_owned),
         }));
         self
+    }
+
+    fn say(&self, status: u16, body: &str) -> &Self {
+        self.answer(status, body, None)
+    }
+
+    fn say_later(&self, status: u16, retry_after: &str) -> &Self {
+        self.answer(status, "", Some(retry_after))
     }
 
     fn fail(&self) -> &Self {
@@ -351,6 +359,48 @@ async fn a_refresh_the_provider_refuses_ends_the_session_but_an_outage_does_not(
         .await
         .unwrap_err();
     assert!(err.message.contains("has ended"));
+    assert!(store.read().unwrap().hosts.is_empty());
+}
+
+#[tokio::test]
+async fn a_rate_limited_or_misrouted_refresh_keeps_the_sign_in() {
+    let (_dir, store) = store();
+    signed_in(&store, 0, Some("REFRESH0"));
+    let provider = Provider::default();
+    provider
+        .say(200, &discovery(true, false))
+        .say_later(429, "30");
+    let err = access_token(&provider, &store, HOST, 1_000)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::Unreachable);
+    assert!(err.message.contains("retry later") && err.message.contains("429"));
+    assert_eq!(err.hint.as_deref(), Some("try again in 30 s"));
+
+    for status in [408, 403, 404, 503] {
+        let provider = Provider::default();
+        provider.say(200, &discovery(true, false)).say(status, "");
+        let err = access_token(&provider, &store, HOST, 1_000)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("has ended"),
+            "{status}: {}",
+            err.message
+        );
+    }
+    let entry = store.read().unwrap().hosts.remove(HOST).unwrap();
+    assert_eq!(entry.refresh_token.as_deref(), Some("REFRESH0"));
+}
+
+#[tokio::test]
+async fn a_rate_limited_login_start_says_so() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    provider.say(200, &discovery(true, false)).say(429, "");
+    let err = run_login(&provider, &store).await.unwrap_err();
+    assert_eq!(err.kind, Kind::Unreachable);
+    assert_eq!(err.hint.as_deref(), Some("try again in a minute"));
     assert!(store.read().unwrap().hosts.is_empty());
 }
 

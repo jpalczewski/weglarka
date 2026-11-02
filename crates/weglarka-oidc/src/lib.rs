@@ -15,6 +15,7 @@ mod token;
 
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
 
 pub use device::{DeviceAuthorization, DevicePoll, device_authorization, poll_device_token};
 pub use discovery::{DiscoveryPolicy, Endpoints, discover};
@@ -53,9 +54,18 @@ pub enum Error {
     Discovery(String),
     #[error("cannot reach the provider: {0}")]
     Network(String),
-    /// The provider answered with a 4xx: the grant or credentials were refused.
+    /// The provider answered with a 4xx other than the "come back later" ones below. Only some of
+    /// them are verdicts on the grant, see [`Error::is_definitive`].
     #[error("the provider refused the request (HTTP {0})")]
     Refused(u16),
+    /// The provider asked to come back later (HTTP 408, 429 or 503): a rate limit or a short
+    /// outage, never a verdict on the grant. `retry_after` is the `Retry-After` header when it
+    /// was strict delta-seconds.
+    #[error("the provider asked to retry later (HTTP {status})")]
+    Throttled {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
     /// A 5xx or any other unusable status.
     #[error("the provider failed (HTTP {0})")]
     ProviderFailed(u16),
@@ -64,9 +74,38 @@ pub enum Error {
 }
 
 impl Error {
-    /// A refresh that failed for a reason retrying cannot fix (revoked or expired grant).
+    /// A refresh that failed for a reason retrying cannot fix (revoked or expired grant), so the
+    /// caller may drop its tokens. An allowlist: only `400` (`invalid_grant` and the other token
+    /// endpoint errors, RFC 6749 5.2) and `401` (`invalid_client`) are verdicts on the grant. Any
+    /// other 4xx (a misrouted proxy answering `404`, a rate limit) leaves the tokens alone.
     pub fn is_definitive(&self) -> bool {
-        matches!(self, Self::Refused(_) | Self::BadResponse(_))
+        matches!(self, Self::Refused(400 | 401) | Self::BadResponse(_))
+    }
+
+    /// How long the provider asked to be left alone, when it said so ([`Error::Throttled`]).
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Throttled { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// Statuses that mean "ask again later" (RFC 9110 15.5.9, 15.6.4; RFC 6585 4).
+pub(crate) fn is_throttle(status: u16) -> bool {
+    matches!(status, 408 | 429 | 503)
+}
+
+/// The error for a non-2xx answer: [`Error::Throttled`] for the "later" statuses (keeping a
+/// usable `Retry-After`), otherwise by status class.
+pub(crate) fn response_error(response: &HttpResponse) -> Error {
+    if is_throttle(response.status) {
+        Error::Throttled {
+            status: response.status,
+            retry_after: retry_after_delta(response.retry_after.as_deref()),
+        }
+    } else {
+        status_error(response.status)
     }
 }
 
@@ -76,6 +115,16 @@ pub(crate) fn status_error(status: u16) -> Error {
     } else {
         Error::ProviderFailed(status)
     }
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110 10.2.3). An HTTP-date or anything malformed is
+/// ignored, as is a value with a sign, a fraction or whitespace inside.
+pub(crate) fn retry_after_delta(value: Option<&str>) -> Option<Duration> {
+    let digits = value?.trim();
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(Duration::from_secs)
 }
 
 /// An answer with its body already capped by the transport.
@@ -115,7 +164,7 @@ pub async fn get_ok<T: Transport>(transport: &T, url: &Url) -> Result<Vec<u8>, E
     if (200..300).contains(&response.status) {
         Ok(response.body)
     } else {
-        Err(status_error(response.status))
+        Err(response_error(&response))
     }
 }
 
@@ -191,5 +240,65 @@ pub(crate) mod testing {
             ));
             self.answers.lock().unwrap().remove(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(status: u16, retry_after: Option<&str>) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: Vec::new(),
+            retry_after: retry_after.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn only_a_refused_grant_or_client_is_definitive() {
+        for status in [400, 401] {
+            assert!(
+                response_error(&answer(status, None)).is_definitive(),
+                "{status}"
+            );
+        }
+        for status in [403, 404, 405, 408, 409, 429, 500, 502, 503] {
+            assert!(
+                !response_error(&answer(status, None)).is_definitive(),
+                "{status}"
+            );
+        }
+        assert!(Error::BadResponse("x").is_definitive());
+        assert!(!Error::Network("x".into()).is_definitive());
+    }
+
+    #[test]
+    fn later_statuses_are_throttling_with_a_strict_retry_after() {
+        let secs = Duration::from_secs;
+        for (status, header, wanted) in [
+            (429, Some("30"), Some(secs(30))),
+            (429, None, None),
+            (408, Some(" 7 "), Some(secs(7))),
+            (503, Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+            (429, Some("-5"), None),
+            (429, Some("1.5"), None),
+        ] {
+            assert!(
+                matches!(
+                    response_error(&answer(status, header)),
+                    Error::Throttled { status: s, retry_after } if s == status && retry_after == wanted
+                ),
+                "{status} {header:?}"
+            );
+        }
+        assert!(matches!(
+            response_error(&answer(404, Some("30"))),
+            Error::Refused(404)
+        ));
+        assert!(matches!(
+            response_error(&answer(502, None)),
+            Error::ProviderFailed(502)
+        ));
     }
 }

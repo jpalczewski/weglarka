@@ -434,9 +434,14 @@ pub(crate) async fn fresh_token(state: &AppState, session: &Session) -> Option<A
             tokens.refresh_retry_at = None;
             Some(tokens.access.clone())
         }
-        // A transient failure while the token still works: keep going, retry after the backoff.
+        // A transient failure while the token still works: keep going, retry after the backoff, or
+        // later if the provider asked for that (asking a rate limiter early lengthens its penalty).
+        // Once the token expires the last attempt is made anyway (above).
         Err(e) if !e.is_definitive() && !expired => {
-            tokens.refresh_retry_at = Some(state.clock.now() + REFRESH_BACKOFF);
+            let wait = e
+                .retry_after()
+                .map_or(REFRESH_BACKOFF, |w| w.max(REFRESH_BACKOFF));
+            tokens.refresh_retry_at = Some(state.clock.now() + wait);
             tracing::warn!(error = %e, "refreshing the session token failed; will retry");
             Some(tokens.access.clone())
         }

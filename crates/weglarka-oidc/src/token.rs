@@ -8,7 +8,7 @@ use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{Error, MAX_BODY, Secret, Transport, form_body, status_error};
+use crate::{Error, MAX_BODY, Secret, Transport, form_body, response_error};
 
 /// Used when the token response omits `expires_in`.
 const DEFAULT_EXPIRES_IN: Duration = Duration::from_secs(300);
@@ -95,7 +95,7 @@ pub async fn token_request<T: Transport>(
         .post_form(endpoint, header.as_ref(), body, MAX_BODY)
         .await?;
     if !(200..300).contains(&response.status) {
-        return Err(status_error(response.status));
+        return Err(response_error(&response));
     }
     parse_tokens(&response.body)
 }
@@ -187,7 +187,7 @@ pub async fn revoke<T: Transport>(
     if (200..300).contains(&response.status) {
         Ok(())
     } else {
-        Err(status_error(response.status))
+        Err(response_error(&response))
     }
 }
 
@@ -243,6 +243,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rate_limited_refresh_is_not_a_verdict_on_the_grant() {
+        let endpoint = Url::parse("https://auth.example.com/token").unwrap();
+        let script = Script::default();
+        script.push_with_retry_after(429, "", "30");
+        script.push(400, r#"{"error":"invalid_grant"}"#);
+        let public = || ClientAuth::Public { id: "cli" };
+        let token = Secret::new("r");
+        let err = refresh(&script, &endpoint, public(), &token, "openid")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Throttled { status: 429, retry_after: Some(d) } if d == Duration::from_secs(30)
+        ));
+        assert!(!err.is_definitive());
+        let err = refresh(&script, &endpoint, public(), &token, "openid")
+            .await
+            .unwrap_err();
+        assert!(err.is_definitive());
+    }
+
+    #[tokio::test]
     async fn refusals_and_odd_answers_are_errors_without_the_body() {
         let endpoint = Url::parse("https://auth.example.com/token").unwrap();
         let script = Script::default();
@@ -257,7 +279,10 @@ mod tests {
         assert!(matches!(err, Error::Refused(400)) && !err.to_string().contains("leak"));
         assert!(matches!(
             token_request(&script, &endpoint, public(), &[]).await,
-            Err(Error::ProviderFailed(503))
+            Err(Error::Throttled {
+                status: 503,
+                retry_after: None
+            })
         ));
         for _ in 0..2 {
             assert!(matches!(

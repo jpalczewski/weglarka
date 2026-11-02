@@ -77,8 +77,11 @@ directory. It holds the access token and the refresh token: **the refresh token 
 the file like an SSH key. Tokens are never printed, logged or put in an error message. The access token lives about 15
 minutes (the provider's `lifespans.access_token`, see [admin API tokens](admin-api-tokens.md)); it is refreshed on use under a
 file lock, so two commands running at once do not spend the same rotating refresh token. If the provider refuses a
-refresh (revoked, expired or rotated elsewhere) the stored session is deleted and the CLI asks you to sign in again; a
-provider that is merely unreachable keeps it.
+refresh with `400` or `401` (the grant is revoked, expired or rotated elsewhere) the stored session is deleted and the
+CLI asks you to sign in again; so is an answer that is not a usable token response. Any other failure keeps it: a
+provider that is unreachable, answers `408`, `429` or `503` (rate limiting or a short outage; the command fails with
+*the identity provider asked to retry later* and, when the provider sent `Retry-After`, how long to wait), or any other
+error status, such as a proxy in front of it answering another 4xx.
 
 `logout` deletes the local copy first, then tells the provider to revoke the refresh token (when its discovery document
 lists a `revocation_endpoint`); a provider that is down never leaves tokens behind.
@@ -90,6 +93,9 @@ lists a `revocation_endpoint`); a provider that is down never leaves tokens behi
 - *the identity provider refused the sign-in request*: the client is not registered as a public client with
   `device_flow = true`, or the scopes or audience differ.
 - *provider discovery failed*: `--issuer` must equal the provider's issuer byte for byte (no trailing slash).
+- *the identity provider asked to retry later*: the provider is rate limiting this client address (Authelia does after
+  many rejected requests, for example a `weglarka login` left waiting for a long time). Nothing stored is lost; run the
+  command again after the time in the hint.
 
 ## Rollback
 

@@ -84,6 +84,18 @@ fn provider_error(e: weglarka_oidc::Error) -> CliError {
         ),
         E::Discovery(m) => CliError::new(Kind::Config, format!("provider discovery failed: {m}"))
             .with_hint("check --issuer: it must be the provider's exact issuer URL"),
+        // A rate limit or a short outage: nothing stored is dropped, the next command tries again.
+        E::Throttled {
+            status,
+            retry_after,
+        } => CliError::new(
+            Kind::Unreachable,
+            format!("the identity provider asked to retry later (HTTP {status})"),
+        )
+        .with_hint(match retry_after {
+            Some(wait) => format!("try again in {} s", wait.as_secs().max(1)),
+            None => "try again in a minute".to_owned(),
+        }),
         other => CliError::internal(other.to_string()),
     }
 }
@@ -332,6 +344,7 @@ async fn access_token<T: Transport>(
             Ok((tokens.access, session))
         }
         // The grant is gone (revoked, expired, rotated elsewhere): the stored tokens are useless.
+        // Anything else (a rate limit, an outage, a misrouted proxy) keeps them for the next try.
         Err(e) if e.is_definitive() => {
             credentials.hosts.remove(host);
             lock.write(&credentials)?;

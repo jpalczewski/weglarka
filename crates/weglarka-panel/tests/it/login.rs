@@ -790,6 +790,35 @@ async fn a_provider_outage_does_not_log_out_a_token_that_still_works() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_refresh_keeps_the_session() {
+    let s = setup().await;
+    s.provider.set(|p| p.expires_in = 60 * 5);
+    let mut b = Browser::new(&s.app);
+    b.login().await;
+    // Inside the refresh margin (60 s) but not expired.
+    s.clock.advance(Duration::from_secs(5 * 60 - 30));
+    s.provider.set(|p| p.refresh = Refresh::RateLimited);
+    let refresh_calls = || {
+        s.provider
+            .requests("/token")
+            .iter()
+            .filter(|r| r.body.contains("grant_type=refresh_token"))
+            .count()
+    };
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    assert_eq!(refresh_calls(), 1, "the 429 was served");
+    // `Retry-After: 30` outlasts the 10 s backoff: the provider is left alone until then.
+    s.clock.advance(Duration::from_secs(15));
+    assert_eq!(b.get("/apps").await.status, StatusCode::OK);
+    assert_eq!(refresh_calls(), 1, "Retry-After is honoured");
+    let seen = bearer_seen(&s.daemon);
+    assert!(
+        seen.iter().all(|b| b == "Bearer access-token-1"),
+        "the old token keeps working: {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_provider_outage_is_probed_once_per_interval_not_once_per_request() {
     let s = setup().await;
     s.provider.set(|p| p.expires_in = 60 * 5);
