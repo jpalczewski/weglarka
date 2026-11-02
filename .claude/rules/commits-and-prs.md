@@ -47,7 +47,7 @@ labels and the roadmap project: `docs/contributing/issues-and-project.md`.
    reveals a collision, renumber with one command: `scripts/adr.sh renumber OLD NEW`. Run `scripts/adr.sh lint` before
    the PR too (the `docs-lint` job does the same).
 6. Title, commits and PR in Conventional Commits (`<type>(<scope>): <summary>`, see above), in English; `Closes #NN`;
-   merge = squash after green CI (`check`, `musl`, `nginx-e2e`, `podman-tests`, `smoke-behind`, `smoke-edge`; a change
+   merge = squash after green CI (`check`, `musl`, `nginx-e2e`, `podman-tests`, `smoke-behind`, `smoke-edge`, `panel-e2e`; a change
    only in `docs/`/`*.md`/`.gitignore` does not build — job `changes`).
 7. Parallel agent sessions, briefs, labels and the roadmap project:
    [`docs/contributing/agent-workflow.md`](../../docs/contributing/agent-workflow.md) and

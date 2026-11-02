@@ -36,9 +36,10 @@
 {% endif %}    </section>
     <section aria-labelledby="h-stats">
       <h2 id="h-stats">Resources</h2>
-      <div id="stats-live" hx-get="/apps/{{ app.name }}/stats" hx-trigger="load, every 10s" hx-swap="innerHTML" aria-live="off">
+      <div id="stats-live" hx-get="/apps/{{ app.name }}/stats" hx-trigger="load, every 10s" hx-swap="innerHTML" aria-live="off" data-poll-ended="stats-ended">
         <p class="muted">Loading…</p>
       </div>
+      <template id="stats-ended">{% include "poll_ended.html" %}</template>
     </section>
 {% if !app.configs.is_empty() %}    <section aria-labelledby="h-cfg">
       <h2 id="h-cfg">Config mounts</h2>

@@ -319,13 +319,10 @@ pub(crate) fn is_passive(method: &Method, path: &str) -> bool {
 /// The answer to a passive poll whose session is gone: a small fragment instead of a whole login
 /// page, with the status that makes htmx swap it once and stop polling.
 pub(crate) fn poll_ended(clear: bool) -> Response {
-    let mut response = (
+    let mut response = crate::pages::respond(
+        &crate::pages::PollEnded,
         StatusCode::from_u16(HTMX_STOP_POLLING).unwrap_or(StatusCode::UNAUTHORIZED),
-        axum::response::Html(
-            "<p class=\"muted\">Your session has ended. <a href=\"/auth/login\">Sign in</a> to see resource use again.</p>",
-        ),
-    )
-        .into_response();
+    );
     if clear {
         response
             .headers_mut()

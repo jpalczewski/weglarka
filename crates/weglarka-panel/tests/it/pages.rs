@@ -1672,3 +1672,21 @@ async fn a_normal_page_still_resets_the_idle_timer_and_a_poll_without_a_session_
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
     }
 }
+
+#[tokio::test]
+async fn the_app_page_carries_the_ended_fragment_the_panel_serves() {
+    // `app.js` shows this template when forward auth answers the poll before the panel can
+    // (#444); it must be the very fragment the panel itself answers an ended poll with.
+    let daemon = fake_daemon(Script::default()).await;
+    let site = site_with(daemon, &[]).await;
+    let who = login(&site, "tok-read");
+    let (_, _, page) = get(&site, Some(&who), "/apps/web").await;
+    assert!(page.contains(r#"data-poll-ended="stats-ended""#), "{page}");
+    let (status, _, fragment) = get(&site, None, "/apps/web/stats").await;
+    assert_eq!(status.as_u16(), 286);
+    let embedded = format!(
+        r#"<template id="stats-ended">{}</template>"#,
+        fragment.trim_end()
+    );
+    assert!(page.contains(&embedded), "{embedded}\n---\n{page}");
+}

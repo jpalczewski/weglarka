@@ -100,6 +100,13 @@ pub struct AppsPage {
     pub apps: Vec<AppRow>,
 }
 
+/// The "session ended" fragment of a passive poll: served by the panel with status 286
+/// (`auth::poll_ended`) and embedded in the app page as a `<template>` for `app.js`, which shows
+/// it when forward auth answers the poll before the panel can (#444). One source for both.
+#[derive(Template)]
+#[template(path = "poll_ended.html")]
+pub struct PollEnded;
+
 #[derive(Template)]
 #[template(path = "app.html")]
 pub struct AppPage {
