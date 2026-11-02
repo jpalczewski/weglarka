@@ -56,3 +56,48 @@ pub struct PanelTransitionResponse {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weglarka_model::release_set::StrictDigest;
+
+    fn digest(byte: char) -> StrictDigest {
+        StrictDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn request_round_trips_and_rejects_unknown_fields() {
+        let request = PanelTransitionRequest {
+            transaction_id: TransactionId::new("tx-1").unwrap(),
+            expected_pin_revision: 7,
+            release_set_digest: digest('a'),
+            target_digest: digest('b'),
+            retry_failed_release: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PanelTransitionRequest>(&json).unwrap(),
+            request
+        );
+        let unknown = json.replacen('}', ",\"bogus\":1}", 1);
+        assert!(serde_json::from_str::<PanelTransitionRequest>(&unknown).is_err());
+        let uppercase = json.replace(
+            &digest('b').to_string(),
+            &format!("sha256:{}", "B".repeat(64)),
+        );
+        assert!(serde_json::from_str::<PanelTransitionRequest>(&uppercase).is_err());
+    }
+
+    #[test]
+    fn status_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&PanelTransitionStatus::RolledBack).unwrap(),
+            "\"rolled_back\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PanelTransitionStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+}
