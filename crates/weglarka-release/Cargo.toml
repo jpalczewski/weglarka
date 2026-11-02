@@ -1,0 +1,22 @@
+[package]
+name = "weglarka-release"
+description = "Węglarka: release-set assembly and verification (v1 skeleton; publication lands in brief B)"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "weglarka-release"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+weglarka-model.workspace = true
+weglarka-registry.workspace = true
