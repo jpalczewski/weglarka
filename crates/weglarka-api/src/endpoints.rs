@@ -411,6 +411,34 @@ pub const OIDC_CLIENT_REMOVE: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `POST` [`PanelTransitionRequest`](crate::PanelTransitionRequest) →
+/// [`PanelTransitionResponse`](crate::PanelTransitionResponse). **Unix socket only**: full-trust
+/// engine route, never the token listener or the panel relay. The engine matches the request against
+/// the prepared journal/reservation; there is no arbitrary image reference or host path.
+///
+/// Deliberately not in [`ENDPOINTS`] in brief 0: that list drives the token listener, which must
+/// never route this route. The unix router registers it, together with the declaration, in brief D.
+pub const PLATFORM_PANEL_TRANSITION: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/platform/panel-transition",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
+/// `GET` → [`PanelTransitionResponse`](crate::PanelTransitionResponse), from the same durable
+/// transition record (also after a restart). **Unix socket only**, see
+/// [`PLATFORM_PANEL_TRANSITION`].
+pub const PLATFORM_PANEL_TRANSITION_STATUS: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/platform/panel-transition/{transaction_id}",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
+
+/// Endpoints that exist only on the full-trust unix socket. They are deliberately absent from
+/// [`ENDPOINTS`] (the token listener's catalogue): adding them there would declare them routable by
+/// a bearer token. The unix router registers them in brief D.
+pub const UNIX_ONLY_ENDPOINTS: &[Endpoint] =
+    &[PLATFORM_PANEL_TRANSITION, PLATFORM_PANEL_TRANSITION_STATUS];
 /// `GET` → [`NotifyStatusResponse`](crate::NotifyStatusResponse): configured channels, the pending
 /// outbox and the last delivery error (issue #38).
 pub const NOTIFICATIONS_STATUS: Endpoint = Endpoint {
@@ -555,5 +583,30 @@ mod tests {
                 assert!(a.method != b.method || a.path != b.path, "{}", a.path);
             }
         }
+    }
+
+    #[test]
+    fn unix_only_endpoints_stay_out_of_the_token_catalogue() {
+        assert_eq!(UNIX_ONLY_ENDPOINTS.len(), 2);
+        for e in UNIX_ONLY_ENDPOINTS {
+            assert_eq!(
+                Endpoint::lookup(e.method.as_str(), e.path),
+                None,
+                "{} {} must not be routable by a bearer token",
+                e.method.as_str(),
+                e.path
+            );
+            assert_eq!(e.body, Body::NoAppData);
+        }
+        assert_eq!(
+            UNIX_ONLY_ENDPOINTS
+                .iter()
+                .map(|e| (e.method.as_str(), e.path))
+                .collect::<Vec<_>>(),
+            [
+                ("POST", "/v1/platform/panel-transition"),
+                ("GET", "/v1/platform/panel-transition/{transaction_id}"),
+            ]
+        );
     }
 }
