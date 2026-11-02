@@ -399,3 +399,79 @@ async fn the_base_config_scan_stays_inside_the_mount() {
     assert!(base_config_check(&report).is_empty(), "{report}");
     h.running.stop().await;
 }
+
+#[tokio::test]
+async fn allowed_groups_become_an_authorization_policy_in_the_generated_file() {
+    let h = with_provider().await;
+    let mut gated = panel();
+    gated["oidc"]["allowed_groups"] = json!(["viewers", "admins"]);
+    add(&h, "panel", gated).await;
+    deployed(&h, "panel").await;
+    eventually("the policy in the generated file", || async {
+        clients_file(&h).contains("authorization_policies")
+    })
+    .await;
+    let file = clients_file(&h);
+    assert!(file.contains("weglarka-panel"), "{file}");
+    assert!(
+        file.contains("group:viewers") && file.contains("group:admins"),
+        "{file}"
+    );
+    assert!(file.contains("\"deny\""), "{file}");
+
+    // The read view shows the group names.
+    let (s, v) = admin(&h, "GET", "/v1/apps/panel", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["spec"]["oidc"]["allowed_groups"],
+        json!(["viewers", "admins"]),
+        "{v}"
+    );
+
+    // An invalid group name is refused at write time.
+    let mut bad = panel();
+    bad["oidc"]["allowed_groups"] = json!(["has space"]);
+    let (s, v) = post_app(&h, "other", bad).await;
+    assert!(s.is_client_error(), "{s} {v}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_warns_about_authorization_policies_in_a_base_config() {
+    let builder = Builder::new();
+    let config_root = builder.root().join("config");
+    std::fs::create_dir_all(config_root.join("authelia")).unwrap();
+    let file = config_root.join("authelia/configuration.yml");
+    std::fs::write(
+        &file,
+        "identity_providers:\n  oidc:\n    authorization_policies:\n      x:\n        default_policy: deny\n",
+    )
+    .unwrap();
+    let h = builder
+        .top_level(&format!(
+            "config_root = {:?}\n",
+            config_root.display().to_string()
+        ))
+        .sections(IDENTITY)
+        .build()
+        .await;
+    let mut p = provider();
+    p["configs"] = json!([{
+        "source": "authelia/configuration.yml",
+        "target": "/config/configuration.yml"
+    }]);
+    add(&h, "authelia", p).await;
+    deployed(&h, "authelia").await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let found = base_config_check(&report);
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["status"], "warn");
+    assert!(
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("authorization_policies"),
+        "{report}"
+    );
+    h.running.stop().await;
+}

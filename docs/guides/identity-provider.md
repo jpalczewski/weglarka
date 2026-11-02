@@ -41,10 +41,12 @@ generated directory could re-open `access_control.default_policy`.
 
 ### What Węglarka owns
 
-Two sections of Authelia's configuration are generated as whole files in `/weglarka/generated/current`:
-`identity_providers.oidc.clients` (with `claims_policies`) and `access_control`. Delete both from your base
-configuration; a copy left there is silently replaced. `weglarka doctor` (`identity.base_config`) warns when a base file delivered
-through `configs` still carries either section; a base file delivered as a secret cannot be inspected, and doctor says so. The access control file always has `default_policy: deny`, a
+Three sections of Authelia's configuration are generated as whole files in `/weglarka/generated/current`:
+`identity_providers.oidc.clients` (with `claims_policies`), `identity_providers.oidc.authorization_policies` (only when
+a client sets `allowed_groups`) and `access_control`. Delete all three from your base
+configuration; a copy left there is silently replaced. Authelia merges config files key by key and warns against
+splitting one section across files, which is why Węglarka owns `authorization_policies` as a whole. `weglarka doctor` (`identity.base_config`) warns when a base file delivered
+through `configs` still carries any of them; a base file delivered as a secret cannot be inspected, and doctor says so. The access control file always has `default_policy: deny`, a
 constant `bypass` rule for the portal host and one rule per forward-auth app, so the provider can start before any app
 exists.
 
@@ -79,6 +81,15 @@ The client id is the instance name. The container receives `OIDC_CLIENT_ID`, `OI
 it under the app's scope (`panel.oidc-client-secret`) and gives the provider only its PBKDF2 digest. These values are added
 at launch and never written back to `apps.toml`; they take part in the spec hash, so adding `oidc` recreates the app once.
 `weglarka run panel -- …` sees the same environment.
+
+To restrict the client to some groups, set `allowed_groups = ["viewers", "admins"]` (names of `[A-Za-z0-9._-]`, up to
+128 characters). Only a member of one of the groups can complete the authorization request; anyone else gets
+`access_denied` without a consent screen. Węglarka renders an Authelia authorization policy named `weglarka-<client id>`
+with `default_policy: deny` and one rule that keeps the client's `authorization_policy` factor for members of any of
+the groups. It is separate from `ingress.auth_groups` (no inheritance), so the forward-auth gate and the OIDC gate may
+differ. Authelia evaluates the policy only at the authorization request, not when a refresh token is used: removing
+someone from a group does not end an existing session at once. Left unset, the rendered file is byte for byte what it
+was before.
 
 Other fields (`authorization_policy`, `token_endpoint_auth_method`, `groups_in_id_token`, `groups_in_access_token`,
 `access_token = "jwt"`, `pkce`, `public`) are render-only: changing them restarts the provider, never the app. Authelia
@@ -121,7 +132,7 @@ weglarka oidc clients remove forge
 ```
 
 Generate a digest with `authelia crypto hash generate pbkdf2 --variant sha512 --iterations 310000 --password <secret>`.
-A client id must not equal any app name.
+A client id must not equal any app name. An external client can set `allowed_groups` too (the same rules as above).
 
 ### Device authorization grant
 
@@ -150,7 +161,9 @@ byte what it was before.
 
 ## Migrating a hand-written configuration
 
-1. Delete `access_control` (including `default_policy`) and `identity_providers.oidc.clients` from the base file.
+1. Delete `access_control` (including `default_policy`), `identity_providers.oidc.clients` and
+   `identity_providers.oidc.authorization_policies` from the base file. Express a group restriction of a client as
+   `allowed_groups` on that client.
 2. Move each client of an app Węglarka runs into that app's `oidc` section; the secret is minted, so update the relying
    party only if it keeps its own copy.
 3. Move clients of other apps into `[oidc_clients.<id>]`; hash a plaintext secret as above, or rotate it in the relying
@@ -190,3 +203,7 @@ again first, then downgrade. The minted secrets stay in `secrets.toml` until you
 
 `device_flow` was added at schema version 15: a file that carries it is refused by an older Węglarka the same way, so remove
 the key (and any client left with no `redirect_uris`) before downgrading.
+
+`allowed_groups` was added at schema version 17: a file that carries it is refused by an older Węglarka the same way, so
+remove it from every `oidc` section and `[oidc_clients.<id>]` before downgrading. Without it the provider lets every
+account complete the authorization request of that client again.

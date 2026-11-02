@@ -46,6 +46,8 @@ pub enum RenderError {
     GroupsInOpaqueToken(String),
     #[error("{0}: invalid auth group {1:?}")]
     InvalidGroup(String, String),
+    #[error("OIDC client {0:?}: invalid allowed_groups entry {1:?}")]
+    InvalidAllowedGroup(String, String),
     #[error("{0}: invalid path prefix {1:?}: {2}")]
     InvalidPath(String, String, &'static str),
 }

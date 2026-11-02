@@ -1,0 +1,98 @@
+---
+source: crates/weglarka-identity/tests/render.rs
+expression: "render_oidc_clients(&c.app_clients(), &c.external).unwrap()"
+---
+{
+  "identity_providers": {
+    "oidc": {
+      "authorization_policies": {
+        "weglarka-forge": {
+          "default_policy": "deny",
+          "rules": [
+            {
+              "policy": "two_factor",
+              "subject": [
+                [
+                  "group:developers"
+                ]
+              ]
+            }
+          ]
+        },
+        "weglarka-panel": {
+          "default_policy": "deny",
+          "rules": [
+            {
+              "policy": "one_factor",
+              "subject": [
+                [
+                  "group:viewers"
+                ],
+                [
+                  "group:admins"
+                ]
+              ]
+            }
+          ]
+        }
+      },
+      "claims_policies": {},
+      "clients": [
+        {
+          "client_id": "forge",
+          "client_name": "Forge",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://git.example.com/user/oauth2/authelia/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "weglarka-forge",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        },
+        {
+          "client_id": "panel",
+          "client_name": "panel",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://admin.example.com/auth/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "weglarka-panel",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        },
+        {
+          "client_id": "wiki",
+          "client_name": "wiki",
+          "client_secret": "$pbkdf2-sha512$310000$c2FsdHNhbHRzYWx0$Vk3dN5y0n2m4q1w8e7r6t5y4u3i2o1p0aSdFgHjKlZxCvBnMqWeRtYuIoPaSdFgHjKlZxCvBnMqWeRtYuIoPaA",
+          "public": false,
+          "redirect_uris": [
+            "https://wiki.example.com/callback"
+          ],
+          "scopes": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "authorization_policy": "two_factor",
+          "token_endpoint_auth_method": "client_secret_basic",
+          "require_pkce": true,
+          "pkce_challenge_method": "S256"
+        }
+      ]
+    }
+  }
+}

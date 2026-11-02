@@ -2209,12 +2209,14 @@ fn read_capped(path: &std::path::Path, cap: u64) -> Option<String> {
 }
 
 /// `identity.base_config` (#242): sections of the provider's own base config that the generated config
-/// silently replaces (`access_control`, `identity_providers.oidc.clients`; ADR 0055). Scans only host
+/// silently replaces (`OWNED_SECTIONS`; ADR 0055). Scans only host
 /// files delivered through the provider's `configs` (never a secret's value); a base file delivered
 /// as a secret can only be flagged as unverifiable. Silent when nothing is wrong.
 fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     use weglarka_model::app::SecretTarget;
-    use weglarka_model::identity::{GENERATED_CONFIG, config_sources, owned_sections_in};
+    use weglarka_model::identity::{
+        GENERATED_CONFIG, OWNED_SECTIONS, config_sources, owned_sections_in,
+    };
     let Some(identity) = &d.host.identity else {
         return;
     };
@@ -2309,8 +2311,9 @@ fn identity_base_config<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChec
             "identity.base_config",
             CheckStatus::Info,
             format!(
-                "cannot verify {} (delivered as a secret): make sure it has no access_control or identity_providers.oidc.clients",
-                detail(unverifiable.join(", "))
+                "cannot verify {} (delivered as a secret): make sure it has none of {}",
+                detail(unverifiable.join(", ")),
+                OWNED_SECTIONS.join(", ")
             ),
             Some("see docs/guides/identity-provider.md"),
         ));

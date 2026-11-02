@@ -31,7 +31,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -154,6 +154,14 @@ fn app_metrics_v16(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v16 → v17: a group gate for OIDC clients (issue #446, ADR 0066). `oidc.allowed_groups` and
+/// `[oidc_clients.<id>] allowed_groups` are optional lists (default empty), so a v16 document needs no
+/// data transformation — the marker records that the file may carry them. A no-op that must accept a
+/// hand-edited file which already has them.
+fn oidc_allowed_groups_v17(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -173,6 +181,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     identity_v14,
     oidc_device_flow_v15,
     app_metrics_v16,
+    oidc_allowed_groups_v17,
 ];
 
 const _: () = assert!(
@@ -1585,7 +1594,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(apps.apps[&name("a")].metrics_port, Some(9100));
         save_apps(&apps_path, &apps).unwrap();
         let text = fs::read_to_string(&apps_path).unwrap();
-        assert!(text.starts_with("schema_version = 16"), "{text}");
+        assert!(
+            text.starts_with(&format!("schema_version = {SCHEMA_VERSION}")),
+            "{text}"
+        );
         assert!(
             text.contains("metrics_port = 9100\nmetrics_path = \"/m\""),
             "{text}"

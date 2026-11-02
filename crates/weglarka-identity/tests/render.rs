@@ -54,6 +54,43 @@ fn oidc_external_client() {
 }
 
 #[test]
+fn oidc_allowed_groups_render_an_authorization_policy() {
+    let c = gated_clients();
+    insta::assert_snapshot!(
+        "oidc_gated",
+        render_oidc_clients(&c.app_clients(), &c.external).unwrap()
+    );
+}
+
+#[test]
+fn oidc_without_allowed_groups_has_no_policies_section() {
+    let c = clients();
+    let text = render_oidc_clients(&c.app_clients(), &c.external).unwrap();
+    assert!(!text.contains("authorization_policies"), "{text}");
+}
+
+#[test]
+fn oidc_rejects_an_invalid_allowed_group() {
+    let c = gated_clients();
+    let mut bad = c.apps[0].1.clone();
+    bad.allowed_groups = vec!["viewers".into(), "a b".into()];
+    assert_eq!(
+        render_oidc_clients(
+            &[AppClient {
+                instance: &c.apps[0].0,
+                spec: &bad,
+                secret_digest: Some(DIGEST),
+            }],
+            &Default::default()
+        ),
+        Err(RenderError::InvalidAllowedGroup(
+            "panel".into(),
+            "a b".into()
+        ))
+    );
+}
+
+#[test]
 fn oidc_empty() {
     insta::assert_snapshot!(render_oidc_clients(&[], &Default::default()).unwrap());
 }

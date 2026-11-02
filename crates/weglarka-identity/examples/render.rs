@@ -1,5 +1,5 @@
-//! `cargo run -p weglarka-identity --example render -- <dir>` writes `oidc-clients.yml` and
-//! `access-control.yml` for the sample inputs of the tests; CI feeds them to `authelia config validate`.
+//! `cargo run -p weglarka-identity --example render -- <dir>` writes `oidc-clients.yml`,
+//! `oidc-clients-gated.yml` and `access-control.yml` for the sample inputs of the tests; CI feeds them to `authelia config validate`.
 
 #[path = "../tests/fixtures.rs"]
 mod fixtures;
@@ -17,6 +17,13 @@ fn main() {
     fs::write(
         dir.join("oidc-clients.yml"),
         render_oidc_clients(&clients.app_clients(), &clients.external).unwrap(),
+    )
+    .unwrap();
+    // The group-gated clients get their own file: CI validates it next to the base config on its own.
+    let gated = fixtures::gated_clients();
+    fs::write(
+        dir.join("oidc-clients-gated.yml"),
+        render_oidc_clients(&gated.app_clients(), &gated.external).unwrap(),
     )
     .unwrap();
     fs::write(

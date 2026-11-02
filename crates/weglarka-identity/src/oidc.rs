@@ -7,7 +7,7 @@ use serde::Serialize;
 use weglarka_model::app::InstanceName;
 use weglarka_model::identity::{
     AccessTokenFormat, AuthorizationPolicy, ClientId, DEFAULT_SCOPES, ExternalClientSpec,
-    OidcClientSpec, Pkce, TokenEndpointAuthMethod, valid_secret_digest,
+    OidcClientSpec, Pkce, TokenEndpointAuthMethod, valid_auth_group, valid_secret_digest,
 };
 
 use crate::{RenderError, to_text};
@@ -33,8 +33,25 @@ struct IdentityProviders<'a> {
 
 #[derive(Serialize)]
 struct Oidc<'a> {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    authorization_policies: BTreeMap<String, AuthorizationPolicyDoc>,
     claims_policies: BTreeMap<String, ClaimsPolicy>,
     clients: Vec<Client<'a>>,
+}
+
+/// An Authelia authorization policy: `deny` unless one rule matches. The rule keeps the client's
+/// own factor policy; `subject` is an outer list of alternatives, each an AND-list of one group
+/// (the shape `access-control.yml` uses for `auth_groups`).
+#[derive(Serialize)]
+struct AuthorizationPolicyDoc {
+    default_policy: &'static str,
+    rules: Vec<PolicyRule>,
+}
+
+#[derive(Serialize)]
+struct PolicyRule {
+    policy: &'static str,
+    subject: Vec<[String; 1]>,
 }
 
 #[derive(Serialize)]
@@ -55,7 +72,7 @@ struct Client<'a> {
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     redirect_uris: &'a [String],
     scopes: Vec<&'a str>,
-    authorization_policy: &'static str,
+    authorization_policy: String,
     token_endpoint_auth_method: &'static str,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     audience: &'a [String],
@@ -77,6 +94,7 @@ struct Common<'a> {
     redirect_uris: &'a [String],
     scopes: &'a Option<Vec<String>>,
     authorization_policy: AuthorizationPolicy,
+    allowed_groups: &'a [String],
     token_endpoint_auth_method: TokenEndpointAuthMethod,
     audience: &'a [String],
     groups_in_id_token: bool,
@@ -93,6 +111,7 @@ impl<'a> From<&'a OidcClientSpec> for Common<'a> {
             redirect_uris: &c.redirect_uris,
             scopes: &c.scopes,
             authorization_policy: c.authorization_policy,
+            allowed_groups: &c.allowed_groups,
             token_endpoint_auth_method: c.token_endpoint_auth_method,
             audience: &c.audience,
             groups_in_id_token: c.groups_in_id_token,
@@ -111,6 +130,7 @@ impl<'a> From<&'a ExternalClientSpec> for Common<'a> {
             redirect_uris: &c.redirect_uris,
             scopes: &c.scopes,
             authorization_policy: c.authorization_policy,
+            allowed_groups: &c.allowed_groups,
             token_endpoint_auth_method: c.token_endpoint_auth_method,
             audience: &c.audience,
             groups_in_id_token: c.groups_in_id_token,
@@ -149,6 +169,7 @@ pub fn render_oidc_clients(
 
     let mut seen = BTreeSet::new();
     let mut claims_policies = BTreeMap::new();
+    let mut authorization_policies = BTreeMap::new();
     let mut clients = Vec::with_capacity(entries.len());
     for (id, name, c, digest) in entries {
         if !seen.insert(id) {
@@ -198,6 +219,35 @@ pub fn render_oidc_clients(
                 grant_types.push("refresh_token");
             }
         }
+        let factor = match c.authorization_policy {
+            AuthorizationPolicy::OneFactor => "one_factor",
+            AuthorizationPolicy::TwoFactor => "two_factor",
+        };
+        // A group gate becomes a policy of its own: deny by default, one rule with every group as an
+        // alternative. Re-checked here so a bad name fails closed instead of reaching the file.
+        let authorization_policy = if c.allowed_groups.is_empty() {
+            factor.to_owned()
+        } else {
+            if let Some(bad) = c.allowed_groups.iter().find(|g| !valid_auth_group(g)) {
+                return Err(RenderError::InvalidAllowedGroup(id.to_owned(), bad.clone()));
+            }
+            let policy = format!("weglarka-{id}");
+            authorization_policies.insert(
+                policy.clone(),
+                AuthorizationPolicyDoc {
+                    default_policy: "deny",
+                    rules: vec![PolicyRule {
+                        policy: factor,
+                        subject: c
+                            .allowed_groups
+                            .iter()
+                            .map(|g| [format!("group:{g}")])
+                            .collect(),
+                    }],
+                },
+            );
+            policy
+        };
         clients.push(Client {
             client_id: id,
             client_name: name,
@@ -205,10 +255,7 @@ pub fn render_oidc_clients(
             public: c.public,
             redirect_uris: c.redirect_uris,
             scopes,
-            authorization_policy: match c.authorization_policy {
-                AuthorizationPolicy::OneFactor => "one_factor",
-                AuthorizationPolicy::TwoFactor => "two_factor",
-            },
+            authorization_policy,
             token_endpoint_auth_method: match (c.public, c.token_endpoint_auth_method) {
                 (true, _) => "none",
                 (false, TokenEndpointAuthMethod::ClientSecretBasic) => "client_secret_basic",
@@ -232,6 +279,7 @@ pub fn render_oidc_clients(
     Ok(to_text(&Document {
         identity_providers: IdentityProviders {
             oidc: Oidc {
+                authorization_policies,
                 claims_policies,
                 clients,
             },

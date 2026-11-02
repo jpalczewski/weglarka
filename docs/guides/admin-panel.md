@@ -67,6 +67,7 @@ scopes = ["openid", "profile", "groups", "offline_access"]
 audience = ["https://admin.example.com/api/"]
 access_token = "jwt"
 groups_in_access_token = true
+allowed_groups = ["viewers", "admins"]
 client_secret = { kind = "env", var = "OIDC_CLIENT_SECRET" }
 ```
 
@@ -97,6 +98,10 @@ Notes on each part:
   `groups_in_access_token = true` is what lets the daemon map groups to scopes. The panel always requests the scopes
   `openid profile groups offline_access`, so list all four: without `offline_access` the provider issues no refresh token
   and a session ends when its first access token expires.
+- **Group gate on the client.** `allowed_groups` makes the provider refuse the authorization request of an account
+  outside those groups (`access_denied`), so the panel's login is not reachable for everyone. The provider checks it
+  only at that request, not on refresh: removing someone from a group does not end a running session at once, the
+  daemon refuses the first access token that carries no mapped group. Forward auth stays the recommended setup.
 - **Secret as a file.** To keep the secret out of the environment use
   `client_secret = { kind = "mount", path = "/run/secrets/oidc", uid = 65532, gid = 65532, mode = 0o400 }` and add `OIDC_CLIENT_SECRET_FILE = "/run/secrets/oidc"` to `[apps.panel.env]`. The owner must be the
   panel's user, or the process cannot read the file and refuses to start.
