@@ -45,8 +45,8 @@ Priorities for every decision: **security → elegant, extensible code (traits/a
 
 ## Build and test pitfalls (details in [testing](.claude/rules/testing.md) and [worktrees](.claude/rules/worktrees.md))
 
-- Every checkout builds in its **own** `target/` (`export CARGO_TARGET_DIR="$(scripts/worktree.sh target)"`); a shared
-  build directory can link another worktree's code without recompiling.
+- Every checkout builds in its **own** `target/` (pinned by the committed `.cargo/config.toml`; do not export
+  `CARGO_TARGET_DIR`); a shared build directory can link another worktree's code without recompiling.
 - Do not hide the exit code in a pipe: `cargo test … > log 2>&1; echo "EXIT: $?"`.
 - Daemon integration tests are one binary (`crates/weglarka-daemon/tests/it/`); a new area = a new `mod`.
 

@@ -19,16 +19,16 @@ paths:
   not a new `tests/*.rs` (every binary rebuilds `Daemon<FakePodman>` from scratch). One area:
   `cargo test -p weglarka-daemon --test it -- sites::`. The panel follows the same pattern
   (`crates/weglarka-panel/tests/it/main.rs`: a module per area).
-- Sandboxed environments (agent / CI in a container): if cargo cannot write to the global `target-dir`
-  (`Operation not permitted`), set `CARGO_TARGET_DIR` to a directory writable in the sandbox — for a worktree its own
-  `target/` (`CARGO_TARGET_DIR="$(scripts/worktree.sh target)"`); never point at another checkout's `target/` (see
-  `.claude/rules/worktrees.md`).
+- Sandboxed environments (agent / CI in a container): the committed `.cargo/config.toml` already builds into the
+  checkout's own `target/`. If cargo still writes elsewhere (`Operation not permitted`), something exported
+  `CARGO_TARGET_DIR` — unset it, or pass `--target-dir "$(scripts/worktree.sh target)"`; never point at another
+  checkout's `target/` (see `.claude/rules/worktrees.md`).
 - **A shared build directory can lie** (measured 2026-10-24 and 2026-10-27): when two checkouts write to one `target/`
   (or `build.build-dir`), cargo may link an **old or foreign** `libweglarka_{core,api}` — either reporting errors that
   are not in the code (`unresolved import weglarka_core::images`, `no field repo_digests on type ImageInfo`,
   `ContainerSpec has no field command`), or, worse, building without error and without recompiling (0 crates) a binary
   from the other worktree's code. Do not "fix" the code then: repeat on a private directory
-  `CARGO_TARGET_DIR="$PWD/target" cargo test --workspace` (a full rebuild, minutes, but trustworthy). Do not hide the
+  `cargo test --workspace --target-dir "$PWD/target"` (a full rebuild, minutes, but trustworthy). Do not hide the
   verdict in a pipe either: `cargo test … > /tmp/log 2>&1; echo "EXIT: $?"` — `| tail` masks the exit code.
 - Fake: `weglarka-engine` with `features = ["testing"]` provides `FakePodman` (scriptable pull digests, errors in the
   middle of a pull, a queue of healthcheck results, a call log). The former `weglarka-core` crate (`weglarka_core::testing::FakePodman`)
