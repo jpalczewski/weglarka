@@ -1,17 +1,19 @@
 name: Release
 
-# main → ghcr.io/jpalczewski/weglarka{,-panel}:main + :sha-<7>; tag v* → :<version> + :latest and GitHub Release assets.
-# Two entry points: a `v*` tag push builds everything here; on main, ci.yml calls this workflow (`workflow_call`)
-# with the musl binaries its own `musl` job already built, so the image job starts right after that build and
-# `binaries` is skipped (docs/decisions/0062).
-# One tag publishes two images: the daemon's and the panel's (docs/decisions/0057), both at the daemon's version.
-# Decisions: docs/decisions/0006-pakowanie-obrazy-i-release.md
+# main → channel `main`; a release tag → channel `stable`.
+#   * `v<daemon version>` builds both images, binaries and the GitHub Release.
+#   * `weglarka-panel-v<version>` builds only the panel image and reuses the daemon artifact.
+#   * `weglarka-cli-v<version>` rebuilds the daemon image (it carries the host CLI) and reuses the
+#     panel artifact.
+# Every run then publishes one signed release set through `weglarka-release` and promotes the
+# channel pointer. Decisions: docs/decisions/0006, 0015, 0024, 0062, 0067 and
+# docs/contracts/platform-update-v1.
 
 on:
   push:
-    # `v[0-9]*` is the daemon's tag only (release-plz.toml). The glob is anchored at the start of the tag name, so
-    # the per-crate tags (`weglarka-panel-vX.Y.Z`, `weglarka-cli-vX.Y.Z`, ...) never start this workflow.
-    tags: ["v[0-9]*"]
+    # The daemon's tag triggers everything; the per-crate tags are the panel-only and CLI-only
+    # release entries (release-plz.toml never produces a bare `v*` for them).
+    tags: ["v[0-9]*", "weglarka-panel-v*", "weglarka-cli-v*"]
   workflow_call:
     inputs:
       artifact:
@@ -25,25 +27,55 @@ env:
   # Same as ci.yml: RUSTFLAGS is part of rust-cache's key, so the linux leg below only shares the
   # `musl-release` entry with the CI `musl` job when the value is identical.
   RUSTFLAGS: -D warnings
+  RELEASE_REPOSITORY: ghcr.io/jpalczewski/weglarka-releases
+  DAEMON_IMAGE: ghcr.io/jpalczewski/weglarka
+  PANEL_IMAGE: ghcr.io/jpalczewski/weglarka-panel
 
 jobs:
-  # The image is assembled from the binaries built once in `binaries` below (also the release assets):
-  # what is published is exactly what was built there, and the image job compiles nothing. One leg per image;
-  # both are signed and attested the same way and carry the same version tag.
-  image:
-    needs: binaries
-    # `binaries` is skipped when the caller supplied the artifact; a failed or cancelled build still blocks the image.
-    if: ${{ !cancelled() && contains(fromJSON('["success","skipped"]'), needs.binaries.result) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: ghcr.io/jpalczewski/weglarka
-            file: Containerfile
-          - image: ghcr.io/jpalczewski/weglarka-panel
-            file: Containerfile.panel
-    env:
-      IMAGE: ${{ matrix.image }}
+  # One place decides the channel and which component images this run may build. A tag run must
+  # never silently publish a set built from another component's artifacts.
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.plan.outputs.channel }}
+      daemon: ${{ steps.plan.outputs.daemon }}
+      panel: ${{ steps.plan.outputs.panel }}
+    steps:
+      - id: plan
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_call ]; then
+            channel=main; daemon=true; panel=true
+          elif [[ "$GITHUB_REF" == refs/tags/v[0-9]* ]]; then
+            channel=stable; daemon=true; panel=true
+          elif [[ "$GITHUB_REF" == refs/tags/weglarka-panel-v* ]]; then
+            # Panel-only: the daemon image (and the host files inside it) is reused unchanged.
+            channel=stable; daemon=false; panel=true
+          elif [[ "$GITHUB_REF" == refs/tags/weglarka-cli-v* ]]; then
+            # The CLI ships inside the daemon image, so a CLI release rebuilds it.
+            channel=stable; daemon=true; panel=false
+          else
+            echo "::error::release.yml was triggered by an unsupported ref $GITHUB_REF"
+            exit 1
+          fi
+          {
+            echo "channel=$channel"
+            echo "daemon=$daemon"
+            echo "panel=$panel"
+          } >> "$GITHUB_OUTPUT"
+
+  # The image is assembled from the binaries built once in `binaries` below (also the release
+  # assets): what is published is exactly what was built there, and the image job compiles nothing.
+  # One leg per component, each with its own trigger; each leg's
+  # `org.opencontainers.image.version` is the version of the crate whose binary it carries,
+  # passed explicitly (never a moving tag or `meta.outputs.version`). Splitting the legs keeps the job-level `if`
+  # within the expressible contexts (a job `if` cannot read `matrix`), so a panel-only tag does not
+  # start a daemon build at all.
+  image-daemon:
+    needs: [plan, binaries]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.daemon == 'true' &&
+      contains(fromJSON('["success","skipped"]'), needs.binaries.result) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -51,17 +83,26 @@ jobs:
       id-token: write # cosign keyless (GitHub OIDC)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Tag matches the weglarka-daemon version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Component crate version
+        id: crate
         run: |
-          ver=$(awk -F'"' '/^\[package\]/{f=1;next} /^\[/{f=0} f&&/^version/{print $2}' crates/weglarka-daemon/Cargo.toml)
-          [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != weglarka-daemon version v$ver"; exit 1; }
+          set -euo pipefail
+          version=$(awk -F'"' '/^\[package\]/{f=1;next} /^\[/{f=0} f&&/^version/{print $2; exit}' \
+            crates/weglarka-daemon/Cargo.toml)
+          [ -n "$version" ] || { echo "::error::cannot read the weglarka-daemon crate version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Daemon tag matches the daemon crate version
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          [ "v${{ steps.crate.outputs.version }}" = "$GITHUB_REF_NAME" ] ||
+            { echo "tag $GITHUB_REF_NAME != weglarka-daemon version v${{ steps.crate.outputs.version }}"; exit 1; }
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.artifact || 'raw-x86_64-unknown-linux-musl' }}
           path: bin
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@81c6f93d4bc491e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -69,32 +110,37 @@ jobs:
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ env.DAEMON_IMAGE }}
+          # A daemon tag releases the daemon image (`<version>`, `latest`). A CLI-only tag rebuilds
+          # this image because it carries the host CLI, but must not overwrite those moving tags:
+          # the immutable `sha-<7>` tag identifies it and the release set names it by digest.
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
+            type=raw,value=${{ steps.crate.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: ${{ matrix.file }}
+          file: Containerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BIN_SOURCE=prebuilt
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ steps.crate.outputs.version }}
             REVISION=${{ github.sha }}
           provenance: false
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Podpis obrazu (keyless)
-        run: cosign sign --yes "$IMAGE@${{ steps.build.outputs.digest }}"
+        run: cosign sign --yes "${{ env.DAEMON_IMAGE }}@${{ steps.build.outputs.digest }}"
       # Second signature, with the long-lived key the daemon can verify offline (`cosign.pub` in the
       # repository is the public half; the daemon embeds it). Keyless stays for humans. No Rekor
       # upload: the verifier needs nothing but the key and the payload (docs/decisions/0024).
+      # A release set references component images by digest and verifies this signature, so a
+      # missing key fails the run on both channels, not just on a daemon tag.
       - name: Podpis obrazu kluczem statycznym (samoaktualizacja)
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
@@ -102,32 +148,133 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
-            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-              echo "::error::COSIGN_PRIVATE_KEY is not set — a release must be verifiable by the self-updater"
-              exit 1
-            fi
-            echo "::warning::COSIGN_PRIVATE_KEY is not set — the image is not signed with the static key, self-update will refuse it"
-            exit 0
+            echo "::error::COSIGN_PRIVATE_KEY is not set — a release set is unverifiable without the static signature"
+            exit 1
           fi
           # The daemon's verifier reads the legacy `sha256-<hex>.sig` tag. Cosign 3 stores a sigstore bundle as
           # an OCI referrer by default, so ask for the legacy simple-signing layout explicitly (#316).
           cosign sign --yes --key env://COSIGN_PRIVATE_KEY --use-signing-config=false --tlog-upload=false \
             --new-bundle-format=false --registry-referrers-mode=legacy \
-            "$IMAGE@${{ steps.build.outputs.digest }}"
-          # Fail the release instead of the first host: the tag the daemon fetches must exist now.
+            "${{ env.DAEMON_IMAGE }}@${{ steps.build.outputs.digest }}"
           digest="${{ steps.build.outputs.digest }}"
-          docker buildx imagetools inspect "$IMAGE:${digest/:/-}.sig" > /dev/null
+          docker buildx imagetools inspect "${{ env.DAEMON_IMAGE }}:${digest/:/-}.sig" > /dev/null
       - name: SBOM (SPDX) jako atestacja cosign
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65cb221b6bb0ad6c # v0.24.3
         with:
-          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.DAEMON_IMAGE }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: false
-      - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE@${{ steps.build.outputs.digest }}"
+      - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${{ env.DAEMON_IMAGE }}@${{ steps.build.outputs.digest }}"
+      - name: Record the built image identity
+        run: |
+          set -euo pipefail
+          mkdir -p image-metadata
+          printf '{"component":"daemon","repository":"%s","digest":"%s","version":"%s","revision":"%s"}\n' \
+            "$DAEMON_IMAGE" "${{ steps.build.outputs.digest }}" "${{ steps.crate.outputs.version }}" \
+            "$GITHUB_SHA" > image-metadata/daemon.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-metadata-daemon
+          path: image-metadata/daemon.json
+          retention-days: 1
 
-  # Full `release` profile (docs/decisions/0008). Tags only: on main the very same linux/musl build is ci.yml's
-  # `musl` job, whose artifact reaches `image` through `inputs.artifact`.
+  image-panel:
+    needs: [plan, binaries]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.panel == 'true' &&
+      contains(fromJSON('["success","skipped"]'), needs.binaries.result) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless (GitHub OIDC)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Component crate version
+        id: crate
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^\[package\]/{f=1;next} /^\[/{f=0} f&&/^version/{print $2; exit}' \
+            crates/weglarka-panel/Cargo.toml)
+          [ -n "$version" ] || { echo "::error::cannot read the weglarka-panel crate version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact || 'raw-x86_64-unknown-linux-musl' }}
+          path: bin
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc491e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.PANEL_IMAGE }}
+          # The panel's own crate version on any release tag (a daemon tag also publishes the
+          # current panel). Never the daemon version: that was issue #312.
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ steps.crate.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile.panel
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BIN_SOURCE=prebuilt
+            VERSION=${{ steps.crate.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Podpis obrazu (keyless)
+        run: cosign sign --yes "${{ env.PANEL_IMAGE }}@${{ steps.build.outputs.digest }}"
+      - name: Podpis obrazu kluczem statycznym (samoaktualizacja)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "::error::COSIGN_PRIVATE_KEY is not set — a release set is unverifiable without the static signature"
+            exit 1
+          fi
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY --use-signing-config=false --tlog-upload=false \
+            --new-bundle-format=false --registry-referrers-mode=legacy \
+            "${{ env.PANEL_IMAGE }}@${{ steps.build.outputs.digest }}"
+          digest="${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect "${{ env.PANEL_IMAGE }}:${digest/:/-}.sig" > /dev/null
+      - name: SBOM (SPDX) jako atestacja cosign
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65cb221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.PANEL_IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+      - run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${{ env.PANEL_IMAGE }}@${{ steps.build.outputs.digest }}"
+      - name: Record the built image identity
+        run: |
+          set -euo pipefail
+          mkdir -p image-metadata
+          printf '{"component":"panel","repository":"%s","digest":"%s","version":"%s","revision":"%s"}\n' \
+            "$PANEL_IMAGE" "${{ steps.build.outputs.digest }}" "${{ steps.crate.outputs.version }}" \
+            "$GITHUB_SHA" > image-metadata/panel.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-metadata-panel
+          path: image-metadata/panel.json
+          retention-days: 1
+
+  # Full `release` profile (docs/decisions/0008). Tags only: on main the very same linux/musl build is
+  # ci.yml's `musl` job, whose artifact reaches `image` through `inputs.artifact`.
   binaries:
     if: ${{ inputs.artifact == '' }}
     strategy:
@@ -185,9 +332,278 @@ jobs:
           path: dist/*.tar.gz
           retention-days: 1
 
+  # Built once from this revision: the compatibility matrix and the release-set job use the same
+  # binary, so the publisher and the verifier are the exact same implementation in one run.
+  release-tool:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-tool
+      - run: cargo build --release --locked -p weglarka-release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: weglarka-release
+          path: target/release/weglarka-release
+          if-no-files-found: error
+          retention-days: 1
+
+  # Rebuild `compatibility.panel_digests` for exactly this daemon digest: the new panel and the
+  # immediately previous promoted panel are each started against the daemon image under test.
+  # Nothing is inherited: the list the publisher receives is the list this job actually ran.
+  compatibility:
+    needs: [plan, image-daemon, image-panel, release-tool]
+    if: >-
+      ${{ !cancelled() && needs.plan.result == 'success' && needs.release-tool.result == 'success' &&
+      !contains(fromJSON('["failure","cancelled"]'), needs.image-daemon.result) &&
+      !contains(fromJSON('["failure","cancelled"]'), needs.image-panel.result) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tested: ${{ steps.matrix.outputs.tested }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/podman-rootless
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: weglarka-release
+          path: tool
+      - name: Download the component image identities
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-metadata-*
+          path: metadata
+          merge-multiple: true
+      - uses: docker/login-action@81c6f93d4bc491e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Read the current channel pointer (first release: none)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          chmod +x tool/weglarka-release
+          if ! tool/weglarka-release verify --channel "$CHANNEL" --json \
+              --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err; then
+            if grep -qi "status 404" verify.err; then
+              echo "no $CHANNEL release set yet"
+              rm -f previous.json
+            else
+              cat verify.err >&2
+              exit 1
+            fi
+          fi
+      - name: Run daemon × panel matrix
+        id: matrix
+        env:
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          payload() { jq -r "$1" "$2" 2>/dev/null || true; }
+          old_daemon=$( [ -f previous.json ] && payload .daemon.digest previous.json || true )
+          old_panel=$( [ -f previous.json ] && payload .panel.digest previous.json || true )
+          new_daemon=$( [ -f metadata/daemon.json ] && payload .digest metadata/daemon.json || true )
+          new_panel=$( [ -f metadata/panel.json ] && payload .digest metadata/panel.json || true )
+          daemon=${new_daemon:-$old_daemon}
+          [ -n "$daemon" ] || { echo "::error::no daemon image to test: it was neither built nor reused"; exit 1; }
+          # The list is rebuilt per daemon digest: the new panel (when this run built one) plus the
+          # previous promoted panel, each run against this daemon image. No entry is inherited.
+          panels=""
+          for digest in "$new_panel" "$old_panel"; do
+            [ -n "$digest" ] || continue
+            case " $panels " in *" $digest "*) continue ;; esac
+            panels="${panels:+$panels }$digest"
+          done
+          [ -n "$panels" ] || { echo "::error::no panel image to test"; exit 1; }
+          for panel_digest in $panels; do
+            echo "--- daemon $daemon × panel $panel_digest"
+            .github/scripts/compatibility-panel.sh \
+              "${{ env.DAEMON_IMAGE }}@$daemon" "${{ env.PANEL_IMAGE }}@$panel_digest"
+          done
+          echo "tested=$(printf '%s' "$panels" | tr ' ' ',')" >> "$GITHUB_OUTPUT"
+
+  # The promotion critical section. One concurrency group per channel, and a queued successor is
+  # never cancelled: if this run is superseded, the successor still promotes and reconciles.
+  release-set:
+    needs: [plan, image-daemon, image-panel, compatibility, release-tool]
+    if: >-
+      ${{ !cancelled() && needs.plan.result == 'success' && needs.compatibility.result == 'success' &&
+      needs.release-tool.result == 'success' }}
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release-set-${{ needs.plan.outputs.channel }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write # publish the release set and move the channel tag
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # ancestry: the previous set's revision must be an ancestor of this one
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: weglarka-release
+          path: tool
+      - name: Download the component image identities
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-metadata-*
+          path: metadata
+          merge-multiple: true
+      - name: Download the host binaries (only when the daemon image was built)
+        if: ${{ needs.plan.outputs.daemon == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact || 'raw-x86_64-unknown-linux-musl' }}
+          path: bin
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc491e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: "Read the current channel pointer (first release: none)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          chmod +x tool/weglarka-release
+          if ! tool/weglarka-release verify --channel "$CHANNEL" --json \
+              --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err; then
+            if grep -qi "status 404" verify.err; then
+              echo "no $CHANNEL release set yet"
+              rm -f previous.json
+            else
+              cat verify.err >&2
+              exit 1
+            fi
+          fi
+      - name: Ancestry — never promote an older revision over a descendant
+        run: |
+          set -euo pipefail
+          if [ ! -f previous.json ]; then
+            echo "first ${{ needs.plan.outputs.channel }} release set"
+            exit 0
+          fi
+          previous=$(jq -r .revision previous.json)
+          if ! git merge-base --is-ancestor "$previous" "$GITHUB_SHA"; then
+            echo "::error::$GITHUB_SHA is not a descendant of the promoted revision $previous; refusing to move the channel backwards"
+            exit 1
+          fi
+      - name: Publish the immutable release set
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          DAEMON: ${{ needs.plan.outputs.daemon }}
+          PANEL: ${{ needs.plan.outputs.panel }}
+          TESTED: ${{ needs.compatibility.outputs.tested }}
+        run: |
+          set -euo pipefail
+          payload() { jq -r "$1" "$2" 2>/dev/null || true; }
+          schema=$(grep -oE 'SCHEMA_VERSION: u32 = [0-9]+' crates/weglarka-model/src/state.rs | grep -oE '[0-9]+')
+          [ -n "$schema" ] || { echo "::error::cannot read the state schema version"; exit 1; }
+
+          args=(--channel "$CHANNEL" --revision "$GITHUB_SHA" --release-repository "$RELEASE_REPOSITORY"
+                --daemon-crate crates/weglarka-daemon --panel-crate crates/weglarka-panel --cli-crate crates/weglarka-cli
+                --host-bin-dir bin --state-read "$schema" --state-write "$schema")
+
+          if [ "$DAEMON" = true ]; then
+            [ -f metadata/daemon.json ] || { echo "::error::the daemon image was built but its identity is missing"; exit 1; }
+            args+=(--daemon-repository "$(payload .repository metadata/daemon.json)"
+                   --daemon-digest "$(payload .digest metadata/daemon.json)")
+          else
+            # Panel-only: reuse the daemon image and its host-file records without relabeling.
+            [ -f previous.json ] || { echo "::error::--reuse-daemon needs a previous release set"; exit 1; }
+            args+=(--reuse-daemon)
+          fi
+
+          if [ "$PANEL" = true ]; then
+            [ -f metadata/panel.json ] || { echo "::error::the panel image was built but its identity is missing"; exit 1; }
+            panel_digest=$(payload .digest metadata/panel.json)
+          else
+            # CLI-only: the panel artifact is unchanged, so the previous promoted panel is reused.
+            [ -f previous.json ] || { echo "::error::a CLI-only release needs a previous release set to reuse the panel"; exit 1; }
+            panel_digest=$(payload .panel.digest previous.json)
+          fi
+          args+=(--panel-repository "$PANEL_IMAGE" --panel-digest "$panel_digest")
+
+          [ -n "$TESTED" ] || { echo "::error::the compatibility matrix reported no tested panel"; exit 1; }
+          IFS=',' read -ra digests <<< "$TESTED"
+          tested_count=0
+          for digest in "${digests[@]}"; do
+            [ -n "$digest" ] || continue
+            args+=(--panel-tested "$digest")
+            tested_count=$((tested_count + 1))
+          done
+          [ "$tested_count" -gt 0 ] || { echo "::error::the compatibility matrix reported no tested panel"; exit 1; }
+
+          tool/weglarka-release publish "${args[@]}" \
+            --registry-user "$GITHUB_ACTOR" --registry-token-env GITHUB_TOKEN --json > published.json
+          cat published.json
+      # The signature uses the existing static release key (the private half of `cosign.pub`), in the
+      # legacy `sha256-<hex>.sig` layout. A missing key fails the run on both channels.
+      - name: Sign the release set with the static key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "::error::COSIGN_PRIVATE_KEY is not set — the release set cannot be signed"
+            exit 1
+          fi
+          digest=$(jq -r .release_set_digest published.json)
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY --use-signing-config=false --tlog-upload=false \
+            --new-bundle-format=false --registry-referrers-mode=legacy \
+            "$RELEASE_REPOSITORY@$digest"
+          docker buildx imagetools inspect "$RELEASE_REPOSITORY:${digest/:/-}.sig" > /dev/null
+      - name: Verify and promote
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tag=$(jq -r .tag published.json)
+          tool/weglarka-release promote --channel "$CHANNEL" --tag "$tag" --json \
+            --registry-user "$GITHUB_ACTOR" | tee promoted.json
+      # A superseded queued run must not leave the channel behind: after promotion, compare the
+      # channel with the newest complete set. If a newer signed set exists, move the pointer to it
+      # (an idempotent, serialized promotion); if it cannot be verified, this step fails loudly.
+      - name: Reconcile a superseded promotion
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tool/weglarka-release reconcile --channel "$CHANNEL" \
+            --registry-user "$GITHUB_ACTOR" --registry-token-env GITHUB_TOKEN
+      - name: Verify the promoted channel with the runtime verifier
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tool/weglarka-release verify --channel "$CHANNEL" \
+            --registry-user "$GITHUB_ACTOR" --registry-token-env GITHUB_TOKEN
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [image, binaries]
+    needs: [image-daemon, image-panel, binaries]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # GitHub Release

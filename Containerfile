@@ -36,6 +36,10 @@ COPY --chmod=0755 bin/weglarka-daemon bin/weglarka /out/
 FROM ${BIN_SOURCE} AS bin
 
 FROM scratch
+# `VERSION` is the **weglarka-daemon** crate version passed by the release workflow (never a moving
+# tag or a metadata-action output): `org.opencontainers.image.version` describes the daemon binary
+# inside this image. `REVISION` is the informational source revision and is deliberately not
+# compared with a release set's `revision` (docs/contracts/platform-update-v1).
 ARG VERSION=dev
 ARG REVISION=unknown
 # The state schema this image writes (crates/weglarka-model/src/state.rs). The self-updater compares
