@@ -26,22 +26,16 @@ pub struct PanelTransitionRequest {
     pub retry_failed_release: bool,
 }
 
-/// Recorded status of a panel transition. `Pending`/`Running` are nonterminal; the rest are durable
-/// terminal answers, including after a restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PanelTransitionStatus {
-    Pending,
-    Running,
-    Succeeded,
-    RolledBack,
-    Failed,
-}
+/// Recorded status of a panel transition (`Pending`/`Running` are nonterminal; the rest are durable
+/// terminal answers, including after a restart). The model's type, not a copy of it.
+pub use weglarka_model::platform_transitions::TransitionStatus as PanelTransitionStatus;
 
 /// Response of both `POST` and `GET`: the same durable record, so a retry after a restart returns
 /// the recorded result instead of redeploying.
+///
+/// Unknown fields are ignored on purpose (unlike the request): an older tool generation kept as the
+/// recovery generation must still read a newer daemon's response once a field is added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PanelTransitionResponse {
     pub transaction_id: TransactionId,
     pub status: PanelTransitionStatus,
@@ -87,6 +81,24 @@ mod tests {
             &format!("sha256:{}", "B".repeat(64)),
         );
         assert!(serde_json::from_str::<PanelTransitionRequest>(&uppercase).is_err());
+    }
+
+    #[test]
+    fn response_ignores_fields_added_by_a_newer_daemon() {
+        let response = PanelTransitionResponse {
+            transaction_id: TransactionId::new("tx-1").unwrap(),
+            status: PanelTransitionStatus::Succeeded,
+            requested_digest: digest('b'),
+            actual_digest: Some(digest('b')),
+            pin_revision: 7,
+            reason: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let newer = json.replacen('}', ",\"added_later\":{\"x\":1}}", 1);
+        assert_eq!(
+            serde_json::from_str::<PanelTransitionResponse>(&newer).unwrap(),
+            response
+        );
     }
 
     #[test]

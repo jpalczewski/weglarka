@@ -613,8 +613,12 @@ pub fn parse_descriptor(
 }
 
 /// An OCI image manifest that carries a release-set descriptor layer.
+///
+/// An external format, so unknown fields are ignored: common tools add `annotations` (and the
+/// OCI spec allows more), and rejecting them would reject a release set nothing is wrong with. What
+/// matters is checked explicitly instead (artifact and media types, blob digests and sizes, no
+/// `urls`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(rename = "schemaVersion")]
     pub schema_version: u32,
@@ -626,9 +630,8 @@ pub struct Manifest {
     pub layers: Vec<ManifestDescriptor>,
 }
 
-/// One descriptor in a manifest (`config` or a layer).
+/// One descriptor in a manifest (`config` or a layer). Unknown fields (`annotations`, ...) are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManifestDescriptor {
     #[serde(rename = "mediaType")]
     pub media_type: String,
@@ -995,6 +998,18 @@ mod tests {
         }
         assert!(Repository::new("ghcr.io/example/weglarka").is_ok());
         assert!(Repository::new("localhost:5000/example/weglarka").is_ok());
+    }
+
+    #[test]
+    fn manifest_with_standard_annotations_parses() {
+        let mut value: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
+        value["annotations"] =
+            serde_json::json!({"org.opencontainers.image.created": "2026-01-01T00:00:00Z"});
+        value["config"]["annotations"] = serde_json::json!({"a": "b"});
+        value["layers"][0]["annotations"] =
+            serde_json::json!({"org.opencontainers.image.title": "release.json"});
+        let manifest = parse_manifest(value.to_string().as_bytes()).unwrap();
+        assert_eq!(manifest, parse_manifest(MANIFEST.as_bytes()).unwrap());
     }
 
     #[test]
