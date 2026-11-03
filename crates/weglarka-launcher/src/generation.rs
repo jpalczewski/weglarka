@@ -173,10 +173,21 @@ impl GenerationStore {
             path: dir.clone(),
             source,
         })?;
-        let meta = fs::metadata(&dir).map_err(|source| GenerationError::Dir {
+        // `symlink_metadata`, not `metadata`: a `generations` that is a symlink (or anything but a
+        // plain directory) is never accepted, so the mode below cannot land on another target.
+        let meta = fs::symlink_metadata(&dir).map_err(|source| GenerationError::Dir {
             path: dir.clone(),
             source,
         })?;
+        if !meta.is_dir() {
+            return Err(GenerationError::Dir {
+                path: dir.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a plain directory",
+                ),
+            });
+        }
         if meta.permissions().mode() & 0o777 != GENERATION_DIR_MODE {
             fs::set_permissions(&dir, fs::Permissions::from_mode(GENERATION_DIR_MODE)).map_err(
                 |source| GenerationError::Dir {

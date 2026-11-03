@@ -205,6 +205,10 @@ pub async fn bootstrap<P: Platform>(
         }
     }
 
+    // Root executes the generation binaries below, so the code must already be root-owned and not
+    // writable by the runtime user. (Applied again at the end for the state files written after this.)
+    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid)?;
+
     // 8. Preflight the active and recovery generation against the *current* configuration, now that
     //    the OpenRC runtime prerequisites are provisioned.
     let mut preflight = PreflightOutcome {
@@ -253,7 +257,7 @@ pub async fn bootstrap<P: Platform>(
     )
     .is_ok();
 
-    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid);
+    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid)?;
 
     Ok(BootstrapReport {
         host_dir,
@@ -568,24 +572,31 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-/// Applies the ownership model of [`crate::ownership`]. Best effort: a non-root bootstrap (tests, an
-/// installer context that already owns the directory) cannot chown, and then nothing is changed.
-fn apply_ownership(host_dir: &Path, uid: Option<u32>, gid: Option<u32>) {
+/// Applies the ownership model of [`crate::ownership`]. A non-root bootstrap (tests, an installer
+/// context that already owns the directory) cannot chown and nothing is changed; once the host
+/// directory itself was taken over, any entry that could not be secured fails the bootstrap.
+fn apply_ownership(
+    host_dir: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), BootstrapError> {
     let (Some(uid), Some(gid)) = (uid, gid) else {
-        return;
+        return Ok(());
     };
     match crate::ownership::apply(host_dir, uid, gid, &mut crate::ownership::lchown) {
-        Ok(0) => {}
-        Ok(failures) => tracing::warn!(
-            host_dir = %host_dir.display(),
-            failures,
-            "some host directory entries could not be given their owner"
-        ),
-        Err(error) => tracing::debug!(
-            host_dir = %host_dir.display(),
-            %error,
-            "host directory ownership not changed"
-        ),
+        Ok(0) => Ok(()),
+        Ok(failures) => Err(BootstrapError::Incomplete(format!(
+            "{failures} entries of {} could not be given their owner or are writable by others",
+            host_dir.display()
+        ))),
+        Err(error) => {
+            tracing::debug!(
+                host_dir = %host_dir.display(),
+                %error,
+                "host directory ownership not changed"
+            );
+            Ok(())
+        }
     }
 }
 

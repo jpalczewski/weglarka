@@ -15,7 +15,7 @@
 //! Ownership is changed with `lchown` on entries that `symlink_metadata` reported as non-symlinks, and
 //! symlinks are never followed or descended into: a link the runtime user plants (`x -> /etc`) is
 //! left alone instead of handing its target to that user. The only path handed to the runtime user is
-//! a final component directly in the host directory (`lchown` does not follow it); everything below
+//! a regular file directly in the host directory, changed through a verified descriptor; everything below
 //! `generations/` is only ever given to root, and no mode is changed by path. The host directory's own
 //! mode is set through a descriptor whose identity was checked against the path.
 
@@ -28,9 +28,45 @@ use weglarka_launcher::host::{GENERATIONS_DIR, LAUNCHER_FILE};
 /// Mode of the host directory: group-writable with the sticky bit (see the module documentation).
 pub const HOST_DIR_MODE: u32 = 0o1770;
 
-/// Changes owner and group without following a symlink at `path`.
+/// Changes owner and group of `path` without ever acting on a symlink or on an inode with other hard
+/// links. Directories use `lchown` (the final component is not followed). A regular file is opened,
+/// its identity (device and inode) is required to equal what `path` names both before and after the
+/// open, it must have exactly one link, and the change goes through the descriptor, so a name
+/// swapped for a symlink or a hard link in between can never redirect it.
 pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+    let named = std::fs::symlink_metadata(path)?;
+    if named.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if named.is_dir() {
+        return std::os::unix::fs::lchown(path, Some(uid), Some(gid));
+    }
+    if !named.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let again = std::fs::symlink_metadata(path)?;
+    let same =
+        |a: &std::fs::Metadata, b: &std::fs::Metadata| (a.dev(), a.ino()) == (b.dev(), b.ino());
+    if !opened.is_file()
+        || opened.nlink() != 1
+        || again.file_type().is_symlink()
+        || !same(&named, &opened)
+        || !same(&again, &opened)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed while it was being examined", path.display()),
+        ));
+    }
+    std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
 }
 
 /// Applies the ownership model to `host_dir`. `chown` is the ownership primitive ([`lchown`] in
@@ -115,8 +151,8 @@ where
     Ok(failures)
 }
 
-/// Makes `dir` and everything below it root-owned. Only `lchown` to `root:root` happens here: it never
-/// follows a symlink at the final component, and handing something to root is never an escalation.
+/// Makes `dir` and everything below it root-owned. Only a change to `root:root` happens here, never
+/// through a symlink, and handing something to root is never an escalation.
 /// Modes are not touched (a path-based chmod follows symlinks): the generation store already creates
 /// `generations/` and its directories `0755` and manifests `0644`, and the tool binaries `0755`.
 /// Symlinks are skipped, not followed.
@@ -137,6 +173,11 @@ where
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
+        }
+        // Code root executes must not be writable by anyone else: report group/world write and
+        // setuid/setgid bits instead of silently accepting them.
+        if metadata.permissions().mode() & 0o7022 != 0 {
+            failures += 1;
         }
         if file_type.is_dir() {
             failures += root_tree(&path, chown);
@@ -247,6 +288,38 @@ mod tests {
             );
         }
         assert!(!calls.iter().any(|(p, _, _)| p.ends_with("passwd")));
+    }
+
+    #[test]
+    fn world_writable_code_is_reported() {
+        let (_dir, _outside, host) = tree();
+        let binary = host
+            .join(GENERATIONS_DIR)
+            .join("g1")
+            .join("weglarka-daemon");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o757)).unwrap();
+        let (_calls, failures) = recorded(&host);
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn the_production_chown_refuses_symlinks_and_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        std::fs::hard_link(&target, dir.path().join("hard")).unwrap();
+        let (uid, gid) = {
+            let m = std::fs::metadata(&target).unwrap();
+            (m.uid(), m.gid())
+        };
+        for name in ["link", "hard", "target"] {
+            // `target` now has two links, so even it is refused.
+            assert!(lchown(&dir.path().join(name), uid, gid).is_err(), "{name}");
+        }
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        lchown(&plain, uid, gid).expect("a plain file owned by the caller");
     }
 
     #[test]
