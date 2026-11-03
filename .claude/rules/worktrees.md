@@ -14,10 +14,13 @@ create the worktree **before** the first edit.
   shared `CARGO_TARGET_DIR` nor a shared `build.build-dir`; measured 2026-10-27, #223). Workspace crate paths are hashed
   relative to the workspace root, so identical layouts produce identical artifact names, and freshness is mtime: if your
   edit is older than another worktree's build, cargo rebuilds nothing and links **that** checkout's code. crates.io
-  dependencies are compiled once by sccache anyway (`RUSTC_WRAPPER=sccache`), so a private `target/` costs disk, not
-  time. `~/.cargo/config.toml` may set a global `target-dir` — pin it:
-  `export CARGO_TARGET_DIR="$(scripts/worktree.sh target)"`. Size: about 1.1 GB after `cargo build --workspace`, ≥2 GB
-  with tests (`scripts/worktree.sh usage` shows all of them plus free space).
+  dependencies are compiled once by sccache (`RUSTC_WRAPPER=sccache`), so a private `target/` costs disk, not time.
+  The pin is the committed `.cargo/config.toml` (`[build] target-dir = "target"`), which beats a global `target-dir`
+  in `~/.cargo/config.toml` — nothing to export. **Do not set `CARGO_TARGET_DIR`**: sccache hashes every `CARGO_*`
+  environment variable into the Rust cache key, so a per-checkout value gives each worktree its own cache entries and
+  dependencies are compiled again everywhere (measured 2026-11-03: env → miss, config or `--target-dir` → hit). Size:
+  about 1.1 GB after `cargo build --workspace`, ≥2 GB with tests (`scripts/worktree.sh usage` shows all of them plus
+  free space).
 - Leaving: `cd` back to the checkout (the worktree and branch stay). After the PR merges, remove the worktree **together
   with its `target/`**: `scripts/worktree.sh remove .agents/worktrees/<name> --delete-branch` (that is `rm -rf target`,
   `git worktree remove`, `git worktree prune`, `git branch -D`). Stale `target/` directories are also cleaned

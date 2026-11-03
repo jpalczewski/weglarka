@@ -5,13 +5,14 @@
 # than that build, and it does so silently (0 crates recompiled, wrong binary). Dependencies from
 # crates.io are still compiled once across worktrees by sccache (RUSTC_WRAPPER=sccache).
 #
-#   export CARGO_TARGET_DIR="$(scripts/worktree.sh target)"   # pin cargo to this checkout's target/
+# The committed .cargo/config.toml pins `target-dir = "target"`, overriding a machine-wide
+# `target-dir` in ~/.cargo/config.toml. Do not export CARGO_TARGET_DIR instead: sccache hashes it
+# into the cache key, so every worktree would compile its dependencies again.
+#
+#   scripts/worktree.sh target                                # this checkout's target/ (for --target-dir)
 #   scripts/worktree.sh usage                                 # target/ size of every worktree + free disk
 #   scripts/worktree.sh remove <worktree path> [--delete-branch]
 #   scripts/worktree.sh sweep [days]                          # cargo sweep --time <days> (default 14)
-#
-# The pin is needed because a machine-wide `target-dir` in ~/.cargo/config.toml would otherwise send
-# every worktree to the same directory.
 set -eu
 
 top=$(git rev-parse --show-toplevel)

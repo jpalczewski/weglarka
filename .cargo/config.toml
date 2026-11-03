@@ -1,0 +1,9 @@
+# Every checkout (main or worktree) builds into its own `target/`, even when ~/.cargo/config.toml sets a
+# machine-wide `target-dir`: this file is closer to the workspace and wins. A relative path resolves against the
+# directory that holds `.cargo/`, i.e. the checkout root.
+#
+# Pin it here, not with `CARGO_TARGET_DIR`: sccache hashes every `CARGO_*` environment variable into the Rust cache
+# key, so a per-checkout `CARGO_TARGET_DIR` gives every worktree its own cache entries and crates.io dependencies are
+# compiled again in each one. The environment variable still overrides this file where it is set (CI, sandboxes).
+[build]
+target-dir = "target"
