@@ -1182,7 +1182,7 @@ mod tests {
 
     fn image(id: &str, digest: char) -> ImageInfo {
         ImageInfo {
-            id: id.to_owned(),
+            id: full_id(id),
             digest: Some(digest_value(digest)),
             standalone_digest: Some(digest_value(digest)),
             repo_tags: Vec::new(),
@@ -1196,9 +1196,15 @@ mod tests {
         digest(c)
     }
 
+    /// A full-length image id (64 hex characters) from a short test label: libpod always reports
+    /// the full id and `ImageId` accepts nothing else.
+    fn full_id(label: &str) -> String {
+        format!("{label:0<64}")
+    }
+
     fn record(id: &str, owner: Owner, repository: &str, c: char) -> ManagedImage {
         ManagedImage {
-            image_id: ImageId::new(id).unwrap(),
+            image_id: ImageId::new(full_id(id)).unwrap(),
             digests: [StrictDigest::new(digest(c).as_str()).unwrap()].into(),
             associations: [Association {
                 owner,
@@ -1223,7 +1229,7 @@ mod tests {
             id: "c1".into(),
             name: "old".into(),
             image: String::new(),
-            image_id: "2".into(),
+            image_id: full_id("2"),
             labels: BTreeMap::new(),
             state: weglarka_model::podman::ContainerState::Exited,
             exit_code: Some(0),
@@ -1257,14 +1263,14 @@ mod tests {
                 .iter()
                 .map(|i| i.id.as_str())
                 .collect::<Vec<_>>(),
-            ["1"]
+            [full_id("1").as_str()]
         );
         assert!(
             plan.keep
                 .iter()
-                .any(|(i, r)| i.id == "2" && *r == KeepReason::InUse(vec!["old".into()]))
+                .any(|(i, r)| i.id == full_id("2") && *r == KeepReason::InUse(vec!["old".into()]))
         );
-        assert!(plan.keep.iter().any(|(i, _)| i.id == "3"));
+        assert!(plan.keep.iter().any(|(i, _)| i.id == full_id("3")));
     }
 
     #[test]
@@ -1288,7 +1294,7 @@ mod tests {
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(plan.keep.len(), 1);
         assert_eq!(plan.unattributed.len(), 1);
-        assert_eq!(plan.unattributed[0].id, "2");
+        assert_eq!(plan.unattributed[0].id, full_id("2"));
     }
 
     fn reconciler() -> (tempfile::TempDir, Reconciler<FakePodman>) {
@@ -1403,7 +1409,7 @@ mod tests {
             "{error:?}"
         );
         let protections = BTreeSet::from([Protection {
-            identity: ProtectionIdentity::ImageId(ImageId::new("aa").unwrap()),
+            identity: ProtectionIdentity::ImageId(ImageId::new(full_id("aa")).unwrap()),
             reason: ProtectionReason::AcquisitionInProgress,
             operation_id: Some(operation.clone()),
         }]);
