@@ -43,13 +43,19 @@ usage)
     ;;
 remove)
     [ $# -ge 2 ] || { echo "usage: $0 remove <worktree path> [--delete-branch]" >&2; exit 2; }
-    wt=$(cd "$2" && pwd -P)
+    # Use the path exactly as git recorded it. On macOS git records a non-ASCII path (the "ę" in the repo
+    # name) decomposed (NFD), as getcwd returns it, but core.precomposeUnicode (on by default there)
+    # composes command-line arguments to NFC, so `git worktree remove <absolute path>` compares two
+    # different byte strings and says "is not a working tree". `-ef` finds the entry whatever the
+    # spelling of $2, and the removal below keeps git from recomposing it.
+    wt=$(worktrees | while IFS= read -r w; do [ "$w" -ef "$2" ] && { printf '%s\n' "$w"; break; }; done || true)
+    [ -n "$wt" ] || { echo "not a worktree of this repository: $2" >&2; exit 1; }
     main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
-    [ "$wt" != "$main" ] || { echo "refusing to remove the main checkout" >&2; exit 1; }
+    [ ! "$wt" -ef "$main" ] || { echo "refusing to remove the main checkout" >&2; exit 1; }
     branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD || true)
     # target/ is untracked, so `git worktree remove` would not need it gone; dropping it first is what frees the disk.
     rm -rf "$wt/target"
-    git worktree remove "$wt"
+    git -c core.precomposeUnicode=false worktree remove "$wt"
     git worktree prune
     if [ "${3:-}" = "--delete-branch" ] && [ -n "$branch" ]; then
         git branch -D "$branch"
