@@ -20,6 +20,7 @@ pub mod history;
 pub mod host_ports;
 pub mod identity;
 pub mod image_inventory;
+pub mod image_ref;
 pub mod labels;
 pub mod limits;
 pub mod platform_transitions;

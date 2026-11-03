@@ -38,27 +38,7 @@ impl ImageRef {
     /// [`ImageRefError::DigestRef`].
     pub fn parse(image: &str) -> Result<Self, ImageRefError> {
         let invalid = || image.to_owned();
-        if image.is_empty() {
-            return Err(ImageRefError::Empty);
-        }
-        if image.len() > MAX_REFERENCE_LEN {
-            return Err(ImageRefError::TooLong(invalid()));
-        }
-        if !image.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(ImageRefError::Control(invalid()));
-        }
-        if image.contains("://") {
-            return Err(ImageRefError::Scheme(invalid()));
-        }
-        // A digest reference names a manifest by digest, so it has no tag to look a signature up
-        // for. Detect it before splitting, otherwise `repo@sha256:…` would look like a tag.
-        if image.contains('@') {
-            return Err(ImageRefError::DigestRef(invalid()));
-        }
-        let (registry, rest) = image
-            .split_once('/')
-            .ok_or_else(|| ImageRefError::MissingRegistry(invalid()))?;
-        validate_registry(registry, image)?;
+        let (registry, rest) = split_registry(image)?;
         let (repository, tag) = rest
             .rsplit_once(':')
             .ok_or_else(|| ImageRefError::MissingTag(invalid()))?;
@@ -78,11 +58,59 @@ impl ImageRef {
         })
     }
 
+    /// Parses a tag-free `host[:port]/path/to/repository`, with the same host and path rules as
+    /// [`ImageRef::parse`]; a tag or digest is rejected (the tag, because `:` is not a path
+    /// character, so it fails as an invalid repository or registry).
+    pub fn parse_repository(repository: &str) -> Result<RepositoryRef, ImageRefError> {
+        let (registry, path) = split_registry(repository)?;
+        if path.is_empty() || path.len() > MAX_REPOSITORY_LEN || !valid_repository(path) {
+            return Err(ImageRefError::Repository(repository.to_owned()));
+        }
+        Ok(RepositoryRef {
+            registry: registry.to_owned(),
+            repository: path.to_owned(),
+        })
+    }
+
     /// `registry/repository` — the reference without the tag, as cosign records it in the payload
     /// identity (`Docker-reference`).
     pub fn repository_reference(&self) -> String {
         format!("{}/{}", self.registry, self.repository)
     }
+}
+
+/// A parsed tag-free `registry/repository`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepositoryRef {
+    pub registry: String,
+    pub repository: String,
+}
+
+/// Shared prefix checks and the `registry` / rest split of a reference or a bare repository.
+fn split_registry(image: &str) -> Result<(&str, &str), ImageRefError> {
+    let invalid = || image.to_owned();
+    if image.is_empty() {
+        return Err(ImageRefError::Empty);
+    }
+    if image.len() > MAX_REFERENCE_LEN {
+        return Err(ImageRefError::TooLong(invalid()));
+    }
+    if !image.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ImageRefError::Control(invalid()));
+    }
+    if image.contains("://") {
+        return Err(ImageRefError::Scheme(invalid()));
+    }
+    // A digest reference names a manifest by digest, so it has no tag to look a signature up
+    // for. Detect it before splitting, otherwise `repo@sha256:…` would look like a tag.
+    if image.contains('@') {
+        return Err(ImageRefError::DigestRef(invalid()));
+    }
+    let (registry, rest) = image
+        .split_once('/')
+        .ok_or_else(|| ImageRefError::MissingRegistry(invalid()))?;
+    validate_registry(registry, image)?;
+    Ok((registry, rest))
 }
 
 impl fmt::Display for ImageRef {
@@ -226,6 +254,24 @@ fn valid_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_repository_requires_a_registry_host_and_no_tag() {
+        let parsed = ImageRef::parse_repository("ghcr.io/jpalczewski/weglarka").unwrap();
+        assert_eq!(parsed.registry, "ghcr.io");
+        assert_eq!(parsed.repository, "jpalczewski/weglarka");
+        assert!(ImageRef::parse_repository("localhost:5000/weglarka").is_ok());
+        for bad in [
+            "example/weglarka",
+            "ghcr.io/jpalczewski/weglarka:edge",
+            "ghcr.io/Upper/case",
+            "ghcr.io/",
+            "ghcr.io",
+            "ghcr.io/a@sha256:00",
+        ] {
+            assert!(ImageRef::parse_repository(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_registry_port_and_tag() {

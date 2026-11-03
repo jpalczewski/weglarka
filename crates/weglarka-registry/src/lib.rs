@@ -29,7 +29,8 @@
 
 mod cosign;
 mod http;
-mod image_ref;
+// The parser lives in the model (the release-set `Repository` validates through it); re-exported here.
+use weglarka_model::image_ref;
 mod key;
 mod registry;
 #[cfg(any(test, feature = "testing"))]

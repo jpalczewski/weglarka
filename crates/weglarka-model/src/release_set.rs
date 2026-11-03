@@ -32,6 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::app::{Digest, InvalidDigest};
+use crate::image_ref::ImageRef;
 
 /// Descriptor format understood by this parser.
 pub const FORMAT_VERSION: u32 = 1;
@@ -238,36 +239,13 @@ pub struct Repository(String);
 pub struct InvalidRepository(pub String);
 
 impl Repository {
+    /// Validated by the same parser as every other image reference (`image_ref`), so a name without a
+    /// registry host (`example/weglarka`) is rejected instead of being resolved through Podman's
+    /// unqualified-search registries.
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidRepository> {
         let value = value.into();
-        let invalid = || InvalidRepository(value.clone());
-        if value.is_empty()
-            || value.len() > 255
-            || !value.bytes().all(|b| b.is_ascii_graphic())
-            || value.contains('@')
-            || value.contains('?')
-            || value.contains('#')
-            || value.contains("://")
-        {
-            return Err(invalid());
-        }
-        let mut parts = value.split('/');
-        let host = parts.next().ok_or_else(invalid)?;
-        let path: Vec<&str> = parts.collect();
-        if path.is_empty() || !valid_host(host) {
-            return Err(invalid());
-        }
-        for component in path {
-            if component.is_empty()
-                || component.len() > 255
-                || !component.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
-                })
-                || !component.starts_with(|c: char| c.is_ascii_alphanumeric())
-                || !component.ends_with(|c: char| c.is_ascii_alphanumeric())
-            {
-                return Err(invalid());
-            }
+        if value.len() > 255 || ImageRef::parse_repository(&value).is_err() {
+            return Err(InvalidRepository(value));
         }
         Ok(Self(value))
     }
@@ -275,52 +253,6 @@ impl Repository {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-fn valid_host(host: &str) -> bool {
-    if host.is_empty() || host.len() > 253 {
-        return false;
-    }
-    if let Some(inner) = host.strip_prefix('[') {
-        let (node, rest) = match inner.split_once(']') {
-            Some(parts) => parts,
-            None => return false,
-        };
-        if node.is_empty()
-            || !node
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
-        {
-            return false;
-        }
-        return match rest.strip_prefix(':') {
-            Some(port) => valid_port(port),
-            None => rest.is_empty(),
-        };
-    }
-    let (name, port) = match host.rsplit_once(':') {
-        Some((name, port)) => (name, Some(port)),
-        None => (host, None),
-    };
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-        || name.split('.').any(|label| label.is_empty())
-    {
-        return false;
-    }
-    match port {
-        Some(port) => valid_port(port),
-        None => true,
-    }
-}
-
-fn valid_port(port: &str) -> bool {
-    !port.is_empty()
-        && port.len() <= 5
-        && port.bytes().all(|b| b.is_ascii_digit())
-        && port.parse::<u16>().is_ok_and(|p| p != 0)
 }
 
 impl TryFrom<String> for Repository {
@@ -1056,6 +988,8 @@ mod tests {
             "ghcr.io/example/weglarka#frag",
             "https://ghcr.io/example/weglarka",
             "ghcr.io/Example/weglarka",
+            // No registry host: Podman would resolve it through its unqualified-search registries.
+            "example/weglarka",
         ] {
             assert!(Repository::new(bad).is_err(), "{bad:?}");
         }

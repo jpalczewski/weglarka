@@ -39,19 +39,21 @@ pub const MAX_IMAGES: usize = 32_768;
 /// Most operations the reservations file may hold.
 pub const MAX_RESERVATIONS: usize = 1024;
 
-/// A canonical full local image ID: lowercase hex, as libpod reports it.
+/// A canonical full local image ID: 64 lowercase hex characters, as libpod reports it. A short or
+/// upper-case form would never compare equal to the id libpod returns, so a protection keyed by it
+/// would not protect the image.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ImageId(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid image id {0:?}: expected 1-128 lower-case hex characters")]
+#[error("invalid image id {0:?}: expected exactly 64 lower-case hex characters")]
 pub struct InvalidImageId(pub String);
 
 impl ImageId {
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidImageId> {
         let value = value.into();
-        let ok = (1..=128).contains(&value.len())
+        let ok = value.len() == 64
             && value
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
@@ -493,6 +495,11 @@ mod tests {
         StrictDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
     }
 
+    /// A full-length image id made of one repeated hex digit.
+    fn id(digit: char) -> String {
+        digit.to_string().repeat(64)
+    }
+
     fn image(id: &str, owner: Owner, byte: char) -> ManagedImage {
         ManagedImage {
             image_id: ImageId::new(id).unwrap(),
@@ -506,13 +513,28 @@ mod tests {
     }
 
     #[test]
+    fn image_id_is_exactly_64_lower_case_hex_characters() {
+        assert!(ImageId::new(id('a')).is_ok());
+        for bad in [
+            "3f2a1b".to_owned(),
+            String::new(),
+            "A".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ] {
+            assert!(ImageId::new(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn inventory_round_trips_sorted_and_rejects_duplicate_ids() {
         let web = Owner::App {
             instance: InstanceName::new("web").unwrap(),
         };
         let inventory = Inventory::new(vec![
-            image("ff", web.clone(), 'b'),
-            image("aa", Owner::PlatformDaemon, 'a'),
+            image(&id('f'), web.clone(), 'b'),
+            image(&id('a'), Owner::PlatformDaemon, 'a'),
         ])
         .unwrap();
         assert_eq!(
@@ -521,13 +543,17 @@ mod tests {
                 .iter()
                 .map(|i| i.image_id.as_str())
                 .collect::<Vec<_>>(),
-            ["aa", "ff"]
+            [id('a').as_str(), id('f').as_str()]
         );
         let text = inventory.to_toml().unwrap();
         assert_eq!(Inventory::parse(&text).unwrap(), inventory);
         assert_eq!(
-            Inventory::new(vec![image("aa", web.clone(), 'a'), image("aa", web, 'b')]).unwrap_err(),
-            InventoryError::DuplicateImageId("aa".into())
+            Inventory::new(vec![
+                image(&id('a'), web.clone(), 'a'),
+                image(&id('a'), web, 'b')
+            ])
+            .unwrap_err(),
+            InventoryError::DuplicateImageId(id('a'))
         );
     }
 
@@ -537,7 +563,7 @@ mod tests {
             owner: ReservationOwner::new("acquisition", 42, "boot-1", 1_700_000_000).unwrap(),
             phase: ReservationPhase::Loaded,
             protections: [Protection {
-                identity: ProtectionIdentity::ImageId(ImageId::new("aa").unwrap()),
+                identity: ProtectionIdentity::ImageId(ImageId::new(id('a')).unwrap()),
                 reason: ProtectionReason::AcquisitionInProgress,
                 operation_id: Some(OperationId::new("op-1").unwrap()),
             }]
@@ -569,7 +595,7 @@ mod tests {
         );
         let many = Inventory {
             format_version: FORMAT_VERSION,
-            images: vec![image("aa", Owner::PlatformDaemon, 'a'); MAX_IMAGES + 1],
+            images: vec![image(&id('a'), Owner::PlatformDaemon, 'a'); MAX_IMAGES + 1],
         };
         assert!(matches!(
             many.to_toml().unwrap_err(),
