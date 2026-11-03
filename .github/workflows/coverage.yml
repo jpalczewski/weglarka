@@ -34,7 +34,7 @@ jobs:
           shared-key: coverage
           save-if: true
       - run: rustup component add llvm-tools-preview
-      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-llvm-cov,nextest
       # Tests that need a real Podman skip themselves without WEGLARKA_PODMAN_SOCKET, so their code counts as
