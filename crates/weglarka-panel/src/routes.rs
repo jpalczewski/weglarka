@@ -100,6 +100,15 @@ impl Req {
         self.ok(result, call.scope())
     }
 
+    /// Courtesy data: a failure leaves it out, never breaks the page.
+    pub async fn try_get<T: DeserializeOwned>(&self, call: Call) -> Option<T> {
+        self.state
+            .daemon
+            .send::<T>(&self.view.token, &call)
+            .await
+            .ok()
+    }
+
     /// Unwraps a daemon result or turns the error into a response. `scope` is what the failed call
     /// needed (`Call::scope`).
     pub fn ok<T>(
@@ -170,24 +179,21 @@ impl Req {
         }
     }
 
+    /// A name from the URL as the API spells it; one that does not parse is a 404 without a daemon
+    /// call.
+    fn name_or_404<N, E>(&self, parsed: Result<N, E>) -> Result<N, Box<Response>> {
+        parsed.map_err(|_| Box::new(self.problem(&DaemonError::NotFound(String::new()), None)))
+    }
+
     /// An application name as the API spells it; anything else is a 404 without a daemon call.
     pub fn app_name(&self, raw: &str) -> Result<String, Box<Response>> {
-        match InstanceName::new(raw) {
-            Ok(name) => Ok(name.to_string()),
-            Err(_) => Err(Box::new(
-                self.problem(&DaemonError::NotFound(String::new()), None),
-            )),
-        }
+        self.name_or_404(InstanceName::new(raw))
+            .map(|name| name.to_string())
     }
 
     /// A site name as the API spells it; anything else is a 404 without a daemon call.
-    pub fn site_name(&self, raw: &str) -> Result<String, Box<Response>> {
-        match SiteName::new(raw) {
-            Ok(name) => Ok(name.to_string()),
-            Err(_) => Err(Box::new(
-                self.problem(&DaemonError::NotFound(String::new()), None),
-            )),
-        }
+    pub fn site_name(&self, raw: &str) -> Result<SiteName, Box<Response>> {
+        self.name_or_404(SiteName::new(raw))
     }
 
     /// The sign-in answer that also ends the session.
@@ -298,11 +304,8 @@ pub async fn apps(req: Req) -> Response {
         Err(r) => return *r,
     };
     // The usage columns are a courtesy: a failing stats call leaves them at `—`, not the page broken.
-    let call = Call::new(&STATS);
     let usage = req
-        .state
-        .daemon
-        .send::<StatsResponse>(&req.view.token, &call)
+        .try_get::<StatsResponse>(Call::new(&STATS))
         .await
         .map(|s| views::usage_by_app(&s))
         .unwrap_or_default();
@@ -332,11 +335,8 @@ pub async fn app(req: Req, Path(name): Path<String>) -> Response {
     // The breadcrumb is a courtesy like the stats columns: no apps list, no breadcrumb. The show
     // response does not say where an instance comes from, the list does.
     let origin = req
-        .state
-        .daemon
-        .send::<ListAppsResponse>(&req.view.token, &Call::new(&APPS_LIST))
+        .try_get::<ListAppsResponse>(Call::new(&APPS_LIST))
         .await
-        .ok()
         .and_then(|l| l.apps.into_iter().find(|a| a.name == app.name))
         .and_then(|a| a.site);
     // `redacted` is true exactly when the token lacks `admin`, which is also what the logs stream
@@ -520,13 +520,10 @@ pub async fn site(req: Req, Path(name): Path<String>) -> Response {
         Ok(name) => name,
         Err(r) => return *r,
     };
-    let call = Call::new(&SITES_SHOW).param("site", name);
-    let apps_call = Call::new(&APPS_LIST);
+    let call = Call::new(&SITES_SHOW).param("site", name.to_string());
     let (site, apps) = tokio::join!(
         req.get::<SiteSummary>(call),
-        req.state
-            .daemon
-            .send::<ListAppsResponse>(&req.view.token, &apps_call),
+        req.try_get::<ListAppsResponse>(Call::new(&APPS_LIST)),
     );
     let site = match site {
         Ok(site) => site,

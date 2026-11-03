@@ -7,8 +7,9 @@ use weglarka_api::{
     AppStatsResponse, AppSummary, CertStatus, CertificateRecord, CertificatesResponse, CheckStatus,
     ConfigMountStatus, ConfigView, ContainerHealth, ContainerStatsView, DoctorCheck, EventRecord,
     HostMountStatus, NotifyStatusResponse, PromotionStatus, RuntimeState, ShowAppResponse,
-    SiteSummary, StatsResponse, StatsRole,
+    SiteEnvSummary, SiteSummary, StatsResponse, StatsRole,
 };
+use weglarka_model::app::Digest;
 use weglarka_model::events::Severity;
 use weglarka_model::units::human_bytes;
 
@@ -162,7 +163,7 @@ pub struct AppDetail {
 
 fn join_or_dash(items: &[String]) -> String {
     if items.is_empty() {
-        "—".to_owned()
+        NONE.to_owned()
     } else {
         items.join(", ")
     }
@@ -174,25 +175,25 @@ pub fn app_detail(app: &ShowAppResponse) -> AppDetail {
     let mut runtime_fields = vec![
         field(
             "Restarts",
-            app.restarts.map_or("—".to_owned(), |n| n.to_string()),
+            app.restarts.map_or(NONE.to_owned(), |n| n.to_string()),
         ),
         field(
             "Started at",
-            app.started_at.clone().unwrap_or_else(|| "—".to_owned()),
+            app.started_at.clone().unwrap_or_else(|| NONE.to_owned()),
         ),
         field(
             "Current digest",
             state
                 .current
                 .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
+                .map_or(NONE.to_owned(), ToString::to_string),
         ),
         field(
             "Previous digest",
             state
                 .previous
                 .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
+                .map_or(NONE.to_owned(), ToString::to_string),
         ),
         field("Generation", state.generation.to_string()),
     ];
@@ -493,8 +494,8 @@ fn cert_row(c: &CertificateRecord) -> CertRow {
         id: c.id.clone(),
         names: c.names.join(", "),
         status: Badge::new(class, text),
-        expires: c.not_after.clone().unwrap_or_else(|| "—".to_owned()),
-        days_left: c.days_left.map_or("—".to_owned(), |d| d.to_string()),
+        expires: c.not_after.clone().unwrap_or_else(|| NONE.to_owned()),
+        days_left: c.days_left.map_or(NONE.to_owned(), |d| d.to_string()),
         coverage: if c.failed {
             format!("{coverage} · last renewal failed")
                 .trim_start_matches(" · ")
@@ -523,8 +524,8 @@ pub fn certs_soon(certs: &CertificatesResponse, within_days: i64) -> Vec<CertRow
 pub struct SiteRow {
     pub name: String,
     pub image: String,
-    /// Some environment waits for a promotion.
-    pub pending: bool,
+    /// Set when some environment waits for a promotion.
+    pub pending: Option<Badge>,
     pub envs: Vec<SiteEnvRow>,
 }
 
@@ -538,31 +539,40 @@ pub struct SiteEnvRow {
     pub previous: String,
 }
 
+/// A short digest, or `—` when there is none.
+fn digest_or_none(digest: Option<&Digest>) -> String {
+    digest.map_or_else(|| NONE.to_owned(), |d| short_digest(&d.to_string()))
+}
+
+/// What an environment gets its releases from: `tag main` or `from staging`.
+fn env_source(env: &SiteEnvSummary) -> String {
+    match (&env.track, &env.promote_from) {
+        (Some(tag), _) => format!("tag {tag}"),
+        (None, Some(from)) => format!("from {from}"),
+        (None, None) => NONE.to_owned(),
+    }
+}
+
 pub fn site_row(site: &SiteSummary) -> SiteRow {
     SiteRow {
         name: site.name.to_string(),
         image: site.image.clone(),
-        pending: site.has_pending(),
+        pending: site
+            .has_pending()
+            .then(|| promotion_badge(PromotionStatus::Pending)),
         envs: site
             .chain()
             .into_iter()
             .map(|e| SiteEnvRow {
                 env: e.env.to_string(),
                 instance: e.instance.to_string(),
-                follows: match (&e.track, &e.promote_from) {
-                    (Some(tag), _) => format!("tag {tag}"),
-                    (None, Some(from)) => format!("promoted from {from}"),
-                    (None, None) => "—".to_owned(),
-                },
+                follows: env_source(e),
                 domains: join_or_dash(&e.domains),
                 current: e
                     .current
                     .as_ref()
                     .map_or("not released".to_owned(), |d| short_digest(&d.to_string())),
-                previous: e
-                    .previous
-                    .as_ref()
-                    .map_or("—".to_owned(), |d| short_digest(&d.to_string())),
+                previous: digest_or_none(e.previous.as_ref()),
             })
             .collect(),
     }
@@ -628,19 +638,9 @@ pub fn site_detail(site: &SiteSummary, apps: &[AppSummary]) -> SiteDetail {
                         link: !d.starts_with('*'),
                     })
                     .collect(),
-                current: e
-                    .current
-                    .as_ref()
-                    .map_or("—".to_owned(), |d| short_digest(&d.to_string())),
-                previous: e
-                    .previous
-                    .as_ref()
-                    .map_or("—".to_owned(), |d| short_digest(&d.to_string())),
-                source: match (&e.track, &e.promote_from) {
-                    (Some(tag), _) => format!("tag {tag}"),
-                    (None, Some(from)) => format!("from {from}"),
-                    (None, None) => "—".to_owned(),
-                },
+                current: digest_or_none(e.current.as_ref()),
+                previous: digest_or_none(e.previous.as_ref()),
+                source: env_source(e),
                 status: promotion_badge(site.promotion_status(e)),
             })
             .collect(),

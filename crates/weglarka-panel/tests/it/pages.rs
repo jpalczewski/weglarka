@@ -431,6 +431,16 @@ fn assert_page_is_clean(path: &str, headers: &axum::http::HeaderMap, html: &str)
             "{path} has an inline handler on{name}"
         );
     }
+    // The only way off this origin is a plain link that cannot reach back (the site page's domains).
+    for (i, _) in html.match_indices("<a ") {
+        let tag = &html[i..i + html[i..].find('>').unwrap()];
+        if tag.contains("href=\"https://") {
+            assert!(
+                tag.contains("rel=\"noopener noreferrer\""),
+                "{path}: external link without rel: {tag}"
+            );
+        }
+    }
     // Every URL the page loads or links to is on this origin.
     for attr in [
         "href=\"",
@@ -444,15 +454,21 @@ fn assert_page_is_clean(path: &str, headers: &axum::http::HeaderMap, html: &str)
             let value = &html[i + attr.len()..];
             let value = &value[..value.find('"').unwrap()];
             assert!(
-                value.starts_with('/') || value.starts_with('#'),
+                value.starts_with('/')
+                    || value.starts_with('#')
+                    || (attr == "href=\""
+                        && value.starts_with("https://")
+                        && html[..i]
+                            .rfind('<')
+                            .is_some_and(|t| html[t..].starts_with("<a "))),
                 "{path}: {attr}{value}\" is not same-origin"
             );
         }
     }
     assert!(
-        // TODO: this also rejects a legitimate `https://` shown as text; narrow it to attribute
-        // values if such a page appears.
-        !html.contains("http://") && !html.contains("https://"),
+        // The `<a href="https://…">` links vetted above are the only ones; this also rejects a
+        // legitimate `https://` shown as text.
+        !html.contains("http://") && !html.replace("href=\"https://", "").contains("https://"),
         "{path} names an external URL"
     );
     assert!(!html.contains(ENV_SECRET), "{path} leaks an env value");
@@ -1711,35 +1727,13 @@ async fn the_app_page_carries_the_ended_fragment_the_panel_serves() {
     assert!(page.contains(&embedded), "{embedded}\n---\n{page}");
 }
 
-/// The site page links its domains out (`https://`), which [`assert_page_is_clean`] rightly refuses
-/// everywhere else: check those anchors here and hand it the page without them.
-fn without_domain_links(html: &str) -> String {
-    let open = "<a href=\"https://";
-    let mut out = String::new();
-    let mut rest = html;
-    while let Some(i) = rest.find(open) {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        let end = tail.find('>').unwrap();
-        assert!(
-            tail[..end].ends_with("\" rel=\"noopener noreferrer\""),
-            "external link without rel: {}",
-            &tail[..end]
-        );
-        out.push_str("<a>");
-        rest = &tail[end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
 #[tokio::test]
 async fn the_site_page_shows_the_promotion_chain() {
     let site = site(Script::default()).await;
     let who = login(&site, "tok-read");
     let (status, headers, html) = get(&site, Some(&who), "/sites/blog").await;
     assert_eq!(status, StatusCode::OK);
-    assert_page_is_clean("/sites/blog", &headers, &without_domain_links(&html));
+    assert_page_is_clean("/sites/blog", &headers, &html);
     // Chain order: the tracked environment first, whatever order the daemon listed them in.
     let (dev, staging, prod) = (
         html.find("<h2>dev").unwrap(),
