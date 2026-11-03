@@ -11,8 +11,12 @@
 
 use std::fmt;
 
-use serde_json::{Map, Value};
+use base64::Engine as _;
+use serde_json::{Map, Value, json};
 use weglarka_model::app::Digest;
+use weglarka_model::release_set::{
+    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
+};
 
 use crate::image_ref::ImageRef;
 use crate::key::PublicKey;
@@ -137,6 +141,47 @@ pub enum VerifyError {
     IdentityMismatch { found: String, expected: String },
     #[error("the signature does not verify against the pinned public key")]
     BadSignature,
+}
+
+/// The simple-signing payload `cosign sign` stores: the image digest, the repository identity and
+/// the key-based signature type. Shared by the verifier's tests and the publisher so both sides
+/// build the exact same document.
+pub fn payload_for(image: &ImageRef, digest: &Digest) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&json!({
+        "critical": {
+            "identity": { "docker-reference": image.repository_reference() },
+            "image": { "docker-manifest-digest": digest.as_str() },
+            "type": COSIGN_TYPE,
+        },
+        "optional": null,
+    }))
+}
+
+/// Builds the legacy cosign signature manifest (`application/vnd.oci.image.manifest.v1+json`) that
+/// stores one key-based simple-signing layer: the payload blob plus the base64 signature in the
+/// layer annotation. This is the document the host's [`crate::verify`] path reads; the publisher
+/// writes it instead of relying on the cosign CLI, so both sides stay one implementation.
+///
+/// The `{}` config is used for the same reason the release artifact uses it: nothing reads it.
+pub fn signature_manifest(payload_digest: &str, payload_size: u64, signature: &[u8]) -> Vec<u8> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(signature);
+    let document = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": EMPTY_CONFIG_MEDIA_TYPE,
+            "digest": EMPTY_CONFIG_DIGEST,
+            "size": 2,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+            "digest": payload_digest,
+            "size": payload_size,
+            "annotations": { "dev.cosignproject.cosign/signature": encoded },
+        }],
+    });
+    // `json!` of string/numbers cannot fail to serialize.
+    serde_json::to_vec(&document).unwrap_or_default()
 }
 
 /// Looks up `name` in a JSON object ignoring ASCII case (the cosign payload capitalizes some keys).
@@ -367,6 +412,50 @@ mod tests {
                 max: MAX_PAYLOAD_BYTES
             }
         );
+    }
+
+    #[test]
+    fn the_publisher_signature_manifest_is_the_legacy_cosign_layout() {
+        use sha2::Digest as _;
+
+        let generated = crate::testing::TestSigningKey::generate().unwrap();
+        let image = image();
+        let digest = digest();
+        let payload = payload_for(&image, &digest).unwrap();
+        let signature = generated.signing_key().sign(&payload).unwrap();
+        let payload_digest = format!(
+            "sha256:{}",
+            crate::registry::hex_lower(&sha2::Sha256::digest(&payload))
+        );
+        let manifest = signature_manifest(&payload_digest, payload.len() as u64, &signature);
+        let document: Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            document["mediaType"],
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(document["config"]["size"], 2);
+        let layer = &document["layers"][0];
+        assert_eq!(
+            layer["mediaType"],
+            "application/vnd.dev.cosign.simplesigning.v1+json"
+        );
+        assert_eq!(layer["digest"], payload_digest);
+        let encoded = layer["annotations"]["dev.cosignproject.cosign/signature"]
+            .as_str()
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        verify(
+            &Signature {
+                payload,
+                signature: decoded,
+            },
+            generated.public_key(),
+            &image,
+            &digest,
+        )
+        .unwrap();
     }
 
     #[test]
