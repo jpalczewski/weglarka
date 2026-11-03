@@ -750,8 +750,14 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
                 .map_err(|e| PlatformError::Command(format!("service selection: {e}")))?;
         // Persist the intent first: if the restart fails, the next worker observes the actual
         // container and retries against the same intended activation.
-        PlatformService::write_locked(&self.host_dir, &selection)
-            .map_err(|e| PlatformError::Io(format!("platform-service.toml: {e}")))?;
+        match PlatformService::write_locked(&self.host_dir, &selection) {
+            Ok(()) => {}
+            // An older request than the stored selection is obsolete: no quadlet, no restart.
+            Err(weglarka_launcher::selection::SelectionError::Stale { .. }) => {
+                return Ok(ActivationReceipt { epoch });
+            }
+            Err(e) => return Err(PlatformError::Io(format!("platform-service.toml: {e}"))),
+        }
 
         let files = render_with_labels(&spec, &labels)?;
         let entry = self.entry()?;

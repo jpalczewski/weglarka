@@ -486,22 +486,19 @@ impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
             argv,
         )
         .map_err(|e| PlatformError::Command(format!("service selection: {e}")))?;
-        std::fs::create_dir_all(&self.host_dir)
+        // One critical section for write, observation and stop. The write is forward only: a request
+        // older than the stored selection is obsolete, changes nothing and never stops a container.
+        weglarka_launcher::selection::create_host_dir(&self.host_dir)
             .map_err(|e| PlatformError::Io(format!("{}: {e}", self.host_dir.display())))?;
-        PlatformService::write_locked(&self.host_dir, &selection)
-            .map_err(|e| PlatformError::Io(format!("platform-service.toml: {e}")))?;
-
-        // Re-read under the service-selection lock and observe the container while the selection is
-        // stable: an obsolete request must not stop a container confirmed at a newer epoch.
         let guard = weglarka_launcher::selection::lock_service_selection(&self.host_dir)
             .map_err(|e| PlatformError::Io(format!("platform-service.lock: {e}")))?;
-        let current = PlatformService::load(&self.host_dir)
-            .map_err(|e| PlatformError::Io(format!("platform-service.toml: {e}")))?;
-        let obsolete =
-            current.is_some_and(|current| current.epoch != epoch.0 || current.digest != digest);
-        if obsolete {
-            drop(guard);
-            return Ok(ActivationReceipt { epoch });
+        match selection.save(&self.host_dir) {
+            Ok(()) => {}
+            Err(weglarka_launcher::selection::SelectionError::Stale { .. }) => {
+                drop(guard);
+                return Ok(ActivationReceipt { epoch });
+            }
+            Err(e) => return Err(PlatformError::Io(format!("platform-service.toml: {e}"))),
         }
         let observed = self.inspect(&spec.name).await?;
         match observed {

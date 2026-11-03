@@ -60,6 +60,12 @@ pub enum SelectionError {
     Encode(String),
     #[error("the argument vector hash does not match the selection")]
     HashMismatch,
+    /// A write that would move the activation epoch backwards, or change what an epoch names. The
+    /// stored selection is left as it was; the request is obsolete.
+    #[error(
+        "stale activation: the stored selection is at epoch {stored}, the request is for epoch {requested}"
+    )]
+    Stale { stored: u64, requested: u64 },
     #[error(transparent)]
     Lock(#[from] LockError),
 }
@@ -216,7 +222,20 @@ impl PlatformService {
     }
 
     /// Writes the selection atomically. The caller must hold [`lock_service_selection`].
+    ///
+    /// Forward only: a lower `epoch` than the stored one, or the same `epoch` naming another image,
+    /// digest or argument vector, is refused with [`SelectionError::Stale`] and the file is left as
+    /// it was. Writing exactly the stored selection again is a no-op success. Order is by epoch,
+    /// never by wall clock or by who arrives last.
     pub fn save(&self, host_dir: &Path) -> Result<(), SelectionError> {
+        if let Some(stored) = Self::load(host_dir)?
+            && (self.epoch < stored.epoch || (self.epoch == stored.epoch && *self != stored))
+        {
+            return Err(SelectionError::Stale {
+                stored: stored.epoch,
+                requested: self.epoch,
+            });
+        }
         let text = self.to_toml()?;
         write_atomic(&Self::path(host_dir), text.as_bytes(), 0o600).map_err(|source| {
             SelectionError::Host(HostError::Write {
@@ -232,26 +251,15 @@ impl PlatformService {
         Self::load(host_dir)
     }
 
-    /// Writes a selection under the service-selection lock.
+    /// Writes a selection under the service-selection lock (forward only, see [`Self::save`]).
+    ///
+    /// The host directory is created by bootstrap with its ownership model (`1770`, root-owned code);
+    /// this never changes its mode.
     pub fn write_locked(
         host_dir: &Path,
         selection: &PlatformService,
     ) -> Result<(), SelectionError> {
-        std::fs::create_dir_all(host_dir).map_err(|source| {
-            SelectionError::Host(HostError::Write {
-                path: host_dir.to_owned(),
-                source,
-            })
-        })?;
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(host_dir, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| {
-                SelectionError::Host(HostError::Write {
-                    path: host_dir.to_owned(),
-                    source,
-                })
-            },
-        )?;
+        create_host_dir(host_dir)?;
         let _guard = lock_service_selection(host_dir)?;
         selection.save(host_dir)
     }
@@ -279,6 +287,17 @@ fn label<'a>(argv: &'a [String], key: &str) -> Option<&'a str> {
 fn feed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+/// Creates the host directory when it is missing (a no-op on an installed host). Its mode is never
+/// changed here: bootstrap owns the ownership model.
+pub fn create_host_dir(host_dir: &Path) -> Result<(), SelectionError> {
+    std::fs::create_dir_all(host_dir).map_err(|source| {
+        SelectionError::Host(HostError::Write {
+            path: host_dir.to_owned(),
+            source,
+        })
+    })
 }
 
 /// Takes the service-selection lock.
@@ -456,6 +475,44 @@ mod tests {
             tampered.validate(),
             Err(SelectionError::HashMismatch)
         ));
+    }
+
+    fn selection_at(epoch: u64, byte: char) -> PlatformService {
+        let d = digest(byte);
+        let image = format!("ghcr.io/example/weglarka@{d}");
+        PlatformService::build(
+            "weglarka",
+            image.clone(),
+            d.clone(),
+            epoch,
+            argv("weglarka", &image, epoch, &d),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_selection_epoch_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path();
+        PlatformService::write_locked(host, &selection_at(4, 'a')).unwrap();
+        let stored = std::fs::read_to_string(PlatformService::path(host)).unwrap();
+
+        // Epoch 3 after epoch 4 is stale; so is epoch 4 naming another digest.
+        for stale in [selection_at(3, 'b'), selection_at(4, 'b')] {
+            assert!(matches!(
+                PlatformService::write_locked(host, &stale),
+                Err(SelectionError::Stale { stored: 4, .. })
+            ));
+        }
+        assert_eq!(
+            std::fs::read_to_string(PlatformService::path(host)).unwrap(),
+            stored,
+            "a refused write leaves the file untouched"
+        );
+        // The same selection again is idempotent; a higher epoch moves forward.
+        PlatformService::write_locked(host, &selection_at(4, 'a')).unwrap();
+        PlatformService::write_locked(host, &selection_at(5, 'b')).unwrap();
+        assert_eq!(PlatformService::load(host).unwrap().unwrap().epoch, 5);
     }
 
     #[test]
