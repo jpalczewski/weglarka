@@ -40,6 +40,12 @@ first push in the same way. The runtime user pulls it without credentials, so **
 - the immutable tag is `set-<channel>-<sequence>`; the channel tag (`main`/`stable`) is the pointer and only moves
   forward, after the set, its blobs and its signature verify.
 
+The first release of a channel has no pointer to read. A "not found" answer is accepted as "no release set yet" only
+when the channel is listed in the repository variable `FIRST_RELEASE_SET_CHANNELS` (for example `main,stable`); clear
+the variable after the first publish. Without it a 404 fails the run, because a pointer that is missing for any other
+reason (a renamed package, a permission error) must never skip the ancestry and sequence checks and let a channel move
+backwards.
+
 Both the component images and the release set are signed with the static key in `COSIGN_PRIVATE_KEY`
 (`cosign.pub` is the public half the daemon embeds). A missing key fails the run on both channels — there is no
 warning-only path. The signature uses the legacy `sha256-<hex>.sig` layout, so do not change the cosign flags to the

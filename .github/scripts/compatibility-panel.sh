@@ -4,7 +4,8 @@
 #   compatibility-panel.sh <daemon-image-ref> <panel-image-ref>
 #
 # Both arguments are digest references (`ghcr.io/…@sha256:…`) so the leg tests exactly the bytes the
-# release set will name. The daemon is started the way an operator runs it (rootless Podman socket,
+# release set will name. The images are not in the local store of this job, so they are pulled by
+# digest on first use (`--pull=missing`); a digest cannot resolve to different bytes. The daemon is started the way an operator runs it (rootless Podman socket,
 # state directory mounted 1:1); the panel then starts against that daemon's admin socket and must
 # answer `/healthz` under the operator hardening. The exit status is the matrix result.
 #
@@ -68,7 +69,7 @@ domain = "weglarka.example.test"
 TOML
 
 echo "--- starting the daemon image $daemon"
-podman run -d --pull=never --name wg-compat-daemon -p 127.0.0.1:19181:19181 \
+podman run -d --pull=missing --name wg-compat-daemon -p 127.0.0.1:19181:19181 \
   -v "$podman_sock:$podman_sock" -v "$dir:$dir" \
   "$daemon" run --config "$dir/weglarka.toml" >/dev/null
 
@@ -82,7 +83,7 @@ podman exec wg-compat-daemon /usr/local/bin/weglarka --socket "$admin_sock" stat
   fail "the CLI inside the daemon image cannot query the daemon"
 
 echo "--- starting the panel image $panel against $admin_sock"
-podman run -d --pull=never --name wg-compat-panel -p 127.0.0.1:18091:8080 \
+podman run -d --pull=missing --name wg-compat-panel -p 127.0.0.1:18091:8080 \
   --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   -v "$dir:$dir" \
   -e "WEGLARKA_PANEL_SOCKET=$admin_sock" \
