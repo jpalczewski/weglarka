@@ -252,8 +252,6 @@ struct PreparedRetention {
     protections: BTreeSet<Protection>,
     scope: RetentionScope,
     diagnostics: Vec<String>,
-    /// Records synthesized from current repository names (legacy installs without provenance).
-    adopted: Vec<ManagedImage>,
 }
 
 impl PreparedRetention {
@@ -407,7 +405,7 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// The durable reservation of `operation`, if any.
-    #[allow(dead_code)] // used by the retention tests
+    #[cfg(test)]
     pub(crate) fn reservation(
         &self,
         operation: &OperationId,
@@ -536,6 +534,9 @@ impl<P: PodmanClient> Reconciler<P> {
     /// time. Returns the reclaimed operation ids.
     pub async fn reclaim_stale_reservations(&self) -> Result<Vec<OperationId>, EngineError> {
         let boot = current_boot_id();
+        // Lock first: a transaction that starts after an earlier read of the journal could reference
+        // a reservation this pass is about to reclaim.
+        let _guard = self.acquire().await;
         let journal = self.read_platform_journal()?;
         let referenced: BTreeSet<&OperationId> = journal
             .transaction
@@ -543,7 +544,6 @@ impl<P: PodmanClient> Reconciler<P> {
             .filter(|transaction| !transaction.is_terminal())
             .map(|transaction| transaction.reservations.iter().collect())
             .unwrap_or_default();
-        let _guard = self.acquire().await;
         let mut reservations = self.read_reservations()?;
         let mut reclaimed = Vec::new();
         reservations.operations.retain(|entry| {
@@ -750,14 +750,15 @@ impl<P: PodmanClient> Reconciler<P> {
             images: inventory.images.clone(),
         };
         let requests = adopt_requests(&images, &apps, &inventory, &scope);
-        let mut adopted = Vec::new();
         for request in requests {
+            // A real prune persists the adoption **before** it can plan a removal from it: if the
+            // record cannot be written (full disk, read-only file), the image stays unattributed
+            // instead of being deleted without durable provenance. A dry run only advertises.
             if let Some(guard) = adopt
-                && InventoryStore::record(self, guard, request.clone())
-                    .await
-                    .is_ok()
+                && let Err(e) = InventoryStore::record(self, guard, request.clone()).await
             {
-                adopted.push(request.clone());
+                diagnostics.push(format!("cannot record image provenance: {e}"));
+                continue;
             }
             advertised(&mut scoped, request);
         }
@@ -795,7 +796,6 @@ impl<P: PodmanClient> Reconciler<P> {
             protections,
             scope,
             diagnostics,
-            adopted,
         })
     }
 
@@ -846,20 +846,6 @@ impl<P: PodmanClient> Reconciler<P> {
         // A failed deletion keeps its record: only successfully removed images are forgotten.
         if let Err(e) = self.forget_removed(&guard, &report) {
             report.diagnostics.push(e.to_string());
-        }
-        for record in &prepared.adopted {
-            if report
-                .removed
-                .iter()
-                .any(|image| image.id == record.image_id.as_str())
-            {
-                continue;
-            }
-            if let Err(e) = InventoryStore::record(self, &guard, record.clone()).await {
-                report
-                    .diagnostics
-                    .push(format!("cannot record image provenance: {e}"));
-            }
         }
         Ok(report)
     }

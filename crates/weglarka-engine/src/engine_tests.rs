@@ -1794,6 +1794,38 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
+/// An adoption that cannot be persisted (here: a read-only state directory) must not be turned into
+/// a deletion: the image stays unattributed and a diagnostic says why.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+    h.rec.reconcile().await.unwrap();
+    let stale = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('e'));
+    h.fake.set_pull_digest(&stale, digest('e'));
+    h.fake.image_pull(&stale).collect::<Vec<_>>().await;
+
+    let dir = h.dir.path();
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = h.rec.prune_images(false).await;
+    std::fs::set_permissions(dir, original).unwrap();
+    let out = out.unwrap();
+
+    assert!(out.removed.is_empty(), "{out:?}");
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.contains("cannot record image provenance")),
+        "{out:?}"
+    );
+    assert_eq!(h.fake.images().len(), 2, "nothing was removed");
+}
+
 // ── config_root mounts and reload (issue #118, ADR 0028) ────────────────────────
 
 /// App with two config mounts (a file and a directory) and a signal-based reload.

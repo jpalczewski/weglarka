@@ -139,11 +139,13 @@ pub(crate) enum DigestSource<'a> {
     Local(&'a Digest),
 }
 
-/// The durable reservation created by one acquisition. It is released once the deploy has committed
-/// (or failed); a cancellation leaves it on disk, so the image can never be pruned unrecorded.
+/// The durable reservations created by the acquisitions of one operation. A deploy can acquire
+/// more than once (the tag pull, then a rollback pull), so all of them are tracked and released once
+/// the deploy has committed (or failed); a cancellation leaves them on disk, so the image can never
+/// be pruned unrecorded.
 #[derive(Default)]
 pub(crate) struct AcquisitionSlot {
-    operation: Option<OperationId>,
+    operations: Vec<OperationId>,
 }
 
 impl AcquisitionSlot {
@@ -152,14 +154,15 @@ impl AcquisitionSlot {
         reconciler: &Reconciler<P>,
         guard: &ImageGuard<'_>,
     ) {
-        if let Some(operation) = self.operation.take() {
+        for operation in self.operations.drain(..) {
             reconciler.finish_acquisition(guard, operation).await;
         }
     }
 
-    /// Takes over an operation that the caller published itself (archive upload).
+    /// Takes over an operation that the caller published itself (archive upload) or that a pull
+    /// recorded. Earlier operations stay tracked, none is overwritten.
     pub(crate) fn track(&mut self, operation: OperationId) {
-        self.operation = Some(operation);
+        self.operations.push(operation);
     }
 }
 
