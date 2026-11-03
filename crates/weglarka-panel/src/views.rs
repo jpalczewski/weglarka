@@ -6,9 +6,10 @@ use serde::Serialize;
 use weglarka_api::{
     AppStatsResponse, AppSummary, CertStatus, CertificateRecord, CertificatesResponse, CheckStatus,
     ConfigMountStatus, ConfigView, ContainerHealth, ContainerStatsView, DoctorCheck, EventRecord,
-    HostMountStatus, NotifyStatusResponse, RuntimeState, ShowAppResponse, SiteSummary,
-    StatsResponse, StatsRole,
+    HostMountStatus, NotifyStatusResponse, PromotionStatus, RuntimeState, ShowAppResponse,
+    SiteEnvSummary, SiteSummary, StatsResponse, StatsRole,
 };
+use weglarka_model::app::Digest;
 use weglarka_model::events::Severity;
 use weglarka_model::units::human_bytes;
 
@@ -145,6 +146,8 @@ pub struct MountRow {
 #[derive(Debug)]
 pub struct AppDetail {
     pub name: String,
+    /// Set by the handler when the instance comes from a site.
+    pub site: Option<SiteCrumb>,
     pub redacted: bool,
     pub runtime: Badge,
     pub health: Option<Badge>,
@@ -160,7 +163,7 @@ pub struct AppDetail {
 
 fn join_or_dash(items: &[String]) -> String {
     if items.is_empty() {
-        "—".to_owned()
+        NONE.to_owned()
     } else {
         items.join(", ")
     }
@@ -172,25 +175,25 @@ pub fn app_detail(app: &ShowAppResponse) -> AppDetail {
     let mut runtime_fields = vec![
         field(
             "Restarts",
-            app.restarts.map_or("—".to_owned(), |n| n.to_string()),
+            app.restarts.map_or(NONE.to_owned(), |n| n.to_string()),
         ),
         field(
             "Started at",
-            app.started_at.clone().unwrap_or_else(|| "—".to_owned()),
+            app.started_at.clone().unwrap_or_else(|| NONE.to_owned()),
         ),
         field(
             "Current digest",
             state
                 .current
                 .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
+                .map_or(NONE.to_owned(), ToString::to_string),
         ),
         field(
             "Previous digest",
             state
                 .previous
                 .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
+                .map_or(NONE.to_owned(), ToString::to_string),
         ),
         field("Generation", state.generation.to_string()),
     ];
@@ -301,6 +304,7 @@ pub fn app_detail(app: &ShowAppResponse) -> AppDetail {
 
     AppDetail {
         name: app.name.to_string(),
+        site: None,
         redacted: app.redacted,
         runtime: runtime_badge(app.runtime),
         health: app.health.map(health_badge),
@@ -490,8 +494,8 @@ fn cert_row(c: &CertificateRecord) -> CertRow {
         id: c.id.clone(),
         names: c.names.join(", "),
         status: Badge::new(class, text),
-        expires: c.not_after.clone().unwrap_or_else(|| "—".to_owned()),
-        days_left: c.days_left.map_or("—".to_owned(), |d| d.to_string()),
+        expires: c.not_after.clone().unwrap_or_else(|| NONE.to_owned()),
+        days_left: c.days_left.map_or(NONE.to_owned(), |d| d.to_string()),
         coverage: if c.failed {
             format!("{coverage} · last renewal failed")
                 .trim_start_matches(" · ")
@@ -520,6 +524,8 @@ pub fn certs_soon(certs: &CertificatesResponse, within_days: i64) -> Vec<CertRow
 pub struct SiteRow {
     pub name: String,
     pub image: String,
+    /// Set when some environment waits for a promotion.
+    pub pending: Option<Badge>,
     pub envs: Vec<SiteEnvRow>,
 }
 
@@ -533,33 +539,128 @@ pub struct SiteEnvRow {
     pub previous: String,
 }
 
+/// A short digest, or `—` when there is none.
+fn digest_or_none(digest: Option<&Digest>) -> String {
+    digest.map_or_else(|| NONE.to_owned(), |d| short_digest(&d.to_string()))
+}
+
+/// What an environment gets its releases from: `tag main` or `from staging`.
+fn env_source(env: &SiteEnvSummary) -> String {
+    match (&env.track, &env.promote_from) {
+        (Some(tag), _) => format!("tag {tag}"),
+        (None, Some(from)) => format!("from {from}"),
+        (None, None) => NONE.to_owned(),
+    }
+}
+
 pub fn site_row(site: &SiteSummary) -> SiteRow {
     SiteRow {
         name: site.name.to_string(),
         image: site.image.clone(),
+        pending: site
+            .has_pending()
+            .then(|| promotion_badge(PromotionStatus::Pending)),
         envs: site
-            .envs
-            .iter()
+            .chain()
+            .into_iter()
             .map(|e| SiteEnvRow {
                 env: e.env.to_string(),
                 instance: e.instance.to_string(),
-                follows: match (&e.track, &e.promote_from) {
-                    (Some(tag), _) => format!("tag {tag}"),
-                    (None, Some(from)) => format!("promoted from {from}"),
-                    (None, None) => "—".to_owned(),
-                },
+                follows: env_source(e),
                 domains: join_or_dash(&e.domains),
                 current: e
                     .current
                     .as_ref()
                     .map_or("not released".to_owned(), |d| short_digest(&d.to_string())),
-                previous: e
-                    .previous
-                    .as_ref()
-                    .map_or("—".to_owned(), |d| short_digest(&d.to_string())),
+                previous: digest_or_none(e.previous.as_ref()),
             })
             .collect(),
     }
+}
+
+/// One domain of an environment; a wildcard is shown but not linked.
+#[derive(Debug)]
+pub struct DomainLink {
+    pub host: String,
+    pub link: bool,
+}
+
+/// One environment of the site page.
+#[derive(Debug)]
+pub struct SiteEnvCard {
+    pub env: String,
+    pub instance: String,
+    /// `None` when the apps list could not be read or does not know the instance.
+    pub runtime: Option<Badge>,
+    pub domains: Vec<DomainLink>,
+    pub current: String,
+    pub previous: String,
+    /// `tag main` / `from staging`.
+    pub source: String,
+    pub status: Badge,
+}
+
+#[derive(Debug)]
+pub struct SiteDetail {
+    pub name: String,
+    pub image: String,
+    pub envs: Vec<SiteEnvCard>,
+}
+
+pub fn promotion_badge(status: PromotionStatus) -> Badge {
+    match status {
+        PromotionStatus::NoRelease => Badge::new("fail", "no release (domains answer 503)"),
+        PromotionStatus::Pending => Badge::new("warn", "pending promotion"),
+        PromotionStatus::UpToDate => Badge::new("ok", "up to date"),
+    }
+}
+
+/// The site page: environments in promotion-chain order. `apps` supplies the runtime badges.
+pub fn site_detail(site: &SiteSummary, apps: &[AppSummary]) -> SiteDetail {
+    SiteDetail {
+        name: site.name.to_string(),
+        image: site.image.clone(),
+        envs: site
+            .chain()
+            .into_iter()
+            .map(|e| SiteEnvCard {
+                env: e.env.to_string(),
+                instance: e.instance.to_string(),
+                runtime: apps
+                    .iter()
+                    .find(|a| a.name == e.instance)
+                    .map(|a| runtime_badge(a.runtime)),
+                domains: e
+                    .domains
+                    .iter()
+                    .map(|d| DomainLink {
+                        host: d.clone(),
+                        link: !d.starts_with('*'),
+                    })
+                    .collect(),
+                current: digest_or_none(e.current.as_ref()),
+                previous: digest_or_none(e.previous.as_ref()),
+                source: env_source(e),
+                status: promotion_badge(site.promotion_status(e)),
+            })
+            .collect(),
+    }
+}
+
+/// `site / env` of an instance expanded from a site, for the breadcrumb of its app page.
+#[derive(Debug)]
+pub struct SiteCrumb {
+    pub site: String,
+    pub env: String,
+}
+
+/// `AppSummary.site` is `<site>/<env>`.
+pub fn site_crumb(origin: &str) -> Option<SiteCrumb> {
+    let (site, env) = origin.split_once('/')?;
+    Some(SiteCrumb {
+        site: site.to_owned(),
+        env: env.to_owned(),
+    })
 }
 
 #[derive(Debug)]

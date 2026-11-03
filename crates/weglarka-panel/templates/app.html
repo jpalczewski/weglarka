@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}{{ app.name }} · Applications · Węglarka{% endblock %}
 {% block content %}
-    <p class="crumb"><a href="/apps">Applications</a></p>
+    <p class="crumb"><a href="/apps">Applications</a>{% if let Some(s) = app.site %} · <a href="/sites/{{ s.site }}">{{ s.site }}</a> / {{ s.env }}{% endif %}</p>
     <h1>{{ app.name }} {{ m::badge(&app.runtime) }}{% if let Some(h) = app.health %} {{ m::badge(&h) }}{% endif %}</h1>
 {% if app.redacted %}    <p class="notice" role="note"><strong>Redacted view.</strong> Your access level hides parts of this application: environment values, command arguments after the first and failure text are withheld. This is not the stored spec and must not be copied back as one.</p>
 {% endif %}    <section aria-labelledby="h-runtime">

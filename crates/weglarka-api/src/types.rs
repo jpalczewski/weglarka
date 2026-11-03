@@ -347,6 +347,86 @@ pub struct SiteSummary {
     pub envs: Vec<SiteEnvSummary>,
 }
 
+/// Where an environment stands against the one it receives digests from (issue #472).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionStatus {
+    /// Nothing was released yet: the environment's domains answer 503.
+    NoRelease,
+    /// The `promote_from` source serves a different digest; `weglarka promote` would change this one.
+    Pending,
+    /// Serving a release and not behind its source.
+    UpToDate,
+}
+
+impl SiteSummary {
+    /// The environments as a promotion chain: `track` environments are the roots (by name), each
+    /// followed by the environments promoted from it, depth first. Environments no root reaches (a
+    /// `promote_from` cycle, a source that is not declared) are appended in name order, so every
+    /// environment appears exactly once and malformed input never panics.
+    pub fn chain(&self) -> Vec<&SiteEnvSummary> {
+        let mut by_name: Vec<&SiteEnvSummary> = self.envs.iter().collect();
+        by_name.sort_by(|a, b| a.env.cmp(&b.env));
+        let mut seen = vec![false; by_name.len()];
+        let mut out = Vec::with_capacity(by_name.len());
+        // Iterative depth-first walk; a stack of indices into `by_name`, children pushed reversed
+        // so they pop in name order.
+        let mut stack: Vec<usize> = Vec::new();
+        let roots = by_name
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.track.is_some())
+            .map(|(i, _)| i);
+        for root in roots {
+            stack.push(root);
+            while let Some(i) = stack.pop() {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                out.push(by_name[i]);
+                for (j, child) in by_name.iter().enumerate().rev() {
+                    if !seen[j]
+                        && child.track.is_none()
+                        && child.promote_from.as_ref() == Some(&by_name[i].env)
+                    {
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        out.extend(
+            by_name
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !seen[*i])
+                .map(|(_, e)| *e),
+        );
+        out
+    }
+
+    /// Promotion status of one environment of this site.
+    pub fn promotion_status(&self, env: &SiteEnvSummary) -> PromotionStatus {
+        let Some(current) = &env.current else {
+            return PromotionStatus::NoRelease;
+        };
+        let source = env
+            .promote_from
+            .as_ref()
+            .and_then(|from| self.envs.iter().find(|e| &e.env == from))
+            .and_then(|e| e.current.as_ref());
+        match source {
+            Some(digest) if digest != current => PromotionStatus::Pending,
+            _ => PromotionStatus::UpToDate,
+        }
+    }
+
+    /// `true` when some environment waits for a promotion.
+    pub fn has_pending(&self) -> bool {
+        self.envs
+            .iter()
+            .any(|e| self.promotion_status(e) == PromotionStatus::Pending)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSitesResponse {
     pub sites: Vec<SiteSummary>,
@@ -583,6 +663,98 @@ pub struct NotifyTestResponse {
 
 #[cfg(test)]
 mod tests {
+    fn env(
+        name: &str,
+        track: Option<&str>,
+        from: Option<&str>,
+        cur: Option<char>,
+    ) -> SiteEnvSummary {
+        SiteEnvSummary {
+            env: EnvName::new(name).unwrap(),
+            instance: InstanceName::new(format!("blog-{name}")).unwrap(),
+            track: track.map(str::to_owned),
+            promote_from: from.map(|f| EnvName::new(f).unwrap()),
+            domains: vec![],
+            current: cur
+                .map(|c| Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()),
+            previous: None,
+        }
+    }
+
+    fn site(envs: Vec<SiteEnvSummary>) -> SiteSummary {
+        SiteSummary {
+            name: SiteName::new("blog").unwrap(),
+            image: "ghcr.io/example/blog".into(),
+            envs,
+        }
+    }
+
+    fn order(s: &SiteSummary) -> Vec<String> {
+        s.chain().iter().map(|e| e.env.to_string()).collect()
+    }
+
+    #[test]
+    fn chain_puts_roots_first_and_follows_promotion() {
+        let s = site(vec![
+            env("prod", None, Some("staging"), Some('a')),
+            env("dev", Some("main"), None, Some('b')),
+            env("staging", None, Some("dev"), Some('b')),
+            env("alpha", Some("alpha"), None, None),
+        ]);
+        assert_eq!(order(&s), ["alpha", "dev", "staging", "prod"]);
+    }
+
+    #[test]
+    fn chain_branches_depth_first_in_name_order() {
+        let s = site(vec![
+            env("b2", None, Some("a"), None),
+            env("a", Some("main"), None, None),
+            env("b1", None, Some("a"), None),
+            env("c", None, Some("b1"), None),
+        ]);
+        assert_eq!(order(&s), ["a", "b1", "c", "b2"]);
+    }
+
+    #[test]
+    fn chain_survives_cycles_and_dangling_sources() {
+        let s = site(vec![
+            env("x", None, Some("y"), None),
+            env("y", None, Some("x"), None),
+            env("lost", None, Some("gone"), None),
+            env("root", Some("main"), None, None),
+            env("self", None, Some("self"), None),
+        ]);
+        assert_eq!(order(&s), ["root", "lost", "self", "x", "y"]);
+    }
+
+    #[test]
+    fn chain_of_an_empty_site_is_empty() {
+        assert!(site(vec![]).chain().is_empty());
+    }
+
+    #[test]
+    fn promotion_status_covers_every_state() {
+        let s = site(vec![
+            env("dev", Some("main"), None, Some('b')),
+            env("fresh", None, Some("dev"), None),
+            env("behind", None, Some("dev"), Some('a')),
+            env("synced", None, Some("dev"), Some('b')),
+            env("dangling", None, Some("gone"), Some('a')),
+            env("empty", Some("x"), None, None),
+            env("after-empty", None, Some("empty"), Some('a')),
+        ]);
+        let status =
+            |n: &str| s.promotion_status(s.envs.iter().find(|e| e.env.as_str() == n).unwrap());
+        assert_eq!(status("dev"), PromotionStatus::UpToDate);
+        assert_eq!(status("fresh"), PromotionStatus::NoRelease);
+        assert_eq!(status("behind"), PromotionStatus::Pending);
+        assert_eq!(status("synced"), PromotionStatus::UpToDate);
+        assert_eq!(status("dangling"), PromotionStatus::UpToDate);
+        assert_eq!(status("empty"), PromotionStatus::NoRelease);
+        assert_eq!(status("after-empty"), PromotionStatus::UpToDate);
+        assert!(s.has_pending());
+    }
+
     use super::*;
 
     #[test]

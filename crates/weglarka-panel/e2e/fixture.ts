@@ -43,6 +43,34 @@ ${htmxConfig}
 <script src="/static/app.js" defer></script>
 </head><body><main>${markup}</main></body></html>`;
 
+// The site page's environment cards. The template has loops and macros the fixture cannot run, so
+// this is a hand-filled copy of the card markup; the class names are checked against the template
+// so a rename there fails here, and `tests/it/pages.rs` pins the real rendering.
+const siteTemplate = read("templates/site.html");
+for (const cls of ['class="envs"', 'class="env-card"', 'class="fields"']) {
+  if (!siteTemplate.includes(cls)) throw new Error(`templates/site.html lost ${cls}`);
+}
+const longHost = `${"very-long-label-".repeat(6)}example.com`;
+const card = (env: string, status: string, source: string) => `
+      <li class="env-card">
+        <h2>${env} <span class="badge badge-ok">${status}</span></h2>
+        <dl class="fields">
+          <dt>Instance</dt><dd><a href="/apps/blog-${env}">blog-${env}</a></dd>
+          <dt>Source</dt><dd>${source}</dd>
+          <dt>Domains</dt><dd><a href="https://${longHost}" rel="noopener noreferrer">${longHost}</a></dd>
+          <dt>Current</dt><dd><code>sha256:cccccccccccc…</code></dd>
+          <dt>Previous</dt><dd><code>—</code></dd>
+        </dl>
+      </li>`;
+const sitePage = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>site fixture</title>
+<link rel="stylesheet" href="/static/app.css">
+</head><body><main id="main">
+    <h1>blog</h1>
+    <ol class="envs">${card("dev", "up to date", "tag main")}${card("staging", "pending promotion", "from dev")}${card("prod", "up to date", "from staging")}
+    </ol>
+</main></body></html>`;
+
 type Mode = "ok" | "redirect" | "unauthorized" | "forbidden";
 let mode: Mode = "ok";
 let polls = 0;
@@ -69,6 +97,10 @@ Bun.serve({
         return new Response(String(polls));
       case "/":
         return html(page);
+      case "/sites/blog":
+        return html(sitePage);
+      case "/static/app.css":
+        return new Response(read("assets/app.css"), { headers: { "content-type": "text/css" } });
       case "/static/app.js":
         return new Response(read("assets/app.js"), { headers: { "content-type": "text/javascript" } });
       case `/static/${htmx}`:

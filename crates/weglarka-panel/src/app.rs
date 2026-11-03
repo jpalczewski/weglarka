@@ -114,6 +114,7 @@ pub fn router(state: AppState) -> Router {
         .route("/volumes", get(routes::volumes))
         .route("/networks", get(routes::networks))
         .route("/sites", get(routes::sites))
+        .route("/sites/{site}", get(routes::site))
         .route("/notifications", get(routes::notifications))
         .route("/certificates", get(routes::certificates))
         .route("/events", get(routes::events))

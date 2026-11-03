@@ -1,0 +1,58 @@
+---
+source: crates/weglarka-panel/tests/it/pages.rs
+expression: html_main(&html)
+---
+<main id="main">
+
+    <p class="crumb"><a href="/sites">Sites</a></p>
+    <h1>blog <span class="muted">ghcr.io/example/blog</span></h1>
+    <p class="muted">Environments in promotion order: a tracked tag first, then what is promoted from it.</p>
+    <ol class="envs">
+      <li class="env-card">
+        <h2>dev <span class="badge badge-ok">up to date</span></h2>
+        <dl class="fields">
+          <dt>Instance</dt>
+          <dd><a href="/apps/blog-dev">blog-dev</a> <span class="badge badge-ok">running</span></dd>
+          <dt>Source</dt>
+          <dd>tag main</dd>
+          <dt>Domains</dt>
+          <dd><a href="https://dev.blog.example.com" rel="noopener noreferrer">dev.blog.example.com</a></dd>
+          <dt>Current</dt>
+          <dd><code>sha256:cccccccccccc…</code></dd>
+          <dt>Previous</dt>
+          <dd><code>sha256:dddddddddddd…</code></dd>
+        </dl>
+      </li>
+      <li class="env-card">
+        <h2>staging <span class="badge badge-warn">pending promotion</span></h2>
+        <dl class="fields">
+          <dt>Instance</dt>
+          <dd><a href="/apps/blog-staging">blog-staging</a> <span class="badge badge-muted">stopped</span></dd>
+          <dt>Source</dt>
+          <dd>from dev</dd>
+          <dt>Domains</dt>
+          <dd>—</dd>
+          <dt>Current</dt>
+          <dd><code>sha256:bbbbbbbbbbbb…</code></dd>
+          <dt>Previous</dt>
+          <dd><code>—</code></dd>
+        </dl>
+      </li>
+      <li class="env-card">
+        <h2>prod <span class="badge badge-fail">no release (domains answer 503)</span></h2>
+        <dl class="fields">
+          <dt>Instance</dt>
+          <dd><a href="/apps/blog-prod">blog-prod</a></dd>
+          <dt>Source</dt>
+          <dd>from staging</dd>
+          <dt>Domains</dt>
+          <dd><a href="https://blog.example.com" rel="noopener noreferrer">blog.example.com</a>, *.blog.example.org</dd>
+          <dt>Current</dt>
+          <dd><code>—</code></dd>
+          <dt>Previous</dt>
+          <dd><code>—</code></dd>
+        </dl>
+      </li>
+    </ol>
+
+  </main>

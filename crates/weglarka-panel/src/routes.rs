@@ -13,14 +13,14 @@ use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use weglarka_api::endpoints::{
     APPS_LIST, APPS_SHOW, APPS_STATS, CERTIFICATES, CONFIG, DOCTOR, EVENTS_RECENT,
-    NOTIFICATIONS_STATUS, SHARED_NETWORKS_LIST, SHARED_VOLUMES_LIST, SITES_LIST, STATS, STATUS,
-    VOLUMES_LIST,
+    NOTIFICATIONS_STATUS, SHARED_NETWORKS_LIST, SHARED_VOLUMES_LIST, SITES_LIST, SITES_SHOW, STATS,
+    STATUS, VOLUMES_LIST,
 };
 use weglarka_api::{
     AppStatsResponse, CertificatesResponse, ConfigView, DoctorReport, EventsResponse,
     ListAppsResponse, ListSharedNetworksResponse, ListSharedVolumesResponse, ListSitesResponse,
-    ListVolumesResponse, NotifyStatusResponse, RuntimeState, ShowAppResponse, StatsResponse,
-    StatusResponse,
+    ListVolumesResponse, NotifyStatusResponse, RuntimeState, ShowAppResponse, SiteSummary,
+    StatsResponse, StatusResponse,
 };
 
 use crate::app::AppState;
@@ -29,12 +29,13 @@ use crate::daemon::{Call, DaemonError};
 use crate::pages::{
     AppPage, AppVolumeRow, AppsPage, CertificatesPage, ConfigPage, DashboardPage, DoctorPage,
     ErrorPage, EventsPage, NetworkRow, NetworksPage, NotificationsPage, ProblemPage,
-    SharedVolumeRow, Shell, SitesPage, StatsFragment, VolumesPage, respond,
+    SharedVolumeRow, Shell, SitePage, SitesPage, StatsFragment, VolumesPage, respond,
 };
 use crate::session::{Session, SessionView};
 use crate::views::{self, field, yes_no};
 use weglarka_model::admin_auth::Scope;
 use weglarka_model::app::InstanceName;
+use weglarka_model::environments::SiteName;
 
 /// How many events the dashboard and the events page show before the live feed takes over.
 const RECENT_EVENTS: usize = 50;
@@ -97,6 +98,15 @@ impl Req {
     pub async fn get<T: DeserializeOwned>(&self, call: Call) -> Result<T, Box<Response>> {
         let result = self.state.daemon.send::<T>(&self.view.token, &call).await;
         self.ok(result, call.scope())
+    }
+
+    /// Courtesy data: a failure leaves it out, never breaks the page.
+    pub async fn try_get<T: DeserializeOwned>(&self, call: Call) -> Option<T> {
+        self.state
+            .daemon
+            .send::<T>(&self.view.token, &call)
+            .await
+            .ok()
     }
 
     /// Unwraps a daemon result or turns the error into a response. `scope` is what the failed call
@@ -169,14 +179,21 @@ impl Req {
         }
     }
 
+    /// A name from the URL as the API spells it; one that does not parse is a 404 without a daemon
+    /// call.
+    fn name_or_404<N, E>(&self, parsed: Result<N, E>) -> Result<N, Box<Response>> {
+        parsed.map_err(|_| Box::new(self.problem(&DaemonError::NotFound(String::new()), None)))
+    }
+
     /// An application name as the API spells it; anything else is a 404 without a daemon call.
     pub fn app_name(&self, raw: &str) -> Result<String, Box<Response>> {
-        match InstanceName::new(raw) {
-            Ok(name) => Ok(name.to_string()),
-            Err(_) => Err(Box::new(
-                self.problem(&DaemonError::NotFound(String::new()), None),
-            )),
-        }
+        self.name_or_404(InstanceName::new(raw))
+            .map(|name| name.to_string())
+    }
+
+    /// A site name as the API spells it; anything else is a 404 without a daemon call.
+    pub fn site_name(&self, raw: &str) -> Result<SiteName, Box<Response>> {
+        self.name_or_404(SiteName::new(raw))
     }
 
     /// The sign-in answer that also ends the session.
@@ -287,11 +304,8 @@ pub async fn apps(req: Req) -> Response {
         Err(r) => return *r,
     };
     // The usage columns are a courtesy: a failing stats call leaves them at `—`, not the page broken.
-    let call = Call::new(&STATS);
     let usage = req
-        .state
-        .daemon
-        .send::<StatsResponse>(&req.view.token, &call)
+        .try_get::<StatsResponse>(Call::new(&STATS))
         .await
         .map(|s| views::usage_by_app(&s))
         .unwrap_or_default();
@@ -318,13 +332,23 @@ pub async fn app(req: Req, Path(name): Path<String>) -> Response {
         Ok(app) => app,
         Err(r) => return *r,
     };
+    // The breadcrumb is a courtesy like the stats columns: no apps list, no breadcrumb. The show
+    // response does not say where an instance comes from, the list does.
+    let origin = req
+        .try_get::<ListAppsResponse>(Call::new(&APPS_LIST))
+        .await
+        .and_then(|l| l.apps.into_iter().find(|a| a.name == app.name))
+        .and_then(|a| a.site);
     // `redacted` is true exactly when the token lacks `admin`, which is also what the logs stream
     // needs: a free signal, with no probe. The daemon still enforces it on the stream itself.
     let logs = !app.redacted;
     respond(
         &AppPage {
             shell: req.shell("apps"),
-            app: views::app_detail(&app),
+            app: views::AppDetail {
+                site: origin.as_deref().and_then(views::site_crumb),
+                ..views::app_detail(&app)
+            },
             logs,
         },
         StatusCode::OK,
@@ -484,6 +508,32 @@ pub async fn sites(req: Req) -> Response {
         &SitesPage {
             shell: req.shell("sites"),
             sites: list.sites.iter().map(views::site_row).collect(),
+        },
+        StatusCode::OK,
+    )
+}
+
+/// `GET /sites/{site}`: the environments of one site as a promotion chain. The apps list only adds
+/// the runtime badges, so a failing call leaves them out instead of breaking the page.
+pub async fn site(req: Req, Path(name): Path<String>) -> Response {
+    let name = match req.site_name(&name) {
+        Ok(name) => name,
+        Err(r) => return *r,
+    };
+    let call = Call::new(&SITES_SHOW).param("site", name.to_string());
+    let (site, apps) = tokio::join!(
+        req.get::<SiteSummary>(call),
+        req.try_get::<ListAppsResponse>(Call::new(&APPS_LIST)),
+    );
+    let site = match site {
+        Ok(site) => site,
+        Err(r) => return *r,
+    };
+    let apps = apps.map(|l| l.apps).unwrap_or_default();
+    respond(
+        &SitePage {
+            shell: req.shell("sites"),
+            site: views::site_detail(&site, &apps),
         },
         StatusCode::OK,
     )
