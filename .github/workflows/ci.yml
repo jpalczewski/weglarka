@@ -87,6 +87,36 @@ jobs:
       - name: ADR numbering, generated index and internal links
         run: scripts/adr.sh lint
 
+  # A pinned action SHA that does not exist fails every job using it before its first step, and one that only
+  # exists in a fork is an impostor opening. actionlint checks syntax and expressions, zizmor the security
+  # patterns (baseline in .github/zizmor.yml), check-action-pins.sh that every `@<sha> # vX` pin resolves in the
+  # action's own repository and that the tag in the comment points at it. Runs for every PR.
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: zizmor
+      # Not in install-action's manifest: fetch the release tarball and verify its checksum.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          sudo install "$RUNNER_TEMP/actionlint" /usr/local/bin/actionlint
+      - run: actionlint
+      - run: zizmor --offline --config .github/zizmor.yml .github
+      - name: Pinned action SHAs exist and match their tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-action-pins.sh
+
   # fmt → clippy → test in ONE job: the toolchain is installed once and the debug `target/`
   # is shared, instead of three runners each paying for toolchain setup and a cold cache.
   # The cache is written only on main (`save-if`); PRs restore main's cache read-only.
@@ -107,7 +137,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # nextest runs every test in its own process, in parallel across binaries; it does not run doc tests,
       # so those keep their own step (all empty today, but a future doc test must not be skipped silently).
-      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
 

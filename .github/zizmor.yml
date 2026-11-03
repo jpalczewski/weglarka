@@ -1,0 +1,23 @@
+# zizmor (workflow security linter), run by the `workflow-lint` CI job.
+#
+# Rules listed here have findings that predate the linter (117 in total on the day it was added). They are switched off
+# rule by rule so that every OTHER rule fails CI immediately; remove an entry once its findings are fixed.
+rules:
+  unpinned-uses:
+    disable: true
+  excessive-permissions:
+    disable: true
+  artipacked:
+    disable: true
+  self-repository:
+    disable: true
+  template-injection:
+    disable: true
+  dependabot-cooldown:
+    disable: true
+  secrets-inherit:
+    disable: true
+  github-env:
+    disable: true
+  cache-poisoning:
+    disable: true
