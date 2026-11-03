@@ -12,8 +12,10 @@
 //!   [`Purpose::Registry`].
 //! * A per-request timeout covering redirects and the body.
 
-use weglarka_http::reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
-use weglarka_http::reqwest::{StatusCode, Url};
+use weglarka_http::reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue, LINK, LOCATION, WWW_AUTHENTICATE,
+};
+use weglarka_http::reqwest::{Method, StatusCode, Url};
 use weglarka_http::{BodyError, Purpose, error_chain, read_capped, transport_allowed};
 
 /// URL limit; the longest URL this client builds is a token URL with a scope.
@@ -134,8 +136,19 @@ pub(crate) struct Response {
     pub(crate) status: u16,
     /// The `WWW-Authenticate` header, when present, printable ASCII (the caller bounds its length).
     pub(crate) challenge: Option<String>,
+    /// `Docker-Content-Digest`: the digest a registry assigned to a manifest it stored or served.
+    pub(crate) digest: Option<String>,
+    /// `Location`: the upload URL of a started blob upload.
+    pub(crate) location: Option<String>,
+    /// `Link`: the pagination cursor of a tag list.
+    pub(crate) link: Option<String>,
     pub(crate) body: Vec<u8>,
 }
+
+/// `Docker-Content-Digest`, the registry's own name for the manifest digest.
+const DIGEST_HEADER: &str = "docker-content-digest";
+/// Header length cap: these are single-line metadata, not content.
+const MAX_HEADER_VALUE: usize = 8 * 1024;
 
 /// HTTP client with one shared TLS configuration.
 pub(crate) struct Client {
@@ -150,55 +163,117 @@ impl Client {
         })
     }
 
-    /// `GET` `url`, following the redirects [`Purpose::Registry`] allows, and read at most `max_body`
-    /// bytes.
-    ///
-    /// `bearer` goes out as a *sensitive* `Authorization` header (redacted in `Debug`) and is dropped
-    /// by `reqwest` when a redirect leaves the original host or port.
-    pub(crate) async fn get(
+    /// `GET` with HTTP Basic credentials, used only for the token endpoint of an authenticated
+    /// publish (`GITHUB_TOKEN` as the password). The header is marked sensitive.
+    pub(crate) async fn get_with_basic(
         &self,
         url: &Url,
-        bearer: Option<&str>,
+        basic: Option<&str>,
         accept: Option<&str>,
         max_body: usize,
         what: &'static str,
     ) -> Result<Response, HttpError> {
-        let mut request = self.client.get(url.clone());
-        if let Some(accept) = accept {
-            request = request.header(ACCEPT, accept);
+        self.request(Request {
+            method: Method::GET,
+            url,
+            bearer: None,
+            basic: basic.map(str::to_owned),
+            accept,
+            content_type: None,
+            body: None,
+            max_body,
+            what,
+        })
+        .await
+    }
+
+    pub(crate) async fn request(&self, request: Request<'_>) -> Result<Response, HttpError> {
+        let mut builder = self.client.request(request.method, request.url.clone());
+        if let Some(accept) = request.accept {
+            builder = builder.header(ACCEPT, accept);
         }
-        if let Some(token) = bearer {
+        if let Some(content_type) = request.content_type {
+            builder = builder.header(CONTENT_TYPE, content_type);
+        }
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        }
+        if let Some(basic) = request.basic.as_deref() {
+            if !basic.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(HttpError::InvalidToken);
+            }
+            let mut value = HeaderValue::from_str(&format!("Basic {basic}"))
+                .map_err(|_| HttpError::InvalidToken)?;
+            value.set_sensitive(true);
+            builder = builder.header(AUTHORIZATION, value);
+        }
+        if let Some(token) = request.bearer.as_deref() {
             if !token.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(HttpError::InvalidToken);
             }
             let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| HttpError::InvalidToken)?;
             value.set_sensitive(true);
-            request = request.header(AUTHORIZATION, value);
+            builder = builder.header(AUTHORIZATION, value);
         }
-        let response = request.send().await.map_err(|e| failure(e, what))?;
+        let response = builder.send().await.map_err(|e| failure(e, request.what))?;
         let status = response.status().as_u16();
-        let challenge = response
-            .headers()
-            .get(WWW_AUTHENTICATE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let header = |name: HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| value.len() <= MAX_HEADER_VALUE)
+                .map(str::to_owned)
+        };
+        let challenge = header(WWW_AUTHENTICATE);
+        let digest = header(HeaderName::from_static(DIGEST_HEADER));
+        let location = header(LOCATION);
+        let link = header(LINK);
         // A redirect that was not followed (no `Location`) has nothing worth reading.
         let body = if StatusCode::from_u16(status).is_ok_and(|s| s.is_redirection()) {
             Vec::new()
         } else {
-            read_capped(response, max_body)
+            read_capped(response, request.max_body)
                 .await
                 .map_err(|error| match error {
-                    BodyError::TooLarge { limit } => HttpError::TooLarge { what, limit },
-                    BodyError::Read(error) => failure(error, what),
+                    BodyError::TooLarge { limit } => HttpError::TooLarge {
+                        what: request.what,
+                        limit,
+                    },
+                    BodyError::Read(error) => failure(error, request.what),
                 })?
         };
         Ok(Response {
             status,
             challenge,
+            digest,
+            location,
+            link,
             body,
         })
+    }
+}
+
+/// Everything one registry request needs; a struct keeps the size-capped client readable.
+#[derive(Clone)]
+pub(crate) struct Request<'a> {
+    pub(crate) method: Method,
+    pub(crate) url: &'a Url,
+    pub(crate) bearer: Option<String>,
+    pub(crate) basic: Option<String>,
+    pub(crate) accept: Option<&'a str>,
+    pub(crate) content_type: Option<&'static str>,
+    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) max_body: usize,
+    pub(crate) what: &'static str,
+}
+
+impl<'a> Request<'a> {
+    /// The same request with a Bearer token (or none), used to answer one `401` challenge.
+    pub(crate) fn with_bearer(mut self, token: Option<&str>) -> Self {
+        self.bearer = token.map(str::to_owned);
+        self
     }
 }
 

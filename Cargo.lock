@@ -2314,6 +2314,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
  "weglarka-model",
  "weglarka-registry",
 ]

@@ -5,19 +5,22 @@
 //! whatever it was scripted with, and [`TestSigner`] holds a private key generated at runtime, so
 //! no test needs an external `cosign` binary or a fixture secret.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
-use base64::Engine as _;
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
-use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use weglarka_model::app::Digest;
+use weglarka_model::release_set::{Repository, StrictDigest};
 
 use crate::cosign::Signature;
 use crate::image_ref::ImageRef;
-use crate::key::{self, KeyError, PublicKey};
-use crate::registry::{Registry, RegistryError};
+use crate::key::{self, KeyError, PublicKey, pem_encode};
+use crate::registry::{FetchedManifest, Registry, RegistryError, ReleaseRegistry};
+
+pub use crate::cosign::payload_for;
 
 /// One recorded [`Registry::cosign_signatures`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,32 +195,6 @@ impl TestSigner {
     }
 }
 
-/// The simple-signing payload `cosign sign` stores: the image digest, the repository identity and
-/// the key-based signature type.
-pub fn payload_for(image: &ImageRef, digest: &Digest) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&json!({
-        "critical": {
-            "identity": { "docker-reference": image.repository_reference() },
-            "image": { "docker-manifest-digest": digest.as_str() },
-            "type": "cosign container image signature",
-        },
-        "optional": null,
-    }))
-}
-
-fn pem_encode(der: &[u8]) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        if let Ok(text) = std::str::from_utf8(chunk) {
-            pem.push_str(text);
-        }
-        pem.push('\n');
-    }
-    pem.push_str("-----END PUBLIC KEY-----\n");
-    pem
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +227,309 @@ mod tests {
             crate::verify(&signature, second.public_key(), &image, &digest).unwrap_err(),
             crate::VerifyError::BadSignature
         ));
+    }
+}
+
+/// An in-memory release repository: manifests, blobs, tags and the legacy `.sig` documents.
+///
+/// It behaves like the registry for the operations the publisher uses, so the release tool's
+/// tests drive the real code paths (sequence allocation, immutable-tag comparison, pointer moves,
+/// signature lookup) without a network or a token endpoint. `cosign_signatures` reads the `.sig`
+/// manifest this fake stored, so the signature layout is exercised end to end.
+#[derive(Debug, Default)]
+pub struct FakeReleaseRegistry {
+    state: Mutex<FakeReleaseState>,
+}
+
+#[derive(Debug, Default)]
+struct FakeReleaseState {
+    /// `(repository, tag)` → exact manifest bytes.
+    manifests: BTreeMap<(String, String), Vec<u8>>,
+    /// `(repository, digest)` → blob bytes.
+    blobs: BTreeMap<(String, String), Vec<u8>>,
+    /// Every call, as `(repository, reference)`, for assertions about write ordering.
+    calls: Vec<(String, String)>,
+    /// Tags hidden from listings while their manifest stays readable (a stale tag list or a
+    /// concurrent push the allocating run did not see).
+    hidden: BTreeSet<(String, String)>,
+}
+
+impl FakeReleaseRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The tags currently stored in `repository`, sorted.
+    pub fn tags_of(&self, repository: &Repository) -> Vec<String> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tags: Vec<String> = state
+            .manifests
+            .keys()
+            .filter(|(repo, _)| repo == repository.as_str())
+            .filter(|key| !state.hidden.contains(*key))
+            .map(|(_, tag)| tag.clone())
+            .filter(|tag| !tag.starts_with("sha256:"))
+            .collect();
+        tags.sort();
+        tags
+    }
+
+    /// The bytes stored under `tag`, if any.
+    pub fn manifest_bytes(&self, repository: &Repository, tag: &str) -> Option<Vec<u8>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .manifests
+            .get(&(repository.as_str().to_owned(), tag.to_owned()))
+            .cloned()
+    }
+
+    /// Hides `tag` from listings while keeping the manifest readable: simulates a stale tag list
+    /// (the allocation must still refuse to overwrite the immutable bytes).
+    pub fn hide_tag(&self, repository: &Repository, tag: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hidden
+            .insert((repository.as_str().to_owned(), tag.to_owned()));
+    }
+
+    /// Every call received, in order.
+    pub fn calls(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .clone()
+    }
+
+    fn record(&self, repository: &Repository, reference: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .push((repository.as_str().to_owned(), reference.to_owned()));
+    }
+}
+
+impl Registry for FakeReleaseRegistry {
+    async fn cosign_signatures(
+        &self,
+        image: &ImageRef,
+        digest: &Digest,
+    ) -> Result<Vec<Signature>, RegistryError> {
+        let repository = image.repository_reference();
+        let tag = format!("{}.sig", digest.as_str().replace(':', "-"));
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(bytes) = state.manifests.get(&(repository.clone(), tag)) else {
+            return Ok(Vec::new());
+        };
+        // A deliberately lenient read of the signature manifest, enough for the verifier: one
+        // simple-signing layer with the signature annotation and the payload blob behind it.
+        let document: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|error| RegistryError::MalformedJson {
+                what: "signature manifest",
+                detail: error.to_string(),
+            })?;
+        let mut signatures = Vec::new();
+        for layer in document["layers"].as_array().into_iter().flatten() {
+            if layer["mediaType"].as_str()
+                != Some("application/vnd.dev.cosign.simplesigning.v1+json")
+            {
+                continue;
+            }
+            let encoded = layer["annotations"]["dev.cosignproject.cosign/signature"]
+                .as_str()
+                .ok_or(RegistryError::MissingAnnotation {
+                    annotation: "dev.cosignproject.cosign/signature",
+                })?;
+            let signature = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| RegistryError::SignatureBase64(error.to_string()))?
+            };
+            let digest = layer["digest"]
+                .as_str()
+                .ok_or(RegistryError::UnsupportedLayerDigest {
+                    digest: String::new(),
+                })?;
+            let payload = state
+                .blobs
+                .get(&(repository.clone(), digest.to_owned()))
+                .ok_or(RegistryError::Status {
+                    status: 404,
+                    what: "signature payload",
+                })?
+                .clone();
+            signatures.push(Signature { payload, signature });
+        }
+        Ok(signatures)
+    }
+}
+
+impl ReleaseRegistry for FakeReleaseRegistry {
+    async fn manifest(
+        &self,
+        repository: &Repository,
+        reference: &str,
+        _max_body: usize,
+    ) -> Result<FetchedManifest, RegistryError> {
+        self.record(repository, reference);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let bytes = match state
+            .manifests
+            .get(&(repository.as_str().to_owned(), reference.to_owned()))
+        {
+            Some(bytes) => bytes.clone(),
+            None if reference.starts_with("sha256:") => state
+                .manifests
+                .iter()
+                .filter(|((repo, _), _)| repo == repository.as_str())
+                .find(|(_, bytes)| {
+                    format!(
+                        "sha256:{}",
+                        crate::registry::hex_lower(&Sha256::digest(bytes))
+                    ) == reference
+                })
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or(RegistryError::Status {
+                    status: 404,
+                    what: "release-set manifest",
+                })?,
+            None => {
+                return Err(RegistryError::Status {
+                    status: 404,
+                    what: "release-set manifest",
+                });
+            }
+        };
+        let digest = StrictDigest::new(format!(
+            "sha256:{}",
+            crate::registry::hex_lower(&Sha256::digest(&bytes))
+        ))
+        .map_err(|_| RegistryError::InvalidDigest {
+            digest: reference.to_owned(),
+        })?;
+        Ok(FetchedManifest { bytes, digest })
+    }
+
+    async fn blob(
+        &self,
+        repository: &Repository,
+        digest: &StrictDigest,
+        _max_body: usize,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.record(repository, digest.as_str());
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .blobs
+            .get(&(repository.as_str().to_owned(), digest.as_str().to_owned()))
+            .cloned()
+            .ok_or(RegistryError::Status {
+                status: 404,
+                what: "release-set blob",
+            })
+    }
+
+    async fn tags(&self, repository: &Repository) -> Result<Vec<String>, RegistryError> {
+        self.record(repository, "tags/list");
+        Ok(self.tags_of(repository))
+    }
+
+    async fn put_blob(
+        &self,
+        repository: &Repository,
+        bytes: &[u8],
+    ) -> Result<StrictDigest, RegistryError> {
+        let digest = StrictDigest::new(format!(
+            "sha256:{}",
+            crate::registry::hex_lower(&Sha256::digest(bytes))
+        ))
+        .map_err(|_| RegistryError::InvalidDigest {
+            digest: "computed sha256".to_owned(),
+        })?;
+        self.record(repository, digest.as_str());
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .blobs
+            .insert(
+                (repository.as_str().to_owned(), digest.as_str().to_owned()),
+                bytes.to_vec(),
+            );
+        Ok(digest)
+    }
+
+    async fn put_manifest(
+        &self,
+        repository: &Repository,
+        tag: &str,
+        bytes: &[u8],
+    ) -> Result<StrictDigest, RegistryError> {
+        self.record(repository, tag);
+        let digest = StrictDigest::new(format!(
+            "sha256:{}",
+            crate::registry::hex_lower(&Sha256::digest(bytes))
+        ))
+        .map_err(|_| RegistryError::InvalidDigest {
+            digest: tag.to_owned(),
+        })?;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .manifests
+            .insert(
+                (repository.as_str().to_owned(), tag.to_owned()),
+                bytes.to_vec(),
+            );
+        Ok(digest)
+    }
+}
+
+/// A generated P-256 key pair in the form the publisher's [`SigningKey`] takes (unencrypted
+/// PKCS#8), so tests exercise signing without a fixture secret.
+pub struct TestSigningKey {
+    signing_key: crate::SigningKey,
+    pkcs8: Vec<u8>,
+}
+
+impl fmt::Debug for TestSigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestSigningKey")
+            .field("public_key_pem", &self.signing_key.public_key_pem())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestSigningKey {
+    pub fn generate() -> Result<Self, SigningError> {
+        let rng = SystemRandom::new();
+        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+            .map_err(|e| SigningError::KeyGeneration(e.to_string()))?;
+        let pkcs8 = document.as_ref().to_vec();
+        let signing_key = crate::SigningKey::from_der(&pkcs8)?;
+        Ok(Self { signing_key, pkcs8 })
+    }
+
+    pub fn signing_key(&self) -> &crate::SigningKey {
+        &self.signing_key
+    }
+
+    pub fn public_key(&self) -> &PublicKey {
+        self.signing_key.public_key()
+    }
+
+    /// The PEM form, for a CLI-level test that must write a key file.
+    pub fn pem(&self) -> String {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.pkcs8);
+        let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            pem.push('\n');
+        }
+        pem.push_str("-----END PRIVATE KEY-----\n");
+        pem
     }
 }

@@ -23,9 +23,11 @@ use std::fmt;
 use std::future::Future;
 use std::sync::{Mutex, PoisonError};
 
+use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use weglarka_model::app::Digest;
+use weglarka_model::release_set::{Repository, StrictDigest};
 
 use weglarka_http::reqwest::Url;
 
@@ -70,10 +72,103 @@ pub trait Registry: Send + Sync {
     ) -> impl Future<Output = Result<Vec<Signature>, RegistryError>> + Send;
 }
 
+/// A manifest as the registry served it, with the digest it resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedManifest {
+    /// The exact manifest bytes; the release-set parser consumes these, not a re-serialization.
+    pub bytes: Vec<u8>,
+    /// The digested identity of `bytes` (the registry's `Docker-Content-Digest`, or the SHA-256 of
+    /// the bytes when the registry did not send one).
+    pub digest: StrictDigest,
+}
+
+/// Reads and writes the generic OCI objects a release set needs (manifests, blobs, tags).
+///
+/// This is separate from [`Registry`] because the host only ever reads a cosign `.sig` next to an
+/// image, while the publisher pushes release-set artifacts and allocates a tag sequence. Both
+/// halves share [`HttpRegistry`], so the transport, token isolation, redirect policy and size caps
+/// are the same code on the publish and on the verify path.
+///
+/// Every method takes explicit bounds: a registry is a hostile peer even when it is GHCR.
+pub trait ReleaseRegistry: Registry {
+    /// Fetches a manifest by tag or digest. A digest reference must resolve to exactly those bytes.
+    fn manifest(
+        &self,
+        repository: &Repository,
+        reference: &str,
+        max_body: usize,
+    ) -> impl Future<Output = Result<FetchedManifest, RegistryError>> + Send;
+
+    /// Fetches a blob and checks it against `digest`.
+    fn blob(
+        &self,
+        repository: &Repository,
+        digest: &StrictDigest,
+        max_body: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RegistryError>> + Send;
+
+    /// Lists every tag of `repository`, bounded by [`MAX_TAGS`].
+    fn tags(
+        &self,
+        repository: &Repository,
+    ) -> impl Future<Output = Result<Vec<String>, RegistryError>> + Send;
+
+    /// Uploads a blob (idempotent: an existing identical blob is fine) and returns its digest.
+    fn put_blob(
+        &self,
+        repository: &Repository,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<StrictDigest, RegistryError>> + Send;
+
+    /// Stores `bytes` under `tag` and returns the manifest digest.
+    fn put_manifest(
+        &self,
+        repository: &Repository,
+        tag: &str,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<StrictDigest, RegistryError>> + Send;
+}
+
+/// Page size for a tag listing request; GHCR caps `n` itself.
+const TAG_PAGE_SIZE: usize = 1000;
+/// Hard bound on tags read for one sequence allocation.
+pub const MAX_TAGS: usize = 10_000;
+/// Pagination pages followed before giving up.
+const MAX_TAG_PAGES: usize = 64;
+/// Response cap for a write acknowledgement (registries answer with an empty body).
+const MAX_WRITE_RESPONSE_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error(transparent)]
     Http(#[from] HttpError),
+    #[error("{what} {reference:?} is not a valid tag or digest")]
+    InvalidReference {
+        what: &'static str,
+        reference: String,
+    },
+    #[error("the manifest resolves to {actual}, not to the requested digest {expected}")]
+    ManifestDigestMismatch { expected: String, actual: String },
+    #[error("the blob {expected} hashes to {actual}")]
+    BlobDigestMismatch { expected: String, actual: String },
+    #[error("the registry started a blob upload without a usable Location header")]
+    MissingUploadLocation,
+    #[error("the registry's upload Location is not a usable URL")]
+    InvalidUploadLocation,
+    #[error(
+        "the tag list exceeded the {MAX_TAGS}-tag limit, so the sequence cannot be allocated safely"
+    )]
+    TooManyTags,
+    #[error("{digest:?} is not a canonical lower-case sha256 digest")]
+    InvalidDigest { digest: String },
+    #[error("{tag:?} is not a valid immutable OCI tag")]
+    InvalidTag { tag: String },
+    #[error("the registry credentials are not a safe HTTP Basic value")]
+    InvalidCredentials,
+    #[error("the registry's pagination Link is not a usable URL")]
+    InvalidLink,
+    #[error("the release signing key cannot be used: {0}")]
+    Signing(String),
     #[error("the registry returned status {status} for the {what}")]
     Status { status: u16, what: &'static str },
     #[error("the registry's WWW-Authenticate response is not a usable Bearer challenge")]
@@ -107,6 +202,9 @@ pub enum RegistryError {
 pub struct HttpRegistry {
     client: http::Client,
     token: Mutex<Option<CachedToken>>,
+    /// HTTP Basic credentials for the token endpoint, `Authorization: Basic <value>`. Only a
+    /// publisher sets them; the host stays anonymous. Never printed (`Debug` is custom).
+    basic: Option<String>,
 }
 
 struct CachedToken {
@@ -115,9 +213,44 @@ struct CachedToken {
     token: String,
 }
 
+/// Registry and repository path a request addresses. The host reaches images through [`ImageRef`];
+/// release sets use the model's tag-free [`Repository`]. Both reduce to the same two fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoAddress {
+    registry: String,
+    repository: String,
+}
+
+impl RepoAddress {
+    fn from_image(image: &ImageRef) -> Self {
+        Self {
+            registry: image.registry.clone(),
+            repository: image.repository.clone(),
+        }
+    }
+
+    /// Splits `host[:port]/lowercase/path`; the model has already validated both halves.
+    fn split(repository: &Repository) -> Result<Self, RegistryError> {
+        let (registry, path) =
+            repository
+                .as_str()
+                .split_once('/')
+                .ok_or_else(|| RegistryError::InvalidReference {
+                    what: "repository",
+                    reference: repository.as_str().to_owned(),
+                })?;
+        Ok(Self {
+            registry: registry.to_owned(),
+            repository: path.to_owned(),
+        })
+    }
+}
+
 impl fmt::Debug for HttpRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpRegistry").finish_non_exhaustive()
+        f.debug_struct("HttpRegistry")
+            .field("authenticated", &self.basic.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -127,35 +260,53 @@ impl HttpRegistry {
         Ok(Self {
             client: http::Client::new()?,
             token: Mutex::new(None),
+            basic: None,
         })
     }
 
-    /// `GET` a registry URL, answering one Bearer challenge and reusing the cached token.
-    async fn authorized_get(
+    /// A client that authenticates the token endpoint with HTTP Basic credentials (`user:token`).
+    /// Used by the publisher only; verification stays anonymous.
+    pub fn with_basic_credentials(username: &str, password: &str) -> Result<Self, RegistryError> {
+        if !username
+            .bytes()
+            .chain(std::iter::once(b':'))
+            .chain(password.bytes())
+            .all(|byte| (0x20..0x7f).contains(&byte))
+        {
+            return Err(RegistryError::InvalidCredentials);
+        }
+        let mut client = Self::new()?;
+        client.basic = Some(
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}")),
+        );
+        Ok(client)
+    }
+
+    fn cached_token(&self, repo: &RepoAddress) -> Option<String> {
+        let cache = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .as_ref()
+            .filter(|token| token.registry == repo.registry && token.repository == repo.repository)
+            .map(|token| token.token.clone())
+    }
+
+    /// Sends one request, answers a single Bearer challenge and reuses the cached token. A `401`
+    /// always re-fetches, so a pull token cached earlier cannot mask a missing `push` scope.
+    async fn authorized(
         &self,
-        url: &Url,
-        image: &ImageRef,
-        accept: Option<&str>,
-        max_body: usize,
-        what: &'static str,
+        request: http::Request<'_>,
+        repo: &RepoAddress,
     ) -> Result<http::Response, RegistryError> {
-        let cached = {
-            let cache = self.token.lock().unwrap_or_else(PoisonError::into_inner);
-            cache
-                .as_ref()
-                .filter(|token| {
-                    token.registry == image.registry && token.repository == image.repository
-                })
-                .map(|token| token.token.clone())
-        };
+        let what = request.what;
+        let cached = self.cached_token(repo);
         let response = self
             .client
-            .get(url, cached.as_deref(), accept, max_body, what)
+            .request(request.clone().with_bearer(cached.as_deref()))
             .await?;
         let response = if response.status == 401 {
-            let token = self.fetch_token(&response, image).await?;
+            let token = self.fetch_token(&response, repo).await?;
             self.client
-                .get(url, Some(&token), accept, max_body, what)
+                .request(request.with_bearer(Some(&token)))
                 .await?
         } else {
             response
@@ -169,11 +320,12 @@ impl HttpRegistry {
         Ok(response)
     }
 
-    /// Fetches an anonymous token for the Bearer challenge in `response` and caches it.
+    /// Fetches a token for the Bearer challenge in `response` and caches it. With credentials
+    /// configured this is an authenticated token (push scope); otherwise it stays anonymous.
     async fn fetch_token(
         &self,
         response: &http::Response,
-        image: &ImageRef,
+        repo: &RepoAddress,
     ) -> Result<String, RegistryError> {
         let challenge = response
             .challenge
@@ -181,8 +333,9 @@ impl HttpRegistry {
             .ok_or(RegistryError::AuthChallenge)?;
         let challenge = Challenge::parse(challenge)?;
         tracing::debug!(
-            registry = image.registry.as_str(),
-            "requesting an anonymous registry token"
+            registry = repo.registry.as_str(),
+            authenticated = self.basic.is_some(),
+            "requesting a registry token"
         );
         let mut url = challenge.realm;
         let mut query = Vec::new();
@@ -191,14 +344,20 @@ impl HttpRegistry {
         }
         let scope = challenge
             .scope
-            .unwrap_or_else(|| format!("repository:{}:pull", image.repository));
+            .unwrap_or_else(|| format!("repository:{}:pull", repo.repository));
         query.push(format!("scope={}", http::percent_encode(&scope)));
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(&query.join("&"));
         let url = http::parse_url(&url)?;
         let response = self
             .client
-            .get(&url, None, None, MAX_TOKEN_BYTES, "auth token")
+            .get_with_basic(
+                &url,
+                self.basic.as_deref(),
+                None,
+                MAX_TOKEN_BYTES,
+                "auth token",
+            )
             .await?;
         if !(200..300).contains(&response.status) {
             return Err(RegistryError::Status {
@@ -219,11 +378,37 @@ impl HttpRegistry {
         }
         let mut cache = self.token.lock().unwrap_or_else(PoisonError::into_inner);
         *cache = Some(CachedToken {
-            registry: image.registry.clone(),
-            repository: image.repository.clone(),
+            registry: repo.registry.clone(),
+            repository: repo.repository.clone(),
             token: token.token.clone(),
         });
         Ok(token.token)
+    }
+
+    /// `GET` a registry URL for an image (the signature path).
+    async fn authorized_get(
+        &self,
+        url: &Url,
+        image: &ImageRef,
+        accept: Option<&str>,
+        max_body: usize,
+        what: &'static str,
+    ) -> Result<http::Response, RegistryError> {
+        self.authorized(
+            http::Request {
+                method: weglarka_http::reqwest::Method::GET,
+                url,
+                bearer: None,
+                basic: None,
+                accept,
+                content_type: None,
+                body: None,
+                max_body,
+                what,
+            },
+            &RepoAddress::from_image(image),
+        )
+        .await
     }
 }
 
@@ -298,6 +483,333 @@ impl Registry for HttpRegistry {
     }
 }
 
+impl ReleaseRegistry for HttpRegistry {
+    async fn manifest(
+        &self,
+        repository: &Repository,
+        reference: &str,
+        max_body: usize,
+    ) -> Result<FetchedManifest, RegistryError> {
+        validate_reference(reference)?;
+        let repo = RepoAddress::split(repository)?;
+        let url = http::registry_url(
+            &repo.registry,
+            &format!("/v2/{}/manifests/{reference}", repo.repository),
+        )?;
+        let response = self
+            .authorized(
+                http::Request {
+                    method: weglarka_http::reqwest::Method::GET,
+                    url: &url,
+                    bearer: None,
+                    basic: None,
+                    accept: Some(ACCEPT_MANIFEST),
+                    content_type: None,
+                    body: None,
+                    max_body,
+                    what: "release-set manifest",
+                },
+                &repo,
+            )
+            .await?;
+        let actual = digest_of(&response.body)?;
+        // A digest reference must resolve to exactly the requested identity; a tag may move.
+        if reference.starts_with("sha256:") && reference != actual.as_str() {
+            return Err(RegistryError::ManifestDigestMismatch {
+                expected: reference.to_owned(),
+                actual: actual.as_str().to_owned(),
+            });
+        }
+        // The registry's own header, when present, must agree with the bytes it returned: a
+        // registry that reports one digest and serves another bytes is rejected here, before any
+        // model parser sees the document.
+        if let Some(reported) = response.digest
+            && reported != actual.as_str()
+        {
+            return Err(RegistryError::ManifestDigestMismatch {
+                expected: reported,
+                actual: actual.as_str().to_owned(),
+            });
+        }
+        Ok(FetchedManifest {
+            bytes: response.body,
+            digest: actual,
+        })
+    }
+
+    async fn blob(
+        &self,
+        repository: &Repository,
+        digest: &StrictDigest,
+        max_body: usize,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let repo = RepoAddress::split(repository)?;
+        let url = http::registry_url(
+            &repo.registry,
+            &format!("/v2/{}/blobs/{}", repo.repository, digest.as_str()),
+        )?;
+        let response = self
+            .authorized(
+                http::Request {
+                    method: weglarka_http::reqwest::Method::GET,
+                    url: &url,
+                    bearer: None,
+                    basic: None,
+                    accept: None,
+                    content_type: None,
+                    body: None,
+                    max_body,
+                    what: "release-set blob",
+                },
+                &repo,
+            )
+            .await?;
+        let actual = digest_of(&response.body)?;
+        if actual != *digest {
+            return Err(RegistryError::BlobDigestMismatch {
+                expected: digest.as_str().to_owned(),
+                actual: actual.as_str().to_owned(),
+            });
+        }
+        Ok(response.body)
+    }
+
+    async fn tags(&self, repository: &Repository) -> Result<Vec<String>, RegistryError> {
+        let repo = RepoAddress::split(repository)?;
+        let mut url = http::registry_url(
+            &repo.registry,
+            &format!("/v2/{}/tags/list?n={TAG_PAGE_SIZE}", repo.repository),
+        )?;
+        let mut tags = Vec::new();
+        for _ in 0..MAX_TAG_PAGES {
+            let response = self
+                .authorized(
+                    http::Request {
+                        method: weglarka_http::reqwest::Method::GET,
+                        url: &url,
+                        bearer: None,
+                        basic: None,
+                        accept: None,
+                        content_type: None,
+                        body: None,
+                        max_body: MAX_WRITE_RESPONSE_BYTES,
+                        what: "tag list",
+                    },
+                    &repo,
+                )
+                .await?;
+            let page: TagPage = serde_json::from_slice(&response.body).map_err(|e| {
+                RegistryError::MalformedJson {
+                    what: "tag list",
+                    detail: e.to_string(),
+                }
+            })?;
+            let count = page.tags.as_ref().map_or(0, Vec::len);
+            if count == 0 {
+                break;
+            }
+            tags.extend(page.tags.into_iter().flatten());
+            if tags.len() > MAX_TAGS {
+                return Err(RegistryError::TooManyTags);
+            }
+            let Some(next) = response.link.as_deref().and_then(next_link) else {
+                break;
+            };
+            // A Link is relative to the registry in practice; resolving against the current URL
+            // keeps the same authority (a redirect to another host is refused by the client).
+            url = url.join(&next).map_err(|_| RegistryError::InvalidLink)?;
+        }
+        Ok(tags)
+    }
+
+    async fn put_blob(
+        &self,
+        repository: &Repository,
+        bytes: &[u8],
+    ) -> Result<StrictDigest, RegistryError> {
+        let repo = RepoAddress::split(repository)?;
+        let upload = http::registry_url(
+            &repo.registry,
+            &format!("/v2/{}/blobs/uploads/", repo.repository),
+        )?;
+        let response = self
+            .authorized(
+                http::Request {
+                    method: weglarka_http::reqwest::Method::POST,
+                    url: &upload,
+                    bearer: None,
+                    basic: None,
+                    accept: None,
+                    content_type: None,
+                    body: None,
+                    max_body: MAX_WRITE_RESPONSE_BYTES,
+                    what: "blob upload",
+                },
+                &repo,
+            )
+            .await?;
+        let location = response
+            .location
+            .ok_or(RegistryError::MissingUploadLocation)?;
+        let mut target = upload
+            .join(&location)
+            .map_err(|_| RegistryError::InvalidUploadLocation)?;
+        let digest = digest_of(bytes)?;
+        target
+            .query_pairs_mut()
+            .append_pair("digest", digest.as_str());
+        self.authorized(
+            http::Request {
+                method: weglarka_http::reqwest::Method::PUT,
+                url: &target,
+                bearer: None,
+                basic: None,
+                accept: None,
+                content_type: Some("application/octet-stream"),
+                body: Some(bytes.to_vec()),
+                max_body: MAX_WRITE_RESPONSE_BYTES,
+                what: "blob upload",
+            },
+            &repo,
+        )
+        .await?;
+        Ok(digest)
+    }
+
+    async fn put_manifest(
+        &self,
+        repository: &Repository,
+        tag: &str,
+        bytes: &[u8],
+    ) -> Result<StrictDigest, RegistryError> {
+        if !valid_tag(tag) {
+            return Err(RegistryError::InvalidTag {
+                tag: tag.to_owned(),
+            });
+        }
+        let repo = RepoAddress::split(repository)?;
+        let url = http::registry_url(
+            &repo.registry,
+            &format!("/v2/{}/manifests/{tag}", repo.repository),
+        )?;
+        let response = self
+            .authorized(
+                http::Request {
+                    method: weglarka_http::reqwest::Method::PUT,
+                    url: &url,
+                    bearer: None,
+                    basic: None,
+                    accept: None,
+                    content_type: Some("application/vnd.oci.image.manifest.v1+json"),
+                    body: Some(bytes.to_vec()),
+                    max_body: MAX_WRITE_RESPONSE_BYTES,
+                    what: "manifest upload",
+                },
+                &repo,
+            )
+            .await?;
+        let actual = digest_of(bytes)?;
+        if let Some(reported) = response.digest
+            && reported != actual.as_str()
+        {
+            return Err(RegistryError::ManifestDigestMismatch {
+                expected: actual.as_str().to_owned(),
+                actual: reported,
+            });
+        }
+        Ok(actual)
+    }
+}
+
+/// Signs `digest` with `key` and stores the legacy cosign `.sig` manifest and its payload blob in
+/// `repository`. The caller passes the exact repository identity because the signature payload
+/// binds it: the host refuses a signature made for another repository.
+pub async fn push_signature<R: ReleaseRegistry + ?Sized>(
+    registry: &R,
+    repository: &Repository,
+    image: &ImageRef,
+    digest: &StrictDigest,
+    key: &crate::SigningKey,
+) -> Result<(), RegistryError> {
+    let payload = crate::cosign::payload_for(image, digest.as_digest())
+        .map_err(|error| RegistryError::Signing(error.to_string()))?;
+    let signature = key
+        .sign(&payload)
+        .map_err(|error| RegistryError::Signing(error.to_string()))?;
+    let payload_digest = registry.put_blob(repository, &payload).await?;
+    let manifest = crate::cosign::signature_manifest(
+        payload_digest.as_str(),
+        payload.len() as u64,
+        &signature,
+    );
+    let tag = format!("{}.sig", digest.as_str().replace(':', "-"));
+    registry.put_manifest(repository, &tag, &manifest).await?;
+    Ok(())
+}
+
+/// A tag moves; a digest must not. Rejects anything that is neither.
+fn validate_reference(reference: &str) -> Result<(), RegistryError> {
+    if reference.starts_with("sha256:") {
+        StrictDigest::new(reference).map_err(|_| RegistryError::InvalidDigest {
+            digest: reference.to_owned(),
+        })?;
+        return Ok(());
+    }
+    if valid_tag(reference) {
+        Ok(())
+    } else {
+        Err(RegistryError::InvalidReference {
+            what: "manifest reference",
+            reference: reference.to_owned(),
+        })
+    }
+}
+
+/// OCI tag grammar (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
+fn valid_tag(tag: &str) -> bool {
+    let mut bytes = tag.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    let rest = bytes.collect::<Vec<_>>();
+    tag.len() <= 128
+        && (first.is_ascii_alphanumeric() || first == b'_')
+        && rest
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn digest_of(bytes: &[u8]) -> Result<StrictDigest, RegistryError> {
+    StrictDigest::new(format!("sha256:{}", hex_lower(&Sha256::digest(bytes)))).map_err(|_| {
+        RegistryError::InvalidDigest {
+            digest: "computed sha256".to_owned(),
+        }
+    })
+}
+
+/// Extracts the `rel="next"` target from a `Link` header.
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|link| {
+        let (target, parameters) = link.split_once(';')?;
+        let target = target.trim().trim_start_matches('<').trim_end_matches('>');
+        if parameters
+            .split(';')
+            .any(|parameter| parameter.trim().replace(' ', "") == "rel=\"next\"")
+        {
+            Some(target.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// The `tags` array of a tag-list page. External format, so lenient like the signature manifest.
+#[derive(Debug, Deserialize)]
+struct TagPage {
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
 /// `<registry>/<repo>:sha256-<hex>.sig` — the tag cosign stores a payload signature under.
 fn signature_tag(digest: &Digest) -> String {
     format!("{}.sig", digest.as_str().replace(':', "-"))
@@ -342,7 +854,7 @@ fn decode_signature(encoded: &str) -> Result<Vec<u8>, RegistryError> {
     Ok(decoded)
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -478,7 +990,6 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
-    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1203,5 +1714,210 @@ mod tests {
         );
         fake.clear_calls();
         assert!(fake.calls().is_empty());
+    }
+
+    // ---- release-set transport -----------------------------------------------------------
+
+    fn loopback_repository(address: SocketAddr) -> Repository {
+        Repository::new(format!("{address}/example/releases")).unwrap()
+    }
+
+    fn challenge(address: SocketAddr, scope: &str) -> String {
+        format!("Bearer realm=\"http://{address}/token\",service=\"test\",scope=\"{scope}\"")
+    }
+
+    /// Every registry request needs a Bearer token; the token endpoint is anonymous unless the
+    /// client is authenticated.
+    fn authorized_or_challenge(request: &Request, address: SocketAddr) -> Option<ResponseSpec> {
+        if request.has_authorization() {
+            return None;
+        }
+        let scope = if request.path.contains("uploads") || request.path.contains("manifests") {
+            "repository:example/releases:pull,push"
+        } else {
+            "repository:example/releases:pull"
+        };
+        Some(with_header(
+            response(401),
+            "WWW-Authenticate",
+            &challenge(address, scope),
+        ))
+    }
+
+    #[tokio::test]
+    async fn release_tags_follow_pagination_and_share_one_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServer::start(listener, move |request| {
+            if request.path.starts_with("/token") {
+                return with_body(response(200), br#"{"token":"tok"}"#.to_vec());
+            }
+            if let Some(challenge) = authorized_or_challenge(request, address) {
+                return challenge;
+            }
+            assert_eq!(request.header("authorization"), Some("Bearer tok"));
+            if request.path.contains("last=set-stable-1") {
+                return with_body(
+                    response(200),
+                    br#"{"name":"example/releases","tags":["set-stable-2"]}"#.to_vec(),
+                );
+            }
+            with_header(
+                with_body(
+                    response(200),
+                    br#"{"name":"example/releases","tags":["set-stable-1"]}"#.to_vec(),
+                ),
+                "Link",
+                &format!(
+                    "<http://{address}/v2/example/releases/tags/list?n=1&last=set-stable-1>; rel=\"next\""
+                ),
+            )
+        });
+        let registry = HttpRegistry::new().unwrap();
+        let tags = registry.tags(&loopback_repository(address)).await.unwrap();
+        assert_eq!(tags, vec!["set-stable-1", "set-stable-2"]);
+        // One anonymous token fetch; registry requests carry the token, never the credentials.
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.starts_with("/token"))
+                .count(),
+            1
+        );
+        assert!(!format!("{registry:?}").contains("tok"));
+    }
+
+    #[tokio::test]
+    async fn release_publish_uses_authenticated_tokens_and_the_upload_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServer::start(listener, move |request| {
+            if request.path.starts_with("/token") {
+                // The token endpoint is called with HTTP Basic, not with a Bearer token.
+                assert!(
+                    request
+                        .header("authorization")
+                        .unwrap()
+                        .starts_with("Basic ")
+                );
+                return with_body(response(200), br#"{"token":"push-token"}"#.to_vec());
+            }
+            if let Some(challenge) = authorized_or_challenge(request, address) {
+                return challenge;
+            }
+            assert_eq!(request.header("authorization"), Some("Bearer push-token"));
+            if request.path.contains("/blobs/uploads/") {
+                if request.path.ends_with("/u1?digest=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a") {
+                    return response(201);
+                }
+                return with_header(
+                    response(202),
+                    "Location",
+                    "/v2/example/releases/blobs/uploads/u1",
+                );
+            }
+            if request.path.contains("/manifests/set-stable-1") {
+                return response(201);
+            }
+            response(404)
+        });
+        let registry = HttpRegistry::with_basic_credentials("user", "s3cret").unwrap();
+        let repository = loopback_repository(address);
+        let digest = registry.put_blob(&repository, b"{}").await.unwrap();
+        assert_eq!(
+            digest.as_str(),
+            weglarka_model::release_set::EMPTY_CONFIG_DIGEST
+        );
+        let manifest = br#"{"schemaVersion":2}"#;
+        let digest = registry
+            .put_manifest(&repository, "set-stable-1", manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            digest.as_str(),
+            format!("sha256:{}", hex_lower(&Sha256::digest(manifest)))
+        );
+        assert!(format!("{registry:?}").contains("authenticated: true"));
+        assert!(!format!("{registry:?}").contains("s3cret"));
+        assert_eq!(server.requests().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_manifest_must_match_the_digest_it_was_requested_by() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#
+                .to_vec();
+        let digest = format!("sha256:{}", hex_lower(&Sha256::digest(&body)));
+        let served = body.clone();
+        let served_digest = digest.clone();
+        let server = TestServer::start(listener, move |_request| {
+            with_header(
+                with_body(response(200), served.clone()),
+                "Docker-Content-Digest",
+                &served_digest,
+            )
+        });
+        let registry = HttpRegistry::new().unwrap();
+        let repository = loopback_repository(address);
+        let fetched = registry.manifest(&repository, &digest, 1024).await.unwrap();
+        assert_eq!(fetched.digest.as_str(), digest);
+        assert_eq!(fetched.bytes, body);
+        let other = format!("sha256:{}", "ab".repeat(32));
+        let error = registry
+            .manifest(&repository, &other, 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryError::ManifestDigestMismatch { .. }
+        ));
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_registry_reporting_another_digest_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServer::start(listener, move |_request| {
+            with_header(
+                with_body(response(200), b"{}".to_vec()),
+                "Docker-Content-Digest",
+                &format!("sha256:{}", "cd".repeat(32)),
+            )
+        });
+        let registry = HttpRegistry::new().unwrap();
+        let error = registry
+            .manifest(&loopback_repository(address), "stable", 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryError::ManifestDigestMismatch { .. }
+        ));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn tag_and_reference_validation_matches_the_oci_grammar() {
+        assert!(valid_tag("set-stable-1"));
+        assert!(valid_tag("sha256-abc.sig"));
+        assert!(valid_tag("_x"));
+        assert!(!valid_tag(""));
+        assert!(!valid_tag("-x"));
+        assert!(!valid_tag("a/b"));
+        assert!(!valid_tag(&"a".repeat(129)));
+        assert!(validate_reference("stable").is_ok());
+        assert!(validate_reference(&format!("sha256:{}", "ab".repeat(32))).is_ok());
+        assert!(validate_reference("sha256:AB").is_err());
+        assert!(validate_reference("bad tag").is_err());
+        assert_eq!(
+            next_link("<http://x/v2/a/tags/list?last=b>; rel=\"next\""),
+            Some("http://x/v2/a/tags/list?last=b".to_owned())
+        );
+        assert_eq!(next_link("<http://x/p>; rel=\"prev\""), None);
+        assert_eq!(next_link("garbage"), None);
     }
 }

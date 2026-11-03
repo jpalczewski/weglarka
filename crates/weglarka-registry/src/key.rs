@@ -7,7 +7,10 @@
 //! non-minimal DER lengths. Signature verification itself is done by `ring`; this module only makes
 //! sure `ring` never sees a key the operator did not intend to pin.
 
-use ring::signature::UnparsedPublicKey;
+use std::fmt;
+
+use ring::rand::SystemRandom;
+use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair, UnparsedPublicKey};
 
 /// DER of the `id-ecPublicKey` algorithm OID (1.2.840.10045.2.1).
 const EC_PUBLIC_KEY_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
@@ -31,7 +34,7 @@ impl PublicKey {
         if pem.len() > MAX_PEM_LEN {
             return Err(KeyError::TooLong(pem.len(), MAX_PEM_LEN));
         }
-        let der = decode_pem(pem)?;
+        let der = decode_pem(pem, PUBLIC_KEY_LABEL)?;
         Self::from_der(&der)
     }
 
@@ -109,13 +112,94 @@ impl PublicKey {
     }
 }
 
+/// A private ECDSA P-256 signing key, used only by the release publisher.
+///
+/// The format is an unencrypted PKCS#8 `PRIVATE KEY` PEM (or DER): the key material the release
+/// workflow holds. It is never logged and the `Debug` impl prints the public half only. The
+/// public half must be the same key the host pins (`cosign.pub`); the publisher checks that
+/// deliberately rather than trusting the file name.
+pub struct SigningKey {
+    key_pair: EcdsaKeyPair,
+    public_key: PublicKey,
+    public_key_pem: String,
+    rng: SystemRandom,
+}
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("public_key_pem", &self.public_key_pem)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SigningKey {
+    /// Parses an unencrypted PKCS#8 PEM block. An encrypted cosign key
+    /// (`ENCRYPTED COSIGN PRIVATE KEY`) is rejected by label: this crate deliberately has no
+    /// password-based key decryption.
+    pub fn from_pem(pem: &str) -> Result<Self, KeyError> {
+        if pem.len() > MAX_PEM_LEN {
+            return Err(KeyError::TooLong(pem.len(), MAX_PEM_LEN));
+        }
+        let der = decode_pem(pem, PRIVATE_KEY_LABEL)?;
+        Self::from_der(&der)
+    }
+
+    /// Parses an unencrypted PKCS#8 DER document.
+    pub fn from_der(der: &[u8]) -> Result<Self, KeyError> {
+        if der.len() > MAX_DER_LEN {
+            return Err(KeyError::TooLong(der.len(), MAX_DER_LEN));
+        }
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng)
+            .map_err(|_| KeyError::SigningKey("not a PKCS#8 P-256 private key"))?;
+        let point: [u8; 65] = key_pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .map_err(|_| KeyError::Point)?;
+        let public_key = PublicKey::from_der(&spki_der(&point))?;
+        Ok(Self {
+            public_key_pem: pem_encode(&spki_der(&point)),
+            key_pair,
+            public_key,
+            rng,
+        })
+    }
+
+    /// The matching public key, for a publisher that checks it against the pinned `cosign.pub`.
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+
+    /// The matching public key as a `PUBLIC KEY` PEM.
+    pub fn public_key_pem(&self) -> &str {
+        &self.public_key_pem
+    }
+
+    /// Signs `payload` (ASN.1 DER ECDSA P-256 / SHA-256, exactly what cosign produces).
+    pub fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, KeyError> {
+        self.key_pair
+            .sign(&self.rng, payload)
+            .map(|signature| signature.as_ref().to_vec())
+            .map_err(|error| KeyError::Sign(error.to_string()))
+    }
+
+    /// Constructs a key from an in-memory PKCS#8 document (tests and the release tool's own
+    /// test-only fixtures).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn from_pkcs8_for_testing(der: &[u8]) -> Result<Self, KeyError> {
+        Self::from_der(der)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
-    #[error("the public key is not a PEM 'PUBLIC KEY' block")]
+    #[error("the key is not a PEM block with the expected label")]
     NotPem,
-    #[error("the public key is {0} bytes, the limit is {1}")]
+    #[error("the key is {0} bytes, the limit is {1}")]
     TooLong(usize, usize),
-    #[error("unsupported PEM label {0:?}: expected \"PUBLIC KEY\"")]
+    #[error("unsupported PEM label {0:?}")]
     WrongLabel(String),
     #[error("malformed PEM: {0}")]
     Pem(&'static str),
@@ -129,18 +213,23 @@ pub enum KeyError {
     UnsupportedCurve(String),
     #[error("the public key is not an uncompressed 65-byte P-256 point")]
     Point,
-    #[error("data after the public key")]
+    #[error("data after the key")]
     TrailingData,
+    #[error("cannot use the signing key: {0}")]
+    SigningKey(&'static str),
+    #[error("cannot sign the payload: {0}")]
+    Sign(String),
 }
 
 const BEGIN: &str = "-----BEGIN ";
 const END: &str = "-----END ";
 const DASHES: &str = "-----";
 const PUBLIC_KEY_LABEL: &str = "PUBLIC KEY";
+const PRIVATE_KEY_LABEL: &str = "PRIVATE KEY";
 
 /// Decodes a single strict PEM block. CRLF line endings are accepted (a file checked out on
 /// Windows), blank lines inside the block are not.
-fn decode_pem(pem: &str) -> Result<Vec<u8>, KeyError> {
+fn decode_pem(pem: &str, expected_label: &str) -> Result<Vec<u8>, KeyError> {
     use base64::Engine as _;
 
     let trimmed = pem.trim_end_matches(['\n', '\r', ' ', '\t']);
@@ -153,7 +242,7 @@ fn decode_pem(pem: &str) -> Result<Vec<u8>, KeyError> {
         .strip_prefix(BEGIN)
         .and_then(|line| line.strip_suffix(DASHES))
         .ok_or(KeyError::NotPem)?;
-    if label != PUBLIC_KEY_LABEL {
+    if label != expected_label {
         return Err(KeyError::WrongLabel(label.to_owned()));
     }
     let mut body = String::new();
@@ -162,7 +251,7 @@ fn decode_pem(pem: &str) -> Result<Vec<u8>, KeyError> {
     while let Some(&line) = lines.get(index) {
         index += 1;
         if let Some(end) = line.strip_prefix(END).and_then(|l| l.strip_suffix(DASHES)) {
-            if end != PUBLIC_KEY_LABEL {
+            if end != expected_label {
                 return Err(KeyError::WrongLabel(end.to_owned()));
             }
             saw_end = true;
@@ -314,7 +403,6 @@ fn oid_to_string(oid: &[u8]) -> String {
 
 /// A DER SubjectPublicKeyInfo for a P-256 key with an arbitrary point (lengths are computed so
 /// that malformed points, not malformed DER, are the thing under test).
-#[cfg(any(test, feature = "testing"))]
 pub(crate) fn spki_der(point: &[u8]) -> Vec<u8> {
     let mut algorithm = der_tlv(0x06, EC_PUBLIC_KEY_OID);
     algorithm.extend_from_slice(&der_tlv(0x06, P256_OID));
@@ -325,7 +413,22 @@ pub(crate) fn spki_der(point: &[u8]) -> Vec<u8> {
     der_tlv(0x30, &spki)
 }
 
-#[cfg(any(test, feature = "testing"))]
+/// Renders DER as a single PEM `PUBLIC KEY` block.
+pub(crate) fn pem_encode(der: &[u8]) -> String {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        if let Ok(text) = std::str::from_utf8(chunk) {
+            pem.push_str(text);
+        }
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    pem
+}
+
 fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     match content.len() {
@@ -340,6 +443,24 @@ fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_keys_are_unencrypted_pkcs8_and_hide_the_private_half() {
+        let generated = crate::testing::TestSigningKey::generate().unwrap();
+        let parsed = SigningKey::from_pem(&generated.pem()).unwrap();
+        assert_eq!(parsed.public_key(), generated.public_key());
+        let payload = b"a release-set manifest digest";
+        let signature = parsed.sign(payload).unwrap();
+        assert!(parsed.public_key().verify(payload, &signature));
+        assert!(!format!("{parsed:?}").contains("PRIVATE KEY"));
+        // An encrypted cosign key needs scrypt + secretbox; this parser says so by label instead
+        // of pretending to support it.
+        let error = SigningKey::from_pem(
+            "-----BEGIN ENCRYPTED COSIGN PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED COSIGN PRIVATE KEY-----\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, KeyError::WrongLabel(_)), "{error}");
+    }
 
     /// A real RSA-2048 SPKI (generated locally, public data).
     const RSA_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----

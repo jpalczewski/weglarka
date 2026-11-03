@@ -1,6 +1,6 @@
 [package]
 name = "weglarka-release"
-description = "Węglarka: release-set assembly and verification (v1 skeleton; publication lands in brief B)"
+description = "Węglarka: signed release-set assembly, publication and verification (v1)"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -18,5 +18,15 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+hex.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
 weglarka-model.workspace = true
 weglarka-registry.workspace = true
+
+[dev-dependencies]
+weglarka-registry = { workspace = true, features = ["testing"] }
