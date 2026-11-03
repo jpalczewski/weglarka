@@ -422,11 +422,13 @@ jobs:
           CHANNEL: ${{ needs.plan.outputs.channel }}
         run: |
           set -euo pipefail
-          payload() { jq -r "$1" "$2" 2>/dev/null || true; }
-          old_daemon=$( [ -f previous.json ] && payload .daemon.digest previous.json || true )
-          old_panel=$( [ -f previous.json ] && payload .panel.digest previous.json || true )
-          new_daemon=$( [ -f metadata/daemon.json ] && payload .digest metadata/daemon.json || true )
-          new_panel=$( [ -f metadata/panel.json ] && payload .digest metadata/panel.json || true )
+          # Empty when the file or the field is missing (first release, or a component not rebuilt);
+          # `// empty` keeps a JSON null from becoming the string "null".
+          payload() { jq -r "($1) // empty" "$2" 2>/dev/null || true; }
+          old_daemon=$(payload .daemon.digest previous.json)
+          old_panel=$(payload .panel.digest previous.json)
+          new_daemon=$(payload .digest metadata/daemon.json)
+          new_panel=$(payload .digest metadata/panel.json)
           daemon=${new_daemon:-$old_daemon}
           [ -n "$daemon" ] || { echo "::error::no daemon image to test: it was neither built nor reused"; exit 1; }
           # The list is rebuilt per daemon digest: the new panel (when this run built one) plus the
