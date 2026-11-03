@@ -192,8 +192,25 @@ async fn fake_daemon(script: Script) -> Mock {
             })),
             "/v1/apps" => json_reply(json!({"apps": [
                 { "name": "web", "image": "ghcr.io/example/web:1", "domains": ["web.example.com"], "runtime": "running",
-                  "digest": format!("sha256:{}", "a".repeat(64)) }]})),
+                  "digest": format!("sha256:{}", "a".repeat(64)) },
+                { "name": "blog-dev", "image": "ghcr.io/example/blog@sha256:aaaa", "domains": ["dev.blog.example.com"],
+                  "runtime": "running", "site": "blog/dev" },
+                { "name": "blog-staging", "image": "ghcr.io/example/blog@sha256:bbbb", "domains": [],
+                  "runtime": "stopped", "site": "blog/staging" }]})),
             "/v1/apps/web" => json_reply(app_json(token)),
+            "/v1/apps/blog-dev" => {
+                let mut app = app_json(token);
+                app["name"] = json!("blog-dev");
+                json_reply(app)
+            }
+            "/v1/sites/blog" => json_reply(json!({ "name": "blog", "image": "ghcr.io/example/blog", "envs": [
+                { "env": "prod", "instance": "blog-prod", "track": null, "promote_from": "staging",
+                  "domains": ["blog.example.com", "*.blog.example.org"], "current": null, "previous": null },
+                { "env": "staging", "instance": "blog-staging", "track": null, "promote_from": "dev",
+                  "domains": [], "current": format!("sha256:{}", "b".repeat(64)), "previous": null },
+                { "env": "dev", "instance": "blog-dev", "track": "main", "promote_from": null,
+                  "domains": ["dev.blog.example.com"], "current": format!("sha256:{}", "c".repeat(64)),
+                  "previous": format!("sha256:{}", "d".repeat(64)) }]})),
             "/v1/apps/web/stats" => json_reply(app_stats_json(&script)),
             "/v1/stats" => json_reply(json!({
                 "sampled_at": "2026-10-31T12:00:00Z", "available": script.stats_available,
@@ -201,6 +218,9 @@ async fn fake_daemon(script: Script) -> Mock {
             })),
             "/v1/apps/web/volumes" => json_reply(json!({"volumes": [
                 { "name": "data", "target": "/data", "podman_name": "web.data", "exists": true }]})),
+            "/v1/apps/blog-dev/volumes" | "/v1/apps/blog-staging/volumes" => {
+                json_reply(json!({"volumes": []}))
+            }
             "/v1/volumes" => json_reply(json!({"volumes": [
                 { "name": "media", "podman_name": "wg-shared-media", "members": ["web"], "exists": true,
                   "uid_range": { "start": 100000, "size": 65536 } }]})),
@@ -1689,4 +1709,106 @@ async fn the_app_page_carries_the_ended_fragment_the_panel_serves() {
         fragment.trim_end()
     );
     assert!(page.contains(&embedded), "{embedded}\n---\n{page}");
+}
+
+/// The site page links its domains out (`https://`), which [`assert_page_is_clean`] rightly refuses
+/// everywhere else: check those anchors here and hand it the page without them.
+fn without_domain_links(html: &str) -> String {
+    let open = "<a href=\"https://";
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(open) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find('>').unwrap();
+        assert!(
+            tail[..end].ends_with("\" rel=\"noopener noreferrer\""),
+            "external link without rel: {}",
+            &tail[..end]
+        );
+        out.push_str("<a>");
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[tokio::test]
+async fn the_site_page_shows_the_promotion_chain() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (status, headers, html) = get(&site, Some(&who), "/sites/blog").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_page_is_clean("/sites/blog", &headers, &without_domain_links(&html));
+    // Chain order: the tracked environment first, whatever order the daemon listed them in.
+    let (dev, staging, prod) = (
+        html.find("<h2>dev").unwrap(),
+        html.find("<h2>staging").unwrap(),
+        html.find("<h2>prod").unwrap(),
+    );
+    assert!(dev < staging && staging < prod, "{html}");
+    assert!(html.contains("href=\"https://dev.blog.example.com\""));
+    assert!(
+        !html.contains("href=\"https://*"),
+        "wildcards are not links"
+    );
+    assert!(html.contains("*.blog.example.org"));
+    insta::assert_snapshot!("site_page", html_main(&html));
+}
+
+/// The page body without the per-session shell (user name, CSRF token).
+fn html_main(html: &str) -> String {
+    let start = html.find("<main").unwrap_or(0);
+    let end = html
+        .find("</main>")
+        .map_or(html.len(), |i| i + "</main>".len());
+    html[start..end].to_owned()
+}
+
+#[tokio::test]
+async fn the_site_page_survives_a_failing_apps_list() {
+    let script = Script {
+        fail: vec![("/v1/apps", 500, "internal")],
+        ..Script::default()
+    };
+    let site = site(script).await;
+    let who = login(&site, "tok-read");
+    let (status, _, html) = get(&site, Some(&who), "/sites/blog").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("pending promotion") && !html.contains("badge-ok\">Running"));
+}
+
+#[tokio::test]
+async fn an_unknown_or_malformed_site_is_a_404_page() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    for path in ["/sites/ghost", "/sites/Bad%20Name"] {
+        let (status, headers, html) = get(&site, Some(&who), path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_page_is_clean(path, &headers, &html);
+    }
+    let (status, ..) = get(&site, None, "/sites/blog").await;
+    assert_ne!(status, StatusCode::OK, "the site page needs a session");
+}
+
+#[tokio::test]
+async fn sites_list_links_to_the_site_page_and_flags_pending_promotions() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (_, _, html) = get(&site, Some(&who), "/sites").await;
+    assert!(html.contains("href=\"/sites/blog\""), "{html}");
+}
+
+#[tokio::test]
+async fn an_instance_from_a_site_links_back_to_it() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (_, headers, html) = get(&site, Some(&who), "/apps/blog-dev").await;
+    assert_page_is_clean("/apps/blog-dev", &headers, &html);
+    assert!(
+        html.contains("<a href=\"/sites/blog\">blog</a> / dev"),
+        "{html}"
+    );
+    let (_, _, plain) = get(&site, Some(&who), "/apps/web").await;
+    assert!(!plain.contains("/sites/"), "{plain}");
 }

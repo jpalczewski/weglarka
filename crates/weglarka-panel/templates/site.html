@@ -1,0 +1,25 @@
+{% extends "layout.html" %}
+{% block title %}{{ site.name }} · Sites · Węglarka{% endblock %}
+{% block content %}
+    <p class="crumb"><a href="/sites">Sites</a></p>
+    <h1>{{ site.name }} <span class="muted">{{ site.image }}</span></h1>
+{% if site.envs.is_empty() %}    <p>This site has no environments.</p>
+{% else %}    <p class="muted">Environments in promotion order: a tracked tag first, then what is promoted from it.</p>
+    <ol class="envs">
+{% for e in site.envs %}      <li class="env-card">
+        <h2>{{ e.env }} {{ m::badge(&e.status) }}</h2>
+        <dl class="fields">
+          <dt>Instance</dt>
+          <dd><a href="/apps/{{ e.instance }}">{{ e.instance }}</a>{% if let Some(r) = e.runtime %} {{ m::badge(r) }}{% endif %}</dd>
+          <dt>Source</dt>
+          <dd>{{ e.source }}</dd>
+          <dt>Domains</dt>
+          <dd>{% if e.domains.is_empty() %}—{% else %}{% for d in e.domains %}{% if !loop.first %}, {% endif %}{% if d.link %}<a href="https://{{ d.host }}" rel="noopener noreferrer">{{ d.host }}</a>{% else %}{{ d.host }}{% endif %}{% endfor %}{% endif %}</dd>
+          <dt>Current</dt>
+          <dd><code>{{ e.current }}</code></dd>
+          <dt>Previous</dt>
+          <dd><code>{{ e.previous }}</code></dd>
+        </dl>
+      </li>
+{% endfor %}    </ol>
+{% endif %}{% endblock %}
