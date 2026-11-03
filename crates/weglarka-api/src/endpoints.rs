@@ -381,6 +381,15 @@ pub const IMAGES_PRUNE: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `POST` [`AbandonReservationRequest`](crate::AbandonReservationRequest) →
+/// [`AbandonReservationResponse`](crate::AbandonReservationResponse). Explicitly frees one durable
+/// image reservation after operator confirmation; elapsed time never authorizes reclamation.
+pub const IMAGES_RESERVATION_ABANDON: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/images/reservations/abandon",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
 /// `POST` with no body → [`OidcRotateResponse`](crate::OidcRotateResponse): replaces the app's OIDC
 /// client secret, re-renders the provider's clients, then recreates the app (#213).
 pub const OIDC_ROTATE: Endpoint = Endpoint {
@@ -496,6 +505,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     CONFIG,
     DOCTOR,
     IMAGES_PRUNE,
+    IMAGES_RESERVATION_ABANDON,
     NOTIFICATIONS_STATUS,
     NOTIFICATIONS_TEST,
     OIDC_ROTATE,

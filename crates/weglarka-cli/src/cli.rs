@@ -109,6 +109,25 @@ pub enum ImagesCommand {
     /// Remove images of the repositories Węglarka deploys that are neither an app's current nor its
     /// previous image and that no container uses. `--dry-run` lists them and removes nothing.
     Prune(PruneImagesArgs),
+    /// Durable image reservations: explicit recovery when a stuck operation fills the file.
+    #[command(subcommand)]
+    Reservations(ReservationsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReservationsCommand {
+    /// Abandon one reservation. This frees capacity without deleting provenance; only do it when the
+    /// owner is known to be gone and no platform transaction references the operation.
+    Abandon(AbandonReservationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AbandonReservationArgs {
+    /// Operation ID of the reservation (reported by `doctor`/prune diagnostics).
+    pub operation_id: String,
+    /// Confirm the abandonment; without it the command refuses.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

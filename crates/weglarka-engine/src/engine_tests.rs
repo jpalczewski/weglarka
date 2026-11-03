@@ -1794,6 +1794,38 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
+/// An adoption that cannot be persisted (here: a read-only state directory) must not be turned into
+/// a deletion: the image stays unattributed and a diagnostic says why.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.fake.script_health("ntfy", [HealthStatus::Healthy]);
+    h.rec.reconcile().await.unwrap();
+    let stale = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('e'));
+    h.fake.set_pull_digest(&stale, digest('e'));
+    h.fake.image_pull(&stale).collect::<Vec<_>>().await;
+
+    let dir = h.dir.path();
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = h.rec.prune_images(false).await;
+    std::fs::set_permissions(dir, original).unwrap();
+    let out = out.unwrap();
+
+    assert!(out.removed.is_empty(), "{out:?}");
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.contains("cannot record image provenance")),
+        "{out:?}"
+    );
+    assert_eq!(h.fake.images().len(), 2, "nothing was removed");
+}
+
 // ── config_root mounts and reload (issue #118, ADR 0028) ────────────────────────
 
 /// App with two config mounts (a file and a directory) and a signal-based reload.
@@ -3719,7 +3751,7 @@ mod push {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_second_upload_is_refused_while_one_is_in_progress() {
+    async fn a_second_upload_is_refused_while_one_holds_the_acquisition_guard() {
         let h = deployed(NTFY).await;
         let rec = h.rec.clone();
         let upload = tokio::spawn(async move {
@@ -3733,9 +3765,15 @@ mod push {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::PushBusy), "{err:?}");
-        // The engine itself is not held by the upload: a deploy still goes through.
-        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+        // The archive holds the acquisition (image) guard through the deploy, so it serializes with
+        // prune and deploys instead of interleaving with them (contract lock order). Once it is
+        // cancelled, the guard and the upload slot are free again.
         upload.abort();
+        let _ = upload.await;
+        h.rec
+            .push_archive(&name("ntfy"), tar(b"image-1"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -5544,5 +5582,571 @@ port = 8086
                 .map(String::as_str)
                 != Some("panel"))
         );
+    }
+}
+
+// ── Image provenance and retention (issue #442, ADR 0067) ──────────────────────
+
+mod retention {
+    use std::path::PathBuf;
+
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::stream;
+    use weglarka_model::fsutil;
+    use weglarka_model::image_inventory::{
+        Association, INVENTORY_FILE_NAME, ImageId, Inventory, MAX_RESERVATIONS, ManagedImage,
+        OperationId, Owner, RESERVATIONS_FILE_NAME, Reservation, ReservationEntry,
+        ReservationOwner, ReservationPhase, Reservations, RetentionScope,
+    };
+    use weglarka_model::platform_update::{
+        CAPABILITIES_FILE_NAME, CapabilityRecord, CoordinationFeature, REQUIRED_FOR_PLATFORM_PRUNE,
+    };
+    use weglarka_model::podman::TarStream;
+    use weglarka_model::release_set::{Repository, StrictDigest};
+
+    const REPO: &str = "ghcr.io/jpalczewski/ntfy.zig";
+
+    fn state_dir(h: &Harness) -> PathBuf {
+        h.rec.paths().state.parent().unwrap().to_owned()
+    }
+
+    fn repo(name: &str) -> Repository {
+        Repository::new(name).unwrap()
+    }
+
+    fn image_id(value: &str) -> ImageId {
+        ImageId::new(value).unwrap()
+    }
+
+    fn strict(c: char) -> StrictDigest {
+        StrictDigest::new(digest(c).as_str()).unwrap()
+    }
+
+    fn owned(id: &str, owner: Owner, repository: &str, c: char) -> ManagedImage {
+        ManagedImage {
+            image_id: image_id(id),
+            digests: [strict(c)].into(),
+            associations: [Association {
+                owner,
+                repository: repo(repository),
+            }]
+            .into(),
+        }
+    }
+
+    fn app(instance: &str) -> Owner {
+        Owner::App {
+            instance: name(instance),
+        }
+    }
+
+    fn write_inventory(h: &Harness, images: Vec<ManagedImage>) {
+        let text = Inventory::new(images).unwrap().to_toml().unwrap();
+        std::fs::write(state_dir(h).join(INVENTORY_FILE_NAME), text).unwrap();
+    }
+
+    fn read_inventory(h: &Harness) -> Inventory {
+        Inventory::parse(&std::fs::read_to_string(state_dir(h).join(INVENTORY_FILE_NAME)).unwrap())
+            .unwrap()
+    }
+
+    fn write_capabilities(h: &Harness, protocol: u32, features: &[CoordinationFeature]) {
+        let record = CapabilityRecord {
+            format_version: 1,
+            host_protocol: protocol,
+            features: features.iter().copied().collect(),
+            active_generation: strict('e'),
+            writer_boot_id: "boot-1".into(),
+        };
+        std::fs::write(
+            state_dir(h).join(CAPABILITIES_FILE_NAME),
+            record.to_toml().unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn deploy(h: &Harness, instance: &str, c: char) {
+        h.fake.set_pull_digest(IMAGE, digest(c));
+        h.rec.deploy(&name(instance), false).await.unwrap();
+    }
+
+    /// The host from #442 keeps neither tags nor repository digests for a superseded image.
+    fn lose_names(h: &Harness, reference: &str, c: char) {
+        h.fake.forget_image_reference(reference);
+        h.fake
+            .forget_image_reference(&format!("{REPO}@{}", digest(c)));
+    }
+
+    fn ids(images: &[weglarka_model::podman::ImageInfo]) -> Vec<String> {
+        images.iter().map(|i| i.id.clone()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_nameless_moving_tag_generations_keep_current_and_previous() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        lose_names(&h, IMAGE, 'a');
+        deploy(&h, "ntfy", 'b').await;
+        lose_names(&h, IMAGE, 'b');
+        deploy(&h, "ntfy", 'c').await;
+        lose_names(&h, IMAGE, 'c');
+
+        // libpod now reports no name at all for the older images; provenance keeps them known.
+        assert!(
+            h.fake
+                .images()
+                .iter()
+                .all(|image| image.repo_tags.is_empty() && image.repo_digests.is_empty()),
+            "the scenario is the nameless one: {:?}",
+            h.fake.images()
+        );
+        let remaining = ids(&h.fake.images());
+        assert!(
+            remaining.contains(&'c'.to_string().repeat(64)),
+            "{remaining:?}"
+        );
+        assert!(
+            remaining.contains(&'b'.to_string().repeat(64)),
+            "{remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&'a'.to_string().repeat(64)),
+            "the oldest generation is gone: {remaining:?}"
+        );
+        let st = h.state("ntfy");
+        assert_eq!(
+            (st.current, st.previous),
+            (Some(digest('c')), Some(digest('b')))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_stopped_and_foreign_containers_protect_their_images() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        // A stopped foreign container keeps an image of the same repository: never removed.
+        h.fake
+            .set_pull_digest(&format!("{REPO}:foreign"), digest('f'));
+        h.fake
+            .image_pull(&format!("{REPO}:foreign"))
+            .collect::<Vec<_>>()
+            .await;
+        h.fake
+            .add_foreign_container("foreign", &format!("{REPO}:foreign"));
+        h.fake.crash_container("foreign", 137);
+        // A shared second app pins another version of the same repository.
+        h.set_apps(
+            "[apps.ntfy]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n\
+             [apps.second]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:second\"\n",
+        );
+        h.fake
+            .set_pull_digest(&format!("{REPO}:second"), digest('e'));
+        h.rec.deploy(&name("second"), false).await.unwrap();
+
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(
+            report.removed.is_empty(),
+            "container and current protections keep everything: {report:?}"
+        );
+        let remaining = ids(&h.fake.images());
+        assert!(
+            remaining.contains(&'f'.to_string().repeat(64)),
+            "{remaining:?}"
+        );
+        assert!(
+            remaining.contains(&'e'.to_string().repeat(64)),
+            "{remaining:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_deletion_keeps_its_inventory_record() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let old = 'e'.to_string().repeat(64);
+        let mut image = weglarka_model::podman::ImageInfo {
+            id: old.clone(),
+            digest: Some(digest('e')),
+            standalone_digest: Some(digest('e')),
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        };
+        image.repo_tags.push(format!("{REPO}:old"));
+        h.fake.add_image(image);
+        let mut inventory = read_inventory(&h);
+        inventory
+            .images
+            .push(owned(&old, Owner::PlatformDaemon, REPO, 'e'));
+        std::fs::write(
+            state_dir(&h).join(INVENTORY_FILE_NAME),
+            Inventory::new(inventory.images).unwrap().to_toml().unwrap(),
+        )
+        .unwrap();
+        write_capabilities(&h, 1, &REQUIRED_FOR_PLATFORM_PRUNE);
+
+        h.fake.script_next_remove_failure("store is busy");
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(read_inventory(&h).get(&image_id(&old)).is_some());
+        assert!(ids(&h.fake.images()).contains(&old));
+
+        // The next pass succeeds and only then forgets the record.
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(ids(&report.removed).contains(&old), "{report:?}");
+        assert!(read_inventory(&h).get(&image_id(&old)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn corrupted_inventory_blocks_prune_and_is_not_replaced() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        std::fs::write(state_dir(&h).join(INVENTORY_FILE_NAME), "{ not toml").unwrap();
+        let error = h.rec.prune_images(false).await.unwrap_err();
+        assert!(
+            matches!(error, EngineError::ImageBookkeeping(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap(),
+            "{ not toml"
+        );
+        assert!(ids(&h.fake.images()).contains(&'a'.to_string().repeat(64)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_without_capabilities_keeps_platform_images() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let platform = 'd'.to_string().repeat(64);
+        let mut image = weglarka_model::podman::ImageInfo {
+            id: platform.clone(),
+            digest: Some(digest('d')),
+            standalone_digest: Some(digest('d')),
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        };
+        image.repo_tags.push(format!("{REPO}:platform"));
+        h.fake.add_image(image);
+        write_inventory(
+            &h,
+            vec![
+                owned(&platform, Owner::PlatformDaemon, REPO, 'd'),
+                owned(&'a'.to_string().repeat(64), app("ntfy"), REPO, 'a'),
+                owned(&'f'.to_string().repeat(64), app("ntfy"), REPO, 'f'),
+            ],
+        );
+        // An app leftover that is not protected: it may be removed even without capabilities.
+        h.fake.add_image(weglarka_model::podman::ImageInfo {
+            id: 'f'.to_string().repeat(64),
+            digest: Some(digest('f')),
+            standalone_digest: Some(digest('f')),
+            repo_tags: vec![format!("{REPO}:leftover")],
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        });
+
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.diagnostics.is_empty(), "{report:?}");
+        assert!(!ids(&report.removed).contains(&platform), "{report:?}");
+        assert!(ids(&h.fake.images()).contains(&platform));
+        assert!(ids(&report.removed).contains(&'f'.to_string().repeat(64)));
+
+        // Older protocol or a missing feature is just as disabling.
+        write_capabilities(&h, 0, &REQUIRED_FOR_PLATFORM_PRUNE);
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.diagnostics.is_empty(), "{report:?}");
+        assert!(ids(&h.fake.images()).contains(&platform));
+
+        write_capabilities(&h, 1, &REQUIRED_FOR_PLATFORM_PRUNE[..1]);
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.diagnostics.is_empty(), "{report:?}");
+        assert!(ids(&h.fake.images()).contains(&platform));
+
+        write_capabilities(&h, 1, &REQUIRED_FOR_PLATFORM_PRUNE);
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert!(ids(&report.removed).contains(&platform), "{report:?}");
+    }
+
+    /// A stream whose first chunk never arrives: the upload is cancelled while `image_load` waits.
+    fn blocked_tar() -> (TarStream, tokio::sync::oneshot::Sender<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let stream = stream::once(async move {
+            let _ = rx.await;
+            Ok::<Bytes, weglarka_model::podman::PodmanError>(Bytes::from_static(b"late"))
+        })
+        .boxed();
+        (stream, tx)
+    }
+
+    fn reservations(h: &Harness) -> Reservations {
+        Reservations::parse(
+            &std::fs::read_to_string(state_dir(h).join(RESERVATIONS_FILE_NAME)).unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_upload_leaves_a_reservation_and_never_tags() {
+        let h = Arc::new(Harness::new(NTFY));
+        let (tar, _keep_open) = blocked_tar();
+        let rec = h.rec.clone();
+        let ntfy = name("ntfy");
+        let task = tokio::spawn(async move { rec.push_archive(&ntfy, tar).await });
+        // The reservation is published before `image_load` starts waiting.
+        for _ in 0..100 {
+            if !reservations(&h).operations.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let before = reservations(&h);
+        assert_eq!(before.operations.len(), 1);
+        assert_eq!(
+            before.operations[0].reservation.phase,
+            ReservationPhase::Loading
+        );
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            !h.fake
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::ImageTag { .. })),
+            "nothing may be tagged before the reservation: {:?}",
+            h.fake.calls()
+        );
+        let after = reservations(&h);
+        assert_eq!(
+            after.operations.len(),
+            1,
+            "a cancelled upload stays recoverable"
+        );
+        assert_eq!(
+            after.operations[0].reservation.phase,
+            ReservationPhase::Loading
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loaded_but_untagged_image_is_protected_until_abandoned() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        h.fake.script_next_tag_failure("connection reset");
+        let error = h
+            .rec
+            .push_archive(
+                &name("ntfy"),
+                stream::iter([Ok(Bytes::from_static(b"image-1"))]).boxed(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, EngineError::Podman(_)),
+            "the tag failure is reported: {error:?}"
+        );
+        let entries = reservations(&h);
+        assert_eq!(entries.operations.len(), 1);
+        assert_eq!(
+            entries.operations[0].reservation.phase,
+            ReservationPhase::Loaded
+        );
+        assert!(
+            !entries.operations[0].reservation.protections.is_empty(),
+            "loaded publishes the image identity"
+        );
+        let pushed = entries.operations[0].reservation.protections.iter().any(|p| {
+            matches!(&p.identity, weglarka_model::image_inventory::ProtectionIdentity::ImageId(id)
+                if id.as_str() == archive_id(b"image-1"))
+        });
+        assert!(pushed, "{entries:?}");
+
+        // Cancellation cannot delete a pending image.
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(
+            ids(&h.fake.images()).contains(&archive_id(b"image-1")),
+            "{report:?}"
+        );
+
+        let operation = entries.operations[0].operation_id.clone();
+        assert!(h.rec.abandon_reservation(&operation).await.unwrap());
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(
+            ids(&report.removed).contains(&archive_id(b"image-1")),
+            "{report:?}"
+        );
+        assert!(
+            ids(&h.fake.images())
+                .iter()
+                .all(|id| id != &archive_id(b"image-1"))
+        );
+    }
+
+    fn archive_id(bytes: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_reservation_file_is_recoverable_only_by_explicit_abandonment() {
+        let h = Harness::new(NTFY);
+        let operations: Vec<ReservationEntry> = (0..MAX_RESERVATIONS)
+            .map(|n| ReservationEntry {
+                operation_id: OperationId::new(format!("stuck-{n}")).unwrap(),
+                reservation: Reservation {
+                    owner: ReservationOwner::new("engine", 1, "boot-gone", 1_700_000_000).unwrap(),
+                    phase: ReservationPhase::Loading,
+                    protections: Default::default(),
+                    journal_ref: None,
+                    created_at: 1_700_000_000,
+                },
+            })
+            .collect();
+        let text = Reservations::new(operations).unwrap().to_toml().unwrap();
+        fsutil::write_atomic(
+            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        let error = h
+            .rec
+            .push_archive(
+                &name("ntfy"),
+                stream::iter([Ok(Bytes::from_static(b"x"))]).boxed(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("abandon"), "{error}");
+
+        let stuck = OperationId::new("stuck-0").unwrap();
+        assert!(h.rec.abandon_reservation(&stuck).await.unwrap());
+        assert_eq!(reservations(&h).operations.len(), MAX_RESERVATIONS - 1);
+        // Capacity is back: the acquisition can reserve again.
+        h.rec
+            .push_archive(
+                &name("ntfy"),
+                stream::iter([Ok(Bytes::from_static(b"image-1"))]).boxed(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_images_survive_a_repository_change_and_app_removal() {
+        let old = "ghcr.io/jpalczewski/ntfy.zig:latest";
+        let new = "ghcr.io/jpalczewski/ntfy-v2.zig:latest";
+        let h = Harness::new(&format!(
+            "[apps.ntfy]\nimage = \"{old}\"\nhealth = {{ attempts = 1, window_secs = 1 }}\n"
+        ));
+        h.fake.set_pull_digest(old, digest('a'));
+        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+
+        h.set_apps(&format!(
+            "[apps.ntfy]\nimage = \"{new}\"\nhealth = {{ attempts = 1, window_secs = 1 }}\n"
+        ));
+        h.fake.set_pull_digest(new, digest('b'));
+        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+        h.fake.set_pull_digest(new, digest('c'));
+        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+
+        // The old repository is out of the automatic scope; its record survives.
+        assert!(
+            ids(&h.fake.images()).contains(&'a'.to_string().repeat(64)),
+            "{:?}",
+            ids(&h.fake.images())
+        );
+
+        // Dry run and doctor share the planner.
+        let (preview, _) = h
+            .rec
+            .retention_preview(RetentionScope::AllManaged)
+            .await
+            .unwrap();
+        let dry = h.rec.prune_images(true).await.unwrap();
+        assert_eq!(ids(&preview.remove), ids(&dry.removed));
+
+        // The app is gone: the explicit global prune may now collect it.
+        h.set_apps("");
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(
+            ids(&report.removed).contains(&'a'.to_string().repeat(64)),
+            "{report:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn self_update_previous_and_fallback_stay_protected() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let previous = 'e'.to_string().repeat(64);
+        h.fake.add_image(weglarka_model::podman::ImageInfo {
+            id: previous.clone(),
+            digest: Some(digest('e')),
+            standalone_digest: Some(digest('e')),
+            repo_tags: vec![format!("{REPO}:previous")],
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        });
+        let mut inventory = read_inventory(&h);
+        inventory
+            .images
+            .push(owned(&previous, Owner::PlatformDaemon, REPO, 'e'));
+        std::fs::write(
+            state_dir(&h).join(INVENTORY_FILE_NAME),
+            Inventory::new(inventory.images).unwrap().to_toml().unwrap(),
+        )
+        .unwrap();
+        let mut state = weglarka_model::self_update::SelfUpdateState {
+            current: Some(digest('a')),
+            previous: Some(digest('e')),
+            ..Default::default()
+        };
+        weglarka_model::self_update::save(&state_dir(&h), &state).unwrap();
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!ids(&report.removed).contains(&previous), "{report:?}");
+        assert!(ids(&h.fake.images()).contains(&previous));
+
+        // An unfinished switch and its automatic fallback target are protected too.
+        state.previous = None;
+        state.pending = Some(digest('d'));
+        state.fallback_to = Some(digest('e'));
+        weglarka_model::self_update::save(&state_dir(&h), &state).unwrap();
+        h.fake.add_image(weglarka_model::podman::ImageInfo {
+            id: 'd'.to_string().repeat(64),
+            digest: Some(digest('d')),
+            standalone_digest: Some(digest('d')),
+            repo_tags: vec![format!("{REPO}:pending")],
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        });
+        let mut inventory = read_inventory(&h);
+        inventory.images.push(owned(
+            &'d'.to_string().repeat(64),
+            Owner::PlatformDaemon,
+            REPO,
+            'd',
+        ));
+        std::fs::write(
+            state_dir(&h).join(INVENTORY_FILE_NAME),
+            Inventory::new(inventory.images).unwrap().to_toml().unwrap(),
+        )
+        .unwrap();
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(
+            !ids(&report.removed).contains(&'d'.to_string().repeat(64)),
+            "{report:?}"
+        );
+        assert!(!ids(&report.removed).contains(&previous), "{report:?}");
     }
 }

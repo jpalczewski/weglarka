@@ -428,6 +428,10 @@ pub struct ImageInfo {
     pub id: String,
     /// Repository digest (from the manifest), if known.
     pub digest: Option<Digest>,
+    /// The standalone manifest digest libpod reports next to `RepoDigests` (`Digest` in v6 wire
+    /// objects). A host may report it when `RepoDigests` is empty or null (#442); it is kept
+    /// separately so an image that lost every repository name is still identifiable.
+    pub standalone_digest: Option<Digest>,
     /// `repo:tag` names of the image (`<none>:<none>` is filtered out).
     pub repo_tags: Vec<String>,
     /// `repo@sha256:…` names of the image. An image whose tag moved away keeps these, which is how an

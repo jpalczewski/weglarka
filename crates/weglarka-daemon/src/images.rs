@@ -10,7 +10,10 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::routing::post;
-use weglarka_api::{ErrorCode, PruneImagesRequest, PruneImagesResponse, PrunedImage, endpoints};
+use weglarka_api::{
+    AbandonReservationRequest, AbandonReservationResponse, ErrorCode, PruneImagesRequest,
+    PruneImagesResponse, PrunedImage, endpoints,
+};
 use weglarka_engine::images::PruneReport;
 use weglarka_model::podman::{ImageInfo, PodmanClient};
 
@@ -20,7 +23,12 @@ use crate::app::Daemon;
 type Shared<P> = State<Arc<Daemon<P>>>;
 
 pub fn routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> {
-    Router::new().route(endpoints::IMAGES_PRUNE.path, post(prune_images::<P>))
+    Router::new()
+        .route(endpoints::IMAGES_PRUNE.path, post(prune_images::<P>))
+        .route(
+            endpoints::IMAGES_RESERVATION_ABANDON.path,
+            post(abandon_reservation::<P>),
+        )
 }
 
 /// `POST /v1/images/prune`. The body is optional: no body (or `{}`) removes, `{"dry_run": true}`
@@ -51,7 +59,23 @@ fn response(report: PruneReport) -> PruneImagesResponse {
             .into_iter()
             .map(|(id, error)| format!("{id}: {error}"))
             .collect(),
+        diagnostics: report.diagnostics,
     }
+}
+
+/// `POST /v1/images/reservations/abandon`: the explicit operator command from the contract. It is
+/// the only way (besides a changed boot without a referencing transaction) to free reservation
+/// capacity; it never deletes an image or a provenance record.
+async fn abandon_reservation<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    body: Bytes,
+) -> Result<Json<AbandonReservationResponse>, Fail> {
+    let request: AbandonReservationRequest = serde_json::from_slice(&body)
+        .map_err(|e| Fail(ErrorCode::InvalidRequest, format!("invalid JSON body: {e}")))?;
+    let operation = weglarka_model::image_inventory::OperationId::new(request.operation_id)
+        .map_err(|e| Fail(ErrorCode::InvalidRequest, e.to_string()))?;
+    let abandoned = mutating(d.engine.abandon_reservation(&operation)).await?;
+    Ok(Json(AbandonReservationResponse { abandoned }))
 }
 
 fn image(info: ImageInfo) -> PrunedImage {

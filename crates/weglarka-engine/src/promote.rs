@@ -8,11 +8,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::deploy::{DeployOutcome, DigestSource};
+use crate::deploy::{AcquisitionSlot, DeployOutcome, DigestSource};
+use crate::images::ImageGuard;
 use crate::reconcile::{EngineError, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec, instance_name};
-use weglarka_model::podman::PodmanClient;
+use weglarka_model::image_inventory::Owner;
+use weglarka_model::podman::{PodmanClient, image_repo};
 use weglarka_model::state;
 
 /// Where the digest to promote comes from.
@@ -128,15 +130,36 @@ impl<P: PodmanClient> Reconciler<P> {
 
         // The image is normally local already (it is `current` or `previous` somewhere); only an
         // explicit digest of a pruned release pulls, with the target's registry credentials.
-        self.ensure_image(&target, &spec, &digest, None).await?;
-        let mut outcome = self
-            .deploy_locked_from(&guard, &target, false, DigestSource::Local(&digest))
-            .await?;
-        // An explicit promotion is the operator's will: retry a digest that failed here before.
-        if matches!(outcome, DeployOutcome::KnownBad { .. }) {
-            outcome = self
-                .deploy_locked_from(&guard, &target, true, DigestSource::Local(&digest))
+        let image_guard = ImageGuard::new(&guard);
+        let mut slot = AcquisitionSlot::default();
+        let result = async {
+            self.ensure_image(&image_guard, &target, &spec, &digest, None, &mut slot)
                 .await?;
+            let mut outcome = self
+                .deploy_locked_from(&guard, &target, false, DigestSource::Local(&digest))
+                .await?;
+            // An explicit promotion is the operator's will: retry a digest that failed here before.
+            if matches!(outcome, DeployOutcome::KnownBad { .. }) {
+                outcome = self
+                    .deploy_locked_from(&guard, &target, true, DigestSource::Local(&digest))
+                    .await?;
+            }
+            Ok::<_, EngineError>(outcome)
+        }
+        .await;
+        slot.finish(self, &image_guard).await;
+        let outcome = result?;
+        if matches!(
+            &outcome,
+            DeployOutcome::Deployed { .. }
+                | DeployOutcome::RolledBack { .. }
+                | DeployOutcome::Provisioned { .. }
+        ) {
+            let owner = Owner::App {
+                instance: target.clone(),
+            };
+            self.retain_images_locked(&guard, &owner, image_repo(&spec.image))
+                .await;
         }
         Ok(PromoteReport {
             plan,

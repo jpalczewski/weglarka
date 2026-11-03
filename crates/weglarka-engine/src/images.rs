@@ -1,29 +1,46 @@
-//! Image retention (issue #40, `docs/decisions/0020`): keep the **current** and the **previous**
-//! (rollback) image of every repository Węglarka deploys and remove the older ones.
+//! Image provenance and retention (issue #442, `docs/decisions/0020` and `0067`): keep the
+//! **current** and the **previous** (rollback) image of every repository Węglarka deploys and remove
+//! the older ones.
 //!
-//! libpod records no provenance, so "an image Węglarka pulled" is approximated by the repository: an
-//! image is managed when one of its `repo:tag` or `repo@sha256:…` names matches a repository named in
-//! `apps.toml`. An untagged leftover of an earlier pull keeps its `RepoDigests`, and an image whose
-//! tag moved away to a new build (or a spec that switched tags) is no longer named by any spec, so
-//! both are reachable this way.
+//! libpod records no provenance. Attribution therefore comes from a durable inventory
+//! (`managed-images.toml`): an acquisition records the local ID, its manifest digests and the
+//! `(owner, repository)` association before the reference can be discarded. Recording is an upsert:
+//! it unions associations and never replaces another owner's. An image whose tag moved away (#442)
+//! keeps its identity in the inventory even when libpod reports neither tags nor repository digests.
 //!
-//! Planning is pure ([`plan`]); [`execute`] performs the removals. An image is never removed while a
-//! container references it, while it is an app's `current`/`previous` digest, or while one of its tags
-//! is named by an app spec. `image_remove` is never called with `force`: Podman refusing an image in
-//! use is the last line of defence.
+//! Planning is pure ([`RetentionPlanner::plan`]); [`execute`] performs the removals and never forces
+//! (`image_remove(id)` only, so libpod refuses an image a container uses). Protections cover every
+//! owner regardless of the retention scope: containers, the durable inventory-backed associations,
+//! `state.toml` current/previous, `self-update.toml`, the platform journal and durable reservations.
+//! A retention pass runs under the image guard; `execute` takes the same guard, so a plan cannot be
+//! applied after the lock was dropped.
+//!
+//! Fail-closed: a corrupt/unsupported inventory, an unreadable journal or self-update record, or a
+//! host without capabilities disables the deletion it would need. `dry-run` and `doctor` share the
+//! same input builder and planner; they never adopt images or mutate bookkeeping.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::deploy::normalize_image;
 use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
+use weglarka_model::fsutil;
 use weglarka_model::image_inventory::{
-    Inventory, ManagedImage, OperationId, Protection, Reservation, ReservationPhase, RetentionScope,
+    Association, INVENTORY_FILE_NAME, ImageId, Inventory, ManagedImage, OperationId, Owner,
+    Protection, ProtectionIdentity, ProtectionReason, RESERVATIONS_FILE_NAME, Reservation,
+    ReservationEntry, ReservationOwner, ReservationPhase, Reservations, RetentionScope,
+};
+use weglarka_model::platform_update::{
+    CAPABILITIES_FILE_NAME, CapabilityError, CapabilityRecord, FILE_NAME as JOURNAL_FILE_NAME,
+    PlatformUpdate, platform_prune_allowed,
 };
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
 };
+use weglarka_model::release_set::{Repository, StrictDigest};
 use weglarka_model::state::{self, StateFile};
 
 /// Why an image is kept (reported by `doctor` and by `weglarka images prune --dry-run`).
@@ -31,22 +48,21 @@ use weglarka_model::state::{self, StateFile};
 pub enum KeepReason {
     /// A container (any state — ours or not, app or ingress) references it.
     InUse(Vec<String>),
-    /// `AppState::current` of the instance: the version running now.
-    Current(InstanceName),
-    /// `AppState::previous` of the instance: the rollback target.
-    Previous(InstanceName),
-    /// The tag is named by an app spec — the image a deploy would use.
-    TagInUse(String),
+    /// A durable protection names it; see [`ProtectionReason`].
+    Protected(ProtectionReason),
 }
 
-/// Outcome of [`plan`]. Only repositories named in `apps.toml` appear here; foreign images are
-/// neither kept nor removed by us.
+/// Outcome of planning. Only images with durable provenance (or, for an explicit prune, images
+/// attributable through a repository an app still names) are candidates; unattributed images are
+/// reported separately and never touched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Images kept, with the reason (sorted by image id).
     pub keep: Vec<(ImageInfo, KeepReason)>,
     /// Images to remove (sorted by image id).
     pub remove: Vec<ImageInfo>,
+    /// Images in the store with no provenance: reported, never removed.
+    pub unattributed: Vec<ImageInfo>,
 }
 
 impl Plan {
@@ -73,6 +89,11 @@ pub struct PruneReport {
     pub reclaimed_bytes: u64,
     /// The removals were only planned, nothing was removed.
     pub dry_run: bool,
+    /// Fail-closed explanations (corrupt bookkeeping, disabled platform-image deletion). A non-empty
+    /// list is a diagnostic, never permission to delete more.
+    pub diagnostics: Vec<String>,
+    /// A fail-closed condition disabled **all** destructive cleanup for this pass.
+    pub blocked: bool,
 }
 
 /// Proof that the engine's image lock is held while a retention plan is executed.
@@ -92,7 +113,7 @@ impl<'a> ImageGuard<'a> {
 }
 
 /// The contract's retention input: observed images/containers, durable provenance, protections and
-/// the requested scope. Planning is pure; the engine implements this in brief A.
+/// the requested scope. Planning is pure.
 pub struct RetentionInput<'a> {
     pub images: &'a [ImageInfo],
     pub containers: &'a [ContainerInfo],
@@ -101,11 +122,86 @@ pub struct RetentionInput<'a> {
     pub scope: RetentionScope,
 }
 
-/// Contract signature `plan(&RetentionInput) -> Plan`. Kept as a trait because the engine already
-/// has the repository-scoped [`plan`] above; a future implementation can live next to it without
-/// breaking existing callers.
+/// Contract signature `plan(&RetentionInput) -> Plan`.
 pub trait RetentionPlanner {
     fn plan(&self, input: &RetentionInput<'_>) -> Plan;
+}
+
+/// The pure planner from the v1 contract. The caller has already scoped the inventory and resolved
+/// every protection; the planner only compares identities.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManagedRetentionPlanner;
+
+impl RetentionPlanner for ManagedRetentionPlanner {
+    fn plan(&self, input: &RetentionInput<'_>) -> Plan {
+        let by_id: BTreeMap<&str, &ImageInfo> = input
+            .images
+            .iter()
+            .map(|image| (image.id.as_str(), image))
+            .collect();
+        let mut used: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for container in input.containers {
+            if !container.image_id.is_empty() {
+                used.entry(container.image_id.as_str())
+                    .or_default()
+                    .push(container.name.clone());
+            }
+        }
+        let mut protected_ids: BTreeMap<&str, ProtectionReason> = BTreeMap::new();
+        let mut protected_digests: BTreeMap<&str, ProtectionReason> = BTreeMap::new();
+        for protection in input.protections {
+            match &protection.identity {
+                ProtectionIdentity::ImageId(id) => {
+                    protected_ids
+                        .entry(id.as_str())
+                        .or_insert(protection.reason);
+                }
+                ProtectionIdentity::Digest(digest) => {
+                    protected_digests
+                        .entry(digest.as_str())
+                        .or_insert(protection.reason);
+                }
+            }
+        }
+
+        let mut plan = Plan::default();
+        let mut known: BTreeSet<&str> = BTreeSet::new();
+        for record in &input.inventory.images {
+            known.insert(record.image_id.as_str());
+            let Some(image) = by_id.get(record.image_id.as_str()) else {
+                continue; // already gone: a complete observation proves absence later
+            };
+            let reason = if let Some(names) = used.get(record.image_id.as_str()) {
+                Some(KeepReason::InUse(names.clone()))
+            } else if let Some(reason) = protected_ids.get(record.image_id.as_str()) {
+                Some(KeepReason::Protected(*reason))
+            } else {
+                let mut reason = record
+                    .digests
+                    .iter()
+                    .find_map(|digest| protected_digests.get(digest.as_str()).copied());
+                if reason.is_none() {
+                    reason = image_digests(image)
+                        .iter()
+                        .find_map(|digest| protected_digests.get(digest).copied());
+                }
+                reason.map(KeepReason::Protected)
+            };
+            match reason {
+                Some(reason) => plan.keep.push(((*image).clone(), reason)),
+                None => plan.remove.push((*image).clone()),
+            }
+        }
+        for image in input.images {
+            if !known.contains(image.id.as_str()) {
+                plan.unattributed.push(image.clone());
+            }
+        }
+        plan.keep.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        plan.remove.sort_by(|a, b| a.id.cmp(&b.id));
+        plan.unattributed.sort_by(|a, b| a.id.cmp(&b.id));
+        plan
+    }
 }
 
 /// Durable provenance store (`managed-images.toml`). `record` is an upsert that unions digests and
@@ -148,88 +244,74 @@ pub trait ReservationStore {
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
 }
 
-/// Which images to keep and which to remove.
-///
-/// `scope = Some(repo)` limits the candidates to one repository (automatic retention after a deploy,
-/// so that deploying one app never touches another app's repository); `None` covers every repository
-/// named in `apps.toml` (`weglarka images prune`). The keep set is always computed from **all** apps.
-pub fn plan(
-    images: &[ImageInfo],
-    containers: &[ContainerInfo],
-    apps: &AppsFile,
-    st: &StateFile,
-    scope: Option<&str>,
-) -> Plan {
-    let specs: Vec<(InstanceName, String, String)> = apps
-        .apps
-        .iter()
-        .map(|(instance, spec)| {
-            let (repo, tag) = normalize_image(&spec.image);
-            (instance.clone(), repo, tag)
-        })
-        .collect();
-    let tracked: BTreeSet<String> = specs.iter().map(|(_, repo, _)| repo.clone()).collect();
-    let tags_in_use: BTreeSet<(&str, &str)> = specs
-        .iter()
-        .map(|(_, repo, tag)| (repo.as_str(), tag.as_str()))
-        .collect();
-    let scope = scope.map(|repo| image_repo(repo).to_ascii_lowercase());
+/// The scoped, owned retention input the engine actually feeds the pure planner.
+struct PreparedRetention {
+    images: Vec<ImageInfo>,
+    containers: Vec<ContainerInfo>,
+    inventory: Inventory,
+    protections: BTreeSet<Protection>,
+    scope: RetentionScope,
+    diagnostics: Vec<String>,
+}
 
-    // Image id → names of the containers referencing it (any state: a stopped container still needs
-    // its image for its next start).
-    let mut used: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for container in containers {
-        if !container.image_id.is_empty() {
-            used.entry(container.image_id.as_str())
-                .or_default()
-                .push(container.name.clone());
+impl PreparedRetention {
+    fn input(&self) -> RetentionInput<'_> {
+        RetentionInput {
+            images: &self.images,
+            containers: &self.containers,
+            inventory: &self.inventory,
+            protections: &self.protections,
+            scope: self.scope.clone(),
         }
     }
-    let current: Vec<(&InstanceName, &Digest)> = st
-        .apps
-        .iter()
-        .filter_map(|(instance, state)| Some((instance, state.current.as_ref()?)))
-        .collect();
-    let previous: Vec<(&InstanceName, &Digest)> = st
-        .apps
-        .iter()
-        .filter_map(|(instance, state)| Some((instance, state.previous.as_ref()?)))
-        .collect();
+}
 
-    let mut plan = Plan::default();
-    for image in images {
-        let repos = image_repos(image);
-        if repos.is_disjoint(&tracked) {
-            continue; // not one of ours (another runtime user's pull, the ingress image, a build…)
-        }
-        if let Some(scope) = &scope
-            && !repos.contains(scope)
-        {
-            continue;
-        }
-        let reason = if let Some(names) = used.get(image.id.as_str()) {
-            Some(KeepReason::InUse(names.clone()))
-        } else if let Some(instance) = app_with_digest(&current, image) {
-            Some(KeepReason::Current(instance.clone()))
-        } else if let Some(instance) = app_with_digest(&previous, image) {
-            Some(KeepReason::Previous(instance.clone()))
-        } else {
-            image
-                .repo_tags
-                .iter()
-                .filter(|tag| !is_placeholder(tag))
-                .map(|tag| normalize_image(tag))
-                .find(|(repo, tag)| tags_in_use.contains(&(repo.as_str(), tag.as_str())))
-                .map(|(_, tag)| KeepReason::TagInUse(tag))
-        };
-        match reason {
-            Some(reason) => plan.keep.push((image.clone(), reason)),
-            None => plan.remove.push(image.clone()),
-        }
-    }
-    plan.keep.sort_by(|a, b| a.0.id.cmp(&b.0.id));
-    plan.remove.sort_by(|a, b| a.id.cmp(&b.id));
-    plan
+/// The host's boot identity. A reservation is reclaimable only when this differs from the owner's
+/// boot; wall-clock time is never evidence.
+fn current_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "unknown-boot".to_owned())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Repository of a reference in the form the inventory stores: lower-case, no tag or digest.
+pub(crate) fn inventory_repository(reference: &str) -> Result<Repository, EngineError> {
+    Repository::new(image_repo(reference).to_ascii_lowercase())
+        .map_err(|e| EngineError::ImageBookkeeping(e.to_string()))
+}
+
+/// One operation id, unique within the process even within the same second.
+fn next_operation_id(component: &str) -> Result<OperationId, EngineError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    OperationId::new(format!("{component}:{}:{nanos}:{n}", std::process::id()))
+        .map_err(|e| EngineError::ImageBookkeeping(e.to_string()))
+}
+
+/// Every manifest digest an observed image reports: repository digests, the standalone `Digest` and
+/// the preferred one. Used to match digest-addressed protections.
+fn image_digests(image: &ImageInfo) -> BTreeSet<&str> {
+    image
+        .repo_digests
+        .iter()
+        .filter_map(|name| name.split_once('@').map(|(_, digest)| digest))
+        .chain(image.digest.as_ref().map(Digest::as_str))
+        .chain(image.standalone_digest.as_ref().map(Digest::as_str))
+        .collect()
 }
 
 /// Removes the planned images, best effort: an image that is already gone counts as removed, any
@@ -255,12 +337,488 @@ pub async fn execute<P: PodmanClient>(
     report
 }
 
+// ── File-backed stores ──────────────────────────────────────────────────────────
+
 impl<P: PodmanClient> Reconciler<P> {
-    /// Explicit prune (`POST /v1/images/prune`, `weglarka images prune`): every repository named in
-    /// `apps.toml`. `dry_run` plans without removing anything.
+    /// The daemon's shared state directory (inventory, reservations, journal, capabilities).
+    pub(crate) fn bookkeeping_dir(&self) -> PathBuf {
+        self.paths
+            .state
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned()
+    }
+
+    fn inventory_path(&self) -> PathBuf {
+        self.bookkeeping_dir().join(INVENTORY_FILE_NAME)
+    }
+
+    fn reservations_path(&self) -> PathBuf {
+        self.bookkeeping_dir().join(RESERVATIONS_FILE_NAME)
+    }
+
+    /// Reads `managed-images.toml`. A missing file means no provenance is known yet; an unreadable or
+    /// invalid one is an error, never an empty inventory (ADR 0067).
+    fn read_inventory(&self) -> Result<Inventory, EngineError> {
+        let path = self.inventory_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Inventory::parse(&text)
+                .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Inventory::default()),
+            Err(e) => Err(EngineError::ImageBookkeeping(format!(
+                "{}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_inventory(&self, inventory: &Inventory) -> Result<(), EngineError> {
+        let path = self.inventory_path();
+        let text = inventory
+            .to_toml()
+            .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))?;
+        fsutil::write_atomic(&path, text.as_bytes(), 0o600)
+            .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))
+    }
+
+    /// Reads `image-reservations.toml`. A missing file is an empty set; an invalid one is an error.
+    fn read_reservations(&self) -> Result<Reservations, EngineError> {
+        let path = self.reservations_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Reservations::parse(&text)
+                .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Reservations::default()),
+            Err(e) => Err(EngineError::ImageBookkeeping(format!(
+                "{}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_reservations(&self, reservations: &Reservations) -> Result<(), EngineError> {
+        let path = self.reservations_path();
+        let text = reservations
+            .to_toml()
+            .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))?;
+        fsutil::write_atomic(&path, text.as_bytes(), 0o600)
+            .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))
+    }
+
+    /// The durable reservation of `operation`, if any.
+    #[cfg(test)]
+    pub(crate) fn reservation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<Option<Reservation>, EngineError> {
+        Ok(self
+            .read_reservations()?
+            .get(operation)
+            .map(|entry| entry.reservation.clone()))
+    }
+
+    /// Begins an acquisition: a durable reservation in phase `loading`, published **before** any
+    /// pull/load/tag mutation. The caller must hold the image guard.
+    pub(crate) async fn begin_acquisition(
+        &self,
+        guard: &ImageGuard<'_>,
+        owner: Owner,
+        repository: Repository,
+    ) -> Result<OperationId, EngineError> {
+        let operation = next_operation_id("acquisition")?;
+        let reservation = Reservation {
+            owner: ReservationOwner::new(
+                "engine",
+                std::process::id(),
+                current_boot_id(),
+                now_secs(),
+            )
+            .map_err(|e| EngineError::ImageBookkeeping(e.to_string()))?,
+            phase: ReservationPhase::Loading,
+            protections: BTreeSet::new(),
+            journal_ref: None,
+            created_at: now_secs(),
+        };
+        // The reservation is the protection itself until the image identity is known; the owner and
+        // repository are recorded on the inventory entry below.
+        let _ = (owner, repository);
+        ReservationStore::reserve(self, guard, operation.clone(), &reservation).await?;
+        Ok(operation)
+    }
+
+    /// Advances a reservation to `loaded` with the identities that are now known, before any tag.
+    pub(crate) async fn advance_acquisition(
+        &self,
+        guard: &ImageGuard<'_>,
+        operation: &OperationId,
+        image_id: Option<&str>,
+        digest: &Digest,
+    ) -> Result<(), EngineError> {
+        let mut protections = BTreeSet::new();
+        if let Some(id) = image_id.and_then(|id| ImageId::new(id).ok()) {
+            protections.insert(Protection {
+                identity: ProtectionIdentity::ImageId(id),
+                reason: ProtectionReason::AcquisitionInProgress,
+                operation_id: Some(operation.clone()),
+            });
+        }
+        if let Ok(digest) = StrictDigest::new(digest.as_str()) {
+            protections.insert(Protection {
+                identity: ProtectionIdentity::Digest(digest),
+                reason: ProtectionReason::AcquisitionInProgress,
+                operation_id: Some(operation.clone()),
+            });
+        }
+        ReservationStore::advance(
+            self,
+            guard,
+            operation.clone(),
+            ReservationPhase::Loaded,
+            &protections,
+        )
+        .await
+    }
+
+    /// Releases an acquisition reservation after durable commit. A failure only warns: a leaked
+    /// reservation protects an image and never authorizes deletion.
+    pub(crate) async fn finish_acquisition(&self, guard: &ImageGuard<'_>, operation: OperationId) {
+        if let Err(e) = ReservationStore::finish(self, guard, operation.clone()).await {
+            tracing::warn!(operation = %operation, error = %e, "cannot release the image reservation");
+        }
+    }
+
+    /// Records the provenance of an acquired image. An upsert: unions associations and digests.
+    pub(crate) async fn record_acquisition(
+        &self,
+        guard: &ImageGuard<'_>,
+        owner: Owner,
+        repository: Repository,
+        image_id: Option<&str>,
+        digest: &Digest,
+    ) -> Result<(), EngineError> {
+        let Some(image_id) = image_id.and_then(|id| ImageId::new(id).ok()) else {
+            return Err(EngineError::ImageBookkeeping(
+                "the acquired image reports no usable local image id".into(),
+            ));
+        };
+        let mut digests = BTreeSet::new();
+        if let Ok(digest) = StrictDigest::new(digest.as_str()) {
+            digests.insert(digest);
+        }
+        let image = ManagedImage {
+            image_id,
+            digests,
+            associations: [Association { owner, repository }].into(),
+        };
+        InventoryStore::record(self, guard, image).await
+    }
+
+    /// Explicit operator abandonment (`weglarka images reservations abandon <id>`). Frees capacity
+    /// without touching live provenance; the caller has confirmed.
+    pub async fn abandon_reservation(&self, operation: &OperationId) -> Result<bool, EngineError> {
+        let _guard = self.acquire().await;
+        let mut reservations = self.read_reservations()?;
+        let before = reservations.operations.len();
+        reservations
+            .operations
+            .retain(|entry| &entry.operation_id != operation);
+        if reservations.operations.len() == before {
+            return Ok(false);
+        }
+        self.write_reservations(&reservations)?;
+        tracing::info!(operation = %operation, "abandoned an image reservation");
+        Ok(true)
+    }
+
+    /// Reclaims reservations whose owner boot is gone and that no nonterminal transaction
+    /// references. Never called from a deploy path (boot change only), and never based on elapsed
+    /// time. Returns the reclaimed operation ids.
+    pub async fn reclaim_stale_reservations(&self) -> Result<Vec<OperationId>, EngineError> {
+        let boot = current_boot_id();
+        // Lock first: a transaction that starts after an earlier read of the journal could reference
+        // a reservation this pass is about to reclaim.
+        let _guard = self.acquire().await;
+        let journal = self.read_platform_journal()?;
+        let referenced: BTreeSet<&OperationId> = journal
+            .transaction
+            .as_ref()
+            .filter(|transaction| !transaction.is_terminal())
+            .map(|transaction| transaction.reservations.iter().collect())
+            .unwrap_or_default();
+        let mut reservations = self.read_reservations()?;
+        let mut reclaimed = Vec::new();
+        reservations.operations.retain(|entry| {
+            let keep =
+                entry.reservation.owner.boot_id == boot || referenced.contains(&entry.operation_id);
+            if !keep {
+                reclaimed.push(entry.operation_id.clone());
+            }
+            keep
+        });
+        if reclaimed.is_empty() {
+            return Ok(reclaimed);
+        }
+        self.write_reservations(&reservations)?;
+        Ok(reclaimed)
+    }
+
+    /// Reads the platform journal when present; a corrupt journal is an error (fail closed).
+    fn read_platform_journal(&self) -> Result<PlatformUpdate, EngineError> {
+        let path = self.bookkeeping_dir().join(JOURNAL_FILE_NAME);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => PlatformUpdate::parse(&text)
+                .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PlatformUpdate::default()),
+            Err(e) => Err(EngineError::ImageBookkeeping(format!(
+                "{}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// `Ok(())` only when this host may delete platform images. Absence, an older protocol or a
+    /// missing feature means "disabled" — lock-file presence is never a signal.
+    fn platform_prune_gate(&self) -> Result<(), CapabilityError> {
+        let path = self.bookkeeping_dir().join(CAPABILITIES_FILE_NAME);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let record = CapabilityRecord::parse(&text)?;
+                platform_prune_allowed(Some(&record))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => platform_prune_allowed(None),
+            Err(e) => Err(CapabilityError::Invalid(format!("{}: {e}", path.display()))),
+        }
+    }
+}
+
+impl<P: PodmanClient> InventoryStore for Reconciler<P> {
+    async fn load(&self, _guard: &ImageGuard<'_>) -> Result<Inventory, EngineError> {
+        self.read_inventory()
+    }
+
+    async fn record(
+        &self,
+        _guard: &ImageGuard<'_>,
+        image: ManagedImage,
+    ) -> Result<(), EngineError> {
+        let mut inventory = self.read_inventory()?;
+        // Conflicting identities are rejected: one manifest digest never names two local images.
+        for other in &inventory.images {
+            if other.image_id == image.image_id {
+                continue;
+            }
+            if other
+                .digests
+                .iter()
+                .any(|digest| image.digests.contains(digest))
+            {
+                return Err(EngineError::ImageBookkeeping(format!(
+                    "digest {:?} is recorded for two image ids ({} and {})",
+                    image
+                        .digests
+                        .first()
+                        .map(StrictDigest::as_str)
+                        .unwrap_or(""),
+                    other.image_id,
+                    image.image_id
+                )));
+            }
+        }
+        match inventory
+            .images
+            .iter_mut()
+            .find(|entry| entry.image_id == image.image_id)
+        {
+            Some(entry) => {
+                entry.digests.extend(image.digests);
+                entry.associations.extend(image.associations);
+            }
+            None => inventory.images.push(image),
+        }
+        self.write_inventory(&inventory)
+    }
+}
+
+impl<P: PodmanClient> ReservationStore for Reconciler<P> {
+    async fn reserve(
+        &self,
+        _guard: &ImageGuard<'_>,
+        operation: OperationId,
+        reservation: &Reservation,
+    ) -> Result<(), EngineError> {
+        let mut reservations = self.read_reservations()?;
+        if reservations.get(&operation).is_some() {
+            return Err(EngineError::ImageBookkeeping(format!(
+                "reservation {operation} already exists"
+            )));
+        }
+        if reservations.operations.len() >= weglarka_model::image_inventory::MAX_RESERVATIONS {
+            return Err(EngineError::ImageBookkeeping(format!(
+                "image reservations are full ({} operations); abandon one with \
+                 `weglarka images reservations abandon <operation-id>`",
+                weglarka_model::image_inventory::MAX_RESERVATIONS
+            )));
+        }
+        reservations.operations.push(ReservationEntry {
+            operation_id: operation,
+            reservation: reservation.clone(),
+        });
+        self.write_reservations(&reservations)
+    }
+
+    async fn advance(
+        &self,
+        _guard: &ImageGuard<'_>,
+        operation: OperationId,
+        phase: ReservationPhase,
+        protections: &BTreeSet<Protection>,
+    ) -> Result<(), EngineError> {
+        let mut reservations = self.read_reservations()?;
+        let entry = reservations
+            .operations
+            .iter_mut()
+            .find(|entry| entry.operation_id == operation)
+            .ok_or_else(|| {
+                EngineError::ImageBookkeeping(format!("unknown reservation {operation}"))
+            })?;
+        entry.reservation.phase = phase;
+        entry
+            .reservation
+            .protections
+            .extend(protections.iter().cloned());
+        self.write_reservations(&reservations)
+    }
+
+    async fn finish(
+        &self,
+        _guard: &ImageGuard<'_>,
+        operation: OperationId,
+    ) -> Result<(), EngineError> {
+        let mut reservations = self.read_reservations()?;
+        reservations
+            .operations
+            .retain(|entry| entry.operation_id != operation);
+        self.write_reservations(&reservations)
+    }
+}
+
+// ── Retention input ────────────────────────────────────────────────────────────
+
+impl<P: PodmanClient> Reconciler<P> {
+    /// Builds the contract input for `scope`: observations, scoped inventory, every protection.
+    ///
+    /// `adopt` is `Some(guard)` only for a real (non-dry-run) prune: it may seed provenance from a
+    /// current repository name for a legacy install, and persists those records. Diagnostics never
+    /// adopt.
+    async fn prepare_retention(
+        &self,
+        scope: RetentionScope,
+        adopt: Option<&ImageGuard<'_>>,
+    ) -> Result<PreparedRetention, EngineError> {
+        let images = self.podman.image_list().await?;
+        let containers = self
+            .podman
+            .container_list(&ContainerFilter::default())
+            .await?;
+        let apps = state::load_apps(&self.paths.apps)?;
+        let st = state::load_state(&self.paths.state)?;
+        let inventory = self.read_inventory()?;
+        let reservations = self.read_reservations()?;
+        let journal = self.read_platform_journal()?;
+        let self_update =
+            weglarka_model::self_update::load(&self.bookkeeping_dir()).map_err(|e| {
+                EngineError::ImageBookkeeping(format!("cannot read self-update.toml: {e}"))
+            })?;
+        let capability = self.platform_prune_gate();
+
+        let mut protections =
+            build_protections(&images, &containers, &apps, &st, &self_update, &journal);
+        // Every durable reservation protects its identities until it is finished or abandoned,
+        // whatever retention scope this pass uses.
+        for entry in &reservations.operations {
+            protections.extend(entry.reservation.protections.iter().cloned());
+        }
+
+        let mut diagnostics = Vec::new();
+        if let Err(error) = &capability
+            && has_platform_owner(&inventory)
+        {
+            diagnostics.push(error.to_string());
+        }
+
+        let mut scoped = Inventory {
+            format_version: inventory.format_version,
+            images: inventory.images.clone(),
+        };
+        let requests = adopt_requests(&images, &apps, &inventory, &scope);
+        for request in requests {
+            // A real prune persists the adoption **before** it can plan a removal from it: if the
+            // record cannot be written (full disk, read-only file), the image stays unattributed
+            // instead of being deleted without durable provenance. A dry run only advertises.
+            if let Some(guard) = adopt
+                && let Err(e) = InventoryStore::record(self, guard, request.clone()).await
+            {
+                diagnostics.push(format!("cannot record image provenance: {e}"));
+                continue;
+            }
+            advertised(&mut scoped, request);
+        }
+        // Scope: automatic retention only considers the owner/repository of the completed operation.
+        if let RetentionScope::OwnerRepository {
+            owner,
+            repository: scoped_repository,
+        } = &scope
+        {
+            scoped.images.retain(|record| {
+                record
+                    .associations
+                    .iter()
+                    .any(|a| &a.owner == owner && &a.repository == scoped_repository)
+            });
+        }
+        // Platform-image deletion stays disabled without the capability record, whatever the scope.
+        if capability.is_err() {
+            scoped.images.retain(|record| {
+                !record
+                    .associations
+                    .iter()
+                    .any(|a| matches!(a.owner, Owner::PlatformDaemon))
+            });
+        }
+        if scoped.images.len() > weglarka_model::image_inventory::MAX_IMAGES {
+            return Err(EngineError::ImageBookkeeping(
+                "the image inventory exceeds its entry limit".into(),
+            ));
+        }
+        Ok(PreparedRetention {
+            images,
+            containers,
+            inventory: scoped,
+            protections,
+            scope,
+            diagnostics,
+        })
+    }
+
+    /// Read-only plan for `doctor`/dry-run: identical to a real prune, mutates nothing. The
+    /// diagnostics explain any fail-closed condition (corrupt bookkeeping, disabled platform-image
+    /// deletion).
+    pub async fn retention_preview(
+        &self,
+        scope: RetentionScope,
+    ) -> Result<(Plan, Vec<String>), EngineError> {
+        let prepared = self.prepare_retention(scope, None).await?;
+        Ok((
+            ManagedRetentionPlanner.plan(&prepared.input()),
+            prepared.diagnostics,
+        ))
+    }
+
+    /// Explicit prune (`POST /v1/images/prune`, `weglarka images prune`): every managed image.
+    /// `dry_run` plans without removing anything.
     pub async fn prune_images(&self, dry_run: bool) -> Result<PruneReport, EngineError> {
         let guard = self.acquire().await;
-        self.prune_images_locked(&guard, dry_run, None).await
+        self.prune_images_locked(&guard, dry_run, RetentionScope::AllManaged)
+            .await
     }
 
     /// The body of [`Self::prune_images`], under the engine lock.
@@ -268,33 +826,78 @@ impl<P: PodmanClient> Reconciler<P> {
         &self,
         held: &EngineGuard<'_>,
         dry_run: bool,
-        scope: Option<&str>,
+        scope: RetentionScope,
     ) -> Result<PruneReport, EngineError> {
-        let apps = state::load_apps(&self.paths.apps)?;
-        let st = state::load_state(&self.paths.state)?;
-        let images = self.podman.image_list().await?;
-        let containers = self
-            .podman
-            .container_list(&ContainerFilter::default())
-            .await?;
-        let plan = plan(&images, &containers, &apps, &st, scope);
-        if dry_run {
-            return Ok(PruneReport {
-                reclaimed_bytes: plan.reclaimable_bytes(),
-                removed: plan.remove,
-                failed: Vec::new(),
-                dry_run: true,
-            });
-        }
         let guard = ImageGuard::new(held);
-        Ok(execute(&self.podman, &guard, plan).await)
+        let prepared = self.prepare_retention(scope, Some(&guard)).await?;
+        let plan = ManagedRetentionPlanner.plan(&prepared.input());
+        let mut report = PruneReport {
+            diagnostics: prepared.diagnostics.clone(),
+            ..PruneReport::default()
+        };
+        if dry_run {
+            report.reclaimed_bytes = plan.reclaimable_bytes();
+            report.removed = plan.remove;
+            report.dry_run = true;
+            return Ok(report);
+        }
+        report = execute(&self.podman, &guard, plan).await;
+        report.diagnostics = prepared.diagnostics;
+        // A failed deletion keeps its record: only successfully removed images are forgotten.
+        if let Err(e) = self.forget_removed(&guard, &report) {
+            report.diagnostics.push(e.to_string());
+        }
+        Ok(report)
     }
 
-    /// Best effort housekeeping after a successful deploy of `repo`: removes the app's images older
-    /// than the current and the previous one. Never fails the deploy — a retention problem is logged.
-    pub(crate) async fn retain_images_locked(&self, held: &EngineGuard<'_>, repo: &str) {
-        match self.prune_images_locked(held, false, Some(repo)).await {
+    /// Removes the inventory records of images that were actually deleted.
+    fn forget_removed(
+        &self,
+        _guard: &ImageGuard<'_>,
+        report: &PruneReport,
+    ) -> Result<(), EngineError> {
+        if report.removed.is_empty() {
+            return Ok(());
+        }
+        let ids: BTreeSet<&str> = report
+            .removed
+            .iter()
+            .map(|image| image.id.as_str())
+            .collect();
+        let mut inventory = self.read_inventory()?;
+        let before = inventory.images.len();
+        inventory
+            .images
+            .retain(|record| !ids.contains(record.image_id.as_str()));
+        if inventory.images.len() == before {
+            return Ok(());
+        }
+        self.write_inventory(&inventory)
+    }
+
+    /// Best effort housekeeping after a completed operation of `owner`/`repo`: removes images of
+    /// that owner/repository older than the current and previous one. Never fails the operation.
+    /// The caller holds the engine/image guard (a fresh one after a deploy released its acquisition
+    /// guard — this function never acquires it itself).
+    pub(crate) async fn retain_images_locked(
+        &self,
+        held: &EngineGuard<'_>,
+        owner: &Owner,
+        repo: &str,
+    ) {
+        let Ok(repository) = inventory_repository(repo) else {
+            tracing::warn!(repo, "image retention: invalid repository");
+            return;
+        };
+        let scope = RetentionScope::OwnerRepository {
+            owner: owner.clone(),
+            repository,
+        };
+        match self.prune_images_locked(held, false, scope).await {
             Ok(report) if report.removed.is_empty() => {
+                for diagnostic in report.diagnostics {
+                    tracing::warn!(repo, %diagnostic, "image retention: disabled");
+                }
                 tracing::debug!(repo, "image retention: nothing to remove");
             }
             Ok(report) => tracing::info!(
@@ -307,93 +910,315 @@ impl<P: PodmanClient> Reconciler<P> {
             Err(e) => tracing::warn!(repo, error = %e, "image retention skipped"),
         }
     }
+
+    /// Retention with its own fresh guard, for callers that already dropped an acquisition guard.
+    pub async fn retain_after_deploy(&self, instance: &InstanceName, repo: &str) {
+        let owner = Owner::App {
+            instance: instance.clone(),
+        };
+        let guard = self.acquire().await;
+        self.retain_images_locked(&guard, &owner, repo).await;
+    }
 }
 
-/// Repositories an image is known under (`repo:tag` and `repo@sha256:…` names).
-fn image_repos(image: &ImageInfo) -> BTreeSet<String> {
-    image
-        .repo_tags
-        .iter()
-        .chain(image.repo_digests.iter())
-        .filter(|name| !is_placeholder(name))
-        .map(|name| normalize_image(name).0)
-        .collect()
+/// Adds a synthesized/loaded record to the in-memory inventory without replacing an existing one's
+/// associations.
+fn advertised(inventory: &mut Inventory, image: ManagedImage) {
+    match inventory
+        .images
+        .iter_mut()
+        .find(|entry| entry.image_id == image.image_id)
+    {
+        Some(entry) => {
+            entry.digests.extend(image.digests);
+            entry.associations.extend(image.associations);
+        }
+        None => inventory.images.push(image),
+    }
 }
 
-/// `<none>:<none>` (and an empty name) is libpod's way of saying "no name".
-fn is_placeholder(name: &str) -> bool {
-    name.is_empty() || name.contains("<none>")
+fn has_platform_owner(inventory: &Inventory) -> bool {
+    inventory.images.iter().any(|record| {
+        record
+            .associations
+            .iter()
+            .any(|a| matches!(a.owner, Owner::PlatformDaemon))
+    })
 }
 
-/// The instance whose `current`/`previous` digest is this image, if any.
-fn app_with_digest<'a>(
-    entries: &[(&'a InstanceName, &'a Digest)],
-    image: &ImageInfo,
-) -> Option<&'a InstanceName> {
-    entries
-        .iter()
-        .find(|(_, digest)| {
-            image.digest.as_ref() == Some(*digest)
-                || image.repo_digests.iter().any(|name| {
-                    name.split_once('@')
-                        .is_some_and(|(_, d)| d == digest.as_str())
-                })
-        })
-        .map(|(instance, _)| *instance)
+/// Images a legacy install names today: a spec's `repo:tag` (or the repository digest of an image
+/// whose tag moved) is adoption evidence, mirroring the repository policy of ADR 0020.
+fn adopt_requests(
+    images: &[ImageInfo],
+    apps: &AppsFile,
+    inventory: &Inventory,
+    scope: &RetentionScope,
+) -> Vec<ManagedImage> {
+    let mut requests = Vec::new();
+    for image in images {
+        if inventory
+            .images
+            .iter()
+            .any(|record| record.image_id.as_str() == image.id)
+        {
+            continue;
+        }
+        let Some(image_id) = ImageId::new(image.id.clone()).ok() else {
+            continue;
+        };
+        let mut associations = BTreeSet::new();
+        for (instance, spec) in &apps.apps {
+            let (repo, tag) = normalize_image(&spec.image);
+            let Ok(repository) = Repository::new(repo.clone()) else {
+                continue;
+            };
+            let matches_scope = match scope {
+                RetentionScope::AllManaged => true,
+                RetentionScope::OwnerRepository {
+                    owner,
+                    repository: scoped_repository,
+                } => {
+                    *owner
+                        == (Owner::App {
+                            instance: instance.clone(),
+                        })
+                        && &repository == scoped_repository
+                }
+            };
+            if !matches_scope {
+                continue;
+            }
+            let tag_name = format!("{repo}:{tag}");
+            let named = image
+                .repo_tags
+                .iter()
+                .any(|name| normalize_image(name) == (repo.clone(), tag.clone()))
+                || image
+                    .repo_digests
+                    .iter()
+                    .any(|name| image_repo(name).eq_ignore_ascii_case(&repo))
+                || image.repo_tags.iter().any(|name| name == &tag_name);
+            if named {
+                associations.insert(Association {
+                    owner: Owner::App {
+                        instance: instance.clone(),
+                    },
+                    repository: repository.clone(),
+                });
+            }
+        }
+        if associations.is_empty() {
+            continue;
+        }
+        requests.push(ManagedImage {
+            image_id,
+            digests: image_digests(image)
+                .into_iter()
+                .filter_map(|digest| StrictDigest::new(digest).ok())
+                .collect(),
+            associations,
+        });
+    }
+    requests
+}
+
+/// Every durable protection, regardless of the retention scope.
+fn build_protections(
+    images: &[ImageInfo],
+    containers: &[ContainerInfo],
+    apps: &AppsFile,
+    st: &StateFile,
+    self_update: &weglarka_model::self_update::SelfUpdateState,
+    journal: &PlatformUpdate,
+) -> BTreeSet<Protection> {
+    let mut protections = BTreeSet::new();
+    for container in containers {
+        if !container.image_id.is_empty() {
+            protect_id(
+                &mut protections,
+                &container.image_id,
+                ProtectionReason::Container,
+            );
+        }
+    }
+    for state in st.apps.values() {
+        if let Some(digest) = &state.current {
+            protect_digest(&mut protections, digest, ProtectionReason::AppCurrent);
+        }
+        if let Some(digest) = &state.previous {
+            protect_digest(&mut protections, digest, ProtectionReason::AppPrevious);
+        }
+    }
+    // The tag an app spec names is the image the next deploy would use without pulling.
+    for spec in apps.apps.values() {
+        let (repo, tag) = normalize_image(&spec.image);
+        if let Some(image) = images.iter().find(|image| {
+            image
+                .repo_tags
+                .iter()
+                .any(|name| normalize_image(name) == (repo.clone(), tag.clone()))
+        }) {
+            protect_id(&mut protections, &image.id, ProtectionReason::SpecTag);
+        }
+    }
+    for digest in [self_update.current.as_ref(), self_update.previous.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let reason = if self_update.previous.as_ref() == Some(digest) {
+            ProtectionReason::PlatformPrevious
+        } else {
+            ProtectionReason::PlatformCurrent
+        };
+        protect_digest(&mut protections, digest, reason);
+    }
+    for digest in [self_update.pending.as_ref(), self_update.switch_to.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        protect_digest(&mut protections, digest, ProtectionReason::PendingSwitch);
+    }
+    for digest in [
+        self_update.switch_from.as_ref(),
+        self_update.fallback_to.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        protect_digest(&mut protections, digest, ProtectionReason::Fallback);
+    }
+    if let Some(transaction) = journal
+        .transaction
+        .as_ref()
+        .filter(|transaction| !transaction.is_terminal())
+    {
+        protect_digest(
+            &mut protections,
+            transaction.old.daemon_digest.as_digest(),
+            ProtectionReason::PlatformCurrent,
+        );
+        protect_digest(
+            &mut protections,
+            transaction.target.daemon_digest.as_digest(),
+            ProtectionReason::PendingSwitch,
+        );
+    } else if let Some(transaction) = journal.transaction.as_ref().filter(|transaction| {
+        transaction.stage == weglarka_model::platform_update::Stage::BlockedRecovery
+    }) {
+        // Every recovery artifact stays protected until explicit resolution.
+        for digest in [
+            transaction.old.daemon_digest.as_digest(),
+            transaction.target.daemon_digest.as_digest(),
+            transaction.old.tools_digest.as_digest(),
+            transaction.target.tools_digest.as_digest(),
+        ] {
+            protect_digest(&mut protections, digest, ProtectionReason::Fallback);
+        }
+    }
+    protections
+}
+
+fn protect_id(protections: &mut BTreeSet<Protection>, id: &str, reason: ProtectionReason) {
+    if let Ok(id) = ImageId::new(id) {
+        protections.insert(Protection {
+            identity: ProtectionIdentity::ImageId(id),
+            reason,
+            operation_id: None,
+        });
+    }
+}
+
+fn protect_digest(
+    protections: &mut BTreeSet<Protection>,
+    digest: &Digest,
+    reason: ProtectionReason,
+) {
+    if let Ok(digest) = StrictDigest::new(digest.as_str()) {
+        protections.insert(Protection {
+            identity: ProtectionIdentity::Digest(digest),
+            reason,
+            operation_id: None,
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::reconcile::ReconcilerOptions;
+    use crate::testing::FakePodman;
     use weglarka_model::app::InstanceName;
-    use weglarka_model::podman::ContainerState;
-    use weglarka_model::state::AppState;
+    use weglarka_model::image_inventory::{FORMAT_VERSION, ImageId};
+    use weglarka_model::secrets::FileSecretStore;
+    use weglarka_model::state::StatePaths;
 
     fn digest(c: char) -> Digest {
         Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
     }
 
-    fn name(s: &str) -> InstanceName {
-        InstanceName::new(s).unwrap()
+    fn instance(name: &str) -> InstanceName {
+        InstanceName::new(name).unwrap()
     }
 
-    /// An image with the id `id` and the given names; a `repo@sha256:…` name is taken as a digest of
-    /// the image, `repo:tag` as a tag.
-    fn image(id: &str, names: &[&str]) -> ImageInfo {
-        let mut tags = Vec::new();
-        let mut digests = Vec::new();
-        for n in names {
-            if n.contains('@') {
-                digests.push((*n).to_owned());
-            } else {
-                tags.push((*n).to_owned());
-            }
-        }
-        let digest = digests
-            .first()
-            .and_then(|d| d.split_once('@').map(|(_, d)| d))
-            .and_then(|d| Digest::new(d).ok());
+    fn repo(name: &str) -> Repository {
+        Repository::new(name).unwrap()
+    }
+
+    fn image(id: &str, digest: char) -> ImageInfo {
         ImageInfo {
-            id: id.to_owned(),
-            digest,
-            repo_tags: tags,
-            repo_digests: digests,
-            size_bytes: 1000,
+            id: full_id(id),
+            digest: Some(digest_value(digest)),
+            standalone_digest: Some(digest_value(digest)),
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size_bytes: 100,
             labels: BTreeMap::new(),
         }
     }
 
-    fn container(name: &str, image_id: &str) -> ContainerInfo {
-        ContainerInfo {
-            id: name.to_owned(),
-            name: name.to_owned(),
+    fn digest_value(c: char) -> Digest {
+        digest(c)
+    }
+
+    /// A full-length image id (64 hex characters) from a short test label: libpod always reports
+    /// the full id and `ImageId` accepts nothing else.
+    fn full_id(label: &str) -> String {
+        format!("{label:0<64}")
+    }
+
+    fn record(id: &str, owner: Owner, repository: &str, c: char) -> ManagedImage {
+        ManagedImage {
+            image_id: ImageId::new(full_id(id)).unwrap(),
+            digests: [StrictDigest::new(digest(c).as_str()).unwrap()].into(),
+            associations: [Association {
+                owner,
+                repository: repo(repository),
+            }]
+            .into(),
+        }
+    }
+
+    fn protection_digest(c: char, reason: ProtectionReason) -> Protection {
+        Protection {
+            identity: ProtectionIdentity::Digest(StrictDigest::new(digest(c).as_str()).unwrap()),
+            reason,
+            operation_id: None,
+        }
+    }
+
+    #[test]
+    fn planner_removes_unprotected_images_and_keeps_container_references() {
+        let images = [image("1", 'a'), image("2", 'b'), image("3", 'c')];
+        let containers = [ContainerInfo {
+            id: "c1".into(),
+            name: "old".into(),
             image: String::new(),
-            image_id: image_id.to_owned(),
+            image_id: full_id("2"),
             labels: BTreeMap::new(),
-            state: ContainerState::Running,
-            exit_code: None,
+            state: weglarka_model::podman::ContainerState::Exited,
+            exit_code: Some(0),
             health: None,
             restarts: 0,
             started_at: None,
@@ -402,250 +1227,229 @@ mod tests {
             published_ports: Vec::new(),
             memory_limit: None,
             oom_killed: false,
-        }
-    }
-
-    fn apps(toml: &str) -> AppsFile {
-        toml::from_str(toml).unwrap()
-    }
-
-    fn state(entries: &[(&str, Option<char>, Option<char>)]) -> StateFile {
-        let mut st = StateFile::default();
-        for (instance, current, previous) in entries {
-            st.apps.insert(
-                name(instance),
-                AppState {
-                    current: current.map(digest),
-                    previous: previous.map(digest),
-                    ..Default::default()
-                },
-            );
-        }
-        st
-    }
-
-    fn pinned(repo: &str, d: char) -> String {
-        format!("{repo}@{}", digest(d))
-    }
-
-    #[test]
-    fn keeps_current_and_previous_and_removes_older_ones() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('c'), Some('b'))]);
-        let images = [
-            image("3", &[&pinned(repo, 'c')]),
-            image("2", &[&pinned(repo, 'b')]),
-            image("1", &[&pinned(repo, 'a')]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
+        }];
+        let inventory = Inventory::new(vec![
+            record("1", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+            record("2", Owner::PlatformDaemon, "ghcr.io/x/y", 'b'),
+            record("3", Owner::PlatformDaemon, "ghcr.io/x/y", 'c'),
+        ])
+        .unwrap();
+        let protections =
+            BTreeSet::from([protection_digest('c', ProtectionReason::PlatformCurrent)]);
+        let input = RetentionInput {
+            images: &images,
+            containers: &containers,
+            inventory: &inventory,
+            protections: &protections,
+            scope: RetentionScope::AllManaged,
+        };
+        let plan = ManagedRetentionPlanner.plan(&input);
         assert_eq!(
             plan.remove
                 .iter()
                 .map(|i| i.id.as_str())
                 .collect::<Vec<_>>(),
-            ["1"]
-        );
-        assert_eq!(plan.reclaimable_bytes(), 1000);
-        assert!(
-            plan.keep
-                .iter()
-                .any(|(i, r)| i.id == "3" && *r == KeepReason::Current(name("web")))
+            [full_id("1").as_str()]
         );
         assert!(
             plan.keep
                 .iter()
-                .any(|(i, r)| i.id == "2" && *r == KeepReason::Previous(name("web")))
+                .any(|(i, r)| i.id == full_id("2") && *r == KeepReason::InUse(vec!["old".into()]))
         );
+        assert!(plan.keep.iter().any(|(i, _)| i.id == full_id("3")));
     }
 
     #[test]
-    fn keeps_the_image_a_container_runs_even_when_it_is_old() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('c'), None)]);
-        let images = [
-            image("3", &[&pinned(repo, 'c')]),
-            image("1", &[&pinned(repo, 'a')]),
-        ];
-        // A stopped container of another app (or a foreign one) still needs image 1.
-        let containers = [container("other", "1")];
-        let plan = plan(&images, &containers, &apps, &st, None);
-        assert!(plan.remove.is_empty(), "{plan:?}");
-        assert!(
-            plan.keep
-                .iter()
-                .any(|(i, r)| i.id == "1" && *r == KeepReason::InUse(vec!["other".to_owned()]))
-        );
-    }
-
-    #[test]
-    fn keeps_the_tag_named_by_a_spec_so_a_deploy_can_run_without_pulling() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:v2\"\n");
-        let st = state(&[("web", Some('a'), None)]);
-        let images = [
-            image("3", &[&format!("{repo}:v2")]),
-            image("1", &[&pinned(repo, 'a')]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
-        assert!(plan.remove.is_empty(), "{plan:?}");
-        assert!(
-            plan.keep
-                .iter()
-                .any(|(i, r)| i.id == "3" && *r == KeepReason::TagInUse("v2".into()))
-        );
-    }
-
-    #[test]
-    fn a_formatted_foreign_image_is_never_touched() {
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('a'), None)]);
-        let images = [
-            image("3", &[&pinned("ghcr.io/x/y", 'a')]),
-            image("9", &["docker.io/library/nginx:alpine"]),
-            image("10", &[]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
+    fn planner_matches_standalone_digest_and_reports_unattributed_images() {
+        // The image kept a standalone `Digest` but no repository names (#442).
+        let mut kept = image("1", 'a');
+        kept.digest = None;
+        let images = [kept, image("2", 'b')];
+        let inventory =
+            Inventory::new(vec![record("1", Owner::PlatformDaemon, "ghcr.io/x/y", 'a')]).unwrap();
+        let protections =
+            BTreeSet::from([protection_digest('a', ProtectionReason::PlatformPrevious)]);
+        let input = RetentionInput {
+            images: &images,
+            containers: &[],
+            inventory: &inventory,
+            protections: &protections,
+            scope: RetentionScope::AllManaged,
+        };
+        let plan = ManagedRetentionPlanner.plan(&input);
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(plan.keep.len(), 1);
+        assert_eq!(plan.unattributed.len(), 1);
+        assert_eq!(plan.unattributed[0].id, full_id("2"));
     }
 
-    #[test]
-    fn two_apps_sharing_a_repository_keep_both_versions() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps(
-            "[apps.a]\nimage = \"ghcr.io/x/y:latest\"\n[apps.b]\nimage = \"ghcr.io/x/y:v1\"\n",
+    fn reconciler() -> (tempfile::TempDir, Reconciler<FakePodman>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::in_dir(dir.path());
+        std::fs::write(&paths.apps, "").unwrap();
+        let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+        let rec = Reconciler::new(
+            FakePodman::new(),
+            store,
+            paths,
+            ReconcilerOptions::default(),
         );
-        let st = state(&[("a", Some('c'), Some('b')), ("b", Some('a'), None)]);
-        let images = [
-            image("4", &[&pinned(repo, 'c')]),
-            image("3", &[&pinned(repo, 'b')]),
-            image("2", &[&pinned(repo, 'a')]),
-            image("1", &[&pinned(repo, '9')]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
+        (dir, rec)
+    }
+
+    #[tokio::test]
+    async fn record_unions_associations_and_digests_for_the_same_image() {
+        let (_dir, rec) = reconciler();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        InventoryStore::record(
+            &rec,
+            &guard,
+            record("aa", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+        )
+        .await
+        .unwrap();
+        InventoryStore::record(
+            &rec,
+            &guard,
+            record(
+                "aa",
+                Owner::App {
+                    instance: instance("web"),
+                },
+                "ghcr.io/x/y",
+                'b',
+            ),
+        )
+        .await
+        .unwrap();
+        let inventory = InventoryStore::load(&rec, &guard).await.unwrap();
+        assert_eq!(inventory.images.len(), 1);
         assert_eq!(
-            plan.remove
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>(),
-            ["1"]
+            inventory.images[0].associations.len(),
+            2,
+            "union, never replace"
         );
+        assert_eq!(inventory.images[0].digests.len(), 2);
     }
 
-    #[test]
-    fn a_provisioned_app_keeps_its_image_without_a_container() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\nstart = false\n");
-        let st = state(&[("web", Some('a'), None)]);
-        let images = [
-            image("1", &[&pinned(repo, 'a')]),
-            image("2", &[&pinned(repo, 'b')]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
+    #[tokio::test]
+    async fn a_digest_cannot_belong_to_two_image_ids() {
+        let (_dir, rec) = reconciler();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        InventoryStore::record(
+            &rec,
+            &guard,
+            record("aa", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+        )
+        .await
+        .unwrap();
+        let error = InventoryStore::record(
+            &rec,
+            &guard,
+            record("bb", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, EngineError::ImageBookkeeping(_)));
+    }
+
+    #[tokio::test]
+    async fn corrupt_inventory_is_an_error_not_an_empty_inventory() {
+        let (dir, rec) = reconciler();
+        std::fs::write(dir.path().join(INVENTORY_FILE_NAME), "not toml").unwrap();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        let error = InventoryStore::load(&rec, &guard).await.unwrap_err();
+        assert!(matches!(error, EngineError::ImageBookkeeping(_)));
+        // The invalid file is not replaced.
         assert_eq!(
-            plan.remove
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>(),
-            ["2"]
-        );
-        assert!(plan.keep.iter().any(|(i, _)| i.id == "1"));
-    }
-
-    #[test]
-    fn a_repository_dropped_from_the_spec_is_out_of_scope() {
-        // The app moved to another image; nothing names the old repository any more.
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/new:latest\"\n");
-        let st = state(&[("web", Some('a'), None)]);
-        let images = [image("1", &[&pinned("ghcr.io/x/old", 'f')])];
-        let plan = plan(&images, &[], &apps, &st, None);
-        assert!(plan.is_empty(), "{plan:?}");
-        assert!(plan.keep.is_empty(), "{plan:?}");
-    }
-
-    #[test]
-    fn scope_limits_removals_to_one_repository() {
-        let ours = "ghcr.io/x/y";
-        let other = "ghcr.io/x/z";
-        let apps = apps(
-            "[apps.a]\nimage = \"ghcr.io/x/y:latest\"\n[apps.b]\nimage = \"ghcr.io/x/z:latest\"\n",
-        );
-        let st = state(&[("a", Some('b'), None), ("b", Some('b'), None)]);
-        let images = [
-            image("y1", &[&pinned(ours, 'a')]),
-            image("z1", &[&pinned(other, 'a')]),
-        ];
-        let scoped = plan(&images, &[], &apps, &st, Some("ghcr.io/x/y:latest"));
-        assert_eq!(
-            scoped
-                .remove
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>(),
-            ["y1"]
-        );
-        assert!(scoped.keep.is_empty(), "z1 not touched: {scoped:?}");
-
-        let global = plan(&images, &[], &apps, &st, None);
-        assert_eq!(global.remove.len(), 2);
-    }
-
-    #[test]
-    fn placeholders_are_ignored() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('b'), None)]);
-        // An old image of ours: only placeholder tags and its repository digest.
-        let mut old = image("1", &[&pinned(repo, 'a')]);
-        old.repo_tags = vec!["<none>:<none>".into(), String::new()];
-        // No usable name at all: not attributable, so left alone.
-        let mut nameless = image("2", &[]);
-        nameless.repo_tags = vec!["<none>:<none>".into()];
-        let images = [old, nameless];
-        let plan = plan(&images, &[], &apps, &st, None);
-        assert_eq!(
-            plan.remove
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>(),
-            ["1"]
+            std::fs::read_to_string(dir.path().join(INVENTORY_FILE_NAME)).unwrap(),
+            "not toml"
         );
     }
 
-    #[test]
-    fn a_rollback_target_that_lost_its_tag_is_kept_by_digest() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('b'), Some('a'))]);
-        // The previous image kept only its repository digest.
-        let images = [image("1", &[&pinned(repo, 'a')])];
-        let plan = plan(&images, &[], &apps, &st, None);
-        assert!(plan.remove.is_empty(), "{plan:?}");
-        assert!(matches!(
-            plan.keep.first().map(|(_, r)| r),
-            Some(KeepReason::Previous(_))
-        ));
+    #[tokio::test]
+    async fn reservation_phases_and_duplicate_ids() {
+        let (dir, rec) = reconciler();
+        std::fs::write(&rec.paths.apps, "").unwrap();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        let operation = OperationId::new("op-1").unwrap();
+        let reservation = Reservation {
+            owner: ReservationOwner::new("engine", 1, "boot-1", 1_700_000_000).unwrap(),
+            phase: ReservationPhase::Loading,
+            protections: BTreeSet::new(),
+            journal_ref: None,
+            created_at: 1_700_000_000,
+        };
+        ReservationStore::reserve(&rec, &guard, operation.clone(), &reservation)
+            .await
+            .unwrap();
+        let error = ReservationStore::reserve(&rec, &guard, operation.clone(), &reservation)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, EngineError::ImageBookkeeping(m) if m.contains("already exists")),
+            "{error:?}"
+        );
+        let protections = BTreeSet::from([Protection {
+            identity: ProtectionIdentity::ImageId(ImageId::new(full_id("aa")).unwrap()),
+            reason: ProtectionReason::AcquisitionInProgress,
+            operation_id: Some(operation.clone()),
+        }]);
+        ReservationStore::advance(
+            &rec,
+            &guard,
+            operation.clone(),
+            ReservationPhase::Loaded,
+            &protections,
+        )
+        .await
+        .unwrap();
+        let stored = rec.reservation(&operation).unwrap().unwrap();
+        assert_eq!(stored.phase, ReservationPhase::Loaded);
+        assert_eq!(stored.protections, protections);
+        ReservationStore::finish(&rec, &guard, operation.clone())
+            .await
+            .unwrap();
+        assert!(
+            Reservations::parse(&reservations_file(&dir))
+                .unwrap()
+                .operations
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn report_is_sorted_and_a_dry_run_removes_nothing() {
-        let repo = "ghcr.io/x/y";
-        let apps = apps("[apps.web]\nimage = \"ghcr.io/x/y:latest\"\n");
-        let st = state(&[("web", Some('f'), None)]);
-        let images = [
-            image("b", &[&pinned(repo, 'b')]),
-            image("a", &[&pinned(repo, 'a')]),
-        ];
-        let plan = plan(&images, &[], &apps, &st, None);
-        assert_eq!(
-            plan.remove
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-        assert_eq!(plan.reclaimable_bytes(), 2000);
+    fn reservations_file(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join(RESERVATIONS_FILE_NAME)).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn the_inventory_is_written_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, rec) = reconciler();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        InventoryStore::record(
+            &rec,
+            &guard,
+            record("aa", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::metadata(dir.path().join(INVENTORY_FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        // The file parses as the shared model and keeps the format version.
+        let inventory = Inventory::parse(
+            &std::fs::read_to_string(dir.path().join(INVENTORY_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inventory.format_version, FORMAT_VERSION);
     }
 }
