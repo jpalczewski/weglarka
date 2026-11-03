@@ -228,7 +228,8 @@ impl<R: CommandRunner> OpenRcPlatform<R> {
                 command.push(' ');
                 command.push_str(&sh_quote(arg));
             }
-            // BusyBox crond wakes every minute; the launcher enforces the configured cadence.
+            // BusyBox crond wakes every minute; the cadence is enforced by the job's own worker (the daemon's
+            // `self-update` checks `[self_update] interval_secs`), not by the launcher.
             lines.push(format!("* * * * * {command}"));
         }
         lines.push(CRON_END.to_owned());

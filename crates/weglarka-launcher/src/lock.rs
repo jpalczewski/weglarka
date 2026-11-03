@@ -30,8 +30,22 @@ pub struct HostLock {
     _file: File,
 }
 
+/// Refuses a lock path that is a symlink. The host directory is group-writable for the runtime user,
+/// and root also takes these locks (bootstrap), so following a planted link would create or open a
+/// file of the attacker's choosing with root's rights.
+fn refuse_symlink(path: &Path) -> Result<(), LockError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(LockError::Open {
+            path: path.to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "lock path is a symlink"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Takes `path` without blocking. `Ok(None)` means another process holds it.
 pub fn try_lock(path: &Path) -> Result<Option<HostLock>, LockError> {
+    refuse_symlink(path)?;
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -57,6 +71,7 @@ pub fn lock(path: &Path) -> Result<HostLock, LockError> {
     if let Some(lock) = try_lock(path)? {
         return Ok(lock);
     }
+    refuse_symlink(path)?;
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -86,6 +101,17 @@ pub fn is_held(path: &Path) -> Result<bool, LockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_symlinked_lock_path_is_refused_and_nothing_is_created_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("created-by-the-lock");
+        let link = dir.path().join("x.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(try_lock(&link).is_err());
+        assert!(lock(&link).is_err());
+        assert!(!target.exists());
+    }
 
     #[test]
     fn a_second_try_lock_reports_busy_and_drop_releases() {

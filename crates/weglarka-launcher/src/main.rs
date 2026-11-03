@@ -112,10 +112,7 @@ fn main() -> Result<()> {
         RoleArg::Supervise(args) => run_worker(&host_dir, &cli.config, Role::Supervise, &args),
         RoleArg::Cli { args } => {
             let generation = resolve(&host_dir, GenerationChoice::Active)?;
-            run_plan(
-                &plan_cli(&generation, args)?,
-                Some(Duration::from_secs(600)),
-            )?;
+            run_plan(&plan_cli(&generation, args)?, None)?;
             Ok(())
         }
         RoleArg::DaemonService {

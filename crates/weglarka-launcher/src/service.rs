@@ -12,12 +12,11 @@
 //! the service permanently inactive.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 
 use crate::budget::{BudgetError, block_service_epoch, note_service_attempt};
-use crate::host::HOST_DAEMON_FILE;
 use crate::selection::{PlatformService, SelectionError};
 
 /// Output of a command the runner executes.
@@ -245,7 +244,12 @@ pub fn run_service(
             .unwrap_or(false);
         match plan_step(&selection, observed.as_ref(), attempts) {
             Step::Wait { id } => {
-                let _ = runner.status(&options.podman, &["wait".to_owned(), id], &env(options));
+                let waited =
+                    runner.status(&options.podman, &["wait".to_owned(), id], &env(options));
+                if !waited.is_ok_and(|status| status.success()) {
+                    // A failing `podman wait` returns at once; do not spin on it.
+                    std::thread::sleep(options.poll);
+                }
             }
             Step::Start { id } => {
                 match note_service_attempt(&options.host_dir, selection.epoch, options.max_attempts)
@@ -272,11 +276,14 @@ pub fn run_service(
                 }
             },
             Step::RemoveAndCreate { id } => {
-                let _ = runner.run(
+                let removed = runner.run(
                     &options.podman,
                     &["rm".to_owned(), "-f".to_owned(), id],
                     &env(options),
                 );
+                if !removed.is_ok_and(|output| output.success) {
+                    std::thread::sleep(options.poll);
+                }
             }
             Step::Blocked { epoch } => block_and_wait(options, epoch),
         }
@@ -359,33 +366,10 @@ fn log_line(message: &str) {
     eprintln!("weglarka-launcher: {message}");
 }
 
-/// Host tool name used in diagnostics (kept here so the module compiles alone).
-pub const DAEMON_TOOL: &str = HOST_DAEMON_FILE;
-
-/// Convenience for the adapter's argv: label pairs are always inserted before the image.
-pub fn label_args(labels: &[(String, String)]) -> Vec<String> {
-    let mut args = Vec::new();
-    for (key, value) in labels {
-        args.push("--label".to_owned());
-        args.push(format!("{key}={value}"));
-    }
-    args
-}
-
-/// Blocking wait used by tests and by the adapter's bounded observation loop.
-pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::selection::{LABEL_ACTIVATION_EPOCH, LABEL_DAEMON_DIGEST};
     use weglarka_model::release_set::StrictDigest;
@@ -553,13 +537,5 @@ mod tests {
         });
         block_and_wait(&options, 1);
         assert_eq!(PlatformService::load(&host).unwrap().unwrap().epoch, 2);
-    }
-
-    #[test]
-    fn labels_are_rendered_as_pairs() {
-        assert_eq!(
-            label_args(&[("a".into(), "b".into())]),
-            vec!["--label".to_string(), "a=b".to_string()]
-        );
     }
 }

@@ -67,6 +67,9 @@ impl GenerationChoice {
 pub struct ExecPlan {
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// The caller's terminal is the child's: stdin is inherited (a pipe or a prompt reaches the CLI).
+    /// Workers are non-interactive and get a closed stdin.
+    pub interactive: bool,
 }
 
 impl ExecPlan {
@@ -74,6 +77,15 @@ impl ExecPlan {
         Self {
             program: program.into(),
             args,
+            interactive: false,
+        }
+    }
+
+    /// An interactive plan: stdin is inherited.
+    pub fn interactive(program: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        Self {
+            interactive: true,
+            ..Self::new(program, args)
         }
     }
 }
@@ -122,12 +134,14 @@ fn plan_daemon(
     ))
 }
 
-/// `cli` passes through to the selected CLI directly; no shell and no implicit arguments.
+/// `cli` passes through to the selected CLI directly; no shell and no implicit arguments. The CLI keeps
+/// the caller's stdin (`weglarka push` reads an archive from it, `run` and `secrets` read input), and
+/// its lifetime is the caller's: the launcher imposes no timeout on it.
 pub fn plan_cli(generation: &Generation, args: Vec<String>) -> Result<ExecPlan, RunError> {
     let program = generation
         .binary(HOST_CLI_FILE)
         .map_err(RunError::Generation)?;
-    Ok(ExecPlan::new(program, args))
+    Ok(ExecPlan::interactive(program, args))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +167,11 @@ pub fn run_plan(plan: &ExecPlan, timeout: Option<Duration>) -> Result<(), RunErr
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
-        .stdin(Stdio::null())
+        .stdin(if plan.interactive {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut child = command.spawn().map_err(|source| RunError::Spawn {
@@ -178,6 +196,9 @@ pub fn run_plan(plan: &ExecPlan, timeout: Option<Duration>) -> Result<(), RunErr
             }
             Ok(None) => {}
             Err(source) => {
+                // Do not leave a worker running that nobody is waiting for any more.
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(RunError::Spawn {
                     program: plan.program.clone(),
                     source,
