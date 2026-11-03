@@ -2115,6 +2115,7 @@ dependencies = [
  "weglarka-engine",
  "weglarka-identity",
  "weglarka-ingress",
+ "weglarka-launcher",
  "weglarka-model",
  "weglarka-notify",
  "weglarka-podman",
@@ -2186,6 +2187,21 @@ name = "weglarka-ingress"
 version = "0.0.6"
 dependencies = [
  "insta",
+ "thiserror",
+ "toml",
+ "weglarka-model",
+]
+
+[[package]]
+name = "weglarka-launcher"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "sha2",
+ "tempfile",
  "thiserror",
  "toml",
  "weglarka-model",

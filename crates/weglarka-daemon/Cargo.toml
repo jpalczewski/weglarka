@@ -41,6 +41,7 @@ weglarka-engine.workspace = true
 weglarka-identity.workspace = true
 weglarka-model.workspace = true
 weglarka-ingress.workspace = true
+weglarka-launcher.workspace = true
 weglarka-notify.workspace = true
 weglarka-podman.workspace = true
 weglarka-registry.workspace = true
