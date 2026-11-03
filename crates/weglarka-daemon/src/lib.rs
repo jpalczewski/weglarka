@@ -10,6 +10,7 @@ pub mod admin;
 pub mod admin_token;
 pub mod app;
 mod app_view;
+pub mod bootstrap;
 pub mod cdn;
 pub mod certificates;
 pub mod config_view;
@@ -26,7 +27,10 @@ pub mod images;
 pub mod ingress;
 pub mod logs;
 pub mod metrics;
+pub mod openrc;
+pub mod ownership;
 pub mod platform;
+pub mod preflight;
 /// `PUT /v1/apps/{name}/image`: deploy an image archive built elsewhere (issue #109).
 pub mod push;
 pub mod resources;
