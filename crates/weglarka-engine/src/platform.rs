@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
+use weglarka_model::app::Digest;
 use weglarka_model::config::PlatformKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +15,10 @@ pub enum PlatformError {
     Command(String),
     #[error("platform i/o error: {0}")]
     Io(String),
+    /// The installed adapter does not implement this v1 interface yet. Callers must treat it as an
+    /// explicit unsupported capability, never as success.
+    #[error("platform capability {0} is not implemented by this adapter")]
+    NotImplemented(&'static str),
 }
 
 pub type Result<T, E = PlatformError> = std::result::Result<T, E>;
@@ -69,6 +74,88 @@ pub enum ServiceStatus {
     NotInstalled,
 }
 
+/// Typed scheduled job. Arbitrary remote shell commands are deliberately not part of this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JobId {
+    Update,
+    Watchdog,
+}
+
+impl JobId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            JobId::Update => "update",
+            JobId::Watchdog => "watchdog",
+        }
+    }
+}
+
+/// A periodic job the installer can provision. The runtime enable flag lives in
+/// `runtime-jobs.toml`; cron/systemd entries themselves are installer-owned and never rewritten at
+/// runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledJob {
+    pub id: JobId,
+    /// Fixed argument vector passed to the launcher; never a shell command.
+    pub args: Vec<String>,
+    /// Runtime user the job runs as.
+    pub runtime_user: String,
+    /// Minimal spacing between runs, in seconds.
+    pub cadence_secs: u64,
+    /// Skip this tick when the previous run is still alive.
+    pub skip_if_running: bool,
+}
+
+/// Monotonic activation epoch. The service selection persists it, and observation reports the epoch
+/// the running container actually carries, so an obsolete request cannot stop a newer container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActivationEpoch(pub u64);
+
+/// Acknowledgment of an activation **request**, not proof of readiness. Read
+/// [`Platform::observe_service`] for the actual container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationReceipt {
+    pub epoch: ActivationEpoch,
+}
+
+/// Name of the daemon service the platform adapter manages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceName(String);
+
+impl ServiceName {
+    pub fn new(name: impl Into<String>) -> Result<Self, PlatformError> {
+        let name = name.into();
+        if name.is_empty() || name.len() > 255 {
+            return Err(PlatformError::Command(
+                "service name must be 1-255 characters".into(),
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ServiceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What is actually running, as observed — not what was requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedService {
+    pub name: ServiceName,
+    pub container_id: Option<String>,
+    pub image_id: Option<String>,
+    pub digest: Option<Digest>,
+    pub activation_epoch: Option<ActivationEpoch>,
+    /// `None` when readiness is not available from this adapter.
+    pub ready: Option<bool>,
+}
+
 /// A unit file to install verbatim: name and contents. The service itself is described by
 /// [`ServiceSpec`]; this carries the extra units Węglarka needs (the self-update timer and its
 /// oneshot service, issue #99) and the quadlet fragments the platform renders from a spec.
@@ -110,4 +197,41 @@ pub trait Platform: Send + Sync {
 
     /// Enables (or disables) a user timer and starts (stops) it now.
     fn set_timer(&self, name: &str, enabled: bool) -> impl Future<Output = Result<()>> + Send;
+
+    // Platform update v1 interfaces. Defaults fail explicitly so an adapter that has not grown the
+    // capability yet cannot be mistaken for a working one.
+
+    /// Installs the fixed periodic jobs. Idempotent; the argument vector is validated by the
+    /// adapter, never evaluated as a shell command.
+    fn install_jobs(&self, _jobs: &[ScheduledJob]) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Err(PlatformError::NotImplemented("install_jobs")))
+    }
+
+    /// Writes `runtime-jobs.toml`; never rewrites cron/init entries at runtime.
+    fn set_job_enabled(
+        &self,
+        _id: JobId,
+        _enabled: bool,
+    ) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Err(PlatformError::NotImplemented("set_job_enabled")))
+    }
+
+    /// Persists the desired service selection (digest + epoch) and requests a restart. The receipt
+    /// acknowledges the request, not readiness.
+    fn activate_service(
+        &self,
+        _spec: ServiceSpec,
+        _epoch: ActivationEpoch,
+    ) -> impl Future<Output = Result<ActivationReceipt>> + Send {
+        std::future::ready(Err(PlatformError::NotImplemented("activate_service")))
+    }
+
+    /// Observes the actual container: ID, image ID, digest, activation epoch and readiness when
+    /// available. A healthy old container is not success.
+    fn observe_service(
+        &self,
+        _name: ServiceName,
+    ) -> impl Future<Output = Result<ObservedService>> + Send {
+        std::future::ready(Err(PlatformError::NotImplemented("observe_service")))
+    }
 }
