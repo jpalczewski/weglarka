@@ -600,13 +600,24 @@ fn verify_one(path: &Path, expected: &ExpectedFile) -> Result<(), GenerationErro
     Ok(())
 }
 
+/// SHA-256 of a file read through a fixed buffer, so hashing a tool binary of tens of MiB (done for
+/// both binaries on every launcher call) never holds the file in memory.
 fn file_digest(path: &Path) -> Result<StrictDigest, GenerationError> {
-    let bytes = fs::read(path).map_err(|source| HostError::Read {
+    let read_error = |source| HostError::Read {
         path: path.to_owned(),
         source,
-    })?;
-    let digest = Sha256::digest(&bytes);
-    StrictDigest::new(format!("sha256:{}", hex::encode(digest))).map_err(|_| {
+    };
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buffer).map_err(read_error)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    StrictDigest::new(format!("sha256:{}", hex::encode(hasher.finalize()))).map_err(|_| {
         GenerationError::Mismatch {
             path: path.to_owned(),
         }

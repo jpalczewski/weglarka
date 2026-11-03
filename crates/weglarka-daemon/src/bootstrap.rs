@@ -253,7 +253,7 @@ pub async fn bootstrap<P: Platform>(
     )
     .is_ok();
 
-    apply_owner(&host_dir, options.runtime_uid, options.runtime_gid);
+    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid);
 
     Ok(BootstrapReport {
         host_dir,
@@ -568,17 +568,24 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-fn apply_owner(path: &Path, uid: Option<u32>, gid: Option<u32>) {
+/// Applies the ownership model of [`crate::ownership`]. Best effort: a non-root bootstrap (tests, an
+/// installer context that already owns the directory) cannot chown, and then nothing is changed.
+fn apply_ownership(host_dir: &Path, uid: Option<u32>, gid: Option<u32>) {
     let (Some(uid), Some(gid)) = (uid, gid) else {
         return;
     };
-    // Best effort: a non-root bootstrap (tests, systemd installer context) cannot chown; the
-    // operator already owns the directory there.
-    let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            apply_owner(&entry.path(), Some(uid), Some(gid));
-        }
+    match crate::ownership::apply(host_dir, uid, gid, &mut crate::ownership::lchown) {
+        Ok(0) => {}
+        Ok(failures) => tracing::warn!(
+            host_dir = %host_dir.display(),
+            failures,
+            "some host directory entries could not be given their owner"
+        ),
+        Err(error) => tracing::debug!(
+            host_dir = %host_dir.display(),
+            %error,
+            "host directory ownership not changed"
+        ),
     }
 }
 

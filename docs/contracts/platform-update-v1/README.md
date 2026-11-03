@@ -291,6 +291,11 @@ Bootstrap and migration are part of the contract:
   installation-configured host-only location, stages the current verified v1 tools as generation 0, writes
   `host-tools.toml` with the initial epoch, creates the host-only directory, and writes
   `host-capabilities.toml`.
+- Ownership after bootstrap: root owns the code (the launcher and everything under `generations/`), the runtime
+  user owns only the flat state files directly in the host-only directory, and that directory is
+  `root:<runtime group>` mode `1770` so the sticky bit stops the runtime user from replacing root-owned entries.
+  Ownership is changed with `lchown`; symlinks are never followed or descended into. Staging a new generation is
+  therefore a root-side step, not something the runtime-user launcher can do in place.
 - It disables or removes the legacy `weglarka-self-update`/watchdog units, imports `self-update.toml`
   (`current`/`previous`/`pending`) into protections, retires the legacy file, and repoints the timer at the
   launcher `update` role. Refuse to enable coordinated updates while any legacy runner unit or `self-update.lock`
