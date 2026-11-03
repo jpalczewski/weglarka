@@ -255,6 +255,13 @@ impl PlatformUpdate {
         channel: Channel,
         pointer: AcceptedPointer,
     ) -> Result<(), PlatformUpdateError> {
+        // Same shape check as `validate`, so a malformed pointer never reaches the in-memory document.
+        if !is_lower_hex(&pointer.revision, 40) {
+            return Err(PlatformUpdateError::Invalid(format!(
+                "accepted revision {:?} is not 40 lower-case hex characters",
+                pointer.revision
+            )));
+        }
         if let Some(stored) = self.accepted.get(channel.as_str()) {
             if pointer.sequence < stored.sequence {
                 return Err(PlatformUpdateError::Invalid(format!(
@@ -599,6 +606,11 @@ mod tests {
         // The same pointer again is idempotent; a higher sequence moves forward.
         journal.accept(Channel::Stable, pointer(5, 'a')).unwrap();
         journal.accept(Channel::Stable, pointer(6, 'b')).unwrap();
+        assert_eq!(journal.accepted(Channel::Stable).unwrap().sequence, 6);
+        // A malformed revision is refused before it is stored.
+        let mut bad = pointer(9, 'd');
+        bad.revision = "XYZ".into();
+        assert!(journal.accept(Channel::Stable, bad).is_err());
         assert_eq!(journal.accepted(Channel::Stable).unwrap().sequence, 6);
         // Channels are independent.
         journal.accept(Channel::Main, pointer(1, 'c')).unwrap();

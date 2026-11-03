@@ -58,12 +58,12 @@ impl ImageRef {
         })
     }
 
-    /// Parses a tag-free `host[:port]/path/to/repository`, with the same host and path rules as
-    /// [`ImageRef::parse`]; a tag or digest is rejected (the tag, because `:` is not a path
-    /// character, so it fails as an invalid repository or registry).
+    /// Parses a tag-free `host[:port]/path/to/repository` with the same host and path rules as
+    /// [`ImageRef::parse`]. A digest is rejected as [`ImageRefError::DigestRef`]; a tag fails as an
+    /// invalid repository path, because `:` is not a path character.
     pub fn parse_repository(repository: &str) -> Result<RepositoryRef, ImageRefError> {
         let (registry, path) = split_registry(repository)?;
-        if path.is_empty() || path.len() > MAX_REPOSITORY_LEN || !valid_repository(path) {
+        if path.len() > MAX_REPOSITORY_LEN || !valid_repository(path) {
             return Err(ImageRefError::Repository(repository.to_owned()));
         }
         Ok(RepositoryRef {

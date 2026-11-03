@@ -244,7 +244,12 @@ impl Repository {
     /// unqualified-search registries.
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidRepository> {
         let value = value.into();
-        if value.len() > 255 || ImageRef::parse_repository(&value).is_err() {
+        // Lower case only: the registry parser allows an upper-case host, but `GHCR.io/a` and `ghcr.io/a`
+        // would then be two different keys for the same repository.
+        if value.len() > 255
+            || value.bytes().any(|b| b.is_ascii_uppercase())
+            || ImageRef::parse_repository(&value).is_err()
+        {
             return Err(InvalidRepository(value));
         }
         Ok(Self(value))
@@ -991,6 +996,7 @@ mod tests {
             "ghcr.io/example/weglarka#frag",
             "https://ghcr.io/example/weglarka",
             "ghcr.io/Example/weglarka",
+            "GHCR.io/example/weglarka",
             // No registry host: Podman would resolve it through its unqualified-search registries.
             "example/weglarka",
         ] {
