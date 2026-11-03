@@ -39,6 +39,9 @@ COPY --chmod=0755 bin/weglarka-panel /out/
 FROM ${BIN_SOURCE} AS bin
 
 FROM scratch
+# `VERSION` is the **weglarka-panel** crate version passed by the release workflow (never the daemon
+# version, a moving tag or a metadata-action output): `org.opencontainers.image.version` describes
+# the panel binary inside this image. `REVISION` is informational.
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="weglarka-panel" \
