@@ -1,4 +1,5 @@
-//! The daemon binary: `run` (default) and `platform install|remove|status`.
+//! The daemon binary: `run` (default), `platform install|remove|status|bootstrap|downgrade`, the
+//! host preflight and the legacy self-update/watchdog entry points.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
+use weglarka_daemon::openrc::OpenRcPlatform;
 use weglarka_daemon::platform::{
     SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_SERVICE, WATCHDOG_TIMER,
     render, run_args,
@@ -16,6 +18,7 @@ use weglarka_daemon::service::{
 };
 use weglarka_daemon::{Settings, start};
 use weglarka_engine::platform::Platform;
+use weglarka_launcher::host::DEFAULT_HOST_DIR;
 use weglarka_model::config::PlatformKind;
 use weglarka_podman::LibpodClient;
 use weglarka_registry::HttpRegistry;
@@ -31,6 +34,10 @@ struct Cli {
         default_value = "/etc/weglarka/weglarka.toml"
     )]
     config: PathBuf,
+    /// Host-only directory for the launcher, generations and host state (outside every container
+    /// bind mount).
+    #[arg(long, global = true, default_value = DEFAULT_HOST_DIR)]
+    host_dir: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -51,6 +58,12 @@ enum Command {
     /// answer the admin API within `[self_update] fallback_timeout_secs` (issue #100). Runs from
     /// `weglarka-watchdog.timer`; a manual run prints what it would do.
     Supervise,
+    /// Read-only host preflight: host protocol, state schemas, journal readability and whether this
+    /// binary parses the current `weglarka.toml`. Used by the launcher for candidate/recovery
+    /// generations.
+    HostPreflight,
+    /// Recovery entry point used by the launcher's `recover` role. The decision machine is brief D.
+    RecoverV1,
     /// Port forwarder of `edge` mode: relays public sockets to nginx's unix sockets with a PROXY
     /// protocol header (issue #162). Runs in its own container; needs no configuration file.
     Forward {
@@ -98,6 +111,33 @@ enum PlatformAction {
     Remove,
     /// Show the service status.
     Status,
+    /// Install the stable launcher and generation 0, retire the legacy runner, provision jobs.
+    Bootstrap(BootstrapArgs),
+    /// Reverse bootstrap: remove launcher units and restore the legacy daemon-only units.
+    Downgrade(BootstrapArgs),
+}
+
+#[derive(clap::Args)]
+struct BootstrapArgs {
+    /// Digest of the verified image the current tools came from (generation key; required for
+    /// bootstrap, defaults to the selector's active generation for downgrade).
+    #[arg(long)]
+    generation: Option<String>,
+    /// Daemon image repository or tag; the installed selection pins it to `--generation`.
+    #[arg(long, default_value = DEFAULT_IMAGE)]
+    image: String,
+    /// Launcher binary to install into the host-only directory.
+    #[arg(long)]
+    launcher: Option<PathBuf>,
+    /// Daemon binary to stage as generation 0 (default: this executable).
+    #[arg(long)]
+    daemon_binary: Option<PathBuf>,
+    /// CLI binary to stage as generation 0 (default: `weglarka` next to the daemon).
+    #[arg(long)]
+    cli_binary: Option<PathBuf>,
+    /// Channel whose durable pointer gates coordinated updates.
+    #[arg(long)]
+    channel: Option<String>,
 }
 
 /// `RUST_LOG` is a plain level (`error|warn|info|debug|trace|off`), not a per-target directive list:
@@ -189,17 +229,21 @@ async fn run_supervise(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> {
-    let platform = systemd(&settings)?;
+async fn run_platform<P: Platform>(
+    platform: &P,
+    settings: Settings,
+    action: PlatformAction,
+    host_dir: PathBuf,
+) -> Result<()> {
     match action {
         PlatformAction::RunArgs { image } => {
-            let socket = host_socket(&settings, &platform).await?;
+            let socket = host_socket(&settings, platform).await?;
             for a in run_args(&service_spec(&settings, socket, image))? {
                 println!("{a}");
             }
         }
         PlatformAction::Install { dry_run, image } => {
-            let socket = host_socket(&settings, &platform).await?;
+            let socket = host_socket(&settings, platform).await?;
             let spec = service_spec(&settings, socket, image);
             let mut units = weglarka_daemon::self_update::units(&settings)?;
             units.extend(weglarka_daemon::self_update::watchdog_units(&settings)?);
@@ -207,34 +251,46 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
                 for f in render(&spec)? {
                     println!("# {}\n{}", f.file_name, f.content);
                 }
-                for f in &units {
-                    println!("# {}\n{}", f.file_name, f.content);
+                if platform.kind() == PlatformKind::Systemd {
+                    for f in &units {
+                        println!("# {}\n{}", f.file_name, f.content);
+                    }
                 }
                 return Ok(());
             }
             platform.install_service(&spec).await?;
-            platform.install_user_units(&units).await?;
-            platform.set_timer(SELF_UPDATE_TIMER, true).await?;
-            platform.set_timer(WATCHDOG_TIMER, true).await?;
-            println!(
-                "Installed. Start it with: systemctl --user start {SERVICE_NAME}.service \
-                 (requires `loginctl enable-linger {}`); the self-update and watchdog timers are \
-                 enabled and do nothing until [self_update] is configured.",
-                settings.host.runtime.user
-            );
+            if platform.kind() == PlatformKind::Systemd {
+                platform.install_user_units(&units).await?;
+                platform.set_timer(SELF_UPDATE_TIMER, true).await?;
+                platform.set_timer(WATCHDOG_TIMER, true).await?;
+                println!(
+                    "Installed. Start it with: systemctl --user start {SERVICE_NAME}.service \
+                     (requires `loginctl enable-linger {}`); the self-update and watchdog timers are \
+                     enabled and do nothing until [self_update] is configured.",
+                    settings.host.runtime.user
+                );
+            } else {
+                println!(
+                    "Installed the OpenRC services. Enable them with `rc-update add \
+                     weglarka-podman default` and `rc-update add {SERVICE_NAME} default`; \
+                     coordinated updates need `platform bootstrap`."
+                );
+            }
         }
         PlatformAction::Remove => {
-            // Disable before deleting: `systemctl disable` needs the unit files.
-            platform.set_timer(SELF_UPDATE_TIMER, false).await?;
-            platform.set_timer(WATCHDOG_TIMER, false).await?;
-            platform
-                .remove_user_units(&[
-                    SELF_UPDATE_SERVICE,
-                    SELF_UPDATE_TIMER,
-                    WATCHDOG_SERVICE,
-                    WATCHDOG_TIMER,
-                ])
-                .await?;
+            if platform.kind() == PlatformKind::Systemd {
+                // Disable before deleting: `systemctl disable` needs the unit files.
+                platform.set_timer(SELF_UPDATE_TIMER, false).await?;
+                platform.set_timer(WATCHDOG_TIMER, false).await?;
+                platform
+                    .remove_user_units(&[
+                        SELF_UPDATE_SERVICE,
+                        SELF_UPDATE_TIMER,
+                        WATCHDOG_SERVICE,
+                        WATCHDOG_TIMER,
+                    ])
+                    .await?;
+            }
             platform.remove_service(SERVICE_NAME).await?;
             println!(
                 "Removed the {SERVICE_NAME} service file, the self-update timer and the watchdog."
@@ -243,8 +299,121 @@ async fn run_platform(settings: Settings, action: PlatformAction) -> Result<()> 
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);
         }
+        PlatformAction::Bootstrap(args) => {
+            let options = bootstrap_options(&args, &settings, host_dir, true)?;
+            let report = weglarka_daemon::bootstrap::bootstrap(platform, &options).await?;
+            println!(
+                "Bootstrapped generation {} (selector epoch {}); coordinated updates {}.",
+                report.generation,
+                report.selector_epoch,
+                if report.coordinated_ready {
+                    "enabled"
+                } else {
+                    "still disabled (no channel pointer or preflight not yet complete)"
+                }
+            );
+            if !report.retired_units.is_empty() {
+                println!("Retired: {}", report.retired_units.join(", "));
+            }
+            if platform.kind() == PlatformKind::Systemd && !report.linger_enabled {
+                println!(
+                    "Warning: lingering is not enabled for {}; run `loginctl enable-linger {}` \
+                     as root or the user timers will not start after a reboot.",
+                    settings.host.runtime.user, settings.host.runtime.user
+                );
+            }
+        }
+        PlatformAction::Downgrade(args) => {
+            let options = bootstrap_options(&args, &settings, host_dir, false)?;
+            weglarka_daemon::bootstrap::downgrade(platform, &options).await?;
+            println!("Removed the launcher units and restored the legacy daemon-only units.");
+        }
     }
     Ok(())
+}
+
+fn bootstrap_options(
+    args: &BootstrapArgs,
+    settings: &Settings,
+    host_dir: PathBuf,
+    require_generation: bool,
+) -> Result<weglarka_daemon::bootstrap::BootstrapOptions> {
+    use weglarka_model::release_set::{Channel, StrictDigest};
+    let generation = match &args.generation {
+        Some(value) => StrictDigest::new(value.clone())
+            .with_context(|| format!("invalid --generation {value:?}"))?,
+        None if require_generation => {
+            bail!("--generation is required for platform bootstrap")
+        }
+        None => {
+            weglarka_launcher::selector::HostSelector::load(&host_dir)
+                .context("reading host-tools.toml for downgrade")?
+                .active
+        }
+    };
+    let image = pin_image(&args.image, &generation)?;
+    let daemon_binary = match &args.daemon_binary {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().context("resolving the current executable")?,
+    };
+    let cli_binary = match &args.cli_binary {
+        Some(path) => path.clone(),
+        None => daemon_binary
+            .parent()
+            .map(|dir| dir.join("weglarka"))
+            .context("the daemon binary has no parent directory")?,
+    };
+    let launcher_binary = match &args.launcher {
+        Some(path) => path.clone(),
+        None => daemon_binary
+            .parent()
+            .map(|dir| dir.join("weglarka-launcher"))
+            .context("the daemon binary has no parent directory")?,
+    };
+    let channel = match &args.channel {
+        Some(value) => Some(Channel::parse(value).ok_or_else(|| {
+            anyhow::anyhow!("unknown --channel {value:?}; expected stable or main")
+        })?),
+        None => None,
+    };
+    let (uid, gid) = weglarka_daemon::bootstrap::lookup_user(&settings.host.runtime.user)
+        .map(|(uid, gid)| (Some(uid), Some(gid)))
+        .unwrap_or((None, None));
+    Ok(weglarka_daemon::bootstrap::BootstrapOptions {
+        host_dir,
+        state_dir: settings.paths.state_dir.clone(),
+        config_path: settings.config_path.clone(),
+        runtime_user: settings.host.runtime.user.clone(),
+        runtime_uid: uid,
+        runtime_gid: gid,
+        generation,
+        daemon_binary,
+        cli_binary,
+        launcher_binary,
+        image,
+        channel,
+        enable_linger: true,
+    })
+}
+
+/// `repo:tag` or `repo` -> `repo@sha256:…`.
+fn pin_image(image: &str, digest: &weglarka_model::release_set::StrictDigest) -> Result<String> {
+    let repository = match image.rsplit_once('@') {
+        Some((repository, _)) => repository.to_owned(),
+        None => {
+            let last_segment = image.rsplit('/').next().unwrap_or_default();
+            if let Some(index) = last_segment.rfind(':') {
+                let cut = image.len() - last_segment.len() + index;
+                image[..cut].to_owned()
+            } else {
+                image.to_owned()
+            }
+        }
+    };
+    if repository.is_empty() {
+        bail!("--image {image:?} has no repository");
+    }
+    Ok(format!("{repository}@{digest}"))
 }
 
 /// The daemon (usually in a `scratch` container) never guesses the socket from `/etc/passwd`: it takes it from
@@ -285,12 +454,53 @@ async fn main() -> Result<()> {
             .await
             .context("port forwarder");
     }
+    if let Some(Command::HostPreflight) = cli.command {
+        let report = weglarka_daemon::preflight::run(&cli.config);
+        println!("{}", report.to_json());
+        if !report.is_eligible() {
+            bail!("host preflight is not eligible: {}", report.to_json());
+        }
+        return Ok(());
+    }
+    if let Some(Command::RecoverV1) = cli.command {
+        bail!(
+            "recover-v1 is the host recovery entry point; its decision machine is brief D              (coordinator/recovery state), while the stable launcher and its bounded attempt \
+             budget are installed"
+        );
+    }
     let settings = Settings::load(&cli.config).context("loading configuration")?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(settings).await,
-        Command::Platform { action } => run_platform(settings, action).await,
+        Command::Platform { action } => run_platform_dispatch(settings, action, cli.host_dir).await,
         Command::SelfUpdate(args) => run_self_update(settings, args).await,
         Command::Supervise => run_supervise(settings).await,
-        Command::Forward { .. } => unreachable!("handled before the configuration is loaded"),
+        Command::HostPreflight | Command::RecoverV1 | Command::Forward { .. } => {
+            unreachable!("handled before the configuration is loaded")
+        }
+    }
+}
+
+async fn run_platform_dispatch(
+    settings: Settings,
+    action: PlatformAction,
+    host_dir: PathBuf,
+) -> Result<()> {
+    let user = settings.host.runtime.user.clone();
+    let state_dir = settings.paths.state_dir.clone();
+    match settings.host.platform.kind {
+        PlatformKind::Systemd => {
+            let platform = SystemdPlatform::new(user)
+                .with_host_dir(host_dir.clone())
+                .with_state_dir(state_dir);
+            run_platform(&platform, settings, action, host_dir).await
+        }
+        PlatformKind::Openrc => {
+            let (uid, _) = weglarka_daemon::bootstrap::lookup_user(&user)
+                .ok_or_else(|| anyhow::anyhow!("runtime user {user:?} is not in /etc/passwd"))?;
+            let platform = OpenRcPlatform::new(user, uid)
+                .with_host_dir(host_dir.clone())
+                .with_state_dir(state_dir);
+            run_platform(&platform, settings, action, host_dir).await
+        }
     }
 }
