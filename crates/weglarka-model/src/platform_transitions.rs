@@ -230,6 +230,11 @@ impl Transitions {
     }
 
     /// Records a terminal outcome and drops history past the bound. The caller persists the file.
+    ///
+    /// A terminal record is never replaced: a transaction ID that already has one is rejected with
+    /// [`TransitionsError::DuplicateTransition`] (answer a retry from [`Transitions::find`]). The
+    /// `terminal` list keeps recording order and the oldest entries are dropped first, so a wall
+    /// clock that steps back cannot make the newest record the one that is trimmed.
     pub fn record_terminal(&mut self, record: TransitionRecord) -> Result<(), TransitionsError> {
         if !record.status.is_terminal() {
             return Err(TransitionsError::Invalid(format!(
@@ -237,13 +242,18 @@ impl Transitions {
                 record.transaction_id, record.status
             )));
         }
+        if self
+            .terminal
+            .iter()
+            .any(|existing| existing.transaction_id == record.transaction_id)
+        {
+            return Err(TransitionsError::DuplicateTransition(
+                record.transaction_id.to_string(),
+            ));
+        }
         self.nonterminal
             .retain(|existing| existing.transaction_id != record.transaction_id);
-        self.terminal
-            .retain(|existing| existing.transaction_id != record.transaction_id);
         self.terminal.push(record);
-        self.terminal
-            .sort_by_key(|a| (a.updated_at, a.transaction_id.clone()));
         let excess = self.terminal.len().saturating_sub(MAX_TERMINAL_TRANSITIONS);
         self.terminal.drain(..excess);
         Ok(())
@@ -292,8 +302,8 @@ impl Transitions {
         }
         let mut nonterminal = self.nonterminal.clone();
         nonterminal.sort_by_key(|a| a.created_at);
-        let mut terminal = self.terminal.clone();
-        terminal.sort_by_key(|a| (a.updated_at, a.transaction_id.clone()));
+        // Recording order is the history order; `updated_at` is wall-clock and must not reorder it.
+        let terminal = self.terminal.clone();
         Ok(Self {
             format_version: FORMAT_VERSION,
             nonterminal,
@@ -481,6 +491,48 @@ mod tests {
                 .find(&TransactionId::new("tx-0").unwrap())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_terminal_record_is_never_replaced_and_trimming_ignores_the_clock() {
+        let mut transitions = Transitions::default();
+        transitions
+            .record_terminal(record("tx-a", TransitionStatus::Failed, 100))
+            .unwrap();
+        assert_eq!(
+            transitions
+                .record_terminal(record("tx-a", TransitionStatus::Succeeded, 200))
+                .unwrap_err(),
+            TransitionsError::DuplicateTransition("tx-a".into())
+        );
+        let kept = transitions
+            .find(&TransactionId::new("tx-a").unwrap())
+            .unwrap();
+        assert_eq!(kept.status, TransitionStatus::Failed);
+
+        // The clock steps back: later records carry smaller `updated_at`, yet the oldest go first.
+        let mut transitions = Transitions::default();
+        for i in 0..(MAX_TERMINAL_TRANSITIONS + 2) {
+            transitions
+                .record_terminal(record(
+                    &format!("tx-{i}"),
+                    TransitionStatus::Succeeded,
+                    10_000 - i as u64,
+                ))
+                .unwrap();
+        }
+        let ids: Vec<_> = transitions
+            .terminal
+            .iter()
+            .map(|r| r.transaction_id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids.first().unwrap(), "tx-2");
+        assert_eq!(
+            ids.last().unwrap(),
+            &format!("tx-{}", MAX_TERMINAL_TRANSITIONS + 1)
+        );
+        let text = transitions.to_toml().unwrap();
+        assert_eq!(Transitions::parse(&text).unwrap(), transitions);
     }
 
     #[test]

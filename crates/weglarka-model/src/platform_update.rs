@@ -245,8 +245,35 @@ impl PlatformUpdate {
     }
 
     /// Records an accepted pointer. The caller must durably persist the document atomically.
-    pub fn accept(&mut self, channel: Channel, pointer: AcceptedPointer) {
+    ///
+    /// The pointer only moves forward: a lower `sequence`, or the same `sequence` naming another
+    /// release set or revision, is rejected and leaves the document unchanged (a correctly signed
+    /// older set must not be stored, or a replay or downgrade would stop being rejected). Accepting
+    /// exactly the stored pointer again is a no-op.
+    pub fn accept(
+        &mut self,
+        channel: Channel,
+        pointer: AcceptedPointer,
+    ) -> Result<(), PlatformUpdateError> {
+        if let Some(stored) = self.accepted.get(channel.as_str()) {
+            if pointer.sequence < stored.sequence {
+                return Err(PlatformUpdateError::Invalid(format!(
+                    "channel {} is at sequence {}; refusing to move back to {}",
+                    channel.as_str(),
+                    stored.sequence,
+                    pointer.sequence
+                )));
+            }
+            if pointer.sequence == stored.sequence && &pointer != stored {
+                return Err(PlatformUpdateError::Invalid(format!(
+                    "channel {} already accepted sequence {} with another release set or revision",
+                    channel.as_str(),
+                    stored.sequence
+                )));
+            }
+        }
         self.accepted.insert(channel.as_str().to_owned(), pointer);
+        Ok(())
     }
 
     pub fn parse(src: &str) -> Result<Self, PlatformUpdateError> {
@@ -556,16 +583,40 @@ mod tests {
     }
 
     #[test]
+    fn the_accepted_pointer_only_moves_forward() {
+        let pointer = |sequence, byte| AcceptedPointer {
+            sequence,
+            release_set_digest: digest(byte),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        let mut journal = PlatformUpdate::default();
+        journal.accept(Channel::Stable, pointer(5, 'a')).unwrap();
+        let before = journal.to_toml().unwrap();
+        // Older sequence, and the same sequence with another digest, are both refused.
+        assert!(journal.accept(Channel::Stable, pointer(3, 'a')).is_err());
+        assert!(journal.accept(Channel::Stable, pointer(5, 'b')).is_err());
+        assert_eq!(journal.to_toml().unwrap(), before);
+        // The same pointer again is idempotent; a higher sequence moves forward.
+        journal.accept(Channel::Stable, pointer(5, 'a')).unwrap();
+        journal.accept(Channel::Stable, pointer(6, 'b')).unwrap();
+        assert_eq!(journal.accepted(Channel::Stable).unwrap().sequence, 6);
+        // Channels are independent.
+        journal.accept(Channel::Main, pointer(1, 'c')).unwrap();
+    }
+
+    #[test]
     fn journal_round_trips_and_keeps_the_accepted_pointer() {
         let mut journal = PlatformUpdate::default();
-        journal.accept(
-            Channel::Stable,
-            AcceptedPointer {
-                sequence: 42,
-                release_set_digest: digest('c'),
-                revision: "0123456789abcdef0123456789abcdef01234567".into(),
-            },
-        );
+        journal
+            .accept(
+                Channel::Stable,
+                AcceptedPointer {
+                    sequence: 42,
+                    release_set_digest: digest('c'),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                },
+            )
+            .unwrap();
         journal.transaction = Some(transaction(Stage::Prepared));
         let text = journal.to_toml().unwrap();
         let parsed = PlatformUpdate::parse(&text).unwrap();
