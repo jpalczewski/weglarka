@@ -581,6 +581,15 @@ pub trait PodmanClient: Send + Sync {
         path: &str,
         tar: TarStream,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// Streams a tar archive of `path` from a container (`GET /containers/{id}/archive?path=…`);
+    /// works on created, not started, containers. The caller validates every entry — the platform
+    /// updater extracts only the two fixed host-tool files as regular 0755 files (no symlinks,
+    /// hardlinks, special files or arbitrary paths).
+    fn container_archive_get(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> impl Future<Output = Result<TarStream>> + Send;
     fn container_inspect(&self, name: &str) -> impl Future<Output = Result<ContainerInfo>> + Send;
     fn container_list(
         &self,
