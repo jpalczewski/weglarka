@@ -153,6 +153,10 @@ struct State {
     load_names: VecDeque<Vec<String>>,
     /// The next `image_load` fails with this message (a broken archive).
     load_failures: VecDeque<String>,
+    /// The next `image_tag` fails with this message (a lost lock or interrupted connection).
+    tag_failures: VecDeque<String>,
+    /// The next `image_remove` fails with this message (e.g. a busy store).
+    remove_failures: VecDeque<String>,
     /// Archive that `image_save` returns for an image, keyed by the image's digest.
     image_archives: BTreeMap<Digest, Bytes>,
     pull_digests: BTreeMap<String, Digest>,
@@ -418,6 +422,25 @@ impl FakePodman {
     /// The next `image_load` fails with `message` (a corrupt or unsupported archive).
     pub fn script_next_load_failure(&self, message: &str) {
         self.lock().load_failures.push_back(message.to_owned());
+    }
+
+    /// The next `image_tag` fails with `message`, after `image_load` already produced the image.
+    pub fn script_next_tag_failure(&self, message: &str) {
+        self.lock().tag_failures.push_back(message.to_owned());
+    }
+
+    /// The next `image_remove` fails with `message` (the record must survive a failed deletion).
+    pub fn script_next_remove_failure(&self, message: &str) {
+        self.lock().remove_failures.push_back(message.to_owned());
+    }
+
+    /// Seeds an image in the store, addressable by its `repo:tag`/`repo@digest` names and its ID.
+    pub fn add_image(&self, image: ImageInfo) {
+        let mut s = self.lock();
+        s.images.insert(image.id.clone(), image.clone());
+        for name in image.repo_tags.iter().chain(image.repo_digests.iter()) {
+            s.images.insert(name.clone(), image.clone());
+        }
     }
 
     /// Exit code returned by subsequent `container_exec`s in this container.
@@ -947,6 +970,7 @@ impl PodmanClient for FakePodman {
             let image = ImageInfo {
                 id: id.clone(),
                 digest: Some(digest.clone()),
+                standalone_digest: Some(digest.clone()),
                 repo_tags,
                 repo_digests,
                 size_bytes: DEFAULT_IMAGE_SIZE_BYTES,
@@ -994,6 +1018,12 @@ impl PodmanClient for FakePodman {
             repo: repo.into(),
             tag: tag.into(),
         });
+        if let Some(message) = s.tag_failures.pop_front() {
+            return Err(PodmanError::Api {
+                status: 500,
+                message,
+            });
+        }
         let mut image = s
             .images
             .values()
@@ -1051,6 +1081,7 @@ impl PodmanClient for FakePodman {
         let image = ImageInfo {
             id: id.clone(),
             digest: Some(digest.clone()),
+            standalone_digest: Some(digest.clone()),
             repo_tags: repo_tags.clone(),
             repo_digests: repo_digests.clone(),
             size_bytes: DEFAULT_IMAGE_SIZE_BYTES,
@@ -1081,6 +1112,12 @@ impl PodmanClient for FakePodman {
     async fn image_remove(&self, reference: &str) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::ImageRemove(reference.to_owned()));
+        if let Some(message) = s.remove_failures.pop_front() {
+            return Err(PodmanError::Api {
+                status: 500,
+                message,
+            });
+        }
         let id = s
             .image_id(reference)
             .ok_or_else(|| PodmanError::NotFound(reference.to_owned()))?;

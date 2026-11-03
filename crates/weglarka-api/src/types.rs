@@ -426,6 +426,25 @@ pub struct PruneImagesResponse {
     /// `"<id>: <error>"` for images Podman refused (e.g. still in use); the rest is still removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
+    /// Fail-closed explanations: corrupt bookkeeping, or platform-image deletion disabled because
+    /// `host-capabilities.toml` is absent/incomplete. A diagnostic is never permission to delete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+/// `POST /v1/images/reservations/abandon`: explicit operator abandonment of one durable image
+/// reservation (contract, "Persistent files and authority"). Only this command or a changed boot
+/// without a referencing transaction frees a reservation; elapsed time never does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbandonReservationRequest {
+    /// Operation ID as shown by the retention diagnostics.
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbandonReservationResponse {
+    /// `false` when no reservation with that operation ID existed.
+    pub abandoned: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
