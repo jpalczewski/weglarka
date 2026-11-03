@@ -35,6 +35,14 @@ pub const MANIFEST_MAX_BYTES: usize = 8 * 1024;
 /// Largest accepted host tool file (contract: files over 64 MiB reject the set).
 pub const MAX_TOOL_BYTES: u64 = 64 * 1024 * 1024;
 /// The only accepted host tool names and their order.
+/// Mode of `generations/` and of every generation directory. World-readable and executable so the
+/// runtime-user launcher can open and run a generation; only the owner (root, see the daemon's
+/// `ownership` module) can change it. Never group- or world-writable.
+const GENERATION_DIR_MODE: u32 = 0o755;
+
+/// Mode of a generation manifest (readable by the runtime user, writable by its owner only).
+const MANIFEST_MODE: u32 = 0o644;
+
 pub const HOST_TOOL_NAMES: [&str; 2] = [HOST_DAEMON_FILE, HOST_CLI_FILE];
 
 /// One expected file from the descriptor / bootstrap source.
@@ -169,13 +177,13 @@ impl GenerationStore {
             path: dir.clone(),
             source,
         })?;
-        if meta.permissions().mode() & 0o777 != 0o700 {
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
-                GenerationError::Dir {
+        if meta.permissions().mode() & 0o777 != GENERATION_DIR_MODE {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(GENERATION_DIR_MODE)).map_err(
+                |source| GenerationError::Dir {
                     path: dir.clone(),
                     source,
-                }
-            })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -195,12 +203,12 @@ impl GenerationStore {
             path: dir.clone(),
             source,
         })?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            GenerationError::Dir {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(GENERATION_DIR_MODE)).map_err(
+            |source| GenerationError::Dir {
                 path: dir.clone(),
                 source,
-            }
-        })?;
+            },
+        )?;
         Ok(dir)
     }
 
@@ -302,12 +310,15 @@ impl GenerationStore {
             path: staging.join(GENERATION_MANIFEST),
             message: e.to_string(),
         })?;
-        write_atomic(&staging.join(GENERATION_MANIFEST), text.as_bytes(), 0o600).map_err(
-            |source| HostError::Write {
-                path: staging.join(GENERATION_MANIFEST),
-                source,
-            },
-        )?;
+        write_atomic(
+            &staging.join(GENERATION_MANIFEST),
+            text.as_bytes(),
+            MANIFEST_MODE,
+        )
+        .map_err(|source| HostError::Write {
+            path: staging.join(GENERATION_MANIFEST),
+            source,
+        })?;
         sync_dir(staging)?;
 
         let target = self.generation_dir(digest);

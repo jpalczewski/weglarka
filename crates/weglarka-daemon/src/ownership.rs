@@ -14,10 +14,13 @@
 //!
 //! Ownership is changed with `lchown` on entries that `symlink_metadata` reported as non-symlinks, and
 //! symlinks are never followed or descended into: a link the runtime user plants (`x -> /etc`) is
-//! left alone instead of handing its target to that user.
+//! left alone instead of handing its target to that user. The only path handed to the runtime user is
+//! a final component directly in the host directory (`lchown` does not follow it); everything below
+//! `generations/` is only ever given to root, and no mode is changed by path. The host directory's own
+//! mode is set through a descriptor whose identity was checked against the path.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use weglarka_launcher::host::{GENERATIONS_DIR, LAUNCHER_FILE};
@@ -42,55 +45,86 @@ pub fn apply<F>(
 where
     F: FnMut(&Path, u32, u32) -> io::Result<()>,
 {
-    let metadata = std::fs::symlink_metadata(host_dir)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    // Pin the host directory by descriptor: open it, then require that the path still names the very
+    // same directory (not a symlink swapped in meanwhile). The mode is set through the descriptor, so
+    // it can never land on a symlink's target.
+    let pinned = std::fs::File::open(host_dir)?;
+    let opened = pinned.metadata()?;
+    let named = std::fs::symlink_metadata(host_dir)?;
+    if named.file_type().is_symlink()
+        || !named.is_dir()
+        || !opened.is_dir()
+        || (named.dev(), named.ino()) != (opened.dev(), opened.ino())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", host_dir.display()),
+            format!("{} is not a plain directory", host_dir.display()),
         ));
     }
     chown(host_dir, 0, runtime_gid)?;
-    std::fs::set_permissions(host_dir, std::fs::Permissions::from_mode(HOST_DIR_MODE))?;
+    pinned.set_permissions(std::fs::Permissions::from_mode(HOST_DIR_MODE))?;
 
     let mut failures = 0;
-    for entry in std::fs::read_dir(host_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = std::fs::symlink_metadata(&path)?.file_type();
-        if file_type.is_symlink() {
+    // The code entries are handled by name, not by whatever `read_dir` returns, so an entry that
+    // vanishes or errors during the listing can never skip them.
+    match std::fs::symlink_metadata(host_dir.join(LAUNCHER_FILE)) {
+        Ok(m) if m.file_type().is_file() => {
+            failures += usize::from(chown(&host_dir.join(LAUNCHER_FILE), 0, 0).is_err());
+        }
+        Ok(m) if m.file_type().is_symlink() => {}
+        Ok(_) => failures += 1,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => failures += 1,
+    }
+    match std::fs::symlink_metadata(host_dir.join(GENERATIONS_DIR)) {
+        Ok(m) if m.file_type().is_dir() => {
+            failures += root_tree(&host_dir.join(GENERATIONS_DIR), chown);
+        }
+        Ok(m) if m.file_type().is_symlink() => {}
+        Ok(_) => failures += 1,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => failures += 1,
+    }
+
+    // Everything else is runtime state: regular files, one level, `lchown` of the final component.
+    let Ok(entries) = std::fs::read_dir(host_dir) else {
+        return Ok(failures + 1);
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            failures += 1;
+            continue;
+        };
+        if entry.file_name() == LAUNCHER_FILE || entry.file_name() == GENERATIONS_DIR {
             continue;
         }
-        let name = entry.file_name();
-        if name == LAUNCHER_FILE {
-            if !file_type.is_file() || chown(&path, 0, 0).is_err() {
-                failures += 1;
-            }
-        } else if name == GENERATIONS_DIR {
-            if !file_type.is_dir() {
-                failures += 1;
-            } else {
-                failures += root_tree(&path, chown);
-            }
-        } else if file_type.is_file() && chown(&path, runtime_uid, runtime_gid).is_err() {
-            // Regular state file. Anything else (a directory the runtime user made) is its own already.
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            failures += 1;
+            continue;
+        };
+        // Symlinks are left alone; a file with other hard links could be someone else's inode, so it is
+        // reported instead of handed over. Directories the runtime user made are its own already.
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            continue;
+        }
+        if metadata.nlink() > 1 || chown(&path, runtime_uid, runtime_gid).is_err() {
             failures += 1;
         }
     }
     Ok(failures)
 }
 
-/// Makes `dir` and everything below it root-owned and readable by the runtime user (directories
-/// `0755`, manifests `0644`; the tool binaries are already `0755`). Symlinks are skipped, not followed.
+/// Makes `dir` and everything below it root-owned. Only `lchown` to `root:root` happens here: it never
+/// follows a symlink at the final component, and handing something to root is never an escalation.
+/// Modes are not touched (a path-based chmod follows symlinks): the generation store already creates
+/// `generations/` and its directories `0755` and manifests `0644`, and the tool binaries `0755`.
+/// Symlinks are skipped, not followed.
 fn root_tree<F>(dir: &Path, chown: &mut F) -> usize
 where
     F: FnMut(&Path, u32, u32) -> io::Result<()>,
 {
-    let mut failures = 0;
-    if chown(dir, 0, 0).is_err()
-        || std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).is_err()
-    {
-        failures += 1;
-    }
+    let mut failures = usize::from(chown(dir, 0, 0).is_err());
     let Ok(entries) = std::fs::read_dir(dir) else {
         return failures + 1;
     };
@@ -106,17 +140,8 @@ where
         }
         if file_type.is_dir() {
             failures += root_tree(&path, chown);
-        } else if file_type.is_file() {
-            let mode = if metadata.permissions().mode() & 0o111 != 0 {
-                0o755
-            } else {
-                0o644
-            };
-            if chown(&path, 0, 0).is_err()
-                || std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).is_err()
-            {
-                failures += 1;
-            }
+        } else if file_type.is_file() && chown(&path, 0, 0).is_err() {
+            failures += 1;
         }
     }
     failures
@@ -193,11 +218,6 @@ mod tests {
             std::fs::metadata(&host).unwrap().permissions().mode() & 0o7777,
             HOST_DIR_MODE
         );
-        let manifest = generations.join("g1").join("manifest.toml");
-        assert_eq!(
-            std::fs::metadata(manifest).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
     }
 
     #[test]
@@ -227,6 +247,17 @@ mod tests {
             );
         }
         assert!(!calls.iter().any(|(p, _, _)| p.ends_with("passwd")));
+    }
+
+    #[test]
+    fn a_state_file_with_another_hard_link_is_reported_not_handed_over() {
+        let (_dir, outside, host) = tree();
+        let foreign = outside.path().join("shadow");
+        std::fs::write(&foreign, b"x").unwrap();
+        std::fs::hard_link(&foreign, host.join("linked")).unwrap();
+        let (calls, failures) = recorded(&host);
+        assert_eq!(failures, 1);
+        assert!(!calls.iter().any(|(p, _, _)| p.ends_with("linked")));
     }
 
     #[test]
