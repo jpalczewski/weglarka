@@ -129,14 +129,16 @@ mod tests {
         .save(host.path())
         .unwrap();
         let mut journal = PlatformUpdate::default();
-        journal.accept(
-            Channel::Stable,
-            AcceptedPointer {
-                sequence: 1,
-                release_set_digest: digest('c'),
-                revision: "0123456789abcdef0123456789abcdef01234567".into(),
-            },
-        );
+        journal
+            .accept(
+                Channel::Stable,
+                AcceptedPointer {
+                    sequence: 1,
+                    release_set_digest: digest('c'),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                },
+            )
+            .unwrap();
         std::fs::write(
             state
                 .path()
