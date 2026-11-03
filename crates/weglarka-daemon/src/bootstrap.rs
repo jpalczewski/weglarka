@@ -584,11 +584,22 @@ fn apply_ownership(
         return Ok(());
     };
     match crate::ownership::apply(host_dir, uid, gid, &mut crate::ownership::lchown) {
-        Ok(0) => Ok(()),
-        Ok(failures) => Err(BootstrapError::Incomplete(format!(
-            "{failures} entries of {} could not be given their owner or are writable by others",
+        Ok(outcome) if outcome.code > 0 => Err(BootstrapError::Incomplete(format!(
+            "{} entries of {} that root executes could not be secured",
+            outcome.code,
             host_dir.display()
         ))),
+        Ok(outcome) => {
+            if outcome.state > 0 {
+                // Entries the runtime user controls cannot block a root bootstrap.
+                tracing::warn!(
+                    host_dir = %host_dir.display(),
+                    entries = outcome.state,
+                    "some runtime state entries were left alone (extra hard links or changed under the walk)"
+                );
+            }
+            Ok(())
+        }
         Err(error) => {
             tracing::debug!(
                 host_dir = %host_dir.display(),

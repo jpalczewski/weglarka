@@ -25,6 +25,16 @@ use std::path::Path;
 
 use weglarka_launcher::host::{GENERATIONS_DIR, LAUNCHER_FILE};
 
+/// What [`apply`] could not do. Code failures leave something root executes under someone else's
+/// control and must stop the bootstrap; state failures are entries the runtime user itself planted or
+/// controls (an extra hard link, a file that changed under the walk) and are only reported, so the
+/// runtime user cannot block a root bootstrap by planting one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    pub code: usize,
+    pub state: usize,
+}
+
 /// Mode of the host directory: group-writable with the sticky bit (see the module documentation).
 pub const HOST_DIR_MODE: u32 = 0o1770;
 
@@ -77,7 +87,7 @@ pub fn apply<F>(
     runtime_uid: u32,
     runtime_gid: u32,
     chown: &mut F,
-) -> io::Result<usize>
+) -> io::Result<Outcome>
 where
     F: FnMut(&Path, u32, u32) -> io::Result<()>,
 {
@@ -100,35 +110,34 @@ where
     chown(host_dir, 0, runtime_gid)?;
     pinned.set_permissions(std::fs::Permissions::from_mode(HOST_DIR_MODE))?;
 
-    let mut failures = 0;
+    let mut outcome = Outcome::default();
     // The code entries are handled by name, not by whatever `read_dir` returns, so an entry that
-    // vanishes or errors during the listing can never skip them.
+    // vanishes or errors during the listing can never skip them. A symlink or anything else standing
+    // in for the launcher or `generations/` is a code failure.
     match std::fs::symlink_metadata(host_dir.join(LAUNCHER_FILE)) {
         Ok(m) if m.file_type().is_file() => {
-            failures += usize::from(chown(&host_dir.join(LAUNCHER_FILE), 0, 0).is_err());
+            outcome.code += usize::from(chown(&host_dir.join(LAUNCHER_FILE), 0, 0).is_err());
         }
-        Ok(m) if m.file_type().is_symlink() => {}
-        Ok(_) => failures += 1,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => failures += 1,
+        _ => outcome.code += 1,
     }
     match std::fs::symlink_metadata(host_dir.join(GENERATIONS_DIR)) {
         Ok(m) if m.file_type().is_dir() => {
-            failures += root_tree(&host_dir.join(GENERATIONS_DIR), chown);
+            outcome.code += root_tree(&host_dir.join(GENERATIONS_DIR), chown);
         }
-        Ok(m) if m.file_type().is_symlink() => {}
-        Ok(_) => failures += 1,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => failures += 1,
+        _ => outcome.code += 1,
     }
 
-    // Everything else is runtime state: regular files, one level, `lchown` of the final component.
+    // Everything else is runtime state: regular files, one level, owner changed through a verified
+    // descriptor. Trouble here is the runtime user's own doing and is reported, not fatal.
     let Ok(entries) = std::fs::read_dir(host_dir) else {
-        return Ok(failures + 1);
+        outcome.code += 1;
+        return Ok(outcome);
     };
     for entry in entries {
         let Ok(entry) = entry else {
-            failures += 1;
+            outcome.state += 1;
             continue;
         };
         if entry.file_name() == LAUNCHER_FILE || entry.file_name() == GENERATIONS_DIR {
@@ -136,7 +145,7 @@ where
         }
         let path = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            failures += 1;
+            outcome.state += 1;
             continue;
         };
         // Symlinks are left alone; a file with other hard links could be someone else's inode, so it is
@@ -145,10 +154,10 @@ where
             continue;
         }
         if metadata.nlink() > 1 || chown(&path, runtime_uid, runtime_gid).is_err() {
-            failures += 1;
+            outcome.state += 1;
         }
     }
-    Ok(failures)
+    Ok(outcome)
 }
 
 /// Makes `dir` and everything below it root-owned. Only a change to `root:root` happens here, never
@@ -224,7 +233,7 @@ mod tests {
         (dir, outside, host)
     }
 
-    fn recorded(host: &Path) -> (Vec<(PathBuf, u32, u32)>, usize) {
+    fn recorded(host: &Path) -> (Vec<(PathBuf, u32, u32)>, Outcome) {
         let mut calls = Vec::new();
         let failures = apply(host, 1000, 1001, &mut |path: &Path, uid, gid| {
             calls.push((path.to_owned(), uid, gid));
@@ -238,7 +247,7 @@ mod tests {
     fn state_belongs_to_the_runtime_user_and_code_to_root() {
         let (_dir, _outside, host) = tree();
         let (calls, failures) = recorded(&host);
-        assert_eq!(failures, 0);
+        assert_eq!(failures, Outcome::default());
         let owner = |path: PathBuf| {
             calls
                 .iter()
@@ -273,7 +282,7 @@ mod tests {
         symlink(outside.path().join("etc"), host.join("loose")).unwrap();
 
         let (calls, failures) = recorded(&host);
-        assert_eq!(failures, 0);
+        assert_eq!(failures, Outcome::default());
         for (path, _, _) in &calls {
             assert!(
                 !path.starts_with(outside.path()),
@@ -299,7 +308,7 @@ mod tests {
             .join("weglarka-daemon");
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o757)).unwrap();
         let (_calls, failures) = recorded(&host);
-        assert_eq!(failures, 1);
+        assert_eq!(failures, Outcome { code: 1, state: 0 });
     }
 
     #[test]
@@ -329,7 +338,7 @@ mod tests {
         std::fs::write(&foreign, b"x").unwrap();
         std::fs::hard_link(&foreign, host.join("linked")).unwrap();
         let (calls, failures) = recorded(&host);
-        assert_eq!(failures, 1);
+        assert_eq!(failures, Outcome { code: 0, state: 1 });
         assert!(!calls.iter().any(|(p, _, _)| p.ends_with("linked")));
     }
 
