@@ -22,9 +22,11 @@ use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName};
 use weglarka_model::delivery::{self, DeliveryDedup};
 use weglarka_model::events::{Event, EventSink, TracingSink};
 use weglarka_model::hash::SpecHash;
+use weglarka_model::image_inventory::Owner;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, NetworkSummary, PodmanClient, PodmanError,
+    image_repo,
 };
 use weglarka_model::secret_store::{SecretError, SecretStore, scoped_name};
 use weglarka_model::state::{self, StateError, StatePaths};
@@ -104,6 +106,10 @@ pub enum EngineError {
     /// `weglarka push` request that names an image the app may not be deployed from.
     #[error("{0}")]
     PushInvalid(String),
+    /// Durable image provenance/reservations cannot be read or written. Fail closed: destructive
+    /// cleanup is disabled, never guessed (ADR 0067).
+    #[error("image bookkeeping: {0}")]
+    ImageBookkeeping(String),
     /// A tag-sourced deploy (`apps deploy`) of a promote-only environment: its release changes only
     /// through `weglarka promote` (issue #205).
     #[error(
@@ -1057,9 +1063,25 @@ impl<P: PodmanClient> Reconciler<P> {
         action: Action,
     ) -> Result<ActionOutcome, EngineError> {
         match action {
-            Action::Deploy { instance } => Ok(ActionOutcome::Deployed(
-                self.deploy_locked(held, &instance, false).await?,
-            )),
+            Action::Deploy { instance } => {
+                let outcome = self.deploy_locked(held, &instance, false).await?;
+                // Reconcile already holds the engine/image guard for the whole pass; retention uses
+                // fresh observations but never reacquires the guard (contract lock order).
+                if matches!(
+                    &outcome,
+                    DeployOutcome::Deployed { .. }
+                        | DeployOutcome::RolledBack { .. }
+                        | DeployOutcome::Provisioned { .. }
+                ) && let Some(spec) = apps.apps.get(&instance)
+                {
+                    let owner = Owner::App {
+                        instance: instance.clone(),
+                    };
+                    self.retain_images_locked(held, &owner, image_repo(&spec.image))
+                        .await;
+                }
+                Ok(ActionOutcome::Deployed(outcome))
+            }
             Action::Recreate { instance, reason } => {
                 let outcome = self.recreate_locked(held, &instance, reason).await?;
                 Ok(ActionOutcome::Recreated(outcome))
@@ -1081,9 +1103,18 @@ impl<P: PodmanClient> Reconciler<P> {
                     .apps
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
-                Ok(ActionOutcome::Provisioned(
-                    self.provision_locked(held, &instance, spec).await?,
-                ))
+                let outcome = self.provision_locked(held, &instance, spec).await?;
+                if matches!(
+                    &outcome,
+                    DeployOutcome::Provisioned { .. } | DeployOutcome::Deployed { .. }
+                ) {
+                    let owner = Owner::App {
+                        instance: instance.clone(),
+                    };
+                    self.retain_images_locked(held, &owner, image_repo(&spec.image))
+                        .await;
+                }
+                Ok(ActionOutcome::Provisioned(outcome))
             }
             Action::Remove { container } => {
                 self.podman.container_remove(&container, true).await?;

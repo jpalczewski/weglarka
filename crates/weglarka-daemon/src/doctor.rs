@@ -101,9 +101,8 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
         format!("weglarka-daemon {}", env!("CARGO_PKG_VERSION")),
     ));
     podman(d, &mut checks).await;
-    let observed = desired_state(d, &mut checks).await;
-    if let Some(observed) = &observed {
-        image_retention(d, observed, &mut checks).await;
+    if desired_state(d, &mut checks).await.is_some() {
+        image_retention(d, &mut checks).await;
     }
     memory_use(d, &mut checks).await;
     configs(d, &mut checks);
@@ -426,17 +425,9 @@ async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     });
 }
 
-/// What `desired_state` loaded once and hands to the later checks (image retention needs all three).
-struct Observed {
-    apps: AppsFile,
-    st: StateFile,
-    containers: Vec<ContainerInfo>,
-}
-
-async fn desired_state<P: PodmanClient>(
-    d: &Daemon<P>,
-    out: &mut Vec<DoctorCheck>,
-) -> Option<Observed> {
+/// Loads and checks the desired state; `Some(())` once Podman's containers were observed too, so
+/// later checks may run.
+async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) -> Option<()> {
     let apps = state::load_apps(&d.paths.state.apps);
     let st = state::load_state(&d.paths.state.state);
     out.push(match &apps {
@@ -544,11 +535,7 @@ async fn desired_state<P: PodmanClient>(
         )
     });
     dependencies(&apps, &st, &containers, out);
-    Some(Observed {
-        apps,
-        st,
-        containers,
-    })
+    Some(())
 }
 
 /// Share of its memory limit (in percent) at which a container is reported as nearly full.
@@ -669,15 +656,12 @@ async fn memory_use<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) 
     }
 }
 
-/// Image retention (issue #40): images of a repository Węglarka deploys that are neither an app's
-/// current nor its previous image and that no container uses. Reports only — `weglarka images prune`
-/// removes them. While a deploy runs the check is informational: the freshly pulled image is not in
-/// `state.toml` yet, so it would look unused (the same reason as [`CheckStatus::Info`] for drift).
-async fn image_retention<P: PodmanClient>(
-    d: &Daemon<P>,
-    observed: &Observed,
-    out: &mut Vec<DoctorCheck>,
-) {
+/// Image retention (issue #40, ADR 0067): managed images that are neither an app's current nor its
+/// previous image and that no container, reservation, `self-update.toml` entry or platform journal
+/// protects. Reports only — `weglarka images prune` removes them. The same planner feeds the dry run,
+/// so what `doctor` reports is what a prune would do. While a deploy runs the check is informational:
+/// the freshly pulled image is not committed yet and would look unused.
+async fn image_retention<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     if let Some(activity) = d.engine.in_flight() {
         out.push(check(
             "runtime.images",
@@ -691,33 +675,64 @@ async fn image_retention<P: PodmanClient>(
         ));
         return;
     }
-    let Ok(images) = d.engine.podman().image_list().await else {
-        return; // missing Podman already reported by `runtime.socket`
+    let (plan, diagnostics) = match d
+        .engine
+        .retention_preview(weglarka_model::image_inventory::RetentionScope::AllManaged)
+        .await
+    {
+        Ok(preview) => preview,
+        Err(e) => {
+            out.push(check(
+                "runtime.images",
+                CheckStatus::Warn,
+                format!("image bookkeeping is unavailable: {e}; image cleanup is disabled"),
+                Some(
+                    "fix or restore managed-images.toml / self-update.toml / platform-update.toml; \
+                     cleanup never runs from incomplete provenance",
+                ),
+            ));
+            return;
+        }
     };
-    let plan = weglarka_engine::images::plan(
-        &images,
-        &observed.containers,
-        &observed.apps,
-        &observed.st,
-        None,
-    );
+    for diagnostic in diagnostics {
+        out.push(check(
+            "runtime.images",
+            CheckStatus::Warn,
+            diagnostic,
+            Some(
+                "platform-image retention waits for `weglarka platform bootstrap` to write \
+                 host-capabilities.toml",
+            ),
+        ));
+    }
     if plan.is_empty() {
         out.push(ok(
             "runtime.images",
             "no unused images from earlier deploys",
         ));
-        return;
+    } else {
+        out.push(check(
+            "runtime.images",
+            CheckStatus::Warn,
+            format!(
+                "{} unused image(s) from earlier deploys ({} at most)",
+                plan.remove.len(),
+                weglarka_model::units::human_bytes(plan.reclaimable_bytes())
+            ),
+            Some("`weglarka images prune` removes them (`--dry-run` first to see the list)"),
+        ));
     }
-    out.push(check(
-        "runtime.images",
-        CheckStatus::Warn,
-        format!(
-            "{} unused image(s) from earlier deploys ({} at most)",
-            plan.remove.len(),
-            weglarka_model::units::human_bytes(plan.reclaimable_bytes())
-        ),
-        Some("`weglarka images prune` removes them (`--dry-run` first to see the list)"),
-    ));
+    if !plan.unattributed.is_empty() {
+        out.push(check(
+            "runtime.images",
+            CheckStatus::Info,
+            format!(
+                "{} image(s) in the store have no Węglarka provenance; they are reported, never removed",
+                plan.unattributed.len()
+            ),
+            Some("provenance is recorded when Węglarka pulls or loads an image; older images need an explicit adoption"),
+        ));
+    }
 }
 
 /// `depends_on` (issue #35): a **running** app whose dependency is down is a real problem, while an

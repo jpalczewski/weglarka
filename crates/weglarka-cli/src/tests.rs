@@ -1708,6 +1708,7 @@ async fn images_prune_sends_the_dry_run_flag_and_renders_the_report() {
         }],
         reclaimed_bytes: 5 * 1024 * 1024,
         failed: Vec::new(),
+        diagnostics: Vec::new(),
     })
     .unwrap();
     let m = mock(move |_, _| (200, response.clone())).await;
@@ -1739,6 +1740,7 @@ async fn images_prune_sends_the_dry_run_flag_and_renders_the_report() {
         }],
         reclaimed_bytes: 5 * 1024 * 1024,
         failed: Vec::new(),
+        diagnostics: Vec::new(),
     };
     let rendered = crate::commands::render_prune(&report);
     assert!(
@@ -1760,6 +1762,7 @@ async fn images_prune_with_failures_exits_non_zero() {
         removed: Vec::new(),
         reclaimed_bytes: 0,
         failed: vec!["deadbeef: image is in use by a container".to_owned()],
+        diagnostics: Vec::new(),
     })
     .unwrap();
     let m = mock(move |_, _| (200, response.clone())).await;

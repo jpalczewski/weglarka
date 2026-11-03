@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
-use crate::deploy::{app_container_base, instance_networks};
+use crate::deploy::{AcquisitionSlot, app_container_base, instance_networks};
+use crate::images::ImageGuard;
 use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use crate::secrets::materialize;
 use weglarka_model::app::{InstanceName, SecretBinding, SecretTarget};
@@ -162,7 +163,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .clone()
             .try_acquire_owned()
             .map_err(|_| EngineError::RunLimit(MAX_CONCURRENT_RUNS))?;
-        let name = self.create_run_container(instance, options).await?;
+        let name = self.create_run_container(_held, instance, options).await?;
         Ok(PendingRun {
             engine: self.clone(),
             instance: instance.clone(),
@@ -182,11 +183,29 @@ impl<P: PodmanClient> Reconciler<P> {
         self.prepare_run(instance, &options).await?.drive(out).await
     }
 
-    /// Creates the container (not started) and returns its name; under the engine lock.
+    /// Creates the container (not started) and returns its name; under the engine lock. A missing
+    /// pinned image is an acquisition: it reserves before the pull and releases after creation.
     async fn create_run_container(
         &self,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         options: &RunOptions,
+    ) -> Result<String, EngineError> {
+        let image_guard = ImageGuard::new(held);
+        let mut slot = AcquisitionSlot::default();
+        let result = self
+            .create_run_container_body(&image_guard, instance, options, &mut slot)
+            .await;
+        slot.finish(self, &image_guard).await;
+        result
+    }
+
+    async fn create_run_container_body(
+        &self,
+        image_guard: &ImageGuard<'_>,
+        instance: &InstanceName,
+        options: &RunOptions,
+        slot: &mut AcquisitionSlot,
     ) -> Result<String, EngineError> {
         let spec = state::load_apps(&self.paths.apps)?
             .apps
@@ -213,7 +232,14 @@ impl<P: PodmanClient> Reconciler<P> {
         // The pinned digest only: a one-off container never follows the tag to something newer.
         let local_id = self.running_image_id(instance).await;
         let image = self
-            .ensure_image(instance, &spec, &digest, local_id.as_deref())
+            .ensure_image(
+                image_guard,
+                instance,
+                &spec,
+                &digest,
+                local_id.as_deref(),
+                slot,
+            )
             .await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, &spec).await?;
         let (prepared, configs) = self.prepare_instance(instance, &spec).await?;

@@ -7,10 +7,11 @@ use std::path::Path;
 use serde::Serialize;
 use weglarka_api::endpoints;
 use weglarka_api::{
-    AddAppRequest, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest,
-    DeployResponse, DoctorReport, ListAppsResponse, ListSecretsResponse, NotifyStatusResponse,
-    NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
-    ReloadRequest, ReloadResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
+    AbandonReservationRequest, AbandonReservationResponse, AddAppRequest, AppSummary,
+    ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
+    ListAppsResponse, ListSecretsResponse, NotifyStatusResponse, NotifyTestResponse,
+    PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction, ReloadRequest,
+    ReloadResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
 };
 use weglarka_model::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
@@ -19,8 +20,9 @@ use weglarka_model::secret_store::valid_secret_name;
 use weglarka_model::units::human_bytes;
 
 use crate::cli::{
-    AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs, ImagesCommand, NotifyCommand,
-    PruneImagesArgs, ReloadArgs, RemoveArgs, SecretRemoveArgs, SecretSetArgs, SecretsCommand,
+    AbandonReservationArgs, AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs,
+    ImagesCommand, NotifyCommand, PruneImagesArgs, ReloadArgs, RemoveArgs, ReservationsCommand,
+    SecretRemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, append_query, request_path};
 use crate::error::{CliError, Kind, exit};
@@ -69,6 +71,9 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Sites(c) => crate::sites::run(json, &overrides, c).await,
         Command::Promote(a) => crate::sites::promote(json, &overrides, a).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
+        Command::Images(ImagesCommand::Reservations(ReservationsCommand::Abandon(a))) => {
+            images_reservations_abandon(json, &overrides, a).await
+        }
         Command::Notify(NotifyCommand::Status) => notify_status(json, &overrides).await,
         Command::Notify(NotifyCommand::Test) => notify_test(json, &overrides).await,
         Command::Login(a) => crate::login::login(json, overrides.host_name()?.as_deref(), a).await,
@@ -698,6 +703,42 @@ pub(crate) async fn images_prune(
     })
 }
 
+/// `images reservations abandon <id>`: the explicit operator command from the contract. It refuses
+/// without `--yes`; the daemon then removes exactly that reservation record.
+pub(crate) async fn images_reservations_abandon(
+    json: bool,
+    o: &Overrides,
+    a: AbandonReservationArgs,
+) -> Result<i32, CliError> {
+    if !a.yes {
+        return Err(CliError::usage(
+            "abandoning an image reservation is irreversible; pass --yes to confirm",
+        )
+        .with_hint(
+            "only abandon an operation whose owner is gone and whose image is not a pending platform \
+             transaction",
+        ));
+    }
+    let request = AbandonReservationRequest {
+        operation_id: a.operation_id,
+    };
+    let response: AbandonReservationResponse = client(o)?
+        .call(endpoints::IMAGES_RESERVATION_ABANDON, &[], Some(&request))
+        .await?;
+    emit(json, &response, || {
+        if response.abandoned {
+            "abandoned the reservation\n".to_owned()
+        } else {
+            "no such reservation\n".to_owned()
+        }
+    });
+    Ok(if response.abandoned {
+        exit::OK
+    } else {
+        exit::USAGE
+    })
+}
+
 // ---------- render ----------
 
 /// `images prune` output: one row per image, then a summary; failures go to stderr.
@@ -727,6 +768,9 @@ pub(crate) fn render_prune(r: &PruneImagesResponse) -> String {
     out.push_str(&format!("{what} {} image(s), {space}\n", r.removed.len()));
     for failure in &r.failed {
         eprintln!("warning: could not remove {failure}");
+    }
+    for diagnostic in &r.diagnostics {
+        eprintln!("warning: {diagnostic}");
     }
     out
 }

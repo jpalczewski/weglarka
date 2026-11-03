@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
+use crate::images::{ImageGuard, inventory_repository};
 use crate::reconcile::{
     ActivityKind, EngineError, EngineGuard, Reconciler, RecreateReason, SecretChangePolicy,
 };
@@ -15,6 +16,7 @@ use crate::secrets::{binding_fingerprints, materialize, registry_auth};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName, normalize_signal};
 use weglarka_model::events::Event;
 use weglarka_model::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
+use weglarka_model::image_inventory::{OperationId, Owner};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
@@ -137,6 +139,36 @@ pub(crate) enum DigestSource<'a> {
     Local(&'a Digest),
 }
 
+/// The durable reservation created by one acquisition. It is released once the deploy has committed
+/// (or failed); a cancellation leaves it on disk, so the image can never be pruned unrecorded.
+#[derive(Default)]
+pub(crate) struct AcquisitionSlot {
+    operation: Option<OperationId>,
+}
+
+impl AcquisitionSlot {
+    pub(crate) async fn finish<P: PodmanClient>(
+        &mut self,
+        reconciler: &Reconciler<P>,
+        guard: &ImageGuard<'_>,
+    ) {
+        if let Some(operation) = self.operation.take() {
+            reconciler.finish_acquisition(guard, operation).await;
+        }
+    }
+
+    /// Takes over an operation that the caller published itself (archive upload).
+    pub(crate) fn track(&mut self, operation: OperationId) {
+        self.operation = Some(operation);
+    }
+}
+
+/// What a pull (or an inspect fallback) established about the acquired image.
+pub(crate) struct ResolvedImage {
+    pub digest: Digest,
+    pub image_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct WebhookOutcome {
     pub duplicate: bool,
@@ -247,13 +279,31 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Manual/webhook deploy of a single instance. `force` skips `Unchanged` and `KnownBad`.
+    ///
+    /// The acquisition guard is dropped before automatic retention runs: retention takes a fresh
+    /// guard and fresh observations, so it never nests the engine/image lock.
     pub async fn deploy(
         &self,
         instance: &InstanceName,
         force: bool,
     ) -> Result<DeployOutcome, EngineError> {
-        let guard = self.acquire().await;
-        self.deploy_locked(&guard, instance, force).await
+        let outcome = {
+            let guard = self.acquire().await;
+            self.deploy_locked(&guard, instance, force).await
+        };
+        if let Ok(outcome) = &outcome
+            && matches!(
+                outcome,
+                DeployOutcome::Deployed { .. }
+                    | DeployOutcome::RolledBack { .. }
+                    | DeployOutcome::Provisioned { .. }
+            )
+            && let Ok(spec) = self.load_spec(instance)
+        {
+            self.retain_after_deploy(instance, image_repo(&spec.image))
+                .await;
+        }
+        outcome
     }
 
     /// `apps reload` (issue #118): make a **running** app re-read its config without recreating the
@@ -378,18 +428,28 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Pulls `reference` for `instance`, with its `registry-auth` credentials when it has any
-    /// (docs/decisions/0026). A 401/403 becomes [`EngineError::RegistryAuth`].
+    /// (docs/decisions/0026). A 401/403 becomes [`EngineError::RegistryAuth`]. Returns the digest and
+    /// the local image ID when the stream reports it.
     async fn pull(
         &self,
         instance: &InstanceName,
         reference: &str,
-    ) -> Result<Option<Digest>, EngineError> {
+    ) -> Result<Option<ResolvedImage>, EngineError> {
         let auth = registry_auth(&self.secrets, instance).await?;
         let mut stream = std::pin::pin!(self.podman.image_pull_with(reference, auth.as_ref()));
-        let mut digest = None;
+        let mut resolved = None;
         while let Some(ev) = stream.next().await {
             match ev {
-                Ok(PullEvent::Complete { digest: d, .. }) => digest = d,
+                Ok(PullEvent::Complete {
+                    image_id, digest, ..
+                }) => {
+                    if let Some(digest) = digest {
+                        resolved = Some(ResolvedImage {
+                            digest,
+                            image_id: (!image_id.is_empty()).then_some(image_id),
+                        });
+                    }
+                }
                 Ok(_) => {}
                 Err(e) if e.is_registry_auth_failure() => {
                     return Err(EngineError::RegistryAuth {
@@ -401,36 +461,117 @@ impl<P: PodmanClient> Reconciler<P> {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(digest)
+        Ok(resolved)
     }
 
     async fn resolve_digest(
         &self,
         instance: &InstanceName,
         reference: &str,
-    ) -> Result<Digest, EngineError> {
+    ) -> Result<ResolvedImage, EngineError> {
         match self.pull(instance, reference).await? {
-            Some(d) => Ok(d),
-            None => self
-                .podman
-                .image_inspect(reference)
-                .await?
-                .digest
-                .ok_or_else(|| EngineError::NoDigest(reference.to_owned())),
+            Some(resolved) => Ok(resolved),
+            None => {
+                let info = self.podman.image_inspect(reference).await?;
+                Ok(ResolvedImage {
+                    digest: info
+                        .digest
+                        .ok_or_else(|| EngineError::NoDigest(reference.to_owned()))?,
+                    image_id: Some(info.id),
+                })
+            }
         }
     }
 
     pub(crate) async fn digest_from(
         &self,
+        guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         source: DigestSource<'_>,
+        slot: &mut AcquisitionSlot,
     ) -> Result<Digest, EngineError> {
         match source {
-            DigestSource::Tag => self.resolve_digest(instance, &spec.image).await,
-            DigestSource::Reference(reference) => self.resolve_digest(instance, reference).await,
+            DigestSource::Tag => {
+                self.acquire_digest(guard, instance, spec, &spec.image, slot)
+                    .await
+            }
+            DigestSource::Reference(reference) => {
+                self.acquire_digest(guard, instance, spec, reference, slot)
+                    .await
+            }
             DigestSource::Local(digest) => Ok(digest.clone()),
         }
+    }
+
+    /// Reserves the operation **before** the pull, records provenance and advances the reservation to
+    /// `loaded` before the image can be tagged or deployed. The reservation stays until the caller
+    /// (or [`AcquisitionSlot`]) releases it, so a disconnect leaves a recoverable operation.
+    async fn pull_reserved(
+        &self,
+        guard: &ImageGuard<'_>,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        reference: &str,
+        slot: &mut AcquisitionSlot,
+    ) -> Result<ResolvedImage, EngineError> {
+        let owner = Owner::App {
+            instance: instance.clone(),
+        };
+        let repository = inventory_repository(&spec.image)?;
+        let operation = self
+            .begin_acquisition(guard, owner.clone(), repository.clone())
+            .await?;
+        let resolved = match self.resolve_digest(instance, reference).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                // A failed acquisition releases its reservation: nothing was loaded.
+                self.finish_acquisition(guard, operation).await;
+                return Err(e);
+            }
+        };
+        self.advance_acquisition(
+            guard,
+            &operation,
+            resolved.image_id.as_deref(),
+            &resolved.digest,
+        )
+        .await?;
+        if let Err(e) = self
+            .record_acquisition(
+                guard,
+                owner,
+                repository,
+                resolved.image_id.as_deref(),
+                &resolved.digest,
+            )
+            .await
+        {
+            // Provenance could not be saved: keep the reservation (and its protection) rather than
+            // releasing the image into cleanup, and report without failing a healthy deploy.
+            tracing::warn!(
+                %instance,
+                error = %e,
+                "cannot record image provenance; image cleanup is disabled for this operation"
+            );
+            return Ok(resolved);
+        }
+        slot.track(operation);
+        Ok(resolved)
+    }
+
+    async fn acquire_digest(
+        &self,
+        guard: &ImageGuard<'_>,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        reference: &str,
+        slot: &mut AcquisitionSlot,
+    ) -> Result<Digest, EngineError> {
+        Ok(self
+            .pull_reserved(guard, instance, spec, reference, slot)
+            .await?
+            .digest)
     }
 
     /// Returns the image reference to create the container from. Order: the pinned `repo@digest`
@@ -438,10 +579,12 @@ impl<P: PodmanClient> Reconciler<P> {
     /// that a rollback does not depend on the registry), and only then a pull.
     pub(crate) async fn ensure_image(
         &self,
+        guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         local_id: Option<&str>,
+        slot: &mut AcquisitionSlot,
     ) -> Result<String, EngineError> {
         let reference = pinned_ref(&spec.image, digest);
         match self.podman.image_inspect(&reference).await {
@@ -452,7 +595,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 {
                     return Ok(id.to_owned());
                 }
-                self.pull(instance, &reference).await?;
+                // A pull is an acquisition like any other: reserve before it, record and advance
+                // before the reference is used to create a container.
+                self.pull_reserved(guard, instance, spec, &reference, slot)
+                    .await?;
                 Ok(reference)
             }
             Err(e) => Err(e.into()),
@@ -577,17 +723,22 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Prepare (image, network, secrets, uid range) → remove the old one → create+start → gate.
     /// `Err` means failure *before* touching the old container; later errors end up
     /// in `Launched::health`.
+    #[allow(clippy::too_many_arguments)]
     async fn launch(
         &self,
+        guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         generation: u64,
         local_id: Option<&str>,
+        slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
         let spec = &*self.effective(instance, spec);
         self.ensure_oidc_credential(instance, spec).await?;
-        let image = self.ensure_image(instance, spec, digest, local_id).await?;
+        let image = self
+            .ensure_image(guard, instance, spec, digest, local_id, slot)
+            .await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
@@ -638,16 +789,19 @@ impl<P: PodmanClient> Reconciler<P> {
     /// `launch` or, for a blue-green app with a serving container, [`Self::launch_blue_green`].
     async fn launch_with_strategy(
         &self,
+        guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         generation: u64,
+        slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
         if self.blue_green_applies(instance, spec).await {
-            self.launch_blue_green(instance, spec, digest, generation)
+            self.launch_blue_green(guard, instance, spec, digest, generation, slot)
                 .await
         } else {
-            self.launch(instance, spec, digest, generation, None).await
+            self.launch(guard, instance, spec, digest, generation, None, slot)
+                .await
         }
     }
 
@@ -659,14 +813,18 @@ impl<P: PodmanClient> Reconciler<P> {
     /// fails its gate is removed and reported as `Launched { old_intact: true, health: Err }`.
     async fn launch_blue_green(
         &self,
+        guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         generation: u64,
+        slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
         let spec = &*self.effective(instance, spec);
         self.ensure_oidc_credential(instance, spec).await?;
-        let image = self.ensure_image(instance, spec, digest, None).await?;
+        let image = self
+            .ensure_image(guard, instance, spec, digest, None, slot)
+            .await?;
         let hash = self.desired_hash(instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // Everything `launch` prepares, **without** touching the serving container.
@@ -933,6 +1091,26 @@ impl<P: PodmanClient> Reconciler<P> {
         force: bool,
         source: DigestSource<'_>,
     ) -> Result<DeployOutcome, EngineError> {
+        let image_guard = ImageGuard::new(held);
+        let mut slot = AcquisitionSlot::default();
+        let outcome = self
+            .deploy_locked_body(held, &image_guard, instance, force, source, &mut slot)
+            .await;
+        // The deploy has committed (or failed) under the same guard; releasing the reservation now
+        // cannot expose an image that is still `current`, `previous` or referenced by a container.
+        slot.finish(self, &image_guard).await;
+        outcome
+    }
+
+    async fn deploy_locked_body(
+        &self,
+        held: &EngineGuard<'_>,
+        image_guard: &ImageGuard<'_>,
+        instance: &InstanceName,
+        force: bool,
+        source: DigestSource<'_>,
+        slot: &mut AcquisitionSlot,
+    ) -> Result<DeployOutcome, EngineError> {
         let mut apps = state::load_apps(&self.paths.apps)?;
         // A promote-only environment never resolves a tag (issue #205): this covers `apps deploy`
         // and a stray reconcile action alike.
@@ -945,12 +1123,14 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         if spec.kind == AppKind::Static {
             return self
-                .deploy_static_from(held, instance, &spec, force, source)
+                .deploy_static_from(held, image_guard, instance, &spec, force, source, slot)
                 .await;
         }
         // `start = false` — provision only (no container, no secrets, no health gate).
         if !spec.start {
-            return self.provision_from(held, instance, &spec, source).await;
+            return self
+                .provision_from(held, image_guard, instance, &spec, source, slot)
+                .await;
         }
         // A deploy starts a container: every app in `depends_on` has to be running/healthy first
         // (issue #35). Not a failure — the start is retried once the dependency is up.
@@ -964,7 +1144,10 @@ impl<P: PodmanClient> Reconciler<P> {
         self.secrets_gate(instance, &spec, &mut st).await?;
         let cur: AppState = st.apps.get(instance).cloned().unwrap_or_default();
 
-        let digest = match self.digest_from(instance, &spec, source).await {
+        let digest = match self
+            .digest_from(image_guard, instance, &spec, source, slot)
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {
@@ -990,7 +1173,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let generation = cur.generation + 1;
         let prev_image_id = self.running_image_id(instance).await;
         let launched = self
-            .launch_with_strategy(instance, &spec, &digest, generation)
+            .launch_with_strategy(image_guard, instance, &spec, &digest, generation, slot)
             .await;
         let launched = match launched {
             Ok(l) => l,
@@ -1024,10 +1207,6 @@ impl<P: PodmanClient> Reconciler<P> {
                     digest: digest.clone(),
                     generation,
                 });
-                // Retention of 1 (issue #40): with `current` and `previous` saved, the older images
-                // of this repository are dead weight. Best effort — never fails the deploy.
-                self.retain_images_locked(held, image_repo(&spec.image))
-                    .await;
                 return Ok(DeployOutcome::Deployed { digest, generation });
             }
             Err(reason) => reason,
@@ -1066,11 +1245,13 @@ impl<P: PodmanClient> Reconciler<P> {
 
         let restore = self
             .launch(
+                image_guard,
                 instance,
                 &spec,
                 &prev,
                 generation + 1,
                 prev_image_id.as_deref(),
+                slot,
             )
             .await;
         let entry = st.apps.entry(instance.clone()).or_default();
@@ -1092,10 +1273,6 @@ impl<P: PodmanClient> Reconciler<P> {
                     restored: prev.clone(),
                     reason: reason.clone(),
                 });
-                // The failed image is neither `current` nor `previous` now; it goes away unless it
-                // still holds the tag named by the spec (issue #40).
-                self.retain_images_locked(held, image_repo(&spec.image))
-                    .await;
                 Ok(DeployOutcome::RolledBack {
                     failed: digest,
                     restored: prev,
@@ -1134,17 +1311,31 @@ impl<P: PodmanClient> Reconciler<P> {
         instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<DeployOutcome, EngineError> {
-        self.provision_from(held, instance, spec, DigestSource::Tag)
-            .await
+        let image_guard = ImageGuard::new(held);
+        let mut slot = AcquisitionSlot::default();
+        let outcome = self
+            .provision_from(
+                held,
+                &image_guard,
+                instance,
+                spec,
+                DigestSource::Tag,
+                &mut slot,
+            )
+            .await;
+        slot.finish(self, &image_guard).await;
+        outcome
     }
 
     /// [`Self::provision_locked`] with the digest taken from `source` instead of the tag.
     pub(crate) async fn provision_from(
         &self,
-        held: &EngineGuard<'_>,
+        _held: &EngineGuard<'_>,
+        image_guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
         source: DigestSource<'_>,
+        slot: &mut AcquisitionSlot,
     ) -> Result<DeployOutcome, EngineError> {
         // Config mounts are validated before anything is pinned or touched, exactly like a deploy.
         self.resolve_mounts(spec)?;
@@ -1152,7 +1343,10 @@ impl<P: PodmanClient> Reconciler<P> {
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.
         self.assign_range(instance, spec).await?;
-        let digest = match self.digest_from(instance, spec, source).await {
+        let digest = match self
+            .digest_from(image_guard, instance, spec, source, slot)
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 self.events.emit(Event::DeployFailed {
@@ -1177,8 +1371,6 @@ impl<P: PodmanClient> Reconciler<P> {
             instance: instance.clone(),
             digest: digest.clone(),
         });
-        self.retain_images_locked(held, image_repo(&spec.image))
-            .await;
         Ok(DeployOutcome::Provisioned { digest })
     }
 
@@ -1204,9 +1396,25 @@ impl<P: PodmanClient> Reconciler<P> {
     /// the digest is already considered good, and the old container does not exist or has a bad spec.
     pub(crate) async fn recreate_locked(
         &self,
-        _held: &EngineGuard<'_>,
+        held: &EngineGuard<'_>,
         instance: &InstanceName,
         reason: RecreateReason,
+    ) -> Result<DeployOutcome, EngineError> {
+        let image_guard = ImageGuard::new(held);
+        let mut slot = AcquisitionSlot::default();
+        let outcome = self
+            .recreate_body(&image_guard, instance, reason, &mut slot)
+            .await;
+        slot.finish(self, &image_guard).await;
+        outcome
+    }
+
+    async fn recreate_body(
+        &self,
+        image_guard: &ImageGuard<'_>,
+        instance: &InstanceName,
+        reason: RecreateReason,
+        slot: &mut AcquisitionSlot,
     ) -> Result<DeployOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
         // Recreating a **missing** container is a start, so the dependencies must be up first.
@@ -1225,7 +1433,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         let generation = cur.generation + 1;
         let launched = self
-            .launch_with_strategy(instance, &spec, &digest, generation)
+            .launch_with_strategy(image_guard, instance, &spec, &digest, generation, slot)
             .await?;
 
         let entry = st.apps.entry(instance.clone()).or_default();

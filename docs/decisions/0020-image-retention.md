@@ -103,3 +103,40 @@ and rolling back a daemon stays safe. `spec_hash` is untouched: retention never 
   can remove another app's rollback target or the ingress image.
 - **Pruning in every reconcile pass** — a periodic automatic sweep can delete an image between a manual
   `podman pull` and the deploy that would use it, and bulk deletion belongs to an operator's decision.
+
+## Amendment: durable provenance, reservations and scoped cleanup (v1 platform update)
+
+The "Known limitations" above are addressed by the platform update contract
+([ADR 0067](0067-managed-images-and-platform-updates.md), [v1 contract](../contracts/platform-update-v1/README.md),
+brief A of the [implementation briefs](../contributing/briefs/platform-updates.md)). This amendment supersedes the
+repository-only attribution of the original decision; the safety rules (never force, any container protects, current
+and previous stay) are unchanged.
+
+- **`managed-images.toml` is the authority for attribution.** Each acquisition (pull or archive load) records the local
+  image ID, its manifest digests and the `(owner, repository)` association before the reference is discarded. Recording
+  is an upsert that unions digests and associations and never replaces another owner's. An image whose tag moved away
+  and whose repository digests are gone (#442) is still known. The Podman list mapping keeps the standalone `Digest`
+  next to `RepoDigests`, and `null` name arrays are ordinary input.
+- **An image removed from `apps.toml` or moved to another repository survives automatic retention** because its record
+  is out of the scoped `(owner, repository)`; the explicit `images prune` (`AllManaged`) collects it once nothing
+  protects it. Images with no record are reported separately and never deleted; an explicit prune may still adopt an
+  image that a current repository name identifies, which preserves the one-off cleanup policy of the original decision.
+- **Protections are global and durable**: containers (any state), `state.toml` current/previous, spec tags,
+  `self-update.toml` current/previous/pending/switch_from/fallback_to, a nonterminal platform journal (and every
+  artifact of `BlockedRecovery`) and every durable reservation. The daemon's previous image stays protected
+  independently of the reservation that acquired it.
+- **`image-reservations.toml` closes the tag-before-record window.** An archive load reserves the operation before
+  `image_load`, advances it to `loaded` with the ID/digest before `image_tag`, and holds the image lock through commit.
+  A cancellation leaves a recoverable reservation; elapsed time never reclaims it. Reclamation requires a changed boot
+  with no referencing transaction, or `weglarka images reservations abandon <operation-id> --yes`. The file's limit
+  (1024 operations) is therefore recoverable without deleting live provenance.
+- **Fail closed.** An invalid inventory disables cleanup and is not replaced with an empty file. Deleting platform-owned
+  images requires `host-capabilities.toml` with host protocol 1 and the image-lock, platform-update-lock,
+  service-activation and reservation-phase features; absence or an older record only prints a diagnostic. A failed
+  deletion keeps its inventory record.
+- **One planner.** `execute` still removes by ID without force; `plan` is pure and takes the contract's
+  `RetentionInput`. Automatic retention runs with a fresh guard and fresh observations after a deploy releases its
+  acquisition guard, and reconcile retains under the guard it already holds rather than reacquiring it. Dry runs and
+  `doctor` use the same input builder.
+- New API surface: `PruneImagesResponse.diagnostics` and `POST /v1/images/reservations/abandon`; new CLI:
+  `weglarka images reservations abandon <operation-id> --yes`. No `apps.toml`/`state.toml` schema change.

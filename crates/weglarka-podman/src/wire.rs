@@ -761,9 +761,11 @@ impl InspectImage {
             .and_then(|d| d.split_once('@').map(|(_, digest)| digest))
             .or(Some(self.digest.as_str()))
             .and_then(|d| Digest::new(d).ok());
+        let standalone_digest = Digest::new(self.digest).ok();
         ImageInfo {
             id: self.id,
             digest,
+            standalone_digest,
             repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
             repo_digests: useful_names(repo_digests),
             size_bytes: self.size.unwrap_or(0),
@@ -778,17 +780,23 @@ impl InspectImage {
 pub(crate) struct ListedImage {
     #[serde(rename = "Id")]
     id: String,
+    /// `null` is ordinary libpod input (an untagged leftover), like an empty array.
     #[serde(rename = "RepoTags")]
     repo_tags: Option<Vec<String>>,
     #[serde(rename = "RepoDigests")]
     repo_digests: Option<Vec<String>>,
     #[serde(rename = "Size")]
     size: Option<u64>,
+    /// Standalone manifest digest. A host that lost every repository name may report only this
+    /// (#442), so it is preserved next to `RepoDigests` instead of being dropped with the names.
+    #[serde(rename = "Digest")]
+    digest: String,
 }
 
 impl ListedImage {
     pub(crate) fn into_domain(self) -> ImageInfo {
         let repo_digests = useful_names(self.repo_digests.unwrap_or_default());
+        let standalone_digest = Digest::new(self.digest).ok();
         ImageInfo {
             id: self.id,
             // The list reports every repository digest, not the one of a requested reference;
@@ -796,7 +804,9 @@ impl ListedImage {
             digest: repo_digests
                 .iter()
                 .find_map(|d| d.split_once('@').map(|(_, digest)| digest))
-                .and_then(|d| Digest::new(d).ok()),
+                .and_then(|d| Digest::new(d).ok())
+                .or_else(|| standalone_digest.clone()),
+            standalone_digest,
             repo_tags: useful_names(self.repo_tags.unwrap_or_default()),
             repo_digests,
             size_bytes: self.size.unwrap_or(0),
@@ -1419,6 +1429,37 @@ mod tests {
         assert!(dangling.repo_tags.is_empty(), "<none>:<none> is dropped");
         assert_eq!(dangling.repo_digests.len(), 1);
         assert_eq!(dangling.size_bytes, 12_345_678);
+    }
+
+    #[test]
+    fn list_images_keeps_standalone_digest_and_accepts_null_names() {
+        let listed: Vec<_> = decode::<Vec<ListedImage>>(fixture!("list_images_nameless.json"))
+            .unwrap()
+            .into_iter()
+            .map(ListedImage::into_domain)
+            .collect();
+        // A generation whose tag and repository names have moved away (#442): null arrays are
+        // ordinary input, and the standalone digest still identifies the image.
+        let nameless = &listed[0];
+        assert!(nameless.repo_tags.is_empty());
+        assert!(nameless.repo_digests.is_empty());
+        assert_eq!(
+            nameless.digest.as_ref().map(Digest::as_str),
+            Some("sha256:5555555555555555555555555555555555555555555555555555555555555555")
+        );
+        assert_eq!(nameless.standalone_digest, nameless.digest);
+        // Both are preserved: the repository digest answers for the name, the standalone one stays
+        // available for an image that loses its repository names later.
+        let both = &listed[1];
+        assert_eq!(
+            both.digest.as_ref().map(Digest::as_str),
+            Some("sha256:6666666666666666666666666666666666666666666666666666666666666666")
+        );
+        assert_eq!(
+            both.standalone_digest.as_ref().map(Digest::as_str),
+            Some("sha256:7777777777777777777777777777777777777777777777777777777777777777")
+        );
+        assert_eq!(both.size_bytes, 200);
     }
 
     #[test]
