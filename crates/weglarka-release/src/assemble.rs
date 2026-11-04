@@ -103,8 +103,6 @@ pub struct ReleaseSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReuseComponent {
     Daemon,
-    // Wired up by the CLI-only release path in the next commit.
-    #[allow(dead_code)]
     Panel,
 }
 
@@ -150,14 +148,17 @@ impl ReleaseSpec {
         Ok(bytes)
     }
 
-    /// Copies one component's whole descriptor (repository, digest and version) from `previous`,
-    /// plus, for the daemon, the host files it ships. Used for a partial release: the unchanged
-    /// component image must not be re-derived (and must not be relabeled under a new tag).
+    /// Copies one component's whole descriptor from `previous`: its repository, digest and
+    /// version, and — for the daemon — the host files it ships and the state schemas it reads and
+    /// writes. Used for a partial release: the unchanged component image must not be re-derived
+    /// (and must not be relabeled under a new tag).
     pub fn reuse(&mut self, component: ReuseComponent, previous: &Descriptor) {
         match component {
             ReuseComponent::Daemon => {
                 self.daemon = previous.daemon.clone();
                 self.host_files = previous.host_tools.files.clone();
+                self.compatibility.state_read = previous.compatibility.state_read.clone();
+                self.compatibility.state_write = previous.compatibility.state_write;
             }
             ReuseComponent::Panel => {
                 self.panel = previous.panel.clone();
@@ -447,7 +448,20 @@ mod tests {
     }
 
     #[test]
-    fn a_cli_only_reuse_keeps_the_panel() {
+    fn a_panel_only_reuse_after_a_schema_bump_keeps_the_daemon_state_versions() {
+        let mut next = spec();
+        let previous = spec().descriptor(9);
+        // The schema advanced since the previous set; the reused daemon still reads and writes the
+        // old schema, so its state versions must come from the previous set, not the flags.
+        next.compatibility =
+            compatibility(vec![18], 18, vec![digest(PANEL)], &digest(PANEL)).unwrap();
+        next.reuse(ReuseComponent::Daemon, &previous);
+        assert_eq!(next.compatibility.state_read, vec![17]);
+        assert_eq!(next.compatibility.state_write, 17);
+    }
+
+    #[test]
+    fn a_cli_only_reuse_keeps_the_panel_digest_and_version() {
         let mut next = spec();
         let previous = spec().descriptor(9);
         next.daemon = component(
@@ -456,8 +470,18 @@ mod tests {
             "0.10.0",
         )
         .unwrap();
+        // A panel version bump must not be paired with the reused digest: reuse copies the whole
+        // panel record — the digest and the version that digest was built from.
+        next.panel = component(
+            "ghcr.io/example/weglarka-panel",
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "0.4.0",
+        )
+        .unwrap();
         next.reuse(ReuseComponent::Panel, &previous);
         assert_eq!(next.panel, previous.panel);
+        assert_eq!(next.panel.version, previous.panel.version);
+        assert_eq!(next.panel.digest, previous.panel.digest);
         assert_ne!(next.daemon, previous.daemon);
     }
 

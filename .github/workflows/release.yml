@@ -542,27 +542,29 @@ jobs:
 
           args=(--channel "$CHANNEL" --revision "$GITHUB_SHA" --release-repository "$RELEASE_REPOSITORY"
                 --daemon-crate crates/weglarka-daemon --panel-crate crates/weglarka-panel --cli-crate crates/weglarka-cli
-                --host-bin-dir bin --state-read "$schema" --state-write "$schema")
+                --host-bin-dir bin)
 
           if [ "$DAEMON" = true ]; then
             [ -f metadata/daemon.json ] || { echo "::error::the daemon image was built but its identity is missing"; exit 1; }
             args+=(--daemon-repository "$(payload .repository metadata/daemon.json)"
-                   --daemon-digest "$(payload .digest metadata/daemon.json)")
+                   --daemon-digest "$(payload .digest metadata/daemon.json)"
+                   --state-read "$schema" --state-write "$schema")
           else
-            # Panel-only: reuse the daemon image and its host-file records without relabeling.
+            # Panel-only: reuse the daemon image, its host-file records and its state schemas
+            # without relabeling or re-deriving them.
             [ -f previous.json ] || { echo "::error::--reuse-daemon needs a previous release set"; exit 1; }
             args+=(--reuse-daemon)
           fi
 
           if [ "$PANEL" = true ]; then
             [ -f metadata/panel.json ] || { echo "::error::the panel image was built but its identity is missing"; exit 1; }
-            panel_digest=$(payload .digest metadata/panel.json)
+            args+=(--panel-repository "$PANEL_IMAGE" --panel-digest "$(payload .digest metadata/panel.json)")
           else
-            # CLI-only: the panel artifact is unchanged, so the previous promoted panel is reused.
+            # CLI-only: the panel artifact is unchanged, so the previous promoted panel is reused
+            # with its digest and version.
             [ -f previous.json ] || { echo "::error::a CLI-only release needs a previous release set to reuse the panel"; exit 1; }
-            panel_digest=$(payload .panel.digest previous.json)
+            args+=(--reuse-panel)
           fi
-          args+=(--panel-repository "$PANEL_IMAGE" --panel-digest "$panel_digest")
 
           [ -n "$TESTED" ] || { echo "::error::the compatibility matrix reported no tested panel"; exit 1; }
           IFS=',' read -ra digests <<< "$TESTED"
