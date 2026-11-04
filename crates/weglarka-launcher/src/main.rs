@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         RoleArg::Update(args) => run_worker(&host_dir, &cli.config, Role::Update, &args),
         RoleArg::Supervise(args) => run_worker(&host_dir, &cli.config, Role::Supervise, &args),
         RoleArg::Cli { args } => {
-            let generation = resolve_cached(&host_dir)?;
+            let generation = resolve(&host_dir, GenerationChoice::Active, true)?;
             // Replace the launcher with the CLI: its exit code, stdin and TTY pass through.
             exec_plan(&plan_cli(&generation, args)?)?;
             Ok(())
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
             if all {
                 generations.push((
                     "active".to_owned(),
-                    resolve(&host_dir, GenerationChoice::Active)?,
+                    resolve(&host_dir, GenerationChoice::Active, false)?,
                 ));
                 let recovery = recovery_generation(&host_dir)?;
                 if generations
@@ -197,7 +197,7 @@ fn main() -> Result<()> {
                     )
                 })?;
                 let generation = match choice {
-                    GenerationChoice::Active => resolve(&host_dir, choice)?,
+                    GenerationChoice::Active => resolve(&host_dir, choice, false)?,
                     GenerationChoice::Previous => recovery_generation(&host_dir)?,
                     GenerationChoice::Candidate => {
                         candidate_generation(&host_dir)?.ok_or_else(|| {
@@ -253,8 +253,8 @@ fn run_worker(
     // The update job always hashes the binaries it is about to run (and may replace); the watchdog
     // runs often enough that it trusts the root-owned verified-metadata record.
     let generation = match role {
-        Role::Update => resolve(host_dir, GenerationChoice::Active)?,
-        _ => resolve_cached(host_dir)?,
+        Role::Update => resolve(host_dir, GenerationChoice::Active, false)?,
+        _ => resolve(host_dir, GenerationChoice::Active, true)?,
     };
     let plan = match role {
         Role::Update => plan_update(&generation, config)?,
@@ -265,7 +265,13 @@ fn run_worker(
     Ok(())
 }
 
-fn resolve(host_dir: &std::path::Path, choice: GenerationChoice) -> Result<Generation> {
+/// Opens the selected generation. `cached` skips the hash of binaries whose metadata matches the
+/// record of their last full verification; only the hot paths (the CLI and the watchdog) ask for it.
+fn resolve(
+    host_dir: &std::path::Path,
+    choice: GenerationChoice,
+    cached: bool,
+) -> Result<Generation> {
     let selector = HostSelector::load(host_dir).context("reading host-tools.toml")?;
     let digest = match choice {
         GenerationChoice::Active => selector.active.clone(),
@@ -275,23 +281,17 @@ fn resolve(host_dir: &std::path::Path, choice: GenerationChoice) -> Result<Gener
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no candidate generation is recorded"))?,
     };
-    GenerationStore::new(host_dir)
-        .open(&digest)
-        .with_context(|| format!("opening generation {digest}"))
-}
-
-/// The active generation, skipping the hash of binaries whose metadata matches the record of their
-/// last full verification. Only the hot paths (the CLI and the watchdog) use it.
-fn resolve_cached(host_dir: &std::path::Path) -> Result<Generation> {
-    let selector = HostSelector::load(host_dir).context("reading host-tools.toml")?;
-    let digest = selector.active;
-    GenerationStore::new(host_dir)
-        .open_cached(&digest)
-        .with_context(|| format!("opening generation {digest}"))
+    let store = GenerationStore::new(host_dir);
+    let opened = if cached {
+        store.open_cached(&digest)
+    } else {
+        store.open(&digest)
+    };
+    opened.with_context(|| format!("opening generation {digest}"))
 }
 
 fn recovery_generation(host_dir: &std::path::Path) -> Result<Generation> {
-    resolve(host_dir, GenerationChoice::Previous)
+    resolve(host_dir, GenerationChoice::Previous, false)
 }
 
 fn candidate_generation(host_dir: &std::path::Path) -> Result<Option<Generation>> {

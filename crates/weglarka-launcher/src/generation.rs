@@ -8,7 +8,7 @@
 //!
 //! Hashing both binaries on every launcher call is the expensive part, so a generation also has a
 //! `<digest>.verified` record next to it (inside `generations/`, hence root-owned): the
-//! `(dev, ino, mtime, size)` of each binary at the moment its SHA-256 last matched the manifest.
+//! `(ino, mtime, size)` of each binary at the moment its SHA-256 last matched the manifest.
 //! [`GenerationStore::open_cached`] skips the hash of a binary whose metadata still matches;
 //! [`GenerationStore::open`] always hashes (bootstrap, update and preflight use it). A record is
 //! only ever written after a full hash matched the manifest, and only the root-owned directory
@@ -130,10 +130,14 @@ pub enum GenerationError {
 }
 
 /// What identifies the bytes of a file without reading them.
+///
+/// `st_dev` is deliberately left out: it is not stable across reboots on every filesystem, and the
+/// runtime-user launcher cannot refresh the record, so including it could turn the cache off for good.
+/// A file swapped for one on another filesystem needs write access to the root-owned `generations/`
+/// and still has to match inode, mtime and size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileStamp {
-    dev: u64,
     ino: u64,
     mtime_sec: i64,
     mtime_nsec: i64,
@@ -143,7 +147,6 @@ struct FileStamp {
 impl FileStamp {
     fn of(metadata: &fs::Metadata) -> Self {
         Self {
-            dev: metadata.dev(),
             ino: metadata.ino(),
             mtime_sec: metadata.mtime(),
             mtime_nsec: metadata.mtime_nsec(),
@@ -292,15 +295,23 @@ impl GenerationStore {
             .join(format!("{}{VERIFIED_SUFFIX}", generation_name(digest)))
     }
 
-    /// The stored record for `digest`, or `None` when it is absent, unreadable or not about this
-    /// generation: a record is only ever an optimisation.
-    fn read_record(&self, digest: &StrictDigest) -> Option<VerifiedRecord> {
-        let text = read_bounded(
-            &self.record_path(digest),
-            "verified record",
-            VERIFIED_MAX_BYTES,
-        )
-        .ok()??;
+    /// The stored record for `generation_dir`'s digest, or `None` when it is absent, unreadable, not
+    /// about this generation or not trustworthy: a record is only ever an optimisation. Beyond its
+    /// content it must be a regular file (never a symlink), owned by whoever owns the binaries, and
+    /// not writable by group or others.
+    fn read_record(&self, digest: &StrictDigest, generation_dir: &Path) -> Option<VerifiedRecord> {
+        let path = self.record_path(digest);
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_file() || meta.permissions().mode() & 0o022 != 0 {
+            return None;
+        }
+        for name in HOST_TOOL_NAMES {
+            let binary = fs::symlink_metadata(generation_dir.join(name)).ok()?;
+            if binary.uid() != meta.uid() {
+                return None;
+            }
+        }
+        let text = read_bounded(&path, "verified record", VERIFIED_MAX_BYTES).ok()??;
         let record: VerifiedRecord = toml::from_str(&text).ok()?;
         (record.format_version == VERIFIED_FORMAT_VERSION && record.generation == *digest)
             .then_some(record)
@@ -327,7 +338,7 @@ impl GenerationStore {
         self.open_with(digest, false)
     }
 
-    /// Like [`open`](Self::open), but a binary whose `(dev, ino, mtime, size)` still equals the
+    /// Like [`open`](Self::open), but a binary whose `(ino, mtime, size)` still equals the
     /// record written after its last full verification is not hashed again. Anything else falls
     /// back to the full check, which refreshes the record only when the hash matches.
     pub fn open_cached(&self, digest: &StrictDigest) -> Result<Generation, GenerationError> {
@@ -372,7 +383,7 @@ impl GenerationStore {
             });
         }
         let record = if use_record {
-            self.read_record(digest)
+            self.read_record(digest, &dir)
         } else {
             None
         };
@@ -801,6 +812,8 @@ fn file_digest_with_stamps(
         path: path.to_owned(),
         source,
     };
+    #[cfg(test)]
+    tests::HASHED_FILES.with(|n| n.set(n.get() + 1));
     let file = fs::File::open(path).map_err(read_error)?;
     let before = FileStamp::of(&file.metadata().map_err(read_error)?);
     let streamed = sha256_reader(&file).map_err(read_error)?;
@@ -829,6 +842,12 @@ fn remove_dir(path: &Path) -> Result<(), GenerationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Binaries hashed on this thread, so a test can tell a cached open from a full one.
+        pub(super) static HASHED_FILES: Cell<usize> = const { Cell::new(0) };
+    }
     use sha2::{Digest as _, Sha256};
 
     fn digest(byte: char) -> StrictDigest {
@@ -1008,21 +1027,33 @@ mod tests {
         assert_eq!(store.list().unwrap(), vec![d]);
     }
 
+    /// Number of binaries hashed on this thread while `f` runs.
+    fn hashed_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = HASHED_FILES.with(Cell::get);
+        let out = f();
+        (out, HASHED_FILES.with(Cell::get) - before)
+    }
+
+    fn later(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5)
+    }
+
     #[test]
     fn a_cached_open_of_an_unchanged_generation_does_not_read_the_binaries() {
         let dir = tempfile::tempdir().unwrap();
         let (store, d) = installed(dir.path(), 'a');
-        let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
-        let mtime = fs::metadata(&daemon).unwrap().modified().unwrap();
 
-        // Same size, same inode, same mtime: the only way to tell is to read the bytes. The cached
-        // open trusts the record and succeeds; the full check reads them and refuses.
-        rewrite_in_place(&daemon, b"DAEMON", Some(mtime));
-        store.open_cached(&d).unwrap();
-        assert!(matches!(
-            store.open(&d),
-            Err(GenerationError::Mismatch { .. })
-        ));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+
+        // The full check (bootstrap, update, preflight) always reads both binaries.
+        let (opened, hashed) = hashed_during(|| store.open(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
     }
 
     #[test]
@@ -1032,13 +1063,10 @@ mod tests {
         let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
         let record = fs::read(store.record_path(&d)).unwrap();
 
-        let later =
-            fs::metadata(&daemon).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
-        rewrite_in_place(&daemon, b"DAEMON", Some(later));
-        assert!(matches!(
-            store.open_cached(&d),
-            Err(GenerationError::Mismatch { .. })
-        ));
+        rewrite_in_place(&daemon, b"DAEMON", Some(later(&daemon)));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        assert!(matches!(opened, Err(GenerationError::Mismatch { .. })));
+        assert_eq!(hashed, 1, "only the changed binary is read");
         // A hash that does not match the manifest never refreshes the record.
         assert_eq!(fs::read(store.record_path(&d)).unwrap(), record);
         assert!(matches!(
@@ -1056,25 +1084,27 @@ mod tests {
         let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
 
         fs::remove_file(&record).unwrap();
-        store.open_cached(&d).unwrap();
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
         assert_eq!(fs::read(&record).unwrap(), original);
 
-        // The same bytes with a new mtime: hashed again (it still matches), then recorded.
-        let later =
-            fs::metadata(&daemon).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
-        daemon_touch(&daemon, later);
-        store.open_cached(&d).unwrap();
+        // The same bytes with a new mtime: that binary is hashed again (it still matches), then recorded.
+        daemon_touch(&daemon, later(&daemon));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 1);
         assert_ne!(fs::read(&record).unwrap(), original);
         // ... and the next cached open trusts the refreshed record.
-        rewrite_in_place(&daemon, b"DAEMON", Some(later));
-        store.open_cached(&d).unwrap();
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
 
-        // Garbage in the record is ignored, not trusted (the rewrite above is now caught).
+        // Garbage in the record is ignored, not trusted.
         fs::write(&record, b"not toml").unwrap();
-        assert!(matches!(
-            store.open_cached(&d),
-            Err(GenerationError::Mismatch { .. })
-        ));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
     }
 
     fn daemon_touch(path: &Path, mtime: std::time::SystemTime) {
@@ -1090,18 +1120,55 @@ mod tests {
     fn a_record_for_another_manifest_entry_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
         let (store, d) = installed(dir.path(), 'd');
-        let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
-        let mtime = fs::metadata(&daemon).unwrap().modified().unwrap();
-        rewrite_in_place(&daemon, b"DAEMON", Some(mtime));
+        let generation_dir = store.generation_dir(&d);
 
         // The stamps still match, but the record vouches for a different digest than the manifest's.
-        let mut record = store.read_record(&d).unwrap();
+        let mut record = store.read_record(&d, &generation_dir).unwrap();
         record.files[0].digest = digest('0');
         fs::write(store.record_path(&d), toml::to_string(&record).unwrap()).unwrap();
-        assert!(matches!(
-            store.open_cached(&d),
-            Err(GenerationError::Mismatch { .. })
-        ));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 1, "only the entry the record does not vouch for");
+    }
+
+    #[test]
+    fn a_symlinked_record_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'e');
+        let record = store.record_path(&d);
+        let elsewhere = dir.path().join("copy.verified");
+        fs::rename(&record, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
+        // The refresh replaces the link with a regular file, which is trusted again.
+        assert!(fs::symlink_metadata(&record).unwrap().file_type().is_file());
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+    }
+
+    #[test]
+    fn a_group_or_world_writable_record_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'f');
+        let record = store.record_path(&d);
+        for mode in [0o664, 0o646] {
+            fs::set_permissions(&record, fs::Permissions::from_mode(mode)).unwrap();
+            let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+            opened.unwrap();
+            assert_eq!(hashed, 2, "mode {mode:o}");
+            // The refresh writes it back with the safe mode.
+            assert_eq!(
+                fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+            opened.unwrap();
+            assert_eq!(hashed, 0);
+        }
     }
 
     #[test]
