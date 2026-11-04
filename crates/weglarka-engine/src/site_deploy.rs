@@ -154,6 +154,14 @@ impl<P: PodmanClient> Reconciler<P> {
             let releases = site_dir.join("releases");
             let partial = releases.join(format!("{id}.partial"));
             let (a, p, r) = (archive.clone(), partial.clone(), releases.clone());
+            // `not_found_page` (#104, ADR 0069) gets the same fail-closed gate as `index.html`
+            // (ADR 0049): the release is rejected and `current` stays untouched when the custom 404
+            // page it names does not exist, rather than having nginx serve a confusing bare 404.
+            let not_found_page = spec
+                .ingress
+                .static_
+                .as_ref()
+                .and_then(|opts| opts.not_found_page.clone());
             tokio::task::spawn_blocking(move || {
                 std::fs::create_dir_all(&r).map_err(|e| format!("{}: {e}", r.display()))?;
                 // A leftover from a crashed deploy.
@@ -162,6 +170,17 @@ impl<P: PodmanClient> Reconciler<P> {
                 if !p.join("index.html").is_file() {
                     let _ = std::fs::remove_dir_all(&p);
                     return Err("the site has no index.html at its root".to_owned());
+                }
+                if let Some(page) = &not_found_page {
+                    // `not_found_page` is a release-relative path like `index.html` (ADR 0069), always
+                    // starting with `/` (`check_path_prefix`); strip it to join under the release dir.
+                    let relative = page.trim_start_matches('/');
+                    if !p.join(relative).is_file() {
+                        let _ = std::fs::remove_dir_all(&p);
+                        return Err(format!(
+                            "the site has no {page} at its root (ingress.static.not_found_page)"
+                        ));
+                    }
                 }
                 Ok(())
             })
