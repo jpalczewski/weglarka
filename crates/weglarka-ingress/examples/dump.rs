@@ -12,7 +12,9 @@
 //! `.github/scripts/test-forward-auth.sh`: `panel` (`panel.example.eu`, forward auth, `/mcp/` exempt) and
 //! `open` (no auth) are upstreams on port 3000, the provider `authelia` answers on 9091.
 //! `landing` (the whole `landing.example.eu`) and `docs` (`blog.example.eu/docs`, next to the `blog` container
-//! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`.
+//! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`; `help`
+//! (`help.example.eu`) is a static site with every per-site option set (#104, ADR 0069: a redirect, a
+//! custom 404 page, a feed and security headers) for the same script.
 
 use std::collections::BTreeMap;
 
@@ -98,6 +100,27 @@ kind = "static"
 image = "registry.example.com/x/docs:latest"
 domains = ["blog.example.eu"]
 paths = ["/docs"]
+
+# Every per-site option at once (#104, ADR 0069) for `.github/scripts/test-static.sh`.
+[apps.help]
+kind = "static"
+image = "registry.example.com/x/help:latest"
+domains = ["help.example.eu"]
+
+[apps.help.ingress.static]
+not_found_page = "/404.html"
+
+[[apps.help.ingress.static.redirects]]
+from = "/old"
+to = "/new"
+
+[[apps.help.ingress.static.feeds]]
+path = "/feed.xml"
+format = "rss"
+
+[apps.help.ingress.static.security_headers]
+preset = "baseline"
+csp = "default-src 'self'"
 "#;
 
 /// `[identity]` for the forward-auth samples; its instance is the `authelia` app below.
