@@ -59,11 +59,18 @@ conf=$runtime_conf
 # `docker run -d` names of the upstream containers; filled below.
 ups=()
 
+# The generated config writes access/error logs to the daemon-owned volume, not to stdout.
+nginx_log() { # file -> contents
+  docker exec wg-edge-nginx cat "/var/log/weglarka/$1" 2>/dev/null     || docker run --rm --entrypoint cat -v wg-nginx-logs:/logs docker.io/library/nginx:1-alpine "/logs/$1" 2>/dev/null     || true
+}
+
 # shellcheck disable=SC2329,SC2317 # invoked by the EXIT trap
 cleanup() {
   status=$?
   if [ "$status" -ne 0 ]; then
-    echo "::group::nginx logs"; docker logs wg-edge-nginx 2>&1 | tail -80 || true; echo "::endgroup::"
+    echo "::group::nginx startup logs"; docker logs wg-edge-nginx 2>&1 | tail -40 || true; echo "::endgroup::"
+    echo "::group::nginx access log"; nginx_log access.log | tail -80; echo "::endgroup::"
+    echo "::group::nginx error log"; nginx_log error.log | tail -40; echo "::endgroup::"
     for name in ${ups[@]+"${ups[@]}"}; do
       echo "::group::$name logs"; docker logs "$name" 2>&1 | tail -20 || true; echo "::endgroup::"
     done
@@ -326,7 +333,7 @@ expect "probe socket: HTTP/1.1 next to http2 on" \
     -H "Host: $tls_domain" http://probe/ 2>/dev/null || true)" "1.1"
 # The access log shows the peer as `unix:` instead of an empty address.
 sleep 1
-if docker logs wg-edge-nginx 2>&1 | grep -F '"remote_addr":"unix:"' | grep -qF "\"host\":\"$plain_domain\""; then
+if nginx_log access.log | grep -F '"remote_addr":"unix:"' | grep -qF "\"host\":\"$plain_domain\""; then
   echo "ok   probe socket: access log shows remote_addr unix:"
 else
   echo "FAIL probe socket: no access log line with remote_addr unix: for $plain_domain"; fail=1
@@ -392,7 +399,7 @@ except OSError:
     pass
 PY
   sleep 1
-  line=$(docker logs wg-edge-nginx 2>&1 | grep -F '"status":400' | grep -F '"remote_addr":"203.0.113.7"' | tail -1 || true)
+  line=$(nginx_log access.log | grep -F '"status":400' | grep -F '"remote_addr":"203.0.113.7"' | tail -1 || true)
   if [ -n "$line" ]; then
     echo "ok   malformed request: logged with the announced client 203.0.113.7"
     case $line in
@@ -401,7 +408,7 @@ PY
     esac
   else
     echo "FAIL malformed request: no 400 log line with remote_addr 203.0.113.7 (unix: before #182)"
-    docker logs wg-edge-nginx 2>&1 | grep -F '"status":400' | tail -3 || true
+    nginx_log access.log | grep -F '"status":400' | tail -3 || true
     fail=1
   fi
 else
@@ -410,7 +417,7 @@ fi
 
 # Requests that reach no app server (the 444 above, the malformed one, the rejected handshakes) must not
 # make nginx warn about an uninitialized `$app`.
-if docker logs wg-edge-nginx 2>&1 | grep -qF 'uninitialized "app" variable'; then
+if nginx_log error.log | grep -qF 'uninitialized "app" variable'; then
   echo 'FAIL catch-all: nginx warned about an uninitialized "app" variable'; fail=1
 else
   echo 'ok   catch-all: no uninitialized "app" warning'
@@ -423,5 +430,5 @@ h2=$(curl -sS -k -o /dev/null -w '%{http_version}' --max-time 10 \
 echo "info HTTP version on the TLS listener: $h2 (HTTP/2 is expected, not asserted)"
 
 echo "--- nginx access log (last lines)"
-docker logs wg-edge-nginx 2>&1 | tail -5 || true
+nginx_log access.log | tail -5 || true
 exit "$fail"
