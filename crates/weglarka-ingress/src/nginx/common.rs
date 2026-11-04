@@ -71,6 +71,12 @@ pub(super) fn write_http_scaffolding(c: &mut Conf, o: &NginxOptions) {
     c.line("fastcgi_temp_path /tmp/fastcgi;");
     c.line("uwsgi_temp_path /tmp/uwsgi;");
     c.line("scgi_temp_path /tmp/scgi;");
+    // A static site's own `return 301`/`rewrite ... permanent` (#104, `redirects`) always spells out
+    // its target, so this is about nginx's *implicit* redirects (a directory without a trailing slash,
+    // `error_page`'s internal redirect): left on, nginx completes them with its own `$scheme`/`$host`/
+    // `$server_port`, which in `behind` mode is the internal port behind Traefik — a client would see
+    // the wrong port or scheme in `Location`. Off everywhere, nginx keeps them relative instead.
+    c.line("absolute_redirect off;");
     c.blank();
     let resolvers: Vec<String> = o
         .resolvers
