@@ -30,6 +30,10 @@ pub struct Call {
 }
 
 /// A [`Registry`] that returns scripted signatures (or a scripted error) and records its calls.
+///
+/// [`FakeRegistry::new`] models a `.sig` manifest that exists but holds no key-based layer (the real
+/// client answers `Ok` with an empty list, e.g. for a keyless-only signature).
+/// [`FakeRegistry::without_signature_tag`] models an unsigned image: no `.sig` tag, so a `404`.
 #[derive(Debug, Default)]
 pub struct FakeRegistry {
     state: Mutex<FakeState>,
@@ -38,6 +42,8 @@ pub struct FakeRegistry {
 #[derive(Debug, Default)]
 struct FakeState {
     signatures: Vec<Signature>,
+    /// No `.sig` tag exists: unless `failure` is set, every call answers `404`.
+    no_signature_tag: bool,
     failure: Option<RegistryError>,
     calls: Vec<Call>,
 }
@@ -45,6 +51,17 @@ struct FakeState {
 impl FakeRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fake for an unsigned image: the `.sig` tag is absent, so every call fails with the `404` the
+    /// HTTP client reports (`RegistryError::is_not_found()`), until signatures are pushed.
+    pub fn without_signature_tag() -> Self {
+        let fake = Self::default();
+        fake.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .no_signature_tag = true;
+        fake
     }
 
     /// A fake that always returns `signatures`.
@@ -59,11 +76,10 @@ impl FakeRegistry {
 
     /// Adds a signature to the scripted answer.
     pub fn push_signature(&self, signature: Signature) {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .signatures
-            .push(signature);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.signatures.push(signature);
+        // The tag exists from now on.
+        state.no_signature_tag = false;
     }
 
     /// The **next** call fails with `error`; later calls return the scripted signatures again.
@@ -105,6 +121,12 @@ impl Registry for FakeRegistry {
         });
         if let Some(failure) = state.failure.take() {
             return Err(failure);
+        }
+        if state.no_signature_tag {
+            return Err(RegistryError::Status {
+                status: 404,
+                what: "signature manifest",
+            });
         }
         Ok(state.signatures.clone())
     }

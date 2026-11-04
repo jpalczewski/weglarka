@@ -27,6 +27,8 @@
 //! 64 KiB), redirects are limited to 5, the `Authorization` header is never sent to a different
 //! authority than the registry, and plain HTTP is allowed only for loopback hosts (tests).
 
+#[cfg(any(test, feature = "testing"))]
+pub mod contract;
 mod cosign;
 mod http;
 // The parser lives in the model (the release-set `Repository` validates through it); re-exported here.
