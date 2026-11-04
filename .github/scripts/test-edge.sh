@@ -199,7 +199,7 @@ mkdir -p "$probe_dir"
 chmod 777 "$probe_dir"
 docker run -d --name wg-edge-nginx --network "$net" \
   -p "127.0.0.1:$http_port:8080" -p "127.0.0.1:$https_port:8443" \
-  -v "$sock_dir:/run/wg-ingress" -v "$probe_dir:/run/weglarka-probe" \
+  -v "$sock_dir:/run/wg-ingress" -v "$probe_dir:/run/weglarka-probe" -v wg-nginx-logs:/var/log/weglarka \
   -v "$conf:/etc/nginx/nginx.conf:ro" -v "$tls_dir:/etc/nginx/tls:ro" \
   -v "$acme_dir:/etc/nginx/acme:ro" docker.io/library/nginx:1-alpine >/dev/null
 

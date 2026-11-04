@@ -47,7 +47,7 @@ use weglarka_model::state;
 
 use crate::admin::{Fail, parse_name};
 use crate::app::Daemon;
-use crate::log_retention::{ACCESS_LOG, completed_file_date, utc_date};
+use crate::log_retention::{ACCESS_LOG, completed_file_date};
 use crate::stream::{CallerSub, Ended, StreamDeadline, stream_response, unix_secs};
 
 /// Frames queued between the pump and the response body: small, so a slow client holds back the
@@ -420,6 +420,17 @@ impl Follow {
                         Ok(meta) => {
                             let current = (meta.dev(), meta.ino());
                             if self.id.is_some_and(|id| id != current) {
+                                // Old workers can still append to the old inode after HUP (a long
+                                // request, a streaming response). Drain it once more before switching,
+                                // or those lines are lost with the dropped descriptor.
+                                match file.read(&mut self.buf).await {
+                                    Ok(0) => {}
+                                    Ok(n) => {
+                                        self.position += n as u64;
+                                        return Some(Ok(Bytes::copy_from_slice(&self.buf[..n])));
+                                    }
+                                    Err(e) => return Some(Err(e)),
+                                }
                                 self.file = None;
                                 continue;
                             }
@@ -441,10 +452,16 @@ impl Follow {
     }
 }
 
-/// Completed daily files inside `since`, in chronological order, followed by the current file. The
-/// current file is last; it may contain lines older than `since`, which `Scan` filters out.
+/// Completed daily files that were still being written at `since`, in write order, followed by the
+/// current file. The current file is last; it may contain lines older than `since`, which `Scan`
+/// filters out.
+///
+/// The name of a completed file is the UTC day the current file *started* on, and rotation runs at
+/// most an hour after midnight. Its last write can therefore be on the next day, after `since`; a
+/// date-based selection would drop those lines. `mtime` is the time of the last write (also when an
+/// old worker kept appending after the rename), which is the right lower bound. A file whose mtime
+/// cannot be read is kept: the timestamp filter in `Scan` still decides per line.
 fn select_files(dir: &StdPath, since: SystemTime) -> VecDeque<PathBuf> {
-    let since_days = crate::log_retention::parse_date(&utc_date(since)).unwrap_or(i64::MAX);
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return VecDeque::new(),
@@ -456,13 +473,14 @@ fn select_files(dir: &StdPath, since: SystemTime) -> VecDeque<PathBuf> {
         let name = name.to_string_lossy();
         if name == ACCESS_LOG {
             current = Some(entry.path());
-        } else if let Some(day) = completed_file_date(&name)
-            && day >= since_days
-        {
-            completed.push((day, entry.path()));
+        } else if completed_file_date(&name).is_some() {
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            if modified.is_none_or(|m| m >= since) {
+                completed.push((modified, entry.path()));
+            }
         }
     }
-    completed.sort_by_key(|(day, _)| *day);
+    completed.sort_by_key(|(modified, _)| *modified);
     completed
         .into_iter()
         .map(|(_, path)| path)
@@ -965,6 +983,39 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_file_is_selected_by_its_last_write_not_its_name() {
+        // Rotation may run after midnight, so `access-D.log` can contain lines from D+1. Selecting by
+        // the date in the name would drop them from a window that starts after midnight.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("access-2026-11-02.log");
+        let recent = dir.path().join("access-2026-11-03.log");
+        let current = dir.path().join(ACCESS_LOG);
+        std::fs::write(&old, b"old\n").unwrap();
+        std::fs::write(&recent, b"recent\n").unwrap();
+        std::fs::write(&current, b"current\n").unwrap();
+        let at = |path: &std::path::Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        // 2026-11-04 00:00 UTC plus a few minutes.
+        let midnight = 1_793_750_400;
+        at(&old, midnight - 600);
+        at(&recent, midnight + 600);
+        at(&current, midnight + 900);
+
+        let files = select_files(dir.path(), UNIX_EPOCH + Duration::from_secs(midnight + 300));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["access-2026-11-03.log", "access.log"]);
+    }
+
+    #[test]
     fn filters_match_as_documented() {
         let e = entry(503, "POST", "/api/v1/x", "web.example.com");
         for (raw, want) in [
@@ -1059,6 +1110,55 @@ mod tests {
         let mut ring = Ring::new(0);
         ring.push(Bytes::from_static(b"x"));
         assert!(ring.frames.is_empty() && ring.bytes == 0);
+    }
+
+    #[tokio::test]
+    async fn follow_drains_the_old_file_after_a_rename() {
+        use std::io::Write as _;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(ACCESS_LOG);
+        std::fs::write(
+            &path, b"a
+",
+        )
+        .unwrap();
+        let file = File::open(&path).await.unwrap();
+        let meta = file.metadata().await.unwrap();
+        let mut follow = Follow {
+            path: path.clone(),
+            file: Some(file),
+            position: 0,
+            id: Some((meta.dev(), meta.ino())),
+            buf: vec![0; CHUNK],
+        };
+        assert_eq!(
+            follow.next_chunk().await.unwrap().unwrap(),
+            Bytes::from_static(
+                b"a
+"
+            )
+        );
+
+        // The daemon renames the file, an old worker appends to the renamed inode, and nginx
+        // creates the new current file.
+        let old = d.path().join("access-2026-11-03.log");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&old)
+            .unwrap()
+            .write_all(b"a2\n")
+            .unwrap();
+        std::fs::write(&path, b"b\n").unwrap();
+
+        assert_eq!(
+            follow.next_chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"a2\n")
+        );
+        assert_eq!(
+            follow.next_chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"b\n")
+        );
     }
 
     // ---- two phases ----

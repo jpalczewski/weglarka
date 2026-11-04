@@ -38,7 +38,8 @@ pass.
 ```
 
 The directory is a writable bind mount at `/var/log/weglarka` in the nginx container. It is deliberately outside
-`<nginx_conf_dir>`, so a backup of the configuration does not copy visitor addresses. nginx does not log requests to
+`<nginx_conf_dir>`, so a backup of the configuration does not copy visitor addresses. A backup of the **state
+directory** does contain this directory and therefore visitor IPs; handle it as personal data. nginx does not log requests to
 its stdout any more; the Podman log of that container keeps only startup/config diagnostics.
 
 The daemon checks once an hour. On the first pass of a UTC day it renames the current files to the completed
@@ -51,9 +52,11 @@ renamed (a collision from an earlier crash) gets a `.1`, `.2`, … suffix instea
 - A completed file dated `D` is deleted when today is `D + retention` (UTC), so a line is normally gone within
   `retention` days and at most **`retention + 1` days**: the current file also holds the lines written since the last
   hourly pass.
-- If the daemon was down across a day boundary, the first rotation groups that backlog in the file of its last write.
-  Those lines can live longer than `retention + 1`; the daemon cannot split a file it was not running for without
-  reading and rewriting it. This is a deliberate limitation of the first version.
+- If the daemon was down across a day boundary, the first rotation groups that backlog in the file named for the
+  day recorded in `.logdate` (the day the current file started), not for its last write. Those lines can live longer
+  than `retention + 1`, and a `--since` window after the downtime may not select the whole backlog; the daemon cannot
+  split a file it was not running for without reading and rewriting it. This is a deliberate limitation of the first
+  version.
 - `retention = "unlimited"` means no deletion at all.
 
 A privacy policy for a site behind Węglarka can therefore say, for example: “The server keeps access logs
@@ -74,10 +77,11 @@ containing IP addresses for 30 days (at most 31 days) and then deletes them.” 
 
 ## Reading the log
 
-`weglarka access <app>` reads the same files: completed days inside the requested window, then the current
-`access.log`. `--since`, `--tail`, the filters and `--follow` are unchanged. History now survives an nginx recreate and
-is bounded by the retention period; follow starts exactly where history stopped, so a line is not repeated within one
-connection. Reconnecting with `--since` can still show a line twice, as before.
+`weglarka access <app>` reads the same files: completed files whose last write is inside the requested window, then
+the current `access.log`. `--since`, `--tail`, the filters and `--follow` are unchanged. History now survives an nginx
+recreate and is bounded by the retention period; follow starts at the byte/inode where history stopped, so a line is
+not repeated within one connection. A rotation during follow can still lose a line written by an old worker at the
+switch, and reconnecting with `--since` can show a line twice; both are best-effort, as before.
 
 ## Disk use
 

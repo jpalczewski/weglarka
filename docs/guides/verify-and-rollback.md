@@ -6,7 +6,7 @@ downgrading Węglarka itself.
 ```sh
 weglarka status && weglarka apps show ntfy      # digest, generation, last deploy
 curl -fsS https://ntfy.example.com/             # from outside, through Traefik
-podman logs weglarka-nginx                      # JSON access log with the app field
+weglarka access ntfy                            # JSON access log of one app (retained, ADR 0070)
 podman inspect weglarka-nginx --format '{{.HostConfig.ReadonlyRootfs}} {{.EffectiveCaps}}'  # true [] (ADR 0014)
 ```
 

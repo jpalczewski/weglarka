@@ -57,8 +57,8 @@ pub(super) fn write_preamble(c: &mut Conf, tls_fingerprint: Option<&str>) {
     c.line("worker_processes 1;");
     c.line("pid /tmp/nginx.pid;");
     // Daemon-owned file, not stderr: the daemon rotates it and deletes it after `[logs] retention`
-    // (issue #502). `error_log` paths cannot contain variables, so the daemon rotates this one with
-    // SIGHUP; the access log has its own daily file policy (see `write_log`).
+    // (issue #502). `error_log` paths cannot contain variables; the daemon renames both this file and
+    // `access.log` (see `write_log`) and reopens them with SIGHUP.
     c.line(&format!("error_log {LOG_CONTAINER_DIR}/error.log warn;"));
     c.blank();
     c.block("events", |c| c.line("worker_connections 1024;"));

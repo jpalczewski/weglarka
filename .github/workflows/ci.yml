@@ -263,7 +263,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx > "$RUNNER_TEMP/nginx.conf"
-          docker run --rm -i -v /run/weglarka-probe docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
+          docker run --rm -i -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka docker.io/library/nginx:1-alpine sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/nginx.conf"
       # Edge mode (issue #95): nginx owns the public web ports and terminates TLS. The same image must accept
       # the generated config with the TLS material mounted where the daemon puts it (<nginx_conf_dir>/tls),
       # and the containers below exercise redirects, the ACME webroot, TLS and the fail-closed paths.
@@ -282,7 +282,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/edge-run"
           chmod 777 "$RUNNER_TEMP/edge-run"
           docker run --rm -i -v "$RUNNER_TEMP/edge-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-run:/run/wg-ingress" \
-            -v /run/weglarka-probe \
+            -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka \
             docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge.conf"
           .github/scripts/test-edge.sh "$RUNNER_TEMP/edge.conf" "$RUNNER_TEMP/edge-certs"
@@ -307,10 +307,10 @@ jobs:
             -subj "/CN=example.eu" -addext "subjectAltName=DNS:example.eu,DNS:*.example.eu"
           chmod 600 "$certs/_wildcard.example.eu.key"
           cargo run -q -p weglarka-ingress --example dump -- nginx-edge "" example.eu > "$RUNNER_TEMP/edge-wildcard.conf"
-          docker run --rm -i -v "$certs:/etc/nginx/tls:ro" -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
+          docker run --rm -i -v "$certs:/etc/nginx/tls:ro" -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-wildcard.conf"
           docker run -d --name wg-edge-wildcard -p 127.0.0.1:18447:8443 \
-            -v /run/weglarka-probe -v "$certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-wildcard.conf:/etc/nginx/nginx.conf:ro" \
+            -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka -v "$certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/edge-wildcard.conf:/etc/nginx/nginx.conf:ro" \
             docker.io/library/nginx:1-alpine
           trap 'docker rm -f wg-edge-wildcard >/dev/null 2>&1 || true' EXIT
           sleep 3
@@ -345,7 +345,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx-forward 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/forward.conf"
-          docker run --rm -i -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
+          docker run --rm -i -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/forward.conf"
           mkdir -p "$RUNNER_TEMP/forward-certs" "$RUNNER_TEMP/forward-run"
           chmod 777 "$RUNNER_TEMP/forward-run"
@@ -358,7 +358,7 @@ jobs:
           WEGLARKA_DUMP_PROXY_SOCKET_DIR=/run/wg-ingress \
             cargo run -q -p weglarka-ingress --example dump -- nginx-edge-forward panel.example.eu,weglarka.example.eu > "$RUNNER_TEMP/edge-forward.conf"
           docker run --rm -i -v "$RUNNER_TEMP/forward-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/forward-run:/run/wg-ingress" \
-            -v /run/weglarka-probe docker.io/library/nginx:1-alpine \
+            -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-forward.conf"
           .github/scripts/test-forward-auth.sh "$RUNNER_TEMP/forward.conf"
       # The two long nginx end-to-end tests run concurrently: they share nothing (own Docker network,

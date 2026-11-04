@@ -2070,7 +2070,10 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
 fn logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     const ID: &str = "logs.retention";
     let dir = d.ingress.logs_dir();
-    let (files, bytes) = crate::log_retention::scan(dir).unwrap_or((0, 0));
+    let (files, bytes, scan_error) = match crate::log_retention::scan(dir) {
+        Ok((files, bytes)) => (files, bytes, None),
+        Err(error) => (0, 0, Some(error.to_string())),
+    };
     let location = format!(
         "{} ({} files, {})",
         dir.display(),
@@ -2089,6 +2092,11 @@ fn logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         hint = Some(
             "set [logs] retention to a number of days; the access log contains visitor IP addresses",
         );
+    }
+    if let Some(error) = scan_error {
+        status = CheckStatus::Warn;
+        message.push_str(&format!("; cannot read the directory: {}", detail(error)));
+        hint = Some("check the ingress log directory permissions and the daemon log");
     }
     if let Ok(meta) = std::fs::metadata(dir)
         && meta.permissions().mode() & 0o077 != 0
