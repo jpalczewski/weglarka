@@ -1,6 +1,6 @@
 # 0068 — `weglarka login --browser`: authorization code flow on a loopback redirect
 
-Status: proposed (2026-11-04, issue #338, #294). Completes ADR 0060, decision 6.
+Status: accepted (2026-11-04, issue #338, #294). Completes ADR 0060, decision 6.
 
 ## Problem
 

@@ -55,7 +55,7 @@ http = "1"
 http-body-util = "0.1"
 # ACME client (docs/decisions/0038): `ring` provider only — the default `aws-lc-rs` needs a C toolchain.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "rcgen"] }
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 insta = { version = "1", features = ["json"] }
 # Outbound HTTP (docs/decisions/0021, #219): `rustls-no-provider` + our own `ring` config via

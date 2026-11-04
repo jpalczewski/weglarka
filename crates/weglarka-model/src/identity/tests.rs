@@ -969,9 +969,7 @@ fn only_loopback_ip_literals_may_use_http() {
         ("http://127.0.0.1/call back", "whitespace"),
         ("http://user@127.0.0.1/callback", "https"),
     ] {
-        let s = spec(&format!(
-            "[oidc]\nredirect_uris = [{uri:?}]\npublic = true"
-        ));
+        let s = spec(&format!("[oidc]\nredirect_uris = [{uri:?}]\npublic = true"));
         assert!(lexical_err(&s).contains(why), "{uri}: {}", lexical_err(&s));
     }
 }

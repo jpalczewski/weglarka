@@ -493,6 +493,7 @@ fn args(issuer: Option<&str>, audience: Option<&str>) -> LoginArgs {
         issuer: issuer.map(str::to_owned),
         audience: audience.map(str::to_owned),
         client_id: "weglarka-cli".into(),
+        browser: false,
     }
 }
 
@@ -690,4 +691,183 @@ async fn flags_with_hidden_characters_are_refused() {
     .await
     .unwrap_err();
     assert_eq!(err.kind, Kind::Usage);
+}
+
+// --- `--browser` ---------------------------------------------------------------------------------
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn query(url: &Url, key: &str) -> String {
+    url.query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+/// What a browser does after the person approves: follow the redirect to the loopback listener.
+fn follow_redirect(url: &Url, tail: &str) -> tokio::task::JoinHandle<String> {
+    let redirect = Url::parse(&query(url, "redirect_uri")).unwrap();
+    let target = format!("{}?{tail}", redirect.path());
+    let addr = format!("127.0.0.1:{}", redirect.port().unwrap());
+    tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {target} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).await.unwrap();
+        text
+    })
+}
+
+fn steps<O: FnOnce(&Url)>(
+    open: O,
+    timeout: Duration,
+) -> BrowserSteps<O, impl Fn(&str) + Send + Sync + 'static> {
+    BrowserSteps {
+        open,
+        timeout,
+        note: |_: &str| {},
+    }
+}
+
+#[tokio::test]
+async fn a_browser_login_exchanges_the_code_with_the_verifier_and_stores_the_tokens() {
+    let provider = Provider::default();
+    provider.say(200, &discovery(false, false)).say(200, TOKENS);
+    let (_dir, store) = store();
+    let seen = Mutex::new(None);
+    let session = browser_login(
+        &provider,
+        &store,
+        &request(),
+        1_000,
+        steps(
+            |url| {
+                // The request is a public client's: PKCE S256, the CLI's scope, the audience.
+                assert_eq!(query(url, "response_type"), "code");
+                assert_eq!(query(url, "client_id"), "weglarka-cli");
+                assert_eq!(query(url, "code_challenge_method"), "S256");
+                assert_eq!(query(url, "scope"), SCOPE);
+                assert!(!query(url, "nonce").is_empty());
+                assert!(query(url, "redirect_uri").starts_with("http://127.0.0.1:"));
+                let tail = format!("code=THECODE&state={}", query(url, "state"));
+                *seen.lock().unwrap() = Some((
+                    follow_redirect(url, &tail),
+                    query(url, "redirect_uri"),
+                    query(url, "code_challenge"),
+                ));
+            },
+            Duration::from_secs(10),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(session.refreshable);
+    let (page, redirect_uri, challenge) = seen.lock().unwrap().take().unwrap();
+    assert!(page.await.unwrap().starts_with("HTTP/1.1 200"));
+
+    let entry = store.read().unwrap().hosts.remove(HOST).unwrap();
+    assert_eq!(entry.access_token, "ACCESS1");
+    assert_eq!(entry.refresh_token.as_deref(), Some("REFRESH1"));
+    let exchange = provider.requests().pop().unwrap().1;
+    assert!(exchange.contains("grant_type=authorization_code"));
+    assert!(exchange.contains("code=THECODE"));
+    assert!(exchange.contains("client_id=weglarka-cli"));
+    assert!(exchange.contains(&format!(
+        "redirect_uri={}",
+        redirect_uri.replace(':', "%3A").replace('/', "%2F")
+    )));
+    // The verifier in the exchange is the one the challenge in the URL was derived from.
+    let verifier = exchange
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("code_verifier="))
+        .unwrap();
+    assert_eq!(weglarka_oidc::pkce_challenge(verifier), challenge);
+}
+
+#[tokio::test]
+async fn a_denied_browser_login_stores_nothing_and_says_so() {
+    let provider = Provider::default();
+    provider.say(200, &discovery(false, false));
+    let (_dir, store) = store();
+    let err = browser_login(
+        &provider,
+        &store,
+        &request(),
+        1_000,
+        steps(
+            |url| {
+                // A callback with a foreign state is ignored; the right state ends the login.
+                follow_redirect(url, "error=access_denied&state=nope");
+                let tail = format!(
+                    "error=access_denied&error_description=secret&state={}",
+                    query(url, "state")
+                );
+                follow_redirect(url, &tail);
+            },
+            Duration::from_secs(10),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("denied"), "{err}");
+    assert!(!err.to_string().contains("secret"));
+    assert!(store.read().unwrap().hosts.is_empty());
+}
+
+#[tokio::test]
+async fn an_unregistered_redirect_shows_as_a_timeout_with_the_hint() {
+    let provider = Provider::default();
+    provider.say(200, &discovery(false, false));
+    let (_dir, store) = store();
+    let err = browser_login(
+        &provider,
+        &store,
+        &request(),
+        1_000,
+        steps(|_| {}, Duration::from_millis(50)),
+    )
+    .await
+    .unwrap_err();
+    let hint = err.hint.clone().unwrap_or_default();
+    assert!(
+        hint.contains("http://127.0.0.1/callback") && hint.contains("device_flow"),
+        "{hint}"
+    );
+    assert!(store.read().unwrap().hosts.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_exchange_names_the_loopback_redirect_in_the_hint() {
+    let provider = Provider::default();
+    provider
+        .say(200, &discovery(false, false))
+        .say(400, r#"{"error":"invalid_request"}"#);
+    let (_dir, store) = store();
+    let err = browser_login(
+        &provider,
+        &store,
+        &request(),
+        1_000,
+        steps(
+            |url| {
+                let tail = format!("code=C&state={}", query(url, "state"));
+                follow_redirect(url, &tail);
+            },
+            Duration::from_secs(10),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.hint
+            .clone()
+            .unwrap_or_default()
+            .contains("http://127.0.0.1/callback"),
+        "{err:?}"
+    );
 }

@@ -222,6 +222,13 @@ jobs:
             echo "::error::authelia config validate printed warnings for oidc-clients-gated.yml"
             exit 1
           fi
+          # A public client with a loopback http redirect (`login --browser`, ADR 0068) must pass the validator.
+          out=$(validate /config/oidc-clients-loopback.yml,/config/access-control.yml 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if grep -qi 'warn' <<< "$out"; then
+            echo "::error::authelia config validate printed warnings for oidc-clients-loopback.yml"
+            exit 1
+          fi
           # Negative control: a misspelled field must fail, or the validator would prove nothing.
           sed 's/"claims_policy"/"claims_polcy"/' "$conf/oidc-clients.yml" > "$conf/broken.yml"
           if validate /config/broken.yml,/config/access-control.yml >/dev/null 2>&1; then
