@@ -525,22 +525,32 @@ impl<P: PodmanClient> Reconciler<P> {
             instance: instance.clone(),
         };
         let repository = inventory_repository(&spec.image)?;
+        // `None`: the reservation file is full, the pull goes on unreserved and retention is blocked.
         let operation = self.begin_acquisition(guard).await?;
         let resolved = match self.resolve_digest(instance, reference).await {
             Ok(resolved) => resolved,
             Err(e) => {
                 // A failed acquisition releases its reservation: nothing was loaded.
-                self.finish_acquisition(guard, operation).await;
+                self.release_acquisition(guard, operation).await;
                 return Err(e);
             }
         };
-        self.advance_acquisition(
-            guard,
-            &operation,
-            resolved.image_id.as_deref(),
-            &resolved.digest,
-        )
-        .await?;
+        if let Some(operation) = &operation
+            && let Err(e) = self
+                .advance_acquisition(
+                    guard,
+                    operation,
+                    resolved.image_id.as_deref(),
+                    &resolved.digest,
+                )
+                .await
+        {
+            // The reservation never reached `loaded`: release it instead of leaking a `loading`
+            // one that disables adoption until an operator abandons it.
+            self.release_acquisition(guard, Some(operation.clone()))
+                .await;
+            return Err(e);
+        }
         if let Err(e) = self
             .record_acquisition(
                 guard,
@@ -560,7 +570,9 @@ impl<P: PodmanClient> Reconciler<P> {
             );
             return Ok(resolved);
         }
-        slot.track(operation);
+        if let Some(operation) = operation {
+            slot.track(operation);
+        }
         Ok(resolved)
     }
 
