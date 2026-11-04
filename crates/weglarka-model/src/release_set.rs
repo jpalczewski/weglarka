@@ -25,6 +25,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::{self, Read};
 
 use semver::Version;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -188,6 +189,13 @@ impl StrictDigest {
         }
     }
 
+    /// The canonical digest of raw SHA-256 output (always lower-case hex, so it cannot be invalid).
+    pub fn from_sha256(sum: [u8; 32]) -> Self {
+        let digest = Digest::new(format!("sha256:{}", hex::encode(sum)))
+            .expect("32 bytes of lower-case hex are a valid digest");
+        Self(digest)
+    }
+
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -225,6 +233,39 @@ impl<'de> Deserialize<'de> for StrictDigest {
             )
         })
     }
+}
+
+/// Size of the fixed buffer [`sha256_reader`] reads through.
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+/// SHA-256 of a stream and the number of bytes it held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamDigest {
+    pub sha256: [u8; 32],
+    pub len: u64,
+}
+
+/// Hashes everything `reader` yields through a fixed 64 KiB buffer, so the memory used does not
+/// depend on the stream's length. A caller that must cap the input wraps the reader in
+/// [`Read::take`] with `limit + 1` and rejects a `len` above `limit`.
+pub fn sha256_reader(mut reader: impl Read) -> io::Result<StreamDigest> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; HASH_BUFFER_BYTES];
+    let mut len = 0u64;
+    loop {
+        let n = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buffer[..n]);
+        len += n as u64;
+    }
+    Ok(StreamDigest {
+        sha256: hasher.finalize().into(),
+        len,
+    })
 }
 
 /// A tag-free, digest-free OCI repository (`ghcr.io/owner/name`).
@@ -928,6 +969,74 @@ mod tests {
         include_str!("../../../docs/contracts/platform-update-v1/fixtures/release-valid.json");
     const MANIFEST: &str =
         include_str!("../../../docs/contracts/platform-update-v1/fixtures/oci-manifest-valid.json");
+
+    /// Yields `len` bytes of a repeating pattern without ever holding them, and records the largest
+    /// buffer it was asked to fill.
+    struct Generated {
+        remaining: u64,
+        largest_read: usize,
+    }
+
+    impl Read for Generated {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.largest_read = self.largest_read.max(buf.len());
+            let n = buf
+                .len()
+                .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            for (i, byte) in buf[..n].iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+            self.remaining -= n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn sha256_reader_matches_known_vectors() {
+        let abc = sha256_reader(&b"abc"[..]).unwrap();
+        assert_eq!(
+            StrictDigest::from_sha256(abc.sha256).as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(abc.len, 3);
+        let empty = sha256_reader(&b""[..]).unwrap();
+        assert_eq!(
+            StrictDigest::from_sha256(empty.sha256).as_str(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(empty.len, 0);
+    }
+
+    #[test]
+    fn sha256_reader_hashes_a_64_mib_stream_through_a_bounded_buffer() {
+        const LEN: u64 = 64 * 1024 * 1024;
+        let mut source = Generated {
+            remaining: LEN,
+            largest_read: 0,
+        };
+        let streamed = sha256_reader(&mut source).unwrap();
+        assert_eq!(streamed.len, LEN);
+        // The reader was never offered more than the fixed buffer, so memory does not grow with LEN.
+        assert!(
+            source.largest_read <= HASH_BUFFER_BYTES,
+            "{}",
+            source.largest_read
+        );
+
+        // Same bytes hashed incrementally by the reference hasher.
+        let mut reference = Sha256::new();
+        let chunk: Vec<u8> = (0..HASH_BUFFER_BYTES).map(|i| (i % 251) as u8).collect();
+        for _ in 0..LEN / HASH_BUFFER_BYTES as u64 {
+            reference.update(&chunk);
+        }
+        assert_eq!(streamed.sha256, <[u8; 32]>::from(reference.finalize()));
+    }
+
+    #[test]
+    fn sha256_reader_reports_the_length_of_a_capped_stream() {
+        let capped = sha256_reader(Read::take(&[7u8; 100][..], 11)).unwrap();
+        assert_eq!(capped.len, 11);
+    }
 
     fn parse(src: &str) -> Result<Descriptor, ReleaseError> {
         parse_descriptor(src.as_bytes(), &DescriptorContext::default())

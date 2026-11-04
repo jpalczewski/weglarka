@@ -6,6 +6,15 @@
 //! a mismatch is an error, never a silent overwrite. Installation renames a complete staging
 //! directory into place and fsyncs the parent.
 //!
+//! Hashing both binaries on every launcher call is the expensive part, so a generation also has a
+//! `<digest>.verified` record next to it (inside `generations/`, hence root-owned): the
+//! `(ino, mtime, size)` of each binary at the moment its SHA-256 last matched the manifest.
+//! [`GenerationStore::open_cached`] skips the hash of a binary whose metadata still matches;
+//! [`GenerationStore::open`] always hashes (bootstrap, update and preflight use it). A record is
+//! only ever written after a full hash matched the manifest, and only the root-owned directory
+//! keeps it trustworthy: a process that cannot write `generations/` can neither forge a record nor
+//! rewrite a binary without changing its metadata.
+//!
 //! GC deletes only directories that are unreferenced by the selector (`active`, `previous`,
 //! `candidate`) or by the caller's extra references (an unfinished journal). The recovery generation
 //! and the running generation are therefore never removed.
@@ -13,14 +22,13 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use weglarka_model::fsutil::write_atomic;
-use weglarka_model::release_set::StrictDigest;
+use weglarka_model::release_set::{StrictDigest, sha256_reader};
 
 use crate::host::{
     GENERATION_MANIFEST, GENERATIONS_DIR, HOST_CLI_FILE, HOST_DAEMON_FILE, HostError,
@@ -42,6 +50,14 @@ const GENERATION_DIR_MODE: u32 = 0o755;
 
 /// Mode of a generation manifest (readable by the runtime user, writable by its owner only).
 const MANIFEST_MODE: u32 = 0o644;
+
+/// Suffix of the verified-metadata record beside a generation directory. It is not a 64-character
+/// digest name, so [`GenerationStore::list`] never mistakes it for a generation.
+const VERIFIED_SUFFIX: &str = ".verified";
+/// Format of a verified-metadata record.
+const VERIFIED_FORMAT_VERSION: u32 = 1;
+/// Largest accepted verified-metadata record.
+const VERIFIED_MAX_BYTES: usize = 4 * 1024;
 
 pub const HOST_TOOL_NAMES: [&str; 2] = [HOST_DAEMON_FILE, HOST_CLI_FILE];
 
@@ -111,6 +127,57 @@ pub enum GenerationError {
     Remove { path: PathBuf, source: io::Error },
     #[error(transparent)]
     Selector(#[from] crate::selector::SelectorError),
+}
+
+/// What identifies the bytes of a file without reading them.
+///
+/// `st_dev` is deliberately left out: it is not stable across reboots on every filesystem, and the
+/// runtime-user launcher cannot refresh the record, so including it could turn the cache off for good.
+/// A file swapped for one on another filesystem needs write access to the root-owned `generations/`
+/// and still has to match inode, mtime and size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileStamp {
+    ino: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    size: u64,
+}
+
+impl FileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            ino: metadata.ino(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            size: metadata.len(),
+        }
+    }
+}
+
+/// One binary's stamp, bound to the manifest entry it was verified against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedFile {
+    name: String,
+    digest: StrictDigest,
+    stamp: FileStamp,
+}
+
+/// `<digest>.verified`: the stamps of both binaries when their SHA-256 last matched the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedRecord {
+    format_version: u32,
+    generation: StrictDigest,
+    files: Vec<VerifiedFile>,
+}
+
+/// Outcome of checking one file: its stamp when it was stable while being hashed (or trusted from
+/// the record), and whether the content was actually read.
+struct Checked {
+    stamp: Option<FileStamp>,
+    hashed: bool,
 }
 
 /// A verified generation directory.
@@ -223,8 +290,66 @@ impl GenerationStore {
         Ok(dir)
     }
 
-    /// Verifies a generation directory and returns its handle.
+    fn record_path(&self, digest: &StrictDigest) -> PathBuf {
+        self.generations_dir()
+            .join(format!("{}{VERIFIED_SUFFIX}", generation_name(digest)))
+    }
+
+    /// The stored record for `generation_dir`'s digest, or `None` when it is absent, unreadable, not
+    /// about this generation or not trustworthy: a record is only ever an optimisation. Beyond its
+    /// content it must be a regular file (never a symlink), owned by whoever owns the binaries, and
+    /// not writable by group or others.
+    fn read_record(&self, digest: &StrictDigest, generation_dir: &Path) -> Option<VerifiedRecord> {
+        let path = self.record_path(digest);
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_file() || meta.permissions().mode() & 0o022 != 0 {
+            return None;
+        }
+        for name in HOST_TOOL_NAMES {
+            let binary = fs::symlink_metadata(generation_dir.join(name)).ok()?;
+            if binary.uid() != meta.uid() {
+                return None;
+            }
+        }
+        let text = read_bounded(&path, "verified record", VERIFIED_MAX_BYTES).ok()??;
+        let record: VerifiedRecord = toml::from_str(&text).ok()?;
+        (record.format_version == VERIFIED_FORMAT_VERSION && record.generation == *digest)
+            .then_some(record)
+    }
+
+    /// Best effort: the runtime user cannot write `generations/`, so only a root caller (bootstrap,
+    /// an update) leaves a record behind, and a failure just means the next open hashes again.
+    fn write_record(&self, digest: &StrictDigest, files: Vec<VerifiedFile>) {
+        let record = VerifiedRecord {
+            format_version: VERIFIED_FORMAT_VERSION,
+            generation: digest.clone(),
+            files,
+        };
+        if let Ok(text) = toml::to_string(&record) {
+            let _ = write_atomic(&self.record_path(digest), text.as_bytes(), MANIFEST_MODE);
+        }
+    }
+
+    /// Verifies a generation directory, hashing every binary, and returns its handle.
+    ///
+    /// This is the check bootstrap, update and preflight rely on. When every hash matches the
+    /// manifest the verified-metadata record is refreshed (see the module docs).
     pub fn open(&self, digest: &StrictDigest) -> Result<Generation, GenerationError> {
+        self.open_with(digest, false)
+    }
+
+    /// Like [`open`](Self::open), but a binary whose `(ino, mtime, size)` still equals the
+    /// record written after its last full verification is not hashed again. Anything else falls
+    /// back to the full check, which refreshes the record only when the hash matches.
+    pub fn open_cached(&self, digest: &StrictDigest) -> Result<Generation, GenerationError> {
+        self.open_with(digest, true)
+    }
+
+    fn open_with(
+        &self,
+        digest: &StrictDigest,
+        use_record: bool,
+    ) -> Result<Generation, GenerationError> {
         let dir = self.generation_dir(digest);
         if !dir.is_dir() {
             return Err(GenerationError::Missing {
@@ -257,7 +382,27 @@ impl GenerationStore {
                 ),
             });
         }
-        verify_files(&dir, digest, &manifest)?;
+        let record = if use_record {
+            self.read_record(digest, &dir)
+        } else {
+            None
+        };
+        let checked = verify_files(&dir, digest, &manifest, record.as_ref())?;
+        if checked.iter().any(|(_, c)| c.hashed) {
+            let stamps: Option<Vec<VerifiedFile>> = checked
+                .iter()
+                .map(|(file, c)| {
+                    c.stamp.map(|stamp| VerifiedFile {
+                        name: file.name.clone(),
+                        digest: file.digest.clone(),
+                        stamp,
+                    })
+                })
+                .collect();
+            if let Some(files) = stamps {
+                self.write_record(digest, files);
+            }
+        }
         Ok(Generation { dir, manifest })
     }
 
@@ -478,6 +623,7 @@ impl GenerationStore {
             }
             let dir = self.generation_dir(&digest);
             remove_dir(&dir)?;
+            let _ = fs::remove_file(self.record_path(&digest));
             removed.push(digest);
         }
         if !removed.is_empty() {
@@ -521,11 +667,12 @@ fn validate_expected(
     Ok(())
 }
 
-fn verify_files(
+fn verify_files<'m>(
     dir: &Path,
     digest: &StrictDigest,
-    manifest: &GenerationManifest,
-) -> Result<(), GenerationError> {
+    manifest: &'m GenerationManifest,
+    record: Option<&VerifiedRecord>,
+) -> Result<Vec<(&'m GenerationFile, Checked)>, GenerationError> {
     if manifest.files.len() != HOST_TOOL_NAMES.len() {
         return Err(GenerationError::Manifest {
             path: dir.join(GENERATION_MANIFEST),
@@ -533,6 +680,7 @@ fn verify_files(
         });
     }
     let mut seen = BTreeSet::new();
+    let mut checked = Vec::with_capacity(manifest.files.len());
     for file in &manifest.files {
         if !HOST_TOOL_NAMES.contains(&file.name.as_str()) {
             return Err(GenerationError::UnexpectedFile {
@@ -546,10 +694,17 @@ fn verify_files(
                 message: format!("duplicate file {}", file.name),
             });
         }
-        verify_one(
+        // Trusted only for the very manifest entry the record was written against.
+        let trusted = record
+            .and_then(|r| r.files.iter().find(|v| v.name == file.name))
+            .filter(|v| v.digest == file.digest && v.stamp.size == file.size)
+            .map(|v| v.stamp);
+        let result = verify_file(
             &dir.join(&file.name),
             &ExpectedFile::new(file.name.clone(), file.size, file.digest.clone()),
+            trusted,
         )?;
+        checked.push((file, result));
     }
     for name in HOST_TOOL_NAMES {
         if !seen.contains(name) {
@@ -580,10 +735,20 @@ fn verify_files(
             name: extra,
         });
     }
-    Ok(())
+    Ok(checked)
 }
 
+/// Full verification of a file outside the record (a staged file about to be installed).
 fn verify_one(path: &Path, expected: &ExpectedFile) -> Result<(), GenerationError> {
+    verify_file(path, expected, None).map(|_| ())
+}
+
+/// Checks type, mode and size, then the SHA-256 unless `trusted` equals the file's current stamp.
+fn verify_file(
+    path: &Path,
+    expected: &ExpectedFile,
+    trusted: Option<FileStamp>,
+) -> Result<Checked, GenerationError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| HostError::Read {
         path: path.to_owned(),
         source,
@@ -614,36 +779,46 @@ fn verify_one(path: &Path, expected: &ExpectedFile) -> Result<(), GenerationErro
             path: path.to_owned(),
         });
     }
-    if file_digest(path)? != expected.digest {
+    if trusted == Some(FileStamp::of(&metadata)) {
+        return Ok(Checked {
+            stamp: trusted,
+            hashed: false,
+        });
+    }
+    let (actual, before, after) = file_digest_with_stamps(path)?;
+    if actual != expected.digest {
         return Err(GenerationError::Mismatch {
             path: path.to_owned(),
         });
     }
-    Ok(())
+    // A file that changed while it was being read is not recorded: the next open hashes it again.
+    Ok(Checked {
+        stamp: (before == after).then_some(before),
+        hashed: true,
+    })
 }
 
 /// SHA-256 of a file read through a fixed buffer, so hashing a tool binary of tens of MiB (done for
 /// both binaries on every launcher call) never holds the file in memory.
 fn file_digest(path: &Path) -> Result<StrictDigest, GenerationError> {
+    file_digest_with_stamps(path).map(|(digest, _, _)| digest)
+}
+
+/// [`file_digest`] plus the open file's stamp before and after the read.
+fn file_digest_with_stamps(
+    path: &Path,
+) -> Result<(StrictDigest, FileStamp, FileStamp), GenerationError> {
     let read_error = |source| HostError::Read {
         path: path.to_owned(),
         source,
     };
-    let mut file = fs::File::open(path).map_err(read_error)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buffer).map_err(read_error)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    StrictDigest::new(format!("sha256:{}", hex::encode(hasher.finalize()))).map_err(|_| {
-        GenerationError::Mismatch {
-            path: path.to_owned(),
-        }
-    })
+    #[cfg(test)]
+    tests::HASHED_FILES.with(|n| n.set(n.get() + 1));
+    let file = fs::File::open(path).map_err(read_error)?;
+    let before = FileStamp::of(&file.metadata().map_err(read_error)?);
+    let streamed = sha256_reader(&file).map_err(read_error)?;
+    let after = FileStamp::of(&file.metadata().map_err(read_error)?);
+    Ok((StrictDigest::from_sha256(streamed.sha256), before, after))
 }
 
 fn sync_dir(dir: &Path) -> Result<(), GenerationError> {
@@ -667,6 +842,13 @@ fn remove_dir(path: &Path) -> Result<(), GenerationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Binaries hashed on this thread, so a test can tell a cached open from a full one.
+        pub(super) static HASHED_FILES: Cell<usize> = const { Cell::new(0) };
+    }
+    use sha2::{Digest as _, Sha256};
 
     fn digest(byte: char) -> StrictDigest {
         StrictDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
@@ -809,6 +991,206 @@ mod tests {
         for d in &digests[..4] {
             assert!(left.contains(d));
         }
+    }
+
+    fn installed(dir: &Path, byte: char) -> (GenerationStore, StrictDigest) {
+        let store = GenerationStore::new(dir);
+        let d = digest(byte);
+        let staging = staging_with(&store, b"daemon", b"cli");
+        store
+            .install(&staging, &d, &expected(b"daemon", b"cli"))
+            .unwrap();
+        (store, d)
+    }
+
+    /// Rewrites a binary in place (same inode), with `mtime` restored to what it was.
+    fn rewrite_in_place(path: &Path, bytes: &[u8], mtime: Option<std::time::SystemTime>) {
+        let before = fs::metadata(path).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(0).unwrap();
+        io::Write::write_all(&mut &file, bytes).unwrap();
+        file.set_modified(mtime.unwrap_or(before.modified().unwrap()))
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().ino(), before.ino());
+    }
+
+    #[test]
+    fn install_leaves_a_record_that_is_not_mistaken_for_a_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'a');
+        let record = store.record_path(&d);
+        assert!(record.is_file());
+        assert_eq!(
+            fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(store.list().unwrap(), vec![d]);
+    }
+
+    /// Number of binaries hashed on this thread while `f` runs.
+    fn hashed_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = HASHED_FILES.with(Cell::get);
+        let out = f();
+        (out, HASHED_FILES.with(Cell::get) - before)
+    }
+
+    fn later(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5)
+    }
+
+    #[test]
+    fn a_cached_open_of_an_unchanged_generation_does_not_read_the_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'a');
+
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+
+        // The full check (bootstrap, update, preflight) always reads both binaries.
+        let (opened, hashed) = hashed_during(|| store.open(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
+    }
+
+    #[test]
+    fn an_in_place_rewrite_is_detected_and_does_not_touch_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'b');
+        let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
+        let record = fs::read(store.record_path(&d)).unwrap();
+
+        rewrite_in_place(&daemon, b"DAEMON", Some(later(&daemon)));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        assert!(matches!(opened, Err(GenerationError::Mismatch { .. })));
+        assert_eq!(hashed, 1, "only the changed binary is read");
+        // A hash that does not match the manifest never refreshes the record.
+        assert_eq!(fs::read(store.record_path(&d)).unwrap(), record);
+        assert!(matches!(
+            store.open_cached(&d),
+            Err(GenerationError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_or_stale_record_falls_back_to_hashing_and_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'c');
+        let record = store.record_path(&d);
+        let original = fs::read(&record).unwrap();
+        let daemon = store.generation_dir(&d).join(HOST_DAEMON_FILE);
+
+        fs::remove_file(&record).unwrap();
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
+        assert_eq!(fs::read(&record).unwrap(), original);
+
+        // The same bytes with a new mtime: that binary is hashed again (it still matches), then recorded.
+        daemon_touch(&daemon, later(&daemon));
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 1);
+        assert_ne!(fs::read(&record).unwrap(), original);
+        // ... and the next cached open trusts the refreshed record.
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+
+        // Garbage in the record is ignored, not trusted.
+        fs::write(&record, b"not toml").unwrap();
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
+    }
+
+    fn daemon_touch(path: &Path, mtime: std::time::SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_record_for_another_manifest_entry_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'd');
+        let generation_dir = store.generation_dir(&d);
+
+        // The stamps still match, but the record vouches for a different digest than the manifest's.
+        let mut record = store.read_record(&d, &generation_dir).unwrap();
+        record.files[0].digest = digest('0');
+        fs::write(store.record_path(&d), toml::to_string(&record).unwrap()).unwrap();
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 1, "only the entry the record does not vouch for");
+    }
+
+    #[test]
+    fn a_symlinked_record_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'e');
+        let record = store.record_path(&d);
+        let elsewhere = dir.path().join("copy.verified");
+        fs::rename(&record, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 2);
+        // The refresh replaces the link with a regular file, which is trusted again.
+        assert!(fs::symlink_metadata(&record).unwrap().file_type().is_file());
+        let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+        opened.unwrap();
+        assert_eq!(hashed, 0);
+    }
+
+    #[test]
+    fn a_group_or_world_writable_record_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, d) = installed(dir.path(), 'f');
+        let record = store.record_path(&d);
+        for mode in [0o664, 0o646] {
+            fs::set_permissions(&record, fs::Permissions::from_mode(mode)).unwrap();
+            let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+            opened.unwrap();
+            assert_eq!(hashed, 2, "mode {mode:o}");
+            // The refresh writes it back with the safe mode.
+            assert_eq!(
+                fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            let (opened, hashed) = hashed_during(|| store.open_cached(&d));
+            opened.unwrap();
+            assert_eq!(hashed, 0);
+        }
+    }
+
+    #[test]
+    fn gc_removes_the_record_with_its_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, keep) = installed(dir.path(), 'a');
+        let staging = staging_with(&store, b"other", b"cli");
+        let drop = digest('b');
+        store
+            .install(&staging, &drop, &expected(b"other", b"cli"))
+            .unwrap();
+        assert!(store.record_path(&drop).is_file());
+        let selector = HostSelector {
+            format_version: crate::selector::FORMAT_VERSION,
+            epoch: 1,
+            active: keep.clone(),
+            previous: None,
+            candidate: None,
+        };
+        store.gc(&selector, &[]).unwrap();
+        assert!(!store.record_path(&drop).exists());
+        assert!(store.record_path(&keep).is_file());
     }
 
     #[test]
