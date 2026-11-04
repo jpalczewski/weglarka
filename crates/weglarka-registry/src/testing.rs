@@ -320,9 +320,15 @@ impl Registry for FakeReleaseRegistry {
         let repository = image.repository_reference();
         let tag = format!("{}.sig", digest.as_str().replace(':', "-"));
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(bytes) = state.manifests.get(&(repository.clone(), tag)) else {
-            return Ok(Vec::new());
-        };
+        // Same answer as the HTTP client for a missing `.sig` tag, so callers see one contract.
+        let bytes =
+            state
+                .manifests
+                .get(&(repository.clone(), tag))
+                .ok_or(RegistryError::Status {
+                    status: 404,
+                    what: "signature manifest",
+                })?;
         // A deliberately lenient read of the signature manifest, enough for the verifier: one
         // simple-signing layer with the signature annotation and the payload blob behind it.
         let document: serde_json::Value =
