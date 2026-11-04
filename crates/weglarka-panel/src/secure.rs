@@ -1,4 +1,5 @@
-//! Random values and comparisons for session ids, CSRF tokens and OIDC `state`/`nonce`.
+//! Random values and comparisons for session ids and CSRF tokens, and the constant-time check of
+//! the OIDC `state` (which `weglarka_oidc::begin_code_flow` generates).
 
 use subtle::ConstantTimeEq;
 use weglarka_oidc::random_b64url;

@@ -1,7 +1,7 @@
 //! The parts of an OIDC client that do not depend on how bytes travel: provider discovery with the
-//! host and scheme policy, PKCE and the authorization URL, token requests (confidential or public
-//! client, refresh, revocation) and the device authorization grant (RFC 8628)
-//! (docs/decisions/0060).
+//! host and scheme policy, the authorization code flow (fresh `state`/`nonce`/PKCE verifier, the
+//! authorization URL and the code exchange), token requests (confidential or public client,
+//! refresh, revocation) and the device authorization grant (RFC 8628) (docs/decisions/0060).
 //!
 //! Everything that touches the network goes through [`Transport`], so the admin panel can use
 //! `reqwest` (`weglarka-http`) and the CLI a small `hyper` client without this crate depending on

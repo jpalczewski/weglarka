@@ -36,10 +36,18 @@ pub struct CodeFlow {
 
 impl std::fmt::Debug for CodeFlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL's query carries `state` and `nonce` too: only its origin and path are shown.
         f.debug_struct("CodeFlow")
-            .field("url", &self.url.as_str())
-            .field("state", &self.state)
-            .field("nonce", &self.nonce)
+            .field(
+                "endpoint",
+                &format_args!(
+                    "{}{}",
+                    self.url.origin().ascii_serialization(),
+                    self.url.path()
+                ),
+            )
+            .field("state", &"<redacted>")
+            .field("nonce", &"<redacted>")
             .field("verifier", &self.verifier)
             .finish()
     }
@@ -135,7 +143,11 @@ mod tests {
         );
         assert_eq!(query(&flow.url, "state").unwrap(), flow.state);
         assert_eq!(query(&flow.url, "nonce").unwrap(), flow.nonce);
-        assert!(!format!("{flow:?}").contains(flow.verifier.expose()));
+        let debug = format!("{flow:?}");
+        for secret in [flow.verifier.expose(), &flow.state, &flow.nonce] {
+            assert!(!debug.contains(secret), "Debug shows {secret}");
+        }
+        assert!(debug.contains("https://auth.example.com/authorize"));
     }
 
     #[test]
