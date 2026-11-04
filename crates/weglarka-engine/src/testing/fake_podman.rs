@@ -141,6 +141,7 @@ struct State {
     stats_script: Option<Vec<ContainerStats>>,
     stats_error: Option<String>,
     list_calls: usize,
+    image_list_calls: usize,
     /// Scripted `storage_info` (`None` = [`DEFAULT_STORAGE`]) and its injected failure.
     storage: Option<StorageInfo>,
     storage_error: Option<String>,
@@ -497,6 +498,12 @@ impl FakePodman {
     /// do not change).
     pub fn container_list_calls(&self) -> usize {
         self.lock().list_calls
+    }
+
+    /// How many times `image_list` was called; every image retention run observes the store once, so
+    /// this counts retention runs (also kept out of [`Call`]).
+    pub fn image_list_calls(&self) -> usize {
+        self.lock().image_list_calls
     }
 
     pub fn containers(&self) -> Vec<ContainerInfo> {
@@ -1034,7 +1041,9 @@ impl PodmanClient for FakePodman {
     }
 
     async fn image_list(&self) -> Result<Vec<ImageInfo>> {
-        Ok(self.lock().unique_images())
+        let mut s = self.lock();
+        s.image_list_calls += 1;
+        Ok(s.unique_images())
     }
 
     async fn image_tag(&self, id: &str, repo: &str, tag: &str) -> Result<()> {

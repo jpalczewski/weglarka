@@ -47,6 +47,18 @@ pub enum DeployOutcome {
     Provisioned { digest: Digest },
 }
 
+impl DeployOutcome {
+    /// Whether the app's image set may have changed, so image retention has to run: a new image
+    /// became `current`, a rollback made the failed one removable, or a provision pinned a digest.
+    /// The one definition every deploy path asks (see `Reconciler::retain_for_outcome`).
+    pub fn needs_retention(&self) -> bool {
+        matches!(
+            self,
+            Self::Deployed { .. } | Self::RolledBack { .. } | Self::Provisioned { .. }
+        )
+    }
+}
+
 /// Outcome of `apps reload` (issue #118): the running app picked up its config without being
 /// recreated. Desired state is not touched either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,17 +306,8 @@ impl<P: PodmanClient> Reconciler<P> {
             let guard = self.acquire().await;
             self.deploy_locked(&guard, instance, force).await
         };
-        if let Ok(outcome) = &outcome
-            && matches!(
-                outcome,
-                DeployOutcome::Deployed { .. }
-                    | DeployOutcome::RolledBack { .. }
-                    | DeployOutcome::Provisioned { .. }
-            )
-            && let Ok(spec) = self.load_spec(instance)
-        {
-            self.retain_after_deploy(instance, image_repo(&spec.image))
-                .await;
+        if let Ok(outcome) = &outcome {
+            self.retain_for_outcome(None, instance, outcome).await;
         }
         outcome
     }
@@ -1086,6 +1089,23 @@ impl<P: PodmanClient> Reconciler<P> {
             .await
     }
 
+    /// [`Self::deploy_locked_from`] followed by image retention under the same held guard, for
+    /// callers that keep the engine/image guard for their whole operation (the reconcile pass).
+    /// Retention uses fresh observations but never reacquires the guard (contract lock order).
+    pub(crate) async fn deploy_and_retain_locked(
+        &self,
+        held: &EngineGuard<'_>,
+        instance: &InstanceName,
+        force: bool,
+        source: DigestSource<'_>,
+    ) -> Result<DeployOutcome, EngineError> {
+        let outcome = self.deploy_locked_from(held, instance, force, source).await;
+        if let Ok(outcome) = &outcome {
+            self.retain_for_outcome(Some(held), instance, outcome).await;
+        }
+        outcome
+    }
+
     /// [`Self::deploy_locked`] with the digest taken from `source` instead of the tag.
     pub(crate) async fn deploy_locked_from(
         &self,
@@ -1126,7 +1146,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         if spec.kind == AppKind::Static {
             return self
-                .deploy_static_from(held, image_guard, instance, &spec, force, source, slot)
+                .deploy_static_from(image_guard, instance, &spec, force, source, slot)
                 .await;
         }
         // `start = false` — provision only (no container, no secrets, no health gate).

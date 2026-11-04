@@ -406,6 +406,81 @@ async fn rollback_uses_local_image_when_registry_cannot_serve_it() {
     assert!(!h.fake.calls().contains(&Call::ImagePull(pinned)));
 }
 
+/// The reconcile pass deploys through `deploy_and_retain_locked` while it holds the guard; a rolled
+/// back deploy has to run retention like a successful one (the failed image becomes removable).
+#[tokio::test(start_paused = true)]
+async fn a_rolled_back_deploy_under_a_held_guard_runs_retention() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_health(
+        "ntfy",
+        [
+            HealthStatus::Unhealthy,
+            HealthStatus::Unhealthy,
+            HealthStatus::Unhealthy,
+            HealthStatus::Healthy,
+        ],
+    );
+    let before = h.fake.image_list_calls();
+    let guard = h.rec.acquire().await;
+    let out = h
+        .rec
+        .deploy_and_retain_locked(
+            &guard,
+            &name("ntfy"),
+            false,
+            crate::deploy::DigestSource::Tag,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out, DeployOutcome::RolledBack { .. }), "{out:?}");
+    assert_eq!(h.fake.image_list_calls() - before, 1);
+
+    // The digest that failed is refused without a retention run.
+    let before = h.fake.image_list_calls();
+    let out = h
+        .rec
+        .deploy_and_retain_locked(
+            &guard,
+            &name("ntfy"),
+            false,
+            crate::deploy::DigestSource::Tag,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out, DeployOutcome::KnownBad { .. }), "{out:?}");
+    assert_eq!(h.fake.image_list_calls(), before);
+}
+
+#[test]
+fn only_outcomes_that_change_the_image_set_need_retention() {
+    let d = digest('a');
+    let yes = [
+        DeployOutcome::Deployed {
+            digest: d.clone(),
+            generation: 1,
+        },
+        DeployOutcome::RolledBack {
+            failed: digest('b'),
+            restored: d.clone(),
+            reason: "x".into(),
+        },
+        DeployOutcome::Provisioned { digest: d.clone() },
+    ];
+    let no = [
+        DeployOutcome::Unchanged { digest: d.clone() },
+        DeployOutcome::KnownBad { digest: d.clone() },
+        DeployOutcome::Failed {
+            digest: d,
+            reason: "x".into(),
+        },
+    ];
+    assert!(yes.iter().all(DeployOutcome::needs_retention));
+    assert!(!no.iter().any(DeployOutcome::needs_retention));
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_health_gate_rolls_back_and_marks_state() {
     let h = Harness::new(NTFY);
@@ -4161,6 +4236,28 @@ domains = ["blog.example.com"]
         assert!(h.fake.containers().is_empty());
         // Converged: the next pass does nothing.
         assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_static_deploy_runs_image_retention_exactly_once() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"v0")]);
+        // Through the reconcile pass (holds the guard), then through `deploy` (acquires its own).
+        let before = h.fake.image_list_calls();
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(h.fake.image_list_calls() - before, 1, "reconcile");
+
+        publish(&h, 'b', &[("index.html", b"v1")]);
+        let before = h.fake.image_list_calls();
+        let out = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+        assert_eq!(h.fake.image_list_calls() - before, 1, "deploy");
+
+        // Nothing changed: no new image set, no retention.
+        let before = h.fake.image_list_calls();
+        let out = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Unchanged { .. }), "{out:?}");
+        assert_eq!(h.fake.image_list_calls(), before, "unchanged");
     }
 
     #[tokio::test(start_paused = true)]

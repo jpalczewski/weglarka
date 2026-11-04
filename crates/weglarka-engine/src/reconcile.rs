@@ -15,18 +15,16 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::crash;
-use crate::deploy::DeployOutcome;
+use crate::deploy::{DeployOutcome, DigestSource};
 use crate::volumes::RemoveAppOptions;
 use crate::waiting::{apply_waiting, missing_secrets};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName};
 use weglarka_model::delivery::{self, DeliveryDedup};
 use weglarka_model::events::{Event, EventSink, TracingSink};
 use weglarka_model::hash::SpecHash;
-use weglarka_model::image_inventory::Owner;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, NetworkSummary, PodmanClient, PodmanError,
-    image_repo,
 };
 use weglarka_model::secret_store::{SecretError, SecretStore, scoped_name};
 use weglarka_model::state::{self, StateError, StatePaths};
@@ -1064,22 +1062,10 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<ActionOutcome, EngineError> {
         match action {
             Action::Deploy { instance } => {
-                let outcome = self.deploy_locked(held, &instance, false).await?;
-                // Reconcile already holds the engine/image guard for the whole pass; retention uses
-                // fresh observations but never reacquires the guard (contract lock order).
-                if matches!(
-                    &outcome,
-                    DeployOutcome::Deployed { .. }
-                        | DeployOutcome::RolledBack { .. }
-                        | DeployOutcome::Provisioned { .. }
-                ) && let Some(spec) = apps.apps.get(&instance)
-                {
-                    let owner = Owner::App {
-                        instance: instance.clone(),
-                    };
-                    self.retain_images_locked(held, &owner, image_repo(&spec.image))
-                        .await;
-                }
+                // Reconcile holds the engine/image guard for the whole pass; retention reuses it.
+                let outcome = self
+                    .deploy_and_retain_locked(held, &instance, false, DigestSource::Tag)
+                    .await?;
                 Ok(ActionOutcome::Deployed(outcome))
             }
             Action::Recreate { instance, reason } => {
@@ -1104,16 +1090,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
                 let outcome = self.provision_locked(held, &instance, spec).await?;
-                if matches!(
-                    &outcome,
-                    DeployOutcome::Provisioned { .. } | DeployOutcome::Deployed { .. }
-                ) {
-                    let owner = Owner::App {
-                        instance: instance.clone(),
-                    };
-                    self.retain_images_locked(held, &owner, image_repo(&spec.image))
-                        .await;
-                }
+                self.retain_for_outcome(Some(held), &instance, &outcome)
+                    .await;
                 Ok(ActionOutcome::Provisioned(outcome))
             }
             Action::Remove { container } => {
