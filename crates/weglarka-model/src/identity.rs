@@ -461,15 +461,7 @@ impl<'a> From<&'a ExternalClientSpec> for ClientCommon<'a> {
 /// Splits an `https://` URL into its host, enforcing the shape every URL we hand to the provider has:
 /// no whitespace/control characters, no userinfo, no IPv6 literal, optional numeric port, no fragment.
 fn https_host(url: &str) -> Result<&str, &'static str> {
-    if url.len() > MAX_URL_LEN {
-        return Err("longer than 2048 bytes");
-    }
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("must not contain whitespace or control characters");
-    }
-    if url.contains('#') {
-        return Err("must not contain a fragment");
-    }
+    url_shape(url)?;
     let Some(rest) = url.strip_prefix("https://") else {
         return Err("must be an https:// URL");
     };
@@ -490,6 +482,49 @@ fn https_host(url: &str) -> Result<&str, &'static str> {
         return Err("port must be a number in 1..=65535");
     }
     Ok(host)
+}
+
+/// Length, character and fragment rules shared by every URL we hand to the provider.
+fn url_shape(url: &str) -> Result<(), &'static str> {
+    if url.len() > MAX_URL_LEN {
+        return Err("longer than 2048 bytes");
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("must not contain whitespace or control characters");
+    }
+    if url.contains('#') {
+        return Err("must not contain a fragment");
+    }
+    Ok(())
+}
+
+/// Whether `url` is an RFC 8252 section 7.3 loopback redirect: `http://127.0.0.1[:port]/...` or
+/// `http://[::1][:port]/...`. `localhost` is deliberately not one (section 8.3). `Some(Err)` is a
+/// loopback URL with a malformed shape; `None` is anything else.
+fn loopback_redirect(url: &str) -> Option<Result<(), &'static str>> {
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let (host, port) = if let Some(v6) = authority.strip_prefix("[::1]") {
+        ("[::1]", v6.strip_prefix(':'))
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host != "127.0.0.1" && host != "[::1]" {
+        return None;
+    }
+    if host == "[::1]" && authority.len() > 5 && !authority[5..].starts_with(':') {
+        return None;
+    }
+    Some(url_shape(url).and_then(|()| {
+        if port.is_some_and(|p| !valid_port(p)) {
+            Err("port must be a number in 1..=65535")
+        } else {
+            Ok(())
+        }
+    }))
 }
 
 /// A DNS name of non-empty labels (at most 63 bytes of `[A-Za-z0-9-]`, no leading or trailing `-`).
@@ -616,7 +651,12 @@ fn check_common(c: &ClientCommon<'_>) -> Result<(), String> {
     }
     let mut seen = BTreeSet::new();
     for uri in c.redirect_uris {
-        https_host(uri).map_err(|r| format!("invalid redirect URI {uri:?}: {r}"))?;
+        match loopback_redirect(uri) {
+            Some(shape) if c.public => shape,
+            Some(_) => Err("a loopback http:// redirect needs a public client"),
+            None => https_host(uri).map(drop),
+        }
+        .map_err(|r| format!("invalid redirect URI {uri:?}: {r}"))?;
         if !seen.insert(uri) {
             return Err(format!("duplicate redirect URI {uri:?}"));
         }
@@ -681,6 +721,10 @@ fn validate_oidc(spec: &AppSpec, oidc: &OidcClientSpec) -> Result<(), String> {
     check_group_list(&oidc.allowed_groups, "oidc.allowed_groups")?;
     for uri in &oidc.redirect_uris {
         // Already shaped by `check_common`; an app may only register callbacks on its own hosts.
+        // A loopback entry (public clients only) names no host.
+        if loopback_redirect(uri).is_some() {
+            continue;
+        }
         let host = https_host(uri).map_err(str::to_owned)?;
         if !spec.domains.iter().any(|d| d.eq_ignore_ascii_case(host)) {
             return Err(format!(
