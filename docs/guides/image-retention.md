@@ -30,7 +30,7 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   The cleanup is **explicit**, not automatic at daemon startup: bulk image deletion is the operator's decision. The
   daemon serializes it with deploys (during a deploy it answers `busy`, like the other mutations). A dry run and the
   `doctor` check use the same planner as the real prune, so they report the same list. Neither adopts images nor writes
-  bookkeeping.
+  any file: `managed-images.toml` and `image-reservations.toml` are byte-identical before and after a dry run.
 - **Images with no provenance are reported, never removed.** Their count appears as an informational `doctor` line. An
   image that matches a current repository name may still be adopted by an explicit prune (the repository policy of
   ADR 0020); nothing is attributed by age, size, labels or digest alone.
@@ -53,6 +53,26 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   record.
 - **Corrupt bookkeeping fails closed.** An invalid `managed-images.toml`, `self-update.toml` or `platform-update.toml`
   disables destructive cleanup (`doctor` reports it) instead of being treated as empty.
+- **A provenance error blocks the whole pass.** If the daemon cannot read or write the bookkeeping — the inventory, the
+  reservations, the journal or `self-update.toml`, or the adoption records a prune persists before it plans — the pass
+  removes **nothing** and forgets nothing, instead of pruning the images it could still attribute. `weglarka images
+  prune` (also `--dry-run`) then fails with the reason; after a deploy the reason is logged as a warning and the deploy
+  is unaffected. Fix the file or the disk (`doctor` shows the same condition) and run it again. The inventory is also
+  checked writable before the first removal, so a read-only state directory cannot leave images deleted but still
+  recorded. The check cannot rule out a disk that fills up during the removals: if the final write that forgets the
+  removed images fails, those images are already gone, their records remain in `managed-images.toml`, and the command
+  fails naming how many images had been removed. Those records belong to deleted images; the image ID is a content
+  hash, so pulling the same image again makes the old record apply to it again.
+- **A pull that is still `loading` disables adoption.** A reservation is published before the pull, when the image ID
+  and digest are not known yet, so it cannot name an image to protect. Pulls and prunes are serialized by the image
+  lock, so a `loading` reservation a prune can see belongs to a pull that was cancelled or failed early. The only image
+  at risk is one that was (partly) pulled and is recorded nowhere: such an image is unattributed, and the only way it
+  could ever be removed is adoption by repository name. While any reservation is `loading`, the pass therefore adopts
+  nothing, and the rest of retention (images that already have records) runs normally. The diagnostic — in the prune
+  output and in `doctor` — names the operation. Nothing clears it automatically yet (reclaiming after a changed boot is
+  not scheduled, and a daemon restart alone does not end it): once the owner is known to be gone, run
+  `weglarka images reservations abandon <operation-id> --yes`. An acquisition that advances to `loaded` protects its
+  image by ID and digest from then on.
 - **Warning in `doctor`:** the `runtime.images` check reports `warn` with the number of unused images and their size
   ("at most", since shared layers are counted per image), and the `hint` points to `weglarka images prune`. During a
   deploy the check is informational (`info`).

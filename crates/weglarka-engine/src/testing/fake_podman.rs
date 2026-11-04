@@ -494,6 +494,15 @@ impl FakePodman {
         self.lock().calls.clone()
     }
 
+    /// How many times `image_remove` was called, including calls that failed.
+    pub fn image_remove_calls(&self) -> usize {
+        self.lock()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::ImageRemove(_)))
+            .count()
+    }
+
     /// How many times `container_list` was called (kept out of [`Call`] so existing call-log assertions
     /// do not change).
     pub fn container_list_calls(&self) -> usize {

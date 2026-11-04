@@ -1869,13 +1869,10 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
-/// An adoption that cannot be persisted (here: a read-only state directory) must not be turned into
-/// a deletion: the image stays unattributed and a diagnostic says why.
-#[cfg(unix)]
+/// An adoption that cannot be persisted (an injected write failure) means provenance is
+/// incomplete: the whole prune is blocked, nothing is removed, nothing is forgotten.
 #[tokio::test(start_paused = true)]
 async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
-    use std::os::unix::fs::PermissionsExt;
-
     let h = Harness::new(NTFY);
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.fake.script_health("ntfy", [HealthStatus::Healthy]);
@@ -1883,22 +1880,31 @@ async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
     let stale = format!("ghcr.io/jpalczewski/ntfy.zig@{}", digest('e'));
     h.fake.set_pull_digest(&stale, digest('e'));
     h.fake.image_pull(&stale).collect::<Vec<_>>().await;
+    let inventory_before = std::fs::read(h.dir.path().join("managed-images.toml")).ok();
 
-    let dir = h.dir.path();
-    let original = std::fs::metadata(dir).unwrap().permissions();
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let out = h.rec.prune_images(false).await;
-    std::fs::set_permissions(dir, original).unwrap();
-    let out = out.unwrap();
+    crate::images::write_count::fail_nth_write(1);
+    let out = h.rec.prune_images(false).await.unwrap();
 
-    assert!(out.removed.is_empty(), "{out:?}");
+    assert!(out.blocked, "{out:?}");
+    assert!(out.removed.is_empty() && out.failed.is_empty(), "{out:?}");
+    assert_eq!(out.reclaimed_bytes, 0, "{out:?}");
     assert!(
         out.diagnostics
             .iter()
             .any(|d| d.contains("cannot record image provenance")),
         "{out:?}"
     );
+    assert_eq!(
+        h.fake.image_remove_calls(),
+        0,
+        "image_remove is never called"
+    );
     assert_eq!(h.fake.images().len(), 2, "nothing was removed");
+    assert_eq!(
+        std::fs::read(h.dir.path().join("managed-images.toml")).ok(),
+        inventory_before,
+        "nothing was forgotten or recorded"
+    );
 }
 
 // ── config_root mounts and reload (issue #118, ADR 0028) ────────────────────────
@@ -5955,16 +5961,277 @@ mod retention {
         let h = Harness::new(NTFY);
         deploy(&h, "ntfy", 'a').await;
         std::fs::write(state_dir(&h).join(INVENTORY_FILE_NAME), "{ not toml").unwrap();
-        let error = h.rec.prune_images(false).await.unwrap_err();
-        assert!(
-            matches!(error, EngineError::ImageBookkeeping(_)),
-            "{error:?}"
-        );
+        for dry_run in [false, true] {
+            let report = h.rec.prune_images(dry_run).await.unwrap();
+            assert!(report.blocked, "{report:?}");
+            assert_eq!(report.dry_run, dry_run);
+            assert!(report.removed.is_empty(), "{report:?}");
+            assert!(
+                report.diagnostics.iter().any(|d| d.contains("blocked")),
+                "{report:?}"
+            );
+        }
+        assert_eq!(h.fake.image_remove_calls(), 0);
         assert_eq!(
             std::fs::read_to_string(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap(),
             "{ not toml"
         );
         assert!(ids(&h.fake.images()).contains(&'a'.to_string().repeat(64)));
+    }
+
+    /// A read error that is not a parse error: the inventory path cannot be read as a file.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_inventory_blocks_prune() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let path = state_dir(&h).join(INVENTORY_FILE_NAME);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        // An unprotected leftover that a healthy pass would remove.
+        h.fake.add_image(leftover_image('e'));
+
+        let report = h.rec.prune_images(false).await.unwrap();
+
+        assert!(report.blocked, "{report:?}");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(h.fake.image_remove_calls(), 0);
+        assert!(ids(&h.fake.images()).contains(&'e'.to_string().repeat(64)));
+    }
+
+    /// An unprotected image of the app, known to the inventory.
+    fn leftover_image(c: char) -> weglarka_model::podman::ImageInfo {
+        weglarka_model::podman::ImageInfo {
+            id: c.to_string().repeat(64),
+            digest: Some(digest(c)),
+            standalone_digest: Some(digest(c)),
+            repo_tags: vec![format!("{REPO}:old-{c}")],
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// The inventory cannot be written although nothing needs adopting: the pass is blocked
+    /// before the first removal, so no image is deleted without being able to forget it.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_unwritable_inventory_blocks_prune_before_any_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let old = 'e'.to_string().repeat(64);
+        h.fake.add_image(leftover_image('e'));
+        let mut inventory = read_inventory(&h);
+        inventory.images.push(owned(&old, app("ntfy"), REPO, 'e'));
+        write_inventory(&h, inventory.images);
+        let before = std::fs::read(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap();
+
+        let dir = state_dir(&h);
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            std::fs::set_permissions(&dir, original).unwrap();
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
+            return;
+        }
+        let report = h.rec.prune_images(false).await;
+        std::fs::set_permissions(&dir, original).unwrap();
+        let report = report.unwrap();
+
+        assert!(report.blocked, "{report:?}");
+        assert!(report.removed.is_empty() && report.failed.is_empty());
+        assert_eq!(h.fake.image_remove_calls(), 0);
+        assert!(ids(&h.fake.images()).contains(&old));
+        assert_eq!(
+            std::fs::read(dir.join(INVENTORY_FILE_NAME)).unwrap(),
+            before,
+            "nothing was forgotten"
+        );
+    }
+
+    /// A dry run never writes: adoptions are only advertised, the bookkeeping files are untouched.
+    #[tokio::test(start_paused = true)]
+    async fn a_dry_run_leaves_the_bookkeeping_files_byte_identical() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        // A legacy image the spec names, without a record: a real prune would adopt it.
+        let legacy = leftover_image('d');
+        let mut legacy = legacy;
+        legacy.repo_tags = vec![IMAGE.to_owned()];
+        h.fake.add_image(legacy);
+        // A loaded reservation is present, so the reservations file exists too.
+        let reservation = Reservations::new(vec![ReservationEntry {
+            operation_id: OperationId::new("op-1").unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, current_boot(), 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loaded,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        }])
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            reservation.to_toml().unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let read = |name: &str| std::fs::read(state_dir(&h).join(name)).ok();
+        let before = (read(INVENTORY_FILE_NAME), read(RESERVATIONS_FILE_NAME));
+        assert!(before.0.is_some() && before.1.is_some());
+
+        let report = h.rec.prune_images(true).await.unwrap();
+
+        assert!(report.dry_run && !report.blocked, "{report:?}");
+        assert_eq!(
+            (read(INVENTORY_FILE_NAME), read(RESERVATIONS_FILE_NAME)),
+            before
+        );
+        assert_eq!(h.fake.image_remove_calls(), 0);
+    }
+
+    fn current_boot() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|id| id.trim().to_owned())
+            .unwrap_or_else(|_| "unknown-boot".to_owned())
+    }
+
+    fn loading_reservation(h: &Harness, operation: &str) {
+        let reservation = Reservations::new(vec![ReservationEntry {
+            operation_id: OperationId::new(operation).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, current_boot(), 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        }])
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(h).join(RESERVATIONS_FILE_NAME),
+            reservation.to_toml().unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+    }
+
+    /// A recorded image the spec no longer names, plus an unrecorded one that only its repository
+    /// digest ties to the app: a real pass would remove the first and could adopt the second.
+    fn recorded_and_unrecorded_leftovers(h: &Harness) -> (String, String) {
+        let recorded = 'e'.to_string().repeat(64);
+        h.fake.add_image(leftover_image('e'));
+        let mut inventory = read_inventory(h);
+        inventory
+            .images
+            .push(owned(&recorded, app("ntfy"), REPO, 'e'));
+        write_inventory(h, inventory.images);
+        let unrecorded = 'd'.to_string().repeat(64);
+        let mut image = leftover_image('d');
+        image.repo_tags = Vec::new();
+        image.repo_digests = vec![format!("{REPO}@{}", digest('d'))];
+        h.fake.add_image(image);
+        (recorded, unrecorded)
+    }
+
+    /// A reservation that is still `loading` names no image yet. The image it was pulling is at
+    /// risk only while nothing records it, and an unrecorded image becomes removable solely through
+    /// adoption: so adoption is skipped (with a diagnostic naming the operation) while the rest of
+    /// retention runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_loading_reservation_disables_adoption_until_it_is_abandoned() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let (recorded, unrecorded) = recorded_and_unrecorded_leftovers(&h);
+        loading_reservation(&h, "pull-1");
+        let inventory_before = std::fs::read(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap();
+
+        // The preview (dry run, doctor) agrees with the real pass.
+        let (preview, diagnostics) = h
+            .rec
+            .retention_preview(RetentionScope::AllManaged)
+            .await
+            .unwrap();
+        assert_eq!(ids(&preview.remove), std::slice::from_ref(&recorded));
+        assert!(diagnostics.iter().any(|d| d.contains("pull-1")));
+
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert_eq!(
+            ids(&report.removed),
+            std::slice::from_ref(&recorded),
+            "an already recorded image is still removed"
+        );
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.contains("pull-1"))
+            .unwrap_or_else(|| panic!("the diagnostic names the operation: {report:?}"));
+        assert!(
+            diagnostic.contains("weglarka images reservations abandon")
+                && diagnostic.contains("--yes"),
+            "{diagnostic}"
+        );
+        assert!(
+            ids(&h.fake.images()).contains(&unrecorded),
+            "the unrecorded image is not adopted, so it is not removed"
+        );
+        let inventory = read_inventory(&h);
+        assert!(
+            inventory.get(&image_id(&unrecorded)).is_none(),
+            "{inventory:?}"
+        );
+        assert_ne!(
+            std::fs::read(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap(),
+            inventory_before,
+            "only the removed image's record was forgotten"
+        );
+
+        // Once the reservation is gone the same image is adopted and removed as before.
+        let operation = OperationId::new("pull-1").unwrap();
+        assert!(h.rec.abandon_reservation(&operation).await.unwrap());
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert_eq!(ids(&report.removed), [unrecorded], "{report:?}");
+    }
+
+    /// The final write that forgets removed images fails after the removals: the report keeps the
+    /// truth (`blocked`, the images that are gone) and their records stay.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_forget_after_removal_reports_blocked_with_the_removed_images() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let old = 'e'.to_string().repeat(64);
+        h.fake.add_image(leftover_image('e'));
+        let mut inventory = read_inventory(&h);
+        inventory.images.push(owned(&old, app("ntfy"), REPO, 'e'));
+        write_inventory(&h, inventory.images);
+
+        // Write 1 is the writability check, write 2 is the one that forgets.
+        crate::images::write_count::fail_nth_write(2);
+        let report = h.rec.prune_images(false).await.unwrap();
+
+        assert!(report.blocked, "{report:?}");
+        assert_eq!(
+            ids(&report.removed),
+            std::slice::from_ref(&old),
+            "{report:?}"
+        );
+        assert_eq!(h.fake.image_remove_calls(), 1);
+        assert!(!ids(&h.fake.images()).contains(&old));
+        assert!(
+            read_inventory(&h).get(&image_id(&old)).is_some(),
+            "the record could not be forgotten"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("injected write failure")),
+            "{report:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

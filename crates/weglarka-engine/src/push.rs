@@ -86,9 +86,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 instance: instance.clone(),
             };
             let repository = inventory_repository(&spec.image)?;
-            let operation = self
-                .begin_acquisition(&image_guard, owner.clone(), repository.clone())
-                .await?;
+            let operation = self.begin_acquisition(&image_guard).await?;
 
             let loaded = match self.podman.image_load(tar).await {
                 Ok(loaded) => loaded,

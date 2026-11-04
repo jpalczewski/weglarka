@@ -46,7 +46,23 @@ async fn prune_images<P: PodmanClient + 'static>(
             .map_err(|e| Fail(ErrorCode::InvalidRequest, format!("invalid JSON body: {e}")))?
     };
     let report = mutating(d.engine.prune_images(request.dry_run)).await?;
-    Ok(Json(response(report)))
+    Ok(Json(reply(report)?))
+}
+
+/// A blocked pass (provenance could not be read or written) is an error, not an empty report: the
+/// operator must see that cleanup did not run, and the response has no field for it.
+fn reply(report: PruneReport) -> Result<PruneImagesResponse, Fail> {
+    if report.blocked {
+        let removed = report.removed.len();
+        let mut message = report.diagnostics.join("; ");
+        if removed > 0 {
+            message.push_str(&format!(
+                "; {removed} image(s) had already been removed in this pass"
+            ));
+        }
+        return Err(Fail::internal(message));
+    }
+    Ok(response(report))
 }
 
 fn response(report: PruneReport) -> PruneImagesResponse {
@@ -84,5 +100,56 @@ fn image(info: ImageInfo) -> PrunedImage {
         tags: info.repo_tags,
         digests: info.repo_digests,
         size_bytes: info.size_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_report_is_an_error_naming_the_reason() {
+        let report = PruneReport {
+            blocked: true,
+            diagnostics: vec!["image retention is blocked: managed-images.toml: bad".into()],
+            ..PruneReport::default()
+        };
+        let Err(Fail(code, message)) = reply(report) else {
+            panic!("a blocked pass must not look like an empty prune");
+        };
+        assert_eq!(code, ErrorCode::Internal);
+        assert!(message.contains("managed-images.toml"), "{message}");
+    }
+
+    #[test]
+    fn a_blocked_report_after_removals_says_how_many_images_are_gone() {
+        let gone = ImageInfo {
+            id: "e".repeat(64),
+            digest: None,
+            standalone_digest: None,
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: Default::default(),
+        };
+        let report = PruneReport {
+            blocked: true,
+            removed: vec![gone.clone(), gone],
+            diagnostics: vec!["managed-images.toml: disk full".into()],
+            ..PruneReport::default()
+        };
+        let Err(Fail(_, message)) = reply(report) else {
+            panic!("a blocked pass must be an error");
+        };
+        assert!(message.contains("disk full"), "{message}");
+        assert!(
+            message.contains("2 image(s) had already been removed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_unblocked_report_is_a_response() {
+        assert!(reply(PruneReport::default()).is_ok());
     }
 }
