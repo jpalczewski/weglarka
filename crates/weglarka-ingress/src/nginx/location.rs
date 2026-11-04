@@ -339,8 +339,12 @@ fn write_directory(
         if opts.cache_revalidate {
             c.line("add_header Cache-Control \"no-cache\" always;");
         }
+        // `cache_revalidate` alone (no `security_headers`) still emits an unconditional `add_header`
+        // above, so `X-Request-Id` must be restated here too — `write_security_headers` only restates
+        // it when `security_headers` is set, which would otherwise silently drop the header.
         if opts.cache_revalidate || opts.security_headers.is_some() {
-            write_security_headers(c, opts.security_headers.as_ref());
+            write_security_preset_only(c, opts.security_headers.as_ref());
+            c.line("add_header X-Request-Id $request_id always;");
         }
     }
     write_try_files(c, opts.is_some_and(|o| o.clean_urls));
@@ -375,24 +379,14 @@ fn write_security_preset(c: &mut Conf, preset: SecurityHeadersPreset) {
 /// `add_header` on a `location` drops every header `server`/`http` would otherwise have set, so a
 /// location that adds any header of its own must repeat the whole set. A no-op when `headers` is
 /// `None` — callers that already emit an unconditional `add_header` of their own (cache locations)
-/// restate `X-Request-Id` themselves instead of going through this function.
+/// restate `X-Request-Id` themselves instead of going through this function. Delegates the
+/// preset/HSTS/CSP body to [`write_security_preset_only`] instead of duplicating it, so the two never
+/// drift apart.
 fn write_security_headers(c: &mut Conf, headers: Option<&SecurityHeaders>) {
-    let Some(headers) = headers else { return };
-    write_security_preset(c, headers.preset);
-    if let Some(age) = headers.hsts_max_age_secs {
-        // No `includeSubDomains`/`preload` in v1: those extend the policy to the whole domain (every
-        // subdomain, forever for `preload`), a decision this one site's config must not make on behalf
-        // of domains it has no authority over.
-        c.line(&format!(
-            "add_header Strict-Transport-Security \"max-age={age}\" always;"
-        ));
+    write_security_preset_only(c, headers);
+    if headers.is_some() {
+        c.line("add_header X-Request-Id $request_id always;");
     }
-    if let Some(csp) = &headers.csp {
-        c.line(&format!(
-            "add_header Content-Security-Policy \"{csp}\" always;"
-        ));
-    }
-    c.line("add_header X-Request-Id $request_id always;");
 }
 
 /// `cache_immutable_paths` and `feeds` (#104): both name a file of the release, relative to the site's
@@ -411,7 +405,10 @@ fn write_site_relative_locations(
     app: Option<&str>,
 ) {
     for p in &opts.cache_immutable_paths {
-        c.block(&format!("location ^~ {site_prefix}{p}"), |c| {
+        // The trailing `/` is a segment boundary (ADR 0031's own convention): without it, `^~` would
+        // also match a sibling path that merely starts with the same string (e.g. `/assets-backup`
+        // for `/assets`).
+        c.block(&format!("location ^~ {site_prefix}{p}/"), |c| {
             if let Some(app) = app {
                 set_app(c, app);
             }
@@ -470,12 +467,23 @@ fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
         if r.prefix {
             // `.` is the only regex metacharacter the path alphabet allows (`check_path_prefix`).
             let escaped = r.from.replace('.', "\\.");
-            c.block(&format!("location ^~ {}", r.from), |c| {
+            // Segment boundary (same convention as `exempt_locations`/ADR 0031): without the
+            // trailing `/` on the prefix match, `^~ {from}` would also match a sibling path that
+            // merely starts with the same string (e.g. `/blogging` for `/blog`). The bare `from`
+            // itself still redirects, via its own exact match below.
+            c.block(&format!("location ^~ {}/", r.from), |c| {
                 if let Some(app) = app {
                     set_app(c, app);
                 }
                 write_security_headers(c, opts.security_headers.as_ref());
-                c.line(&format!("rewrite ^{escaped}(.*)$ {}$1 permanent;", r.to));
+                c.line(&format!("rewrite ^{escaped}/(.*)$ {}/$1 permanent;", r.to));
+            });
+            c.block(&format!("location = {}", r.from), |c| {
+                if let Some(app) = app {
+                    set_app(c, app);
+                }
+                write_security_headers(c, opts.security_headers.as_ref());
+                c.line(&format!("return 301 {}$is_args$args;", r.to));
             });
         } else {
             c.block(&format!("location = {}", r.from), |c| {

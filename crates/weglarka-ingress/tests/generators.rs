@@ -1771,8 +1771,9 @@ fn nginx_static_site_with_every_option_snapshots() {
         );
         // `not_found_page`, at the site's own root (no path prefix here).
         assert!(conf.contains("error_page 404 /404.html;"), "{conf}");
-        // `cache_immutable_paths`: its own sibling location, not nested in the main one.
-        assert!(conf.contains("location ^~ /assets {"), "{conf}");
+        // `cache_immutable_paths`: its own sibling location, not nested in the main one, with a
+        // segment boundary so a sibling path (`/assets-backup`) cannot match it.
+        assert!(conf.contains("location ^~ /assets/ {"), "{conf}");
         assert!(
             conf.contains(
                 "add_header Cache-Control \"public, max-age=31536000, immutable\" always;"
@@ -1784,12 +1785,19 @@ fn nginx_static_site_with_every_option_snapshots() {
             conf.contains("add_header Cache-Control \"no-cache\" always;"),
             "{conf}"
         );
-        // `redirects`: exact and prefix.
+        // `redirects`: exact and prefix. A prefix redirect gets a segment-bounded `^~` location for
+        // what's below it (so `/blogging` is never swept in) plus its own exact match for the bare
+        // path itself.
         assert!(conf.contains("location = /old {"), "{conf}");
         assert!(conf.contains("return 301 /new$is_args$args;"), "{conf}");
-        assert!(conf.contains("location ^~ /blog {"), "{conf}");
+        assert!(conf.contains("location ^~ /blog/ {"), "{conf}");
         assert!(
-            conf.contains("rewrite ^/blog(.*)$ /articles$1 permanent;"),
+            conf.contains("rewrite ^/blog/(.*)$ /articles/$1 permanent;"),
+            "{conf}"
+        );
+        assert!(conf.contains("location = /blog {"), "{conf}");
+        assert!(
+            conf.contains("return 301 /articles$is_args$args;"),
             "{conf}"
         );
         // `feeds`.
