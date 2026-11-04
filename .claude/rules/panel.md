@@ -20,7 +20,7 @@ paths:
   response carries the CSP and the other security headers (`headers.rs`).
 - **Configuration** is env-only (`config.rs`): `OIDC_*` (including `OIDC_CLIENT_SECRET_FILE`), `PANEL_PUBLIC_URL`,
   `PANEL_API_AUDIENCE`, `PANEL_SESSION_IDLE_SECS`/`_MAX_SECS`, `PANEL_TRUSTED_PROXIES`, `PANEL_LISTEN`, `WEGLARKA_PANEL_SOCKET`; secrets are
-  `Secret` with a redacted `Debug`; an `http://` issuer is allowed only on loopback.
+  `Secret` with a redacted `Debug`; an `http://` issuer is allowed only on loopback; `OIDC_ISSUER` and `PANEL_API_AUDIENCE` must be printable ASCII (`admin_auth::printable_ascii`, the CLI applies the same rule to what a host publishes).
 - Vendored htmx/SSE/Alpine CSP builds live in `crates/weglarka-panel/assets/vendor/` (versions and SHA-256 in
   `VENDORED.md`; a test pins them).
 - `health_probe` in the daemon is deliberately separate from `weglarka-unix-http` (raw bytes, HTTP/1.0, injection

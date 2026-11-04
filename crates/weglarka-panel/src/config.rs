@@ -40,7 +40,7 @@ const SESSION_MAX_BOUNDS: std::ops::RangeInclusive<u64> = 300..=7 * 24 * 60 * 60
 /// A client secret file is a few dozen bytes; anything bigger is the wrong file.
 const MAX_SECRET_FILE_BYTES: u64 = 4096;
 
-use weglarka_model::admin_auth::MAX_AUDIENCE_BYTES;
+use weglarka_model::admin_auth::{MAX_AUDIENCE_BYTES, printable_ascii};
 pub use weglarka_oidc::Secret;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -108,6 +108,14 @@ impl PanelConfig {
 
         let public_url = parse_url(ENV_PUBLIC_URL, &required(ENV_PUBLIC_URL)?, true)?;
         let issuer = required(ENV_ISSUER)?.trim().to_owned();
+        // Published verbatim by `GET /_weglarka/api/login` and printed by the CLI: plain ASCII only.
+        // The value is never echoed.
+        if !printable_ascii(&issuer) {
+            return Err(invalid(
+                ENV_ISSUER,
+                "expected a URL of printable ASCII only",
+            ));
+        }
         // A loopback `http://` issuer is allowed for a test provider; everything else is https.
         let issuer_url = parse_url(ENV_ISSUER, &issuer, true)?;
         // The same rule the OIDC client applies to every endpoint: plain http only to a loopback IP
@@ -120,10 +128,10 @@ impl PanelConfig {
         }
 
         let audience = required(ENV_API_AUDIENCE)?.trim().to_owned();
-        if audience.len() > MAX_AUDIENCE_BYTES || audience.chars().any(|c| c.is_control()) {
+        if audience.len() > MAX_AUDIENCE_BYTES || !printable_ascii(&audience) {
             return Err(invalid(
                 ENV_API_AUDIENCE,
-                "expected a short single-line identifier",
+                "expected a short identifier of printable ASCII only",
             ));
         }
         let extra_endpoint_hosts = endpoint_hosts(get(ENV_ENDPOINT_HOSTS))?;
@@ -432,8 +440,37 @@ mod tests {
         assert_eq!(err, ConfigError::Missing(ENV_API_AUDIENCE));
         let c = PanelConfig::from_lookup(env(&[])).unwrap();
         assert_eq!(c.oidc.audience, "https://admin.example.com/api/");
-        for bad in ["two\nlines", &"a".repeat(600)] {
-            assert!(PanelConfig::from_lookup(env(&[(ENV_API_AUDIENCE, bad)])).is_err());
+        for bad in [
+            "two\nlines",
+            "two words",
+            "https://admin.example.com/\u{202e}",
+            "https://admin.example.com/\u{200b}",
+            "https://zażółć.example.com/",
+            &"a".repeat(600),
+        ] {
+            let err = PanelConfig::from_lookup(env(&[(ENV_API_AUDIENCE, bad)])).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { var, .. } if var == ENV_API_AUDIENCE));
+            assert!(!err.to_string().contains("zażółć"), "the value is echoed");
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_or_hidden_issuer_is_refused_without_echoing_it() {
+        for bad in [
+            "https://auth.example.com/\u{202e}",
+            "https://auth.example.com/\u{200b}",
+            "https://auth.example.com/\u{1b}[2J",
+            "https://auth.example.com/ x",
+            "https://zażółć.example.com",
+        ] {
+            let err = PanelConfig::from_lookup(env(&[(ENV_ISSUER, bad)])).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { var, .. } if var == ENV_ISSUER),
+                "{bad:?}"
+            );
+            assert!(
+                !err.to_string().contains("zażółć") && !err.to_string().contains("example.com")
+            );
         }
     }
 

@@ -117,10 +117,10 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | Variable | Default | Meaning |
 |---|---|---|
 | `OIDC_CLIENT_ID` | required | Client id at the provider (the instance name; injected). |
-| `OIDC_ISSUER` | required | Issuer URL, compared byte for byte with the token's `iss` (injected). Must be `https://`. Plain `http://` is accepted only for a loopback IP address (`127.0.0.1`, `[::1]`, not `localhost`), meant for a test provider; the same rule applies to every endpoint the discovery document names. |
+| `OIDC_ISSUER` | required | Issuer URL, compared byte for byte with the token's `iss` (injected). Must be `https://`. Plain `http://` is accepted only for a loopback IP address (`127.0.0.1`, `[::1]`, not `localhost`), meant for a test provider; the same rule applies to every endpoint the discovery document names. Visible ASCII only (no spaces, control or Unicode format characters); the panel refuses to start otherwise, because `weglarka login` shows this value to the person signing in. |
 | `OIDC_CLIENT_SECRET` | required unless the file variable is set | Client secret (injected for `kind = "env"`). |
 | `OIDC_CLIENT_SECRET_FILE` | none | Path of a mounted secret file (first line, at most 4 KiB). Set it **or** `OIDC_CLIENT_SECRET`, not both. |
-| `PANEL_API_AUDIENCE` | required | The `aud` the daemon expects (`[admin.http] audience`); sent in the authorization request so tokens carry it. |
+| `PANEL_API_AUDIENCE` | required | The `aud` the daemon expects (`[admin.http] audience`); sent in the authorization request so tokens carry it. Visible ASCII only, at most 512 bytes. |
 | `PANEL_PUBLIC_URL` | required | The panel's public origin; the redirect URI is `<url>/auth/callback`. |
 | `PANEL_SESSION_IDLE_SECS` | `1800` | A session ends after this long without a request (60 to 86400); must not exceed the maximum. |
 | `PANEL_SESSION_MAX_SECS` | `28800` | A session ends this long after login, however active (300 to 604800). |

@@ -36,6 +36,14 @@ pub const LOGIN_DISCOVERY_PATH: &str = "/_weglarka/api/login";
 /// The longest `audience` the panel accepts and the CLI believes.
 pub const MAX_AUDIENCE_BYTES: usize = 512;
 
+/// Whether `value` is nothing but visible ASCII (`0x21..=0x7e`: no whitespace, no controls, no Unicode
+/// format characters). Issuers and audiences are URIs and the CLI prints the issuer before signing in,
+/// so a bidi override or a zero-width character must never be accepted in either; the panel refuses
+/// them at start-up and the CLI refuses them in what a host publishes.
+pub fn printable_ascii(value: &str) -> bool {
+    value.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// What the panel publishes at [`LOGIN_DISCOVERY_PATH`]: public, secret-free sign-in settings.
 ///
 /// Deliberately without `deny_unknown_fields`: this is a wire format read across CLI and panel
@@ -614,6 +622,25 @@ mod tests {
     fn the_login_discovery_path_lives_under_the_relay_prefix() {
         assert!(super::LOGIN_DISCOVERY_PATH.starts_with(super::RELAY_PREFIX));
         assert!(super::LOGIN_DISCOVERY_PATH[super::RELAY_PREFIX.len()..].starts_with('/'));
+    }
+
+    #[test]
+    fn printable_ascii_accepts_a_url_and_nothing_that_hides_or_breaks_a_line() {
+        assert!(super::printable_ascii("https://auth.example.com/a-b_c?x=1"));
+        assert!(super::printable_ascii(""));
+        for bad in [
+            "a b",
+            "a\nb",
+            "a\tb",
+            "a\u{1b}[2J",
+            "a\u{202e}b",
+            "a\u{200b}b",
+            "a\u{feff}",
+            "zażółć",
+            "a\u{7f}",
+        ] {
+            assert!(!super::printable_ascii(bad), "{bad:?}");
+        }
     }
 
     #[test]

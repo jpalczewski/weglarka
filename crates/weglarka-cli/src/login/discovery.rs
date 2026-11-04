@@ -7,7 +7,9 @@
 //! document, and refuses to replace the issuer or audience of a host it is already signed in to
 //! (trust on first use, undone only by an explicit `logout`).
 
-use weglarka_model::admin_auth::{LOGIN_DISCOVERY_PATH, LoginDiscovery, MAX_AUDIENCE_BYTES};
+use weglarka_model::admin_auth::{
+    LOGIN_DISCOVERY_PATH, LoginDiscovery, MAX_AUDIENCE_BYTES, printable_ascii,
+};
 use weglarka_oidc::{Transport, Url};
 
 use super::credentials::Store;
@@ -63,12 +65,6 @@ fn loopback(url: &Url) -> bool {
         .map(|h| h.trim_matches(['[', ']']))
         .and_then(|h| h.parse::<std::net::IpAddr>().ok())
         .is_some_and(|ip| ip.is_loopback())
-}
-
-/// Issuers and audiences are URIs: visible ASCII only (no whitespace, controls or Unicode format
-/// characters that could disguise what is printed).
-fn printable_ascii(value: &str) -> bool {
-    value.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 fn validate(document: &LoginDiscovery) -> Result<(), CliError> {
