@@ -88,6 +88,22 @@ impl ExecPlan {
             ..Self::new(program, args)
         }
     }
+
+    /// Builds the command for this plan. Interactive roles inherit the caller's stdin (a pipe or a
+    /// prompt reaches the child); workers get a closed stdin. Stdout and stderr are always inherited.
+    pub fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.args)
+            .stdin(if self.interactive {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        command
+    }
 }
 
 /// The daemon subcommand the launcher's `update` role runs. The coordinator may replace the body
@@ -164,16 +180,7 @@ pub enum RunError {
 /// Runs a plan to completion. `None` means no timeout (the daemon-service role manages its own
 /// lifetime); a value is the bounded worker timeout.
 pub fn run_plan(plan: &ExecPlan, timeout: Option<Duration>) -> Result<(), RunError> {
-    let mut command = Command::new(&plan.program);
-    command
-        .args(&plan.args)
-        .stdin(if plan.interactive {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    let mut command = plan.command();
     let mut child = command.spawn().map_err(|source| RunError::Spawn {
         program: plan.program.clone(),
         source,
