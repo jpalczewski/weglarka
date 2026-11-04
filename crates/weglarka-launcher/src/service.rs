@@ -9,14 +9,20 @@
 //! create` ensures a slow pull cannot start the previous digest; an epoch mismatch removes the
 //! just-created container and loops. Start attempts are bounded per epoch (persisted before each
 //! start), and on exhaustion the process stays alive waiting for a new selection instead of leaving
-//! the service permanently inactive.
+//! the service permanently inactive. A container that runs longer than `stable_after` resets the
+//! counter, so a reboot or a rare crash never exhausts it; consecutive failures back off
+//! exponentially up to a cap. Without any selection, at start or after it vanishes, the launcher
+//! exits non-zero and the supervisor restarts it.
 
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use crate::budget::{BudgetError, block_service_epoch, note_service_attempt};
+use crate::budget::{
+    BudgetError, backoff_delay, block_service_epoch, note_service_attempt, note_service_run,
+    run_was_stable,
+};
 use crate::inspect;
 use crate::selection::{PlatformService, SelectionError};
 
@@ -180,6 +186,12 @@ pub enum ServiceError {
     Selection(#[from] SelectionError),
     #[error(transparent)]
     Budget(#[from] BudgetError),
+    #[error(
+        "no service selection at {}; exiting so the supervisor restarts the launcher once \
+         activation has written one",
+        path.display()
+    )]
+    NoSelection { path: PathBuf },
     #[error("podman {args}: {message}")]
     Podman { args: String, message: String },
     #[error("podman {args}: {source}")]
@@ -195,9 +207,15 @@ pub struct ServiceOptions {
     pub host_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub podman: String,
-    /// How long to wait before retrying a missing socket or an unchanged selection.
+    /// How often a blocked runner re-reads the selection while it waits for a new one.
     pub poll: Duration,
     pub max_attempts: u32,
+    /// A container run longer than this resets the epoch's attempt counter and the backoff.
+    pub stable_after: Duration,
+    /// Delay after the first failure; it doubles with every further consecutive failure.
+    pub backoff_base: Duration,
+    /// Upper bound of the delay.
+    pub backoff_cap: Duration,
 }
 
 fn env(options: &ServiceOptions) -> Vec<(String, String)> {
@@ -238,23 +256,49 @@ pub fn inspect(
     )
 }
 
-/// Runs the foreground service loop until the process is stopped by the init system.
+/// Sleeps for the next backoff step after one more consecutive failure.
+fn back_off(clock: &impl Clock, options: &ServiceOptions, failures: &mut u32) {
+    *failures = failures.saturating_add(1);
+    clock.sleep(backoff_delay(
+        *failures,
+        options.backoff_base,
+        options.backoff_cap,
+    ));
+}
+
+/// Settles the budget after a container run of `ran`; a stable run also ends the backoff.
+/// Returns whether the run was stable.
+fn note_run(options: &ServiceOptions, epoch: u64, ran: Duration, failures: &mut u32) -> bool {
+    if !run_was_stable(ran, options.stable_after) {
+        return false;
+    }
+    match note_service_run(&options.host_dir, epoch, ran, options.stable_after) {
+        Ok(_) => log_line(&format!(
+            "the daemon container ran for {}s; the attempt budget for epoch {epoch} is reset",
+            ran.as_secs()
+        )),
+        Err(error) => log_line(&format!("cannot reset the attempt budget: {error}")),
+    }
+    *failures = 0;
+    true
+}
+
+/// Runs the foreground service loop until the process is stopped by the init system, or fails
+/// when the service selection is missing so the supervisor restarts the launcher.
 pub fn run_service(
     runner: &impl CommandRunner,
     clock: &impl Clock,
     options: &ServiceOptions,
 ) -> Result<(), ServiceError> {
+    // Consecutive failures since the last stable run; they drive the backoff.
+    let mut failures = 0u32;
     loop {
         let selection = match PlatformService::load(&options.host_dir) {
             Ok(Some(selection)) => selection,
-            Ok(None) => {
-                // No selection yet: the service stays alive for the adapter to fill it in.
-                clock.sleep(options.poll);
-                continue;
-            }
+            Ok(None) => return Err(no_selection(options)),
             Err(error) => {
                 log_line(&format!("cannot read the service selection: {error}"));
-                clock.sleep(options.poll);
+                back_off(clock, options, &mut failures);
                 continue;
             }
         };
@@ -263,7 +307,7 @@ pub fn run_service(
             Err(error) => {
                 // A missing socket at boot must not kill the supervised service.
                 log_line(&format!("cannot observe the daemon container: {error}"));
-                clock.sleep(options.poll);
+                back_off(clock, options, &mut failures);
                 continue;
             }
         };
@@ -272,11 +316,15 @@ pub fn run_service(
             .unwrap_or(false);
         match plan_step(&selection, observed.as_ref(), attempts) {
             Step::Wait { id } => {
+                let started = clock.now();
                 let waited =
                     runner.status(&options.podman, &["wait".to_owned(), id], &env(options));
-                if !waited.is_ok_and(|status| status.success()) {
+                if waited.is_ok_and(|status| status.success()) {
+                    let ran = clock.now().saturating_sub(started);
+                    note_run(options, selection.epoch, ran, &mut failures);
+                } else {
                     // A failing `podman wait` returns at once; do not spin on it.
-                    clock.sleep(options.poll);
+                    back_off(clock, options, &mut failures);
                 }
             }
             Step::Start { id } => {
@@ -287,20 +335,35 @@ pub fn run_service(
                             "starting the existing daemon container (attempt {})",
                             attempt.number
                         ));
+                        let started = clock.now();
                         let _ = runner.status(
                             &options.podman,
                             &["start".to_owned(), "-a".to_owned(), id],
                             &env(options),
                         );
+                        let ran = clock.now().saturating_sub(started);
+                        if !note_run(options, selection.epoch, ran, &mut failures) {
+                            back_off(clock, options, &mut failures);
+                        }
                     }
-                    Err(_) => block_and_wait(clock, options, selection.epoch),
+                    Err(_) => {
+                        block_and_wait(clock, options, selection.epoch)?;
+                        failures = 0;
+                    }
                 }
             }
             Step::Create => match create_and_start(runner, clock, options, &selection) {
-                Ok(()) => {}
+                Ok(Some(ran)) => {
+                    if !note_run(options, selection.epoch, ran, &mut failures) {
+                        back_off(clock, options, &mut failures);
+                    }
+                }
+                // Superseded by a newer selection, or unblocked by one: begin afresh.
+                Ok(None) => failures = 0,
+                Err(error @ ServiceError::NoSelection { .. }) => return Err(error),
                 Err(error) => {
                     log_line(&format!("cannot create the daemon container: {error}"));
-                    clock.sleep(options.poll);
+                    back_off(clock, options, &mut failures);
                 }
             },
             Step::RemoveAndCreate { id } => {
@@ -310,25 +373,31 @@ pub fn run_service(
                     &env(options),
                 );
                 if !removed.is_ok_and(|output| output.success) {
-                    clock.sleep(options.poll);
+                    back_off(clock, options, &mut failures);
                 }
             }
-            Step::Blocked { epoch } => block_and_wait(clock, options, epoch),
+            Step::Blocked { epoch } => {
+                block_and_wait(clock, options, epoch)?;
+                failures = 0;
+            }
         }
     }
 }
 
+/// Creates the container for `selection` and runs it attached. `Some(ran)` is how long it ran;
+/// `None` means it was not started: the selection changed during the create, or the budget ran out
+/// and a new selection arrived.
 fn create_and_start(
     runner: &impl CommandRunner,
     clock: &impl Clock,
     options: &ServiceOptions,
     selection: &PlatformService,
-) -> Result<(), ServiceError> {
+) -> Result<Option<Duration>, ServiceError> {
     match note_service_attempt(&options.host_dir, selection.epoch, options.max_attempts) {
         Ok(_) => {}
         Err(BudgetError::Exhausted(_)) => {
-            block_and_wait(clock, options, selection.epoch);
-            return Ok(());
+            block_and_wait(clock, options, selection.epoch)?;
+            return Ok(None);
         }
         Err(error) => return Err(error.into()),
     }
@@ -368,27 +437,43 @@ fn create_and_start(
             &["rm".to_owned(), "-f".to_owned(), id.to_owned()],
             &env(options),
         );
-        return Ok(());
+        return Ok(None);
     }
+    let started = clock.now();
     let _ = runner.status(
         &options.podman,
         &["start".to_owned(), "-a".to_owned(), id.to_owned()],
         &env(options),
     );
-    Ok(())
+    Ok(Some(clock.now().saturating_sub(started)))
 }
 
-fn block_and_wait(clock: &impl Clock, options: &ServiceOptions, epoch: u64) {
+/// Marks `epoch` blocked and waits until the selection changes to another epoch. Fails when the
+/// selection disappears meanwhile.
+fn block_and_wait(
+    clock: &impl Clock,
+    options: &ServiceOptions,
+    epoch: u64,
+) -> Result<(), ServiceError> {
     let _ = block_service_epoch(&options.host_dir, epoch);
     log_line(&format!(
         "attempt budget for epoch {epoch} exhausted; waiting for a new selection"
     ));
     loop {
         match PlatformService::load(&options.host_dir) {
-            Ok(Some(selection)) if selection.epoch != epoch => return,
+            Ok(Some(selection)) if selection.epoch != epoch => return Ok(()),
+            Ok(None) => return Err(no_selection(options)),
             _ => clock.sleep(options.poll),
         }
     }
+}
+
+fn no_selection(options: &ServiceOptions) -> ServiceError {
+    let error = ServiceError::NoSelection {
+        path: PlatformService::path(&options.host_dir),
+    };
+    log_line(&error.to_string());
+    error
 }
 
 fn log_line(message: &str) {
@@ -400,6 +485,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::budget::ServiceAttempts;
     use crate::selection::{LABEL_ACTIVATION_EPOCH, LABEL_DAEMON_DIGEST};
     use weglarka_model::release_set::StrictDigest;
 
@@ -514,6 +600,9 @@ mod tests {
                 podman: "podman".to_owned(),
                 poll: Duration::from_millis(10),
                 max_attempts: 3,
+                stable_after: Duration::from_secs(600),
+                backoff_base: Duration::from_secs(2),
+                backoff_cap: Duration::from_secs(60),
             },
             ScriptedRunner {
                 host: host.to_owned(),
@@ -564,8 +653,184 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             selection(2).save(&writer).unwrap();
         });
-        block_and_wait(&SystemClock::new(), &options, 1);
+        block_and_wait(&SystemClock::new(), &options, 1).unwrap();
         assert_eq!(PlatformService::load(&host).unwrap().unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn a_vanished_selection_ends_the_wait_for_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        selection(1).save(&host).unwrap();
+        let (options, _runner) = options(&host, false);
+        let clock = FakeClock::default();
+        std::fs::remove_file(PlatformService::path(&host)).unwrap();
+        let error = block_and_wait(&clock, &options, 1).unwrap_err();
+        assert!(matches!(error, ServiceError::NoSelection { .. }), "{error}");
+    }
+
+    /// A clock that only moves when told to: `sleep` records the delay and advances it.
+    #[derive(Default)]
+    struct FakeClock {
+        now: std::cell::Cell<Duration>,
+        sleeps: std::cell::RefCell<Vec<Duration>>,
+    }
+
+    impl FakeClock {
+        fn advance(&self, by: Duration) {
+            self.now.set(self.now.get() + by);
+        }
+
+        fn sleeps(&self) -> Vec<u64> {
+            self.sleeps.borrow().iter().map(Duration::as_secs).collect()
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Duration {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            assert!(
+                self.sleeps.borrow().len() < 100,
+                "the loop is not terminating"
+            );
+            self.sleeps.borrow_mut().push(duration);
+            self.advance(duration);
+        }
+    }
+
+    /// Reports a stopped container of epoch 1 and "runs" it for a scripted time per start (the
+    /// last entry repeats). After `starts` runs it deletes the selection, which ends the loop.
+    struct CrashingRunner<'a> {
+        host: PathBuf,
+        clock: &'a FakeClock,
+        run_for: Vec<Duration>,
+        starts: std::cell::Cell<usize>,
+        stop_after: usize,
+    }
+
+    impl CommandRunner for CrashingRunner<'_> {
+        fn run(&self, _: &str, args: &[String], _: &[(String, String)]) -> io::Result<Output> {
+            assert_eq!(
+                args.first().map(String::as_str),
+                Some("inspect"),
+                "{args:?}"
+            );
+            Ok(Output {
+                success: true,
+                stdout: "abc|false|img|repo@sha256:aa|1".to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        fn status(
+            &self,
+            _: &str,
+            args: &[String],
+            _: &[(String, String)],
+        ) -> io::Result<ExitStatus> {
+            assert_eq!(args.join(" "), "start -a abc");
+            let n = self.starts.get();
+            self.starts.set(n + 1);
+            self.clock
+                .advance(self.run_for[n.min(self.run_for.len() - 1)]);
+            if n + 1 == self.stop_after {
+                std::fs::remove_file(PlatformService::path(&self.host)).unwrap();
+            }
+            std::process::Command::new("true").status()
+        }
+    }
+
+    /// Runs the loop against `CrashingRunner` until it loses its selection; returns the delays
+    /// slept and the final budget.
+    fn crash_loop(
+        options: ServiceOptions,
+        run_for: &[u64],
+        stop_after: usize,
+    ) -> (Vec<u64>, ServiceAttempts, usize) {
+        let host = options.host_dir.clone();
+        selection(1).save(&host).unwrap();
+        let clock = FakeClock::default();
+        let runner = CrashingRunner {
+            host: host.clone(),
+            clock: &clock,
+            run_for: run_for.iter().copied().map(Duration::from_secs).collect(),
+            starts: std::cell::Cell::new(0),
+            stop_after,
+        };
+        let error = run_service(&runner, &clock, &options).unwrap_err();
+        assert!(matches!(error, ServiceError::NoSelection { .. }), "{error}");
+        (
+            clock.sleeps(),
+            ServiceAttempts::load(&host, 1).unwrap(),
+            runner.starts.get(),
+        )
+    }
+
+    fn host_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        (dir, host)
+    }
+
+    #[test]
+    fn long_runs_never_exhaust_the_budget() {
+        // The reboot case: the daemon runs for hours, the host restarts, and the runner starts the
+        // stopped container again. Five such runs against a budget of three.
+        let (_dir, host) = host_dir();
+        let (options, _) = options(&host, false);
+        let (sleeps, budget, starts) = crash_loop(options, &[3600], 5);
+        assert_eq!(starts, 5);
+        assert!(sleeps.is_empty(), "stable runs need no backoff: {sleeps:?}");
+        assert!(!budget.blocked);
+        assert_eq!(budget.attempts, 0);
+    }
+
+    #[test]
+    fn short_runs_back_off_exponentially_up_to_the_cap() {
+        let (_dir, host) = host_dir();
+        let (mut options, _) = options(&host, false);
+        options.max_attempts = 5;
+        options.backoff_cap = Duration::from_secs(8);
+        let (sleeps, budget, starts) = crash_loop(options, &[1], 5);
+        assert_eq!(starts, 5);
+        assert_eq!(sleeps, [2, 4, 8, 8, 8]);
+        assert_eq!(budget.attempts, 5);
+    }
+
+    #[test]
+    fn a_stable_run_in_the_middle_restarts_the_backoff_and_the_count() {
+        let (_dir, host) = host_dir();
+        let (mut options, _) = options(&host, false);
+        options.max_attempts = 3;
+        let (sleeps, budget, starts) = crash_loop(options, &[1, 1, 601, 1], 4);
+        assert_eq!(starts, 4);
+        assert_eq!(sleeps, [2, 4, 2]);
+        assert_eq!(budget.attempts, 1);
+    }
+
+    #[test]
+    fn a_run_of_exactly_the_threshold_is_still_a_failure() {
+        let (_dir, host) = host_dir();
+        let (options, _) = options(&host, false);
+        let (sleeps, budget, _) = crash_loop(options, &[600], 2);
+        assert_eq!(sleeps, [2, 4]);
+        assert_eq!(budget.attempts, 2);
+    }
+
+    #[test]
+    fn no_selection_at_start_fails_instead_of_waiting() {
+        let (_dir, host) = host_dir();
+        let (options, runner) = options(&host, false);
+        let clock = FakeClock::default();
+        let error = run_service(&runner, &clock, &options).unwrap_err();
+        assert!(matches!(error, ServiceError::NoSelection { .. }), "{error}");
+        assert!(clock.sleeps().is_empty());
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     /// Answers every call with one fixed outcome.

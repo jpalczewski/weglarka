@@ -60,12 +60,22 @@ enum RoleArg {
         /// Rootless Podman runtime directory (`XDG_RUNTIME_DIR`).
         #[arg(long)]
         runtime_dir: Option<PathBuf>,
-        /// Delay before retrying a missing socket or an unchanged selection.
+        /// How often a runner that exhausted its attempts re-reads the selection.
         #[arg(long, default_value_t = 5)]
         poll_secs: u64,
         /// Bounded start attempts per activation epoch.
         #[arg(long, default_value_t = 5)]
         max_attempts: u32,
+        /// A daemon container running longer than this resets the epoch's attempt counter.
+        #[arg(long, default_value_t = 600)]
+        stable_after_secs: u64,
+        /// Delay after the first failure (missing socket, failed create, short run); it doubles
+        /// with every further consecutive failure.
+        #[arg(long, default_value_t = 2)]
+        backoff_base_secs: u64,
+        /// Upper bound of the failure delay.
+        #[arg(long, default_value_t = 60)]
+        backoff_cap_secs: u64,
     },
     /// Run the recorded recovery generation in bounded `recover-v1` mode.
     Recover {
@@ -121,6 +131,9 @@ fn main() -> Result<()> {
             runtime_dir,
             poll_secs,
             max_attempts,
+            stable_after_secs,
+            backoff_base_secs,
+            backoff_cap_secs,
         } => {
             let runtime_dir = match runtime_dir {
                 Some(dir) => dir,
@@ -130,8 +143,18 @@ fn main() -> Result<()> {
                         anyhow::anyhow!("daemon-service needs --runtime-dir or XDG_RUNTIME_DIR")
                     })?,
             };
-            if poll_secs == 0 || max_attempts == 0 {
-                bail!("--poll-secs and --max-attempts must be positive");
+            if poll_secs == 0
+                || max_attempts == 0
+                || stable_after_secs == 0
+                || backoff_base_secs == 0
+            {
+                bail!(
+                    "--poll-secs, --max-attempts, --stable-after-secs and --backoff-base-secs \
+                     must be positive"
+                );
+            }
+            if backoff_cap_secs < backoff_base_secs {
+                bail!("--backoff-cap-secs must not be below --backoff-base-secs");
             }
             run_service(
                 &ProcessRunner,
@@ -142,6 +165,9 @@ fn main() -> Result<()> {
                     podman: "podman".to_owned(),
                     poll: Duration::from_secs(poll_secs),
                     max_attempts,
+                    stable_after: Duration::from_secs(stable_after_secs),
+                    backoff_base: Duration::from_secs(backoff_base_secs),
+                    backoff_cap: Duration::from_secs(backoff_cap_secs),
                 },
             )?;
             Ok(())

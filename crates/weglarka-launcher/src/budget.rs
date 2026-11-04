@@ -3,7 +3,8 @@
 //! Two independent budgets keep a crash loop from running forever:
 //!
 //! - The daemon service launcher owns a start-attempt budget **per activation epoch** and records a
-//!   blocked marker when it is exhausted, while staying alive so a new selection can start.
+//!   blocked marker when it is exhausted, while staying alive so a new selection can start. A run
+//!   longer than the stability threshold clears the counter, so only a crash loop exhausts it.
 //! - The stable launcher records a recovery attempt **before** every recovery exec, so a failing
 //!   recovery binary cannot be restarted forever and a process restart cannot reset the budget.
 //!
@@ -159,6 +160,23 @@ pub fn note_service_attempt(
     Ok(Attempt {
         number: state.attempts,
     })
+}
+
+/// Records that the daemon container ran for `ran`. A run longer than `stable_after` clears the
+/// epoch's attempt counter (a daemon that survived a reboot or a long uptime is not a crash loop);
+/// returns whether it did.
+pub fn note_service_run(
+    host_dir: &Path,
+    epoch: u64,
+    ran: Duration,
+    stable_after: Duration,
+) -> Result<bool, BudgetError> {
+    let state = ServiceAttempts::load(host_dir, epoch)?;
+    let after = state.after_run(ran, stable_after);
+    if after != state {
+        after.save(host_dir)?;
+    }
+    Ok(run_was_stable(ran, stable_after))
 }
 
 /// Marks the current epoch as blocked without consuming another attempt.
