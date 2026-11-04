@@ -20,12 +20,14 @@ use weglarka_engine::platform::{
     ScheduledJob, ServiceName, ServiceSpec, ServiceStatus, UnitFile,
 };
 use weglarka_launcher::host::{DEFAULT_HOST_DIR, LAUNCHER_FILE};
+use weglarka_launcher::inspect::{self, InspectedContainer};
 use weglarka_launcher::selection::{Job, PlatformService, RuntimeJobs};
 use weglarka_model::app::Digest;
 use weglarka_model::config::PlatformKind;
 
 use crate::platform::{
-    CommandRunner, TokioRunner, activation_labels, pinned_digest, run_args_with_labels,
+    CommandOutput, CommandRunner, TokioRunner, activation_labels, pinned_digest,
+    run_args_with_labels,
 };
 
 /// Rootless Podman API service.
@@ -116,6 +118,11 @@ impl<R: CommandRunner> OpenRcPlatform<R> {
     }
 
     async fn run(&self, program: &str, args: &[String]) -> Result<(bool, String)> {
+        let out = self.run_output(program, args).await?;
+        Ok((out.success, out.stdout))
+    }
+
+    async fn run_output(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
         let env = [(
             "XDG_RUNTIME_DIR".to_owned(),
             self.runtime_dir().display().to_string(),
@@ -328,46 +335,23 @@ impl<R: CommandRunner> OpenRcPlatform<R> {
         Ok(())
     }
 
-    async fn inspect(&self, service: &str) -> Result<Option<ContainerState>> {
-        let format = "{{.Id}}|{{.State.Running}}|{{.Image}}|{{.Config.Image}}|\
-                      {{index .Config.Labels \"io.weglarka.activation-epoch\"}}";
-        let (ok, out) = self
-            .run(
-                "podman",
-                &[
-                    "inspect".to_owned(),
-                    "--type".to_owned(),
-                    "container".to_owned(),
-                    "--format".to_owned(),
-                    format.to_owned(),
-                    service.to_owned(),
-                ],
-            )
-            .await?;
-        if !ok {
+    /// `Ok(None)` means Podman reports no such container; any other failure (for example an
+    /// unreachable socket) is an error.
+    async fn inspect(&self, service: &str) -> Result<Option<InspectedContainer>> {
+        let args = inspect::container_args(service);
+        let out = self.run_output("podman", &args).await?;
+        if out.success {
+            return Ok(inspect::parse_inspect(&out.stdout));
+        }
+        if inspect::is_absent(&out.stderr) {
             return Ok(None);
         }
-        let mut parts = out.split('|');
-        let id = parts.next().unwrap_or_default().trim().to_owned();
-        if id.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(ContainerState {
-            id,
-            running: parts.next().unwrap_or_default().trim() == "true",
-            image_id: parts.next().unwrap_or_default().trim().to_owned(),
-            config_image: parts.next().unwrap_or_default().trim().to_owned(),
-            epoch: parts.next().unwrap_or_default().trim().parse().ok(),
-        }))
+        Err(PlatformError::Command(format!(
+            "podman {}: {}",
+            args.join(" "),
+            out.stderr
+        )))
     }
-}
-
-struct ContainerState {
-    id: String,
-    running: bool,
-    image_id: String,
-    config_image: String,
-    epoch: Option<u64>,
 }
 
 impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
@@ -699,7 +683,7 @@ mod tests {
             program: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
+        ) -> io::Result<CommandOutput> {
             let call = format!("{program} {}", args.join(" "));
             self.0.lock().unwrap().push(call.clone());
             let out = if call.contains("inspect --type container") {
@@ -709,7 +693,11 @@ mod tests {
             } else {
                 String::new()
             };
-            Ok((true, out))
+            Ok(CommandOutput {
+                success: true,
+                stdout: out,
+                stderr: String::new(),
+            })
         }
     }
 
@@ -733,6 +721,77 @@ mod tests {
             args: vec!["run".into()],
             hardening: Hardening::default(),
         }
+    }
+
+    /// Fails every `podman inspect` with a fixed stderr; everything else succeeds.
+    struct FailingInspect(&'static str);
+
+    impl CommandRunner for FailingInspect {
+        async fn run(
+            &self,
+            _: &str,
+            args: &[String],
+            _: &[(String, String)],
+        ) -> io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                success: !args.iter().any(|a| a == "inspect"),
+                stdout: String::new(),
+                stderr: self.0.to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_treats_a_missing_container_as_absent() {
+        let p = OpenRcPlatform::with_runner(
+            "weglarka",
+            1001,
+            FailingInspect("Error: no such container weglarka"),
+        );
+        let observed = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(observed.container_id, None);
+        assert_eq!(observed.ready, Some(false));
+    }
+
+    #[tokio::test]
+    async fn observe_ignores_warnings_before_a_missing_container() {
+        let p = OpenRcPlatform::with_runner(
+            "weglarka",
+            1001,
+            FailingInspect(
+                "level=warning msg=\"Failed to add pause process to systemd sandbox cgroup: dial unix \
+         /run/user/1001/bus: connect: no such file or directory\"\nError: no such container \
+         weglarka",
+            ),
+        );
+        let observed = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(observed.container_id, None);
+    }
+
+    #[tokio::test]
+    async fn observe_reports_an_unreachable_socket_as_an_error() {
+        let p = OpenRcPlatform::with_runner(
+            "weglarka",
+            1001,
+            FailingInspect(
+                "Cannot connect to Podman. Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` and `podman machine \
+         start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to \
+         connect: dial unix /run/user/1001/podman/podman.sock: connect: no such file or \
+         directory: unix:///run/user/1001/podman/podman.sock",
+            ),
+        );
+        let error = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unable to connect"), "{error}");
     }
 
     #[tokio::test]

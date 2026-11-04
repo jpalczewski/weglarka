@@ -11,6 +11,7 @@ use weglarka_engine::platform::{
     ScheduledJob, ServiceName, ServiceSpec, ServiceStatus,
 };
 use weglarka_launcher::host::DEFAULT_HOST_DIR;
+use weglarka_launcher::inspect;
 use weglarka_launcher::selection::{
     Job, LABEL_ACTIVATION_EPOCH, LABEL_DAEMON_DIGEST, PlatformService, RuntimeJobs,
 };
@@ -18,16 +19,17 @@ use weglarka_model::app::Digest;
 use weglarka_model::config::PlatformKind;
 
 pub use weglarka_engine::platform::UnitFile;
+pub use weglarka_launcher::service::Output as CommandOutput;
 
 /// Wykonuje polecenia (`systemctl --user …`); podmieniany w testach.
 pub trait CommandRunner: Send + Sync {
-    /// `(sukces, stdout)`.
+    /// Success flag plus trimmed stdout and stderr.
     fn run(
         &self,
         program: &str,
         args: &[String],
         env: &[(String, String)],
-    ) -> impl Future<Output = io::Result<(bool, String)>> + Send;
+    ) -> impl Future<Output = io::Result<CommandOutput>> + Send;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -39,16 +41,17 @@ impl CommandRunner for TokioRunner {
         program: &str,
         args: &[String],
         env: &[(String, String)],
-    ) -> io::Result<(bool, String)> {
+    ) -> io::Result<CommandOutput> {
         let out = tokio::process::Command::new(program)
             .args(args)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .output()
             .await?;
-        Ok((
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-        ))
+        Ok(CommandOutput {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        })
     }
 }
 
@@ -541,11 +544,13 @@ impl<R: CommandRunner> SystemdPlatform<R> {
             self.runner
                 .run("runuser", &command, &env)
                 .await
+                .map(|out| (out.success, out.stdout))
                 .map_err(|e| PlatformError::Command(format!("runuser systemctl: {e}")))
         } else {
             self.runner
                 .run("systemctl", &full, &env)
                 .await
+                .map(|out| (out.success, out.stdout))
                 .map_err(|e| PlatformError::Command(format!("systemctl: {e}")))
         }
     }
@@ -815,22 +820,20 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
     async fn observe_service(&self, name: ServiceName) -> Result<ObservedService> {
         let entry = self.entry()?;
         let name = name.as_str().to_owned();
-        let format = "{{.Id}}|{{.State.Running}}|{{.Image}}|{{.Config.Image}}|\
-                      {{index .Config.Labels \"io.weglarka.activation-epoch\"}}";
-        let (ok, out) = self
-            .podman(
-                &entry,
-                &[
-                    "inspect".to_owned(),
-                    "--type".to_owned(),
-                    "container".to_owned(),
-                    "--format".to_owned(),
-                    format.to_owned(),
-                    name.clone(),
-                ],
-            )
-            .await?;
-        if !ok {
+        let args = inspect::container_args(&name);
+        let out = self.podman_output(&entry, &args).await?;
+        let container = if out.success {
+            inspect::parse_inspect(&out.stdout)
+        } else if inspect::is_absent(&out.stderr) {
+            None
+        } else {
+            return Err(PlatformError::Command(format!(
+                "podman {}: {}",
+                args.join(" "),
+                out.stderr
+            )));
+        };
+        let Some(container) = container else {
             return Ok(ObservedService {
                 name: ServiceName::new(name)?,
                 container_id: None,
@@ -839,19 +842,12 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
                 activation_epoch: None,
                 ready: Some(false),
             });
-        }
-        let mut parts = out.split('|');
-        let container_id = parts.next().unwrap_or_default().trim().to_owned();
-        let running = parts.next().unwrap_or_default().trim() == "true";
-        let image_id = parts.next().unwrap_or_default().trim().to_owned();
-        let config_image = parts.next().unwrap_or_default().trim().to_owned();
-        let activation_epoch = parts
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .map(ActivationEpoch);
+        };
+        let container_id = container.id;
+        let running = container.running;
+        let image_id = container.image_id;
+        let config_image = container.config_image;
+        let activation_epoch = container.epoch.map(ActivationEpoch);
 
         let mut digest = None;
         if !image_id.is_empty() {
@@ -882,7 +878,7 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
             .await?;
         Ok(ObservedService {
             name: ServiceName::new(name)?,
-            container_id: (!container_id.is_empty()).then_some(container_id),
+            container_id: Some(container_id),
             image_id: (!image_id.is_empty()).then_some(image_id),
             digest,
             activation_epoch,
@@ -919,8 +915,14 @@ pub(crate) fn activation_labels(
 }
 
 impl<R: CommandRunner> SystemdPlatform<R> {
-    /// Runs `podman` as the runtime user (through `runuser` when bootstrap is root).
+    /// Runs `podman` as the runtime user and keeps only `(success, stdout)`.
     async fn podman(&self, entry: &PasswdEntry, args: &[String]) -> Result<(bool, String)> {
+        let out = self.podman_output(entry, args).await?;
+        Ok((out.success, out.stdout))
+    }
+
+    /// Runs `podman` as the runtime user (through `runuser` when bootstrap is root).
+    async fn podman_output(&self, entry: &PasswdEntry, args: &[String]) -> Result<CommandOutput> {
         let runtime_dir = format!("/run/user/{}", entry.uid);
         let env = [
             ("XDG_RUNTIME_DIR".to_owned(), runtime_dir.clone()),
@@ -1019,6 +1021,14 @@ mod tests {
         assert!(render(&s).is_err());
     }
 
+    fn ok(stdout: String) -> CommandOutput {
+        CommandOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        }
+    }
+
     struct Fake(&'static str);
     impl CommandRunner for Fake {
         async fn run(
@@ -1026,15 +1036,12 @@ mod tests {
             _: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
-            Ok((
-                true,
-                if args.iter().any(|a| a == "is-active") {
-                    self.0.into()
-                } else {
-                    String::new()
-                },
-            ))
+        ) -> io::Result<CommandOutput> {
+            Ok(ok(if args.iter().any(|a| a == "is-active") {
+                self.0.into()
+            } else {
+                String::new()
+            }))
         }
     }
 
@@ -1162,14 +1169,14 @@ mod tests {
             program: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
+        ) -> io::Result<CommandOutput> {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let args = args.strip_prefix(&["--user"][..]).unwrap_or(&args);
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("{program} {}", args.join(" ")));
-            Ok((true, String::new()))
+            Ok(ok(String::new()))
         }
     }
 
@@ -1189,7 +1196,7 @@ mod tests {
             program: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
+        ) -> io::Result<CommandOutput> {
             let joined = args.join(" ");
             self.calls
                 .lock()
@@ -1207,8 +1214,81 @@ mod tests {
             } else {
                 String::new()
             };
-            Ok((true, out))
+            Ok(ok(out))
         }
+    }
+
+    /// Fails every `podman inspect` with a fixed stderr; everything else succeeds.
+    struct FailingInspect(&'static str);
+
+    impl CommandRunner for FailingInspect {
+        async fn run(
+            &self,
+            _: &str,
+            args: &[String],
+            _: &[(String, String)],
+        ) -> io::Result<CommandOutput> {
+            if args.iter().any(|a| a == "inspect") {
+                return Ok(CommandOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: self.0.to_owned(),
+                });
+            }
+            Ok(ok(String::new()))
+        }
+    }
+
+    fn observe_platform(dir: &Path, stderr: &'static str) -> SystemdPlatform<FailingInspect> {
+        let passwd = dir.join("passwd");
+        std::fs::write(&passwd, "weglarka:x:1001:1001::/home/weglarka:/bin/sh\n").unwrap();
+        SystemdPlatform::with_runner("weglarka", FailingInspect(stderr)).with_passwd(&passwd)
+    }
+
+    #[tokio::test]
+    async fn observe_treats_a_missing_container_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = observe_platform(dir.path(), "Error: no such container weglarka");
+        let observed = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(observed.container_id, None);
+        assert_eq!(observed.ready, Some(false));
+    }
+
+    #[tokio::test]
+    async fn observe_ignores_warnings_before_a_missing_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = observe_platform(
+            dir.path(),
+            "level=warning msg=\"Failed to add pause process to systemd sandbox cgroup: dial unix \
+         /run/user/1001/bus: connect: no such file or directory\"\nError: no such container \
+         weglarka",
+        );
+        let observed = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(observed.container_id, None);
+    }
+
+    #[tokio::test]
+    async fn observe_reports_an_unreachable_socket_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = observe_platform(
+            dir.path(),
+            "Cannot connect to Podman. Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` and `podman machine \
+         start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to \
+         connect: dial unix /run/user/1001/podman/podman.sock: connect: no such file or \
+         directory: unix:///run/user/1001/podman/podman.sock",
+        );
+        let error = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unable to connect"), "{error}");
     }
 
     fn pinned_spec() -> ServiceSpec {
@@ -1466,8 +1546,17 @@ mod tests {
             _: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
-            Ok((!args.iter().any(|a| a == "disable"), String::new()))
+        ) -> io::Result<CommandOutput> {
+            let disable = args.iter().any(|a| a == "disable");
+            Ok(CommandOutput {
+                success: !disable,
+                stdout: String::new(),
+                stderr: if disable {
+                    "Failed to disable unit: Access denied".to_owned()
+                } else {
+                    String::new()
+                },
+            })
         }
     }
 

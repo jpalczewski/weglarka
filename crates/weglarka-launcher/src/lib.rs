@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod budget;
 pub mod generation;
 pub mod host;
+pub mod inspect;
 pub mod lock;
 pub mod run;
 pub mod selection;

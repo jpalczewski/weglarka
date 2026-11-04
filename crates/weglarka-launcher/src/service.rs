@@ -17,6 +17,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use crate::budget::{BudgetError, block_service_epoch, note_service_attempt};
+use crate::inspect;
 use crate::selection::{PlatformService, SelectionError};
 
 /// Output of a command the runner executes.
@@ -172,15 +173,7 @@ pub fn inspect(
     options: &ServiceOptions,
     service: &str,
 ) -> Result<Option<ContainerState>, ServiceError> {
-    let args = vec![
-        "inspect".to_owned(),
-        "--type".to_owned(),
-        "container".to_owned(),
-        "--format".to_owned(),
-        "{{.Id}}|{{.State.Running}}|{{index .Config.Labels \"io.weglarka.activation-epoch\"}}"
-            .to_owned(),
-        service.to_owned(),
-    ];
+    let args = inspect::container_args(service);
     let output = runner
         .run(&options.podman, &args, &env(options))
         .map_err(|source| ServiceError::Io {
@@ -188,8 +181,7 @@ pub fn inspect(
             source,
         })?;
     if !output.success {
-        let stderr = output.stderr.to_ascii_lowercase();
-        if stderr.contains("no such") || stderr.contains("not found") {
+        if inspect::is_absent(&output.stderr) {
             return Ok(None);
         }
         return Err(ServiceError::Podman {
@@ -197,18 +189,13 @@ pub fn inspect(
             message: output.stderr,
         });
     }
-    let mut parts = output.stdout.split('|');
-    let id = parts.next().unwrap_or_default().trim();
-    if id.is_empty() {
-        return Ok(None);
-    }
-    let running = parts.next().unwrap_or_default().trim() == "true";
-    let epoch = parts.next().unwrap_or_default().trim().parse::<u64>().ok();
-    Ok(Some(ContainerState {
-        id: id.to_owned(),
-        epoch,
-        running,
-    }))
+    Ok(
+        inspect::parse_inspect(&output.stdout).map(|container| ContainerState {
+            id: container.id,
+            epoch: container.epoch,
+            running: container.running,
+        }),
+    )
 }
 
 /// Runs the foreground service loop until the process is stopped by the init system.
@@ -537,5 +524,76 @@ mod tests {
         });
         block_and_wait(&options, 1);
         assert_eq!(PlatformService::load(&host).unwrap().unwrap().epoch, 2);
+    }
+
+    /// Answers every call with one fixed outcome.
+    struct FixedRunner(Output);
+
+    impl CommandRunner for FixedRunner {
+        fn run(&self, _: &str, _: &[String], _: &[(String, String)]) -> io::Result<Output> {
+            Ok(self.0.clone())
+        }
+
+        fn status(&self, _: &str, _: &[String], _: &[(String, String)]) -> io::Result<ExitStatus> {
+            unreachable!("inspect never runs with inherited stdio")
+        }
+    }
+
+    fn failed(stderr: &str) -> FixedRunner {
+        FixedRunner(Output {
+            success: false,
+            stdout: String::new(),
+            stderr: stderr.to_owned(),
+        })
+    }
+
+    #[test]
+    fn inspect_reads_the_container_state() {
+        let (options, _) = options(Path::new("/unused"), false);
+        let runner = FixedRunner(Output {
+            success: true,
+            stdout: "abc|true|img|repo@sha256:aa|4".to_owned(),
+            stderr: String::new(),
+        });
+        assert_eq!(
+            inspect(&runner, &options, "weglarka").unwrap(),
+            Some(ContainerState {
+                id: "abc".into(),
+                epoch: Some(4),
+                running: true,
+            })
+        );
+    }
+
+    #[test]
+    fn inspect_treats_a_missing_container_as_absent() {
+        let (options, _) = options(Path::new("/unused"), false);
+        let runner = failed("Error: no such container weglarka");
+        assert_eq!(inspect(&runner, &options, "weglarka").unwrap(), None);
+    }
+
+    #[test]
+    fn inspect_ignores_warnings_before_a_missing_container() {
+        let (options, _) = options(Path::new("/unused"), false);
+        let runner = failed(
+            "level=warning msg=\"Failed to add pause process to systemd sandbox cgroup: dial unix \
+         /run/user/1001/bus: connect: no such file or directory\"\nError: no such container \
+         weglarka",
+        );
+        assert_eq!(inspect(&runner, &options, "weglarka").unwrap(), None);
+    }
+
+    #[test]
+    fn inspect_reports_an_unreachable_socket_as_an_error() {
+        let (options, _) = options(Path::new("/unused"), false);
+        let runner = failed(
+            "Cannot connect to Podman. Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` and `podman machine \
+         start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to \
+         connect: dial unix /run/user/1001/podman/podman.sock: connect: no such file or \
+         directory: unix:///run/user/1001/podman/podman.sock",
+        );
+        let error = inspect(&runner, &options, "weglarka").unwrap_err();
+        assert!(matches!(error, ServiceError::Podman { .. }), "{error}");
     }
 }
