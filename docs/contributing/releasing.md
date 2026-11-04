@@ -67,6 +67,13 @@ group that does not cancel a queued successor. A crash after the immutable tag p
 allocates the next sequence, and the post-promotion reconciliation step moves a superseded channel to the newest
 complete set. Do not create, move or delete these tags by hand.
 
+The `compatibility` job tests one daemon digest against the panel list, and `release-set` publishes that list.
+`release-set` passes the tested daemon to `weglarka-release publish --expect-daemon-digest <digest>`: the publisher
+compares it with the daemon of the set it is about to publish (including a reused daemon, read from the current
+pointer) and fails with both digests named, before pushing anything. The concurrency group stays on `release-set`
+only, so the channel lock is not held during the long compatibility tests; the assertion is what keeps a promotion
+between the two jobs from pairing a daemon with a panel list tested for another daemon.
+
 Inspect a published set with the same binary the host uses:
 
 ```sh
