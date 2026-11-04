@@ -13,8 +13,7 @@ use crate::images::ImageGuard;
 use crate::reconcile::{EngineError, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec, instance_name};
-use weglarka_model::image_inventory::Owner;
-use weglarka_model::podman::{PodmanClient, image_repo};
+use weglarka_model::podman::PodmanClient;
 use weglarka_model::state;
 
 /// Where the digest to promote comes from.
@@ -149,18 +148,9 @@ impl<P: PodmanClient> Reconciler<P> {
         .await;
         slot.finish(self, &image_guard).await;
         let outcome = result?;
-        if matches!(
-            &outcome,
-            DeployOutcome::Deployed { .. }
-                | DeployOutcome::RolledBack { .. }
-                | DeployOutcome::Provisioned { .. }
-        ) {
-            let owner = Owner::App {
-                instance: target.clone(),
-            };
-            self.retain_images_locked(&guard, &owner, image_repo(&spec.image))
-                .await;
-        }
+        // After `slot.finish`: the operator's reservation must not shield the failed digest.
+        self.retain_for_outcome(Some(&guard), &target, &outcome)
+            .await;
         Ok(PromoteReport {
             plan,
             outcome: Some(outcome),

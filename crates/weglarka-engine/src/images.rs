@@ -24,7 +24,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::deploy::normalize_image;
+use crate::deploy::{DeployOutcome, normalize_image};
 use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
 use weglarka_model::fsutil;
@@ -949,6 +949,34 @@ impl<P: PodmanClient> Reconciler<P> {
                 "image retention: removed older images"
             ),
             Err(e) => tracing::warn!(repo, error = %e, "image retention skipped"),
+        }
+    }
+
+    /// The one place that decides whether a deploy outcome is followed by retention
+    /// ([`DeployOutcome::needs_retention`]). `held` is the engine/image guard of a caller that still
+    /// holds it (retention reuses it, never reacquires); `None` is for a caller that already dropped
+    /// its acquisition guard, and retention takes a fresh one.
+    pub(crate) async fn retain_for_outcome(
+        &self,
+        held: Option<&EngineGuard<'_>>,
+        instance: &InstanceName,
+        outcome: &DeployOutcome,
+    ) {
+        if !outcome.needs_retention() {
+            return;
+        }
+        let Ok(spec) = self.load_spec(instance) else {
+            return;
+        };
+        let repo = image_repo(&spec.image);
+        match held {
+            Some(held) => {
+                let owner = Owner::App {
+                    instance: instance.clone(),
+                };
+                self.retain_images_locked(held, &owner, repo).await;
+            }
+            None => self.retain_after_deploy(instance, repo).await,
         }
     }
 

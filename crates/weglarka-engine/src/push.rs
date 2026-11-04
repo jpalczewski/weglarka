@@ -56,9 +56,8 @@ impl<P: PodmanClient> Reconciler<P> {
             self.deploy_pushed_locked(&guard, instance, DigestSource::Reference(reference))
                 .await
         };
-        if matches!(&outcome, Ok(o) if is_deployed(o)) {
-            self.retain_after_deploy(instance, image_repo(&spec.image))
-                .await;
+        if let Ok(outcome) = &outcome {
+            self.retain_for_outcome(None, instance, outcome).await;
         }
         outcome
     }
@@ -143,11 +142,10 @@ impl<P: PodmanClient> Reconciler<P> {
             outcome
         };
 
-        if matches!(&outcome, Ok(o) if is_deployed(o))
+        if let Ok(outcome) = &outcome
             && spec.kind != weglarka_model::app::AppKind::Static
         {
-            self.retain_after_deploy(instance, image_repo(&spec.image))
-                .await;
+            self.retain_for_outcome(None, instance, outcome).await;
         }
         outcome
     }
@@ -172,15 +170,6 @@ impl<P: PodmanClient> Reconciler<P> {
         }
         Ok(outcome)
     }
-}
-
-fn is_deployed(outcome: &DeployOutcome) -> bool {
-    matches!(
-        outcome,
-        DeployOutcome::Deployed { .. }
-            | DeployOutcome::RolledBack { .. }
-            | DeployOutcome::Provisioned { .. }
-    )
 }
 
 #[cfg(test)]
