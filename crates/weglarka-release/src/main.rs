@@ -26,7 +26,7 @@ use serde_json::json;
 use weglarka_model::release_set::{Channel, DescriptorContext, StrictDigest};
 use weglarka_registry::{DEFAULT_PUBLIC_KEY_PEM, HttpRegistry, PublicKey, SigningKey};
 
-use crate::assemble::{ReleaseSpec, component, crate_version, host_file};
+use crate::assemble::{ReleaseSpec, ReuseComponent, component, crate_version, host_file};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -139,7 +139,7 @@ impl PartialSpec {
                     host_files: Vec::new(),
                     compatibility: self.compatibility,
                 };
-                spec.reuse_daemon(previous);
+                spec.reuse(ReuseComponent::Daemon, previous);
                 Ok(spec)
             }
         }

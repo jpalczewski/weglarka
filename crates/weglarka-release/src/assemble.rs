@@ -99,6 +99,15 @@ pub struct ReleaseSpec {
     pub compatibility: Compatibility,
 }
 
+/// Which component a partial release reuses from the previous promoted set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseComponent {
+    Daemon,
+    // Wired up by the CLI-only release path in the next commit.
+    #[allow(dead_code)]
+    Panel,
+}
+
 impl ReleaseSpec {
     /// The descriptor for `sequence`, with the host-tools image pinned to the daemon image (the
     /// contract's v1 rule: the tools come from the selected daemon image).
@@ -141,12 +150,25 @@ impl ReleaseSpec {
         Ok(bytes)
     }
 
-    /// Replaces daemon and host-tool records with the ones from `previous`. Used for a panel-only
-    /// release: the daemon image is unchanged, so its digest, repository, version and host-file
-    /// hashes must not be re-derived (and must not be relabeled under a new tag).
+    /// Copies one component's whole descriptor (repository, digest and version) from `previous`,
+    /// plus, for the daemon, the host files it ships. Used for a partial release: the unchanged
+    /// component image must not be re-derived (and must not be relabeled under a new tag).
+    pub fn reuse(&mut self, component: ReuseComponent, previous: &Descriptor) {
+        match component {
+            ReuseComponent::Daemon => {
+                self.daemon = previous.daemon.clone();
+                self.host_files = previous.host_tools.files.clone();
+            }
+            ReuseComponent::Panel => {
+                self.panel = previous.panel.clone();
+            }
+        }
+    }
+
+    /// Reuses the daemon's whole descriptor (see [`Self::reuse`]); `publish`'s tests call it by name.
+    #[cfg(test)]
     pub fn reuse_daemon(&mut self, previous: &Descriptor) {
-        self.daemon = previous.daemon.clone();
-        self.host_files = previous.host_tools.files.clone();
+        self.reuse(ReuseComponent::Daemon, previous);
     }
 }
 
@@ -418,10 +440,25 @@ mod tests {
             "0.4.0",
         )
         .unwrap();
-        next.reuse_daemon(&previous);
+        next.reuse(ReuseComponent::Daemon, &previous);
         assert_eq!(next.daemon, previous.daemon);
         assert_eq!(next.host_files, previous.host_tools.files);
         assert_ne!(next.panel, previous.panel);
+    }
+
+    #[test]
+    fn a_cli_only_reuse_keeps_the_panel() {
+        let mut next = spec();
+        let previous = spec().descriptor(9);
+        next.daemon = component(
+            "ghcr.io/example/weglarka",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "0.10.0",
+        )
+        .unwrap();
+        next.reuse(ReuseComponent::Panel, &previous);
+        assert_eq!(next.panel, previous.panel);
+        assert_ne!(next.daemon, previous.daemon);
     }
 
     #[test]
