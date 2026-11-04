@@ -4,9 +4,10 @@
 //! direct execution, timeouts and the persisted recovery budget) without an init system or Podman.
 //! The real systemd/OpenRC tests are separate and marked ignored.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
@@ -232,4 +233,37 @@ fn cli_passes_arguments_directly_without_a_shell() {
     assert!(output.status.success(), "{output:?}");
     let args = std::fs::read_to_string(out).unwrap();
     assert_eq!(args.lines().collect::<Vec<_>>(), ["apps", "show", "a;b"]);
+}
+
+#[test]
+fn the_cli_role_keeps_the_cli_exit_code() {
+    let fixture = fixture("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 7\n");
+    let output = launcher()
+        .args(["--host-dir", fixture.host.to_str().unwrap(), "cli"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+#[test]
+fn the_cli_role_passes_stdin_through_to_the_cli() {
+    let fixture = fixture("#!/bin/sh\nexit 0\n", "#!/bin/sh\ncat\n");
+    let mut child = launcher()
+        .args(["--host-dir", fixture.host.to_str().unwrap(), "cli"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello from stdin\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello from stdin\n"
+    );
 }

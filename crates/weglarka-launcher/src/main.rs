@@ -16,7 +16,8 @@ use weglarka_launcher::budget::note_recovery_attempt;
 use weglarka_launcher::generation::{Generation, GenerationStore};
 use weglarka_launcher::host::{HOST_PROTOCOL_VERSION, validate_host_dir};
 use weglarka_launcher::run::{
-    GenerationChoice, Role, plan_cli, plan_recover, plan_supervise, plan_update, run_plan,
+    GenerationChoice, Role, exec_plan, plan_cli, plan_recover, plan_supervise, plan_update,
+    run_plan,
 };
 use weglarka_launcher::selection::{Job, RuntimeJobs};
 use weglarka_launcher::selector::HostSelector;
@@ -112,7 +113,8 @@ fn main() -> Result<()> {
         RoleArg::Supervise(args) => run_worker(&host_dir, &cli.config, Role::Supervise, &args),
         RoleArg::Cli { args } => {
             let generation = resolve(&host_dir, GenerationChoice::Active)?;
-            run_plan(&plan_cli(&generation, args)?, None)?;
+            // Replace the launcher with the CLI: its exit code, stdin and TTY pass through.
+            exec_plan(&plan_cli(&generation, args)?)?;
             Ok(())
         }
         RoleArg::DaemonService {
