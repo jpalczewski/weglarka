@@ -1034,13 +1034,20 @@ impl<P: PodmanClient> Reconciler<P> {
                 }
                 tracing::debug!(repo, "image retention: nothing to remove");
             }
-            Ok(report) => tracing::info!(
-                repo,
-                removed = report.removed.len(),
-                reclaimed_bytes = report.reclaimed_bytes,
-                failed = report.failed.len(),
-                "image retention: removed older images"
-            ),
+            Ok(report) => {
+                // A pass that removed images can still have skipped part of its work (adoption
+                // during a `loading` reservation, platform deletion without capabilities).
+                for diagnostic in &report.diagnostics {
+                    tracing::warn!(repo, %diagnostic, "image retention: partly skipped");
+                }
+                tracing::info!(
+                    repo,
+                    removed = report.removed.len(),
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    failed = report.failed.len(),
+                    "image retention: removed older images"
+                );
+            }
             Err(e) => tracing::warn!(repo, error = %e, "image retention skipped"),
         }
     }
