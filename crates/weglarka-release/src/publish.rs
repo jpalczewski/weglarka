@@ -91,10 +91,15 @@ async fn require_signature<R: ReleaseRegistry + ?Sized>(
     key: &PublicKey,
 ) -> Result<()> {
     let image = image_ref(repository)?;
-    let signatures = registry
-        .cosign_signatures(&image, digest.as_digest())
-        .await
-        .with_context(|| format!("cannot fetch the cosign signature for {digest}"))?;
+    let signatures = match registry.cosign_signatures(&image, digest.as_digest()).await {
+        Ok(signatures) => signatures,
+        // No `.sig` tag at all is the same failure as an empty list: the image is unsigned.
+        Err(error) if error.is_not_found() => Vec::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot fetch the cosign signature for {digest}"));
+        }
+    };
     if signatures.is_empty() {
         bail!(
             "{repository}@{digest} has no key-based cosign signature; \
@@ -120,11 +125,14 @@ async fn has_signature<R: ReleaseRegistry + ?Sized>(
     digest: &StrictDigest,
 ) -> Result<bool> {
     let image = image_ref(repository)?;
-    Ok(!registry
-        .cosign_signatures(&image, digest.as_digest())
-        .await
-        .with_context(|| format!("cannot fetch the cosign signature for {digest}"))?
-        .is_empty())
+    match registry.cosign_signatures(&image, digest.as_digest()).await {
+        Ok(signatures) => Ok(!signatures.is_empty()),
+        // No `.sig` tag at all: the image is unsigned, not a failed lookup.
+        Err(error) if error.is_not_found() => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot fetch the cosign signature for {digest}"))
+        }
+    }
 }
 
 /// Parses a fetched manifest and its two blobs, then the descriptor. Signature and component
@@ -642,6 +650,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use weglarka_model::release_set::{DescriptorContext, HostFile, Repository};
+    use weglarka_registry::Registry as _;
     use weglarka_registry::testing::{FakeReleaseRegistry, TestSigningKey};
 
     use crate::assemble::{ReleaseSpec, compatibility, component, manifest_for, set_tag, sha256};
@@ -889,6 +898,65 @@ mod tests {
         .unwrap_err();
         assert!(
             format!("{error:#}").contains("org.opencontainers.image.version"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_signature_tag_is_unsigned_not_a_failed_lookup() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let repository = Repository::new(DAEMON_REPO).unwrap();
+        let digest = image_index(&registry, DAEMON_REPO).await;
+
+        // The fake answers a missing `.sig` tag with the 404 the HTTP client returns.
+        let image = image_ref(&repository).unwrap();
+        let error = registry
+            .cosign_signatures(&image, digest.as_digest())
+            .await
+            .unwrap_err();
+        assert!(error.is_not_found(), "{error}");
+
+        assert!(
+            !has_signature(&registry, &repository, &digest)
+                .await
+                .unwrap()
+        );
+
+        // Verification still fails closed, with the unsigned-image message.
+        let error = require_signature(&registry, &repository, &digest, key.public_key())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no key-based cosign signature"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_signature_manifest_is_still_a_failed_lookup() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let repository = Repository::new(DAEMON_REPO).unwrap();
+        let digest = image_index(&registry, DAEMON_REPO).await;
+        let tag = format!("{}.sig", digest.as_str().replace(':', "-"));
+        registry
+            .put_manifest(&repository, &tag, b"not json")
+            .await
+            .unwrap();
+
+        let error = has_signature(&registry, &repository, &digest)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot fetch the cosign signature"),
+            "{error:#}"
+        );
+        let error = require_signature(&registry, &repository, &digest, key.public_key())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot fetch the cosign signature"),
             "{error:#}"
         );
     }
