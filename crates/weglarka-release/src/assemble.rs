@@ -213,7 +213,10 @@ pub fn next_sequence(channel: Channel, pointer: Option<u64>, tags: &[String]) ->
         .filter_map(|tag| parse_set_tag(channel, tag))
         .max()
         .unwrap_or(0);
-    pointer.unwrap_or(0).max(highest) + 1
+    // Saturating, not `+ 1`: a planted `set-<channel>-18446744073709551615` tag must not wrap the
+    // allocation to 0 in a release build. The saturated value collides with that immutable tag, and
+    // `publish` refuses to overwrite it.
+    pointer.unwrap_or(0).max(highest).saturating_add(1)
 }
 
 /// Validates the compatibility list the compatibility job produced: every entry is unique, the
@@ -268,6 +271,13 @@ pub fn component(repository: &str, digest: &str, version: &str) -> Result<Compon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_sequence_never_wraps_around() {
+        let tags = vec![format!("set-main-{}", u64::MAX)];
+        assert_eq!(next_sequence(Channel::Main, None, &tags), u64::MAX);
+        assert_eq!(next_sequence(Channel::Main, Some(u64::MAX), &[]), u64::MAX);
+    }
     use weglarka_model::release_set::parse_descriptor;
 
     const DAEMON: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

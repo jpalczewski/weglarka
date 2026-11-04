@@ -167,6 +167,8 @@ pub enum RegistryError {
     InvalidCredentials,
     #[error("the registry's pagination Link is not a usable URL")]
     InvalidLink,
+    #[error("the registry's token realm is on another host; refusing to send credentials there")]
+    CredentialsRealm,
     #[error("the release signing key cannot be used: {0}")]
     Signing(String),
     #[error("the registry returned status {status} for the {what}")]
@@ -349,6 +351,15 @@ impl HttpRegistry {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(&query.join("&"));
         let url = http::parse_url(&url)?;
+        // The realm comes from the registry's response. Credentials (`GITHUB_TOKEN`) are only ever
+        // sent to the registry's own origin; an anonymous token request carries nothing to leak and
+        // may go to the realm the registry names (Docker Hub style).
+        if self.basic.is_some() {
+            let own = http::registry_url(&repo.registry, "/")?;
+            if !same_origin(&own, &url) {
+                return Err(RegistryError::CredentialsRealm);
+            }
+        }
         let response = self
             .client
             .get_with_basic(
@@ -617,7 +628,12 @@ impl ReleaseRegistry for HttpRegistry {
             };
             // A Link is relative to the registry in practice; resolving against the current URL
             // keeps the same authority (a redirect to another host is refused by the client).
-            url = url.join(&next).map_err(|_| RegistryError::InvalidLink)?;
+            // The cursor is followed with the registry's token, so it must stay on the same origin.
+            let next_url = url.join(&next).map_err(|_| RegistryError::InvalidLink)?;
+            if !same_origin(&url, &next_url) {
+                return Err(RegistryError::InvalidLink);
+            }
+            url = next_url;
         }
         Ok(tags)
     }
@@ -654,6 +670,10 @@ impl ReleaseRegistry for HttpRegistry {
         let mut target = upload
             .join(&location)
             .map_err(|_| RegistryError::InvalidUploadLocation)?;
+        // The upload PUT carries the push token: it never leaves the registry's origin.
+        if !same_origin(&upload, &target) {
+            return Err(RegistryError::InvalidUploadLocation);
+        }
         let digest = digest_of(bytes)?;
         target
             .query_pairs_mut()
@@ -777,6 +797,13 @@ fn valid_tag(tag: &str) -> bool {
         && rest
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Same scheme, host and port: the unit a token or credential may be sent to.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 fn digest_of(bytes: &[u8]) -> Result<StrictDigest, RegistryError> {
@@ -997,6 +1024,49 @@ mod tests {
     use crate::testing::{FakeRegistry, TestSigner, payload_for};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn origins_compare_scheme_host_and_port() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(same_origin(
+            &u("https://ghcr.io/v2/a"),
+            &u("https://ghcr.io:443/token")
+        ));
+        assert!(!same_origin(
+            &u("https://ghcr.io/"),
+            &u("https://evil.example/")
+        ));
+        assert!(!same_origin(&u("https://ghcr.io/"), &u("http://ghcr.io/")));
+        assert!(!same_origin(
+            &u("http://127.0.0.1:1/"),
+            &u("http://127.0.0.1:2/")
+        ));
+    }
+
+    #[tokio::test]
+    async fn credentials_are_never_sent_to_a_realm_on_another_origin() {
+        let registry = HttpRegistry::with_basic_credentials("user", "s3cret").unwrap();
+        let repo = RepoAddress {
+            registry: "127.0.0.1:1".to_owned(),
+            repository: "jpalczewski/weglarka-releases".to_owned(),
+        };
+        let response = http::Response {
+            status: 401,
+            challenge: Some(
+                "Bearer realm=\"http://127.0.0.1:2/token\",service=\"x\",scope=\"repository:a:push\""
+                    .to_owned(),
+            ),
+            digest: None,
+            location: None,
+            link: None,
+            body: Vec::new(),
+        };
+        let error = registry.fetch_token(&response, &repo).await.unwrap_err();
+        assert!(
+            matches!(error, RegistryError::CredentialsRealm),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn the_signature_tag_is_the_cosign_convention() {
