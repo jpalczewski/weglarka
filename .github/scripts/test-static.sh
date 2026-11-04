@@ -117,10 +117,8 @@ expect "docs /docs (exact) serves the site root" "200 docs-r1" GET blog.example.
 # script must not come back as `text/plain` — a browser then refuses to apply or execute it.
 expect_content_type() { # expect_content_type <description> <want> <host> <path>
   local got
-  # A feed's `charset utf-8;` (#104) appends `; charset=utf-8` to the header; cut it at `;` so this
-  # checks the media type alone, like the plain static-file case that never sets a charset.
   got=$(curl -sS --path-as-is -I -H "Host: $3" "http://127.0.0.1:$port$4" \
-    | tr -d '\r' | grep -i '^content-type:' | cut -d' ' -f2 | cut -d';' -f1)
+    | tr -d '\r' | grep -i '^content-type:' | cut -d' ' -f2)
   if [ "$got" = "$2" ]; then
     echo "ok   $1"
   else
@@ -130,6 +128,21 @@ expect_content_type() { # expect_content_type <description> <want> <host> <path>
 }
 expect_content_type "landing /style.css has a css content type" "text/css" landing.example.eu /style.css
 expect_content_type "landing /app.js has a javascript content type" "application/javascript" landing.example.eu /app.js
+
+# expect_feed_content_type: a feed's `charset utf-8;` (#104) appends `; charset=utf-8` to the header,
+# so this checks the media type alone — a separate helper from `expect_content_type` above, which stays
+# a full-header match so it keeps catching a stray charset on a plain static file (issue #498).
+expect_feed_content_type() { # expect_feed_content_type <description> <want> <host> <path>
+  local got
+  got=$(curl -sS --path-as-is -I -H "Host: $3" "http://127.0.0.1:$port$4" \
+    | tr -d '\r' | grep -i '^content-type:' | cut -d' ' -f2 | cut -d';' -f1)
+  if [ "$got" = "$2" ]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: want '$2', got '$got'"
+    fail=1
+  fi
+}
 
 # expect_header <description> <host> <path> <header-name> <want-value>: case-insensitive header match.
 expect_header() {
@@ -147,7 +160,7 @@ expect_header() {
 # #104, ADR 0069: `help` has every per-site option set at once (dump.rs's `APPS`).
 expect "help / serves index.html" "200 help-r1" GET help.example.eu /
 expect "help custom 404 page serves its own content" "404 help-r1-not-found" GET help.example.eu /missing.html
-expect_content_type "help /feed.xml has an rss content type" "application/rss+xml" help.example.eu /feed.xml
+expect_feed_content_type "help /feed.xml has an rss content type" "application/rss+xml" help.example.eu /feed.xml
 # `absolute_redirect off` (first exercised by `redirects`): the Location of a redirect behind this
 # proxy must be relative, never built from nginx's own internal scheme/host/port.
 expect_header "help /old redirects with a relative Location" help.example.eu /old location /new
