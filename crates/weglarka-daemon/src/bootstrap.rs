@@ -106,11 +106,140 @@ pub enum BootstrapError {
     Incomplete(String),
 }
 
+/// One state-changing action of a bootstrap, in execution order. A step carries everything it needs,
+/// so [`apply`] never has to look at the host to decide *whether* to act.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Create the host-only directory with mode 0700 (the ownership step opens it up later).
+    CreateHostDir { path: PathBuf },
+    /// Copy the stable launcher into the host-only directory.
+    InstallLauncher { source: PathBuf },
+    /// Enable lingering for the runtime user (systemd).
+    EnableLinger { user: String },
+    /// Stage the current tools as a verified generation.
+    InstallGeneration {
+        digest: StrictDigest,
+        daemon: PathBuf,
+        cli: PathBuf,
+    },
+    /// Disable and remove the legacy self-update/watchdog units and the legacy lock file.
+    RetireLegacyUnits,
+    /// Import `self-update.toml` into the host-only directory and retire the file.
+    ImportLegacyState,
+    /// Write the initial selector (or keep the existing one for the same generation).
+    EnsureSelector { generation: StrictDigest },
+    /// Write the shared `host-capabilities.toml`.
+    WriteCapabilities,
+    /// Install the fixed launcher jobs.
+    InstallJobs { jobs: Vec<ScheduledJob> },
+    /// Install the daemon service pinned to the image.
+    InstallService { image: String },
+    /// OpenRC: write the service selection with the selector epoch.
+    ActivateService,
+    /// OpenRC: start the runtime user's Podman service and wait for its socket.
+    StartRuntimeSocket { user: String },
+    /// Hand the code to root and the flat state files to the runtime user.
+    ApplyOwnership { uid: u32, gid: u32 },
+    /// Run `host-preflight` of the active and recovery generation against the installed host.
+    VerifyPreflight,
+    /// Write the durable "bootstrap complete" marker.
+    WriteMarker,
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateHostDir { path } => write!(f, "create host directory {}", path.display()),
+            Self::InstallLauncher { source } => {
+                write!(f, "install launcher from {}", source.display())
+            }
+            Self::EnableLinger { user } => write!(f, "enable linger for {user}"),
+            Self::InstallGeneration {
+                digest,
+                daemon,
+                cli,
+            } => write!(
+                f,
+                "install generation {digest} (daemon {}, cli {})",
+                daemon.display(),
+                cli.display()
+            ),
+            Self::RetireLegacyUnits => {
+                write!(f, "retire legacy self-update/watchdog units and lock")
+            }
+            Self::ImportLegacyState => write!(f, "import legacy self-update state"),
+            Self::EnsureSelector { generation } => {
+                write!(f, "select generation {generation}")
+            }
+            Self::WriteCapabilities => write!(f, "write host capabilities"),
+            Self::InstallJobs { jobs } => {
+                let ids: Vec<&str> = jobs.iter().map(|job| job.id.as_str()).collect();
+                write!(f, "install launcher jobs: {}", ids.join(", "))
+            }
+            Self::InstallService { image } => write!(f, "install service pinned to {image}"),
+            Self::ActivateService => write!(f, "write the service selection"),
+            Self::StartRuntimeSocket { user } => {
+                write!(f, "start the Podman runtime service for {user}")
+            }
+            Self::ApplyOwnership { uid, gid } => {
+                write!(f, "apply host directory ownership (uid {uid}, gid {gid})")
+            }
+            Self::VerifyPreflight => write!(f, "preflight the active and recovery generation"),
+            Self::WriteMarker => write!(f, "write the bootstrap-complete marker"),
+        }
+    }
+}
+
+/// The ordered work of a bootstrap, produced by [`plan`] and executed by [`apply`].
+pub struct BootstrapPlan {
+    options: BootstrapOptions,
+    host_dir: PathBuf,
+    now: u64,
+    service: weglarka_engine::platform::ServiceSpec,
+    steps: Vec<Step>,
+}
+
+impl BootstrapPlan {
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+}
+
+impl std::fmt::Display for BootstrapPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, step) in self.steps.iter().enumerate() {
+            if index > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{:>2}. {step}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for BootstrapPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapPlan")
+            .field("host_dir", &self.host_dir)
+            .field("steps", &self.steps)
+            .finish()
+    }
+}
+
 /// Installs the launcher and generation 0, retires the legacy runner and provisions the fixed jobs.
 pub async fn bootstrap<P: Platform>(
     platform: &P,
     options: &BootstrapOptions,
 ) -> Result<BootstrapReport, BootstrapError> {
+    let plan = plan(platform, options).await?;
+    apply(platform, &plan).await
+}
+
+/// Decides what a bootstrap would do. Changes nothing on the host.
+pub async fn plan<P: Platform>(
+    platform: &P,
+    options: &BootstrapOptions,
+) -> Result<BootstrapPlan, BootstrapError> {
     let host_dir = validate_host_dir(&options.host_dir)?;
     if host_dir == options.state_dir
         || host_dir.starts_with(&options.state_dir)
@@ -121,60 +250,12 @@ pub async fn bootstrap<P: Platform>(
             state: options.state_dir.clone(),
         });
     }
-    let now = unix_now();
+    let systemd = platform.kind() == weglarka_model::config::PlatformKind::Systemd;
+    let ownership = options.runtime_uid.zip(options.runtime_gid);
+    let ownership_step = || ownership.map(|(uid, gid)| Step::ApplyOwnership { uid, gid });
 
-    // 1. Host-only directory and the stable launcher.
-    create_dir(&host_dir)?;
-    install_launcher(&host_dir, &options.launcher_binary)?;
-    let linger_enabled = if options.enable_linger
-        && platform.kind() == weglarka_model::config::PlatformKind::Systemd
-    {
-        enable_linger(&options.runtime_user)
-    } else {
-        false
-    };
-
-    // 2. Stage the current tools as generation 0 (verify-and-reuse is idempotent).
-    let store = GenerationStore::new(&host_dir);
-    let generation = store.install_from_files(
-        &options.generation,
-        &[
-            (HOST_DAEMON_FILE, options.daemon_binary.clone()),
-            (
-                weglarka_launcher::host::HOST_CLI_FILE,
-                options.cli_binary.clone(),
-            ),
-        ],
-    )?;
-
-    // 3. Retire the legacy runner before any new timer can start.
-    let retired_units = retire_legacy_units(platform, &options.state_dir).await?;
-    import_legacy_state(&host_dir, &options.state_dir, now)?;
-
-    // 4. Selector (re-running with the same generation keeps the epoch).
-    let selector = match HostSelector::load_optional(&host_dir)? {
-        Some(existing) if existing.active == options.generation => existing,
-        Some(existing) => {
-            return Err(BootstrapError::AlreadyBootstrapped(existing.active));
-        }
-        None => {
-            let selector = HostSelector::fresh(options.generation.clone());
-            selector.save(&host_dir)?;
-            selector
-        }
-    };
-
-    // 5. Shared capability record. Only features this build really implements are claimed; retention
-    //    therefore stays fail-closed until A/D extend the set.
-    write_capabilities(&options.state_dir, &options.generation)?;
-
-    // 6. Fixed launcher jobs (systemd user timers or the BusyBox crontab managed block).
-    let jobs = launcher_jobs(options);
-    platform.install_jobs(&jobs).await?;
-
-    // 7. Point the legacy-compatible service at the pinned image. On OpenRC the selection file is
-    //    what the supervised launcher reads after boot; activation writes it without stopping a
-    //    container that carries no matching epoch.
+    // The legacy-compatible service spec: the pinned image, and on OpenRC the selection file the
+    // supervised launcher reads after boot.
     let settings = Settings::load(&options.config_path)
         .map_err(|e| BootstrapError::Incomplete(e.to_string()))?;
     let socket = platform
@@ -186,70 +267,192 @@ pub async fn bootstrap<P: Platform>(
                 options.runtime_user
             ))
         });
-    let spec = service_spec(&settings, socket, options.image.clone());
-    platform.install_service(&spec).await?;
-    if platform.kind() == weglarka_model::config::PlatformKind::Openrc {
-        platform
-            .activate_service(spec, ActivationEpoch(selector.epoch))
-            .await?;
-        // The rootless API socket must exist for preflight; starting the installed service is the
-        // installer's job, not the runtime user's.
-        let _ = platform.restart_service(PODMAN_SERVICE).await;
-        if let Ok(socket) = platform.runtime_socket(&options.runtime_user).await {
-            for _ in 0..100 {
-                if socket.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
+    let service = service_spec(&settings, socket, options.image.clone());
 
+    let mut steps = vec![
+        Step::CreateHostDir {
+            path: host_dir.clone(),
+        },
+        Step::InstallLauncher {
+            source: options.launcher_binary.clone(),
+        },
+    ];
+    if options.enable_linger && systemd {
+        steps.push(Step::EnableLinger {
+            user: options.runtime_user.clone(),
+        });
+    }
+    steps.extend([
+        Step::InstallGeneration {
+            digest: options.generation.clone(),
+            daemon: options.daemon_binary.clone(),
+            cli: options.cli_binary.clone(),
+        },
+        // Retire the legacy runner before any new timer can start.
+        Step::RetireLegacyUnits,
+        Step::ImportLegacyState,
+        Step::EnsureSelector {
+            generation: options.generation.clone(),
+        },
+        // Only features this build really implements are claimed; retention therefore stays
+        // fail-closed until A/D extend the set.
+        Step::WriteCapabilities,
+        Step::InstallJobs {
+            jobs: launcher_jobs(options),
+        },
+        Step::InstallService {
+            image: options.image.clone(),
+        },
+    ]);
+    if !systemd {
+        steps.push(Step::ActivateService);
+        steps.push(Step::StartRuntimeSocket {
+            user: options.runtime_user.clone(),
+        });
+    }
     // Root executes the generation binaries below, so the code must already be root-owned and not
     // writable by the runtime user. (Applied again at the end for the state files written after this.)
-    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid)?;
+    steps.extend(ownership_step());
+    steps.push(Step::VerifyPreflight);
+    steps.push(Step::WriteMarker);
+    steps.extend(ownership_step());
 
-    // 8. Preflight the active and recovery generation against the *current* configuration, now that
-    //    the OpenRC runtime prerequisites are provisioned.
+    Ok(BootstrapPlan {
+        options: options.clone(),
+        host_dir,
+        now: unix_now(),
+        service,
+        steps,
+    })
+}
+
+/// Executes a plan's steps in order.
+pub async fn apply<P: Platform>(
+    platform: &P,
+    plan: &BootstrapPlan,
+) -> Result<BootstrapReport, BootstrapError> {
+    let options = &plan.options;
+    let host_dir = &plan.host_dir;
+    let store = GenerationStore::new(host_dir);
+    let mut linger_enabled = false;
+    let mut retired_units = Vec::new();
+    let mut installed = None;
+    let mut selector = None;
     let mut preflight = PreflightOutcome {
         active: false,
         recovery: false,
     };
-    for (label, digest) in [
-        ("active", selector.active.clone()),
-        ("recovery", selector.recovery().clone()),
-    ] {
-        let generation = store.open(&digest)?;
-        match weglarka_launcher::run::run_preflight(
-            &generation,
-            &options.config_path,
-            std::time::Duration::from_secs(60),
-        ) {
-            Ok(()) => {
-                if label == "active" {
-                    preflight.active = true;
-                } else {
-                    preflight.recovery = true;
+
+    for step in &plan.steps {
+        match step {
+            Step::CreateHostDir { path } => create_dir(path)?,
+            Step::InstallLauncher { source } => install_launcher(host_dir, source)?,
+            Step::EnableLinger { user } => linger_enabled = enable_linger(user),
+            Step::InstallGeneration {
+                digest,
+                daemon,
+                cli,
+            } => {
+                // Verify-and-reuse is idempotent.
+                installed = Some(store.install_from_files(
+                    digest,
+                    &[
+                        (HOST_DAEMON_FILE, daemon.clone()),
+                        (weglarka_launcher::host::HOST_CLI_FILE, cli.clone()),
+                    ],
+                )?);
+            }
+            Step::RetireLegacyUnits => {
+                retired_units = retire_legacy_units(platform, &options.state_dir).await?;
+            }
+            Step::ImportLegacyState => import_legacy_state(host_dir, &options.state_dir, plan.now)?,
+            Step::EnsureSelector { generation } => {
+                // Re-running with the same generation keeps the epoch.
+                selector = Some(match HostSelector::load_optional(host_dir)? {
+                    Some(existing) if existing.active == *generation => existing,
+                    Some(existing) => {
+                        return Err(BootstrapError::AlreadyBootstrapped(existing.active));
+                    }
+                    None => {
+                        let selector = HostSelector::fresh(generation.clone());
+                        selector.save(host_dir)?;
+                        selector
+                    }
+                });
+            }
+            Step::WriteCapabilities => write_capabilities(&options.state_dir, &options.generation)?,
+            Step::InstallJobs { jobs } => platform.install_jobs(jobs).await?,
+            Step::InstallService { .. } => platform.install_service(&plan.service).await?,
+            Step::ActivateService => {
+                let selector = selector.as_ref().ok_or_else(missing_selector)?;
+                platform
+                    .activate_service(plan.service.clone(), ActivationEpoch(selector.epoch))
+                    .await?;
+            }
+            Step::StartRuntimeSocket { user } => {
+                // The rootless API socket must exist for preflight; starting the installed service
+                // is the installer's job, not the runtime user's.
+                let _ = platform.restart_service(PODMAN_SERVICE).await;
+                if let Ok(socket) = platform.runtime_socket(user).await {
+                    for _ in 0..100 {
+                        if socket.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
             }
-            Err(error) => return Err(BootstrapError::Preflight(label, error.to_string())),
+            Step::ApplyOwnership { uid, gid } => apply_ownership(host_dir, *uid, *gid)?,
+            Step::VerifyPreflight => {
+                // The active and recovery generation against the *current* configuration, now that
+                // the OpenRC runtime prerequisites are provisioned.
+                let selector = selector.as_ref().ok_or_else(missing_selector)?;
+                for (label, digest) in [
+                    ("active", selector.active.clone()),
+                    ("recovery", selector.recovery().clone()),
+                ] {
+                    let generation = store.open(&digest)?;
+                    match weglarka_launcher::run::run_preflight(
+                        &generation,
+                        &options.config_path,
+                        std::time::Duration::from_secs(60),
+                    ) {
+                        Ok(()) => {
+                            if label == "active" {
+                                preflight.active = true;
+                            } else {
+                                preflight.recovery = true;
+                            }
+                        }
+                        Err(error) => {
+                            return Err(BootstrapError::Preflight(label, error.to_string()));
+                        }
+                    }
+                }
+            }
+            Step::WriteMarker => {
+                // The marker is the durable "bootstrap complete" signal. It is written only after
+                // every installation step and both preflights passed.
+                let selector = selector.as_ref().ok_or_else(missing_selector)?;
+                BootstrapMarker {
+                    format_version: 1,
+                    generation: selector.active.clone(),
+                    selector_epoch: selector.epoch,
+                    completed_at: plan.now,
+                }
+                .save(host_dir)?;
+            }
         }
     }
 
-    // 9. The marker is the durable "bootstrap complete" signal. It is written only after every
-    //    installation step and both preflights passed.
-    BootstrapMarker {
-        format_version: 1,
-        generation: selector.active.clone(),
-        selector_epoch: selector.epoch,
-        completed_at: now,
-    }
-    .save(&host_dir)?;
-
-    // 10. Report whether coordinated updates may be enabled now. A missing channel pointer is not a
-    //     bootstrap failure: the installer completes and the coordinator enables updates later.
+    let selector = selector.ok_or_else(missing_selector)?;
+    let generation = installed.ok_or_else(|| {
+        BootstrapError::Incomplete("the plan did not install a generation".into())
+    })?;
+    // Whether coordinated updates may be enabled now. A missing channel pointer is not a bootstrap
+    // failure: the installer completes and the coordinator enables updates later.
     let coordinated_ready = coordinated_updates_ready(
-        &host_dir,
+        host_dir,
         &options.state_dir,
         options.channel,
         preflight,
@@ -257,16 +460,18 @@ pub async fn bootstrap<P: Platform>(
     )
     .is_ok();
 
-    apply_ownership(&host_dir, options.runtime_uid, options.runtime_gid)?;
-
     Ok(BootstrapReport {
-        host_dir,
+        host_dir: host_dir.clone(),
         generation: generation.digest().clone(),
         selector_epoch: selector.epoch,
         coordinated_ready,
         retired_units,
         linger_enabled,
     })
+}
+
+fn missing_selector() -> BootstrapError {
+    BootstrapError::Incomplete("the plan has no selector step before it is needed".into())
 }
 
 /// Reverse command: refuses while a transaction is nonterminal, then removes the launcher setup (jobs,
@@ -557,17 +762,11 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-/// Applies the ownership model of [`crate::ownership`]. A non-root bootstrap (tests, an installer
+/// Applies the ownership model of [`crate::ownership`]. The plan has no such step when the runtime
+/// user is unknown. A non-root bootstrap (tests, an installer
 /// context that already owns the directory) cannot chown and nothing is changed; once the host
 /// directory itself was taken over, any entry that could not be secured fails the bootstrap.
-fn apply_ownership(
-    host_dir: &Path,
-    uid: Option<u32>,
-    gid: Option<u32>,
-) -> Result<(), BootstrapError> {
-    let (Some(uid), Some(gid)) = (uid, gid) else {
-        return Ok(());
-    };
+fn apply_ownership(host_dir: &Path, uid: u32, gid: u32) -> Result<(), BootstrapError> {
     match crate::ownership::apply(host_dir, uid, gid, &mut crate::ownership::lchown) {
         Ok(outcome) if outcome.code > 0 => Err(BootstrapError::Incomplete(format!(
             "{} entries of {} that root executes could not be secured",
