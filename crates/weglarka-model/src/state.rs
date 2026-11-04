@@ -1944,4 +1944,277 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         assert_eq!(st.schema_version, Some(SCHEMA_VERSION));
         assert_eq!(st.apps[&name("a")].generation, 2);
     }
+
+    /// #104, ADR 0069: every `AppIngress` field outside the allowlist is rejected for a static site,
+    /// named in the error, and `ingress.static` itself is rejected the other way round.
+    #[test]
+    fn static_sites_allow_only_the_ingress_fields_adr_0069_lists() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap()
+        };
+        let err = |extra: &str| validate_app(&name("a"), &spec(extra)).unwrap_err();
+        for (extra, needle) in [
+            ("ingress = { streaming = true }", "ingress.streaming"),
+            // `stream_timeout_secs` alone (without `streaming = true`) is already rejected earlier,
+            // by the generic `validate_ingress` ("requires ingress.streaming = true",
+            // `ingress_options_are_validated`); the allowlist's own entry for it is exercised directly
+            // below, since `streaming` would otherwise always fire first.
+            (
+                "paths = [\"/p\"]\ningress = { strip_prefix = true }",
+                "ingress.strip_prefix",
+            ),
+            (
+                "ingress = { max_body_size = \"1m\" }",
+                "ingress.max_body_size",
+            ),
+            (
+                "ingress = { streaming_paths = [\"/x\"] }",
+                "ingress.streaming_paths",
+            ),
+            ("ingress = { auth = \"forward\" }", "ingress.auth"),
+            (
+                "ingress = { auth_policy = \"one_factor\" }",
+                "ingress.auth_policy",
+            ),
+            (
+                "ingress = { auth_groups = [\"admins\"] }",
+                "ingress.auth_groups",
+            ),
+            (
+                "ingress = { auth_exempt_paths = [\"/x\"] }",
+                "ingress.auth_exempt_paths",
+            ),
+        ] {
+            let e = err(extra);
+            assert!(e.contains(needle), "{extra:?}: {e}");
+            assert!(e.contains("does not apply to kind = \"static\""), "{e}");
+        }
+        // `stream_timeout_secs` is still a named binding in the allowlist's own destructure (ADR
+        // 0069), exercised directly since `streaming` always fires first through the full
+        // `validate_app` chain above (a timeout without `streaming = true` is already rejected
+        // earlier anyway, by `validate_ingress`).
+        let timeout_only = crate::app::AppIngress {
+            stream_timeout_secs: 10,
+            ..crate::app::AppIngress::default()
+        };
+        let e = validate_static_ingress_allowlist(&name("a"), &timeout_only).unwrap_err();
+        assert!(e.contains("ingress.stream_timeout_secs"), "{e}");
+        // The allowlisted fields are fine together.
+        assert!(
+            validate_app(
+                &name("a"),
+                &spec("ingress = { access_log_skip_paths = [\"/healthz\"] }")
+            )
+            .is_ok()
+        );
+        assert!(validate_app(&name("a"), &spec("ingress.static = { clean_urls = true }")).is_ok());
+    }
+
+    #[test]
+    fn ingress_static_does_not_apply_to_a_container() {
+        let spec: AppSpec =
+            toml::from_str("image = \"i\"\ningress.static = { clean_urls = true }").unwrap();
+        let err = validate_app(&name("a"), &spec).unwrap_err();
+        assert!(
+            err.contains("`ingress.static` does not apply to kind = \"container\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn static_ingress_field_values_are_validated() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\npaths = [\"/blog\"]\ningress.static = {{ {extra} }}"
+            ))
+            .unwrap()
+        };
+        let check = |extra: &str| validate_app(&name("a"), &spec(extra));
+
+        // `not_found_page`: must end in `.html` and use the `paths` alphabet.
+        assert!(check("not_found_page = \"/404.html\"").is_ok());
+        let err = check("not_found_page = \"/404\"").unwrap_err();
+        assert!(err.contains("must end in \".html\""), "{err}");
+        let err = check("not_found_page = \"/a/../404.html\"").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.not_found_page"),
+            "{err}"
+        );
+
+        // `redirects[].from` must be inside the site's own `paths` (here, under `/blog`).
+        assert!(check("redirects = [{ from = \"/blog/old\", to = \"/blog/new\" }]").is_ok());
+        let err = check("redirects = [{ from = \"/other/old\", to = \"/blog/new\" }]").unwrap_err();
+        assert!(err.contains("is outside the site's own paths"), "{err}");
+        let err = check("redirects = [{ from = \"/blog/a b\", to = \"/x\" }]").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.redirects[].from"),
+            "{err}"
+        );
+
+        // `redirects[].to`: same alphabet, or an absolute `https://<host>/...`.
+        assert!(
+            check("redirects = [{ from = \"/blog/old\", to = \"https://other.example.com/new\" }]")
+                .is_ok()
+        );
+        for bad_to in [
+            "https://evil\".com/x",
+            "https://evil$(id).com/x",
+            "https://evil;x.com/x",
+            "/a\"b",
+        ] {
+            let err = check(&format!(
+                "redirects = [{{ from = \"/blog/old\", to = {bad_to:?} }}]"
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("invalid ingress.static.redirects[].to"),
+                "{bad_to}: {err}"
+            );
+        }
+
+        // Duplicate `from` entries are rejected.
+        let err = check(
+            "redirects = [{ from = \"/blog/a\", to = \"/x\" }, { from = \"/blog/a\", to = \"/y\" }]",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicate ingress.static.redirects[].from"),
+            "{err}"
+        );
+
+        // `feeds[].path`: the `paths` alphabet, syntax only (no containment rule).
+        assert!(check("feeds = [{ path = \"/feed.xml\", format = \"rss\" }]").is_ok());
+        let err = check("feeds = [{ path = \"feed.xml\", format = \"rss\" }]").unwrap_err();
+        assert!(err.contains("invalid ingress.static.feeds[].path"), "{err}");
+        let err = check(
+            "feeds = [{ path = \"/f\", format = \"rss\" }, { path = \"/f\", format = \"atom\" }]",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicate ingress.static.feeds[].path"),
+            "{err}"
+        );
+
+        // `cache_immutable_paths`: the `paths` alphabet.
+        assert!(check("cache_immutable_paths = [\"/assets\"]").is_ok());
+        let err = check("cache_immutable_paths = [\"assets\"]").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.cache_immutable_paths"),
+            "{err}"
+        );
+
+        // `security_headers.csp`: printable ASCII, no `"`/`\`/`$`.
+        assert!(check("security_headers = { csp = \"default-src 'self'\" }").is_ok());
+        for bad_csp in ["bad\"csp", "bad\\csp", "bad$csp", "bad\ncsp"] {
+            let err = check(&format!("security_headers = {{ csp = {bad_csp:?} }}")).unwrap_err();
+            assert!(err.contains("security_headers.csp"), "{bad_csp:?}: {err}");
+        }
+        let huge_csp = "a".repeat(2049);
+        let err = check(&format!("security_headers = {{ csp = {huge_csp:?} }}")).unwrap_err();
+        assert!(err.contains("security_headers.csp"), "{err}");
+        // `hsts_max_age_secs` takes any `u32`, no extra validation.
+        assert!(check("security_headers = { hsts_max_age_secs = 31536000 }").is_ok());
+
+        // `redirects` and `feeds` together are capped.
+        let many_redirects: Vec<String> = (0..65)
+            .map(|i| format!("{{ from = \"/blog/r{i}\", to = \"/x\" }}"))
+            .collect();
+        let err = check(&format!("redirects = [{}]", many_redirects.join(", "))).unwrap_err();
+        assert!(err.contains("at most 64 entries"), "{err}");
+    }
+
+    #[test]
+    fn static_ingress_round_trips_and_an_empty_table_is_not_serialized() {
+        // Unset: the table does not appear at all.
+        let plain: crate::app::AppIngress = toml::from_str("").unwrap();
+        assert!(plain.static_.is_none());
+        let plain_spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        assert!(!toml::to_string(&plain_spec).unwrap().contains("static"));
+
+        // A fully populated table round-trips byte-for-byte through parse -> serialize -> parse.
+        let toml_src = r#"
+kind = "static"
+image = "i"
+domains = ["a.example.com"]
+
+[ingress.static]
+clean_urls = true
+not_found_page = "/404.html"
+cache_immutable_paths = ["/assets"]
+cache_revalidate = true
+
+[[ingress.static.redirects]]
+from = "/old"
+to = "/new"
+prefix = true
+
+[[ingress.static.feeds]]
+path = "/feed.xml"
+format = "rss"
+
+[ingress.static.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
+csp = "default-src 'self'"
+"#;
+        let spec: AppSpec = toml::from_str(toml_src).unwrap();
+        let opts = spec.ingress.static_.as_ref().expect("static_ set");
+        assert!(opts.clean_urls);
+        assert_eq!(opts.not_found_page.as_deref(), Some("/404.html"));
+        assert_eq!(opts.redirects[0].from, "/old");
+        assert!(opts.redirects[0].prefix);
+        assert_eq!(opts.feeds[0].format, crate::app::FeedFormat::Rss);
+        let reserialized = toml::to_string(&spec).unwrap();
+        let reparsed: AppSpec = toml::from_str(&reserialized).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn schema_v17_file_without_ingress_static_is_unchanged_by_the_v18_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 17\n[apps.a]\nimage = \"x:1\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(apps.apps[&name("a")].ingress.static_.is_none());
+        save_apps(&apps_path, &apps).unwrap();
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        assert!(!fs::read_to_string(&apps_path).unwrap().contains("static"));
+    }
+
+    #[test]
+    fn schema_v18_file_with_ingress_static_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "[apps.a]\nkind = \"static\"\nimage = \"x:1\"\ndomains = [\"a.example.com\"]\n[apps.a.ingress.static]\nclean_urls = true\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(
+            apps.apps[&name("a")]
+                .ingress
+                .static_
+                .as_ref()
+                .unwrap()
+                .clean_urls
+        );
+        save_apps(&apps_path, &apps).unwrap();
+        let reloaded = load_apps(&apps_path).unwrap();
+        assert_eq!(reloaded, apps);
+        assert!(
+            fs::read_to_string(&apps_path)
+                .unwrap()
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
+        );
+    }
 }
