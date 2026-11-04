@@ -39,8 +39,11 @@ pub mod testing;
 /// PEM-encoded P-256 public key embedded in the daemon binary (`cosign.pub` in the repository root).
 pub const DEFAULT_PUBLIC_KEY_PEM: &str = include_str!("../../../cosign.pub");
 
-pub use cosign::{Signature, VerifyError, verify};
+pub use cosign::{Signature, VerifyError, payload_for, signature_manifest, verify};
 pub use http::HttpError;
 pub use image_ref::{ImageRef, ImageRefError};
-pub use key::{KeyError, PublicKey};
-pub use registry::{HttpRegistry, Registry, RegistryError};
+pub use key::{KeyError, PublicKey, SigningKey};
+pub use registry::{
+    FetchedManifest, HttpRegistry, MAX_TAGS, Registry, RegistryError, ReleaseRegistry,
+    push_signature,
+};
