@@ -19,6 +19,7 @@ mod assemble;
 mod publish;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -388,7 +389,25 @@ impl RegistryAuth {
     }
 }
 
-fn main() -> Result<()> {
+/// Exit code of every failure that has no dedicated code.
+const EXIT_FAILURE: u8 = 1;
+
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(exit_code(&error))
+        }
+    }
+}
+
+/// Maps a failure to the process exit code.
+fn exit_code(_error: &anyhow::Error) -> u8 {
+    EXIT_FAILURE
+}
+
+fn try_main() -> Result<()> {
     let cli = Cli::parse();
     // The registry client is async; the binary is otherwise synchronous and one-shot.
     let runtime = tokio::runtime::Builder::new_current_thread()
