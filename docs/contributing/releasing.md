@@ -35,8 +35,9 @@ first push in the same way. The runtime user pulls it without credentials, so **
 `release.yml` publishes one signed release set per run (`docs/contracts/platform-update-v1`):
 
 - a push to `main` promotes channel `main`; the daemon tag `vX.Y.Z` promotes channel `stable`;
-- `weglarka-panel-vX.Y.Z` is a panel-only release (the daemon image and its host files are reused, not rebuilt or
-  relabeled); `weglarka-cli-vX.Y.Z` rebuilds the daemon image because it carries the host CLI and reuses the panel;
+- `weglarka-panel-vX.Y.Z` is a panel-only release (the daemon image, its host files and the state schemas it reads
+  and writes are reused, not rebuilt, relabeled or re-derived); `weglarka-cli-vX.Y.Z` rebuilds the daemon image because it carries the host CLI and
+  reuses the panel (digest and version together);
 - the immutable tag is `set-<channel>-<sequence>`; the channel tag (`main`/`stable`) is the pointer and only moves
   forward, after the set, its blobs and its signature verify.
 

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use weglarka_model::release_set::{Channel, DescriptorContext, StrictDigest};
+use weglarka_model::release_set::{Channel, Compatibility, DescriptorContext, StrictDigest};
 use weglarka_registry::{DEFAULT_PUBLIC_KEY_PEM, HttpRegistry, PublicKey, SigningKey};
 
 use crate::assemble::{ReleaseSpec, ReuseComponent, component, crate_version, host_file};
@@ -96,11 +96,14 @@ struct DescriptorArgs {
     panel_tested: Vec<String>,
     /// Reuse the daemon image, host-file records and state schemas from the current channel
     /// pointer (panel-only release: the daemon artifact is unchanged and must not be relabeled).
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["daemon_repository", "daemon_digest", "state_read", "state_write"]
+    )]
     reuse_daemon: bool,
     /// Reuse the panel image (its digest and version) from the current channel pointer (CLI-only
     /// release: the panel artifact is unchanged).
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["panel_repository", "panel_digest"])]
     reuse_panel: bool,
 }
 
@@ -119,81 +122,60 @@ struct PartialSpec {
 }
 
 impl PartialSpec {
-    /// Fills the components a partial release reuses from `previous` and validates the
-    /// compatibility list against the selected panel. Never invents a component identity.
+    /// Completes a partial release from `previous` and validates the compatibility list against
+    /// the selected panel. Every component this release does not build is copied by
+    /// [`ReleaseSpec::reuse`]; this function never invents a component identity.
     fn complete(
         self,
         previous: Option<&weglarka_model::release_set::Descriptor>,
     ) -> Result<ReleaseSpec> {
-        let daemon = match &self.daemon {
-            Some(daemon) => daemon.clone(),
-            None => previous
-                .context("no daemon component was given and there is no existing pointer to reuse")?
-                .daemon
-                .clone(),
+        let reused = |what: &str| {
+            previous.with_context(|| {
+                format!("no {what} component was given and there is no existing pointer to reuse")
+            })
         };
-        let panel = match &self.panel {
-            Some(panel) => panel.clone(),
-            None => previous
-                .context("no panel component was given and there is no existing pointer to reuse")?
-                .panel
-                .clone(),
-        };
-        // The daemon owns the state schemas: an explicit daemon takes them from the flags, a
-        // reused daemon from the previous set it was built for.
-        let (state_read, state_write) = match &self.daemon {
-            Some(_) => match (&self.state_read, self.state_write) {
-                (Some(read), Some(write)) => (read.clone(), write),
-                _ => bail!(
-                    "--state-read and --state-write are required unless --reuse-daemon is set"
-                ),
-            },
-            None => {
-                let previous = previous.context(
-                    "no daemon component was given and there is no existing pointer to reuse",
-                )?;
-                (
-                    previous.compatibility.state_read.clone(),
-                    previous.compatibility.state_write,
-                )
-            }
-        };
-        let compatibility =
-            assemble::compatibility(state_read, state_write, self.panel_tested, &panel.digest)?;
+        if self.daemon.is_some() && (self.state_read.is_none() || self.state_write.is_none()) {
+            bail!("--state-read and --state-write are required unless --reuse-daemon is set");
+        }
+        // A reused component only needs a value of the right shape here; `reuse` below replaces it
+        // with the previous record, so the copy lives in one place.
         let mut spec = ReleaseSpec {
             channel: self.channel,
             revision: self.revision,
-            daemon,
-            panel,
+            daemon: match &self.daemon {
+                Some(daemon) => daemon.clone(),
+                None => reused("daemon")?.daemon.clone(),
+            },
+            panel: match &self.panel {
+                Some(panel) => panel.clone(),
+                None => reused("panel")?.panel.clone(),
+            },
             host_files: self.host_files,
-            compatibility,
+            compatibility: Compatibility {
+                host_protocol: 1,
+                state_read: self.state_read.unwrap_or_default(),
+                state_write: self.state_write.unwrap_or_default(),
+                panel_digests: Vec::new(),
+            },
         };
-        // A reused component keeps its whole descriptor: `reuse` also copies the daemon's host
-        // files (still empty above) and re-copies the exact component records.
         if self.daemon.is_none() {
-            spec.reuse(
-                ReuseComponent::Daemon,
-                previous.context("a reused daemon needs a previous pointer")?,
-            );
+            spec.reuse(ReuseComponent::Daemon, reused("daemon")?);
         }
         if self.panel.is_none() {
-            spec.reuse(
-                ReuseComponent::Panel,
-                previous.context("a reused panel needs a previous pointer")?,
-            );
+            spec.reuse(ReuseComponent::Panel, reused("panel")?);
         }
+        spec.compatibility = assemble::compatibility(
+            spec.compatibility.state_read,
+            spec.compatibility.state_write,
+            self.panel_tested,
+            &spec.panel.digest,
+        )?;
         Ok(spec)
     }
 }
 
 impl DescriptorArgs {
     fn spec(&self) -> Result<PartialSpec> {
-        if self.reuse_daemon && (self.state_read.is_some() || self.state_write.is_some()) {
-            bail!(
-                "--state-read and --state-write cannot be combined with --reuse-daemon; \
-                 the daemon's state schemas are copied from the previous set"
-            );
-        }
         let daemon_version = crate_version(&self.daemon_crate)?;
         let panel_version = crate_version(&self.panel_crate)?;
         let cli_version = crate_version(&self.cli_crate)?;
@@ -429,6 +411,9 @@ async fn run(cli: Cli) -> Result<()> {
 fn assemble_command(args: AssembleArgs) -> Result<()> {
     if args.descriptor.reuse_daemon || args.descriptor.reuse_panel {
         bail!("--reuse-daemon and --reuse-panel need a published pointer; use `publish`");
+    }
+    if args.descriptor.state_read.is_none() || args.descriptor.state_write.is_none() {
+        bail!("assemble needs --state-read and --state-write");
     }
     let spec = args.descriptor.spec()?.complete(None)?;
     let layer = spec.descriptor_bytes(args.sequence)?;
@@ -666,47 +651,197 @@ mod tests {
         .unwrap();
     }
 
-    fn args(
-        reuse_daemon: bool,
-        reuse_panel: bool,
-        state_read: Option<Vec<u32>>,
-        state_write: Option<u32>,
-    ) -> DescriptorArgs {
-        DescriptorArgs {
+    const DAEMON_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NEW_DAEMON_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const PANEL_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NEW_PANEL_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// The fixture release set: daemon 0.9.0, panel 0.3.1, state schema 17.
+    fn previous() -> weglarka_model::release_set::Descriptor {
+        parse_descriptor(
+            include_bytes!(
+                "../../../docs/contracts/platform-update-v1/fixtures/release-valid.json"
+            ),
+            &DescriptorContext {
+                channel: Some(Channel::Stable),
+            },
+        )
+        .unwrap()
+    }
+
+    fn partial(
+        daemon: Option<(&str, &str)>,
+        panel: Option<(&str, &str)>,
+        state: Option<(Vec<u32>, u32)>,
+        panel_tested: &[&str],
+    ) -> PartialSpec {
+        let record = |(digest, version): (&str, &str)| {
+            component("ghcr.io/example/weglarka-component", digest, version).unwrap()
+        };
+        PartialSpec {
             channel: Channel::Stable,
             revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            daemon_repository: None,
-            daemon_digest: None,
-            panel_repository: None,
-            panel_digest: None,
-            daemon_crate: PathBuf::from(assemble::DAEMON_CRATE),
-            panel_crate: PathBuf::from(assemble::PANEL_CRATE),
-            cli_crate: PathBuf::from(assemble::CLI_CRATE),
-            host_bin_dir: PathBuf::from("bin"),
-            state_read,
-            state_write,
-            panel_tested: vec![],
-            reuse_daemon,
-            reuse_panel,
+            daemon: daemon.map(record),
+            panel: panel.map(record),
+            host_files: Vec::new(),
+            state_read: state.as_ref().map(|(read, _)| read.clone()),
+            state_write: state.map(|(_, write)| write),
+            panel_tested: panel_tested
+                .iter()
+                .map(|digest| strict_digest(digest, "tested panel digest").unwrap())
+                .collect(),
         }
     }
 
     #[test]
-    fn state_flags_are_rejected_with_reuse_daemon() {
-        for (state_read, state_write) in [
-            (Some(vec![17]), None),
-            (None, Some(17)),
-            (Some(vec![17]), Some(17)),
+    fn a_panel_only_set_after_a_schema_bump_keeps_the_previous_state_versions() {
+        let previous = previous();
+        // The flags describe the current schema (18); the reused daemon was built for 17.
+        let spec = partial(
+            None,
+            Some((NEW_PANEL_DIGEST, "0.4.0")),
+            Some((vec![18], 18)),
+            &[NEW_PANEL_DIGEST],
+        )
+        .complete(Some(&previous))
+        .unwrap();
+        assert_eq!(spec.compatibility.state_read, vec![17]);
+        assert_eq!(spec.compatibility.state_write, 17);
+        assert_eq!(spec.daemon, previous.daemon);
+        assert_eq!(spec.host_files, previous.host_tools.files);
+        assert_eq!(spec.panel.version, "0.4.0");
+    }
+
+    #[test]
+    fn a_cli_only_set_after_a_panel_version_bump_keeps_the_panel_digest_and_version() {
+        let previous = previous();
+        // The current panel crate says 0.4.0, but the reused digest is the 0.3.1 build.
+        let spec = partial(
+            Some((NEW_DAEMON_DIGEST, "0.10.0")),
+            None,
+            Some((vec![17], 17)),
+            &[PANEL_DIGEST],
+        )
+        .complete(Some(&previous))
+        .unwrap();
+        assert_eq!(spec.panel, previous.panel);
+        assert_eq!(spec.panel.version, "0.3.1");
+        assert_eq!(spec.daemon.digest.to_string(), NEW_DAEMON_DIGEST);
+    }
+
+    #[test]
+    fn reusing_both_components_copies_both_records() {
+        let previous = previous();
+        let spec = partial(None, None, None, &[PANEL_DIGEST])
+            .complete(Some(&previous))
+            .unwrap();
+        assert_eq!(spec.daemon, previous.daemon);
+        assert_eq!(spec.panel, previous.panel);
+        assert_eq!(
+            spec.compatibility.state_read,
+            previous.compatibility.state_read
+        );
+        assert_eq!(
+            spec.compatibility.state_write,
+            previous.compatibility.state_write
+        );
+    }
+
+    #[test]
+    fn a_reused_panel_must_still_be_in_the_tested_list() {
+        let error = partial(
+            Some((NEW_DAEMON_DIGEST, "0.10.0")),
+            None,
+            Some((vec![17], 17)),
+            &[NEW_PANEL_DIGEST],
+        )
+        .complete(Some(&previous()))
+        .expect_err("the reused panel is not tested")
+        .to_string();
+        assert!(
+            error.contains("not in the tested list"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn reuse_needs_a_previous_pointer() {
+        assert!(
+            partial(
+                None,
+                Some((NEW_PANEL_DIGEST, "0.4.0")),
+                None,
+                &[NEW_PANEL_DIGEST]
+            )
+            .complete(None)
+            .is_err()
+        );
+        assert!(
+            partial(
+                Some((NEW_DAEMON_DIGEST, "0.10.0")),
+                None,
+                Some((vec![17], 17)),
+                &[PANEL_DIGEST]
+            )
+            .complete(None)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_explicit_daemon_needs_its_state_flags() {
+        let error = partial(
+            Some((NEW_DAEMON_DIGEST, "0.10.0")),
+            Some((NEW_PANEL_DIGEST, "0.4.0")),
+            None,
+            &[NEW_PANEL_DIGEST],
+        )
+        .complete(None)
+        .expect_err("state flags are required")
+        .to_string();
+        assert!(error.contains("--state-read"), "unexpected: {error}");
+    }
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec![
+            "weglarka-release",
+            "assemble",
+            "--channel",
+            "stable",
+            "--revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--output",
+            "descriptor.json",
+            "--sequence",
+            "1",
+        ];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn reuse_flags_conflict_with_the_explicit_component_flags() {
+        let daemon = format!("--daemon-digest={DAEMON_DIGEST}");
+        let panel = format!("--panel-digest={PANEL_DIGEST}");
+        for conflict in [
+            ["--reuse-daemon", "--daemon-repository=ghcr.io/example/d"].as_slice(),
+            ["--reuse-daemon", daemon.as_str()].as_slice(),
+            ["--reuse-daemon", "--state-read=17"].as_slice(),
+            ["--reuse-daemon", "--state-write=17"].as_slice(),
+            ["--reuse-panel", "--panel-repository=ghcr.io/example/p"].as_slice(),
+            ["--reuse-panel", panel.as_str()].as_slice(),
         ] {
-            let error = args(true, false, state_read, state_write)
-                .spec()
-                .err()
-                .expect("state flags must be rejected with --reuse-daemon")
-                .to_string();
-            assert!(
-                error.contains("--reuse-daemon"),
-                "unexpected error message: {error}"
+            let error = parse(conflict).expect_err("the flags must conflict");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{conflict:?}"
             );
         }
+        parse(&["--reuse-daemon", "--reuse-panel"]).unwrap();
     }
 }
