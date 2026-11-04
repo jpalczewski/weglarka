@@ -566,7 +566,16 @@ fn validate_static_ingress_values(
     } else {
         &spec.paths
     };
-    let mut seen_from = BTreeSet::new();
+    // Every one of these renders an exact `location = <path>` in `weglarka-ingress` for this site: a
+    // non-root entry of the site's own `paths` (ADR 0031), a redirect's `from` (a `prefix` redirect
+    // also matches its own bare `from` exactly, not just what is below it), and a feed's `path`.
+    // nginx refuses two `location = <path>` directives in one `server`, so all three must be
+    // pairwise distinct — tracked in one set instead of three, so a collision between e.g. a redirect
+    // and a feed is caught here instead of surfacing as a broken `nginx -t` at apply time.
+    let mut claimed_exact: BTreeSet<&String> = effective_paths
+        .iter()
+        .filter(|p| p.as_str() != "/")
+        .collect();
     for r in &opts.redirects {
         crate::app::check_path_prefix(&r.from).map_err(|reason| {
             format!(
@@ -584,14 +593,14 @@ fn validate_static_ingress_values(
             ));
         }
         validate_static_redirect_to(name, &r.to)?;
-        if !seen_from.insert(&r.from) {
+        if !claimed_exact.insert(&r.from) {
             return Err(format!(
-                "{name}: duplicate ingress.static.redirects[].from {:?}",
+                "{name}: ingress.static.redirects[].from {:?} collides with the site's own paths, \
+                 another redirect or a feed (nginx would see two identical `location` blocks)",
                 r.from
             ));
         }
     }
-    let mut seen_feed = BTreeSet::new();
     for f in &opts.feeds {
         crate::app::check_path_prefix(&f.path).map_err(|reason| {
             format!(
@@ -599,9 +608,10 @@ fn validate_static_ingress_values(
                 f.path
             )
         })?;
-        if !seen_feed.insert(&f.path) {
+        if !claimed_exact.insert(&f.path) {
             return Err(format!(
-                "{name}: duplicate ingress.static.feeds[].path {:?}",
+                "{name}: ingress.static.feeds[].path {:?} collides with the site's own paths, a \
+                 redirect or another feed (nginx would see two identical `location` blocks)",
                 f.path
             ));
         }
@@ -2075,13 +2085,13 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             );
         }
 
-        // Duplicate `from` entries are rejected.
+        // Duplicate `from` entries are rejected (collide on the same `location = <path>`).
         let err = check(
             "redirects = [{ from = \"/blog/a\", to = \"/x\" }, { from = \"/blog/a\", to = \"/y\" }]",
         )
         .unwrap_err();
         assert!(
-            err.contains("duplicate ingress.static.redirects[].from"),
+            err.contains("ingress.static.redirects[].from") && err.contains("collides"),
             "{err}"
         );
 
@@ -2094,9 +2104,22 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         )
         .unwrap_err();
         assert!(
-            err.contains("duplicate ingress.static.feeds[].path"),
+            err.contains("ingress.static.feeds[].path") && err.contains("collides"),
             "{err}"
         );
+
+        // A redirect and a feed sharing the same exact path collide too (#500 review: both render
+        // an exact `location = <path>`, so nginx would see a duplicate location without this check).
+        let err = check(
+            "redirects = [{ from = \"/blog/x\", to = \"/blog/y\" }], feeds = [{ path = \"/blog/x\", format = \"rss\" }]",
+        )
+        .unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+
+        // A redirect whose `from` equals one of the site's own non-root `paths` entries collides
+        // with that path's own exact `location = <path>` the ingress already renders.
+        let err = check("redirects = [{ from = \"/blog\", to = \"/blog2\" }]").unwrap_err();
+        assert!(err.contains("collides"), "{err}");
 
         // `cache_immutable_paths`: the `paths` alphabet.
         assert!(check("cache_immutable_paths = [\"/assets\"]").is_ok());
