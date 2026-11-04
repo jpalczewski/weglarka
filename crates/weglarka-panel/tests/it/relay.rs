@@ -356,3 +356,67 @@ async fn a_forwarding_proxy_that_is_not_trusted_is_noticed_but_not_believed() {
     let (second, _, _) = send(&app, call("198.51.100.2")).await;
     assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
 }
+
+#[tokio::test]
+async fn login_discovery_publishes_the_configured_issuer_and_audience_without_a_session() {
+    let (app, daemon) = relay_to(|_| Reply::new(200, "{}")).await;
+    let (status, headers, body) = send(
+        &app,
+        request(
+            Method::GET,
+            weglarka_model::admin_auth::LOGIN_DISCOVERY_PATH,
+        )
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let document: weglarka_model::admin_auth::LoginDiscovery =
+        serde_json::from_slice(&body).unwrap();
+    assert_eq!(document.issuer, "https://auth.example.com");
+    assert_eq!(document.audience, "https://admin.example.com/api/");
+    // Exactly these two fields: nothing else is published.
+    let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(raw.as_object().unwrap().len(), 2);
+    // It is not a relayed endpoint: the daemon was never asked and the allowlist does not know it.
+    assert!(daemon.seen.lock().unwrap().is_empty());
+    assert!(weglarka_panel::relay::find_endpoint("GET", "/login").is_none());
+}
+
+#[tokio::test]
+async fn login_discovery_accepts_only_get() {
+    let (app, daemon) = relay_to(|_| Reply::new(200, "{}")).await;
+    for method in [Method::POST, Method::PUT, Method::DELETE] {
+        let (status, _, _) = send(
+            &app,
+            request(method, weglarka_model::admin_auth::LOGIN_DISCOVERY_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+    assert!(daemon.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn login_discovery_shares_the_relay_rate_limit() {
+    let (app, _daemon) = relay_to(|_| Reply::new(200, "{}")).await;
+    let mut last = StatusCode::OK;
+    for _ in 0..=weglarka_panel::relay::LIMIT {
+        last = send(
+            &app,
+            request(
+                Method::GET,
+                weglarka_model::admin_auth::LOGIN_DISCOVERY_PATH,
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .0;
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}

@@ -210,6 +210,12 @@ it forwards a request, byte for byte, to the daemon's token socket, so the CLI c
 - **Streams** (logs, events) pass through unbuffered and end where the daemon ends them, including its `TokenExpired`
   frame when the token expires.
 
+- **One public sibling: `GET /_weglarka/api/login`.** It returns `{"issuer": …, "audience": …}` (the panel's
+  `OIDC_ISSUER` and `PANEL_API_AUDIENCE`, no secret, `Cache-Control: no-store`) so that `weglarka --host … login` needs no
+  flags. It needs no session or token, shares the relay's per-address rate limit, answers other methods with `405`, and
+  is the only route under the prefix that is not an admin endpoint. It sits under the relay prefix so that the
+  carve-out below already makes it reachable through forward auth.
+
 **Nothing to configure.** The instance listed in `[admin.http] clients` is the panel, and Węglarka carves the relay
 prefix `/_weglarka/api` out of that app's `location /` by itself (the same mechanism as
 [forward auth](forward-auth.md) exemptions and [streaming](streaming.md) paths, rendered with the rest of `nginx.conf`):

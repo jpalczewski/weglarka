@@ -14,6 +14,11 @@
 //! - request and response bodies pass through unbuffered, so a stream ends when the daemon ends it
 //!   (including its `TokenExpired` frame at the token's expiry).
 //!
+//! The one deliberate exception to "the endpoint table is the only route list" is
+//! [`login_discovery`]: `GET /_weglarka/api/login`, a static route registered beside the relay
+//! wildcard (never inside [`handle`], so it never reaches [`find_endpoint`]). It publishes the issuer
+//! and audience `weglarka login` needs, shares the relay's per-address limit and needs no session.
+//!
 //! Local refusals use the admin API's error envelope so the CLI reads them like the daemon's own.
 
 use std::net::{IpAddr, SocketAddr};
@@ -22,7 +27,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER};
+use axum::http::header::{
+    ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
+};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream;
@@ -30,7 +37,7 @@ use http_body_util::Limited;
 use tokio::sync::OwnedSemaphorePermit;
 use weglarka_api::endpoints::{self, ENDPOINTS};
 use weglarka_api::{ApiError, Endpoint, ErrorCode};
-use weglarka_model::admin_auth::{RELAY_MAX_BODY_BYTES, RELAY_PREFIX};
+use weglarka_model::admin_auth::{LoginDiscovery, RELAY_MAX_BODY_BYTES, RELAY_PREFIX};
 use weglarka_unix_http::{Bytes, bearer};
 
 use crate::app::AppState;
@@ -120,6 +127,32 @@ fn has_bearer(request: &Request) -> bool {
                     scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()
                 })
         })
+}
+
+/// `GET /_weglarka/api/login`: the public, secret-free sign-in settings of this panel.
+pub async fn login_discovery(State(state): State<AppState>, request: Request) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::from([0, 0, 0, 0]), |c| c.0.ip());
+    let client = state.client_addr(peer, request.headers());
+    if !state.api_limit.admit(client) {
+        tracing::warn!(%client, "too many API requests from one address");
+        return slow_down();
+    }
+    let document = LoginDiscovery {
+        issuer: state.config.oidc.issuer.clone(),
+        audience: state.config.oidc.audience.clone(),
+    };
+    let mut response = (
+        StatusCode::OK,
+        serde_json::to_vec(&document).unwrap_or_default(),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 pub async fn handle(State(state): State<AppState>, request: Request) -> Response {

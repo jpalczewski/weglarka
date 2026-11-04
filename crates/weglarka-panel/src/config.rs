@@ -39,8 +39,8 @@ const SESSION_IDLE_BOUNDS: std::ops::RangeInclusive<u64> = 60..=24 * 60 * 60;
 const SESSION_MAX_BOUNDS: std::ops::RangeInclusive<u64> = 300..=7 * 24 * 60 * 60;
 /// A client secret file is a few dozen bytes; anything bigger is the wrong file.
 const MAX_SECRET_FILE_BYTES: u64 = 4096;
-const MAX_AUDIENCE_BYTES: usize = 512;
 
+use weglarka_model::admin_auth::MAX_AUDIENCE_BYTES;
 pub use weglarka_oidc::Secret;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

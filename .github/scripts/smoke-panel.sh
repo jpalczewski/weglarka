@@ -96,6 +96,17 @@ for path in /config /apps /events/stream; do
 done
 echo "no page is served without a session"
 
+# --- the sign-in settings `weglarka login` discovers (ADR 0060, addendum) are public
+echo "--- GET /_weglarka/api/login without a session"
+code=$(curl -sS -D "$tmp/disc.h" -o "$tmp/disc.b" -w '%{http_code}' "$base/_weglarka/api/login")
+[ "$code" = 200 ] || fail "/_weglarka/api/login returned $code"
+header cache-control "$tmp/disc.h" | grep -qi 'no-store' || fail "/_weglarka/api/login is cacheable"
+grep -qF '"issuer":"http://127.0.0.1:9"' "$tmp/disc.b" || fail "/_weglarka/api/login does not name the issuer: $(cat "$tmp/disc.b")"
+grep -qF '"audience":"https://admin.example.test/api/"' "$tmp/disc.b" || fail "/_weglarka/api/login does not name the audience"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$base/_weglarka/api/login")
+[ "$code" = 405 ] || fail "POST /_weglarka/api/login returned $code (expected 405)"
+echo "login discovery ok"
+
 # --- embedded assets
 echo "--- /static/ assets"
 code=$(curl -sS -D "$tmp/css.h" -o "$tmp/css.b" -w '%{http_code}' "$base/static/app.css")

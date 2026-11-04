@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Directory under the state dir that holds the token listener's socket (`0711`: containers with
 /// other uids must traverse it; the socket is `0666` and every request carries a token); mounted
@@ -28,6 +28,24 @@ pub const CONTAINER_SOCKET: &str = "/run/weglarka-admin/api.sock";
 /// gives it the long-lived stream settings itself, so an operator configures neither. A prefix no
 /// ordinary app serves, so exempting it from the identity provider unprotects nothing real.
 pub const RELAY_PREFIX: &str = "/_weglarka/api";
+/// The one route under [`RELAY_PREFIX`] that is not an admin endpoint: `GET` returns the panel's
+/// [`LoginDiscovery`] document so `weglarka login` needs only `--host` (docs/decisions/0060, addendum).
+/// A literal because `concat!` cannot take a const; a test keeps it under the prefix, where the
+/// ingress already bypasses forward auth.
+pub const LOGIN_DISCOVERY_PATH: &str = "/_weglarka/api/login";
+/// The longest `audience` the panel accepts and the CLI believes.
+pub const MAX_AUDIENCE_BYTES: usize = 512;
+
+/// What the panel publishes at [`LOGIN_DISCOVERY_PATH`]: public, secret-free sign-in settings.
+///
+/// Deliberately without `deny_unknown_fields`: this is a wire format read across CLI and panel
+/// versions, so a newer panel may add fields an older CLI must ignore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginDiscovery {
+    pub issuer: String,
+    pub audience: String,
+}
+
 /// The largest body the relay passes (an image archive or a volume import); also the ingress's body
 /// limit on [`RELAY_PREFIX`].
 pub const RELAY_MAX_BODY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -592,6 +610,19 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_login_discovery_path_lives_under_the_relay_prefix() {
+        assert!(super::LOGIN_DISCOVERY_PATH.starts_with(super::RELAY_PREFIX));
+        assert!(super::LOGIN_DISCOVERY_PATH[super::RELAY_PREFIX.len()..].starts_with('/'));
+    }
+
+    #[test]
+    fn the_login_discovery_document_ignores_unknown_fields() {
+        let doc: super::LoginDiscovery =
+            serde_json::from_str(r#"{"issuer":"https://a","audience":"b","future":1}"#).unwrap();
+        assert_eq!(doc.audience, "b");
+    }
+
     use super::testing::*;
     use super::*;
     use ring::signature::RsaKeyPair;

@@ -1890,4 +1890,9 @@ fn host_is_a_global_flag_that_excludes_an_explicit_socket_flag() {
         crate::cli::Cli::parse_args(["weglarka", "login", "--issuer", "a", "--audience", "b"])
             .is_ok()
     );
+    // Both flags are optional: the host publishes them.
+    assert!(
+        crate::cli::Cli::parse_args(["weglarka", "--host", "https://panel.example.com", "login"])
+            .is_ok()
+    );
 }

@@ -15,7 +15,7 @@ paths:
 - **Server-side rendered BFF.** Everything except `/healthz`, `/static/*`, `/auth/login`, `/auth/callback` and `/_weglarka/api/*`
   sits behind `auth::require_session` (default-deny). `/_weglarka/api/*` is the bearer-only relay to the daemon (ADR 0060,
   `relay.rs`): endpoint allowlist from `weglarka_api::endpoints`, no cookie ever read, only four headers forwarded, rate
-  limit and in-flight cap, the daemon authorizes. The user's access token is only ever sent in `Authorization`; cookies carry
+  limit and in-flight cap, the daemon authorizes; its one sibling is the static `GET /_weglarka/api/login` (issuer + audience for `weglarka login`, ADR 0060 addendum, `relay::login_discovery`). The user's access token is only ever sent in `Authorization`; cookies carry
   the session id (`__Host-` prefix). Polled fragments (`GET /apps/{name}/stats`, allowlist `auth::is_passive`) are passive: they need a valid session but never reset the idle timer (like streams), and an ended session gets a `286` stop-polling fragment. Non-GET requests need a CSRF token and a same-origin `Sec-Fetch-Site`. Every
   response carries the CSP and the other security headers (`headers.rs`).
 - **Configuration** is env-only (`config.rs`): `OIDC_*` (including `OIDC_CLIENT_SECRET_FILE`), `PANEL_PUBLIC_URL`,
