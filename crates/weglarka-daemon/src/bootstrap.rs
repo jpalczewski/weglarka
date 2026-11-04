@@ -899,10 +899,77 @@ image = "ghcr.io/example/weglarka:latest"
             journal.to_toml().unwrap(),
         )
         .unwrap();
+        let platform = FakePlatform::systemd();
         assert!(matches!(
-            downgrade(&FakePlatform::systemd(), &options).await,
+            downgrade(&platform, &options).await,
             Err(BootstrapError::Incomplete(_))
         ));
+        assert_eq!(*platform.teardowns.lock().unwrap(), 0);
+    }
+
+    /// Runs nothing and succeeds: the OpenRC adapter's `rc-service`/`rc-update` calls.
+    struct QuietRunner;
+
+    impl crate::platform::CommandRunner for QuietRunner {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: &[(String, String)],
+        ) -> std::io::Result<(bool, String)> {
+            Ok((true, String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn downgrade_on_a_real_openrc_adapter_leaves_no_launcher_init_script_or_cron_line() {
+        use crate::openrc::OpenRcPlatform;
+        use weglarka_engine::platform::{Hardening, JobId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let init = dir.path().join("init.d");
+        let crontabs = dir.path().join("crontabs");
+        let platform = OpenRcPlatform::with_runner("weglarka", 1001, QuietRunner)
+            .with_host_dir(&options.host_dir)
+            .with_init_dir(&init)
+            .with_crontab_dir(&crontabs);
+        let digest = format!("sha256:{}", "b".repeat(64));
+        platform
+            .install_service(&weglarka_engine::platform::ServiceSpec {
+                name: "weglarka".into(),
+                image: format!("ghcr.io/example/weglarka@{digest}"),
+                run_as_user: "weglarka".into(),
+                env: vec![],
+                mounts: vec![],
+                networks: vec![],
+                args: vec!["run".into()],
+                hardening: Hardening::default(),
+            })
+            .await
+            .unwrap();
+        platform
+            .install_jobs(&[ScheduledJob {
+                id: JobId::Update,
+                args: vec!["update".into()],
+                runtime_user: "weglarka".into(),
+                cadence_secs: 3600,
+                skip_if_running: true,
+            }])
+            .await
+            .unwrap();
+        let crontab = crontabs.join("weglarka");
+        let managed = std::fs::read_to_string(&crontab).unwrap();
+        assert!(managed.contains("weglarka-launcher"), "{managed}");
+        std::fs::write(&crontab, format!("0 3 * * * /usr/bin/backup\n{managed}")).unwrap();
+        assert_eq!(std::fs::read_dir(&init).unwrap().count(), 2);
+
+        downgrade(&platform, &options).await.unwrap();
+
+        assert_eq!(std::fs::read_dir(&init).unwrap().count(), 0);
+        let left = std::fs::read_to_string(&crontab).unwrap();
+        assert_eq!(left, "0 3 * * * /usr/bin/backup\n");
+        assert!(!left.contains("launcher"), "{left}");
     }
 
     #[tokio::test]
@@ -916,7 +983,6 @@ image = "ghcr.io/example/weglarka:latest"
             };
             downgrade(&platform, &options).await.unwrap();
             assert_eq!(*platform.teardowns.lock().unwrap(), 1, "{kind:?}");
-            assert!(platform.jobs.lock().unwrap().is_empty(), "{kind:?}");
         }
     }
 

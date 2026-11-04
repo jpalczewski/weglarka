@@ -2,7 +2,8 @@
 
 `platform bootstrap` installs the launcher-based setup (coordinated platform updates): periodic launcher jobs, and on
 OpenRC the launcher-run `weglarka` and `weglarka-podman` init scripts. Two commands take it apart again. Both run on the
-host as the runtime user's installer, like `platform install`:
+host with `weglarka-daemon`, never inside the container, and with the same privileges as `platform install`
+(see [installation](../install.md)): the runtime user on systemd, root on OpenRC, whose init scripts are root-owned:
 
 ```sh
 weglarka-daemon --config /etc/weglarka/weglarka.toml platform downgrade
@@ -10,7 +11,9 @@ weglarka-daemon --config /etc/weglarka/weglarka.toml platform remove
 ```
 
 Both are idempotent: pieces that are already gone are skipped. Unrelated entries (other lines in the runtime user's
-crontab) are never touched.
+crontab) are never touched, and a crontab without the managed block is not rewritten at all. If the block's start marker
+has no end marker, the command stops with an error naming the file and changes nothing: remove the block by hand and
+run it again.
 
 ## Downgrade
 
@@ -27,7 +30,8 @@ restore, and an OpenRC host has no daemon after `downgrade` (also after a reboot
 again. The platform update contract describes the reverse command as removing the launcher units and restoring the
 legacy daemon-only units, and the cron block as the only crontab content that uninstall removes.
 
-A running daemon container is not stopped by `downgrade`; the init script that supervised it is.
+On OpenRC nothing supervises a daemon after `downgrade`: the init script is gone, and a container that was running keeps
+running unsupervised until it exits or the host reboots.
 
 ## Remove
 

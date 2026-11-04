@@ -711,10 +711,12 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
         }
     }
     /// Disables and deletes the launcher job units and the self-update and watchdog units that
-    /// `platform install` writes. Disabling a unit that is not installed fails, which is fine here.
+    /// `platform install` writes. A timer whose unit file is not installed is skipped (there is
+    /// nothing to disable); a failure to disable an installed one is an error.
     async fn remove_launcher_setup(&self) -> Result<()> {
         let (update_service, update_timer) = job_unit_names(JobId::Update);
         let (watchdog_service, watchdog_timer) = job_unit_names(JobId::Watchdog);
+        let dir = self.units_dir(&self.entry()?);
         // Disable before deleting: `systemctl disable` needs the unit files.
         for timer in [
             update_timer,
@@ -722,7 +724,9 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
             SELF_UPDATE_TIMER,
             WATCHDOG_TIMER,
         ] {
-            let _ = self.set_timer(timer, false).await;
+            if dir.join(timer).exists() {
+                self.set_timer(timer, false).await?;
+            }
         }
         self.remove_user_units(&[
             update_service,
@@ -1409,15 +1413,23 @@ mod tests {
         )
         .unwrap();
         files.extend(
+            render_watchdog_units(
+                Path::new("/usr/local/bin/weglarka-daemon"),
+                Path::new("/etc/weglarka/weglarka.toml"),
+            )
+            .unwrap(),
+        );
+        let job = |id, cadence_secs| ScheduledJob {
+            id,
+            args: vec!["run".into()],
+            runtime_user: "weglarka".into(),
+            cadence_secs,
+            skip_if_running: true,
+        };
+        files.extend(
             render_job_units(
                 &dir.path().join("host"),
-                &[ScheduledJob {
-                    id: JobId::Update,
-                    args: vec!["update".into()],
-                    runtime_user: "weglarka".into(),
-                    cadence_secs: 3600,
-                    skip_if_running: true,
-                }],
+                &[job(JobId::Update, 3600), job(JobId::Watchdog, 60)],
             )
             .unwrap(),
         );
@@ -1443,5 +1455,61 @@ mod tests {
                 "{timer}: {calls:?}"
             );
         }
+    }
+
+    /// `systemctl disable` fails, everything else succeeds.
+    struct DisableFails;
+
+    impl CommandRunner for DisableFails {
+        async fn run(
+            &self,
+            _: &str,
+            args: &[String],
+            _: &[(String, String)],
+        ) -> io::Result<(bool, String)> {
+            Ok((!args.iter().any(|a| a == "disable"), String::new()))
+        }
+    }
+
+    fn passwd_in(dir: &Path) -> PathBuf {
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0::/root:/bin/sh\nweglarka:x:1001:1001::/home/weglarka:/bin/sh\n",
+        )
+        .unwrap();
+        passwd
+    }
+
+    #[tokio::test]
+    async fn removing_the_launcher_setup_skips_timers_that_are_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = SystemdPlatform::with_runner("weglarka", Recorder::default())
+            .with_passwd(passwd_in(dir.path()))
+            .with_quadlet_dir(dir.path().join("q"))
+            .with_units_dir(dir.path().join("units"));
+
+        p.remove_launcher_setup().await.unwrap();
+
+        let calls = p.runner.calls();
+        assert!(!calls.iter().any(|c| c.contains("disable")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_the_launcher_setup_reports_a_timer_that_will_not_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join(WATCHDOG_TIMER), "[Timer]\n").unwrap();
+        let p = SystemdPlatform::with_runner("weglarka", DisableFails)
+            .with_passwd(passwd_in(dir.path()))
+            .with_quadlet_dir(dir.path().join("q"))
+            .with_units_dir(&units);
+
+        let err = p.remove_launcher_setup().await.unwrap_err();
+
+        assert!(err.to_string().contains(WATCHDOG_TIMER), "{err}");
+        // Nothing was deleted: a unit that could not be disabled is still there to retry with.
+        assert!(units.join(WATCHDOG_TIMER).exists());
     }
 }
