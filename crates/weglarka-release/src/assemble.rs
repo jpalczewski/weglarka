@@ -99,6 +99,13 @@ pub struct ReleaseSpec {
     pub compatibility: Compatibility,
 }
 
+/// Which component a partial release reuses from the previous promoted set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseComponent {
+    Daemon,
+    Panel,
+}
+
 impl ReleaseSpec {
     /// The descriptor for `sequence`, with the host-tools image pinned to the daemon image (the
     /// contract's v1 rule: the tools come from the selected daemon image).
@@ -141,12 +148,28 @@ impl ReleaseSpec {
         Ok(bytes)
     }
 
-    /// Replaces daemon and host-tool records with the ones from `previous`. Used for a panel-only
-    /// release: the daemon image is unchanged, so its digest, repository, version and host-file
-    /// hashes must not be re-derived (and must not be relabeled under a new tag).
+    /// Copies one component's whole descriptor from `previous`: its repository, digest and
+    /// version, and — for the daemon — the host files it ships and the state schemas it reads and
+    /// writes. Used for a partial release: the unchanged component image must not be re-derived
+    /// (and must not be relabeled under a new tag).
+    pub fn reuse(&mut self, component: ReuseComponent, previous: &Descriptor) {
+        match component {
+            ReuseComponent::Daemon => {
+                self.daemon = previous.daemon.clone();
+                self.host_files = previous.host_tools.files.clone();
+                self.compatibility.state_read = previous.compatibility.state_read.clone();
+                self.compatibility.state_write = previous.compatibility.state_write;
+            }
+            ReuseComponent::Panel => {
+                self.panel = previous.panel.clone();
+            }
+        }
+    }
+
+    /// Reuses the daemon's whole descriptor (see [`Self::reuse`]); `publish`'s tests call it by name.
+    #[cfg(test)]
     pub fn reuse_daemon(&mut self, previous: &Descriptor) {
-        self.daemon = previous.daemon.clone();
-        self.host_files = previous.host_tools.files.clone();
+        self.reuse(ReuseComponent::Daemon, previous);
     }
 }
 
@@ -418,10 +441,48 @@ mod tests {
             "0.4.0",
         )
         .unwrap();
-        next.reuse_daemon(&previous);
+        next.reuse(ReuseComponent::Daemon, &previous);
         assert_eq!(next.daemon, previous.daemon);
         assert_eq!(next.host_files, previous.host_tools.files);
         assert_ne!(next.panel, previous.panel);
+    }
+
+    #[test]
+    fn a_panel_only_reuse_after_a_schema_bump_keeps_the_daemon_state_versions() {
+        let mut next = spec();
+        let previous = spec().descriptor(9);
+        // The schema advanced since the previous set; the reused daemon still reads and writes the
+        // old schema, so its state versions must come from the previous set, not the flags.
+        next.compatibility =
+            compatibility(vec![18], 18, vec![digest(PANEL)], &digest(PANEL)).unwrap();
+        next.reuse(ReuseComponent::Daemon, &previous);
+        assert_eq!(next.compatibility.state_read, vec![17]);
+        assert_eq!(next.compatibility.state_write, 17);
+    }
+
+    #[test]
+    fn a_cli_only_reuse_keeps_the_panel_digest_and_version() {
+        let mut next = spec();
+        let previous = spec().descriptor(9);
+        next.daemon = component(
+            "ghcr.io/example/weglarka",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "0.10.0",
+        )
+        .unwrap();
+        // A panel version bump must not be paired with the reused digest: reuse copies the whole
+        // panel record — the digest and the version that digest was built from.
+        next.panel = component(
+            "ghcr.io/example/weglarka-panel",
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "0.4.0",
+        )
+        .unwrap();
+        next.reuse(ReuseComponent::Panel, &previous);
+        assert_eq!(next.panel, previous.panel);
+        assert_eq!(next.panel.version, previous.panel.version);
+        assert_eq!(next.panel.digest, previous.panel.digest);
+        assert_ne!(next.daemon, previous.daemon);
     }
 
     #[test]
