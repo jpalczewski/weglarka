@@ -573,9 +573,26 @@ mod tests {
     }
 
     #[test]
+    fn inspect_ignores_warnings_before_a_missing_container() {
+        let (options, _) = options(Path::new("/unused"), false);
+        let runner = failed(
+            "level=warning msg=\"Failed to add pause process to systemd sandbox cgroup: dial unix \
+         /run/user/1001/bus: connect: no such file or directory\"\nError: no such container \
+         weglarka",
+        );
+        assert_eq!(inspect(&runner, &options, "weglarka").unwrap(), None);
+    }
+
+    #[test]
     fn inspect_reports_an_unreachable_socket_as_an_error() {
         let (options, _) = options(Path::new("/unused"), false);
-        let runner = failed("Cannot connect to Podman. Please verify your connection");
+        let runner = failed(
+            "Cannot connect to Podman. Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` and `podman machine \
+         start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to \
+         connect: dial unix /run/user/1001/podman/podman.sock: connect: no such file or \
+         directory: unix:///run/user/1001/podman/podman.sock",
+        );
         let error = inspect(&runner, &options, "weglarka").unwrap_err();
         assert!(matches!(error, ServiceError::Podman { .. }), "{error}");
     }

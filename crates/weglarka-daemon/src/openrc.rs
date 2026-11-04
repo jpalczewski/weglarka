@@ -757,17 +757,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_ignores_warnings_before_a_missing_container() {
+        let p = OpenRcPlatform::with_runner(
+            "weglarka",
+            1001,
+            FailingInspect(
+                "level=warning msg=\"Failed to add pause process to systemd sandbox cgroup: dial unix \
+         /run/user/1001/bus: connect: no such file or directory\"\nError: no such container \
+         weglarka",
+            ),
+        );
+        let observed = p
+            .observe_service(ServiceName::new("weglarka").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(observed.container_id, None);
+    }
+
+    #[tokio::test]
     async fn observe_reports_an_unreachable_socket_as_an_error() {
         let p = OpenRcPlatform::with_runner(
             "weglarka",
             1001,
-            FailingInspect("Cannot connect to Podman. Please verify your connection"),
+            FailingInspect(
+                "Cannot connect to Podman. Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` and `podman machine \
+         start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to \
+         connect: dial unix /run/user/1001/podman/podman.sock: connect: no such file or \
+         directory: unix:///run/user/1001/podman/podman.sock",
+            ),
         );
         let error = p
             .observe_service(ServiceName::new("weglarka").unwrap())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Cannot connect"), "{error}");
+        assert!(error.to_string().contains("unable to connect"), "{error}");
     }
 
     #[tokio::test]

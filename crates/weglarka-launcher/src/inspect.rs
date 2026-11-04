@@ -52,11 +52,19 @@ pub fn parse_inspect(stdout: &str) -> Option<InspectedContainer> {
 }
 
 /// Whether a failed inspect means the container does not exist (as opposed to an unreachable
-/// socket or any other Podman failure, which the caller must report). A missing socket file
-/// also reads "no such file or directory", which is not an absent container.
+/// socket, a missing runtime or any other Podman failure, which the caller must report).
+///
+/// Podman writes its verdict on an `Error:` line, possibly after `level=warning` lines on the
+/// same stream, so only `Error:` lines count: the warnings can mention anything. A container
+/// that is missing is reported as `no such container` or `no such object`; broader matches
+/// (`not found`, `no such file`, `no such host`) also describe a missing runtime binary, socket
+/// file or remote host, which are errors.
 pub fn is_absent(stderr: &str) -> bool {
-    let stderr = stderr.to_ascii_lowercase();
-    (stderr.contains("no such") && !stderr.contains("no such file")) || stderr.contains("not found")
+    stderr.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.starts_with("error:")
+            && (line.contains("no such container") || line.contains("no such object"))
+    })
 }
 
 #[cfg(test)]
@@ -134,15 +142,36 @@ mod tests {
     fn only_a_missing_container_is_absent() {
         let cases = [
             ("Error: no such container weglarka", true),
+            ("Error: no such object: \"weglarka\"", true),
             (
                 "Error: inspecting object: no such object: \"weglarka\"",
                 true,
             ),
             ("Error: NO SUCH CONTAINER", true),
-            ("Error: container weglarka not found", true),
+            // Warnings share the stream and may precede the verdict.
+            (
+                "time=\"2026-11-04T10:00:00Z\" level=warning msg=\"Failed to add pause process to \
+                 systemd sandbox cgroup: dial unix /run/user/1001/bus: connect: no such file or \
+                 directory\"\nError: no such container weglarka",
+                true,
+            ),
+            // A warning alone says nothing about the container.
+            (
+                "level=warning msg=\"dial unix /run/user/1001/bus: no such container\"",
+                false,
+            ),
+            // Failures that are not a missing container.
             (
                 "Cannot connect to Podman. Please verify your connection to the Linux system \
                  using `podman system connection list`",
+                false,
+            ),
+            (
+                "Cannot connect to Podman. Please verify your connection to the Linux system \
+                 using `podman system connection list`, or try `podman machine init` and \
+                 `podman machine start` to manage a new Linux VM\nError: unable to connect to \
+                 Podman socket: failed to connect: dial unix /run/user/1001/podman/podman.sock: \
+                 connect: no such file or directory: unix:///run/user/1001/podman/podman.sock",
                 false,
             ),
             (
@@ -150,6 +179,25 @@ mod tests {
                  /run/user/1001/podman/podman.sock: connect: no such file or directory",
                 false,
             ),
+            (
+                "Failed to obtain podman configuration: lstat /run/user/1001: no such file or \
+                 directory",
+                false,
+            ),
+            (
+                "Error: unable to connect to Podman socket: dial tcp: lookup example.com: no \
+                 such host",
+                false,
+            ),
+            (
+                "Error: default OCI runtime \"crun\" not found: invalid argument",
+                false,
+            ),
+            (
+                "Error: exec: \"newuidmap\": executable file not found in $PATH",
+                false,
+            ),
+            ("Error: container weglarka not found", false),
             ("Error: permission denied", false),
             ("", false),
         ];
