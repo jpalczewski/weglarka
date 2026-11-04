@@ -449,10 +449,12 @@ async fn check_signature(
         Ok(key) => key,
         Err(e) => return Err(format!("cannot load the pinned public key: {e}")),
     };
-    let signatures: Vec<Signature> = registry
-        .cosign_signatures(image, digest)
-        .await
-        .map_err(|e| format!("cannot fetch the cosign signature: {e}"))?;
+    let signatures: Vec<Signature> = match registry.cosign_signatures(image, digest).await {
+        Ok(signatures) => signatures,
+        // No `.sig` tag at all is the same refusal as an empty list: the image is unsigned.
+        Err(e) if e.is_not_found() => Vec::new(),
+        Err(e) => return Err(format!("cannot fetch the cosign signature: {e}")),
+    };
     if signatures.is_empty() {
         return Err(format!(
             "no key-based cosign signature for {digest}: is the image signed with `cosign sign --key`?"
@@ -1097,6 +1099,62 @@ dir = "{root}/state"
             Some(digest)
         );
         assert!(!report.is_success());
+    }
+
+    #[tokio::test]
+    async fn a_missing_signature_tag_is_refused_as_unsigned() {
+        let mut ctx = Ctx::new(true);
+        // The real 404 of an image that has no `.sig` tag at all.
+        ctx.registry = FakeRegistry::without_signature_tag();
+        let digest = digest_of('a');
+        ctx.pulled_digest(&digest);
+
+        let report = ctx.run(Options::default()).await;
+        match &report {
+            Report::Refused { reason } => {
+                assert!(reason.contains("no key-based cosign signature"), "{reason}");
+                assert!(!reason.contains("cannot fetch"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+        let state = ctx.state();
+        assert!(state.pending.is_none());
+        assert_eq!(
+            state.error.as_ref().and_then(|e| e.digest.clone()),
+            Some(digest)
+        );
+        assert!(!report.is_success());
+    }
+
+    #[tokio::test]
+    async fn another_signature_lookup_failure_is_still_a_failed_lookup() {
+        for status in [401, 403, 500, 503] {
+            let ctx = Ctx::new(true);
+            let digest = digest_of('a');
+            ctx.pulled_digest(&digest);
+            // Even with a valid signature on record, a failed lookup must not install anything.
+            ctx.signed(&digest);
+            ctx.registry.fail_once(RegistryError::Status {
+                status,
+                what: "cosign signature manifest",
+            });
+
+            match ctx.run(Options::default()).await {
+                Report::Refused { reason } => {
+                    assert!(
+                        reason.contains("cannot fetch the cosign signature"),
+                        "{status}: {reason}"
+                    );
+                    assert!(!reason.contains("no key-based"), "{status}: {reason}");
+                }
+                other => panic!("{status}: expected a refusal, got {other:?}"),
+            }
+            assert!(ctx.platform.installed_images().is_empty(), "{status}");
+            assert_eq!(ctx.platform.restarts(), 0, "{status}");
+            assert!(ctx.state().pending.is_none(), "{status}");
+        }
     }
 
     #[tokio::test]
