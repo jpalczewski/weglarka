@@ -615,6 +615,9 @@ async fn an_unusable_document_is_refused() {
         r#"{"issuer":"https://auth.example.com/\u001b[2J","audience":"a"}"#.to_owned(),
         r#"{"issuer":"https://auth.example.com/\nTrusted: yes","audience":"a"}"#.to_owned(),
         r#"{"issuer":"https://auth.example.com/ x","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u202e","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u200b","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com","audience":"a\u202eb"}"#.to_owned(),
     ] {
         let (_dir, store) = store();
         let provider = Provider::default();
@@ -674,4 +677,17 @@ async fn a_known_host_cannot_be_moved_to_another_issuer_or_audience() {
     let provider = Provider::default();
     provider.say(200, PUBLISHED);
     resolve(&provider, &store, &args(None, None)).await.unwrap();
+}
+
+#[tokio::test]
+async fn flags_with_hidden_characters_are_refused() {
+    let (_dir, store) = store();
+    let err = resolve(
+        &Provider::default(),
+        &store,
+        &args(Some("https://auth.example.com/\u{202e}"), Some("a")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, Kind::Usage);
 }

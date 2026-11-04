@@ -65,16 +65,18 @@ fn loopback(url: &Url) -> bool {
         .is_some_and(|ip| ip.is_loopback())
 }
 
+/// Issuers and audiences are URIs: visible ASCII only (no whitespace, controls or Unicode format
+/// characters that could disguise what is printed).
+fn printable_ascii(value: &str) -> bool {
+    value.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 fn validate(document: &LoginDiscovery) -> Result<(), CliError> {
     let bad = |what: &str| config(format!("the host's sign-in settings are unusable: {what}"));
-    // The raw string is kept, compared and printed, not the parsed form: a control character (a
-    // terminal escape, a newline) must never reach the "Signing in with …" line.
-    if document
-        .issuer
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace())
-    {
-        return Err(bad("the issuer contains control or whitespace characters"));
+    // The raw string is kept, compared and printed, not the parsed form: a control character, a
+    // bidi override or a zero-width character must never reach the "Signing in with …" line.
+    if !printable_ascii(&document.issuer) {
+        return Err(bad("the issuer is not plain printable ASCII"));
     }
     let issuer = Url::parse(&document.issuer).map_err(|_| bad("the issuer is not a URL"))?;
     let scheme_ok = issuer.scheme() == "https" || (issuer.scheme() == "http" && loopback(&issuer));
@@ -85,10 +87,7 @@ fn validate(document: &LoginDiscovery) -> Result<(), CliError> {
         return Err(bad("the issuer carries credentials or a fragment"));
     }
     let audience = &document.audience;
-    if audience.is_empty()
-        || audience.len() > MAX_AUDIENCE_BYTES
-        || audience.chars().any(char::is_control)
-    {
+    if audience.is_empty() || audience.len() > MAX_AUDIENCE_BYTES || !printable_ascii(audience) {
         return Err(bad("the audience is not a short single-line identifier"));
     }
     Ok(())
@@ -138,6 +137,13 @@ pub(super) async fn resolve_target<T: Transport>(
 ) -> Result<LoginTarget, CliError> {
     let issuer = args.issuer.as_deref().map(str::trim);
     let audience = args.audience.as_deref().map(str::trim);
+    for (flag, name) in [(issuer, "issuer"), (audience, "audience")] {
+        if flag.is_some_and(|v| !printable_ascii(v)) {
+            return Err(CliError::usage(format!(
+                "--{name} must be plain printable ASCII"
+            )));
+        }
+    }
     let found = match (issuer, audience) {
         (Some(issuer), Some(audience)) => LoginDiscovery {
             issuer: issuer.to_owned(),
