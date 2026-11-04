@@ -28,6 +28,9 @@ const CALLBACK_PATH: &str = "/callback";
 /// Time given to the connection of the accepted callback to flush the "you can close this tab" page.
 const FLUSH_GRACE: Duration = Duration::from_secs(1);
 
+/// Pause after a failed `accept` (e.g. fd exhaustion), so a persistent error cannot spin the CPU.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
 const DONE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>weglarka</title>\
 <p>You can close this tab and return to the terminal.</p>";
 const REJECTED_PAGE: &str = "<!doctype html><meta charset=utf-8><title>weglarka</title>\
@@ -81,6 +84,7 @@ impl Listener {
         let serve = async {
             loop {
                 let Ok((stream, _)) = self.inner.accept().await else {
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
                     continue;
                 };
                 let (state, note, tx) = (state.clone(), note.clone(), tx.clone());
