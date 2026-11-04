@@ -269,8 +269,9 @@ pub async fn bootstrap<P: Platform>(
     })
 }
 
-/// Reverse command: refuses while a transaction is nonterminal, then removes the launcher jobs and
-/// restores the legacy daemon-only units. Panel unenrollment and the coordinator's own downgrade
+/// Reverse command: refuses while a transaction is nonterminal, then removes the launcher setup (jobs,
+/// the cron block, launcher-owned init scripts) and restores the legacy daemon-only units. OpenRC had
+/// no legacy units, so it ends with none. Panel unenrollment and the coordinator's own downgrade
 /// predicate are brief D's.
 pub async fn downgrade<P: Platform>(
     platform: &P,
@@ -279,24 +280,8 @@ pub async fn downgrade<P: Platform>(
     let host_dir = validate_host_dir(&options.host_dir)?;
     refuse_nonterminal_transaction(&options.state_dir)?;
 
-    for timer in [
-        "weglarka-platform-update.timer",
-        "weglarka-platform-watchdog.timer",
-    ] {
-        let _ = platform.set_timer(timer, false).await;
-    }
-    let _ = platform
-        .remove_user_units(&[
-            "weglarka-platform-update.service",
-            "weglarka-platform-update.timer",
-            "weglarka-platform-watchdog.service",
-            "weglarka-platform-watchdog.timer",
-        ])
-        .await;
-    // OpenRC: empty the managed block, keep the daemon-only init scripts.
-    if platform.kind() == weglarka_model::config::PlatformKind::Openrc {
-        let _ = platform.install_jobs(&[]).await;
-    }
+    // Jobs, the cron block, launcher-owned services and user units and timers.
+    platform.remove_launcher_setup().await?;
 
     // Restore the legacy units (systemd only; on OpenRC there were none).
     if platform.kind() == weglarka_model::config::PlatformKind::Systemd {
@@ -659,6 +644,7 @@ mod tests {
         timers: Mutex<Vec<(String, bool)>>,
         installed: Mutex<Vec<String>>,
         activated: Mutex<Vec<u64>>,
+        teardowns: Mutex<u32>,
     }
 
     impl FakePlatform {
@@ -708,6 +694,10 @@ mod tests {
         }
         async fn set_timer(&self, name: &str, enabled: bool) -> PlatformResult<()> {
             self.timers.lock().unwrap().push((name.to_owned(), enabled));
+            Ok(())
+        }
+        async fn remove_launcher_setup(&self) -> PlatformResult<()> {
+            *self.teardowns.lock().unwrap() += 1;
             Ok(())
         }
         async fn install_jobs(&self, jobs: &[ScheduledJob]) -> PlatformResult<()> {
@@ -909,10 +899,91 @@ image = "ghcr.io/example/weglarka:latest"
             journal.to_toml().unwrap(),
         )
         .unwrap();
+        let platform = FakePlatform::systemd();
         assert!(matches!(
-            downgrade(&FakePlatform::systemd(), &options).await,
+            downgrade(&platform, &options).await,
             Err(BootstrapError::Incomplete(_))
         ));
+        assert_eq!(*platform.teardowns.lock().unwrap(), 0);
+    }
+
+    /// Runs nothing and succeeds: the OpenRC adapter's `rc-service`/`rc-update` calls.
+    struct QuietRunner;
+
+    impl crate::platform::CommandRunner for QuietRunner {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: &[(String, String)],
+        ) -> std::io::Result<(bool, String)> {
+            Ok((true, String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn downgrade_on_a_real_openrc_adapter_leaves_no_launcher_init_script_or_cron_line() {
+        use crate::openrc::OpenRcPlatform;
+        use weglarka_engine::platform::{Hardening, JobId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let init = dir.path().join("init.d");
+        let crontabs = dir.path().join("crontabs");
+        let platform = OpenRcPlatform::with_runner("weglarka", 1001, QuietRunner)
+            .with_host_dir(&options.host_dir)
+            .with_init_dir(&init)
+            .with_crontab_dir(&crontabs);
+        let digest = format!("sha256:{}", "b".repeat(64));
+        platform
+            .install_service(&weglarka_engine::platform::ServiceSpec {
+                name: "weglarka".into(),
+                image: format!("ghcr.io/example/weglarka@{digest}"),
+                run_as_user: "weglarka".into(),
+                env: vec![],
+                mounts: vec![],
+                networks: vec![],
+                args: vec!["run".into()],
+                hardening: Hardening::default(),
+            })
+            .await
+            .unwrap();
+        platform
+            .install_jobs(&[ScheduledJob {
+                id: JobId::Update,
+                args: vec!["update".into()],
+                runtime_user: "weglarka".into(),
+                cadence_secs: 3600,
+                skip_if_running: true,
+            }])
+            .await
+            .unwrap();
+        let crontab = crontabs.join("weglarka");
+        let managed = std::fs::read_to_string(&crontab).unwrap();
+        assert!(managed.contains("weglarka-launcher"), "{managed}");
+        std::fs::write(&crontab, format!("0 3 * * * /usr/bin/backup\n{managed}")).unwrap();
+        assert_eq!(std::fs::read_dir(&init).unwrap().count(), 2);
+
+        downgrade(&platform, &options).await.unwrap();
+
+        assert_eq!(std::fs::read_dir(&init).unwrap().count(), 0);
+        let left = std::fs::read_to_string(&crontab).unwrap();
+        assert_eq!(left, "0 3 * * * /usr/bin/backup\n");
+        assert!(!left.contains("launcher"), "{left}");
+    }
+
+    #[tokio::test]
+    async fn downgrade_removes_the_launcher_setup_once_on_either_platform() {
+        for kind in [PlatformKind::Systemd, PlatformKind::Openrc] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = options(dir.path());
+            let platform = FakePlatform {
+                kind: Some(kind),
+                ..FakePlatform::default()
+            };
+            downgrade(&platform, &options).await.unwrap();
+            assert_eq!(*platform.teardowns.lock().unwrap(), 1, "{kind:?}");
+        }
     }
 
     fn endpoint() -> weglarka_model::platform_update::JournalEndpoint {

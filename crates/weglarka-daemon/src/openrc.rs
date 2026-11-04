@@ -236,13 +236,8 @@ impl<R: CommandRunner> OpenRcPlatform<R> {
         Ok(lines.join("\n"))
     }
 
-    /// Replaces only the managed block, preserving unrelated crontab entries.
-    async fn write_crontab(&self, jobs: &[ScheduledJob]) -> Result<()> {
-        let dir = self.crontab_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| PlatformError::Io(format!("{}: {e}", dir.display())))?;
-        let path = self.crontab_path();
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    /// The crontab lines outside the managed block.
+    fn unmanaged_lines(existing: &str) -> Vec<String> {
         let mut kept = Vec::new();
         let mut inside = false;
         for line in existing.lines() {
@@ -258,6 +253,70 @@ impl<R: CommandRunner> OpenRcPlatform<R> {
                 kept.push(line.to_owned());
             }
         }
+        kept
+    }
+
+    /// Whether the crontab has a managed block, and whether one of them is never closed.
+    fn managed_blocks(existing: &str) -> (bool, bool) {
+        let mut found = false;
+        let mut inside = false;
+        for line in existing.lines() {
+            match line.trim() {
+                CRON_BEGIN => {
+                    found = true;
+                    inside = true;
+                }
+                CRON_END => inside = false,
+                _ => {}
+            }
+        }
+        (found, inside)
+    }
+
+    /// Removes the managed block (markers included), preserving unrelated crontab entries. A
+    /// crontab without a managed block is not ours and is left byte for byte as it is (no write, no
+    /// delete); one whose block is never closed is refused, because the block's extent is unknown.
+    /// A crontab left without any line is deleted.
+    fn clear_crontab(&self) -> Result<()> {
+        let path = self.crontab_path();
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(PlatformError::Io(format!("{}: {e}", path.display()))),
+        };
+        match Self::managed_blocks(&existing) {
+            (false, _) => return Ok(()),
+            (true, true) => {
+                return Err(PlatformError::Command(format!(
+                    "{}: the managed block starting with {CRON_BEGIN:?} has no {CRON_END:?} line; \
+                     remove the block by hand, nothing was changed",
+                    path.display()
+                )));
+            }
+            (true, false) => {}
+        }
+        let kept = Self::unmanaged_lines(&existing);
+        if kept.iter().all(|line| line.trim().is_empty()) {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(PlatformError::Io(format!("{}: {e}", path.display()))),
+            };
+        }
+        let mut text = kept.join("\n");
+        text.push('\n');
+        weglarka_model::fsutil::write_atomic(&path, text.as_bytes(), 0o600)
+            .map_err(|e| PlatformError::Io(format!("{}: {e}", path.display())))
+    }
+
+    /// Replaces only the managed block, preserving unrelated crontab entries.
+    async fn write_crontab(&self, jobs: &[ScheduledJob]) -> Result<()> {
+        let dir = self.crontab_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| PlatformError::Io(format!("{}: {e}", dir.display())))?;
+        let path = self.crontab_path();
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let kept = Self::unmanaged_lines(&existing);
         let mut text = kept.join("\n");
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
@@ -352,8 +411,14 @@ impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
         Ok(())
     }
 
+    /// Stops, disables and deletes the init scripts. A service whose script is already gone is
+    /// skipped, so a repeated call (`platform remove` runs the teardown first) does no work.
     async fn remove_service(&self, _name: &str) -> Result<()> {
         for service in [DAEMON_SERVICE, PODMAN_SERVICE] {
+            let path = self.init_dir().join(service);
+            if !path.exists() {
+                continue;
+            }
             let _ = self.rc_service("stop", service).await;
             let _ = self
                 .run(
@@ -361,7 +426,6 @@ impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
                     &["del".to_owned(), service.to_owned(), "default".to_owned()],
                 )
                 .await;
-            let path = self.init_dir().join(service);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -413,6 +477,14 @@ impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
         Err(PlatformError::NotImplemented(
             "set_timer on OpenRC; periodic jobs use install_jobs and runtime-jobs.toml",
         ))
+    }
+
+    /// Clears the cron block first, so no tick starts the launcher while its services go, then
+    /// stops, disables and deletes the launcher-owned init scripts. `crond` itself stays: it is a
+    /// shared system service and the operator's own crontab lines keep using it.
+    async fn remove_launcher_setup(&self) -> Result<()> {
+        self.clear_crontab()?;
+        self.remove_service(DAEMON_SERVICE).await
     }
 
     async fn install_jobs(&self, jobs: &[ScheduledJob]) -> Result<()> {
@@ -791,5 +863,126 @@ mod tests {
             observed.digest.unwrap().as_str(),
             format!("sha256:{}", "a".repeat(64))
         );
+    }
+
+    fn update_job() -> ScheduledJob {
+        ScheduledJob {
+            id: JobId::Update,
+            args: vec!["update".into()],
+            runtime_user: "weglarka".into(),
+            cadence_secs: 3600,
+            skip_if_running: true,
+        }
+    }
+
+    fn files_under(dir: &Path) -> Vec<String> {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_the_launcher_setup_leaves_no_init_script_and_no_cron_line_for_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        p.install_service(&spec()).await.unwrap();
+        p.install_jobs(&[update_job()]).await.unwrap();
+        let crontab = dir.path().join("crontabs/weglarka");
+        let managed = std::fs::read_to_string(&crontab).unwrap();
+        std::fs::write(&crontab, format!("0 3 * * * /usr/bin/backup\n{managed}")).unwrap();
+        assert_eq!(files_under(&dir.path().join("init.d")).len(), 2);
+
+        p.remove_launcher_setup().await.unwrap();
+
+        assert!(files_under(&dir.path().join("init.d")).is_empty());
+        let crontab = std::fs::read_to_string(&crontab).unwrap();
+        assert_eq!(crontab, "0 3 * * * /usr/bin/backup\n");
+        assert!(!crontab.contains(LAUNCHER_FILE), "{crontab}");
+        assert!(!crontab.contains(CRON_BEGIN), "{crontab}");
+        let calls = p.runner.calls();
+        for service in [DAEMON_SERVICE, PODMAN_SERVICE] {
+            assert!(
+                calls.contains(&format!("rc-update del {service} default")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.contains(&format!("rc-service {service} stop")),
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crontab_with_only_the_managed_block_is_deleted_and_teardown_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        p.install_service(&spec()).await.unwrap();
+        p.install_jobs(&[update_job()]).await.unwrap();
+
+        p.remove_launcher_setup().await.unwrap();
+        p.remove_launcher_setup().await.unwrap();
+
+        assert!(files_under(&dir.path().join("crontabs")).is_empty());
+        assert!(files_under(&dir.path().join("init.d")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn teardown_on_a_host_without_a_crontab_does_not_create_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        p.remove_launcher_setup().await.unwrap();
+        assert!(!dir.path().join("crontabs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_crontab_without_a_managed_block_keeps_its_exact_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        let crontab = dir.path().join("crontabs/weglarka");
+        std::fs::create_dir_all(crontab.parent().unwrap()).unwrap();
+        let original = "0 3 * * * /usr/bin/backup\r\n# no trailing newline";
+        std::fs::write(&crontab, original).unwrap();
+        std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        p.remove_launcher_setup().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&crontab).unwrap(), original);
+        let mode = std::fs::metadata(&crontab).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_managed_block_is_refused_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        p.install_service(&spec()).await.unwrap();
+        let crontab = dir.path().join("crontabs/weglarka");
+        std::fs::create_dir_all(crontab.parent().unwrap()).unwrap();
+        let original = format!("{CRON_BEGIN}\n* * * * * x\n0 3 * * * /usr/bin/backup\n");
+        std::fs::write(&crontab, &original).unwrap();
+
+        let err = p.remove_launcher_setup().await.unwrap_err();
+
+        assert!(err.to_string().contains("crontabs/weglarka"), "{err}");
+        assert_eq!(std::fs::read_to_string(&crontab).unwrap(), original);
+        // The cron block is checked first, so the init scripts were not touched either.
+        assert_eq!(files_under(&dir.path().join("init.d")).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn removing_the_service_after_the_teardown_runs_no_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = platform(dir.path());
+        p.install_service(&spec()).await.unwrap();
+        p.remove_launcher_setup().await.unwrap();
+        let before = p.runner.calls().len();
+
+        p.remove_service("weglarka").await.unwrap();
+
+        assert_eq!(p.runner.calls().len(), before);
     }
 }
