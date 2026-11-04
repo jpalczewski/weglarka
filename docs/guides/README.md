@@ -73,4 +73,5 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Notifications](notifications.md) | ntfy notifications, outbox, deduplication |
 | [Crash detection](crash-detection.md) | Crash loops and unhealthy apps (`[monitor]`) |
 | [Self-update](self-update.md) | Signed image updates, watchdog and automatic fallback |
+| [Log retention](log-retention.md) | Ingress access/error logs: `[logs] retention`, where the files live, what is removed after how long |
 | [State schema](state-schema.md) | `schema_version` of the state files and rolling back across it |

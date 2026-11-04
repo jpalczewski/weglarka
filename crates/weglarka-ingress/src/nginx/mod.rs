@@ -69,6 +69,10 @@ pub const CERT_CONTAINER_DIR: &str = "/etc/nginx/tls";
 /// Container directory with ACME HTTP-01 tokens (`<nginx_conf_dir>/acme`): the file `<token>` is
 /// served at [`ACME_CHALLENGE_PREFIX`]`<token>`. Read by the **worker** on request.
 pub const ACME_CONTAINER_DIR: &str = "/etc/nginx/acme";
+/// Container directory with the daemon-owned request logs (issue #502, ADR 0070). It is a writable
+/// bind mount from `<state dir>/ingress-logs`; nginx writes the access and error logs here, so the
+/// daemon (not Podman) owns their retention.
+pub const LOG_CONTAINER_DIR: &str = "/var/log/weglarka";
 /// Socket files (in [`NginxOptions::proxy_socket_dir`]) the port forwarder connects to: plain HTTP and TLS.
 pub const PLAIN_SOCKET: &str = "http.sock";
 pub const TLS_SOCKET: &str = "https.sock";

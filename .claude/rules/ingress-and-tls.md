@@ -23,11 +23,19 @@ paths:
   the material in `nginx.conf` causes a reload (`nginx -t` + SIGHUP) — **never** a recreate of the container; this is
   the path the ACME worker uses (`[acme]`, ADR 0038, `docs/guides/acme.md`). In edge **nobody is trusted** about
   `X-Forwarded-*` (0007), and the ingress uid map is two-line (uid 0 = runtime user, 1.. = ingress range) so that the
-  master can read 0600 keys — therefore **only `<nginx_conf_dir>` may be mounted into nginx** (its subdirectories `run/`
-  and `probe/` additionally, writable). Ports are published by the `weglarka-forwarder` container (daemon image, pasta,
-  PROXY protocol over the socket `<nginx_conf_dir>/run`, `0700`; ADR 0043, #162), not by nginx — otherwise rootlessport
-  loses the client address; `weglarka.ingress-hash` = v5 in both modes (mount of `probe/`, ADR 0054). Ports < 1024 need
+  master can read 0600 keys — therefore the only writable mounts are `<nginx_conf_dir>` (plus its `run/`/`probe/`
+  subdirectories) and `<state dir>/ingress-logs` (`0700`, ADR 0070). The latter is deliberately outside
+  `<nginx_conf_dir>`, so a configuration backup never contains visitor IPs; no other path may be mounted. Ports are
+  published by the `weglarka-forwarder` container (daemon image, pasta, PROXY protocol over the socket
+  `<nginx_conf_dir>/run`, `0700`; ADR 0043, #162), not by nginx — otherwise rootlessport loses the client address;
+  `weglarka.ingress-hash` = v6 in both modes (mounts of `probe/` and `ingress-logs/`, ADR 0054/0070). Ports < 1024 need
   a sysctl and `[runtime] allow_privileged_host_ports`.
+
+- **Ingress logs (ADR 0070):** nginx writes `access.log`/`error.log` to `<state dir>/ingress-logs`, not to stdout.
+  The daemon rotates them daily (UTC, a `.logdate` sidecar) and prunes completed files after `[logs] retention`. A
+  rename is followed by `nginx -t` + **SIGHUP** through `IngressManager::reopen_logs()`, serialized with `apply`;
+  never `USR1` (the worker uid 101 cannot open the daemon-owned `0700` directory, and nginx would keep writing to the
+  renamed file). `weglarka access` reads the files; keep the mount set narrow and the directory private.
 
 - **Admin relay carve-out (ADR 0060):** `Plan::build` sets `AppRoute::admin_relay` for an `[admin.http] clients` app served
   at `/`, and the nginx generator renders `RELAY_PREFIX` (`weglarka_model::admin_auth`) as unguarded, long-lived locations
@@ -39,4 +47,4 @@ paths:
 |---|---|
 | ingress | `crates/weglarka-ingress/src/plan.rs` (`Plan::build` validates, including disjoint `paths` on a shared domain; `route_table()` for `doctor`) → `nginx.rs`/`traefik.rs` (render + snapshots); reload: `crates/weglarka-daemon/src/ingress.rs`; path prefixes: ADR 0031, `paths`/`ingress.strip_prefix` in `crates/weglarka-model/src/app.rs`, syntax `check_path_prefix`, `docs/guides/path-routing.md`; `edge` mode (two published ports, TLS, ACME webroot, ingress uid map): ADR 0036, `docs/guides/edge-mode.md` |
 | ACME certificates (edge) | `crates/weglarka-acme/src/{manager,store,solver,instant,renewal}.rs` (engine, `FakeAcme` in `testing.rs`), `crates/weglarka-model/src/config.rs` (`AcmeConfig`, validation in `HostConfig::validate`), `crates/weglarka-model/src/events.rs` (`CertificateIssued`/`CertificateRenewalFailed`), `crates/weglarka-daemon/src/acme.rs` (worker, `AcmeStatus`) + wiring in `crates/weglarka-daemon/src/lib.rs`, checks `acme.*` in `crates/weglarka-daemon/src/doctor.rs`, `docs/guides/acme.md` (ADR 0038); wildcard via DNS-01: `[acme.dns]` (`AcmeDnsConfig`, `token_file` 0600 like ntfy), `DnsBackend` + a second `Manager` in `crates/weglarka-daemon/src/acme.rs`, `DnsSolver` in `crates/weglarka-acme/src/dns.rs`, adapters in `weglarka-dns`, checks `acme.dns`/`acme.wildcards`, `docs/guides/wildcard-certificates.md` (ADR 0039); serving wildcards: `crates/weglarka-model/src/config.rs` (`wildcard_covers`, `wildcard_cert_stem`), `crates/weglarka-ingress/src/nginx.rs` (`NginxOptions::certificate_stem`: an own pair wins, then the wildcard of the longest apex), scan of `_wildcard.<apex>` in `crates/weglarka-daemon/src/ingress.rs`, HTTP-01 skipped for covered domains in `AcmeWorker::specs` |
-| health probe (`health.http`, probe socket) | `crates/weglarka-daemon/src/health_probe.rs` (`NginxProber` over `UnixStream`), `crates/weglarka-daemon/src/ingress.rs` (`PROBE_SUBDIR`, `probe_socket_path`, mount only into nginx, hash v5), `crates/weglarka-ingress/src/nginx/common.rs` (`listen_probe`), `NginxOptions::probe_socket`, ADR 0054 |
+| health probe (`health.http`, probe socket) | `crates/weglarka-daemon/src/health_probe.rs` (`NginxProber` over `UnixStream`), `crates/weglarka-daemon/src/ingress.rs` (`PROBE_SUBDIR`, `probe_socket_path`, mount only into nginx, hash v6), `crates/weglarka-ingress/src/nginx/common.rs` (`listen_probe`), `NginxOptions::probe_socket`, ADR 0054 |

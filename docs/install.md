@@ -127,7 +127,12 @@ listen = "0.0.0.0:9180"                                    # inside the containe
 domain = "weglarka.example.com"                            # only /webhook/ paths are exposed
 
 [state]
-dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/
+dir = "/var/lib/weglarka"                                  # apps.toml, state.toml, secrets.toml, nginx/, ingress-logs/
+
+[logs]
+# Days to keep the ingress access/error logs (they contain visitor IPs); 1..=3650 or "unlimited".
+# Default 30. See the log-retention guide.
+retention = 30
 
 # Directory with the apps' configuration files (see the host-configs guide). Mounted read-only into Węglarka's container.
 # Absolute, or relative to the directory of weglarka.toml. Unset = feature disabled.
@@ -140,7 +145,8 @@ pids_limit = 256                                           # process/thread limi
 ```
 
 The guides for the optional parts of this file: [Host ports](guides/host-ports.md) (`allow_privileged_host_ports`),
-[Edge mode](guides/edge-mode.md) (`mode = "edge"`), [Host configs](guides/host-configs.md) (`config_root`).
+[Edge mode](guides/edge-mode.md) (`mode = "edge"`), [Host configs](guides/host-configs.md) (`config_root`),
+[Log retention](guides/log-retention.md) (`[logs]`).
 
 `[runtime] socket` is **not needed**: `platform install` works out the socket on the host
 (`/run/user/<uid>/podman/podman.sock`) and passes it to the container in the `WEGLARKA_PODMAN_SOCKET` variable in

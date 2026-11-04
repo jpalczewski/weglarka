@@ -74,7 +74,7 @@ docker run -d --name wg-auth-idp --network "$net" --network-alias authelia -v "$
   docker.io/library/python:3-alpine python3 -u /srv/idp.py >/dev/null
 docker volume create wg-auth-probe >/dev/null
 docker run -d --name wg-auth-nginx --network "$net" -p 127.0.0.1:18097:8080 \
-  -v wg-auth-probe:/run/weglarka-probe -v "$conf:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
+  -v wg-auth-probe:/run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka -v "$conf:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
 
 # `GET http://127.0.0.1:18097<path>` as <host>; extra curl args follow. Prints "<code> <redirect url>" then the body.
 call() { # host path extra curl args...

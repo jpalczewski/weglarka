@@ -1,9 +1,9 @@
 # Access log
 
-The edge nginx writes one JSON line per request to its stdout (and so to the journal). A single chatty
-client can dominate it: a CI runner polling every 2 s is ~43k lines a day, all `200`, all zero information.
-`ingress.access_log_skip_paths` lets an app name such paths so that their **successful** requests are left
-out of the log.
+The edge nginx writes one JSON line per request to `access.log` in `<state dir>/ingress-logs` (ADR 0070). A
+single chatty client can dominate it: a CI runner polling every 2 s is ~43k lines a day, all `200`, all zero
+information. `ingress.access_log_skip_paths` lets an app name such paths so that their **successful** requests
+are left out of the log. How long the files are kept is set by [`[logs] retention`](log-retention.md).
 
 ```toml
 # apps.toml
@@ -33,8 +33,10 @@ Via the CLI: `weglarka apps add forgejo ... --access-log-skip-path /healthz`, an
 ## Reading an app's requests: `weglarka access`
 
 `weglarka logs` shows what an app's container printed; `weglarka access` shows the requests that **reached the app
-through its domains**, taken from the ingress log above. The log is shared by every app, so the daemon does the
-filtering: it keeps only the lines whose `app` is the one you named, and nobody else's traffic leaves it.
+through its domains**, taken from the ingress log files above. The log is shared by every app, so the daemon does the
+filtering: it keeps only the lines whose `app` is the one you named, and nobody else's traffic leaves it. History is
+read from the completed daily files inside `--since`, then from the current file; `--follow` starts exactly where
+history stopped. The files and their retention are described in [log retention](log-retention.md).
 
 ```bash
 weglarka access web                          # the last 100 requests of the last hour
@@ -64,8 +66,8 @@ terminal control characters are replaced and a path can never start a line of it
   people and cannot be redacted. See [admin API tokens](admin-api-tokens.md). Over a token the stream ends with the
   token and `weglarka access` reopens it itself, so a request near the renewal can appear twice.
 - **Limits.** Successful requests on `access_log_skip_paths` are not in the log. Requests nginx could not attribute to
-  an app (`app` is `-`, for example a scan of an unknown host) belong to no app and are not shown here. The log lives
-  in the nginx container, so its history is gone when that container is recreated.
+  an app (`app` is `-`, for example a scan of an unknown host) belong to no app and are not shown here. History now
+  survives an nginx recreate and is bounded by the retention period (see [log retention](log-retention.md)).
 - **Cost.** `-n` is applied to matching requests, so the daemon reads the whole window to find them (a busy host and
   a window of days takes a while; a quiet app is not slower than a busy one). At most 1 MiB of entries is held in
   memory.

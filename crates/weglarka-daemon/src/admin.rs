@@ -371,6 +371,7 @@ async fn status<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Res
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         podman_version,
         apps: summaries(&d).await?,
+        log_retention: Some(d.host.logs.retention),
     }))
 }
 

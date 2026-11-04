@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use super::conf::Conf;
-use super::{NginxOptions, PLAIN_SOCKET, TLS_SOCKET};
+use super::{LOG_CONTAINER_DIR, NginxOptions, PLAIN_SOCKET, TLS_SOCKET};
 use crate::plan::{Cidr, Domain, IdentityRoute, Plan, WEBHOOK_UPSTREAM_HOST};
 
 /// The three expressions the shared proxy headers are built from. `behind` reuses the trust maps
@@ -56,7 +56,10 @@ pub(super) fn write_preamble(c: &mut Conf, tls_fingerprint: Option<&str>) {
     }
     c.line("worker_processes 1;");
     c.line("pid /tmp/nginx.pid;");
-    c.line("error_log /dev/stderr warn;");
+    // Daemon-owned file, not stderr: the daemon rotates it and deletes it after `[logs] retention`
+    // (issue #502). `error_log` paths cannot contain variables; the daemon renames both this file and
+    // `access.log` (see `write_log`) and reopens them with SIGHUP.
+    c.line(&format!("error_log {LOG_CONTAINER_DIR}/error.log warn;"));
     c.blank();
     c.block("events", |c| c.line("worker_connections 1024;"));
     c.blank();
@@ -210,9 +213,13 @@ pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
     let format = log_format(client);
     c.line(&format!("    '{format}';"));
     if write_log_skip_maps(c, plan) {
-        c.line("access_log /dev/stdout weglarka if=$weglarka_loggable;");
+        c.line(&format!(
+            "access_log {LOG_CONTAINER_DIR}/access.log weglarka if=$weglarka_loggable;"
+        ));
     } else {
-        c.line("access_log /dev/stdout weglarka;");
+        c.line(&format!(
+            "access_log {LOG_CONTAINER_DIR}/access.log weglarka;"
+        ));
     }
 }
 

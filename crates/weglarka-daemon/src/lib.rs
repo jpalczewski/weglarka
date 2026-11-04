@@ -25,6 +25,7 @@ pub mod health_probe;
 pub mod identity;
 pub mod images;
 pub mod ingress;
+pub mod log_retention;
 pub mod logs;
 pub mod metrics;
 pub mod openrc;
@@ -159,6 +160,8 @@ pub struct Running<P: PodmanClient + 'static> {
     /// Joins the metrics network in the background; ends when joined or on shutdown.
     metrics_join: Option<JoinHandle<()>>,
     ingress: JoinHandle<()>,
+    /// Ingress log retention worker (issue #502, ADR 0070).
+    log_retention: JoinHandle<()>,
     reconcile: JoinHandle<()>,
     /// Notification worker; `None` when notifications are not configured.
     notify: Option<JoinHandle<()>>,
@@ -418,6 +421,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         engine.clone(),
         host.clone(),
         paths.nginx_conf_dir.clone(),
+        paths.ingress_logs.clone(),
     ));
     // ACME (issue #96): the worker shares the engine's event sink and asks the ingress to apply
     // whenever it wrote a certificate.
@@ -445,6 +449,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         ));
     }
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
+    let logs_status = Arc::new(log_retention::Status::default());
     let daemon = Arc::new(Daemon {
         host: host.clone(),
         paths: paths.clone(),
@@ -455,6 +460,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         notify: notify.clone(),
         events: history,
         acme: acme_worker.as_ref().map(acme::AcmeWorker::status),
+        logs: logs_status.clone(),
         generated: generated_worker.clone(),
         desired_lock: tokio::sync::Mutex::new(()),
         started: std::time::Instant::now(),
@@ -571,6 +577,15 @@ pub async fn start_with<P: PodmanClient + 'static>(
         let rx = shutdown_rx.clone();
         async move { ingress.run(period, rx).await }
     });
+    // Ingress log retention (issue #502, ADR 0070): the first pass also rotates a backlog after a
+    // restart. It uses the same ingress lock as `apply`, so a rotation never races a reload.
+    let log_retention_task = log_retention::spawn(
+        ingress.clone(),
+        paths.ingress_logs.clone(),
+        host.logs.retention,
+        logs_status,
+        shutdown_rx.clone(),
+    );
     let reconcile = tokio::spawn({
         let engine = engine.clone();
         async move { engine.run(trigger_rx, period).await }
@@ -615,6 +630,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         metrics,
         metrics_join,
         ingress: ingress_task,
+        log_retention: log_retention_task,
         reconcile,
         notify: notify_task,
         acme: acme_task,
@@ -636,6 +652,7 @@ impl<P: PodmanClient + 'static> Running<P> {
             metrics,
             metrics_join,
             ingress,
+            log_retention,
             reconcile,
             notify,
             acme,
@@ -653,6 +670,12 @@ impl<P: PodmanClient + 'static> Running<P> {
             {
                 tracing::warn!(task = name, "did not stop in time");
             }
+        }
+        if tokio::time::timeout(SERVER_STOP_TIMEOUT, log_retention)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ingress log retention worker did not stop in time");
         }
         if let Some(handle) = admin_token
             && tokio::time::timeout(SERVER_STOP_TIMEOUT, handle)

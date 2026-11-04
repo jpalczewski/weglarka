@@ -115,9 +115,9 @@ Decision: [ADR 0054](../decisions/0054-health-probe-socket.md).
   [container hardening](container-hardening.md)) does not change (the same three capabilities, read-only root);
   the uid map does — the container root is the runtime user, the worker stays in the ingress range
   ([ADR 0036](../decisions/0036-edge-mode.md), [ADR 0009](../decisions/0009-volume-ownership.md)). Consequence:
-  **nothing but `<nginx_conf_dir>` may be mounted into the nginx container** (no state directory, no
-  `config_root`, no Traefik file) — its subdirectories `run/` (forwarder sockets) and `probe/` (probe socket) are
-  the only ones mounted a second time, writable.
+  **only `<nginx_conf_dir>` and `<state dir>/ingress-logs` may be mounted into the nginx container** (no
+  `config_root`, no Traefik file) — the subdirectories `run/` (forwarder sockets) and `probe/` (probe socket) are
+  mounted a second time, writable, and so is `ingress-logs` (`0700`, [log retention](log-retention.md)).
 - A custom `ingress.nginx_image` must have nginx >= 1.25.1 (`http2 on`, `ssl_reject_handshake`); the official
   `nginx:1-alpine` and the digest from [host configuration](../install.md#host-configuration) satisfy this, an
   older image fails `nginx -t`.

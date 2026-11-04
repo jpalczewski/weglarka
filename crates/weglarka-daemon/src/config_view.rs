@@ -49,6 +49,8 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         acme,
         identity,
         metrics,
+        // Read by `status`/`doctor`, not part of this view.
+        logs: _,
     } = host;
     ConfigView {
         runtime: runtime_view(runtime),

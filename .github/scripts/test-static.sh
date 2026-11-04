@@ -61,7 +61,7 @@ ln -s releases/r1 "$work/sites/help/current"
 chmod -R a+rX "$work"
 
 docker run -d --name wg-static-nginx -p "127.0.0.1:$port:8080" \
-  --read-only --tmpfs /tmp:rw,size=16m -v /run/weglarka-probe \
+  --read-only --tmpfs /tmp:rw,size=16m -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka \
   -v "$conf:/etc/nginx/nginx.conf:ro" -v "$work/sites:/etc/nginx/sites:ro" \
   docker.io/library/nginx:1-alpine >/dev/null
 

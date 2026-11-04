@@ -6,7 +6,7 @@ expression: conf
 # tls material: fingerprint 1a2b3c4d
 worker_processes 1;
 pid /tmp/nginx.pid;
-error_log /dev/stderr warn;
+error_log /var/log/weglarka/error.log warn;
 
 events {
     worker_connections 1024;
@@ -52,7 +52,7 @@ http {
         default 1;
         "~^1:[123][0-9][0-9]$" 0;
     }
-    access_log /dev/stdout weglarka if=$weglarka_loggable;
+    access_log /var/log/weglarka/access.log weglarka if=$weglarka_loggable;
 
     map "$remote_addr:$http_x_forwarded_proto" $weglarka_proto {
         default $scheme;

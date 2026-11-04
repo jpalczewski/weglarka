@@ -97,6 +97,8 @@ pub enum IngressApplyError {
          inspect with `podman exec weglarka-nginx nginx -t`"
     )]
     ConfigRejected(i32),
+    #[error("nginx -t failed before reopening the rotated logs (exit {0})")]
+    LogReopen(i32),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> IngressApplyError + '_ {
@@ -132,6 +134,8 @@ pub struct IngressManager<P: PodmanClient> {
     engine: Arc<Reconciler<P>>,
     host: HostConfig,
     conf_dir: PathBuf,
+    /// Daemon-owned access/error logs (issue #502, ADR 0070); mounted writable into nginx.
+    logs_dir: PathBuf,
     apps_path: PathBuf,
     apply_lock: tokio::sync::Mutex<()>,
     notify: Notify,
@@ -143,12 +147,18 @@ pub struct IngressManager<P: PodmanClient> {
 }
 
 impl<P: PodmanClient> IngressManager<P> {
-    pub fn new(engine: Arc<Reconciler<P>>, host: HostConfig, conf_dir: PathBuf) -> Self {
+    pub fn new(
+        engine: Arc<Reconciler<P>>,
+        host: HostConfig,
+        conf_dir: PathBuf,
+        logs_dir: PathBuf,
+    ) -> Self {
         let apps_path = engine.paths().apps.clone();
         Self {
             engine,
             host,
             conf_dir,
+            logs_dir,
             apps_path,
             apply_lock: tokio::sync::Mutex::new(()),
             notify: Notify::new(),
@@ -281,6 +291,9 @@ impl<P: PodmanClient> IngressManager<P> {
             self.ensure_socket_dir()?;
         }
         self.ensure_probe_dir()?;
+        // The logs directory exists before the container starts: nginx opens both files while it
+        // parses the config, and a missing directory would make `nginx -t`/the start fail.
+        self.ensure_logs_dir()?;
 
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
         // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
@@ -428,12 +441,52 @@ impl<P: PodmanClient> IngressManager<P> {
         probe_dir(&self.conf_dir)
     }
 
+    /// Host directory of the ingress access/error logs (issue #502, ADR 0070).
+    pub fn logs_dir(&self) -> &Path {
+        &self.logs_dir
+    }
+
     /// The `0700` directory of nginx's probe socket, in both modes; the mode is re-applied on every
     /// pass like the forwarder's, because it is what keeps other local users off the socket.
     fn ensure_probe_dir(&self) -> Result<(), IngressApplyError> {
         let dir = self.probe_dir();
         fs::create_dir_all(&dir).map_err(io_err(&dir))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(io_err(&dir))
+    }
+
+    /// `0700` directory of the daemon-owned request logs. Only the daemon user (container uid 0 of
+    /// nginx, mapped to the same host user) opens the files; the worker inherits their descriptors,
+    /// so it needs no permission on the directory itself.
+    fn ensure_logs_dir(&self) -> Result<(), IngressApplyError> {
+        let dir = &self.logs_dir;
+        fs::create_dir_all(dir).map_err(io_err(dir))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))
+    }
+
+    /// Re-opens nginx's log files after the retention worker renamed them (ADR 0070). `SIGHUP`
+    /// parses the (unchanged) config and opens the files in the **master**, which then starts new
+    /// workers that inherit the descriptors. `SIGUSR1` would make the worker (uid 101) open the
+    /// path itself, and it cannot: the directory is `0700` and the files are `0644`, both owned by
+    /// the daemon's user. A no-op when nginx does not run; its next start opens the new files.
+    pub async fn reopen_logs(&self) -> Result<(), IngressApplyError> {
+        let _g = self.apply_lock.lock().await;
+        let podman = self.engine.podman();
+        let running = podman
+            .container_list(&ContainerFilter::default())
+            .await?
+            .into_iter()
+            .any(|c| c.name == NGINX_CONTAINER && c.state == ContainerState::Running);
+        if !running {
+            tracing::debug!("nginx is not running; the next start opens the rotated logs");
+            return Ok(());
+        }
+        let test = ["nginx", "-t", "-c", "/etc/nginx/nginx.conf"].map(str::to_owned);
+        let code = podman.container_exec(NGINX_CONTAINER, &test).await?;
+        if code != 0 {
+            return Err(IngressApplyError::LogReopen(code));
+        }
+        podman.container_kill(NGINX_CONTAINER, "HUP").await?;
+        Ok(())
     }
 
     /// The `0700` directory of nginx's forwarder sockets. The mode is the whole protection against a
@@ -894,6 +947,13 @@ impl<P: PodmanClient> IngressManager<P> {
             target: nginx::PROBE_CONTAINER_DIR.to_owned(),
             read_only: false,
         });
+        // Both modes: the daemon-owned request logs (issue #502, ADR 0070). Writable, but no other
+        // local user can reach the directory.
+        mounts.push(BindMount {
+            source: self.logs_dir.display().to_string(),
+            target: nginx::LOG_CONTAINER_DIR.to_owned(),
+            read_only: false,
+        });
         let _ = https_listen_port;
         self.ensure_image(image).await?;
         // Everything slow (the image pull) is done: from here to the start below nothing serves.
@@ -968,7 +1028,9 @@ impl<P: PodmanClient> IngressManager<P> {
 /// nginx publishes nothing and listens on the forwarder's unix sockets. v5 (issue #221,
 /// docs/decisions/0054): both modes mount the probe directory, so an nginx created without it must be
 /// recreated once — `nginx -t` on a config that listens on the probe socket would fail forever otherwise.
-const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v5";
+/// v6 (issue #502, ADR 0070): both modes mount the daemon-owned logs directory, so a container created
+/// without it must be recreated once — the generated config writes its access/error logs there.
+const INGRESS_HASH_FORMAT: &str = "weglarka.ingress-hash/v6";
 
 /// Hardened profile of the nginx container — ours to choose, unlike an app's `security`, so it is always
 /// on (docs/decisions/0014): read-only root with libpod's writable `/tmp`, `/var/tmp` and `/run` tmpfs
@@ -1390,10 +1452,11 @@ mod tests {
         assert_ne!(a, ingress_hash("i", bind, Some(https), 8080, 8444, r, &sec));
     }
 
-    /// docs/decisions/0054: both modes mount the probe directory from v5 on, so a container created
-    /// by an older daemon (v3 `behind`, v4 `edge`) has a different identity and is recreated once.
+    /// docs/decisions/0054 and ADR 0070: both modes mount the probe directory from v5 and the log
+    /// directory from v6, so a container created by an older daemon has a different identity and is
+    /// recreated once.
     #[test]
-    fn hash_format_v5_recreates_nginx_created_without_the_probe_mount() {
+    fn hash_format_v6_recreates_nginx_created_without_the_log_mount() {
         let r = UidRange {
             start: 1,
             size: 4096,
@@ -1407,9 +1470,9 @@ mod tests {
             r,
             &nginx_security(),
         );
-        assert!(spec.contains("weglarka.ingress-hash/v5"), "{spec}");
-        for old in ["v3", "v4"] {
-            let old_spec = spec.replace("v5", old);
+        assert!(spec.contains("weglarka.ingress-hash/v6"), "{spec}");
+        for old in ["v3", "v4", "v5"] {
+            let old_spec = spec.replace("v6", old);
             assert_ne!(
                 recreate_reason(Some(&old_spec), &spec),
                 "changed: ",
