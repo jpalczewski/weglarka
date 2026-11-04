@@ -612,6 +612,9 @@ async fn an_unusable_document_is_refused() {
         r#"{"issuer":"https://user:pw@auth.example.com","audience":"a"}"#.to_owned(),
         r#"{"issuer":"https://auth.example.com/#frag","audience":"a"}"#.to_owned(),
         r#"{"issuer":"not a url","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u001b[2J","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\nTrusted: yes","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/ x","audience":"a"}"#.to_owned(),
     ] {
         let (_dir, store) = store();
         let provider = Provider::default();

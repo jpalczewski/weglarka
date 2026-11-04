@@ -67,6 +67,15 @@ fn loopback(url: &Url) -> bool {
 
 fn validate(document: &LoginDiscovery) -> Result<(), CliError> {
     let bad = |what: &str| config(format!("the host's sign-in settings are unusable: {what}"));
+    // The raw string is kept, compared and printed, not the parsed form: a control character (a
+    // terminal escape, a newline) must never reach the "Signing in with …" line.
+    if document
+        .issuer
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(bad("the issuer contains control or whitespace characters"));
+    }
     let issuer = Url::parse(&document.issuer).map_err(|_| bad("the issuer is not a URL"))?;
     let scheme_ok = issuer.scheme() == "https" || (issuer.scheme() == "http" && loopback(&issuer));
     if !scheme_ok || issuer.host_str().is_none() {
