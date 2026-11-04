@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::InstanceName;
 use crate::platform_update::TransactionId;
 use crate::release_set::{Repository, StrictDigest};
+use crate::size_limit;
 
 /// Panel pin file in the shared state directory.
 pub const PINS_FILE_NAME: &str = "platform-pins.toml";
@@ -95,7 +96,13 @@ impl Pins {
     }
 
     pub fn parse(src: &str) -> Result<Self, TransitionsError> {
-        check_size(PINS_FILE_NAME, src.len())?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: PINS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let pins: Self = toml::from_str(src)?;
@@ -103,7 +110,15 @@ impl Pins {
     }
 
     pub fn to_toml(&self) -> Result<String, TransitionsError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: PINS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn canonical(&self) -> Result<Self, TransitionsError> {
@@ -260,7 +275,13 @@ impl Transitions {
     }
 
     pub fn parse(src: &str) -> Result<Self, TransitionsError> {
-        check_size(TRANSITIONS_FILE_NAME, src.len())?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: TRANSITIONS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let transitions: Self = toml::from_str(src)?;
@@ -268,7 +289,15 @@ impl Transitions {
     }
 
     pub fn to_toml(&self) -> Result<String, TransitionsError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: TRANSITIONS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn canonical(&self) -> Result<Self, TransitionsError> {
@@ -347,18 +376,6 @@ impl From<toml::de::Error> for TransitionsError {
 impl From<toml::ser::Error> for TransitionsError {
     fn from(error: toml::ser::Error) -> Self {
         Self::TomlSer(error.to_string())
-    }
-}
-
-fn check_size(file: &'static str, size: usize) -> Result<(), TransitionsError> {
-    if size > MAX_BYTES {
-        Err(TransitionsError::TooLarge {
-            file,
-            size,
-            limit: MAX_BYTES,
-        })
-    } else {
-        Ok(())
     }
 }
 
@@ -543,5 +560,32 @@ mod tests {
             Transitions::parse(&newer).unwrap_err(),
             TransitionsError::UnsupportedFormat(2)
         );
+    }
+
+    #[test]
+    fn to_toml_rejects_pins_over_the_byte_limit() {
+        let pins: Vec<PinEntry> = (0..4_000)
+            .map(|n| {
+                let mut pin = pin();
+                pin.instance = name(&format!("pin-{n}"));
+                pin
+            })
+            .collect();
+        let pins = Pins::new(pins).unwrap();
+        assert!(matches!(
+            pins.to_toml().unwrap_err(),
+            TransitionsError::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_transitions_over_the_byte_limit() {
+        let mut live = record("tx-live", TransitionStatus::Running, 10);
+        live.reason = Some("x".repeat(MAX_BYTES + 1));
+        let transitions = Transitions::new(vec![live], vec![]).unwrap();
+        assert!(matches!(
+            transitions.to_toml().unwrap_err(),
+            TransitionsError::TooLarge { .. }
+        ));
     }
 }

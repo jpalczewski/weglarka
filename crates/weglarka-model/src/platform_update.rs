@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::image_inventory::OperationId;
 use crate::release_set::{Channel, Repository, StrictDigest};
+use crate::size_limit;
 
 /// File in the shared state directory.
 pub const FILE_NAME: &str = "platform-update.toml";
@@ -284,7 +285,13 @@ impl PlatformUpdate {
     }
 
     pub fn parse(src: &str) -> Result<Self, PlatformUpdateError> {
-        check_size(src.len(), MAX_BYTES)?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(PlatformUpdateError::TooLarge {
+                what: FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let document: Self = toml::from_str(src)?;
@@ -294,7 +301,15 @@ impl PlatformUpdate {
 
     pub fn to_toml(&self) -> Result<String, PlatformUpdateError> {
         self.validate()?;
-        Ok(toml::to_string(self)?)
+        let text = toml::to_string(self)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(PlatformUpdateError::TooLarge {
+                what: FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn validate(&self) -> Result<(), PlatformUpdateError> {
@@ -378,18 +393,6 @@ fn check_format(value: Option<u32>) -> Result<(), PlatformUpdateError> {
     }
 }
 
-fn check_size(size: usize, limit: usize) -> Result<(), PlatformUpdateError> {
-    if size > limit {
-        Err(PlatformUpdateError::TooLarge {
-            what: FILE_NAME,
-            size,
-            limit,
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value
@@ -458,10 +461,10 @@ pub struct CapabilityRecord {
 
 impl CapabilityRecord {
     pub fn parse(src: &str) -> Result<Self, CapabilityError> {
-        if src.len() > CAPABILITIES_MAX_BYTES {
+        if let Err(over) = size_limit::check(src.len(), CAPABILITIES_MAX_BYTES) {
             return Err(CapabilityError::Invalid(format!(
-                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {CAPABILITIES_MAX_BYTES}",
-                src.len()
+                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {}",
+                over.size, over.limit
             )));
         }
         let probe: FormatProbe =
@@ -479,8 +482,21 @@ impl CapabilityRecord {
     }
 
     pub fn to_toml(&self) -> Result<String, CapabilityError> {
+        self.encode(CAPABILITIES_MAX_BYTES)
+    }
+
+    /// `to_toml` with an explicit limit: every field is bounded by `validate`, so a valid record
+    /// cannot reach [`CAPABILITIES_MAX_BYTES`] and the limit is only exercisable through here.
+    fn encode(&self, limit: usize) -> Result<String, CapabilityError> {
         self.validate()?;
-        toml::to_string(self).map_err(|e| CapabilityError::Invalid(e.to_string()))
+        let text = toml::to_string(self).map_err(|e| CapabilityError::Invalid(e.to_string()))?;
+        if let Err(over) = size_limit::check(text.len(), limit) {
+            return Err(CapabilityError::Invalid(format!(
+                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {}",
+                over.size, over.limit
+            )));
+        }
+        Ok(text)
     }
 
     fn validate(&self) -> Result<(), CapabilityError> {
@@ -701,6 +717,32 @@ mod tests {
         assert_eq!(
             missing.check_platform_prune().unwrap_err(),
             CapabilityError::MissingFeature(CoordinationFeature::ReservationPhases)
+        );
+    }
+
+    #[test]
+    fn to_toml_rejects_a_journal_over_the_byte_limit() {
+        let mut journal = PlatformUpdate::default();
+        let mut tx = transaction(Stage::Prepared);
+        tx.reason = Some("x".repeat(MAX_BYTES + 1));
+        journal.transaction = Some(tx);
+        assert!(matches!(
+            journal.to_toml().unwrap_err(),
+            PlatformUpdateError::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_a_capability_record_over_the_byte_limit() {
+        let record = capabilities(&REQUIRED_FOR_PLATFORM_PRUNE);
+        let text = record.to_toml().unwrap();
+        assert!(text.len() < CAPABILITIES_MAX_BYTES);
+        // At the exact encoded size the record still fits; one byte less is rejected.
+        assert_eq!(record.encode(text.len()).unwrap(), text);
+        let error = record.encode(text.len() - 1).unwrap_err();
+        assert!(
+            matches!(&error, CapabilityError::Invalid(m) if m.contains("the limit is")),
+            "{error:?}"
         );
     }
 }
