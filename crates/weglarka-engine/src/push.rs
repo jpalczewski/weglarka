@@ -142,9 +142,7 @@ impl<P: PodmanClient> Reconciler<P> {
             outcome
         };
 
-        if let Ok(outcome) = &outcome
-            && spec.kind != weglarka_model::app::AppKind::Static
-        {
+        if let Ok(outcome) = &outcome {
             self.retain_for_outcome(None, instance, outcome).await;
         }
         outcome

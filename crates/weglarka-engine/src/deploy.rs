@@ -1146,7 +1146,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         if spec.kind == AppKind::Static {
             return self
-                .deploy_static_from(held, image_guard, instance, &spec, force, source, slot)
+                .deploy_static_from(image_guard, instance, &spec, force, source, slot)
                 .await;
         }
         // `start = false` — provision only (no container, no secrets, no health gate).

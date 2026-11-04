@@ -12,12 +12,11 @@ use futures_util::StreamExt;
 
 use crate::deploy::{AcquisitionSlot, DeployOutcome, DigestSource, pinned_ref};
 use crate::images::ImageGuard;
-use crate::reconcile::{ActivityKind, EngineError, EngineGuard, Reconciler};
+use crate::reconcile::{ActivityKind, EngineError, Reconciler};
 use crate::sites::{ExtractLimits, extract_release};
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::events::Event;
-use weglarka_model::image_inventory::Owner;
-use weglarka_model::podman::{PodmanClient, TarStream, image_repo};
+use weglarka_model::podman::{PodmanClient, TarStream};
 use weglarka_model::state::{self, FailedDeploy, StateFile};
 
 /// Subdirectory of the sites root for exported archives that are being unpacked.
@@ -47,7 +46,6 @@ impl<P: PodmanClient> Reconciler<P> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn deploy_static_from(
         &self,
-        held: &EngineGuard<'_>,
         image_guard: &ImageGuard<'_>,
         instance: &InstanceName,
         spec: &AppSpec,
@@ -121,13 +119,6 @@ impl<P: PodmanClient> Reconciler<P> {
             generation,
         });
         prune_releases(&site_dir, &keep).await;
-        // The files are on disk now; the image only has to stay while it is `current`/`previous`.
-        // The static deploy still holds the operation guard here, but never reacquires it.
-        let owner = Owner::App {
-            instance: instance.clone(),
-        };
-        self.retain_images_locked(held, &owner, image_repo(&spec.image))
-            .await;
         Ok(DeployOutcome::Deployed { digest, generation })
     }
 
