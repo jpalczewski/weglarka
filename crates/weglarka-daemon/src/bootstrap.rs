@@ -279,24 +279,8 @@ pub async fn downgrade<P: Platform>(
     let host_dir = validate_host_dir(&options.host_dir)?;
     refuse_nonterminal_transaction(&options.state_dir)?;
 
-    for timer in [
-        "weglarka-platform-update.timer",
-        "weglarka-platform-watchdog.timer",
-    ] {
-        let _ = platform.set_timer(timer, false).await;
-    }
-    let _ = platform
-        .remove_user_units(&[
-            "weglarka-platform-update.service",
-            "weglarka-platform-update.timer",
-            "weglarka-platform-watchdog.service",
-            "weglarka-platform-watchdog.timer",
-        ])
-        .await;
-    // OpenRC: empty the managed block, keep the daemon-only init scripts.
-    if platform.kind() == weglarka_model::config::PlatformKind::Openrc {
-        let _ = platform.install_jobs(&[]).await;
-    }
+    // Jobs, the cron block, launcher-owned services and user units and timers.
+    platform.remove_launcher_setup().await?;
 
     // Restore the legacy units (systemd only; on OpenRC there were none).
     if platform.kind() == weglarka_model::config::PlatformKind::Systemd {
@@ -659,6 +643,7 @@ mod tests {
         timers: Mutex<Vec<(String, bool)>>,
         installed: Mutex<Vec<String>>,
         activated: Mutex<Vec<u64>>,
+        teardowns: Mutex<u32>,
     }
 
     impl FakePlatform {
@@ -708,6 +693,10 @@ mod tests {
         }
         async fn set_timer(&self, name: &str, enabled: bool) -> PlatformResult<()> {
             self.timers.lock().unwrap().push((name.to_owned(), enabled));
+            Ok(())
+        }
+        async fn remove_launcher_setup(&self) -> PlatformResult<()> {
+            *self.teardowns.lock().unwrap() += 1;
             Ok(())
         }
         async fn install_jobs(&self, jobs: &[ScheduledJob]) -> PlatformResult<()> {
@@ -913,6 +902,21 @@ image = "ghcr.io/example/weglarka:latest"
             downgrade(&FakePlatform::systemd(), &options).await,
             Err(BootstrapError::Incomplete(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn downgrade_removes_the_launcher_setup_once_on_either_platform() {
+        for kind in [PlatformKind::Systemd, PlatformKind::Openrc] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = options(dir.path());
+            let platform = FakePlatform {
+                kind: Some(kind),
+                ..FakePlatform::default()
+            };
+            downgrade(&platform, &options).await.unwrap();
+            assert_eq!(*platform.teardowns.lock().unwrap(), 1, "{kind:?}");
+            assert!(platform.jobs.lock().unwrap().is_empty(), "{kind:?}");
+        }
     }
 
     fn endpoint() -> weglarka_model::platform_update::JournalEndpoint {

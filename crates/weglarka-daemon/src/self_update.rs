@@ -883,6 +883,9 @@ mod tests {
         async fn set_timer(&self, _: &str, _: bool) -> Result<(), PlatformError> {
             Ok(())
         }
+        async fn remove_launcher_setup(&self) -> Result<(), PlatformError> {
+            Ok(())
+        }
     }
 
     struct Ctx {

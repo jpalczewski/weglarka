@@ -198,6 +198,14 @@ pub trait Platform: Send + Sync {
     /// Enables (or disables) a user timer and starts (stops) it now.
     fn set_timer(&self, name: &str, enabled: bool) -> impl Future<Output = Result<()>> + Send;
 
+    /// Removes everything the launcher-based setup installed: the periodic jobs (and the cron
+    /// block), the launcher-owned services and init scripts, and the user units and timers. The
+    /// container service definition of `install_service` stays on systemd; `remove_service` owns it.
+    ///
+    /// Idempotent: missing pieces are not an error, so `remove` and `downgrade` can call it on a
+    /// host in any state. Unrelated entries (other crontab lines) are preserved.
+    fn remove_launcher_setup(&self) -> impl Future<Output = Result<()>> + Send;
+
     // Platform update v1 interfaces. Defaults fail explicitly so an adapter that has not grown the
     // capability yet cannot be mistaken for a working one.
 

@@ -10,8 +10,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
 use weglarka_daemon::openrc::OpenRcPlatform;
 use weglarka_daemon::platform::{
-    SELF_UPDATE_SERVICE, SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_SERVICE, WATCHDOG_TIMER,
-    render, run_args,
+    SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_TIMER, render, run_args,
 };
 use weglarka_daemon::service::{
     DEFAULT_IMAGE, SERVICE_NAME, SOCKET_ENV, host_socket, service_spec,
@@ -278,19 +277,7 @@ async fn run_platform<P: Platform>(
             }
         }
         PlatformAction::Remove => {
-            if platform.kind() == PlatformKind::Systemd {
-                // Disable before deleting: `systemctl disable` needs the unit files.
-                platform.set_timer(SELF_UPDATE_TIMER, false).await?;
-                platform.set_timer(WATCHDOG_TIMER, false).await?;
-                platform
-                    .remove_user_units(&[
-                        SELF_UPDATE_SERVICE,
-                        SELF_UPDATE_TIMER,
-                        WATCHDOG_SERVICE,
-                        WATCHDOG_TIMER,
-                    ])
-                    .await?;
-            }
+            platform.remove_launcher_setup().await?;
             platform.remove_service(SERVICE_NAME).await?;
             println!(
                 "Removed the {SERVICE_NAME} service file, the self-update timer and the watchdog."

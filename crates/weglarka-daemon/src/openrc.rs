@@ -415,6 +415,10 @@ impl<R: CommandRunner> Platform for OpenRcPlatform<R> {
         ))
     }
 
+    async fn remove_launcher_setup(&self) -> Result<()> {
+        self.install_jobs(&[]).await
+    }
+
     async fn install_jobs(&self, jobs: &[ScheduledJob]) -> Result<()> {
         for job in jobs {
             if job.cadence_secs == 0 {
