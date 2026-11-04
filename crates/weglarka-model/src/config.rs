@@ -1,5 +1,6 @@
 //! `weglarka.toml` — host configuration. Written by a human/Ansible; the daemon only reads it.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,9 @@ pub struct HostConfig {
     pub platform: PlatformConfig,
     #[serde(default)]
     pub state: StateConfig,
+    /// Retention of the ingress request logs (issue #502). Absent keeps the default (30 days).
+    #[serde(default, skip_serializing_if = "LogsConfig::is_default")]
+    pub logs: LogsConfig,
     /// Host directory with the app config files/directories that `apps.toml`'s `configs` mount
     /// (issue #118, `docs/decisions/0028-config-root-mounts.md`). Absolute, or relative to the
     /// directory of `weglarka.toml` (the caller resolves it, like `[state] dir`). Unset = the
@@ -60,6 +64,7 @@ impl HostConfig {
     /// port fails loudly instead of at the first `apply` or at container start.
     pub fn validate(&self) -> Result<(), String> {
         self.ingress.validate()?;
+        self.logs.validate()?;
         validate_host_mount_allowlist(&self.runtime.host_mounts)?;
         validate_group_allowlist(&self.runtime.group_add)?;
         // Public ingress ports below 1024 are rootless Podman's privileged-port problem
@@ -105,6 +110,105 @@ impl HostConfig {
         }
         Ok(())
     }
+}
+
+/// `[logs]`: how long the ingress keeps its request logs (issue #502, ADR 0070).
+///
+/// The ingress access and error logs contain visitor IP addresses. They are written to files owned
+/// by the daemon (not to the nginx container's stdout), rotated once a day in UTC and deleted after
+/// the configured retention. This is a host setting, not an app setting: nginx writes one shared log
+/// for every app, so per-app retention would need separate files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsConfig {
+    /// `30` (days) by default; `"unlimited"` keeps the rotated files forever.
+    #[serde(default = "LogsConfig::default_retention")]
+    pub retention: LogRetention,
+}
+
+impl LogsConfig {
+    /// Retention in days when `[logs]` is absent. Thirty days is the first value a privacy policy
+    /// needs (issue #502); an operator who wants a different period sets it explicitly.
+    pub const DEFAULT_DAYS: u32 = 30;
+    /// Upper bound of `LogRetention::Days`. Ten years is effectively "a very long time", while still
+    /// keeping the arithmetic and the configuration in a sane range.
+    pub const MAX_DAYS: u32 = 3650;
+
+    fn default_retention() -> LogRetention {
+        LogRetention::Days(Self::DEFAULT_DAYS)
+    }
+
+    /// True when the value is exactly the default; used to keep `[logs]` out of a serialized config
+    /// that never set it (the host file is written by a human, not the daemon).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.retention {
+            LogRetention::Days(days) if !(1..=Self::MAX_DAYS).contains(&days) => Err(format!(
+                "[logs] retention = {days}: expected 1..={} days or \"unlimited\"",
+                Self::MAX_DAYS
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            retention: Self::default_retention(),
+        }
+    }
+}
+
+/// Age of the ingress logs: a number of days, or the explicit `"unlimited"` value.
+///
+/// `"unlimited"` is deliberately spelled out instead of `0`: a zero would be easy to misread as
+/// "delete immediately" and would silently disable the privacy feature (ADR 0070).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LogRetention {
+    Days(u32),
+    Unlimited(Unlimited),
+}
+
+impl LogRetention {
+    pub fn days(self) -> Option<u32> {
+        match self {
+            Self::Days(days) => Some(days),
+            Self::Unlimited(_) => None,
+        }
+    }
+
+    pub fn is_unlimited(self) -> bool {
+        matches!(self, Self::Unlimited(_))
+    }
+}
+
+impl Default for LogRetention {
+    fn default() -> Self {
+        Self::Days(LogsConfig::DEFAULT_DAYS)
+    }
+}
+
+impl fmt::Display for LogRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Days(1) => f.write_str("1 day"),
+            Self::Days(days) => write!(f, "{days} days"),
+            Self::Unlimited(_) => f.write_str("unlimited"),
+        }
+    }
+}
+
+/// The `"unlimited"` spelling of [`LogRetention`]; a separate type keeps the untagged enum readable
+/// and makes an invalid string fail at deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unlimited {
+    Unlimited,
 }
 
 /// `[metrics]`: the opt-in `GET /metrics` listener (issue #350, ADR 0061). It is TCP, reachable only
@@ -1120,6 +1224,56 @@ kind = "systemd"
     fn rejects_unknown_fields() {
         let bad = SAMPLE.replace("[platform]", "[platform]\nbogus = true");
         assert!(HostConfig::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn log_retention_defaults_to_thirty_days_and_accepts_days_or_unlimited() {
+        let absent = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert_eq!(absent.logs.retention, LogRetention::Days(30));
+        assert!(absent.logs.is_default());
+        absent.validate().unwrap();
+        assert!(
+            !toml::to_string(&absent).unwrap().contains("[logs]"),
+            "the default stays out of the serialized config"
+        );
+
+        for (src, want) in [
+            ("[logs]\nretention = 7", LogRetention::Days(7)),
+            ("[logs]\nretention = 3650", LogRetention::Days(3650)),
+            (
+                "[logs]\nretention = \"unlimited\"",
+                LogRetention::Unlimited(Unlimited::Unlimited),
+            ),
+        ] {
+            let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}")).unwrap();
+            assert_eq!(cfg.logs.retention, want, "{src}");
+            cfg.validate().unwrap();
+        }
+        assert_eq!(LogRetention::Days(1).to_string(), "1 day");
+        assert_eq!(LogRetention::Days(30).to_string(), "30 days");
+        assert_eq!(
+            LogRetention::Unlimited(Unlimited::Unlimited).to_string(),
+            "unlimited"
+        );
+    }
+
+    #[test]
+    fn log_retention_rejects_zero_out_of_range_and_unknown_fields() {
+        for (src, message) in [
+            ("[logs]\nretention = 0", "1..=3650"),
+            ("[logs]\nretention = 3651", "1..=3650"),
+            ("[logs]\nbogus = 1", "unknown field"),
+            ("[logs]\nretention = \"forever\"", "did not match"),
+        ] {
+            let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}"));
+            match cfg {
+                Err(error) => assert!(error.to_string().contains(message), "{src}: {error}"),
+                Ok(host) => {
+                    let error = host.validate().expect_err(src);
+                    assert!(error.contains(message), "{src}: {error}");
+                }
+            }
+        }
     }
 
     #[test]

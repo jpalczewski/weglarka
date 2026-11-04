@@ -1,30 +1,35 @@
-//! `GET /v1/apps/{name}/access` (docs/decisions/0063) over the real admin sockets on `FakePodman`:
-//! the boundary between apps, the `admin` scope, errors before the stream starts, the two-phase read
-//! and where a stream ends. The fake ignores `since` and answers every read with the same script, so
-//! with `follow` every entry shows up twice (history, then the live read) — asserted below on purpose.
+//! `GET /v1/apps/{name}/access` (docs/decisions/0063, ADR 0070) over the real admin sockets:
+//! the boundary between apps, the `admin` scope, errors before the stream starts, the file history,
+//! follow from the byte where history stopped and where a stream ends. The log is a real file under
+//! `<state>/ingress-logs`, so no Podman log stream is involved.
 
 use crate::common::*;
-use crate::logs::{STEP, deployed_app, log_calls, open, read_all, script, token_for};
+use crate::logs::{STEP, deployed_app, open, read_all, token_for};
 use crate::token_api::setup;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use hyper::StatusCode;
 use serde_json::json;
 use weglarka_api::{
     ACCESS_STREAM_CONTENT_TYPE, AccessEntry, AccessFrame, AccessFrameDecoder, endpoints,
 };
-use weglarka_model::podman::{LogSource, PodmanClient};
-
-const NGINX: &str = "weglarka-nginx";
 
 fn access_path(app: &str) -> String {
     endpoints::APPS_ACCESS.path.replace("{name}", app)
 }
 
 fn line(app: &str, status: u16, path: &str) -> String {
+    let now = weglarka_model::secrets::rfc3339_utc(std::time::SystemTime::now());
+    line_at(&now, app, status, path)
+}
+
+fn line_at(time: &str, app: &str, status: u16, path: &str) -> String {
     format!(
-        "{{\"time\":\"2026-10-31T12:00:00+00:00\",\"app\":\"{app}\",\"host\":\"{app}.example.com\",\
+        "{{\"time\":\"{time}\",\"app\":\"{app}\",\"host\":\"{app}.example.com\",\
          \"remote_addr\":\"203.0.113.7\",\"method\":\"GET\",\"path\":\"{path}\",\"status\":{status},\
          \"bytes_sent\":5,\"request_time\":0.001,\"upstream_response_time\":\"0.001\",\
          \"request_id\":\"r\",\"user_agent\":\"curl\",\"secret_new_field\":\"leak\"}}\n"
@@ -41,9 +46,26 @@ fn traffic() -> String {
     .concat()
 }
 
-fn script_nginx(h: &Harness, text: &str, hold_open: bool) {
-    h.fake
-        .script_logs(NGINX, script(&[(LogSource::Stdout, text)], hold_open));
+fn log_dir(h: &Harness) -> PathBuf {
+    h.root.join("state").join("ingress-logs")
+}
+
+fn write_log(h: &Harness, name: &str, text: &str) {
+    let dir = log_dir(h);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), text).unwrap();
+}
+
+fn append_log(h: &Harness, text: &str) {
+    let dir = log_dir(h);
+    fs::create_dir_all(&dir).unwrap();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("access.log"))
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
 async fn frames(response: hyper::Response<hyper::body::Incoming>) -> Vec<AccessFrame> {
@@ -61,11 +83,28 @@ fn paths(frames: &[AccessFrame]) -> Vec<String> {
         .collect()
 }
 
+/// Reads frames until `seen` contains `want`, or the stream ends; returns the decoded frames.
+async fn frames_until(
+    response: &mut hyper::Response<hyper::body::Incoming>,
+    decoder: &mut AccessFrameDecoder,
+    seen: &mut Vec<AccessFrame>,
+    want: &str,
+) {
+    while paths(seen).iter().all(|path| path != want) {
+        let frame = tokio::time::timeout(STEP, http_body_util::BodyExt::frame(response.body_mut()))
+            .await
+            .expect("a frame before the timeout")
+            .expect("a frame")
+            .expect("a body frame");
+        seen.extend(decoder.push(&frame.into_data().unwrap()).unwrap());
+    }
+}
+
 #[tokio::test]
 async fn an_admin_token_gets_only_its_apps_lines_and_not_unknown_fields() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, &traffic(), false);
+    write_log(&s.h, "access.log", &traffic());
     let token = s.issuer.token("adam", &["admins"]);
 
     let response = open(
@@ -103,7 +142,7 @@ async fn an_admin_token_gets_only_its_apps_lines_and_not_unknown_fields() {
 async fn filters_and_tail_apply_in_the_daemon() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, &traffic(), false);
+    write_log(&s.h, "access.log", &traffic());
     let token = s.issuer.token("adam", &["admins"]);
     for (query, want) in [
         ("status=5xx", vec!["/b"]),
@@ -129,6 +168,7 @@ async fn filters_and_tail_apply_in_the_daemon() {
 async fn a_read_token_is_refused_before_anything_is_read() {
     let s = setup().await;
     deployed_app(&s.h).await;
+    write_log(&s.h, "access.log", &traffic());
     let reader = s.issuer.token("rita", &["viewers"]);
     let (status, _, body) = crate::token_api::call(
         &s.token_socket,
@@ -139,7 +179,6 @@ async fn a_read_token_is_refused_before_anything_is_read() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(log_calls(&s.h).is_empty());
 }
 
 #[tokio::test]
@@ -174,36 +213,36 @@ async fn bad_requests_fail_with_json_before_the_stream_starts() {
         let (status, body) = get(format!("{}?{bad}", access_path("web"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
-    assert!(log_calls(&s.h).is_empty(), "nothing reached podman");
 }
 
 #[tokio::test]
-async fn without_an_ingress_container_the_answer_is_json_not_found() {
+async fn without_logs_the_stream_is_empty_not_an_error() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    s.h.fake.container_remove(NGINX, true).await.unwrap();
+    // No log file: history is empty and the stream ends cleanly. The old endpoint answered 404 here
+    // because the log lived in the container.
     let token = s.issuer.token("adam", &["admins"]);
-    let (status, _, body) = crate::token_api::call(
+    let response = open(
         &s.token_socket,
         "GET",
         &access_path("web"),
         Some(&token),
-        None,
+        vec![],
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(log_calls(&s.h).is_empty());
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(frames(response).await, [AccessFrame::End]);
+    assert_eq!(s.h.fake.open_log_streams(), 0, "no Podman log stream");
 }
 
 #[tokio::test]
-async fn follow_reads_history_first_and_then_a_live_stream_from_t() {
+async fn follow_reads_history_first_and_then_the_appended_lines_once() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, &line("web", 200, "/a"), true);
-    let token = token_for(&s, "adam", &["admins"], Duration::from_secs(3));
-    let before = SystemTime::now();
+    write_log(&s.h, "access.log", &line("web", 200, "/a"));
+    let token = token_for(&s, "adam", &["admins"], Duration::from_secs(5));
 
-    let response = open(
+    let mut response = open(
         &s.token_socket,
         "GET",
         &format!("{}?follow=true", access_path("web")),
@@ -211,33 +250,41 @@ async fn follow_reads_history_first_and_then_a_live_stream_from_t() {
         vec![],
     )
     .await;
-    let got = frames(response).await;
-    // The fake gives both reads the same script, so the entry is there twice: at-least-once, no dedup.
-    assert_eq!(paths(&got), ["/a", "/a"]);
-    assert_eq!(got.last(), Some(&AccessFrame::TokenExpired));
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut decoder = AccessFrameDecoder::default();
+    let mut seen = Vec::new();
+    frames_until(&mut response, &mut decoder, &mut seen, "/a").await;
+    append_log(&s.h, &line("web", 200, "/b"));
 
-    let calls = log_calls(&s.h);
-    let nginx: Vec<_> = calls.iter().filter(|(n, _)| n == NGINX).collect();
-    let [(_, history), (_, live)] = nginx.as_slice() else {
-        panic!("{calls:?}")
-    };
-    assert!(!history.follow && history.tail.is_none() && !history.timestamps);
-    assert!(live.follow && live.tail.is_none());
-    // The default window is the last hour; the live read starts at T, taken before the history.
-    let window = before.duration_since(history.since.unwrap()).unwrap();
-    assert!((window.as_secs() as i64 - 3600).abs() <= 5, "{window:?}");
-    let t = live.since.unwrap();
-    assert!(
-        t >= before - Duration::from_secs(1) && t <= SystemTime::now(),
-        "{t:?}"
-    );
+    // Drain to the token's end; `/a` from history, `/b` from follow, no duplicate.
+    loop {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(6),
+            http_body_util::BodyExt::frame(response.body_mut()),
+        )
+        .await
+        .expect("the token ends the stream")
+        .expect("a frame")
+        .expect("a body frame");
+        seen.extend(decoder.push(&frame.into_data().unwrap()).unwrap());
+        if seen.iter().any(|f| matches!(f, AccessFrame::TokenExpired)) {
+            break;
+        }
+    }
+    assert_eq!(paths(&seen), ["/a", "/b"]);
+    assert_eq!(seen.last(), Some(&AccessFrame::TokenExpired));
 }
 
 #[tokio::test]
-async fn an_explicit_since_reaches_the_history_read() {
+async fn since_filters_by_the_line_timestamp() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, &traffic(), false);
+    write_log(
+        &s.h,
+        "access.log",
+        &(line_at("2023-01-01T00:00:00+00:00", "web", 200, "/old")
+            + &line_at("2025-01-01T00:00:00+00:00", "web", 200, "/new")),
+    );
     let token = s.issuer.token("adam", &["admins"]);
     let response = open(
         &s.token_socket,
@@ -247,20 +294,14 @@ async fn an_explicit_since_reaches_the_history_read() {
         vec![],
     )
     .await;
-    frames(response).await;
-    let calls = log_calls(&s.h);
-    let (_, options) = calls.iter().find(|(n, _)| n == NGINX).unwrap();
-    assert_eq!(
-        options.since,
-        Some(UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000))
-    );
+    assert_eq!(paths(&frames(response).await), ["/new"]);
 }
 
 #[tokio::test]
-async fn a_quiet_followed_stream_ends_at_the_token_expiry_and_lets_go_of_podman() {
+async fn a_quiet_followed_stream_ends_at_the_token_expiry() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, "", true);
+    write_log(&s.h, "access.log", "");
     let token = token_for(&s, "adam", &["admins"], Duration::from_secs(3));
     let started = std::time::Instant::now();
     let response = open(
@@ -277,17 +318,14 @@ async fn a_quiet_followed_stream_ends_at_the_token_expiry_and_lets_go_of_podman(
         "{:?}",
         started.elapsed()
     );
-    eventually("the podman stream is dropped", || async {
-        s.h.fake.open_log_streams() == 0
-    })
-    .await;
+    assert_eq!(s.h.fake.open_log_streams(), 0);
 }
 
 #[tokio::test]
-async fn a_client_hanging_up_drops_the_podman_stream() {
+async fn a_client_hanging_up_ends_the_file_stream() {
     let s = setup().await;
     deployed_app(&s.h).await;
-    script_nginx(&s.h, &line("web", 200, "/a"), true);
+    write_log(&s.h, "access.log", &line("web", 200, "/a"));
     let token = s.issuer.token("adam", &["admins"]);
     let mut response = open(
         &s.token_socket,
@@ -303,19 +341,15 @@ async fn a_client_hanging_up_drops_the_podman_stream() {
         .unwrap()
         .unwrap();
     assert!(first.into_data().is_ok());
-    assert_eq!(s.h.fake.open_log_streams(), 1);
+    assert_eq!(s.h.fake.open_log_streams(), 0);
     drop(response);
-    eventually("the podman stream is dropped", || async {
-        s.h.fake.open_log_streams() == 0
-    })
-    .await;
 }
 
 #[tokio::test]
 async fn the_unix_socket_has_no_deadline() {
     let h = harness().await;
     deployed_app(&h).await;
-    script_nginx(&h, &line("web", 200, "/a"), true);
+    write_log(&h, "access.log", &line("web", 200, "/a"));
     let mut response = open(
         &h.running.admin_socket,
         "GET",
@@ -327,16 +361,8 @@ async fn the_unix_socket_has_no_deadline() {
     assert_eq!(response.status(), StatusCode::OK);
     let mut decoder = AccessFrameDecoder::default();
     let mut seen = Vec::new();
-    // History and the live read each deliver the entry; then nothing ends the stream by itself.
-    while seen.len() < 2 {
-        let frame = tokio::time::timeout(STEP, http_body_util::BodyExt::frame(response.body_mut()))
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        seen.extend(decoder.push(&frame.into_data().unwrap()).unwrap());
-    }
-    assert_eq!(paths(&seen), ["/a", "/a"]);
+    frames_until(&mut response, &mut decoder, &mut seen, "/a").await;
+    assert_eq!(paths(&seen), ["/a"]);
     assert!(
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -345,10 +371,6 @@ async fn the_unix_socket_has_no_deadline() {
         .await
         .is_err()
     );
-    assert_eq!(h.fake.open_log_streams(), 1);
+    assert_eq!(h.fake.open_log_streams(), 0);
     drop(response);
-    eventually("the podman stream is dropped", || async {
-        h.fake.open_log_streams() == 0
-    })
-    .await;
 }

@@ -172,6 +172,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
     let (_, v) = admin(&h, "GET", "/v1/status", None).await;
     assert_eq!(v["api_version"], "v1");
     assert_eq!(v["apps"].as_array().unwrap().len(), 1);
+    assert_eq!(v["log_retention"], 30, "the default retention is visible");
 
     // Secrets: name and value validation, no values in responses.
     let (s, v) = admin(
@@ -250,6 +251,7 @@ async fn admin_lifecycle_add_deploy_status_remove() {
         "state.drift",
         "webhook.listener",
         "ingress.traefik_file",
+        "logs.retention",
     ] {
         assert!(ids.contains(&want), "missing check {want}: {ids:?}");
     }

@@ -24,6 +24,10 @@ pub struct Paths {
     pub secrets: PathBuf,
     /// Host directory with `nginx.conf` (mounted into the nginx container).
     pub nginx_conf_dir: PathBuf,
+    /// Durable ingress request logs (issue #502, ADR 0070): access/error files rotated and pruned by
+    /// the daemon. Outside `nginx_conf_dir` so a backup of the configuration never contains visitor
+    /// IP addresses.
+    pub ingress_logs: PathBuf,
     /// Durable queue of notifications that have not been delivered yet (issue #38).
     pub notifications: PathBuf,
     /// ACME account credentials (`[acme]`, issue #96): `0600`, outside the webroot and `tls/`.
@@ -71,6 +75,7 @@ impl Paths {
                 .nginx_conf_dir
                 .clone()
                 .unwrap_or_else(|| state_dir.join("nginx")),
+            ingress_logs: state_dir.join("ingress-logs"),
             notifications: state_dir.join("notifications.toml"),
             acme_account_key: state_dir.join("acme").join("account.key"),
             cdn_ranges: state_dir.join("cdn-ranges.toml"),

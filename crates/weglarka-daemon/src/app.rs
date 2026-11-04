@@ -36,6 +36,8 @@ pub struct Daemon<P: PodmanClient> {
     pub events: Arc<weglarka_model::history::EventHistory>,
     /// What the ACME worker found on its last pass; `None` when `[acme]` is absent or paused.
     pub acme: Option<Arc<crate::acme::AcmeStatus>>,
+    /// Last ingress log retention pass (issue #502, ADR 0070); read by `doctor`.
+    pub logs: Arc<crate::log_retention::Status>,
     /// Keeps generated config files current (#212); `None` when no generator is registered.
     pub generated: Option<Arc<crate::generated::GeneratedWorker<P>>>,
     /// Serializes "check and save" in `apps add` (the engine locks only the save itself).

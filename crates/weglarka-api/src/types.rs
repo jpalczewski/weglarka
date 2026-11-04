@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use weglarka_model::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
+use weglarka_model::config::LogRetention;
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
 use weglarka_model::events::Severity;
 use weglarka_model::state::AppState;
@@ -598,6 +599,10 @@ pub struct StatusResponse {
     pub daemon_version: String,
     pub podman_version: String,
     pub apps: Vec<AppSummary>,
+    /// How long the ingress keeps its request logs (issue #502, ADR 0070). `None` when the daemon
+    /// predates the feature; `Some(unlimited)` means rotation continues but nothing is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_retention: Option<LogRetention>,
 }
 
 /// `GET /v1/health` — readiness of the admin API, not a health check of the apps (issue #100).

@@ -1,48 +1,54 @@
 //! `GET /v1/apps/{name}/access` (`admin` scope, docs/decisions/0063): the requests that reached an app
 //! through its domains, as a stream of [`AccessFrame`]s.
 //!
-//! nginx writes one JSON line per request to its stdout, in **one log shared by all apps**. The daemon
-//! is the boundary between them: it reads that log, parses every line, keeps the lines whose `app` is
-//! the requested one and sends each as an [`AccessEntry`] (an allowlist of fields, serialised anew).
-//! Nothing is decided by searching the raw line for text: a user agent may well contain `"app":"x"`.
+//! nginx writes one JSON line per request into **one file shared by all apps** (ADR 0070):
+//! `<state dir>/ingress-logs/access.log`, rotated daily by the daemon. The daemon is the boundary
+//! between the apps: it parses every line, keeps the lines whose `app` is the requested one and sends
+//! each as an [`AccessEntry`] (an allowlist of fields, serialised anew). Nothing is decided by
+//! searching the raw line for text: a user agent may well contain `"app":"x"`.
 //!
-//! Reading is two-phase, because libpod does not say where history ends when it follows: first the
-//! window up to now without `follow`, then — only with `follow=true` — a second read from `T`, the
-//! instant taken *before* the first one. A request logged around `T` may show up in both (at-least-once,
-//! as in the logs stream).
+//! History is read from the completed daily files whose date is inside `since`, then from the current
+//! `access.log`. Follow starts at the byte offset and inode where history stopped, so a line is sent
+//! exactly once within one stream; a rotation during history is handled by draining the old file first
+//! and only then switching to the new one.
 //!
-//! The stream lives in its own task (the pump), like the logs stream: it ends when the client hangs up,
-//! when the token expires or when the log ends, also during a long scan that sends nothing.
+//! The stream lives in its own task (the pump): it ends when the client hangs up, when the token
+//! expires or when the log ends, also during a long scan that sends nothing.
 //!
 //! Audit: one line when the stream ends, with counts and the shape of the query; never a filter value
 //! and never log content.
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path as StdPath, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::response::Response;
 use axum::routing::get;
-use futures_util::StreamExt;
 use serde::Deserialize;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use weglarka_api::{
     ACCESS_STREAM_CONTENT_TYPE, AccessEntry, AccessFrame, AccessQuery, StatusFilter, endpoints,
+    parse_rfc3339,
 };
 use weglarka_model::app::InstanceName;
-use weglarka_model::podman::{LogOptions, LogSource, LogStream, PodmanClient, PodmanError};
+use weglarka_model::podman::PodmanClient;
 use weglarka_model::state;
 
 use crate::admin::{Fail, parse_name};
 use crate::app::Daemon;
-use crate::ingress::NGINX_CONTAINER;
-use crate::stream::{CallerSub, Ended, StreamDeadline, podman_failure, stream_response, unix_secs};
+use crate::log_retention::{ACCESS_LOG, completed_file_date, utc_date};
+use crate::stream::{CallerSub, Ended, StreamDeadline, stream_response, unix_secs};
 
 /// Frames queued between the pump and the response body: small, so a slow client holds back the
 /// reading of the Podman stream instead of buffering the log in memory.
@@ -74,57 +80,21 @@ async fn app_access<P: PodmanClient + 'static>(
     if !known {
         return Err(Fail::not_found(format!("unknown app: {name}")));
     }
-    let missing = "the ingress container does not exist";
-    d.engine
-        .podman()
-        .container_inspect(NGINX_CONTAINER)
-        .await
-        .map_err(|e| podman_failure(&name, missing, e))?;
-
-    // `T` before the history is read, so the follow read loses nothing in between.
     let now = SystemTime::now();
     let since = query.since_time().unwrap_or_else(|| {
         now.checked_sub(DEFAULT_ACCESS_WINDOW)
             .unwrap_or(SystemTime::UNIX_EPOCH)
     });
-    let history = d
-        .engine
-        .podman()
-        .container_logs(
-            NGINX_CONTAINER,
-            &LogOptions {
-                follow: false,
-                tail: None,
-                since: Some(since),
-                timestamps: false,
-            },
-        )
-        .await
-        .map_err(|e| podman_failure(&name, missing, e))?;
-    let follow = query.follow.then(|| {
-        let d = Arc::clone(&d);
-        async move {
-            d.engine
-                .podman()
-                .container_logs(
-                    NGINX_CONTAINER,
-                    &LogOptions {
-                        follow: true,
-                        tail: None,
-                        since: Some(now),
-                        timestamps: false,
-                    },
-                )
-                .await
-        }
-    });
+    let dir = d.ingress.logs_dir().to_path_buf();
+    let history = Reader::History(History::new(dir.clone(), since));
+    let follow = query.follow.then_some(FollowPlan::Files(dir));
 
     let (frames_tx, frames_rx) = mpsc::channel::<Bytes>(FRAME_QUEUE);
     let audit = Audit::new(sub, name.clone(), &query, since);
     tokio::spawn(pump(
         history,
         follow,
-        Scan::new(name, &query),
+        Scan::new(name, &query, since),
         query.tail,
         frames_tx,
         deadline,
@@ -194,6 +164,12 @@ impl Filter {
     }
 }
 
+/// Whether the entry is inside the time window. `None` means `$time_iso8601` is missing or does not
+/// parse: the line is skipped (and counted) instead of being shown out of window.
+fn time_window(entry: &AccessEntry, since: Duration) -> Option<bool> {
+    parse_rfc3339(entry.time.as_bytes()).map(|time| time >= since)
+}
+
 /// A complete line of the log, or the mark of one that was too long to keep.
 #[derive(Debug, PartialEq, Eq)]
 enum Line<'a> {
@@ -244,30 +220,34 @@ struct Scan {
     app: InstanceName,
     filter: Filter,
     lines: LineBuffer,
+    /// `since` as seconds/nanoseconds since the unix epoch, compared with `AccessEntry::time`.
+    since: Duration,
     /// Lines seen, whatever they were.
     scanned: u64,
-    /// Lines that were not valid entries (too long, not JSON).
+    /// Lines that were not valid entries (too long, not JSON, no usable time).
     skipped: u64,
 }
 
 impl Scan {
-    fn new(app: InstanceName, query: &AccessQuery) -> Self {
+    fn new(app: InstanceName, query: &AccessQuery, since: SystemTime) -> Self {
         Self {
             app,
             filter: Filter::new(query),
             lines: LineBuffer::default(),
+            since: since.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO),
             scanned: 0,
             skipped: 0,
         }
     }
 
-    /// The entries of this app that pass the filter in `data` (a chunk of nginx's stdout).
+    /// The entries of this app that pass the filter in `data` (a chunk of the access log).
     fn chunk(&mut self, data: &[u8]) -> Vec<AccessEntry> {
         let mut kept = Vec::new();
         let Self {
             app,
             filter,
             lines,
+            since,
             scanned,
             skipped,
         } = self;
@@ -280,14 +260,214 @@ impl Scan {
             match parse_line(line) {
                 Parsed::Invalid => *skipped += 1,
                 Parsed::Entry { app: of, entry } => {
-                    if of == app.as_str() && filter.matches(&entry) {
-                        kept.push(entry);
+                    if of != app.as_str() {
+                        return;
+                    }
+                    match time_window(&entry, *since) {
+                        Some(true) if filter.matches(&entry) => kept.push(entry),
+                        Some(_) => {}
+                        None => *skipped += 1,
                     }
                 }
             }
         });
         kept
     }
+}
+
+// ---- File sources (ADR 0070) ----
+
+/// How much a single file read returns; the pump turns it into lines.
+const CHUNK: usize = 64 * 1024;
+/// Poll interval of a followed file. A log stream may be up to this late; that is cheaper than an
+/// inotify dependency and matches the previous libpod stream's latency closely enough.
+const POLL: Duration = Duration::from_millis(250);
+
+/// A reader of one `access.log` (follow) or of the daily files selected by `since` (history).
+enum Reader {
+    History(History),
+    Follow(Follow),
+    #[cfg(test)]
+    TestStream(futures_util::stream::BoxStream<'static, io::Result<Bytes>>),
+}
+
+/// What to follow after history. Production points at the directory (the history reader knows the
+/// exact offset and inode); unit tests provide a prepared reader instead.
+enum FollowPlan {
+    Files(PathBuf),
+    #[cfg(test)]
+    Reader(Box<Reader>),
+}
+
+impl Reader {
+    async fn next_chunk(&mut self) -> Option<io::Result<Bytes>> {
+        match self {
+            Self::History(history) => history.next_chunk().await,
+            Self::Follow(follow) => follow.next_chunk().await,
+            #[cfg(test)]
+            Self::TestStream(stream) => futures_util::StreamExt::next(stream).await,
+        }
+    }
+}
+
+struct History {
+    files: VecDeque<PathBuf>,
+    file: Option<File>,
+    path: Option<PathBuf>,
+    position: u64,
+    id: Option<(u64, u64)>,
+    buf: Vec<u8>,
+}
+
+impl History {
+    fn new(dir: PathBuf, since: SystemTime) -> Self {
+        Self {
+            files: select_files(&dir, since),
+            file: None,
+            path: None,
+            position: 0,
+            id: None,
+            buf: vec![0; CHUNK],
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Option<io::Result<Bytes>> {
+        loop {
+            let Some(file) = self.file.as_mut() else {
+                let path = self.files.pop_front()?;
+                match File::open(&path).await {
+                    Ok(file) => {
+                        self.id = file.metadata().await.ok().map(|m| (m.dev(), m.ino()));
+                        self.file = Some(file);
+                        self.path = Some(path);
+                        self.position = 0;
+                        continue;
+                    }
+                    // Pruned between the listing and the open: the rest of the history is still valid.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Some(Err(e)),
+                }
+            };
+            match file.read(&mut self.buf).await {
+                Ok(0) => {
+                    // Keep the last descriptor open at EOF for follow: it carries the exact byte
+                    // offset and inode where history stopped, so the first live line is not
+                    // repeated. A non-final file is closed and the loop opens the next one.
+                    if self.files.is_empty() {
+                        return None;
+                    }
+                    self.file = None;
+                }
+                Ok(n) => {
+                    self.position += n as u64;
+                    return Some(Ok(Bytes::copy_from_slice(&self.buf[..n])));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Build the follow reader at the exact byte where history stopped. When history ended on a
+    /// rotated file (or on no file at all), the new current file starts at zero; when it ended on
+    /// `access.log`, the open descriptor is reused, so no line written during history is lost.
+    fn into_follow(self, dir: PathBuf) -> (Follow, bool) {
+        let current = dir.join(ACCESS_LOG);
+        let same = self.path.as_deref() == Some(current.as_path());
+        (
+            Follow {
+                path: current,
+                file: same.then_some(self.file).flatten(),
+                position: if same { self.position } else { 0 },
+                id: if same { self.id } else { None },
+                buf: vec![0; CHUNK],
+            },
+            same,
+        )
+    }
+}
+
+struct Follow {
+    path: PathBuf,
+    file: Option<File>,
+    position: u64,
+    id: Option<(u64, u64)>,
+    buf: Vec<u8>,
+}
+
+impl Follow {
+    async fn next_chunk(&mut self) -> Option<io::Result<Bytes>> {
+        loop {
+            if self.file.is_none() {
+                match File::open(&self.path).await {
+                    Ok(file) => {
+                        self.id = file.metadata().await.ok().map(|m| (m.dev(), m.ino()));
+                        self.file = Some(file);
+                        self.position = 0;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        tokio::time::sleep(POLL).await;
+                        continue;
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let file = self.file.as_mut()?;
+            match file.read(&mut self.buf).await {
+                Ok(0) => {
+                    // At EOF: a different inode at the path means the daemon rotated the file. The
+                    // old descriptor is drained (we are at EOF), so switch only after this check.
+                    match tokio::fs::metadata(&self.path).await {
+                        Ok(meta) => {
+                            let current = (meta.dev(), meta.ino());
+                            if self.id.is_some_and(|id| id != current) {
+                                self.file = None;
+                                continue;
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            // Between rename and HUP nginx has not created the new file yet.
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+                Ok(n) => {
+                    self.position += n as u64;
+                    return Some(Ok(Bytes::copy_from_slice(&self.buf[..n])));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// Completed daily files inside `since`, in chronological order, followed by the current file. The
+/// current file is last; it may contain lines older than `since`, which `Scan` filters out.
+fn select_files(dir: &StdPath, since: SystemTime) -> VecDeque<PathBuf> {
+    let since_days = crate::log_retention::parse_date(&utc_date(since)).unwrap_or(i64::MAX);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return VecDeque::new(),
+    };
+    let mut completed = Vec::new();
+    let mut current = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ACCESS_LOG {
+            current = Some(entry.path());
+        } else if let Some(day) = completed_file_date(&name)
+            && day >= since_days
+        {
+            completed.push((day, entry.path()));
+        }
+    }
+    completed.sort_by_key(|(day, _)| *day);
+    completed
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(current)
+        .collect()
 }
 
 // ---- The pump ----
@@ -400,7 +580,7 @@ async fn send(
 /// Reads `logs` to its end. Matching entries go into `ring` when there is one, else straight to the
 /// client. `Ok` means the log ended; `Err` says why the stream has to.
 async fn read_phase(
-    mut logs: LogStream,
+    reader: &mut Reader,
     scan: &mut Scan,
     mut ring: Option<&mut Ring>,
     tx: &mpsc::Sender<Bytes>,
@@ -413,18 +593,16 @@ async fn read_phase(
             biased;
             () = &mut *expiry => return Err(Ended::TokenExpired),
             () = tx.closed() => return Err(Ended::ClientClosed),
-            next = logs.next() => next,
+            next = reader.next_chunk() => next,
         };
         match next {
             None => return Ok(()),
             Some(Err(error)) => {
-                tracing::warn!(app = %scan.app, %error, "the nginx log stream failed");
+                tracing::warn!(app = %scan.app, %error, "the ingress access log could not be read");
                 return Err(Ended::Error);
             }
-            // nginx's stderr is `error_log`, not the access log.
-            Some(Ok(chunk)) if chunk.source == LogSource::Stderr => {}
-            Some(Ok(chunk)) => {
-                let entries = scan.chunk(&chunk.data);
+            Some(Ok(data)) => {
+                let entries = scan.chunk(&data);
                 audit.scanned = scan.scanned;
                 audit.skipped = scan.skipped;
                 for entry in entries {
@@ -445,66 +623,59 @@ async fn read_phase(
 }
 
 /// The whole stream; the error is why it ended early.
-async fn run<F>(
-    history: LogStream,
-    follow: Option<F>,
+async fn run(
+    mut history: Reader,
+    follow: Option<FollowPlan>,
     scan: &mut Scan,
     tail: Option<u32>,
     tx: &mpsc::Sender<Bytes>,
     expiry: &mut (impl Future<Output = ()> + Unpin),
     audit: &mut Audit,
-) -> Result<(), Ended>
-where
-    F: Future<Output = Result<LogStream, PodmanError>>,
-{
+) -> Result<(), Ended> {
     match tail {
         Some(tail) => {
             let mut ring = Ring::new(tail as usize);
-            read_phase(history, scan, Some(&mut ring), tx, expiry, audit).await?;
+            read_phase(&mut history, scan, Some(&mut ring), tx, expiry, audit).await?;
             for frame in ring.frames {
                 send(tx, expiry, frame).await?;
                 audit.frames += 1;
             }
         }
-        None => read_phase(history, scan, None, tx, expiry, audit).await?,
+        None => read_phase(&mut history, scan, None, tx, expiry, audit).await?,
     }
-    let Some(follow) = follow else {
+    let Some(plan) = follow else {
         return Ok(());
     };
-    let live = tokio::select! {
-        biased;
-        () = &mut *expiry => return Err(Ended::TokenExpired),
-        () = tx.closed() => return Err(Ended::ClientClosed),
-        live = follow => live,
+    let mut follow = match plan {
+        FollowPlan::Files(dir) => {
+            let Reader::History(history) = history else {
+                return Ok(());
+            };
+            let (follow, same_file) = history.into_follow(dir);
+            // A fragment the history ended in belongs to the file it was reading. When history ended
+            // on a rotated file, follow switches to the (new) current file and drops the fragment.
+            if !same_file {
+                scan.lines = LineBuffer::default();
+            }
+            Reader::Follow(follow)
+        }
+        #[cfg(test)]
+        FollowPlan::Reader(reader) => *reader,
     };
-    match live {
-        Ok(live) => {
-            // A fragment the history ended in is not the start of the live stream's first line.
-            scan.lines = LineBuffer::default();
-            read_phase(live, scan, None, tx, expiry, audit).await
-        }
-        Err(error) => {
-            tracing::warn!(app = %scan.app, %error, "following the nginx log failed");
-            Err(Ended::Error)
-        }
-    }
+    read_phase(&mut follow, scan, None, tx, expiry, audit).await
 }
 
 /// Copies the app's access log into `frames_tx` until it ends, the client goes away or the token
-/// expires, then writes the audit line. Returns by dropping the Podman streams. The result is what
-/// the audit line says (for the tests).
-async fn pump<F>(
-    history: LogStream,
-    follow: Option<F>,
+/// expires, then writes the audit line. The result is what the audit line says (for the tests).
+async fn pump(
+    history: Reader,
+    follow: Option<FollowPlan>,
     mut scan: Scan,
     tail: Option<u32>,
     frames_tx: mpsc::Sender<Bytes>,
     deadline: StreamDeadline,
     mut audit: Audit,
-) -> (Ended, Audit)
-where
-    F: Future<Output = Result<LogStream, PodmanError>>,
-{
+) -> (Ended, Audit) {
     let mut expiry = pin!(deadline.reached());
     let result = run(
         history,
@@ -549,13 +720,10 @@ where
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use bytes::Bytes as B;
+    use futures_util::StreamExt as _;
     use futures_util::stream;
-    use weglarka_model::podman::LogChunk;
 
     use super::*;
-
-    type NoFollow = std::future::Ready<Result<LogStream, PodmanError>>;
 
     fn line(app: &str, status: u16, path: &str) -> String {
         format!(
@@ -566,11 +734,8 @@ mod tests {
         )
     }
 
-    fn out(data: impl Into<Vec<u8>>) -> Result<LogChunk, PodmanError> {
-        Ok(LogChunk {
-            source: LogSource::Stdout,
-            data: B::from(data.into()),
-        })
+    fn out(data: impl Into<Vec<u8>>) -> io::Result<Bytes> {
+        Ok(Bytes::from(data.into()))
     }
 
     fn name() -> InstanceName {
@@ -582,7 +747,14 @@ mod tests {
     }
 
     fn scan(raw: &str) -> Scan {
-        Scan::new(name(), &query(raw))
+        Scan::new(name(), &query(raw), UNIX_EPOCH)
+    }
+
+    #[cfg(test)]
+    fn stream_reader(
+        chunks: impl futures_util::Stream<Item = io::Result<Bytes>> + Send + 'static,
+    ) -> Reader {
+        Reader::TestStream(Box::pin(chunks))
     }
 
     fn audit(q: &AccessQuery) -> Audit {
@@ -600,16 +772,13 @@ mod tests {
     }
 
     /// Runs the pump over `chunks` as the history and returns what the client gets.
-    async fn history_of(
-        raw: &str,
-        chunks: Vec<Result<LogChunk, PodmanError>>,
-    ) -> (Vec<AccessFrame>, Audit) {
+    async fn history_of(raw: &str, chunks: Vec<io::Result<Bytes>>) -> (Vec<AccessFrame>, Audit) {
         let q = query(raw);
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
         let task = tokio::spawn(pump(
-            stream::iter(chunks).boxed(),
-            None::<NoFollow>,
-            Scan::new(name(), &q),
+            stream_reader(stream::iter(chunks)),
+            None,
+            Scan::new(name(), &q, UNIX_EPOCH),
             q.tail,
             tx,
             StreamDeadline(None),
@@ -719,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_forged_user_agent_cannot_change_the_app() {
-        let forged = r#"{"time":"t","app":"web","host":"h","remote_addr":"a","method":"GET","path":"/","status":200,"bytes_sent":1,"request_time":0.1,"upstream_response_time":"-","request_id":"r","user_agent":"x\",\"app\":\"other"}"#;
+        let forged = r#"{"time":"2026-10-31T12:00:00+00:00","app":"web","host":"h","remote_addr":"a","method":"GET","path":"/","status":200,"bytes_sent":1,"request_time":0.1,"upstream_response_time":"-","request_id":"r","user_agent":"x\",\"app\":\"other"}"#;
         let Parsed::Entry { app, entry } = parse_line(forged.as_bytes()) else {
             panic!()
         };
@@ -841,14 +1010,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stderr_is_ignored() {
-        let err = Ok(LogChunk {
-            source: LogSource::Stderr,
-            data: B::from(line("web", 200, "/from-error-log")),
-        });
-        let (frames, audit) = history_of("", vec![err, out(line("web", 200, "/ok"))]).await;
+    async fn a_line_without_a_parseable_time_is_skipped() {
+        let bad = line("web", 200, "/bad-time").replace("2026-10-31T12:00:00+00:00", "not-a-time");
+        let (frames, audit) = history_of("", vec![out(bad), out(line("web", 200, "/ok"))]).await;
         assert_eq!(paths(&frames), ["/ok"]);
-        assert_eq!(audit.scanned, 1);
+        assert_eq!(audit.scanned, 2);
+        assert_eq!(audit.skipped, 1);
     }
 
     // ---- the ring ----
@@ -900,18 +1067,16 @@ mod tests {
     async fn follow_reads_a_second_stream_after_the_history_without_waiting_for_a_ring() {
         let q = query("follow=true&tail=1");
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
-        let history = stream::iter(vec![
-            out(line("web", 200, "/h1") + &line("web", 200, "/h2")),
-        ])
-        .boxed();
-        let live = stream::iter(vec![
-            out(line("web", 200, "/l1") + &line("web", 200, "/l2")),
-        ])
-        .boxed();
+        let history = stream_reader(stream::iter(vec![out(
+            line("web", 200, "/h1") + &line("web", 200, "/h2")
+        )]));
+        let live = stream_reader(stream::iter(vec![out(
+            line("web", 200, "/l1") + &line("web", 200, "/l2")
+        )]));
         let task = tokio::spawn(pump(
             history,
-            Some(async move { Ok(live) }),
-            Scan::new(name(), &q),
+            Some(FollowPlan::Reader(Box::new(live))),
+            Scan::new(name(), &q, UNIX_EPOCH),
             q.tail,
             tx,
             StreamDeadline(None),
@@ -924,18 +1089,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unterminated_history_fragment_does_not_spoil_the_first_live_line() {
+    async fn an_unterminated_history_fragment_is_completed_by_follow() {
         let q = query("follow=true");
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
-        let history = stream::iter(vec![out(
-            line("web", 200, "/h").trim_end().to_owned() + "\n{\"app\":\"we"
-        )])
-        .boxed();
-        let live = stream::iter(vec![out(line("web", 200, "/live"))]).boxed();
+        let full = line("web", 200, "/live");
+        let cut = full.len() - 10;
+        let history = stream_reader(stream::iter(vec![out(
+            line("web", 200, "/h") + &full[..cut]
+        )]));
+        let live = stream_reader(stream::iter(vec![out(full[cut..].to_owned())]));
         let task = tokio::spawn(pump(
             history,
-            Some(async move { Ok(live) }),
-            Scan::new(name(), &q),
+            Some(FollowPlan::Reader(Box::new(live))),
+            Scan::new(name(), &q, UNIX_EPOCH),
             None,
             tx,
             StreamDeadline(None),
@@ -947,13 +1113,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_follow_that_cannot_be_opened_is_an_error_frame_without_its_text() {
+    async fn a_follow_that_cannot_be_read_is_an_error_frame_without_its_text() {
         let q = query("follow=true");
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
+        let live = stream_reader(stream::iter(vec![Err(io::Error::other(
+            "/run/user/1000/podman.sock: secret",
+        ))]));
         let task = tokio::spawn(pump(
-            stream::iter(Vec::new()).boxed(),
-            Some(async { Err(PodmanError::Protocol("/run/user/1000/podman.sock".into())) }),
-            Scan::new(name(), &q),
+            stream_reader(stream::iter(Vec::new())),
+            Some(FollowPlan::Reader(Box::new(live))),
+            Scan::new(name(), &q, UNIX_EPOCH),
             None,
             tx,
             StreamDeadline(None),
@@ -983,9 +1152,9 @@ mod tests {
         let q = query("");
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
         let task = tokio::spawn(pump(
-            foreign,
-            None::<NoFollow>,
-            Scan::new(name(), &q),
+            stream_reader(foreign),
+            None,
+            Scan::new(name(), &q, UNIX_EPOCH),
             None,
             tx,
             deadline,
@@ -1014,9 +1183,9 @@ mod tests {
         let (ended, got) = tokio::time::timeout(
             Duration::from_secs(10),
             pump(
-                all,
-                None::<NoFollow>,
-                Scan::new(name(), &q),
+                stream_reader(all),
+                None,
+                Scan::new(name(), &q, UNIX_EPOCH),
                 None,
                 tx,
                 deadline,
@@ -1048,9 +1217,9 @@ mod tests {
         let q = query("");
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
         let task = tokio::spawn(pump(
-            logs,
-            None::<NoFollow>,
-            Scan::new(name(), &q),
+            stream_reader(logs),
+            None,
+            Scan::new(name(), &q, UNIX_EPOCH),
             None,
             tx,
             StreamDeadline(None),
@@ -1065,14 +1234,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_podman_failure_mid_stream_is_an_error_frame_without_its_text() {
+    async fn a_file_error_mid_stream_is_an_error_frame_without_its_text() {
         let (frames, _) = history_of(
             "",
             vec![
                 out(line("web", 200, "/a")),
-                Err(PodmanError::Protocol(
-                    "/run/user/1000/podman.sock: secret".into(),
-                )),
+                Err(io::Error::other("/run/user/1000/podman.sock: secret")),
             ],
         )
         .await;

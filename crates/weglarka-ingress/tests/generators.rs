@@ -327,7 +327,7 @@ port = 3003
 fn access_log_skip_paths_render_maps_and_a_conditional_log() {
     let conf = nginx::generate(&host(), &apps(ACCESS_LOG_SKIP_APPS), &opts()).unwrap();
     assert!(
-        conf.contains("access_log /dev/stdout weglarka if=$weglarka_loggable;"),
+        conf.contains("access_log /var/log/weglarka/access.log weglarka if=$weglarka_loggable;"),
         "{conf}"
     );
     // A trailing slash is a prefix, anything else is anchored; the dots are escaped.
@@ -348,7 +348,10 @@ fn access_log_skip_paths_render_maps_and_a_conditional_log() {
 #[test]
 fn empty_access_log_skip_paths_leave_the_config_untouched() {
     let conf = nginx::generate(&host(), &apps(BODY_LIMIT_APPS), &opts()).unwrap();
-    assert!(conf.contains("access_log /dev/stdout weglarka;"), "{conf}");
+    assert!(
+        conf.contains("access_log /var/log/weglarka/access.log weglarka;"),
+        "{conf}"
+    );
     assert!(!conf.contains("weglarka_loggable"), "{conf}");
     assert!(!conf.contains("weglarka_skip_path"), "{conf}");
 }

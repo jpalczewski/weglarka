@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
 use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
-use weglarka_model::config::IngressMode;
+use weglarka_model::config::{IngressMode, LogRetention};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
@@ -115,6 +115,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
+    logs(d, &mut checks);
     acme(d, scan_certificates(d).await.as_deref(), &mut checks);
     generated(d, &mut checks);
     identity_provider(d, &mut checks).await;
@@ -2062,6 +2063,63 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             ),
         ));
     }
+}
+
+/// `logs.retention` (issue #502, ADR 0070): the configured period, the files on disk and the last
+/// pass. Never mentions log content; the size and the file count are safe.
+fn logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    const ID: &str = "logs.retention";
+    let dir = d.ingress.logs_dir();
+    let (files, bytes) = crate::log_retention::scan(dir).unwrap_or((0, 0));
+    let location = format!(
+        "{} ({} files, {})",
+        dir.display(),
+        files,
+        human_bytes(bytes)
+    );
+    let retention = d.host.logs.retention;
+    let mut message = match retention {
+        LogRetention::Days(days) => format!("keeping ingress logs for {days} days in {location}"),
+        LogRetention::Unlimited(_) => format!("keeping ingress logs indefinitely in {location}"),
+    };
+    let mut status = CheckStatus::Ok;
+    let mut hint = None;
+    if retention.is_unlimited() {
+        status = CheckStatus::Info;
+        hint = Some(
+            "set [logs] retention to a number of days; the access log contains visitor IP addresses",
+        );
+    }
+    if let Ok(meta) = std::fs::metadata(dir)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        status = CheckStatus::Warn;
+        message.push_str("; the directory is readable by other local users");
+        hint = Some("chmod 0700 the ingress log directory");
+    }
+    if let Some(last) = d.logs.last() {
+        message.push_str(&format!(
+            "; last pass removed {} file(s), freed {}",
+            last.report.deleted,
+            human_bytes(last.report.freed_bytes)
+        ));
+        if let Some(error) = last.error {
+            status = CheckStatus::Warn;
+            message.push_str(&format!("; last pass failed: {}", detail(error)));
+            hint = Some("fix the log directory or nginx; the next hourly pass retries");
+        }
+    } else {
+        // The first pass runs at startup; an early `doctor` may win the race, so this is not a warn.
+        if status == CheckStatus::Ok {
+            status = CheckStatus::Info;
+        }
+        message.push_str("; no retention pass has run yet");
+    }
+    let check = DoctorCheck::new(ID, status, message);
+    out.push(match hint {
+        Some(hint) => check.with_hint(hint),
+        None => check,
+    });
 }
 
 async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {

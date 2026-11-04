@@ -79,6 +79,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `oidc` (with `device_flow`, `allowed_groups`); the `[oidc_clients.<id>]` sections (with `device_flow`, `allowed_groups`) | [identity provider](identity-provider.md) |
 | `apps.toml`, apps | `metrics_port`, `metrics_path` (`weglarka apps update <app> --metrics-port none`) | [metrics](metrics.md) |
 | `apps.toml`, apps | `ingress.auth_policy`, `ingress.auth_groups` (generated into the provider's access rules since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
+| `weglarka.toml` | `[logs]` (whole section) | [log retention](log-retention.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
 | `weglarka.toml` | `[metrics]` | [metrics](metrics.md) |
@@ -101,6 +102,14 @@ container gets one more mount (`<nginx_conf_dir>/probe`), so the daemon recreate
 alike (in `edge` the forwarder holds connections meanwhile). Nothing changes in `apps.toml`, `state.toml` or
 `weglarka.toml`, so there is no field to remove. On a downgrade the older daemon recreates nginx with the old mounts
 and the unused `probe/` directory stays in `<nginx_conf_dir>`; remove it if you like.
+
+**Upgrading to the release with log retention ([ADR 0070](../decisions/0070-ingress-log-retention.md)):** nginx gets
+one more writable mount (`<state dir>/ingress-logs`) and the ingress hash moves to v6, so the container is recreated
+**once**. Request logs written to the old container's Podman log are lost with it — acceptable, and it removes data
+that would otherwise have no retention. The directory contains personal data (visitor IPs). On a downgrade remove the
+`[logs]` section **and** `<state dir>/ingress-logs`; the older daemon does not know the directory and does not prune
+it, and it recreates nginx with the old mounts to log to stdout again. Nothing changes in `apps.toml`, `state.toml` or
+`schema_version`.
 
 Notes:
 

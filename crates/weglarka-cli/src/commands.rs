@@ -429,8 +429,12 @@ pub(crate) fn report_deploy(json: bool, name: &InstanceName, resp: &DeployRespon
 async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {
     let resp: StatusResponse = client(o)?.call(endpoints::STATUS, &[], None::<&()>).await?;
     emit(json, &resp, || {
+        let logs = resp
+            .log_retention
+            .map(|retention| format!(", ingress logs kept: {retention}"))
+            .unwrap_or_default();
         format!(
-            "daemon {} (api {}), podman {}\n\n{}",
+            "daemon {} (api {}), podman {}{logs}\n\n{}",
             resp.daemon_version,
             resp.api_version,
             resp.podman_version,
