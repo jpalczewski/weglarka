@@ -11,9 +11,7 @@ use weglarka_model::release_set::{
     Channel, Component, Descriptor, DescriptorContext, INDEX_MEDIA_TYPE, MAX_DESCRIPTOR_BYTES,
     MAX_MANIFEST_BYTES, Repository, StrictDigest, parse_descriptor, parse_manifest,
 };
-use weglarka_registry::{
-    ImageRef, PublicKey, RegistryError, ReleaseRegistry, SigningKey, push_signature, verify,
-};
+use weglarka_registry::{ImageRef, PublicKey, ReleaseRegistry, SigningKey, push_signature, verify};
 
 use crate::assemble::{manifest_for, next_sequence, parse_set_tag, set_tag};
 
@@ -83,10 +81,6 @@ pub struct ReconcileOutcome {
     pub moved_to: Option<u64>,
     /// Immutable tags skipped because they carry no signature (orphans of a crashed run).
     pub skipped: Vec<String>,
-}
-
-fn is_not_found(error: &RegistryError) -> bool {
-    matches!(error, RegistryError::Status { status: 404, .. })
 }
 
 /// Fetches the signatures for `digest` and requires one to verify against `key`.
@@ -369,7 +363,7 @@ pub async fn read_pointer<R: ReleaseRegistry + ?Sized>(
         .await
     {
         Ok(fetched) => fetched,
-        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("cannot read the {channel} pointer"));
         }
@@ -436,7 +430,7 @@ pub async fn publish<R: ReleaseRegistry + ?Sized>(
             existing.digest,
             crate::assemble::sha256(&manifest_bytes)
         ),
-        Err(error) if is_not_found(&error) => {
+        Err(error) if error.is_not_found() => {
             // Blobs first: the manifest is only stored once everything it references exists.
             registry
                 .put_blob(repository, b"{}")
@@ -481,7 +475,7 @@ async fn read_pointer_structure<R: ReleaseRegistry + ?Sized>(
         .await
     {
         Ok(fetched) => fetched,
-        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("cannot read the {channel} pointer"));
         }
@@ -608,7 +602,7 @@ pub async fn reconcile<R: ReleaseRegistry + ?Sized>(
             .await
         {
             Ok(fetched) => fetched,
-            Err(error) if is_not_found(&error) => {
+            Err(error) if error.is_not_found() => {
                 skipped.push(tag);
                 continue;
             }

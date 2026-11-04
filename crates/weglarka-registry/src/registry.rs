@@ -197,6 +197,13 @@ pub enum RegistryError {
     PayloadDigestMismatch { expected: String, actual: String },
 }
 
+impl RegistryError {
+    /// True when the registry answered `404`: the manifest, tag or blob does not exist.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status { status: 404, .. })
+    }
+}
+
 /// [`Registry`] over the shared HTTP client (see [`crate::http`]).
 ///
 /// The anonymous Bearer token is cached in memory for the last registry+repository pair. The
@@ -1022,6 +1029,18 @@ mod tests {
 
     use super::*;
     use crate::testing::{FakeRegistry, TestSigner, payload_for};
+
+    #[test]
+    fn only_a_404_status_is_not_found() {
+        let status = |status| RegistryError::Status {
+            status,
+            what: "manifest",
+        };
+        assert!(status(404).is_not_found());
+        assert!(!status(401).is_not_found());
+        assert!(!status(500).is_not_found());
+        assert!(!RegistryError::AuthChallenge.is_not_found());
+    }
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
