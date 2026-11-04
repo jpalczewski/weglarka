@@ -58,15 +58,21 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   removes **nothing** and forgets nothing, instead of pruning the images it could still attribute. `weglarka images
   prune` (also `--dry-run`) then fails with the reason; after a deploy the reason is logged as a warning and the deploy
   is unaffected. Fix the file or the disk (`doctor` shows the same condition) and run it again. The inventory is also
-  proven writable before the first removal, so a read-only or full state directory cannot leave images deleted but
-  still recorded. (Should the final write that forgets the removed images fail anyway, the stale records are harmless —
-  they name images that are gone — and the pass reports the failure and blocks further cleanup.)
-- **A pull that is still `loading` blocks retention.** A reservation is published before the pull, when the image ID and
-  digest are not known yet, so it cannot name an image to protect; the key it uses is its phase. While any reservation
-  is `loading`, retention is blocked for every owner and repository, with a diagnostic naming the operation. It ends
-  when the acquisition advances to `loaded` (the image ID and digest then protect it), when the reservation is
-  reclaimed after a reboot, or with `weglarka images reservations abandon`. This only matters after a cancelled or
-  crashed pull: during a pull the image lock already holds retention off.
+  checked writable before the first removal, so a read-only state directory cannot leave images deleted but still
+  recorded. The check cannot rule out a disk that fills up during the removals: if the final write that forgets the
+  removed images fails, those images are already gone, their records remain in `managed-images.toml`, and the command
+  fails naming how many images had been removed. Those records belong to deleted images; the image ID is a content
+  hash, so pulling the same image again makes the old record apply to it again.
+- **A pull that is still `loading` disables adoption.** A reservation is published before the pull, when the image ID
+  and digest are not known yet, so it cannot name an image to protect. Pulls and prunes are serialized by the image
+  lock, so a `loading` reservation a prune can see belongs to a pull that was cancelled or failed early. The only image
+  at risk is one that was (partly) pulled and is recorded nowhere: such an image is unattributed, and the only way it
+  could ever be removed is adoption by repository name. While any reservation is `loading`, the pass therefore adopts
+  nothing, and the rest of retention (images that already have records) runs normally. The diagnostic — in the prune
+  output and in `doctor` — names the operation. Nothing clears it automatically yet (reclaiming after a changed boot is
+  not scheduled, and a daemon restart alone does not end it): once the owner is known to be gone, run
+  `weglarka images reservations abandon <operation-id> --yes`. An acquisition that advances to `loaded` protects its
+  image by ID and digest from then on.
 - **Warning in `doctor`:** the `runtime.images` check reports `warn` with the number of unused images and their size
   ("at most", since shared layers are counted per image), and the `hint` points to `weglarka images prune`. During a
   deploy the check is informational (`info`).

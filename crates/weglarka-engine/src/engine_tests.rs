@@ -1869,13 +1869,10 @@ async fn prune_images_dry_run_then_removes_leftovers() {
     assert_eq!(ids, ['a'.to_string().repeat(64)], "only the running image");
 }
 
-/// An adoption that cannot be persisted (here: a read-only state directory) means provenance is
+/// An adoption that cannot be persisted (an injected write failure) means provenance is
 /// incomplete: the whole prune is blocked, nothing is removed, nothing is forgotten.
-#[cfg(unix)]
 #[tokio::test(start_paused = true)]
 async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
-    use std::os::unix::fs::PermissionsExt;
-
     let h = Harness::new(NTFY);
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.fake.script_health("ntfy", [HealthStatus::Healthy]);
@@ -1885,17 +1882,8 @@ async fn prune_does_not_delete_an_image_whose_adoption_could_not_be_recorded() {
     h.fake.image_pull(&stale).collect::<Vec<_>>().await;
     let inventory_before = std::fs::read(h.dir.path().join("managed-images.toml")).ok();
 
-    let dir = h.dir.path();
-    let original = std::fs::metadata(dir).unwrap().permissions();
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    if std::fs::File::create(dir.join("probe")).is_ok() {
-        // Permissions are not enforced (running as root): the failure cannot be provoked.
-        std::fs::set_permissions(dir, original).unwrap();
-        return;
-    }
-    let out = h.rec.prune_images(false).await;
-    std::fs::set_permissions(dir, original).unwrap();
-    let out = out.unwrap();
+    crate::images::write_count::fail_nth_write(1);
+    let out = h.rec.prune_images(false).await.unwrap();
 
     assert!(out.blocked, "{out:?}");
     assert!(out.removed.is_empty() && out.failed.is_empty(), "{out:?}");
@@ -6044,7 +6032,8 @@ mod retention {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         if std::fs::File::create(dir.join("probe")).is_ok() {
             std::fs::set_permissions(&dir, original).unwrap();
-            return; // permissions are not enforced (running as root)
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
+            return;
         }
         let report = h.rec.prune_images(false).await;
         std::fs::set_permissions(&dir, original).unwrap();
@@ -6129,10 +6118,89 @@ mod retention {
         .unwrap();
     }
 
-    /// A reservation that is still `loading` names no image yet, so it protects the pull by
-    /// blocking retention for every owner and repository until it advances, finishes or is abandoned.
+    /// A recorded image the spec no longer names, plus an unrecorded one that only its repository
+    /// digest ties to the app: a real pass would remove the first and could adopt the second.
+    fn recorded_and_unrecorded_leftovers(h: &Harness) -> (String, String) {
+        let recorded = 'e'.to_string().repeat(64);
+        h.fake.add_image(leftover_image('e'));
+        let mut inventory = read_inventory(h);
+        inventory
+            .images
+            .push(owned(&recorded, app("ntfy"), REPO, 'e'));
+        write_inventory(h, inventory.images);
+        let unrecorded = 'd'.to_string().repeat(64);
+        let mut image = leftover_image('d');
+        image.repo_tags = Vec::new();
+        image.repo_digests = vec![format!("{REPO}@{}", digest('d'))];
+        h.fake.add_image(image);
+        (recorded, unrecorded)
+    }
+
+    /// A reservation that is still `loading` names no image yet. The image it was pulling is at
+    /// risk only while nothing records it, and an unrecorded image becomes removable solely through
+    /// adoption: so adoption is skipped (with a diagnostic naming the operation) while the rest of
+    /// retention runs.
     #[tokio::test(start_paused = true)]
-    async fn a_loading_reservation_blocks_retention_until_it_is_abandoned() {
+    async fn a_loading_reservation_disables_adoption_until_it_is_abandoned() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        let (recorded, unrecorded) = recorded_and_unrecorded_leftovers(&h);
+        loading_reservation(&h, "pull-1");
+        let inventory_before = std::fs::read(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap();
+
+        // The preview (dry run, doctor) agrees with the real pass.
+        let (preview, diagnostics) = h
+            .rec
+            .retention_preview(RetentionScope::AllManaged)
+            .await
+            .unwrap();
+        assert_eq!(ids(&preview.remove), std::slice::from_ref(&recorded));
+        assert!(diagnostics.iter().any(|d| d.contains("pull-1")));
+
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert_eq!(
+            ids(&report.removed),
+            std::slice::from_ref(&recorded),
+            "an already recorded image is still removed"
+        );
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.contains("pull-1"))
+            .unwrap_or_else(|| panic!("the diagnostic names the operation: {report:?}"));
+        assert!(
+            diagnostic.contains("weglarka images reservations abandon")
+                && diagnostic.contains("--yes"),
+            "{diagnostic}"
+        );
+        assert!(
+            ids(&h.fake.images()).contains(&unrecorded),
+            "the unrecorded image is not adopted, so it is not removed"
+        );
+        let inventory = read_inventory(&h);
+        assert!(
+            inventory.get(&image_id(&unrecorded)).is_none(),
+            "{inventory:?}"
+        );
+        assert_ne!(
+            std::fs::read(state_dir(&h).join(INVENTORY_FILE_NAME)).unwrap(),
+            inventory_before,
+            "only the removed image's record was forgotten"
+        );
+
+        // Once the reservation is gone the same image is adopted and removed as before.
+        let operation = OperationId::new("pull-1").unwrap();
+        assert!(h.rec.abandon_reservation(&operation).await.unwrap());
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert_eq!(ids(&report.removed), [unrecorded], "{report:?}");
+    }
+
+    /// The final write that forgets removed images fails after the removals: the report keeps the
+    /// truth (`blocked`, the images that are gone) and their records stay.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_forget_after_removal_reports_blocked_with_the_removed_images() {
         let h = Harness::new(NTFY);
         deploy(&h, "ntfy", 'a').await;
         let old = 'e'.to_string().repeat(64);
@@ -6140,29 +6208,30 @@ mod retention {
         let mut inventory = read_inventory(&h);
         inventory.images.push(owned(&old, app("ntfy"), REPO, 'e'));
         write_inventory(&h, inventory.images);
-        loading_reservation(&h, "pull-1");
 
+        // Write 1 is the writability check, write 2 is the one that forgets.
+        crate::images::write_count::fail_nth_write(2);
         let report = h.rec.prune_images(false).await.unwrap();
+
         assert!(report.blocked, "{report:?}");
-        assert!(
-            report.diagnostics.iter().any(|d| d.contains("pull-1")),
-            "the diagnostic names the operation: {report:?}"
+        assert_eq!(
+            ids(&report.removed),
+            std::slice::from_ref(&old),
+            "{report:?}"
         );
-        assert_eq!(h.fake.image_remove_calls(), 0);
-        assert!(ids(&h.fake.images()).contains(&old));
-        // The doctor/dry-run preview agrees.
+        assert_eq!(h.fake.image_remove_calls(), 1);
+        assert!(!ids(&h.fake.images()).contains(&old));
         assert!(
-            h.rec
-                .retention_preview(RetentionScope::AllManaged)
-                .await
-                .is_err()
+            read_inventory(&h).get(&image_id(&old)).is_some(),
+            "the record could not be forgotten"
         );
-
-        let operation = OperationId::new("pull-1").unwrap();
-        assert!(h.rec.abandon_reservation(&operation).await.unwrap());
-        let report = h.rec.prune_images(false).await.unwrap();
-        assert!(!report.blocked, "{report:?}");
-        assert!(ids(&report.removed).contains(&old), "{report:?}");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("injected write failure")),
+            "{report:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

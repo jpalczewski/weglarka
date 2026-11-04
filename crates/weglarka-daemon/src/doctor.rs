@@ -702,7 +702,8 @@ async fn image_retention<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChe
             diagnostic,
             Some(
                 "platform-image retention waits for `weglarka platform bootstrap` to write \
-                 host-capabilities.toml",
+                 host-capabilities.toml; a stuck image acquisition is ended with `weglarka images \
+                 reservations abandon <operation-id> --yes` once its owner is gone",
             ),
         ));
     }

@@ -122,6 +122,33 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_report_after_removals_says_how_many_images_are_gone() {
+        let gone = ImageInfo {
+            id: "e".repeat(64),
+            digest: None,
+            standalone_digest: None,
+            repo_tags: Vec::new(),
+            repo_digests: Vec::new(),
+            size_bytes: 100,
+            labels: Default::default(),
+        };
+        let report = PruneReport {
+            blocked: true,
+            removed: vec![gone.clone(), gone],
+            diagnostics: vec!["managed-images.toml: disk full".into()],
+            ..PruneReport::default()
+        };
+        let Err(Fail(_, message)) = reply(report) else {
+            panic!("a blocked pass must be an error");
+        };
+        assert!(message.contains("disk full"), "{message}");
+        assert!(
+            message.contains("2 image(s) had already been removed"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn an_unblocked_report_is_a_response() {
         assert!(reply(PruneReport::default()).is_ok());
     }

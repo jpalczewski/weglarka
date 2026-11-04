@@ -16,9 +16,9 @@
 //! applied after the lock was dropped.
 //!
 //! Fail-closed: a corrupt/unsupported inventory, an unreadable journal or self-update record, an
-//! adoption that cannot be recorded, or a reservation still `loading` blocks the whole pass
-//! ([`PruneReport::blocked`]: nothing is removed or forgotten); a host without capabilities
-//! disables only the platform deletion it would need. `dry-run` and `doctor` share the same input
+//! adoption that cannot be recorded blocks the whole pass ([`PruneReport::blocked`]: nothing is
+//! removed or forgotten); a reservation still `loading` disables adoption for the pass; a host
+//! without capabilities disables only the platform deletion it would need. `dry-run` and `doctor` share the same input
 //! builder and planner; they never adopt images or mutate bookkeeping.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,22 +46,42 @@ use weglarka_model::release_set::{Repository, StrictDigest};
 use weglarka_model::state::{self, StateFile};
 
 /// Test-only counter of atomic writes to `managed-images.toml`, for the "one read, one write"
-/// assertion of [`InventoryStore::record_many`]. Thread-local so parallel tests stay independent.
+/// assertion of [`InventoryStore::record_many`], and a seam that makes a chosen upcoming write fail
+/// (a full disk, without depending on file permissions). Thread-local so parallel tests stay
+/// independent.
 #[cfg(test)]
-mod write_count {
+pub(crate) mod write_count {
     use std::cell::Cell;
 
     thread_local! {
         static INVENTORY_WRITES: Cell<usize> = const { Cell::new(0) };
+        static FAIL_IN: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
-    pub(super) fn bump() {
+    /// Counts one write; `true` when this write must fail (see [`fail_nth_write`]).
+    pub(super) fn bump() -> bool {
         INVENTORY_WRITES.with(|count| count.set(count.get() + 1));
+        FAIL_IN.with(|fail| match fail.get() {
+            Some(1) => {
+                fail.set(None);
+                true
+            }
+            Some(n) => {
+                fail.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
     }
 
     /// Returns the count since the last call and resets it to zero.
-    pub(super) fn take() -> usize {
+    pub(crate) fn take() -> usize {
         INVENTORY_WRITES.with(|count| count.replace(0))
+    }
+
+    /// Makes the `n`th inventory write from now on (1 = the next one) fail once.
+    pub(crate) fn fail_nth_write(n: usize) {
+        FAIL_IN.with(|fail| fail.set(Some(n)));
     }
 }
 
@@ -116,7 +136,8 @@ pub struct PruneReport {
     pub diagnostics: Vec<String>,
     /// Provenance could not be read or written, so **all** destructive cleanup was disabled for this
     /// pass: nothing was removed and nothing forgotten. The one exception is a failure to forget
-    /// images that were already removed (their stale records are harmless). `diagnostics` says why.
+    /// images that were already removed: `removed` then lists them and their inventory records
+    /// remain. `diagnostics` says why.
     pub blocked: bool,
 }
 
@@ -437,9 +458,14 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     fn write_inventory(&self, inventory: &Inventory) -> Result<(), EngineError> {
-        #[cfg(test)]
-        write_count::bump();
         let path = self.inventory_path();
+        #[cfg(test)]
+        if write_count::bump() {
+            return Err(EngineError::ImageBookkeeping(format!(
+                "{}: injected write failure",
+                path.display()
+            )));
+        }
         let text = inventory
             .to_toml()
             .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))?;
@@ -483,9 +509,9 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Begins an acquisition: a durable reservation in phase `loading`, published **before** any
-    /// pull/load/tag mutation. While it is `loading` it protects whatever is being pulled by
-    /// blocking retention altogether; [`Self::advance_acquisition`] replaces that with the image's
-    /// identities. The caller must hold the image guard.
+    /// pull/load/tag mutation. While it is `loading` it protects whatever is being pulled by making
+    /// retention skip adoption ([`loading_operations`]); [`Self::advance_acquisition`] replaces that
+    /// with the image's identities. The caller must hold the image guard.
     pub(crate) async fn begin_acquisition(
         &self,
         guard: &ImageGuard<'_>,
@@ -505,7 +531,7 @@ impl<P: PodmanClient> Reconciler<P> {
             created_at: now_secs(),
         };
         // No image identity is known yet, so the reservation carries no protections; its `loading`
-        // phase blocks retention instead (see `refuse_while_loading`). The owner and repository are
+        // phase makes retention skip adoption instead (see [`loading_operations`]). The owner and repository are
         // recorded on the inventory entry by [`Self::record_acquisition`].
         ReservationStore::reserve(self, guard, operation.clone(), &reservation).await?;
         Ok(operation)
@@ -781,7 +807,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let st = state::load_state(&self.paths.state)?;
         let inventory = self.read_inventory()?;
         let reservations = self.read_reservations()?;
-        refuse_while_loading(&reservations)?;
+        let loading = loading_operations(&reservations);
         let journal = self.read_platform_journal()?;
         let self_update =
             weglarka_model::self_update::load(&self.bookkeeping_dir()).map_err(|e| {
@@ -808,7 +834,14 @@ impl<P: PodmanClient> Reconciler<P> {
             format_version: inventory.format_version,
             images: inventory.images.clone(),
         };
-        let requests = adopt_requests(&images, &apps, &inventory, &scope);
+        // A pull that is still `loading` may have left a partly pulled image that nothing records
+        // yet; the only way such an image becomes removable is adoption, so adoption is skipped.
+        let requests = if loading.is_empty() {
+            adopt_requests(&images, &apps, &inventory, &scope)
+        } else {
+            diagnostics.push(loading_diagnostic(&loading));
+            Vec::new()
+        };
         if let Some(guard) = adopt {
             // A real prune persists the adoptions **before** it can plan a removal from them. If the
             // batch cannot be written (full disk, read-only file) provenance is incomplete and the
@@ -931,8 +964,8 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut report = execute(&self.podman, &guard, plan).await;
         report.diagnostics = prepared.diagnostics;
         // A failed deletion keeps its record: only successfully removed images are forgotten. A
-        // record that outlives its image is harmless (the planner skips an absent image), so a
-        // failed write here blocks further cleanup but undoes nothing.
+        // record that outlives its image is skipped by the planner while the image is absent, so a
+        // failed write here is reported (`blocked`, with the true `removed` list) and undoes nothing.
         if let Err(e) = self.forget_removed(&guard, &report) {
             report.blocked = true;
             report.diagnostics.push(e.to_string());
@@ -1050,27 +1083,32 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 }
 
-/// A reservation in phase `loading` has not learned its image id or digest yet, so it can name no
-/// protection: the pull it guards may have produced (or be about to replace) any local image. The
-/// only key available without a new field in `image-reservations.toml` is the phase itself, so while
-/// one exists retention is blocked for **every** owner and repository. It ends when the acquisition
-/// advances to `loaded` (identities protect from then on) or finishes, when the reservation is
-/// reclaimed after a reboot, or with `weglarka images reservations abandon`.
-fn refuse_while_loading(reservations: &Reservations) -> Result<(), EngineError> {
-    let loading: Vec<String> = reservations
+/// Operation ids of the reservations still in phase `loading`.
+///
+/// Such a reservation has not learned its image id or digest, so it can name no protection (the file
+/// has no field for the pull's target). Acquisitions and prunes serialize under the engine guard, so
+/// any `loading` reservation a pass can see is orphaned (a cancelled upload, an early return); the
+/// image it was pulling is at risk only if nothing records it, because an unrecorded image is
+/// unattributed and becomes removable solely through repository-name **adoption**. While one exists,
+/// the pass therefore skips adoption (fail closed for exactly those images) and the rest of
+/// retention runs normally. The operator ends it with `weglarka images reservations abandon`; until
+/// that is automated, abandonment is manual.
+fn loading_operations(reservations: &Reservations) -> Vec<String> {
+    reservations
         .operations
         .iter()
         .filter(|entry| entry.reservation.phase == ReservationPhase::Loading)
         .map(|entry| entry.operation_id.to_string())
-        .collect();
-    if loading.is_empty() {
-        return Ok(());
-    }
-    Err(EngineError::ImageBookkeeping(format!(
-        "image acquisition {} is still loading; retention waits for it to finish, or abandon it with \
-         `weglarka images reservations abandon <operation-id>` when its owner is gone",
+        .collect()
+}
+
+fn loading_diagnostic(loading: &[String]) -> String {
+    format!(
+        "image acquisition {} is still loading: images without a record are not adopted until it \
+         is abandoned with `weglarka images reservations abandon <operation-id> --yes` (once its \
+         owner is gone)",
         loading.join(", ")
-    )))
+    )
 }
 
 /// The conflict an upsert rejects: one manifest digest never names two local image ids.
@@ -1772,6 +1810,7 @@ mod tests {
         if std::fs::File::create(dir.path().join("probe")).is_ok() {
             // Permissions are not enforced (running as root): the failure cannot be provoked.
             restore(0o755);
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
             return;
         }
 
