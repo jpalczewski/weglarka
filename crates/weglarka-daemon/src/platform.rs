@@ -1546,8 +1546,17 @@ mod tests {
             _: &str,
             args: &[String],
             _: &[(String, String)],
-        ) -> io::Result<(bool, String)> {
-            Ok((!args.iter().any(|a| a == "disable"), String::new()))
+        ) -> io::Result<CommandOutput> {
+            let disable = args.iter().any(|a| a == "disable");
+            Ok(CommandOutput {
+                success: !disable,
+                stdout: String::new(),
+                stderr: if disable {
+                    "Failed to disable unit: Access denied".to_owned()
+                } else {
+                    String::new()
+                },
+            })
         }
     }
 

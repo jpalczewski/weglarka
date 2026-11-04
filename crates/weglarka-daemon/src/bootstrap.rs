@@ -916,8 +916,12 @@ image = "ghcr.io/example/weglarka:latest"
             _: &str,
             _: &[String],
             _: &[(String, String)],
-        ) -> std::io::Result<(bool, String)> {
-            Ok((true, String::new()))
+        ) -> std::io::Result<crate::platform::CommandOutput> {
+            Ok(crate::platform::CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         }
     }
 
