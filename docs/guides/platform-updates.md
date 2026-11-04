@@ -28,11 +28,15 @@ numbered steps without applying them:
 weglarka-daemon --config /etc/weglarka/weglarka.toml platform bootstrap --generation sha256:<digest> --dry-run
 ```
 
-The preflight of the tools runs on a verified private copy next to the host-only directory (removed again afterwards).
-On OpenRC the preflight also needs the runtime user's Podman socket and the cron service, which bootstrap itself
-provisions, so there it still runs after those steps, as the last check before the bootstrap-complete marker is written.
-Two races stay checked while applying: the legacy lock is looked at again once the legacy timers are off, and the
-launcher and tool sources are validated again when they are read.
+A dry run needs the same privileges as the real run and writes nothing that outlives it. The preflight of the tools
+runs on a verified private copy in a `.weglarka-bootstrap-plan-*` directory (mode 0700) next to the host-only
+directory, whose parent directory must therefore exist; it is removed when the run ends, and leftovers of a killed run
+are removed by the next one. An existing generation directory is verified read-only (the `.verified` cache record is
+not rewritten). On OpenRC the preflight also needs the runtime user's Podman socket and the cron service, which
+bootstrap itself provisions, so there it still runs after those steps, as the last check before the bootstrap-complete
+marker is written. Two things are deliberately looked at again while applying: the legacy lock once the legacy timers
+are off, and `self-update.toml`, which is read, imported and retired only then, so a legacy timer firing during a long
+preflight cannot make bootstrap import a stale copy. The launcher and tool sources are validated again when they are read.
 
 ## Downgrade
 

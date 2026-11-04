@@ -7,7 +7,7 @@ expression: "plan.to_string().replace(dir.path().to_str().unwrap(), \"[root]\")"
  3. enable linger for weglarka
  4. install generation sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daemon [root]/src-daemon, cli [root]/src-cli)
  5. retire legacy self-update/watchdog units and lock
- 6. import legacy self-update state and retire the file
+ 6. import legacy self-update state (if any) and retire the file
  7. select generation sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (epoch 1)
  8. write host capabilities
  9. install launcher jobs: update, watchdog
