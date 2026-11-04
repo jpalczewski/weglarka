@@ -3,13 +3,15 @@
 //! Two independent budgets keep a crash loop from running forever:
 //!
 //! - The daemon service launcher owns a start-attempt budget **per activation epoch** and records a
-//!   blocked marker when it is exhausted, while staying alive so a new selection can start.
+//!   blocked marker when it is exhausted, while staying alive so a new selection can start. A run
+//!   longer than the stability threshold clears the counter, so only a crash loop exhausts it.
 //! - The stable launcher records a recovery attempt **before** every recovery exec, so a failing
 //!   recovery binary cannot be restarted forever and a process restart cannot reset the budget.
 //!
 //! Both files are host-only, atomic and mode 0600.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use weglarka_model::fsutil::write_atomic;
@@ -84,7 +86,36 @@ fn save<T: Serialize>(path: &Path, value: &T, file: &'static str) -> Result<(), 
     Ok(())
 }
 
+/// Whether a container run lasted long enough to count as healthy rather than a crash loop.
+pub fn run_was_stable(ran: Duration, stable_after: Duration) -> bool {
+    ran > stable_after
+}
+
+/// Delay before retry number `failures` (1-based): `base`, `2 × base`, `4 × base`, … never above
+/// `cap`. No failures, no delay.
+pub fn backoff_delay(failures: u32, base: Duration, cap: Duration) -> Duration {
+    let Some(doublings) = failures.checked_sub(1) else {
+        return Duration::ZERO;
+    };
+    // 2^31 × base is far beyond any cap; the clamp only keeps the shift defined.
+    base.saturating_mul(1 << doublings.min(31)).min(cap)
+}
+
 impl ServiceAttempts {
+    /// The budget after a run of `ran`: a stable run proves the epoch works, so the next crash
+    /// starts counting from zero again. A short run changes nothing.
+    pub fn after_run(&self, ran: Duration, stable_after: Duration) -> Self {
+        if run_was_stable(ran, stable_after) {
+            Self {
+                attempts: 0,
+                blocked: false,
+                ..self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
+
     pub fn path(host_dir: &Path) -> PathBuf {
         host_dir.join(SERVICE_ATTEMPTS_FILE)
     }
@@ -129,6 +160,23 @@ pub fn note_service_attempt(
     Ok(Attempt {
         number: state.attempts,
     })
+}
+
+/// Records that the daemon container ran for `ran`. A run longer than `stable_after` clears the
+/// epoch's attempt counter (a daemon that survived a reboot or a long uptime is not a crash loop);
+/// returns whether it did.
+pub fn note_service_run(
+    host_dir: &Path,
+    epoch: u64,
+    ran: Duration,
+    stable_after: Duration,
+) -> Result<bool, BudgetError> {
+    let state = ServiceAttempts::load(host_dir, epoch)?;
+    let after = state.after_run(ran, stable_after);
+    if after != state {
+        after.save(host_dir)?;
+    }
+    Ok(run_was_stable(ran, stable_after))
 }
 
 /// Marks the current epoch as blocked without consuming another attempt.
@@ -220,6 +268,39 @@ mod tests {
         assert!(ServiceAttempts::load(dir.path(), 4).unwrap().blocked);
         // A new selection (epoch) starts a fresh budget.
         assert_eq!(note_service_attempt(dir.path(), 5, 3).unwrap().number, 1);
+    }
+
+    #[test]
+    fn only_a_run_longer_than_the_threshold_is_stable() {
+        let after = Duration::from_secs(600);
+        assert!(!run_was_stable(Duration::from_secs(599), after));
+        assert!(!run_was_stable(after, after));
+        assert!(run_was_stable(Duration::from_secs(601), after));
+    }
+
+    #[test]
+    fn the_backoff_doubles_up_to_the_cap() {
+        let (base, cap) = (Duration::from_secs(2), Duration::from_secs(60));
+        let delays: Vec<u64> = (0..=8)
+            .map(|n| backoff_delay(n, base, cap).as_secs())
+            .collect();
+        assert_eq!(delays, [0, 2, 4, 8, 16, 32, 60, 60, 60]);
+        // Absurd failure counts neither overflow nor exceed the cap.
+        assert_eq!(backoff_delay(u32::MAX, base, cap), cap);
+    }
+
+    #[test]
+    fn a_stable_run_resets_the_counter_and_a_short_one_keeps_it() {
+        let state = ServiceAttempts {
+            format_version: FORMAT_VERSION,
+            epoch: 4,
+            attempts: 3,
+            blocked: false,
+        };
+        let after = Duration::from_secs(600);
+        assert_eq!(state.after_run(Duration::from_secs(5), after), state);
+        let reset = state.after_run(Duration::from_secs(601), after);
+        assert_eq!((reset.epoch, reset.attempts), (4, 0));
     }
 
     #[test]

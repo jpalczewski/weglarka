@@ -385,6 +385,12 @@ when it is exhausted, leaving the service active so a new selection can start. T
 `rc-service start`; the watchdog writes a new selection and the still-supervised launcher picks it up. Exhaustion
 must not leave a permanently inactive service that only root can revive.
 
+A container run longer than a stability threshold (default 10 minutes) clears the epoch's attempt counter, so a
+reboot or a rare crash never exhausts the budget; only a crash loop does. Consecutive failures (missing socket,
+failed create, a run shorter than the threshold) back off exponentially (default 2 s, doubling, capped at 60 s). A
+launcher that finds no service selection, at start or after it disappears, exits non-zero with a clear message and
+the supervisor restarts it, instead of idling without a selection.
+
 Use Alpine's BusyBox crond with installer-provisioned entries in the runtime user's crontab, invoking only the
 fixed launcher roles once per minute. The updater enforces the configured longer interval; watchdog checks every
 tick. Preserve unrelated crontab entries, mark the managed block, and remove only that block on uninstall. Jobs run

@@ -267,3 +267,21 @@ fn the_cli_role_passes_stdin_through_to_the_cli() {
         "hello from stdin\n"
     );
 }
+
+#[test]
+fn the_daemon_service_without_a_selection_exits_non_zero() {
+    let fixture = fixture("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+    let output = launcher()
+        .args([
+            "--host-dir",
+            fixture.host.to_str().unwrap(),
+            "daemon-service",
+            "--runtime-dir",
+            fixture.root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no service selection"), "{stderr}");
+}
