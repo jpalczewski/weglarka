@@ -21,7 +21,7 @@ use weglarka_launcher::run::{
 };
 use weglarka_launcher::selection::{Job, RuntimeJobs};
 use weglarka_launcher::selector::HostSelector;
-use weglarka_launcher::service::{ProcessRunner, ServiceOptions, run_service};
+use weglarka_launcher::service::{ProcessRunner, ServiceOptions, SystemClock, run_service};
 
 #[derive(Parser)]
 #[command(
@@ -135,6 +135,7 @@ fn main() -> Result<()> {
             }
             run_service(
                 &ProcessRunner,
+                &SystemClock::new(),
                 &ServiceOptions {
                     host_dir,
                     runtime_dir,

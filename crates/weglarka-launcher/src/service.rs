@@ -14,7 +14,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::budget::{BudgetError, block_service_epoch, note_service_attempt};
 use crate::inspect;
@@ -71,6 +71,46 @@ impl CommandRunner for ProcessRunner {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
+    }
+}
+
+/// Time source of the service loop, substituted in tests so they neither sleep nor wait for a
+/// container to run for minutes.
+pub trait Clock {
+    /// Monotonic time since an arbitrary fixed origin.
+    fn now(&self) -> Duration;
+
+    /// Blocks the calling thread for `duration`.
+    fn sleep(&self, duration: Duration);
+}
+
+/// The real monotonic clock.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemClock {
+    origin: Instant,
+}
+
+impl SystemClock {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for SystemClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
     }
 }
 
@@ -201,6 +241,7 @@ pub fn inspect(
 /// Runs the foreground service loop until the process is stopped by the init system.
 pub fn run_service(
     runner: &impl CommandRunner,
+    clock: &impl Clock,
     options: &ServiceOptions,
 ) -> Result<(), ServiceError> {
     loop {
@@ -208,12 +249,12 @@ pub fn run_service(
             Ok(Some(selection)) => selection,
             Ok(None) => {
                 // No selection yet: the service stays alive for the adapter to fill it in.
-                std::thread::sleep(options.poll);
+                clock.sleep(options.poll);
                 continue;
             }
             Err(error) => {
                 log_line(&format!("cannot read the service selection: {error}"));
-                std::thread::sleep(options.poll);
+                clock.sleep(options.poll);
                 continue;
             }
         };
@@ -222,7 +263,7 @@ pub fn run_service(
             Err(error) => {
                 // A missing socket at boot must not kill the supervised service.
                 log_line(&format!("cannot observe the daemon container: {error}"));
-                std::thread::sleep(options.poll);
+                clock.sleep(options.poll);
                 continue;
             }
         };
@@ -235,7 +276,7 @@ pub fn run_service(
                     runner.status(&options.podman, &["wait".to_owned(), id], &env(options));
                 if !waited.is_ok_and(|status| status.success()) {
                     // A failing `podman wait` returns at once; do not spin on it.
-                    std::thread::sleep(options.poll);
+                    clock.sleep(options.poll);
                 }
             }
             Step::Start { id } => {
@@ -252,14 +293,14 @@ pub fn run_service(
                             &env(options),
                         );
                     }
-                    Err(_) => block_and_wait(options, selection.epoch),
+                    Err(_) => block_and_wait(clock, options, selection.epoch),
                 }
             }
-            Step::Create => match create_and_start(runner, options, &selection) {
+            Step::Create => match create_and_start(runner, clock, options, &selection) {
                 Ok(()) => {}
                 Err(error) => {
                     log_line(&format!("cannot create the daemon container: {error}"));
-                    std::thread::sleep(options.poll);
+                    clock.sleep(options.poll);
                 }
             },
             Step::RemoveAndCreate { id } => {
@@ -269,23 +310,24 @@ pub fn run_service(
                     &env(options),
                 );
                 if !removed.is_ok_and(|output| output.success) {
-                    std::thread::sleep(options.poll);
+                    clock.sleep(options.poll);
                 }
             }
-            Step::Blocked { epoch } => block_and_wait(options, epoch),
+            Step::Blocked { epoch } => block_and_wait(clock, options, epoch),
         }
     }
 }
 
 fn create_and_start(
     runner: &impl CommandRunner,
+    clock: &impl Clock,
     options: &ServiceOptions,
     selection: &PlatformService,
 ) -> Result<(), ServiceError> {
     match note_service_attempt(&options.host_dir, selection.epoch, options.max_attempts) {
         Ok(_) => {}
         Err(BudgetError::Exhausted(_)) => {
-            block_and_wait(options, selection.epoch);
+            block_and_wait(clock, options, selection.epoch);
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -336,7 +378,7 @@ fn create_and_start(
     Ok(())
 }
 
-fn block_and_wait(options: &ServiceOptions, epoch: u64) {
+fn block_and_wait(clock: &impl Clock, options: &ServiceOptions, epoch: u64) {
     let _ = block_service_epoch(&options.host_dir, epoch);
     log_line(&format!(
         "attempt budget for epoch {epoch} exhausted; waiting for a new selection"
@@ -344,7 +386,7 @@ fn block_and_wait(options: &ServiceOptions, epoch: u64) {
     loop {
         match PlatformService::load(&options.host_dir) {
             Ok(Some(selection)) if selection.epoch != epoch => return,
-            _ => std::thread::sleep(options.poll),
+            _ => clock.sleep(options.poll),
         }
     }
 }
@@ -488,7 +530,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         selection(1).save(&host).unwrap();
         let (options, runner) = options(&host, true);
-        create_and_start(&runner, &options, &selection(1)).unwrap();
+        create_and_start(&runner, &SystemClock::new(), &options, &selection(1)).unwrap();
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|c| c.starts_with("create")));
         assert!(calls.iter().any(|c| c == "rm -f newid"), "{calls:?}");
@@ -505,7 +547,7 @@ mod tests {
         std::fs::create_dir_all(&host).unwrap();
         selection(1).save(&host).unwrap();
         let (options, runner) = options(&host, false);
-        create_and_start(&runner, &options, &selection(1)).unwrap();
+        create_and_start(&runner, &SystemClock::new(), &options, &selection(1)).unwrap();
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|c| c == "start -a newid"), "{calls:?}");
     }
@@ -522,7 +564,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             selection(2).save(&writer).unwrap();
         });
-        block_and_wait(&options, 1);
+        block_and_wait(&SystemClock::new(), &options, 1);
         assert_eq!(PlatformService::load(&host).unwrap().unwrap().epoch, 2);
     }
 
