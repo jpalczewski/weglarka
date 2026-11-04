@@ -1,0 +1,18 @@
+---
+source: crates/weglarka-daemon/src/bootstrap.rs
+expression: "plan.to_string().replace(dir.path().to_str().unwrap(), \"[root]\")"
+---
+ 1. create host directory [root]/host
+ 2. install launcher from [root]/src-launcher
+ 3. enable linger for weglarka
+ 4. install generation sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daemon [root]/src-daemon, cli [root]/src-cli)
+ 5. retire legacy self-update/watchdog units and lock
+ 6. import legacy self-update state (if any) and retire the file
+ 7. select generation sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (epoch 1)
+ 8. write host capabilities
+ 9. install launcher jobs: update, watchdog
+10. install service pinned to ghcr.io/example/weglarka@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+11. apply host directory ownership (uid 1001, gid 1001)
+12. preflight the active and recovery generation
+13. write the bootstrap-complete marker
+14. apply host directory ownership (uid 1001, gid 1001)

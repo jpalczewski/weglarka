@@ -15,6 +15,29 @@ crontab) are never touched, and a crontab without the managed block is not rewri
 has no end marker, the command stops with an error naming the file and changes nothing: remove the block by hand and
 run it again.
 
+## Bootstrap: check first
+
+`platform bootstrap` decides everything before it changes anything: it reads the host, runs the checks and only then
+executes the steps. A host that is already bootstrapped with another `--generation`, a legacy self-update runner that
+still holds `self-update.lock`, an unreadable `self-update.toml`, a launcher or tool that is not a regular file, a
+generation directory whose files differ from the tools being installed, or (on systemd) a tool that fails
+`host-preflight` is refused with nothing installed, retired or imported. `--dry-run` runs the same checks and prints the
+numbered steps without applying them:
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform bootstrap --generation sha256:<digest> --dry-run
+```
+
+A dry run needs the same privileges as the real run and writes nothing that outlives it. The preflight of the tools
+runs on a verified private copy in a `.weglarka-bootstrap-plan-*` directory (mode 0700) next to the host-only
+directory, whose parent directory must therefore exist; it is removed when the run ends, and leftovers of a killed run
+are removed by the next one. An existing generation directory is verified read-only (the `.verified` cache record is
+not rewritten). On OpenRC the preflight also needs the runtime user's Podman socket and the cron service, which
+bootstrap itself provisions, so there it still runs after those steps, as the last check before the bootstrap-complete
+marker is written. Two things are deliberately looked at again while applying: the legacy lock once the legacy timers
+are off, and `self-update.toml`, which is read, imported and retired only then, so a legacy timer firing during a long
+preflight cannot make bootstrap import a stale copy. The launcher and tool sources are validated again when they are read.
+
 ## Downgrade
 
 `platform downgrade` goes back to the daemon-only setup. It refuses while a platform update transaction is not

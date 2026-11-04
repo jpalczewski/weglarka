@@ -111,9 +111,18 @@ enum PlatformAction {
     /// Show the service status.
     Status,
     /// Install the stable launcher and generation 0, retire the legacy runner, provision jobs.
-    Bootstrap(BootstrapArgs),
+    Bootstrap(BootstrapCommand),
     /// Reverse bootstrap: remove launcher units and restore the legacy daemon-only units.
     Downgrade(BootstrapArgs),
+}
+
+#[derive(clap::Args)]
+struct BootstrapCommand {
+    #[command(flatten)]
+    args: BootstrapArgs,
+    /// Run every check, print the steps a bootstrap would take and change nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -294,8 +303,13 @@ async fn run_platform<P: Platform>(
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);
         }
-        PlatformAction::Bootstrap(args) => {
+        PlatformAction::Bootstrap(BootstrapCommand { args, dry_run }) => {
             let options = bootstrap_options(&args, &settings, host_dir, true)?;
+            if dry_run {
+                let plan = weglarka_daemon::bootstrap::plan(platform, &options).await?;
+                println!("Bootstrap plan (nothing was changed):\n{plan}");
+                return Ok(());
+            }
             let report = weglarka_daemon::bootstrap::bootstrap(platform, &options).await?;
             println!(
                 "Bootstrapped generation {} (selector epoch {}); coordinated updates {}.",
