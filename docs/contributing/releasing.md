@@ -41,11 +41,21 @@ first push in the same way. The runtime user pulls it without credentials, so **
 - the immutable tag is `set-<channel>-<sequence>`; the channel tag (`main`/`stable`) is the pointer and only moves
   forward, after the set, its blobs and its signature verify.
 
-The first release of a channel has no pointer to read. A "not found" answer is accepted as "no release set yet" only
-when the channel is listed in the repository variable `FIRST_RELEASE_SET_CHANNELS` (for example `main,stable`); clear
-the variable after the first publish. Without it a 404 fails the run, because a pointer that is missing for any other
-reason (a renamed package, a permission error) must never skip the ancestry and sequence checks and let a channel move
-backwards.
+The first release of a channel has no pointer to read. `weglarka-release verify` signals that with a dedicated exit
+code (below), and the workflow accepts it as "no release set yet" only when the channel is listed in the repository
+variable `FIRST_RELEASE_SET_CHANNELS` (for example `main,stable`); clear the variable after the first publish. Without
+it the run fails, because a pointer that is missing for any other reason (a renamed package, a permission error) must
+never skip the ancestry and sequence checks and let a channel move backwards. The workflow switches on the exit code,
+never on the text of the error.
+
+`weglarka-release` exit codes:
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Success. |
+| `1`  | Any failure without a dedicated code: authentication, network, a bad signature or descriptor, a missing blob or signature, a missing immutable `set-<channel>-<n>` tag. |
+| `2`  | Usage error (invalid arguments). |
+| `3`  | `verify` only: the channel tag itself (`main`/`stable`) does not exist in the registry, i.e. the channel has never been released. |
 
 Both the component images and the release set are signed with the static key in `COSIGN_PRIVATE_KEY`
 (`cosign.pub` is the public half the daemon embeds). A missing key fails the run on both channels — there is no

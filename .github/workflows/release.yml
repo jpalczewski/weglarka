@@ -394,7 +394,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
-          # A 404 means "no release set yet" only when the maintainer says this channel has none
+          # A missing channel tag (exit code 3) means "no release set yet" only when the maintainer says this channel has none
           # (repository variable FIRST_RELEASE_SET_CHANNELS, e.g. `main,stable`, cleared after the
           # first publish). Any other 404 (a renamed package, missing permission, a wrong
           # repository) must not look like a first release: that would skip the ancestry and
@@ -403,14 +403,19 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x tool/weglarka-release
-          if ! tool/weglarka-release verify --channel "$CHANNEL" --json \
-              --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err; then
-            if grep -qi "status 404" verify.err && [ "$FIRST_RELEASE_ALLOWED" = true ]; then
+          # Exit code 3 means exactly "the channel tag does not exist" (see `verify --help`); every
+          # other failure, including other 404s, is a generic failure. Capture the code explicitly
+          # so `set -e` does not end the step before it is inspected.
+          verify_rc=0
+          tool/weglarka-release verify --channel "$CHANNEL" --json \
+            --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err || verify_rc=$?
+          if [ "$verify_rc" -ne 0 ]; then
+            if [ "$verify_rc" -eq 3 ] && [ "$FIRST_RELEASE_ALLOWED" = true ]; then
               echo "no $CHANNEL release set yet (allowed by FIRST_RELEASE_SET_CHANNELS)"
               rm -f previous.json
             else
               cat verify.err >&2
-              if grep -qi "status 404" verify.err; then
+              if [ "$verify_rc" -eq 3 ]; then
                 echo "::error::the $CHANNEL pointer was not found; if this is the first release, add $CHANNEL to the FIRST_RELEASE_SET_CHANNELS repository variable and re-run"
               fi
               exit 1
@@ -493,7 +498,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
-          # A 404 means "no release set yet" only when the maintainer says this channel has none
+          # A missing channel tag (exit code 3) means "no release set yet" only when the maintainer says this channel has none
           # (repository variable FIRST_RELEASE_SET_CHANNELS, e.g. `main,stable`, cleared after the
           # first publish). Any other 404 (a renamed package, missing permission, a wrong
           # repository) must not look like a first release: that would skip the ancestry and
@@ -502,14 +507,19 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x tool/weglarka-release
-          if ! tool/weglarka-release verify --channel "$CHANNEL" --json \
-              --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err; then
-            if grep -qi "status 404" verify.err && [ "$FIRST_RELEASE_ALLOWED" = true ]; then
+          # Exit code 3 means exactly "the channel tag does not exist" (see `verify --help`); every
+          # other failure, including other 404s, is a generic failure. Capture the code explicitly
+          # so `set -e` does not end the step before it is inspected.
+          verify_rc=0
+          tool/weglarka-release verify --channel "$CHANNEL" --json \
+            --registry-user "$GITHUB_ACTOR" > previous.json 2> verify.err || verify_rc=$?
+          if [ "$verify_rc" -ne 0 ]; then
+            if [ "$verify_rc" -eq 3 ] && [ "$FIRST_RELEASE_ALLOWED" = true ]; then
               echo "no $CHANNEL release set yet (allowed by FIRST_RELEASE_SET_CHANNELS)"
               rm -f previous.json
             else
               cat verify.err >&2
-              if grep -qi "status 404" verify.err; then
+              if [ "$verify_rc" -eq 3 ]; then
                 echo "::error::the $CHANNEL pointer was not found; if this is the first release, add $CHANNEL to the FIRST_RELEASE_SET_CHANNELS repository variable and re-run"
               fi
               exit 1
