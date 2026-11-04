@@ -9,13 +9,14 @@
 //! app currently sees (`apps show`/`doctor`). [`describe`] never fails: a broken mount is a status.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
 use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::HostConfig;
+use weglarka_model::release_set::sha256_reader;
 
 /// Most entries a directory fingerprint walks; a larger tree is not fingerprinted.
 const MAX_FINGERPRINT_ENTRIES: usize = 4096;
@@ -213,13 +214,19 @@ pub fn validate_host(host: &HostConfig, apps: &AppsFile) -> Result<(), ConfigErr
 /// an i/o error — a fingerprint is a convenience, never a correctness input.
 pub fn fingerprint(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
-    let mut hasher = Sha256::new();
-    if meta.is_file() {
+    let sum: [u8; 32] = if meta.is_file() {
         if meta.len() > MAX_FINGERPRINT_BYTES {
             return None;
         }
-        hasher.update(fs::read(path).ok()?);
+        // Streamed, and capped again at read time: the file may have grown since `metadata`.
+        let streamed =
+            sha256_reader(fs::File::open(path).ok()?.take(MAX_FINGERPRINT_BYTES + 1)).ok()?;
+        if streamed.len > MAX_FINGERPRINT_BYTES {
+            return None;
+        }
+        streamed.sha256
     } else if meta.is_dir() {
+        let mut hasher = Sha256::new();
         let mut entries = Vec::new();
         collect_entries(path, "", &mut entries)?;
         let mut bytes = 0u64;
@@ -247,10 +254,11 @@ pub fn fingerprint(path: &Path) -> Option<String> {
                 }
             }
         }
+        hasher.finalize().into()
     } else {
         return None;
-    }
-    let hex = hex::encode(hasher.finalize());
+    };
+    let hex = hex::encode(sum);
     Some(hex[..FINGERPRINT_HEX_LEN].to_owned())
 }
 

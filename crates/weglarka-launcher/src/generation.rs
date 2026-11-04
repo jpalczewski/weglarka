@@ -18,9 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use weglarka_model::fsutil::write_atomic;
-use weglarka_model::release_set::StrictDigest;
+use weglarka_model::release_set::{StrictDigest, sha256_reader};
 
 use crate::host::{
     GENERATION_MANIFEST, GENERATIONS_DIR, HOST_CLI_FILE, HOST_DAEMON_FILE, HostError,
@@ -629,21 +628,9 @@ fn file_digest(path: &Path) -> Result<StrictDigest, GenerationError> {
         path: path.to_owned(),
         source,
     };
-    let mut file = fs::File::open(path).map_err(read_error)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buffer).map_err(read_error)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    StrictDigest::new(format!("sha256:{}", hex::encode(hasher.finalize()))).map_err(|_| {
-        GenerationError::Mismatch {
-            path: path.to_owned(),
-        }
-    })
+    let file = fs::File::open(path).map_err(read_error)?;
+    let streamed = sha256_reader(file).map_err(read_error)?;
+    Ok(StrictDigest::from_sha256(streamed.sha256))
 }
 
 fn sync_dir(dir: &Path) -> Result<(), GenerationError> {
@@ -667,6 +654,7 @@ fn remove_dir(path: &Path) -> Result<(), GenerationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
 
     fn digest(byte: char) -> StrictDigest {
         StrictDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
