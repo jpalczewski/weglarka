@@ -482,9 +482,15 @@ impl CapabilityRecord {
     }
 
     pub fn to_toml(&self) -> Result<String, CapabilityError> {
+        self.encode(CAPABILITIES_MAX_BYTES)
+    }
+
+    /// `to_toml` with an explicit limit: every field is bounded by `validate`, so a valid record
+    /// cannot reach [`CAPABILITIES_MAX_BYTES`] and the limit is only exercisable through here.
+    fn encode(&self, limit: usize) -> Result<String, CapabilityError> {
         self.validate()?;
         let text = toml::to_string(self).map_err(|e| CapabilityError::Invalid(e.to_string()))?;
-        if let Err(over) = size_limit::check(text.len(), CAPABILITIES_MAX_BYTES) {
+        if let Err(over) = size_limit::check(text.len(), limit) {
             return Err(CapabilityError::Invalid(format!(
                 "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {}",
                 over.size, over.limit
@@ -724,5 +730,19 @@ mod tests {
             journal.to_toml().unwrap_err(),
             PlatformUpdateError::TooLarge { .. }
         ));
+    }
+
+    #[test]
+    fn to_toml_rejects_a_capability_record_over_the_byte_limit() {
+        let record = capabilities(&REQUIRED_FOR_PLATFORM_PRUNE);
+        let text = record.to_toml().unwrap();
+        assert!(text.len() < CAPABILITIES_MAX_BYTES);
+        // At the exact encoded size the record still fits; one byte less is rejected.
+        assert_eq!(record.encode(text.len()).unwrap(), text);
+        let error = record.encode(text.len() - 1).unwrap_err();
+        assert!(
+            matches!(&error, CapabilityError::Invalid(m) if m.contains("the limit is")),
+            "{error:?}"
+        );
     }
 }

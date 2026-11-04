@@ -1549,4 +1549,113 @@ mod tests {
         .unwrap();
         assert_eq!(inventory.images.len(), 3);
     }
+
+    /// Three unmanaged images that a legacy install's specs name: each one is adoptable.
+    fn legacy_adoptable_images(rec: &Reconciler<FakePodman>) {
+        std::fs::write(
+            &rec.paths.apps,
+            "[apps.a]\nimage = \"ghcr.io/x/a:latest\"\n\
+             [apps.b]\nimage = \"ghcr.io/x/b:latest\"\n\
+             [apps.c]\nimage = \"ghcr.io/x/c:latest\"\n",
+        )
+        .unwrap();
+        for (id, name, c) in [("1", "a", 'a'), ("2", "b", 'b'), ("3", "c", 'c')] {
+            let mut info = image(id, c);
+            info.repo_tags = vec![format!("ghcr.io/x/{name}:latest")];
+            rec.podman.add_image(info);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retention_run_adopting_several_images_writes_the_inventory_once() {
+        let (dir, rec) = reconciler();
+        legacy_adoptable_images(&rec);
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        write_count::take();
+
+        let prepared = rec
+            .prepare_retention(RetentionScope::AllManaged, Some(&guard))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            write_count::take(),
+            1,
+            "adopting three images records with one write"
+        );
+        assert!(
+            prepared.diagnostics.is_empty(),
+            "{:?}",
+            prepared.diagnostics
+        );
+        assert_eq!(prepared.inventory.images.len(), 3);
+        let on_disk = Inventory::parse(
+            &std::fs::read_to_string(dir.path().join(INVENTORY_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.images.len(), 3, "every adoption lands in the file");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_advertises_adoptions_without_writing() {
+        let (dir, rec) = reconciler();
+        legacy_adoptable_images(&rec);
+        write_count::take();
+
+        let prepared = rec
+            .prepare_retention(RetentionScope::AllManaged, None)
+            .await
+            .unwrap();
+
+        assert_eq!(write_count::take(), 0, "a dry run never writes");
+        assert_eq!(prepared.inventory.images.len(), 3, "but it advertises");
+        assert!(!dir.path().join(INVENTORY_FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_adoption_write_leaves_the_batch_out_of_the_plan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, rec) = reconciler();
+        legacy_adoptable_images(&rec);
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        let restore = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        restore(0o555);
+        if std::fs::File::create(dir.path().join("probe")).is_ok() {
+            // Permissions are not enforced (running as root): the failure cannot be provoked.
+            restore(0o755);
+            return;
+        }
+
+        let prepared = rec
+            .prepare_retention(RetentionScope::AllManaged, Some(&guard))
+            .await;
+        restore(0o755);
+        let prepared = prepared.unwrap();
+
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("cannot record image provenance")),
+            "{:?}",
+            prepared.diagnostics
+        );
+        assert!(
+            prepared.inventory.images.is_empty(),
+            "no image of a failed batch is attributed: {:?}",
+            prepared.inventory.images
+        );
+        let plan = ManagedRetentionPlanner.plan(&prepared.input());
+        assert!(
+            plan.remove.is_empty(),
+            "nothing is planned for removal: {plan:?}"
+        );
+        assert_eq!(plan.unattributed.len(), 3);
+        assert!(!dir.path().join(INVENTORY_FILE_NAME).exists());
+    }
 }
