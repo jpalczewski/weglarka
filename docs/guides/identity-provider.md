@@ -161,6 +161,27 @@ A client with `device_flow` may leave `redirect_uris` out; it then has no author
 like the other client fields: changing it restarts the provider, never an app. Left unset, the rendered file is byte for
 byte what it was before.
 
+### Loopback redirects for native clients
+
+A `public = true` client may list loopback redirect URIs, `http://127.0.0.1[:port]/path` or `http://[::1][:port]/path`
+(RFC 8252 section 7.3), next to or instead of `https://` ones; this is how `weglarka login --browser` receives its
+callback ([remote CLI](remote-cli.md), [ADR 0068](../decisions/0068-cli-browser-login-loopback-redirect.md)):
+
+```toml
+[oidc_clients.cli]
+name = "weglarka CLI"
+public = true
+device_flow = true
+redirect_uris = ["http://127.0.0.1/callback"]
+scopes = ["openid", "profile", "groups", "offline_access"]
+```
+
+A confidential client, `localhost` and any other `http://` URL are refused. On an app's own `[apps.<name>.oidc]` a
+loopback entry names no host, so the "host is one of the app's domains" rule does not apply to it. Authelia (4.39)
+matches a registered `http://127.0.0.1` URI whatever port the request names, but scheme, host literal and path must
+equal. The field already existed: no schema change, and the rendered file of a client without such an entry is
+unchanged.
+
 ## Migrating a hand-written configuration
 
 1. Delete `access_control` (including `default_policy`), `identity_providers.oidc.clients` and

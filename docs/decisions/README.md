@@ -74,3 +74,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0065](0065-container-resource-usage-in-the-admin-api.md) | Container resource usage in the admin API |
 | [0066](0066-oidc-client-group-gate.md) | Group gate on an OIDC client through authorization policies |
 | [0067](0067-managed-images-and-platform-updates.md) | Managed image provenance and coordinated platform updates |
+| [0068](0068-cli-browser-login-loopback-redirect.md) | `weglarka login --browser`: authorization code flow on a loopback redirect |

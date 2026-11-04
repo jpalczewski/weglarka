@@ -26,6 +26,25 @@ fn main() {
         render_oidc_clients(&gated.app_clients(), &gated.external).unwrap(),
     )
     .unwrap();
+    // A public client with a loopback redirect (`weglarka login --browser`, ADR 0068), validated on its own.
+    let mut loopback = std::collections::BTreeMap::new();
+    loopback.insert(
+        weglarka_model::identity::ClientId::new("cli").unwrap(),
+        fixtures::external(
+            r#"
+            name = "weglarka CLI"
+            redirect_uris = ["http://127.0.0.1/callback"]
+            public = true
+            device_flow = true
+            scopes = ["openid", "profile", "groups", "offline_access"]
+            "#,
+        ),
+    );
+    fs::write(
+        dir.join("oidc-clients-loopback.yml"),
+        render_oidc_clients(&[], &loopback).unwrap(),
+    )
+    .unwrap();
     fs::write(
         dir.join("access-control.yml"),
         render_access_control(fixtures::ISSUER, &forward).unwrap(),

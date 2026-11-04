@@ -28,6 +28,17 @@ groups_in_access_token = true
 The client id is `cli` here; the CLI asks for `weglarka-cli` unless you pass `--client-id`, so either name the client
 `weglarka-cli` or pass `--client-id cli`.
 
+To also sign in with `--browser` (below), register the loopback callback on the same client:
+
+```toml
+redirect_uris = ["http://127.0.0.1/callback"]
+```
+
+Only a `public = true` client may carry a loopback `http://` entry; `localhost` and any other `http://` stay refused.
+Authelia ignores the port of a registered `http://127.0.0.1` redirect (RFC 8252 section 7.3), so one entry covers the
+port the CLI picks each time ([ADR 0068](../decisions/0068-cli-browser-login-loopback-redirect.md)). A provider that
+matches the port exactly is not supported by `--browser`.
+
 ## Sign in
 
 ```bash
@@ -47,6 +58,19 @@ weglarka --host https://panel.example.com login \
 Either flag may also be given alone, but it must equal what the panel publishes (byte for byte), otherwise the command
 stops. The command prints a short code and an address; approve it in any browser (the provider applies its two-factor policy)
 and the command finishes. Nothing needs to run on the machine's own browser, so it works over SSH.
+
+### Signing in with the browser
+
+```bash
+weglarka --host https://panel.example.com login --browser
+```
+
+On a workstation where you sit at the keyboard, `--browser` opens the provider's sign-in page (`open` on macOS,
+`xdg-open` elsewhere; the address is always printed too) and receives the result on `http://127.0.0.1:<port>/callback`,
+a listener that lives for the sign-in only, binds the loopback interface only and gives up after five minutes. Use the
+device flow over SSH, on a machine without a browser or when the provider does not have the loopback entry above.
+Everything after the sign-in (tokens, refresh, `logout`) is identical. A callback that does not carry the expected
+`state` is ignored with a note, so a stray request to the port cannot end the sign-in.
 
 ### Whom you trust when you sign in
 
@@ -110,6 +134,9 @@ lists a `revocation_endpoint`); a provider that is down never leaves tokens behi
   `device_authorization_endpoint`. Authelia has one; check the version.
 - *the identity provider refused the sign-in request*: the client is not registered as a public client with
   `device_flow = true`, or the scopes or audience differ.
+- `login --browser` timed out or *the identity provider refused the sign-in* (the provider shows its own error page and
+  never calls back for a redirect it does not know): the client lacks `http://127.0.0.1/callback` in `redirect_uris`, is
+  not `public = true`, or the scopes differ.
 - *the host does not publish its sign-in settings*: an older panel; pass `--issuer` and `--audience`.
 - *--issuer differs from the issuer the host publishes*: drop the flag, or check you are signing in to the right host.
 - *already signed in with a different issuer or audience*: the host's settings changed (or the host is not the one you signed in to before); `logout` first if that is expected.

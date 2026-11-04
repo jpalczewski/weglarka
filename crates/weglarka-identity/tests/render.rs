@@ -350,3 +350,21 @@ fn oidc_device_flow_adds_the_device_grant_and_drops_the_code_grant_without_redir
     // Unset, the file keeps listing no grants at all (see `oidc_offline_access_gets_refresh_grants`).
     assert!(!clients_only(&["panel"]).contains("device_code"));
 }
+
+#[test]
+fn oidc_loopback_redirect_of_a_public_client_is_rendered_verbatim() {
+    let cli = external(
+        r#"
+        name = "weglarka CLI"
+        redirect_uris = ["http://127.0.0.1/callback"]
+        public = true
+        device_flow = true
+        scopes = ["openid", "profile", "groups", "offline_access"]
+        "#,
+    );
+    let mut external = std::collections::BTreeMap::new();
+    external.insert(weglarka_model::identity::ClientId::new("cli").unwrap(), cli);
+    let text = render_oidc_clients(&[], &external).unwrap();
+    assert!(text.contains("http://127.0.0.1/callback"));
+    insta::assert_snapshot!(text);
+}

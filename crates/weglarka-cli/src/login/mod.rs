@@ -7,6 +7,7 @@
 
 mod credentials;
 mod discovery;
+mod loopback;
 pub(crate) mod remote;
 mod transport;
 
@@ -16,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Args;
 use serde::Serialize;
 use weglarka_oidc::{
-    ClientAuth, DeviceAuthorization, DevicePoll, DiscoveryPolicy, Endpoints, Secret, TokenSet,
-    Transport,
+    ClientAuth, CodeFlowRequest, DeviceAuthorization, DevicePoll, DiscoveryPolicy, Endpoints,
+    Secret, TokenSet, Transport, Url,
 };
 
 use self::credentials::{HostEntry, Store, normalize_host};
@@ -46,6 +47,11 @@ pub struct LoginArgs {
     /// The provider's client id of the CLI (a public client with `device_flow = true`).
     #[arg(long, default_value = "weglarka-cli", value_name = "ID")]
     pub client_id: String,
+    /// Sign in through the browser (authorization code flow with PKCE on a loopback redirect)
+    /// instead of the device code. Needs `http://127.0.0.1/callback` among the client's
+    /// `redirect_uris`.
+    #[arg(long)]
+    pub browser: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,16 +125,31 @@ pub async fn login(json: bool, host: Option<&str>, args: LoginArgs) -> Result<i3
     let target = discovery::resolve_target(&transport, &store, &host, &args).await?;
     // Always shown: the first login is the one the host controls (see `discovery`).
     eprintln!("Signing in to {} with {}", target.host, target.issuer);
-    let session = device_login(
-        &transport,
-        &store,
-        &target,
-        now_secs(),
-        tokio::time::sleep,
-        show_instructions,
-        |line| eprintln!("{line}"),
-    )
-    .await?;
+    let session = if args.browser {
+        browser_login(
+            &transport,
+            &store,
+            &target,
+            now_secs(),
+            BrowserSteps {
+                open: open_browser,
+                timeout: loopback::WAIT,
+                note: |line: &str| eprintln!("{line}"),
+            },
+        )
+        .await?
+    } else {
+        device_login(
+            &transport,
+            &store,
+            &target,
+            now_secs(),
+            tokio::time::sleep,
+            show_instructions,
+            |line| eprintln!("{line}"),
+        )
+        .await?
+    };
     emit(json, &session, || {
         format!("Signed in to {}.\n", session.host)
     });
@@ -253,6 +274,129 @@ where
     };
 
     Ok((tokens, waited))
+}
+
+/// The injected edges of the browser flow, so tests never launch a browser or wait five minutes.
+struct BrowserSteps<O, N> {
+    /// Hands the authorization URL to a browser; best effort (the URL is printed either way).
+    open: O,
+    timeout: Duration,
+    note: N,
+}
+
+/// Discovery, the authorization code flow on a loopback redirect and saving the session.
+async fn browser_login<T, O, N>(
+    transport: &T,
+    store: &Store,
+    target: &LoginTarget,
+    now: u64,
+    steps: BrowserSteps<O, N>,
+) -> Result<Session, CliError>
+where
+    T: Transport,
+    O: FnOnce(&Url),
+    N: Fn(&str) + Send + Sync + 'static,
+{
+    let endpoints = weglarka_oidc::discover(transport, &target.issuer, &DiscoveryPolicy::default())
+        .await
+        .map_err(provider_error)?;
+    let listener = loopback::Listener::bind().await.map_err(|e| {
+        CliError::new(
+            Kind::Unreachable,
+            format!("cannot listen on the loopback interface: {e}"),
+        )
+    })?;
+    let (tokens, waited) = browser_grant(transport, &endpoints, target, listener, steps).await?;
+    save_session(store, target, &tokens, now + waited.as_secs())
+}
+
+/// RFC 6749 4.1 with PKCE and an RFC 8252 loopback redirect. Returns the tokens and how long the
+/// person took. `state` is checked by the listener; `nonce` is sent, but the id token is not
+/// verified: the access token is opaque to the CLI and the daemon decides (ADR 0060).
+async fn browser_grant<T, O, N>(
+    transport: &T,
+    endpoints: &Endpoints,
+    target: &LoginTarget,
+    listener: loopback::Listener,
+    steps: BrowserSteps<O, N>,
+) -> Result<(TokenSet, Duration), CliError>
+where
+    T: Transport,
+    O: FnOnce(&Url),
+    N: Fn(&str) + Send + Sync + 'static,
+{
+    let redirect_uri = listener.redirect_uri();
+    let flow = weglarka_oidc::begin_code_flow(
+        &endpoints.authorization,
+        &CodeFlowRequest {
+            client_id: &target.client_id,
+            redirect_uri: &redirect_uri,
+            scope: SCOPE,
+            audience: &target.audience,
+        },
+    );
+    eprintln!(
+        "Opening your browser to sign in. If it does not open, visit:\n  {}",
+        flow.url
+    );
+    (steps.open)(&flow.url);
+    let started = std::time::Instant::now();
+    let code = match listener.wait(&flow.state, steps.timeout, steps.note).await {
+        loopback::Outcome::Code(code) => code,
+        loopback::Outcome::Denied => {
+            return Err(CliError::internal("the sign-in was denied in the browser"));
+        }
+        loopback::Outcome::TimedOut => {
+            return Err(
+                CliError::internal("no sign-in arrived in the browser in time")
+                    .with_hint(redirect_hint(target)),
+            );
+        }
+    };
+    let tokens = weglarka_oidc::exchange_code(
+        transport,
+        &endpoints.token,
+        ClientAuth::Public {
+            id: &target.client_id,
+        },
+        &code,
+        &redirect_uri,
+        &flow.verifier,
+    )
+    .await
+    .map_err(|e| match e {
+        weglarka_oidc::Error::Refused(_) => {
+            CliError::new(Kind::Config, "the identity provider refused the sign-in")
+                .with_hint(redirect_hint(target))
+        }
+        other => provider_error(other),
+    })?;
+    Ok((tokens, started.elapsed()))
+}
+
+/// What to check when the provider rejects the browser flow (it shows its own error page and
+/// never calls back for an unregistered `redirect_uri`, so this also explains a timeout).
+fn redirect_hint(target: &LoginTarget) -> String {
+    format!(
+        "is `{}` a public client with `http://127.0.0.1/callback` in its `redirect_uris` and the scopes `{SCOPE}`? (the device flow, `weglarka login` without --browser, needs `device_flow = true` instead)",
+        target.client_id
+    )
+}
+
+/// Best effort: `open` on macOS, `xdg-open` elsewhere. The URL is its own argument, never a shell
+/// string, and a failure is silent because the URL has been printed.
+fn open_browser(url: &Url) {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(program)
+        .arg(url.as_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Stores the tokens of a finished sign-in under the host; `issued` is when they were handed out.

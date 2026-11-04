@@ -931,3 +931,45 @@ fn owned_sections_find_authorization_policies() {
         ["identity_providers.oidc.authorization_policies"]
     );
 }
+
+// --- loopback redirects (RFC 8252 section 7.3, ADR 0068) ---------------------------------------
+
+#[test]
+fn loopback_redirects_are_for_public_clients_only() {
+    for uri in [
+        "http://127.0.0.1/callback",
+        "http://127.0.0.1:8123/callback",
+        "http://[::1]/callback",
+        "http://[::1]:8123/callback?x=1",
+    ] {
+        lexical(&spec(&format!(
+            "[oidc]\nredirect_uris = [{uri:?}]\npublic = true"
+        )))
+        .unwrap();
+        let confidential = spec(&format!(
+            "[oidc]\nredirect_uris = [{uri:?}]\nclient_secret = {{ kind = \"env\", var = \"S\" }}"
+        ));
+        assert!(
+            lexical_err(&confidential).contains("public client"),
+            "{uri}"
+        );
+    }
+}
+
+#[test]
+fn only_loopback_ip_literals_may_use_http() {
+    for (uri, why) in [
+        ("http://localhost/callback", "https"),
+        ("http://localhost:8123/callback", "https"),
+        ("http://127.0.0.2/callback", "https"),
+        ("http://127.0.0.1.example.com/callback", "https"),
+        ("http://[::1]x/callback", "https"),
+        ("http://127.0.0.1:0/callback", "port"),
+        ("http://127.0.0.1/callback#f", "fragment"),
+        ("http://127.0.0.1/call back", "whitespace"),
+        ("http://user@127.0.0.1/callback", "https"),
+    ] {
+        let s = spec(&format!("[oidc]\nredirect_uris = [{uri:?}]\npublic = true"));
+        assert!(lexical_err(&s).contains(why), "{uri}: {}", lexical_err(&s));
+    }
+}
