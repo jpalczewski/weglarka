@@ -1014,7 +1014,8 @@ pub struct SecurityHeaders {
     /// Only variant today; reserved for future presets without another schema change.
     #[serde(default)]
     pub preset: SecurityHeadersPreset,
-    /// `Strict-Transport-Security: max-age=<n>; includeSubDomains`. Unset omits the header.
+    /// `Strict-Transport-Security: max-age=<n>`. Unset omits the header; no `includeSubDomains`/
+    /// `preload` in v1 — those extend the policy beyond this one site's own domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hsts_max_age_secs: Option<u32>,
     /// `Content-Security-Policy` value, printable ASCII without `"`/`\`/`$`, at most 2048 bytes

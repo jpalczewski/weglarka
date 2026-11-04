@@ -146,7 +146,7 @@ http {
             add_header X-Content-Type-Options nosniff always;
             add_header X-Frame-Options DENY always;
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             add_header Content-Security-Policy "default-src 'self'" always;
             add_header X-Request-Id $request_id always;
             try_files $uri $uri.html $uri/index.html =404;
@@ -160,7 +160,7 @@ http {
             add_header X-Content-Type-Options nosniff always;
             add_header X-Frame-Options DENY always;
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             add_header Content-Security-Policy "default-src 'self'" always;
             add_header X-Request-Id $request_id always;
             try_files $uri $uri.html $uri/index.html =404;
@@ -176,7 +176,7 @@ http {
             add_header X-Content-Type-Options nosniff always;
             add_header X-Frame-Options DENY always;
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             add_header Content-Security-Policy "default-src 'self'" always;
             add_header X-Request-Id $request_id always;
             limit_except GET HEAD {
@@ -187,7 +187,7 @@ http {
             add_header X-Content-Type-Options nosniff always;
             add_header X-Frame-Options DENY always;
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             add_header Content-Security-Policy "default-src 'self'" always;
             add_header X-Request-Id $request_id always;
             return 301 /new$is_args$args;
@@ -196,7 +196,7 @@ http {
             add_header X-Content-Type-Options nosniff always;
             add_header X-Frame-Options DENY always;
             add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             add_header Content-Security-Policy "default-src 'self'" always;
             add_header X-Request-Id $request_id always;
             rewrite ^/blog(.*)$ /articles$1 permanent;

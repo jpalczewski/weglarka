@@ -380,8 +380,11 @@ fn write_security_headers(c: &mut Conf, headers: Option<&SecurityHeaders>) {
     let Some(headers) = headers else { return };
     write_security_preset(c, headers.preset);
     if let Some(age) = headers.hsts_max_age_secs {
+        // No `includeSubDomains`/`preload` in v1: those extend the policy to the whole domain (every
+        // subdomain, forever for `preload`), a decision this one site's config must not make on behalf
+        // of domains it has no authority over.
         c.line(&format!(
-            "add_header Strict-Transport-Security \"max-age={age}; includeSubDomains\" always;"
+            "add_header Strict-Transport-Security \"max-age={age}\" always;"
         ));
     }
     if let Some(csp) = &headers.csp {
@@ -446,8 +449,9 @@ fn write_security_preset_only(c: &mut Conf, headers: Option<&SecurityHeaders>) {
     let Some(headers) = headers else { return };
     write_security_preset(c, headers.preset);
     if let Some(age) = headers.hsts_max_age_secs {
+        // No `includeSubDomains`/`preload` in v1 — see `write_security_headers`.
         c.line(&format!(
-            "add_header Strict-Transport-Security \"max-age={age}; includeSubDomains\" always;"
+            "add_header Strict-Transport-Security \"max-age={age}\" always;"
         ));
     }
     if let Some(csp) = &headers.csp {

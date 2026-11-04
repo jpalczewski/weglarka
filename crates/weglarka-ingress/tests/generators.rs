@@ -1803,9 +1803,7 @@ fn nginx_static_site_with_every_option_snapshots() {
         assert!(
             conf.contains("add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;")
         );
-        assert!(conf.contains(
-            "add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;"
-        ));
+        assert!(conf.contains("add_header Strict-Transport-Security \"max-age=31536000\" always;"));
         assert!(conf.contains("add_header Content-Security-Policy \"default-src 'self'\" always;"));
         assert!(
             conf.matches("add_header X-Request-Id $request_id always;")
