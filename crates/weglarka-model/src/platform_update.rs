@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::image_inventory::OperationId;
 use crate::release_set::{Channel, Repository, StrictDigest};
+use crate::size_limit;
 
 /// File in the shared state directory.
 pub const FILE_NAME: &str = "platform-update.toml";
@@ -284,7 +285,13 @@ impl PlatformUpdate {
     }
 
     pub fn parse(src: &str) -> Result<Self, PlatformUpdateError> {
-        check_size(src.len(), MAX_BYTES)?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(PlatformUpdateError::TooLarge {
+                what: FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let document: Self = toml::from_str(src)?;
@@ -378,18 +385,6 @@ fn check_format(value: Option<u32>) -> Result<(), PlatformUpdateError> {
     }
 }
 
-fn check_size(size: usize, limit: usize) -> Result<(), PlatformUpdateError> {
-    if size > limit {
-        Err(PlatformUpdateError::TooLarge {
-            what: FILE_NAME,
-            size,
-            limit,
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value
@@ -458,10 +453,10 @@ pub struct CapabilityRecord {
 
 impl CapabilityRecord {
     pub fn parse(src: &str) -> Result<Self, CapabilityError> {
-        if src.len() > CAPABILITIES_MAX_BYTES {
+        if let Err(over) = size_limit::check(src.len(), CAPABILITIES_MAX_BYTES) {
             return Err(CapabilityError::Invalid(format!(
-                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {CAPABILITIES_MAX_BYTES}",
-                src.len()
+                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {}",
+                over.size, over.limit
             )));
         }
         let probe: FormatProbe =

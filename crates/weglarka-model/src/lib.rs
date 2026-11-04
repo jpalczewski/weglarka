@@ -34,6 +34,7 @@ pub mod secrets;
 pub mod self_update;
 pub mod shared_networks;
 pub mod shared_volumes;
+pub mod size_limit;
 pub mod state;
 pub mod uid_range;
 pub mod units;

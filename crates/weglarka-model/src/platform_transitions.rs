@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::InstanceName;
 use crate::platform_update::TransactionId;
 use crate::release_set::{Repository, StrictDigest};
+use crate::size_limit;
 
 /// Panel pin file in the shared state directory.
 pub const PINS_FILE_NAME: &str = "platform-pins.toml";
@@ -95,7 +96,13 @@ impl Pins {
     }
 
     pub fn parse(src: &str) -> Result<Self, TransitionsError> {
-        check_size(PINS_FILE_NAME, src.len())?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: PINS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let pins: Self = toml::from_str(src)?;
@@ -260,7 +267,13 @@ impl Transitions {
     }
 
     pub fn parse(src: &str) -> Result<Self, TransitionsError> {
-        check_size(TRANSITIONS_FILE_NAME, src.len())?;
+        if let Err(over) = size_limit::check(src.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: TRANSITIONS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
         let probe: FormatProbe = toml::from_str(src)?;
         check_format(probe.format_version)?;
         let transitions: Self = toml::from_str(src)?;
@@ -347,18 +360,6 @@ impl From<toml::de::Error> for TransitionsError {
 impl From<toml::ser::Error> for TransitionsError {
     fn from(error: toml::ser::Error) -> Self {
         Self::TomlSer(error.to_string())
-    }
-}
-
-fn check_size(file: &'static str, size: usize) -> Result<(), TransitionsError> {
-    if size > MAX_BYTES {
-        Err(TransitionsError::TooLarge {
-            file,
-            size,
-            limit: MAX_BYTES,
-        })
-    } else {
-        Ok(())
     }
 }
 

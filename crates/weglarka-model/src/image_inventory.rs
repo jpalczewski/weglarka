@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::InstanceName;
 use crate::platform_update::TransactionId;
 use crate::release_set::{Repository, StrictDigest};
+use crate::size_limit;
 
 /// Inventory file in the shared state directory.
 pub const INVENTORY_FILE_NAME: &str = "managed-images.toml";
@@ -195,11 +196,11 @@ impl Inventory {
     }
 
     pub fn parse(src: &str) -> Result<Self, InventoryError> {
-        if src.len() > MAX_INVENTORY_BYTES {
+        if let Err(over) = size_limit::check(src.len(), MAX_INVENTORY_BYTES) {
             return Err(InventoryError::TooLarge {
                 file: INVENTORY_FILE_NAME,
-                size: src.len(),
-                limit: MAX_INVENTORY_BYTES,
+                size: over.size,
+                limit: over.limit,
             });
         }
         let probe: FormatProbe = toml::from_str(src)?;
@@ -394,11 +395,11 @@ impl Reservations {
     }
 
     pub fn parse(src: &str) -> Result<Self, InventoryError> {
-        if src.len() > MAX_RESERVATIONS_BYTES {
+        if let Err(over) = size_limit::check(src.len(), MAX_RESERVATIONS_BYTES) {
             return Err(InventoryError::TooLarge {
                 file: RESERVATIONS_FILE_NAME,
-                size: src.len(),
-                limit: MAX_RESERVATIONS_BYTES,
+                size: over.size,
+                limit: over.limit,
             });
         }
         let probe: FormatProbe = toml::from_str(src)?;
