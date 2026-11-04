@@ -301,7 +301,15 @@ impl PlatformUpdate {
 
     pub fn to_toml(&self) -> Result<String, PlatformUpdateError> {
         self.validate()?;
-        Ok(toml::to_string(self)?)
+        let text = toml::to_string(self)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(PlatformUpdateError::TooLarge {
+                what: FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn validate(&self) -> Result<(), PlatformUpdateError> {
@@ -475,7 +483,14 @@ impl CapabilityRecord {
 
     pub fn to_toml(&self) -> Result<String, CapabilityError> {
         self.validate()?;
-        toml::to_string(self).map_err(|e| CapabilityError::Invalid(e.to_string()))
+        let text = toml::to_string(self).map_err(|e| CapabilityError::Invalid(e.to_string()))?;
+        if let Err(over) = size_limit::check(text.len(), CAPABILITIES_MAX_BYTES) {
+            return Err(CapabilityError::Invalid(format!(
+                "{CAPABILITIES_FILE_NAME} is {} bytes, the limit is {}",
+                over.size, over.limit
+            )));
+        }
+        Ok(text)
     }
 
     fn validate(&self) -> Result<(), CapabilityError> {
@@ -697,5 +712,17 @@ mod tests {
             missing.check_platform_prune().unwrap_err(),
             CapabilityError::MissingFeature(CoordinationFeature::ReservationPhases)
         );
+    }
+
+    #[test]
+    fn to_toml_rejects_a_journal_over_the_byte_limit() {
+        let mut journal = PlatformUpdate::default();
+        let mut tx = transaction(Stage::Prepared);
+        tx.reason = Some("x".repeat(MAX_BYTES + 1));
+        journal.transaction = Some(tx);
+        assert!(matches!(
+            journal.to_toml().unwrap_err(),
+            PlatformUpdateError::TooLarge { .. }
+        ));
     }
 }

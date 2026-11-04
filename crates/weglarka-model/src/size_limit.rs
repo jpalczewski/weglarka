@@ -26,3 +26,21 @@ pub fn check(size: usize, limit: usize) -> Result<(), SizeLimit> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_rejects_only_sizes_over_the_limit() {
+        assert_eq!(check(10, 10), Ok(()));
+        assert_eq!(check(9, 10), Ok(()));
+        assert_eq!(
+            check(11, 10),
+            Err(SizeLimit {
+                size: 11,
+                limit: 10
+            })
+        );
+    }
+}

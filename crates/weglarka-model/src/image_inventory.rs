@@ -210,7 +210,15 @@ impl Inventory {
     }
 
     pub fn to_toml(&self) -> Result<String, InventoryError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_INVENTORY_BYTES) {
+            return Err(InventoryError::TooLarge {
+                file: INVENTORY_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     /// Sorted, duplicate-free, within bounds.
@@ -409,7 +417,15 @@ impl Reservations {
     }
 
     pub fn to_toml(&self) -> Result<String, InventoryError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_RESERVATIONS_BYTES) {
+            return Err(InventoryError::TooLarge {
+                file: RESERVATIONS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn canonical(&self) -> Result<Self, InventoryError> {
@@ -601,6 +617,56 @@ mod tests {
         assert!(matches!(
             many.to_toml().unwrap_err(),
             InventoryError::TooManyImages(_)
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_an_inventory_over_the_byte_limit() {
+        let images: Vec<ManagedImage> = (0..MAX_IMAGES)
+            .map(|n| ManagedImage {
+                image_id: ImageId::new(format!("{n:064x}")).unwrap(),
+                digests: [digest('a')].into(),
+                associations: [Association {
+                    owner: Owner::PlatformDaemon,
+                    repository: Repository::new("ghcr.io/example/weglarka").unwrap(),
+                }]
+                .into(),
+            })
+            .collect();
+        let inventory = Inventory {
+            format_version: FORMAT_VERSION,
+            images,
+        };
+        assert!(matches!(
+            inventory.to_toml().unwrap_err(),
+            InventoryError::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_reservations_over_the_byte_limit() {
+        let protections: BTreeSet<Protection> = (0..6_000)
+            .map(|n| Protection {
+                identity: ProtectionIdentity::ImageId(ImageId::new(format!("{n:064x}")).unwrap()),
+                reason: ProtectionReason::AcquisitionInProgress,
+                operation_id: Some(OperationId::new("o".repeat(128)).unwrap()),
+            })
+            .collect();
+        let reservation = Reservation {
+            owner: ReservationOwner::new("engine", 1, "boot-1", 1_700_000_000).unwrap(),
+            phase: ReservationPhase::Loaded,
+            protections,
+            journal_ref: None,
+            created_at: 1_700_000_000,
+        };
+        let entry = ReservationEntry {
+            operation_id: OperationId::new("op-1").unwrap(),
+            reservation,
+        };
+        let reservations = Reservations::new(vec![entry]).unwrap();
+        assert!(matches!(
+            reservations.to_toml().unwrap_err(),
+            InventoryError::TooLarge { .. }
         ));
     }
 }

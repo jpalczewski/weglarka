@@ -110,7 +110,15 @@ impl Pins {
     }
 
     pub fn to_toml(&self) -> Result<String, TransitionsError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: PINS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn canonical(&self) -> Result<Self, TransitionsError> {
@@ -281,7 +289,15 @@ impl Transitions {
     }
 
     pub fn to_toml(&self) -> Result<String, TransitionsError> {
-        Ok(toml::to_string(&self.canonical()?)?)
+        let text = toml::to_string(&self.canonical()?)?;
+        if let Err(over) = size_limit::check(text.len(), MAX_BYTES) {
+            return Err(TransitionsError::TooLarge {
+                file: TRANSITIONS_FILE_NAME,
+                size: over.size,
+                limit: over.limit,
+            });
+        }
+        Ok(text)
     }
 
     fn canonical(&self) -> Result<Self, TransitionsError> {
@@ -544,5 +560,32 @@ mod tests {
             Transitions::parse(&newer).unwrap_err(),
             TransitionsError::UnsupportedFormat(2)
         );
+    }
+
+    #[test]
+    fn to_toml_rejects_pins_over_the_byte_limit() {
+        let pins: Vec<PinEntry> = (0..4_000)
+            .map(|n| {
+                let mut pin = pin();
+                pin.instance = name(&format!("pin-{n}"));
+                pin
+            })
+            .collect();
+        let pins = Pins::new(pins).unwrap();
+        assert!(matches!(
+            pins.to_toml().unwrap_err(),
+            TransitionsError::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_transitions_over_the_byte_limit() {
+        let mut live = record("tx-live", TransitionStatus::Running, 10);
+        live.reason = Some("x".repeat(MAX_BYTES + 1));
+        let transitions = Transitions::new(vec![live], vec![]).unwrap();
+        assert!(matches!(
+            transitions.to_toml().unwrap_err(),
+            TransitionsError::TooLarge { .. }
+        ));
     }
 }

@@ -43,6 +43,26 @@ use weglarka_model::podman::{
 use weglarka_model::release_set::{Repository, StrictDigest};
 use weglarka_model::state::{self, StateFile};
 
+/// Test-only counter of atomic writes to `managed-images.toml`, for the "one read, one write"
+/// assertion of [`InventoryStore::record_many`]. Thread-local so parallel tests stay independent.
+#[cfg(test)]
+mod write_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static INVENTORY_WRITES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        INVENTORY_WRITES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Returns the count since the last call and resets it to zero.
+    pub(super) fn take() -> usize {
+        INVENTORY_WRITES.with(|count| count.replace(0))
+    }
+}
+
 /// Why an image is kept (reported by `doctor` and by `weglarka images prune --dry-run`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepReason {
@@ -217,6 +237,15 @@ pub trait InventoryStore {
         guard: &ImageGuard<'_>,
         image: ManagedImage,
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
+
+    /// Records a batch of images with one read and one write. Returns the images that were durably
+    /// recorded, in input order; an image whose digest already names another image id is skipped,
+    /// never merged over another owner's association.
+    fn record_many(
+        &self,
+        guard: &ImageGuard<'_>,
+        images: Vec<ManagedImage>,
+    ) -> impl Future<Output = Result<Vec<ManagedImage>, EngineError>> + Send;
 }
 
 /// Durable reservation store (`image-reservations.toml`). A reservation is published before
@@ -373,6 +402,8 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     fn write_inventory(&self, inventory: &Inventory) -> Result<(), EngineError> {
+        #[cfg(test)]
+        write_count::bump();
         let path = self.inventory_path();
         let text = inventory
             .to_toml()
@@ -601,40 +632,32 @@ impl<P: PodmanClient> InventoryStore for Reconciler<P> {
         image: ManagedImage,
     ) -> Result<(), EngineError> {
         let mut inventory = self.read_inventory()?;
-        // Conflicting identities are rejected: one manifest digest never names two local images.
-        for other in &inventory.images {
-            if other.image_id == image.image_id {
+        if let Some(error) = digest_conflict(&inventory, &image) {
+            return Err(error);
+        }
+        upsert(&mut inventory, &image);
+        self.write_inventory(&inventory)
+    }
+
+    async fn record_many(
+        &self,
+        _guard: &ImageGuard<'_>,
+        images: Vec<ManagedImage>,
+    ) -> Result<Vec<ManagedImage>, EngineError> {
+        let mut inventory = self.read_inventory()?;
+        let mut recorded = Vec::with_capacity(images.len());
+        for image in images {
+            if digest_conflict(&inventory, &image).is_some() {
                 continue;
             }
-            if other
-                .digests
-                .iter()
-                .any(|digest| image.digests.contains(digest))
-            {
-                return Err(EngineError::ImageBookkeeping(format!(
-                    "digest {:?} is recorded for two image ids ({} and {})",
-                    image
-                        .digests
-                        .first()
-                        .map(StrictDigest::as_str)
-                        .unwrap_or(""),
-                    other.image_id,
-                    image.image_id
-                )));
-            }
+            upsert(&mut inventory, &image);
+            recorded.push(image);
         }
-        match inventory
-            .images
-            .iter_mut()
-            .find(|entry| entry.image_id == image.image_id)
-        {
-            Some(entry) => {
-                entry.digests.extend(image.digests);
-                entry.associations.extend(image.associations);
-            }
-            None => inventory.images.push(image),
+        if recorded.is_empty() {
+            return Ok(recorded);
         }
-        self.write_inventory(&inventory)
+        self.write_inventory(&inventory)?;
+        Ok(recorded)
     }
 }
 
@@ -750,17 +773,35 @@ impl<P: PodmanClient> Reconciler<P> {
             images: inventory.images.clone(),
         };
         let requests = adopt_requests(&images, &apps, &inventory, &scope);
-        for request in requests {
-            // A real prune persists the adoption **before** it can plan a removal from it: if the
-            // record cannot be written (full disk, read-only file), the image stays unattributed
-            // instead of being deleted without durable provenance. A dry run only advertises.
-            if let Some(guard) = adopt
-                && let Err(e) = InventoryStore::record(self, guard, request.clone()).await
-            {
-                diagnostics.push(format!("cannot record image provenance: {e}"));
-                continue;
+        if let Some(guard) = adopt {
+            // A real prune persists the adoptions **before** it can plan a removal from them: if the
+            // records cannot be written (full disk, read-only file), the images stay unattributed
+            // instead of being deleted without durable provenance. One read and one write for the
+            // whole batch; a conflicting image is skipped. A dry run only advertises.
+            match InventoryStore::record_many(self, guard, requests.clone()).await {
+                Ok(recorded) => {
+                    let recorded: BTreeSet<&str> = recorded
+                        .iter()
+                        .map(|image| image.image_id.as_str())
+                        .collect();
+                    for request in requests {
+                        if recorded.contains(request.image_id.as_str()) {
+                            upsert(&mut scoped, &request);
+                        } else {
+                            diagnostics.push(format!(
+                                "cannot record image provenance for {}: a digest is already \
+                                 recorded for another image",
+                                request.image_id
+                            ));
+                        }
+                    }
+                }
+                Err(e) => diagnostics.push(format!("cannot record image provenance: {e}")),
             }
-            advertised(&mut scoped, request);
+        } else {
+            for request in requests {
+                upsert(&mut scoped, &request);
+            }
         }
         // Scope: automatic retention only considers the owner/repository of the completed operation.
         if let RetentionScope::OwnerRepository {
@@ -921,19 +962,47 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 }
 
-/// Adds a synthesized/loaded record to the in-memory inventory without replacing an existing one's
-/// associations.
-fn advertised(inventory: &mut Inventory, image: ManagedImage) {
+/// The conflict an upsert rejects: one manifest digest never names two local image ids.
+fn digest_conflict(inventory: &Inventory, image: &ManagedImage) -> Option<EngineError> {
+    for other in &inventory.images {
+        if other.image_id == image.image_id {
+            continue;
+        }
+        if other
+            .digests
+            .iter()
+            .any(|digest| image.digests.contains(digest))
+        {
+            return Some(EngineError::ImageBookkeeping(format!(
+                "digest {:?} is recorded for two image ids ({} and {})",
+                image
+                    .digests
+                    .first()
+                    .map(StrictDigest::as_str)
+                    .unwrap_or(""),
+                other.image_id,
+                image.image_id
+            )));
+        }
+    }
+    None
+}
+
+/// Unions `image` into `inventory`: an upsert that unions digests and associations and never
+/// replaces another owner's association.
+fn upsert(inventory: &mut Inventory, image: &ManagedImage) {
     match inventory
         .images
         .iter_mut()
         .find(|entry| entry.image_id == image.image_id)
     {
         Some(entry) => {
-            entry.digests.extend(image.digests);
-            entry.associations.extend(image.associations);
+            entry.digests.extend(image.digests.iter().cloned());
+            entry
+                .associations
+                .extend(image.associations.iter().cloned());
         }
-        None => inventory.images.push(image),
+        None => inventory.images.push(image.clone()),
     }
 }
 
@@ -1451,5 +1520,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inventory.format_version, FORMAT_VERSION);
+    }
+
+    #[tokio::test]
+    async fn record_many_writes_the_inventory_once() {
+        let (dir, rec) = reconciler();
+        let held = rec.acquire().await;
+        let guard = ImageGuard::new(&held);
+        write_count::take();
+        let images = vec![
+            record("aa", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+            record("bb", Owner::PlatformDaemon, "ghcr.io/x/y", 'b'),
+            record("cc", Owner::PlatformDaemon, "ghcr.io/x/y", 'c'),
+        ];
+        let recorded = InventoryStore::record_many(&rec, &guard, images)
+            .await
+            .unwrap();
+        assert_eq!(recorded.len(), 3, "all three images are recorded");
+        assert_eq!(
+            write_count::take(),
+            1,
+            "a batch records with one read and one write"
+        );
+        // The whole batch lands in the file, not just the last write.
+        let inventory = Inventory::parse(
+            &std::fs::read_to_string(dir.path().join(INVENTORY_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inventory.images.len(), 3);
     }
 }
