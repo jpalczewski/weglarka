@@ -19,6 +19,7 @@ mod assemble;
 mod publish;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -47,6 +48,10 @@ enum Command {
     /// Verify an immutable set and move the channel pointer to it.
     Promote(PromoteArgs),
     /// Verify a published release set with the runtime verifier.
+    ///
+    /// Exit codes: 0 verified; 3 the channel tag itself (`main`/`stable`) does not exist, i.e. the
+    /// channel has never been released; 1 any other failure (including other "not found"
+    /// answers such as a missing blob or signature); 2 usage error.
     Verify(VerifyArgs),
     /// Move the channel pointer to the highest complete set above it.
     Reconcile(ReconcileArgs),
@@ -388,7 +393,33 @@ impl RegistryAuth {
     }
 }
 
-fn main() -> Result<()> {
+/// Exit code of every failure that has no dedicated code.
+const EXIT_FAILURE: u8 = 1;
+/// `verify` found no manifest under the channel tag itself: the channel has never been released.
+/// The release workflow switches on this to allow a first release. Usage errors exit 2 (clap).
+const EXIT_CHANNEL_TAG_MISSING: u8 = 3;
+
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(exit_code(&error))
+        }
+    }
+}
+
+/// Maps a failure to the process exit code: [`EXIT_CHANNEL_TAG_MISSING`] only for a missing
+/// channel tag, [`EXIT_FAILURE`] for everything else (auth, network, a missing blob or signature).
+fn exit_code(error: &anyhow::Error) -> u8 {
+    if error.downcast_ref::<publish::ChannelTagMissing>().is_some() {
+        EXIT_CHANNEL_TAG_MISSING
+    } else {
+        EXIT_FAILURE
+    }
+}
+
+fn try_main() -> Result<()> {
     let cli = Cli::parse();
     // The registry client is async; the binary is otherwise synchronous and one-shot.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -635,6 +666,40 @@ mod tests {
         assert_eq!(parse_channel("stable").unwrap(), Channel::Stable);
         assert_eq!(parse_channel("main").unwrap(), Channel::Main);
         assert!(parse_channel("edge").is_err());
+    }
+
+    #[test]
+    fn only_a_missing_channel_tag_has_a_dedicated_exit_code() {
+        use weglarka_model::release_set::Repository;
+        use weglarka_registry::RegistryError;
+
+        let status = |status| RegistryError::Status {
+            status,
+            what: "manifest",
+        };
+        let missing = anyhow::Error::new(publish::ChannelTagMissing {
+            channel: Channel::Stable,
+            repository: Repository::new("ghcr.io/example/releases").unwrap(),
+            source: status(404),
+        })
+        .context("cannot resolve ghcr.io/example/releases:stable");
+        assert_eq!(exit_code(&missing), EXIT_CHANNEL_TAG_MISSING);
+        assert_eq!(EXIT_CHANNEL_TAG_MISSING, 3);
+
+        // Other 404s (a blob, a signature, a set tag), auth and network failures stay generic.
+        for error in [
+            anyhow::Error::new(status(404)).context("cannot fetch the descriptor blob"),
+            anyhow::Error::new(status(401))
+                .context("cannot resolve ghcr.io/example/releases:stable"),
+            anyhow::Error::new(status(403)),
+            anyhow::Error::new(RegistryError::Http(weglarka_registry::HttpError::Request {
+                what: "manifest",
+                detail: "connection refused".to_owned(),
+            })),
+            anyhow::anyhow!("the published set does not verify"),
+        ] {
+            assert_eq!(exit_code(&error), EXIT_FAILURE, "{error:#}");
+        }
     }
 
     #[test]

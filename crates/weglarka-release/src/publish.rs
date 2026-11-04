@@ -11,7 +11,9 @@ use weglarka_model::release_set::{
     Channel, Component, Descriptor, DescriptorContext, INDEX_MEDIA_TYPE, MAX_DESCRIPTOR_BYTES,
     MAX_MANIFEST_BYTES, Repository, StrictDigest, parse_descriptor, parse_manifest,
 };
-use weglarka_registry::{ImageRef, PublicKey, ReleaseRegistry, SigningKey, push_signature, verify};
+use weglarka_registry::{
+    ImageRef, PublicKey, RegistryError, ReleaseRegistry, SigningKey, push_signature, verify,
+};
 
 use crate::assemble::{manifest_for, next_sequence, parse_set_tag, set_tag};
 
@@ -315,11 +317,26 @@ async fn verify_component<R: ReleaseRegistry + ?Sized>(
     Ok(())
 }
 
+/// The registry has no manifest under the channel tag itself (`main`/`stable`): the channel has
+/// never been released. Any other "not found" (a set tag, a blob, a signature) is an ordinary
+/// failure, so callers can tell a first release from a broken registry state.
+#[derive(Debug, thiserror::Error)]
+#[error("the {channel} channel tag {repository}:{channel} does not exist")]
+pub struct ChannelTagMissing {
+    pub channel: Channel,
+    pub repository: Repository,
+    #[source]
+    pub source: RegistryError,
+}
+
 /// Full verification of a published set: signature over the manifest digest, exact manifest
 /// bytes, the descriptor layer, and both component images with their version labels and
 /// signatures.
 ///
 /// `context.channel` binds the descriptor's own channel to the one the caller resolved.
+///
+/// A missing manifest under the channel tag itself fails with [`ChannelTagMissing`] (reachable
+/// with `downcast_ref` through the added context); every other failure is an ordinary error.
 pub async fn verify_reference<R: ReleaseRegistry + ?Sized>(
     registry: &R,
     repository: &Repository,
@@ -327,10 +344,27 @@ pub async fn verify_reference<R: ReleaseRegistry + ?Sized>(
     context: DescriptorContext,
     key: &PublicKey,
 ) -> Result<LoadedSet> {
-    let fetched = registry
+    let fetched = match registry
         .manifest(repository, reference, MAX_MANIFEST_BYTES)
         .await
-        .with_context(|| format!("cannot resolve {repository}:{reference}"))?;
+    {
+        Ok(fetched) => fetched,
+        Err(source) if source.is_not_found() => {
+            let error = match Channel::parse(reference) {
+                Some(channel) => anyhow::Error::new(ChannelTagMissing {
+                    channel,
+                    repository: repository.clone(),
+                    source,
+                }),
+                None => anyhow::Error::new(source),
+            };
+            return Err(error.context(format!("cannot resolve {repository}:{reference}")));
+        }
+        Err(source) => {
+            return Err(anyhow::Error::new(source)
+                .context(format!("cannot resolve {repository}:{reference}")));
+        }
+    };
     // Verify the signature over the digest before the layer is even fetched.
     require_signature(registry, repository, &fetched.digest, key).await?;
     let set = decode_set(
@@ -898,6 +932,74 @@ mod tests {
         .unwrap_err();
         assert!(
             format!("{error:#}").contains("org.opencontainers.image.version"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_channel_tag_is_reported_as_a_missing_channel() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+
+        // Nothing published: the channel tag itself is absent.
+        let error = verify_stable(&registry, &key).await.unwrap_err();
+        let missing = error
+            .downcast_ref::<ChannelTagMissing>()
+            .unwrap_or_else(|| panic!("not a missing channel tag: {error:#}"));
+        assert_eq!(missing.channel, Channel::Stable);
+        assert!(missing.source.is_not_found());
+
+        // A missing immutable set tag is a 404 too, but not the channel pointer.
+        let error = verify_reference(
+            &registry,
+            &repo(),
+            "set-stable-1",
+            stable(),
+            key.public_key(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<ChannelTagMissing>().is_none());
+        assert!(
+            error
+                .downcast_ref::<RegistryError>()
+                .is_some_and(RegistryError::is_not_found),
+            "{error:#}"
+        );
+
+        // A channel manifest without a signature: a failure, not a missing channel.
+        let layer = br#"{}"#;
+        let (_, manifest) = manifest_for(layer).unwrap();
+        registry
+            .put_manifest(&repo(), "stable", &manifest)
+            .await
+            .unwrap();
+        let error = verify_stable(&registry, &key).await.unwrap_err();
+        assert!(error.downcast_ref::<ChannelTagMissing>().is_none());
+        assert!(
+            format!("{error:#}").contains("no key-based cosign signature"),
+            "{error:#}"
+        );
+
+        // A signed channel manifest whose descriptor blob was never pushed: also a 404, also not
+        // a missing channel.
+        let digest = sha256(&manifest);
+        push_signature(
+            &registry,
+            &repo(),
+            &image_ref(&repo()).unwrap(),
+            &digest,
+            key.signing_key(),
+        )
+        .await
+        .unwrap();
+        let error = verify_stable(&registry, &key).await.unwrap_err();
+        assert!(error.downcast_ref::<ChannelTagMissing>().is_none());
+        assert!(
+            error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<RegistryError>())
+                .any(RegistryError::is_not_found),
             "{error:#}"
         );
     }
