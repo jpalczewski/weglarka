@@ -668,12 +668,28 @@ mod tests {
     use std::sync::Mutex;
     use weglarka_engine::platform::Hardening;
 
-    #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    /// Records every command. The observed container reports `epoch` as its activation epoch.
+    struct Recorder {
+        calls: Mutex<Vec<String>>,
+        epoch: u64,
+    }
+
+    impl Default for Recorder {
+        fn default() -> Self {
+            Self::reporting(4)
+        }
+    }
 
     impl Recorder {
+        fn reporting(epoch: u64) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                epoch,
+            }
+        }
+
         fn calls(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -685,9 +701,12 @@ mod tests {
             _: &[(String, String)],
         ) -> io::Result<CommandOutput> {
             let call = format!("{program} {}", args.join(" "));
-            self.0.lock().unwrap().push(call.clone());
+            self.calls.lock().unwrap().push(call.clone());
             let out = if call.contains("inspect --type container") {
-                "abc|true|img|ghcr.io/example/weglarka@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|4".to_owned()
+                format!(
+                    "abc|true|img|ghcr.io/example/weglarka@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|{}",
+                    self.epoch
+                )
             } else if call.contains("inspect --type image") {
                 format!("sha256:{}", "a".repeat(64))
             } else {
@@ -702,7 +721,11 @@ mod tests {
     }
 
     fn platform(dir: &Path) -> OpenRcPlatform<Recorder> {
-        OpenRcPlatform::with_runner("weglarka", 1001, Recorder::default())
+        platform_with(dir, Recorder::default())
+    }
+
+    fn platform_with(dir: &Path, recorder: Recorder) -> OpenRcPlatform<Recorder> {
+        OpenRcPlatform::with_runner("weglarka", 1001, recorder)
             .with_host_dir(dir.join("host"))
             .with_state_dir(dir.join("state"))
             .with_init_dir(dir.join("init.d"))
@@ -891,6 +914,31 @@ mod tests {
             "{:?}",
             p.runner.calls()
         );
+    }
+
+    #[tokio::test]
+    async fn activation_leaves_a_previous_epoch_container_to_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        // The observed container is at epoch 3; the request is epoch 4, so the selection is newer.
+        let p = platform_with(dir.path(), Recorder::reporting(3));
+        let receipt = p
+            .activate_service(spec(), ActivationEpoch(4))
+            .await
+            .unwrap();
+        assert_eq!(receipt.epoch, ActivationEpoch(4));
+        let calls = p.runner.calls();
+        // Not stopped by ID (the launcher's re-read after `podman create` replaces it with --replace),
+        // and not removed either.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("podman stop") || c.contains("podman rm")),
+            "{calls:?}"
+        );
+        // The selection was still written for epoch 4.
+        let selection =
+            std::fs::read_to_string(dir.path().join("host/platform-service.toml")).unwrap();
+        assert!(selection.contains("epoch = 4"), "{selection}");
     }
 
     #[tokio::test]
