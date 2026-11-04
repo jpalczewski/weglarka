@@ -457,6 +457,25 @@ jobs:
       - run: cargo test -p weglarka-engine --test volumes --test image_save --test ingress_identity -- --nocapture
       # The Prometheus targets generator against the real `promtool` of the official image (#366, ADR 0064).
       - run: "cargo test -p weglarka-daemon --test it -- promtool:: --nocapture"
+      # The registry contract suite against a real registry (distribution, loopback HTTP): the same cases
+      # the fakes pass in unit tests (#492). The image is pinned like the one in scripts/acceptance.sh.
+      - name: Start a local registry
+        run: |
+          set -euo pipefail
+          podman run -d --rm --name contract-registry -p 127.0.0.1:5000:5000 \
+            docker.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:5000/v2/ && exit 0
+            sleep 1
+          done
+          echo "the local registry did not come up" >&2
+          exit 1
+      - run: cargo test -p weglarka-registry --features testing --test contract -- --nocapture
+        env:
+          WEGLARKA_REGISTRY_URL: 127.0.0.1:5000
+      - name: Stop the local registry
+        if: always()
+        run: podman stop --ignore contract-registry || true
       - name: Podman service log
         if: failure()
         run: cat "$RUNNER_TEMP/podman-service.log" || true

@@ -29,3 +29,8 @@ weglarka-model.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "test-util", "rt-multi-thread"] }
+
+# The suites live behind the `testing` feature; a bare `cargo test -p weglarka-registry` skips this target.
+[[test]]
+name = "contract"
+required-features = ["testing"]
