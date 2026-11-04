@@ -277,6 +277,29 @@ impl Backend<'_> {
     }
 }
 
+/// MIME types for a static site (issue #498). The generated config is self-contained on purpose (ADR
+/// 0005/0006: no `include mime.types` from the image), and nginx's compiled-in table only knows
+/// `html`/`gif`/`jpg` — everything else falls back to `default_type` and is served as `text/plain`,
+/// which browsers reject as a stylesheet and refuse to load as an ES module. This table covers the file
+/// types a built static site (Astro, Hugo, plain HTML) actually ships; an unmatched extension gets the
+/// explicit, inert `application/octet-stream` instead of `text/plain`.
+const STATIC_SITE_TYPES: &[(&str, &[&str])] = &[
+    ("text/html", &["html", "htm"]),
+    ("text/css", &["css"]),
+    ("application/javascript", &["js", "mjs"]),
+    ("application/json", &["json", "webmanifest"]),
+    ("image/svg+xml", &["svg"]),
+    ("font/woff", &["woff"]),
+    ("font/woff2", &["woff2"]),
+    ("application/wasm", &["wasm"]),
+    ("application/xml", &["xml"]),
+    ("text/plain", &["txt"]),
+    ("image/png", &["png"]),
+    ("image/jpeg", &["jpg", "jpeg"]),
+    ("image/gif", &["gif"]),
+    ("image/x-icon", &["ico"]),
+];
+
 /// A static site's `location` body. `rewrite ... break` runs before `try_files`, which then sees the URI
 /// relative to the site root; nginx has normalized `$uri` (no `..`) before this point. Only GET and HEAD
 /// are allowed, and nothing is listed.
@@ -285,6 +308,12 @@ fn write_directory(c: &mut Conf, root: &str, strip: Option<&(String, String)>) {
         c.line(&format!("rewrite {regex} {replacement} break;"));
     }
     c.line(&format!("root {root};"));
+    c.block("types", |c| {
+        for (mime, extensions) in STATIC_SITE_TYPES {
+            c.line(&format!("{mime} {};", extensions.join(" ")));
+        }
+    });
+    c.line("default_type application/octet-stream;");
     c.line("index index.html;");
     c.line("autoindex off;");
     c.line("try_files $uri $uri/index.html =404;");

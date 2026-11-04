@@ -41,6 +41,8 @@ site() { # site <name> <release> <index body>
 site landing r1 landing-r1
 site landing r2 landing-r2
 site docs r1 docs-r1
+printf 'body{}' >"$work/sites/landing/releases/r1/style.css"
+printf 'console.log(1)' >"$work/sites/landing/releases/r1/app.js"
 ln -s releases/r1 "$work/sites/landing/current"
 ln -s releases/r1 "$work/sites/docs/current"
 echo secret >"$work/sites/secret.txt"
@@ -99,6 +101,22 @@ expect "docs /docs/ serves the site root" "200 docs-r1" GET blog.example.eu /doc
 expect "docs /docs/about/ serves a subdirectory" "200 docs-r1-about" GET blog.example.eu /docs/about/
 expect "docs /docs/guide.html strips the prefix" "200 docs-r1-guide" GET blog.example.eu /docs/guide.html
 expect "docs /docs (exact) serves the site root" "200 docs-r1" GET blog.example.eu /docs
+
+# issue #498: the generated config carries its own MIME table (no `include mime.types`), so a stylesheet or
+# script must not come back as `text/plain` — a browser then refuses to apply or execute it.
+expect_content_type() { # expect_content_type <description> <want> <path>
+  local got
+  got=$(curl -sS --path-as-is -I -H "Host: landing.example.eu" "http://127.0.0.1:$port$3" \
+    | tr -d '\r' | grep -i '^content-type:' | cut -d' ' -f2)
+  if [ "$got" = "$2" ]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: want '$2', got '$got'"
+    fail=1
+  fi
+}
+expect_content_type "landing /style.css has a css content type" "text/css" /style.css
+expect_content_type "landing /app.js has a javascript content type" "application/javascript" /app.js
 
 # `..` must never leave the release (curl does not normalise with --path-as-is; nginx does).
 got=$(request GET landing.example.eu /../secret.txt)

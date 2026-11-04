@@ -133,6 +133,23 @@ http {
             set $app "docs";
             rewrite ^ /index.html break;
             root /etc/nginx/sites/docs/current;
+            types {
+                text/html html htm;
+                text/css css;
+                application/javascript js mjs;
+                application/json json webmanifest;
+                image/svg+xml svg;
+                font/woff woff;
+                font/woff2 woff2;
+                application/wasm wasm;
+                application/xml xml;
+                text/plain txt;
+                image/png png;
+                image/jpeg jpg jpeg;
+                image/gif gif;
+                image/x-icon ico;
+            }
+            default_type application/octet-stream;
             index index.html;
             autoindex off;
             try_files $uri $uri/index.html =404;
@@ -144,6 +161,23 @@ http {
             set $app "docs";
             rewrite ^/docs\.v2/(.*)$ /$1 break;
             root /etc/nginx/sites/docs/current;
+            types {
+                text/html html htm;
+                text/css css;
+                application/javascript js mjs;
+                application/json json webmanifest;
+                image/svg+xml svg;
+                font/woff woff;
+                font/woff2 woff2;
+                application/wasm wasm;
+                application/xml xml;
+                text/plain txt;
+                image/png png;
+                image/jpeg jpg jpeg;
+                image/gif gif;
+                image/x-icon ico;
+            }
+            default_type application/octet-stream;
             index index.html;
             autoindex off;
             try_files $uri $uri/index.html =404;
@@ -164,6 +198,23 @@ http {
         client_max_body_size 67108864;
         location / {
             root /etc/nginx/sites/landing/current;
+            types {
+                text/html html htm;
+                text/css css;
+                application/javascript js mjs;
+                application/json json webmanifest;
+                image/svg+xml svg;
+                font/woff woff;
+                font/woff2 woff2;
+                application/wasm wasm;
+                application/xml xml;
+                text/plain txt;
+                image/png png;
+                image/jpeg jpg jpeg;
+                image/gif gif;
+                image/x-icon ico;
+            }
+            default_type application/octet-stream;
             index index.html;
             autoindex off;
             try_files $uri $uri/index.html =404;
