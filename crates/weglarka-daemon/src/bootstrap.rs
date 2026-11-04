@@ -16,9 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use weglarka_engine::platform::{ActivationEpoch, JobId, Platform, PlatformError, ScheduledJob};
 use weglarka_launcher::bootstrap::{PreflightOutcome, coordinated_updates_ready};
-use weglarka_launcher::generation::GenerationStore;
+use weglarka_launcher::generation::{Generation, GenerationStore};
 use weglarka_launcher::host::{
-    BOOTSTRAP_MARKER, HOST_DAEMON_FILE, LAUNCHER_FILE, validate_host_dir,
+    BOOTSTRAP_MARKER, GENERATION_MANIFEST, GENERATIONS_DIR, HOST_DAEMON_FILE, LAUNCHER_FILE,
+    generation_name, validate_host_dir,
 };
 use weglarka_launcher::lock;
 use weglarka_launcher::selector::{BootstrapMarker, HostSelector, LegacyImport};
@@ -36,6 +37,9 @@ use crate::platform::{
 };
 use crate::service::service_spec;
 use crate::settings::Settings;
+
+/// The legacy runner's lock file in the state directory.
+const LEGACY_LOCK_FILE: &str = "self-update.lock";
 
 /// Inputs of a bootstrap. `--host-dir` is the installation-configured host-only directory; all
 /// paths are explicit because bootstrap runs before any selector exists.
@@ -124,10 +128,12 @@ pub enum Step {
     },
     /// Disable and remove the legacy self-update/watchdog units and the legacy lock file.
     RetireLegacyUnits,
-    /// Import `self-update.toml` into the host-only directory and retire the file.
-    ImportLegacyState,
-    /// Write the initial selector (or keep the existing one for the same generation).
-    EnsureSelector { generation: StrictDigest },
+    /// Import `self-update.toml` into the host-only directory and retire the file. Only planned
+    /// when the file exists.
+    ImportLegacyState { import: LegacyImport },
+    /// Write the initial selector. Not planned when the host already carries one for this
+    /// generation (the epoch is kept).
+    WriteSelector { selector: HostSelector },
     /// Write the shared `host-capabilities.toml`.
     WriteCapabilities,
     /// Install the fixed launcher jobs.
@@ -167,10 +173,14 @@ impl std::fmt::Display for Step {
             Self::RetireLegacyUnits => {
                 write!(f, "retire legacy self-update/watchdog units and lock")
             }
-            Self::ImportLegacyState => write!(f, "import legacy self-update state"),
-            Self::EnsureSelector { generation } => {
-                write!(f, "select generation {generation}")
+            Self::ImportLegacyState { .. } => {
+                write!(f, "import legacy self-update state and retire the file")
             }
+            Self::WriteSelector { selector } => write!(
+                f,
+                "select generation {} (epoch {})",
+                selector.active, selector.epoch
+            ),
             Self::WriteCapabilities => write!(f, "write host capabilities"),
             Self::InstallJobs { jobs } => {
                 let ids: Vec<&str> = jobs.iter().map(|job| job.id.as_str()).collect();
@@ -196,6 +206,8 @@ pub struct BootstrapPlan {
     host_dir: PathBuf,
     now: u64,
     service: weglarka_engine::platform::ServiceSpec,
+    /// The selector the host ends up with: the existing one for the same generation, or a fresh one.
+    selector: HostSelector,
     steps: Vec<Step>,
 }
 
@@ -235,7 +247,14 @@ pub async fn bootstrap<P: Platform>(
     apply(platform, &plan).await
 }
 
-/// Decides what a bootstrap would do. Changes nothing on the host.
+/// Decides what a bootstrap would do: reads the host and runs every precondition and preflight, so
+/// that an impossible bootstrap is refused before anything changes. Changes nothing that outlives the
+/// call (a scratch directory next to the host directory is removed again).
+///
+/// The generation preflight runs against a verified scratch copy of the tools on systemd. On OpenRC
+/// the preflight also checks the runtime prerequisites (rootless Podman socket, cron) that only the
+/// apply step provisions, so there it still runs, unchanged, as the [`Step::VerifyPreflight`] step
+/// after provisioning.
 pub async fn plan<P: Platform>(
     platform: &P,
     options: &BootstrapOptions,
@@ -251,6 +270,35 @@ pub async fn plan<P: Platform>(
         });
     }
     let systemd = platform.kind() == weglarka_model::config::PlatformKind::Systemd;
+    let now = unix_now();
+
+    check_launcher(&options.launcher_binary)?;
+    let scratch_generation = stage_scratch_generation(&host_dir, options)?;
+    if systemd {
+        run_preflight_on(
+            &scratch_generation.generation,
+            "active",
+            &options.config_path,
+        )?;
+    }
+    check_existing_generation(&host_dir, &scratch_generation.generation)?;
+
+    // A host already bootstrapped with another generation is refused before anything is touched. The
+    // same generation keeps its selector (and epoch).
+    let existing = HostSelector::load_optional(&host_dir)?;
+    let selector = match &existing {
+        Some(existing) if existing.active == options.generation => existing.clone(),
+        Some(existing) => return Err(BootstrapError::AlreadyBootstrapped(existing.active.clone())),
+        None => HostSelector::fresh(options.generation.clone()),
+    };
+
+    // A legacy runner still holding the lock must be stopped; refusing is the safe answer.
+    let legacy_lock = options.state_dir.join(LEGACY_LOCK_FILE);
+    if lock::is_held(&legacy_lock)? {
+        return Err(BootstrapError::LegacyRunnerActive);
+    }
+    let legacy_import = plan_legacy_import(&options.state_dir, now)?;
+
     let ownership = options.runtime_uid.zip(options.runtime_gid);
     let ownership_step = || ownership.map(|(uid, gid)| Step::ApplyOwnership { uid, gid });
 
@@ -290,10 +338,14 @@ pub async fn plan<P: Platform>(
         },
         // Retire the legacy runner before any new timer can start.
         Step::RetireLegacyUnits,
-        Step::ImportLegacyState,
-        Step::EnsureSelector {
-            generation: options.generation.clone(),
-        },
+    ]);
+    steps.extend(legacy_import.map(|import| Step::ImportLegacyState { import }));
+    if existing.is_none() {
+        steps.push(Step::WriteSelector {
+            selector: selector.clone(),
+        });
+    }
+    steps.extend([
         // Only features this build really implements are claimed; retention therefore stays
         // fail-closed until A/D extend the set.
         Step::WriteCapabilities,
@@ -320,8 +372,9 @@ pub async fn plan<P: Platform>(
     Ok(BootstrapPlan {
         options: options.clone(),
         host_dir,
-        now: unix_now(),
+        now,
         service,
+        selector,
         steps,
     })
 }
@@ -337,7 +390,7 @@ pub async fn apply<P: Platform>(
     let mut linger_enabled = false;
     let mut retired_units = Vec::new();
     let mut installed = None;
-    let mut selector = None;
+    let selector = &plan.selector;
     let mut preflight = PreflightOutcome {
         active: false,
         recovery: false,
@@ -365,26 +418,14 @@ pub async fn apply<P: Platform>(
             Step::RetireLegacyUnits => {
                 retired_units = retire_legacy_units(platform, &options.state_dir).await?;
             }
-            Step::ImportLegacyState => import_legacy_state(host_dir, &options.state_dir, plan.now)?,
-            Step::EnsureSelector { generation } => {
-                // Re-running with the same generation keeps the epoch.
-                selector = Some(match HostSelector::load_optional(host_dir)? {
-                    Some(existing) if existing.active == *generation => existing,
-                    Some(existing) => {
-                        return Err(BootstrapError::AlreadyBootstrapped(existing.active));
-                    }
-                    None => {
-                        let selector = HostSelector::fresh(generation.clone());
-                        selector.save(host_dir)?;
-                        selector
-                    }
-                });
+            Step::ImportLegacyState { import } => {
+                import_legacy_state(host_dir, &options.state_dir, import)?;
             }
+            Step::WriteSelector { selector } => selector.save(host_dir)?,
             Step::WriteCapabilities => write_capabilities(&options.state_dir, &options.generation)?,
             Step::InstallJobs { jobs } => platform.install_jobs(jobs).await?,
             Step::InstallService { .. } => platform.install_service(&plan.service).await?,
             Step::ActivateService => {
-                let selector = selector.as_ref().ok_or_else(missing_selector)?;
                 platform
                     .activate_service(plan.service.clone(), ActivationEpoch(selector.epoch))
                     .await?;
@@ -406,34 +447,22 @@ pub async fn apply<P: Platform>(
             Step::VerifyPreflight => {
                 // The active and recovery generation against the *current* configuration, now that
                 // the OpenRC runtime prerequisites are provisioned.
-                let selector = selector.as_ref().ok_or_else(missing_selector)?;
                 for (label, digest) in [
                     ("active", selector.active.clone()),
                     ("recovery", selector.recovery().clone()),
                 ] {
                     let generation = store.open(&digest)?;
-                    match weglarka_launcher::run::run_preflight(
-                        &generation,
-                        &options.config_path,
-                        std::time::Duration::from_secs(60),
-                    ) {
-                        Ok(()) => {
-                            if label == "active" {
-                                preflight.active = true;
-                            } else {
-                                preflight.recovery = true;
-                            }
-                        }
-                        Err(error) => {
-                            return Err(BootstrapError::Preflight(label, error.to_string()));
-                        }
+                    run_preflight_on(&generation, label, &options.config_path)?;
+                    if label == "active" {
+                        preflight.active = true;
+                    } else {
+                        preflight.recovery = true;
                     }
                 }
             }
             Step::WriteMarker => {
                 // The marker is the durable "bootstrap complete" signal. It is written only after
                 // every installation step and both preflights passed.
-                let selector = selector.as_ref().ok_or_else(missing_selector)?;
                 BootstrapMarker {
                     format_version: 1,
                     generation: selector.active.clone(),
@@ -445,7 +474,6 @@ pub async fn apply<P: Platform>(
         }
     }
 
-    let selector = selector.ok_or_else(missing_selector)?;
     let generation = installed.ok_or_else(|| {
         BootstrapError::Incomplete("the plan did not install a generation".into())
     })?;
@@ -468,10 +496,6 @@ pub async fn apply<P: Platform>(
         retired_units,
         linger_enabled,
     })
-}
-
-fn missing_selector() -> BootstrapError {
-    BootstrapError::Incomplete("the plan has no selector step before it is needed".into())
 }
 
 /// Reverse command: refuses while a transaction is nonterminal, then removes the launcher setup (jobs,
@@ -550,7 +574,8 @@ fn create_dir(path: &Path) -> Result<(), BootstrapError> {
     })
 }
 
-fn install_launcher(host_dir: &Path, source: &Path) -> Result<(), BootstrapError> {
+/// Validates the launcher source: a regular file (never a symlink) of bounded size.
+fn check_launcher(source: &Path) -> Result<std::fs::Metadata, BootstrapError> {
     let metadata = std::fs::symlink_metadata(source).map_err(|source_err| BootstrapError::Io {
         path: source.to_owned(),
         source: source_err,
@@ -567,6 +592,12 @@ fn install_launcher(host_dir: &Path, source: &Path) -> Result<(), BootstrapError
             source.display()
         )));
     }
+    Ok(metadata)
+}
+
+/// The plan already validated the source; it is checked again here because root reads it now.
+fn install_launcher(host_dir: &Path, source: &Path) -> Result<(), BootstrapError> {
+    check_launcher(source)?;
     let bytes = std::fs::read(source).map_err(|source_err| BootstrapError::Io {
         path: source.to_owned(),
         source: source_err,
@@ -577,6 +608,102 @@ fn install_launcher(host_dir: &Path, source: &Path) -> Result<(), BootstrapError
         source,
     })?;
     Ok(())
+}
+
+/// A private directory removed again on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Creates `<near's parent>/.weglarka-bootstrap-plan-*` with mode 0700 (the system temporary
+    /// directory when the parent does not exist yet). Next to the host directory rather than in
+    /// `/tmp` because the copy is executed and `/tmp` may be mounted `noexec`.
+    fn create(near: &Path) -> Result<Self, BootstrapError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = near
+            .parent()
+            .filter(|parent| parent.is_dir())
+            .map_or_else(std::env::temp_dir, Path::to_owned);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = base.join(format!(
+            ".weglarka-bootstrap-plan-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|source| BootstrapError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The tools staged and verified in a scratch store.
+struct ScratchGeneration {
+    generation: Generation,
+    _scratch: Scratch,
+}
+
+/// Stages the tools exactly as the apply step will (same source checks, size limit and digest) into
+/// a private scratch store, so a bad source is refused before the host is touched and the preflight
+/// has a verified copy to run.
+fn stage_scratch_generation(
+    host_dir: &Path,
+    options: &BootstrapOptions,
+) -> Result<ScratchGeneration, BootstrapError> {
+    let scratch = Scratch::create(host_dir)?;
+    let generation = GenerationStore::new(&scratch.0).install_from_files(
+        &options.generation,
+        &[
+            (HOST_DAEMON_FILE, options.daemon_binary.clone()),
+            (
+                weglarka_launcher::host::HOST_CLI_FILE,
+                options.cli_binary.clone(),
+            ),
+        ],
+    )?;
+    Ok(ScratchGeneration {
+        generation,
+        _scratch: scratch,
+    })
+}
+
+/// A generation directory that already exists on the host is reused only when it verifies and holds
+/// exactly the files being installed (the same check `install_from_files` runs while applying).
+fn check_existing_generation(host_dir: &Path, staged: &Generation) -> Result<(), BootstrapError> {
+    let target = host_dir
+        .join(GENERATIONS_DIR)
+        .join(generation_name(staged.digest()));
+    if std::fs::symlink_metadata(&target).is_err() {
+        return Ok(());
+    }
+    let existing = GenerationStore::new(host_dir).open(staged.digest())?;
+    if existing.manifest().files != staged.manifest().files {
+        return Err(weglarka_launcher::generation::GenerationError::Mismatch {
+            path: target.join(GENERATION_MANIFEST),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn run_preflight_on(
+    generation: &Generation,
+    label: &'static str,
+    config: &Path,
+) -> Result<(), BootstrapError> {
+    weglarka_launcher::run::run_preflight(generation, config, std::time::Duration::from_secs(60))
+        .map_err(|error| BootstrapError::Preflight(label, error.to_string()))
 }
 
 async fn retire_legacy_units<P: Platform>(
@@ -607,8 +734,9 @@ async fn retire_legacy_units<P: Platform>(
             .map(str::to_owned),
         );
     }
-    // A legacy runner still holding the lock must be stopped; refusing is the safe answer.
-    let legacy_lock = state_dir.join("self-update.lock");
+    // A legacy runner that started between the plan and now holds the lock again: the timers are
+    // off at this point, so a held lock is a real runner and stopping is the safe answer.
+    let legacy_lock = state_dir.join(LEGACY_LOCK_FILE);
     if lock::is_held(&legacy_lock)? {
         return Err(BootstrapError::LegacyRunnerActive);
     }
@@ -625,26 +753,35 @@ async fn retire_legacy_units<P: Platform>(
     Ok(retired)
 }
 
-fn import_legacy_state(host_dir: &Path, state_dir: &Path, now: u64) -> Result<(), BootstrapError> {
-    let path = weglarka_model::self_update::path(state_dir);
+/// What importing `self-update.toml` would write, or `None` when the file does not exist. A file
+/// that does not parse is refused here.
+fn plan_legacy_import(state_dir: &Path, now: u64) -> Result<Option<LegacyImport>, BootstrapError> {
     let state = weglarka_model::self_update::load(state_dir)
         .map_err(|e| BootstrapError::Legacy(e.to_string()))?;
-    if path.exists() {
-        LegacyImport {
-            format_version: 1,
-            current: state.current.as_ref().map(|d| d.as_str().to_owned()),
-            previous: state.previous.as_ref().map(|d| d.as_str().to_owned()),
-            pending: state.pending.as_ref().map(|d| d.as_str().to_owned()),
-            imported_at: now,
-        }
-        .save(host_dir)?;
-        let retired = path.with_extension("toml.retired");
-        std::fs::rename(&path, &retired).map_err(|source| BootstrapError::Io {
-            path: retired.clone(),
-            source,
-        })?;
+    if !weglarka_model::self_update::path(state_dir).exists() {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(LegacyImport {
+        format_version: 1,
+        current: state.current.as_ref().map(|d| d.as_str().to_owned()),
+        previous: state.previous.as_ref().map(|d| d.as_str().to_owned()),
+        pending: state.pending.as_ref().map(|d| d.as_str().to_owned()),
+        imported_at: now,
+    }))
+}
+
+fn import_legacy_state(
+    host_dir: &Path,
+    state_dir: &Path,
+    import: &LegacyImport,
+) -> Result<(), BootstrapError> {
+    let path = weglarka_model::self_update::path(state_dir);
+    import.save(host_dir)?;
+    let retired = path.with_extension("toml.retired");
+    std::fs::rename(&path, &retired).map_err(|source| BootstrapError::Io {
+        path: retired.clone(),
+        source,
+    })
 }
 
 fn restore_legacy_state(state_dir: &Path) -> Result<(), BootstrapError> {
@@ -1040,6 +1177,174 @@ image = "ghcr.io/example/weglarka:latest"
             bootstrap(&FakePlatform::systemd(), &options).await,
             Err(BootstrapError::Overlapping { .. })
         ));
+    }
+
+    /// Every path under `root` with its kind, mode, owner and content hash (symlinks by target), so
+    /// "nothing changed" is a plain equality. Timestamps are left out on purpose.
+    fn tree(root: &Path) -> Vec<String> {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        fn walk(dir: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let detail = if meta.file_type().is_symlink() {
+                    format!("-> {}", std::fs::read_link(&path).unwrap().display())
+                } else if meta.is_file() {
+                    hex::encode(Sha256::digest(std::fs::read(&path).unwrap()))
+                } else {
+                    String::new()
+                };
+                out.push(format!(
+                    "{} {:o} {}:{} {detail}",
+                    path.display(),
+                    meta.mode(),
+                    meta.uid(),
+                    meta.gid()
+                ));
+                if meta.is_dir() {
+                    walk(&path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_already_bootstrapped_host_refuses_another_generation_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let platform = FakePlatform::systemd();
+        bootstrap(&platform, &options).await.unwrap();
+        // A legacy file that a premature import would retire.
+        std::fs::write(
+            options.state_dir.join("self-update.toml"),
+            format!("current = \"sha256:{}\"\n", "c".repeat(64)),
+        )
+        .unwrap();
+        let before = tree(dir.path());
+        let jobs = platform.jobs.lock().unwrap().len();
+
+        let mut other = options.clone();
+        other.generation = StrictDigest::new(format!("sha256:{}", "f".repeat(64))).unwrap();
+        let error = bootstrap(&platform, &other).await.unwrap_err();
+
+        assert!(
+            matches!(&error, BootstrapError::AlreadyBootstrapped(active) if *active == options.generation),
+            "{error}"
+        );
+        assert_eq!(tree(dir.path()), before);
+        assert_eq!(platform.jobs.lock().unwrap().len(), jobs);
+    }
+
+    #[tokio::test]
+    async fn a_refused_bootstrap_leaves_a_fresh_host_untouched() {
+        // Each precondition is checked while planning, so no refusal leaves a half-installed host.
+        let dir = tempfile::tempdir().unwrap();
+        let base = options(dir.path());
+        let before = tree(dir.path());
+        let platform = FakePlatform::systemd();
+
+        let failing_preflight = base.clone();
+        script(&failing_preflight.daemon_binary, "#!/bin/sh\nexit 3\n");
+        let before_script = tree(dir.path());
+        assert!(matches!(
+            bootstrap(&platform, &failing_preflight).await,
+            Err(BootstrapError::Preflight("active", _))
+        ));
+        assert_eq!(tree(dir.path()), before_script);
+        script(&base.daemon_binary, "#!/bin/sh\nexit 0\n");
+        assert_eq!(tree(dir.path()), before);
+
+        let mut symlinked_launcher = base.clone();
+        let link = dir.path().join("launcher-link");
+        std::os::unix::fs::symlink(&base.launcher_binary, &link).unwrap();
+        symlinked_launcher.launcher_binary = link;
+        let before_link = tree(dir.path());
+        assert!(matches!(
+            bootstrap(&platform, &symlinked_launcher).await,
+            Err(BootstrapError::Incomplete(_))
+        ));
+        assert_eq!(tree(dir.path()), before_link);
+
+        std::fs::write(base.state_dir.join("self-update.toml"), "current = [1]\n").unwrap();
+        let before_legacy = tree(dir.path());
+        assert!(matches!(
+            bootstrap(&platform, &base).await,
+            Err(BootstrapError::Legacy(_))
+        ));
+        assert_eq!(tree(dir.path()), before_legacy);
+        assert!(!base.host_dir.exists());
+        assert!(platform.jobs.lock().unwrap().is_empty());
+        assert!(platform.installed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_legacy_runner_is_refused_before_any_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let held =
+            weglarka_launcher::lock::lock(&options.state_dir.join(LEGACY_LOCK_FILE)).unwrap();
+        let before = tree(dir.path());
+        let platform = FakePlatform::systemd();
+        assert!(matches!(
+            plan(&platform, &options).await,
+            Err(BootstrapError::LegacyRunnerActive)
+        ));
+        assert_eq!(tree(dir.path()), before);
+        assert!(platform.removed_units.lock().unwrap().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn dry_run_lists_the_steps_of_a_fresh_host_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(dir.path());
+        options.enable_linger = true;
+        options.runtime_uid = Some(1001);
+        options.runtime_gid = Some(1001);
+        std::fs::write(
+            options.state_dir.join("self-update.toml"),
+            format!("current = \"sha256:{}\"\n", "c".repeat(64)),
+        )
+        .unwrap();
+        let before = tree(dir.path());
+        let platform = FakePlatform::systemd();
+
+        let plan = plan(&platform, &options).await.unwrap();
+
+        insta::assert_snapshot!(
+            "dry_run_systemd_fresh_host",
+            plan.to_string()
+                .replace(dir.path().to_str().unwrap(), "[root]")
+        );
+        assert_eq!(tree(dir.path()), before);
+        assert!(platform.jobs.lock().unwrap().is_empty());
+        assert!(platform.installed.lock().unwrap().is_empty());
+        assert!(platform.removed_units.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_openrc_plan_keeps_the_preflight_for_after_provisioning() {
+        // On OpenRC the preflight needs the Podman socket and cron that only the apply step
+        // provisions, so a failing tool does not fail the plan; the step stays in the plan.
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        script(&options.daemon_binary, "#!/bin/sh\nexit 3\n");
+        let platform = FakePlatform {
+            kind: Some(PlatformKind::Openrc),
+            ..FakePlatform::default()
+        };
+        let plan = plan(&platform, &options).await.unwrap();
+        assert!(plan.steps().contains(&Step::VerifyPreflight));
+        assert!(plan.steps().contains(&Step::ActivateService));
+        assert!(!options.host_dir.exists());
     }
 
     #[tokio::test]
