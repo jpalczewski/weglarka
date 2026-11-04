@@ -427,9 +427,23 @@ pub async fn read_pointer<R: ReleaseRegistry + ?Sized>(
     }))
 }
 
+/// The release set about to be published carries another daemon than the one the caller tested.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the release set would publish daemon {actual}, but the tested daemon is {expected}; \
+     nothing was published"
+)]
+pub struct DaemonDigestMismatch {
+    pub expected: StrictDigest,
+    pub actual: StrictDigest,
+}
+
 /// Publishes one immutable set: allocate the sequence and push the immutable tag (blobs first,
 /// then the manifest). A signature is **not** written here: CI signs the manifest digest with the
 /// existing static cosign key, exactly as it signs images, and only then calls [`promote`].
+///
+/// With `expected_daemon`, the daemon digest of `spec` (including a reused one) must equal it; the
+/// check runs before any registry call, so a mismatch pushes nothing.
 ///
 /// The promotion critical section is the workflow's per-channel concurrency group. This function
 /// never moves the pointer and never overwrites an existing immutable tag.
@@ -438,7 +452,16 @@ pub async fn publish<R: ReleaseRegistry + ?Sized>(
     repository: &Repository,
     spec: &crate::assemble::ReleaseSpec,
     requested_sequence: Option<u64>,
+    expected_daemon: Option<&StrictDigest>,
 ) -> Result<PublishOutcome> {
+    if let Some(expected) = expected_daemon
+        && &spec.daemon.digest != expected
+    {
+        return Err(anyhow::Error::new(DaemonDigestMismatch {
+            expected: expected.clone(),
+            actual: spec.daemon.digest.clone(),
+        }));
+    }
     let pointer = read_pointer_structure(registry, repository, spec.channel).await?;
     let tags = registry
         .tags(repository)
@@ -803,7 +826,7 @@ mod tests {
         spec: &ReleaseSpec,
         key: &TestSigningKey,
     ) -> Result<(PublishOutcome, PromoteOutcome)> {
-        let published = publish(registry, &repo(), spec, None).await?;
+        let published = publish(registry, &repo(), spec, None, None).await?;
         sign(
             registry,
             &repo(),
@@ -1174,7 +1197,7 @@ mod tests {
             .unwrap();
         registry.hide_tag(&repo(), &set_tag(Channel::Stable, 2));
 
-        let error = publish(&registry, &repo(), &other, Some(2))
+        let error = publish(&registry, &repo(), &other, Some(2), None)
             .await
             .unwrap_err();
         assert!(
@@ -1201,7 +1224,7 @@ mod tests {
         publish_signed(&registry, &spec, &key).await.unwrap();
 
         // Replaying an old sequence is refused, not rewritten under the same immutable tag.
-        let error = publish(&registry, &repo(), &spec, Some(1))
+        let error = publish(&registry, &repo(), &spec, Some(1), None)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("already used"), "{error:#}");
@@ -1335,5 +1358,97 @@ mod tests {
             format!("{error:#}").contains("refusing to reconcile"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_daemon_digest_fails_before_any_registry_call() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let daemon = image(&registry, DAEMON_REPO, "0.9.0", key.signing_key()).await;
+        let panel = image(&registry, PANEL_REPO, "0.3.0", key.signing_key()).await;
+        let spec = spec(daemon.clone(), panel.clone(), "0.3.0", vec![panel]);
+        let tested = sha256(b"the daemon the compatibility job tested");
+        let calls_before = registry.calls().len();
+
+        let error = publish(&registry, &repo(), &spec, None, Some(&tested))
+            .await
+            .unwrap_err();
+        let mismatch = error
+            .downcast_ref::<DaemonDigestMismatch>()
+            .unwrap_or_else(|| panic!("not a daemon mismatch: {error:#}"));
+        assert_eq!(mismatch.expected, tested);
+        assert_eq!(mismatch.actual, daemon);
+        let message = format!("{error:#}");
+        assert!(message.contains(tested.as_str()), "{message}");
+        assert!(message.contains(daemon.as_str()), "{message}");
+        // The check runs first: no read, no blob upload, no manifest, no tag.
+        assert_eq!(
+            registry.calls().len(),
+            calls_before,
+            "{:?}",
+            registry.calls()
+        );
+        assert!(registry.tags_of(&repo()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_matching_daemon_digest_publishes_as_before() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let daemon = image(&registry, DAEMON_REPO, "0.9.0", key.signing_key()).await;
+        let panel = image(&registry, PANEL_REPO, "0.3.0", key.signing_key()).await;
+        let spec = spec(daemon.clone(), panel.clone(), "0.3.0", vec![panel]);
+
+        let published = publish(&registry, &repo(), &spec, None, Some(&daemon))
+            .await
+            .unwrap();
+        assert_eq!(published.sequence, 1);
+        assert_eq!(published.tag, "set-stable-1");
+        assert!(registry.manifest_bytes(&repo(), "set-stable-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_reused_daemon_is_the_one_compared() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let daemon = image(&registry, DAEMON_REPO, "0.9.0", key.signing_key()).await;
+        let panel = image(&registry, PANEL_REPO, "0.3.0", key.signing_key()).await;
+        publish_signed(
+            &registry,
+            &spec(daemon.clone(), panel.clone(), "0.3.0", vec![panel.clone()]),
+            &key,
+        )
+        .await
+        .unwrap();
+        let loaded = verify_stable(&registry, &key).await.unwrap();
+
+        // A panel-only release: the daemon is taken from the promoted pointer, not from the flags.
+        let new_panel = image(&registry, PANEL_REPO, "0.4.0", key.signing_key()).await;
+        let placeholder = sha256(b"a daemon digest the flags name but the release does not use");
+        let mut next = spec(
+            placeholder.clone(),
+            new_panel.clone(),
+            "0.4.0",
+            vec![new_panel.clone()],
+        );
+        next.reuse_daemon(&loaded.descriptor);
+
+        // A tested daemon that is not the reused one is refused, and the message names the reused one.
+        let other = sha256(b"a daemon that was tested for another release");
+        let error = publish(&registry, &repo(), &next, None, Some(&other))
+            .await
+            .unwrap_err();
+        let mismatch = error
+            .downcast_ref::<DaemonDigestMismatch>()
+            .unwrap_or_else(|| panic!("not a daemon mismatch: {error:#}"));
+        assert_eq!(mismatch.actual, daemon);
+        assert!(format!("{error:#}").contains(daemon.as_str()));
+        assert!(registry.manifest_bytes(&repo(), "set-stable-2").is_none());
+
+        // The reused daemon is the tested one: the release publishes as sequence 2.
+        let published = publish(&registry, &repo(), &next, None, Some(&daemon))
+            .await
+            .unwrap();
+        assert_eq!(published.sequence, 2);
     }
 }

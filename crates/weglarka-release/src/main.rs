@@ -271,6 +271,10 @@ struct PublishArgs {
     /// Pin the sequence instead of allocating it; it must still be free and at least the next one.
     #[arg(long)]
     sequence: Option<u64>,
+    /// Daemon image digest the compatibility job tested. Publishing fails before anything is pushed
+    /// when the release set would carry another daemon (including a reused one).
+    #[arg(long, value_name = "DIGEST")]
+    expect_daemon_digest: Option<String>,
     /// Report the written set as JSON.
     #[arg(long)]
     json: bool,
@@ -472,6 +476,11 @@ fn assemble_command(args: AssembleArgs) -> Result<()> {
 
 async fn publish_command(args: PublishArgs) -> Result<()> {
     let repository = repository(&args.release_repository)?;
+    let expected_daemon = args
+        .expect_daemon_digest
+        .as_deref()
+        .map(|value| strict_digest(value, "expected daemon digest"))
+        .transpose()?;
     let pinned = public_key(args.public_key.as_ref())?;
     let registry = args.auth.client()?;
     let partial = args.descriptor.spec()?;
@@ -491,7 +500,14 @@ async fn publish_command(args: PublishArgs) -> Result<()> {
         None
     };
     let spec = partial.complete(previous.as_ref())?;
-    let outcome = publish::publish(&registry, &repository, &spec, args.sequence).await?;
+    let outcome = publish::publish(
+        &registry,
+        &repository,
+        &spec,
+        args.sequence,
+        expected_daemon.as_ref(),
+    )
+    .await?;
     let mut promoted = None;
     if let Some(path) = &args.signing_key {
         let key = signing_key(path)?;

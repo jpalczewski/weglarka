@@ -368,6 +368,7 @@ jobs:
       contents: read
       packages: read
     outputs:
+      daemon_digest: ${{ steps.matrix.outputs.daemon_digest }}
       tested: ${{ steps.matrix.outputs.tested }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -450,6 +451,9 @@ jobs:
             .github/scripts/compatibility-panel.sh \
               "${{ env.DAEMON_IMAGE }}@$daemon" "${{ env.PANEL_IMAGE }}@$panel_digest"
           done
+          # The publisher asserts this digest (`--expect-daemon-digest`), so a daemon promoted or
+          # reused differently after these tests cannot be paired with this panel list.
+          echo "daemon_digest=$daemon" >> "$GITHUB_OUTPUT"
           echo "tested=$(printf '%s' "$panels" | tr ' ' ',')" >> "$GITHUB_OUTPUT"
 
   # The promotion critical section. One concurrency group per channel, and a queued successor is
@@ -544,6 +548,7 @@ jobs:
           DAEMON: ${{ needs.plan.outputs.daemon }}
           PANEL: ${{ needs.plan.outputs.panel }}
           TESTED: ${{ needs.compatibility.outputs.tested }}
+          TESTED_DAEMON: ${{ needs.compatibility.outputs.daemon_digest }}
         run: |
           set -euo pipefail
           payload() { jq -r "$1" "$2" 2>/dev/null || true; }
@@ -585,6 +590,12 @@ jobs:
             tested_count=$((tested_count + 1))
           done
           [ "$tested_count" -gt 0 ] || { echo "::error::the compatibility matrix reported no tested panel"; exit 1; }
+
+          # The daemon the compatibility job ran against. `publish` refuses to push when the set it
+          # is about to publish carries another daemon, so a promotion between the two jobs fails
+          # here instead of pairing a daemon with a tested-panel list built for another one.
+          [ -n "$TESTED_DAEMON" ] || { echo "::error::the compatibility matrix reported no tested daemon"; exit 1; }
+          args+=(--expect-daemon-digest "$TESTED_DAEMON")
 
           tool/weglarka-release publish "${args[@]}" \
             --registry-user "$GITHUB_ACTOR" --registry-token-env GITHUB_TOKEN --json > published.json
