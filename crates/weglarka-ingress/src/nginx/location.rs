@@ -1,7 +1,9 @@
 //! Backends and the `location`s rendered for them.
 
 use weglarka_model::admin_auth::{RELAY_MAX_BODY_BYTES, RELAY_PREFIX};
-use weglarka_model::app::{AppIngress, BodySizeLimit};
+use weglarka_model::app::{
+    AppIngress, BodySizeLimit, SecurityHeaders, SecurityHeadersPreset, StaticIngress,
+};
 
 use super::NginxOptions;
 use super::common::{
@@ -191,6 +193,7 @@ impl Backend<'_> {
         location: &Location<'_>,
         ingress: &AppIngress,
         forwarded: &Forwarded,
+        site_prefix: &str,
     ) {
         // Issue #180: a streaming-path location is the app's own settings with the long-lived
         // stream directives on (long timeout, buffering off); the body limit is inherited.
@@ -236,7 +239,7 @@ impl Backend<'_> {
             }
             match self {
                 Backend::Directory { root } => {
-                    write_directory(c, root, location.strip.as_ref());
+                    write_directory(c, root, location.strip.as_ref(), site_prefix, ingress.static_.as_ref());
                     return;
                 }
                 Backend::Unreleased => {
@@ -302,8 +305,21 @@ const STATIC_SITE_TYPES: &[(&str, &[&str])] = &[
 
 /// A static site's `location` body. `rewrite ... break` runs before `try_files`, which then sees the URI
 /// relative to the site root; nginx has normalized `$uri` (no `..`) before this point. Only GET and HEAD
-/// are allowed, and nothing is listed.
-fn write_directory(c: &mut Conf, root: &str, strip: Option<&(String, String)>) {
+/// are allowed, and nothing is listed. `opts` are the site's per-site rendering options (#104, ADR
+/// 0069: `clean_urls`, `not_found_page`, `cache_revalidate`, `security_headers` — `cache_immutable_paths`,
+/// `redirects` and `feeds` add sibling `location`s instead, see [`write_cache_immutable_locations`] and
+/// [`write_redirects_and_feeds`], since nginx cannot define the same `location` twice and a site may be
+/// reached through two locations (an exact `/p` and a prefix `/p/`, ADR 0031)); `site_prefix` is the
+/// public path this site is mounted at ("" for the root), needed to turn `not_found_page` — a path
+/// relative to the release root, like `index.html` — back into a client-facing URI `error_page` can
+/// route through this same location.
+fn write_directory(
+    c: &mut Conf,
+    root: &str,
+    strip: Option<&(String, String)>,
+    site_prefix: &str,
+    opts: Option<&StaticIngress>,
+) {
     if let Some((regex, replacement)) = strip {
         c.line(&format!("rewrite {regex} {replacement} break;"));
     }
@@ -316,8 +332,169 @@ fn write_directory(c: &mut Conf, root: &str, strip: Option<&(String, String)>) {
     c.line("default_type application/octet-stream;");
     c.line("index index.html;");
     c.line("autoindex off;");
-    c.line("try_files $uri $uri/index.html =404;");
+    if let Some(opts) = opts {
+        if let Some(page) = &opts.not_found_page {
+            c.line(&format!("error_page 404 {site_prefix}{page};"));
+        }
+        if opts.cache_revalidate {
+            c.line("add_header Cache-Control \"no-cache\" always;");
+        }
+        // `cache_revalidate` alone (no `security_headers`) still emits an unconditional `add_header`
+        // above, so `X-Request-Id` must be restated here too — `write_security_headers` only restates
+        // it when `security_headers` is set, which would otherwise silently drop the header.
+        if opts.cache_revalidate || opts.security_headers.is_some() {
+            write_security_preset_only(c, opts.security_headers.as_ref());
+            c.line("add_header X-Request-Id $request_id always;");
+        }
+    }
+    write_try_files(c, opts.is_some_and(|o| o.clean_urls));
     c.block("limit_except GET HEAD", |c| c.line("deny all;"));
+}
+
+/// `try_files` fallback chain: `clean_urls` (#104) also tries `$uri.html`, so `/about` is served from
+/// `about.html` without a redirect.
+fn write_try_files(c: &mut Conf, clean_urls: bool) {
+    if clean_urls {
+        c.line("try_files $uri $uri.html $uri/index.html =404;");
+    } else {
+        c.line("try_files $uri $uri/index.html =404;");
+    }
+}
+
+/// The preset content of [`SecurityHeadersPreset`] (#104, ADR 0069's "Rendering"; the exact header set
+/// is this PR's own decision — the ADR fixes the mechanism, not the values): conservative defaults a
+/// static site has no app framework of its own to set. `Content-Security-Policy` stays an explicit
+/// opt-in (`csp`) because it is specific to each site's own markup and a wrong default would break pages.
+fn write_security_preset(c: &mut Conf, preset: SecurityHeadersPreset) {
+    match preset {
+        SecurityHeadersPreset::Baseline => {
+            c.line("add_header X-Content-Type-Options nosniff always;");
+            c.line("add_header X-Frame-Options DENY always;");
+            c.line("add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;");
+        }
+    }
+}
+
+/// `security_headers`' directives, ending with a restated `X-Request-Id` (ADR 0069): the first
+/// `add_header` on a `location` drops every header `server`/`http` would otherwise have set, so a
+/// location that adds any header of its own must repeat the whole set. A no-op when `headers` is
+/// `None` — callers that already emit an unconditional `add_header` of their own (cache locations)
+/// restate `X-Request-Id` themselves instead of going through this function. Delegates the
+/// preset/HSTS/CSP body to [`write_security_preset_only`] instead of duplicating it, so the two never
+/// drift apart.
+fn write_security_headers(c: &mut Conf, headers: Option<&SecurityHeaders>) {
+    write_security_preset_only(c, headers);
+    if headers.is_some() {
+        c.line("add_header X-Request-Id $request_id always;");
+    }
+}
+
+/// `cache_immutable_paths` and `feeds` (#104): both name a file of the release, relative to the site's
+/// own root like `not_found_page`, so both need `site_prefix` and get a sibling `location
+/// ^~ <site_prefix><p>` (cache) or `location = <site_prefix><path>` (feed) with its own copy of
+/// `root` — never nested inside the main location, since nginx resolves `location`s by specificity
+/// regardless of nesting, and a sibling avoids ever defining the same `location` twice when a prefixed
+/// site also renders an exact `location = <site_prefix>` (ADR 0031). `^~` wins over the shorter main
+/// location by nginx's own longest-prefix rule, so textual order does not matter. Rendered once per
+/// `(path, app)` pair, like `not_found_page`, so a multi-`paths` site gets one block per path prefix.
+fn write_site_relative_locations(
+    c: &mut Conf,
+    root: &str,
+    site_prefix: &str,
+    opts: &StaticIngress,
+    app: Option<&str>,
+) {
+    for p in &opts.cache_immutable_paths {
+        // The trailing `/` is a segment boundary (ADR 0031's own convention): without it, `^~` would
+        // also match a sibling path that merely starts with the same string (e.g. `/assets-backup`
+        // for `/assets`).
+        c.block(&format!("location ^~ {site_prefix}{p}/"), |c| {
+            if let Some(app) = app {
+                set_app(c, app);
+            }
+            c.line(&format!("root {root};"));
+            c.line("add_header Cache-Control \"public, max-age=31536000, immutable\" always;");
+            write_security_preset_only(c, opts.security_headers.as_ref());
+            // Cache-Control is unconditional here, so `X-Request-Id` always needs restating
+            // (`write_security_headers` would skip it when `security_headers` is unset).
+            c.line("add_header X-Request-Id $request_id always;");
+            write_try_files(c, opts.clean_urls);
+            c.block("limit_except GET HEAD", |c| c.line("deny all;"));
+        });
+    }
+    for f in &opts.feeds {
+        c.block(&format!("location = {site_prefix}{}", f.path), |c| {
+            if let Some(app) = app {
+                set_app(c, app);
+            }
+            c.line(&format!("root {root};"));
+            // An empty `types {}` turns off extension sniffing for this one location, so the forced
+            // `default_type` always wins (issue #498's table would otherwise still match `.xml`).
+            c.line("types { }");
+            c.line(&format!("default_type {};", f.format.content_type()));
+            c.line("charset utf-8;");
+            write_security_preset_only(c, opts.security_headers.as_ref());
+            c.line("add_header X-Request-Id $request_id always;");
+            c.block("limit_except GET HEAD", |c| c.line("deny all;"));
+        });
+    }
+}
+
+/// The preset's directives alone, without the trailing `X-Request-Id` (the caller already restates it
+/// unconditionally because it always emits an `add_header` of its own). A no-op when unset.
+fn write_security_preset_only(c: &mut Conf, headers: Option<&SecurityHeaders>) {
+    let Some(headers) = headers else { return };
+    write_security_preset(c, headers.preset);
+    if let Some(age) = headers.hsts_max_age_secs {
+        // No `includeSubDomains`/`preload` in v1 — see `write_security_headers`.
+        c.line(&format!(
+            "add_header Strict-Transport-Security \"max-age={age}\" always;"
+        ));
+    }
+    if let Some(csp) = &headers.csp {
+        c.line(&format!(
+            "add_header Content-Security-Policy \"{csp}\" always;"
+        ));
+    }
+}
+
+/// `redirects` (#104): already-absolute client paths, validated against the site's own `paths` in
+/// `weglarka-model` (unlike `cache_immutable_paths`/`feeds`, which are release-relative). Rendered once
+/// per app rather than once per `(path, app)` pair — a multi-`paths` site would otherwise define the
+/// same `location` twice.
+fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
+    for r in &opts.redirects {
+        if r.prefix {
+            // `.` is the only regex metacharacter the path alphabet allows (`check_path_prefix`).
+            let escaped = r.from.replace('.', "\\.");
+            // Segment boundary (same convention as `exempt_locations`/ADR 0031): without the
+            // trailing `/` on the prefix match, `^~ {from}` would also match a sibling path that
+            // merely starts with the same string (e.g. `/blogging` for `/blog`). The bare `from`
+            // itself still redirects, via its own exact match below.
+            c.block(&format!("location ^~ {}/", r.from), |c| {
+                if let Some(app) = app {
+                    set_app(c, app);
+                }
+                write_security_headers(c, opts.security_headers.as_ref());
+                c.line(&format!("rewrite ^{escaped}/(.*)$ {}/$1 permanent;", r.to));
+            });
+            c.block(&format!("location = {}", r.from), |c| {
+                if let Some(app) = app {
+                    set_app(c, app);
+                }
+                write_security_headers(c, opts.security_headers.as_ref());
+                c.line(&format!("return 301 {}$is_args$args;", r.to));
+            });
+        } else {
+            c.block(&format!("location = {}", r.from), |c| {
+                if let Some(app) = app {
+                    set_app(c, app);
+                }
+                write_security_headers(c, opts.security_headers.as_ref());
+                c.line(&format!("return 301 {}$is_args$args;", r.to));
+            });
+        }
+    }
 }
 
 /// Per-app body limit (ADR 0033). It is a *location* directive so that apps sharing a `server`
@@ -374,7 +551,7 @@ pub(super) fn write_app_locations(
         .flat_map(|app| app.paths.iter().map(move |p| (p, *app)))
         .collect();
     locations.sort_by(|a, b| a.0.cmp(b.0));
-    for (path, app) in locations {
+    for (path, app) in &locations {
         let backend = match &app.backend {
             RouteBackend::Upstream { port } => Backend::Container {
                 host: app.instance.as_str(),
@@ -387,8 +564,40 @@ pub(super) fn write_app_locations(
         };
         let directory = matches!(backend, Backend::Directory { .. } | Backend::Unreleased);
         let name = shared.then(|| app.instance.as_str());
+        // The public path this site answers under ("" for the root): `StaticIngress` options that
+        // name a file of the release (`not_found_page`, `cache_immutable_paths`, `feeds`) need it to
+        // turn their release-relative path back into a client-facing URI (#104, ADR 0069).
+        let site_prefix = if path.is_root() {
+            String::new()
+        } else {
+            path.as_str().to_owned()
+        };
         for location in path_locations(app, path, name, directory) {
-            backend.write_location(c, &location, &app.ingress, forwarded);
+            backend.write_location(c, &location, &app.ingress, forwarded, &site_prefix);
         }
+        if let Backend::Directory { root } = &backend
+            && let Some(opts) = app.ingress.static_.as_ref()
+        {
+            write_site_relative_locations(c, root, &site_prefix, opts, name);
+        }
+    }
+    // `redirects` are already-absolute client paths, independent of path-prefix routing, so they are
+    // emitted once per app rather than once per `(path, app)` pair (#104, ADR 0069).
+    let mut redirects_done = std::collections::BTreeSet::new();
+    for (_, app) in &locations {
+        if !redirects_done.insert(app.instance) {
+            continue;
+        }
+        if o.unreleased.contains(app.instance) {
+            continue;
+        }
+        let Some(opts) = app.ingress.static_.as_ref() else {
+            continue;
+        };
+        if opts.redirects.is_empty() {
+            continue;
+        }
+        let name = shared.then(|| app.instance.as_str());
+        write_redirects(c, opts, name);
     }
 }

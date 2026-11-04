@@ -1721,6 +1721,185 @@ fn a_static_site_without_a_release_answers_503() {
     );
 }
 
+// --- Static site per-site options (#104, ADR 0069) ---------------------------------------------------
+
+/// One static site with every `ingress.static` option set.
+const SITE_WITH_EVERY_OPTION: &str = r#"
+[apps.docs]
+kind = "static"
+image = "ghcr.io/x/docs:latest"
+domains = ["docs.example.eu"]
+
+[apps.docs.ingress.static]
+clean_urls = true
+not_found_page = "/404.html"
+cache_immutable_paths = ["/assets"]
+cache_revalidate = true
+
+[[apps.docs.ingress.static.redirects]]
+from = "/old"
+to = "/new"
+
+[[apps.docs.ingress.static.redirects]]
+from = "/blog"
+to = "/articles"
+prefix = true
+
+[[apps.docs.ingress.static.feeds]]
+path = "/feed.xml"
+format = "rss"
+
+[apps.docs.ingress.static.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
+csp = "default-src 'self'"
+"#;
+
+#[test]
+fn nginx_static_site_with_every_option_snapshots() {
+    let a = apps(SITE_WITH_EVERY_OPTION);
+    let behind = nginx::generate(&host(), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_static_every_option_behind", behind);
+    let edge = nginx::generate(&edge_host(), &a, &edge_opts(&["docs.example.eu"])).unwrap();
+    insta::assert_snapshot!("nginx_static_every_option_edge", edge);
+
+    for conf in [&behind, &edge] {
+        // `clean_urls`.
+        assert!(
+            conf.contains("try_files $uri $uri.html $uri/index.html =404;"),
+            "{conf}"
+        );
+        // `not_found_page`, at the site's own root (no path prefix here).
+        assert!(conf.contains("error_page 404 /404.html;"), "{conf}");
+        // `cache_immutable_paths`: its own sibling location, not nested in the main one, with a
+        // segment boundary so a sibling path (`/assets-backup`) cannot match it.
+        assert!(conf.contains("location ^~ /assets/ {"), "{conf}");
+        assert!(
+            conf.contains(
+                "add_header Cache-Control \"public, max-age=31536000, immutable\" always;"
+            ),
+            "{conf}"
+        );
+        // `cache_revalidate` on the rest of the site.
+        assert!(
+            conf.contains("add_header Cache-Control \"no-cache\" always;"),
+            "{conf}"
+        );
+        // `redirects`: exact and prefix. A prefix redirect gets a segment-bounded `^~` location for
+        // what's below it (so `/blogging` is never swept in) plus its own exact match for the bare
+        // path itself.
+        assert!(conf.contains("location = /old {"), "{conf}");
+        assert!(conf.contains("return 301 /new$is_args$args;"), "{conf}");
+        assert!(conf.contains("location ^~ /blog/ {"), "{conf}");
+        assert!(
+            conf.contains("rewrite ^/blog/(.*)$ /articles/$1 permanent;"),
+            "{conf}"
+        );
+        assert!(conf.contains("location = /blog {"), "{conf}");
+        assert!(
+            conf.contains("return 301 /articles$is_args$args;"),
+            "{conf}"
+        );
+        // `feeds`.
+        assert!(conf.contains("location = /feed.xml {"), "{conf}");
+        assert!(conf.contains("default_type application/rss+xml;"), "{conf}");
+        assert!(conf.contains("charset utf-8;"), "{conf}");
+        // `security_headers`: the baseline preset, HSTS, CSP, and `X-Request-Id` restated wherever
+        // another `add_header` is emitted (ADR 0069).
+        assert!(conf.contains("add_header X-Content-Type-Options nosniff always;"));
+        assert!(conf.contains("add_header X-Frame-Options DENY always;"));
+        assert!(
+            conf.contains("add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;")
+        );
+        assert!(conf.contains("add_header Strict-Transport-Security \"max-age=31536000\" always;"));
+        assert!(conf.contains("add_header Content-Security-Policy \"default-src 'self'\" always;"));
+        assert!(
+            conf.matches("add_header X-Request-Id $request_id always;")
+                .count()
+                >= 2,
+            "restated in the main location and in the cache/redirect/feed ones: {conf}"
+        );
+        // A client-controlled redirect target would leak the internal port/scheme without this.
+        assert!(conf.contains("absolute_redirect off;"), "{conf}");
+    }
+}
+
+#[test]
+fn nginx_static_site_without_options_is_unchanged() {
+    // `SITE_APPS` (used by `nginx_static_site_snapshots`) sets no `ingress.static` at all: none of
+    // the new directives must appear, so an existing site's rendered config does not change.
+    let a = apps(SITE_APPS);
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    for needle in [
+        "error_page 404",
+        "Cache-Control",
+        "X-Content-Type-Options",
+        "X-Frame-Options",
+        "Strict-Transport-Security",
+        "Content-Security-Policy",
+        "$uri.html",
+    ] {
+        assert!(!conf.contains(needle), "{needle} unexpectedly in {conf}");
+    }
+}
+
+#[test]
+fn an_unreleased_site_with_every_option_still_only_answers_503() {
+    let a = apps(SITE_WITH_EVERY_OPTION);
+    let mut o = opts();
+    o.unreleased.insert(InstanceName::new("docs").unwrap());
+    let conf = nginx::generate(&host(), &a, &o).unwrap();
+    let server = server_block(&conf, "docs.example.eu");
+    assert!(
+        server.contains("return 503;") && !server.contains("try_files"),
+        "{server}"
+    );
+    for needle in [
+        "error_page 404",
+        "Cache-Control",
+        "location = /old",
+        "location ^~ /blog",
+        "location = /feed.xml",
+        "X-Content-Type-Options",
+    ] {
+        assert!(
+            !conf.contains(needle),
+            "{needle} unexpectedly rendered for an unreleased site: {conf}"
+        );
+    }
+}
+
+#[test]
+fn security_headers_of_a_static_site_do_not_leak_into_a_container_on_the_same_domain() {
+    let shared = r#"
+[apps.a]
+image = "ghcr.io/x/a:latest"
+domains = ["shared.example.eu"]
+port = 3000
+paths = ["/api"]
+
+[apps.s]
+kind = "static"
+image = "ghcr.io/x/s:latest"
+domains = ["shared.example.eu"]
+paths = ["/docs"]
+
+[apps.s.ingress.static.security_headers]
+preset = "baseline"
+"#;
+    let conf = nginx::generate(&host(), &apps(shared), &opts()).unwrap();
+    let server = server_block(&conf, "shared.example.eu");
+    // The container's own locations (`/api`, exact and below) end at `proxy_pass` with no
+    // `add_header` of their own — the site's headers never leak into them.
+    assert_eq!(
+        server.matches("proxy_pass $upstream;\n        }").count(),
+        2,
+        "{server}"
+    );
+    // The site's own locations do get them.
+    assert!(server.contains("X-Content-Type-Options"), "{server}");
+}
+
 // --- Forward auth (#89, ADR 0052): nginx `auth_request` in both modes -------------------------------
 
 const IDENTITY: &str = r#"

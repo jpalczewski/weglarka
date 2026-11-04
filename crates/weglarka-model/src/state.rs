@@ -17,8 +17,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{
-    AppKind, AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget, SharedVolumeName,
-    normalize_signal, valid_config_source, valid_mount_target, valid_volume_name,
+    AppIngress, AppKind, AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget,
+    SharedVolumeName, StaticIngress, normalize_signal, valid_config_source, valid_mount_target,
+    valid_volume_name,
 };
 use crate::fsutil::write_atomic;
 use crate::hash::SpecHash;
@@ -31,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -162,6 +163,14 @@ fn oidc_allowed_groups_v17(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v17 → v18: per-site rendering options for static sites (issue #104, ADR 0069). `AppIngress::static_`
+/// (clean URLs, a custom 404 page, cache headers, redirects, feed MIME types, security headers) is
+/// optional and defaults to unset, so a v17 document needs no data transformation — the marker records
+/// that the file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn static_ingress_options_v18(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -182,6 +191,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     oidc_device_flow_v15,
     app_metrics_v16,
     oidc_allowed_groups_v17,
+    static_ingress_options_v18,
 ];
 
 const _: () = assert!(
@@ -413,9 +423,16 @@ pub(crate) fn check_mount_owner(uid: Option<u32>, gid: Option<u32>) -> Result<()
 }
 
 /// A static site (ADR 0049) has no process: every field that configures one is a typo or a mistaken
-/// `kind`, and silently ignoring it would hide that.
+/// `kind`, and silently ignoring it would hide that. `ingress.static` is the mirror image of that rule
+/// (#104, ADR 0069): it only means something for a directory backend, so it is rejected the same way
+/// for `kind = "container"`.
 fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if spec.kind != AppKind::Static {
+        if spec.ingress.static_.is_some() {
+            return Err(format!(
+                "{name}: `ingress.static` does not apply to kind = \"container\" (only a static site has a release directory to render options for)"
+            ));
+        }
         return Ok(());
     }
     let defaults: AppSpec = toml::from_str("image = \"i\"").expect("minimal spec parses");
@@ -434,7 +451,6 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         ("security", spec.security != defaults.security),
         ("configs", !spec.configs.is_empty()),
         ("reload_signal", spec.reload_signal.is_some()),
-        ("ingress", spec.ingress != defaults.ingress),
         ("start", !spec.start),
         ("host_mounts", !spec.host_mounts.is_empty()),
         ("group_add", !spec.group_add.is_empty()),
@@ -446,6 +462,218 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
         return Err(format!(
             "{name}: `{field}` does not apply to kind = \"static\" (a static site has no container)"
+        ));
+    }
+    // `ingress` itself is no longer a blanket rejection (ADR 0069): an allowlist, built by
+    // destructuring `AppIngress` without `..`, replaces the single `spec.ingress != defaults.ingress`
+    // check so a future `AppIngress` field fails to compile here until someone decides whether a
+    // static site may use it.
+    validate_static_ingress_allowlist(name, &spec.ingress)?;
+    if let Some(opts) = &spec.ingress.static_ {
+        validate_static_ingress_values(name, spec, opts)?;
+    }
+    Ok(())
+}
+
+/// The allowlist of `AppIngress` fields a static site may set (#104, ADR 0069): everything else
+/// configures a proxy to a container, which a directory backend has none of.
+fn validate_static_ingress_allowlist(
+    name: &InstanceName,
+    ingress: &AppIngress,
+) -> Result<(), String> {
+    let AppIngress {
+        streaming,
+        stream_timeout_secs,
+        strip_prefix,
+        max_body_size,
+        // Identical meaning for files as for a container's responses: skipping noisy polls from the
+        // access log does not need a process on the other end.
+        access_log_skip_paths: _,
+        streaming_paths,
+        auth,
+        auth_policy,
+        auth_groups,
+        auth_exempt_paths,
+        // Validated separately, by `validate_static_ingress_values`.
+        static_: _,
+    } = ingress;
+    let rejected = [
+        ("ingress.streaming", *streaming),
+        (
+            "ingress.stream_timeout_secs",
+            *stream_timeout_secs != AppIngress::DEFAULT_STREAM_TIMEOUT_SECS,
+        ),
+        ("ingress.strip_prefix", *strip_prefix),
+        ("ingress.max_body_size", max_body_size.is_some()),
+        ("ingress.streaming_paths", !streaming_paths.is_empty()),
+        // Forward auth on a static site is #169's territory (`identity.rs` already rejects it); this
+        // allowlist rejects it too so the rule holds even if that check ever moved or were removed.
+        ("ingress.auth", *auth != crate::identity::IngressAuth::None),
+        ("ingress.auth_policy", auth_policy.is_some()),
+        ("ingress.auth_groups", !auth_groups.is_empty()),
+        ("ingress.auth_exempt_paths", !auth_exempt_paths.is_empty()),
+    ];
+    if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
+        return Err(format!(
+            "{name}: `{field}` does not apply to kind = \"static\" (a static site has no container)"
+        ));
+    }
+    Ok(())
+}
+
+/// At most this many `redirects`/`feeds` entries together (ADR 0069 leaves the exact number to the
+/// implementation): generous for any real site, while keeping `nginx -t` and a reload fast and a spec
+/// readable — each entry is one more `location` block in the generated config.
+const MAX_STATIC_ROUTES: usize = 64;
+
+/// Field-level rules for `StaticIngress` (#104, ADR 0069): every value is rendered into `nginx.conf`
+/// verbatim, so the alphabet is checked here rather than trusted from the generator.
+fn validate_static_ingress_values(
+    name: &InstanceName,
+    spec: &AppSpec,
+    opts: &StaticIngress,
+) -> Result<(), String> {
+    if let Some(page) = &opts.not_found_page {
+        if !page.ends_with(".html") {
+            return Err(format!(
+                "{name}: ingress.static.not_found_page {page:?} must end in \".html\""
+            ));
+        }
+        crate::app::check_path_prefix(page).map_err(|reason| {
+            format!("{name}: invalid ingress.static.not_found_page {page:?}: {reason}")
+        })?;
+    }
+    let mut seen_cache = BTreeSet::new();
+    for path in &opts.cache_immutable_paths {
+        crate::app::check_path_prefix(path).map_err(|reason| {
+            format!("{name}: invalid ingress.static.cache_immutable_paths entry {path:?}: {reason}")
+        })?;
+        if !seen_cache.insert(path) {
+            return Err(format!(
+                "{name}: duplicate ingress.static.cache_immutable_paths entry {path:?}"
+            ));
+        }
+    }
+    if opts.redirects.len() + opts.feeds.len() > MAX_STATIC_ROUTES {
+        return Err(format!(
+            "{name}: ingress.static.redirects and .feeds together must be at most {MAX_STATIC_ROUTES} entries"
+        ));
+    }
+    // `paths` defaults to `["/"]` when the site sets none (same convention as `Plan::build`).
+    let root_paths = [String::from("/")];
+    let effective_paths: &[String] = if spec.paths.is_empty() {
+        &root_paths
+    } else {
+        &spec.paths
+    };
+    // Every one of these renders an exact `location = <path>` in `weglarka-ingress` for this site: a
+    // non-root entry of the site's own `paths` (ADR 0031), a redirect's `from` (a `prefix` redirect
+    // also matches its own bare `from` exactly, not just what is below it), and a feed's `path`.
+    // nginx refuses two `location = <path>` directives in one `server`, so all three must be
+    // pairwise distinct — tracked in one set instead of three, so a collision between e.g. a redirect
+    // and a feed is caught here instead of surfacing as a broken `nginx -t` at apply time.
+    let mut claimed_exact: BTreeSet<&String> = effective_paths
+        .iter()
+        .filter(|p| p.as_str() != "/")
+        .collect();
+    for r in &opts.redirects {
+        crate::app::check_path_prefix(&r.from).map_err(|reason| {
+            format!(
+                "{name}: invalid ingress.static.redirects[].from {:?}: {reason}",
+                r.from
+            )
+        })?;
+        if !effective_paths
+            .iter()
+            .any(|p| crate::app::path_is_within(&r.from, p))
+        {
+            return Err(format!(
+                "{name}: ingress.static.redirects[].from {:?} is outside the site's own paths",
+                r.from
+            ));
+        }
+        validate_static_redirect_to(name, &r.to)?;
+        if !claimed_exact.insert(&r.from) {
+            return Err(format!(
+                "{name}: ingress.static.redirects[].from {:?} collides with the site's own paths, \
+                 another redirect or a feed (nginx would see two identical `location` blocks)",
+                r.from
+            ));
+        }
+    }
+    for f in &opts.feeds {
+        crate::app::check_path_prefix(&f.path).map_err(|reason| {
+            format!(
+                "{name}: invalid ingress.static.feeds[].path {:?}: {reason}",
+                f.path
+            )
+        })?;
+        if !claimed_exact.insert(&f.path) {
+            return Err(format!(
+                "{name}: ingress.static.feeds[].path {:?} collides with the site's own paths, a \
+                 redirect or another feed (nginx would see two identical `location` blocks)",
+                f.path
+            ));
+        }
+    }
+    if let Some(headers) = &opts.security_headers
+        && let Some(csp) = &headers.csp
+    {
+        validate_static_csp(name, csp)?;
+    }
+    Ok(())
+}
+
+/// `redirects[].to`: the same path alphabet as `from` (`check_path_prefix`), or an absolute
+/// `https://<host>/...`. The host alphabet is deliberately narrower than a full domain name
+/// (`[A-Za-z0-9.-]` only, no validation of label lengths or a numeric TLD): this is an injection guard
+/// for `nginx.conf`, not a second domain validator, and `weglarka-model` cannot reuse
+/// `weglarka-ingress`'s `Domain` (a leaf crate it must not depend on, `crate-map.md`).
+fn validate_static_redirect_to(name: &InstanceName, to: &str) -> Result<(), String> {
+    if let Some(rest) = to.strip_prefix("https://") {
+        let (host, path) = match rest.split_once('/') {
+            Some((h, p)) => (h, format!("/{p}")),
+            None => (rest, String::new()),
+        };
+        let host_ok = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'));
+        if !host_ok {
+            return Err(format!(
+                "{name}: invalid ingress.static.redirects[].to host {host:?}"
+            ));
+        }
+        if !path.is_empty() {
+            crate::app::check_path_prefix(&path).map_err(|reason| {
+                format!("{name}: invalid ingress.static.redirects[].to path {path:?}: {reason}")
+            })?;
+        }
+        Ok(())
+    } else {
+        crate::app::check_path_prefix(to).map_err(|reason| {
+            format!("{name}: invalid ingress.static.redirects[].to {to:?}: {reason}")
+        })
+    }
+}
+
+/// `security_headers.csp`: printable ASCII (spaces allowed, no control characters) without
+/// `"`/`\`/`$` — the same injection guard as the rest of `StaticIngress` — and at most 2048 bytes
+/// (ADR 0069).
+fn validate_static_csp(name: &InstanceName, csp: &str) -> Result<(), String> {
+    const MAX_CSP_BYTES: usize = 2048;
+    if csp.is_empty() || csp.len() > MAX_CSP_BYTES {
+        return Err(format!(
+            "{name}: ingress.static.security_headers.csp must be 1..={MAX_CSP_BYTES} bytes"
+        ));
+    }
+    let ok = csp
+        .bytes()
+        .all(|b| (b.is_ascii_graphic() || b == b' ') && !matches!(b, b'"' | b'\\' | b'$'));
+    if !ok {
+        return Err(format!(
+            "{name}: ingress.static.security_headers.csp must be printable ASCII without '\"', '\\\\' or '$'"
         ));
     }
     Ok(())
@@ -491,7 +719,6 @@ fn validate_depends_on(name: &InstanceName, spec: &AppSpec) -> Result<(), String
 /// generator. A timeout without `streaming` and a `strip_prefix` without a real prefix would be silent
 /// no-ops, hence errors. Cross-app overlap of `paths` is the ingress plan's job (needs all apps).
 fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
-    use crate::app::AppIngress;
     let ingress = &spec.ingress;
     if !ingress.streaming {
         if ingress.stream_timeout_secs != AppIngress::DEFAULT_STREAM_TIMEOUT_SECS {
@@ -1013,7 +1240,6 @@ mod tests {
 
     #[test]
     fn ingress_options_are_validated() {
-        use crate::app::AppIngress;
         let check = |ingress: AppIngress| {
             let spec = AppSpec {
                 ingress,
@@ -1727,5 +1953,291 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             migrate(&path, "[apps.a]\ngeneration = 2\n", IMPLICIT_SCHEMA_VERSION).unwrap();
         assert_eq!(st.schema_version, Some(SCHEMA_VERSION));
         assert_eq!(st.apps[&name("a")].generation, 2);
+    }
+
+    /// #104, ADR 0069: every `AppIngress` field outside the allowlist is rejected for a static site,
+    /// named in the error, and `ingress.static` itself is rejected the other way round.
+    #[test]
+    fn static_sites_allow_only_the_ingress_fields_adr_0069_lists() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap()
+        };
+        let err = |extra: &str| validate_app(&name("a"), &spec(extra)).unwrap_err();
+        for (extra, needle) in [
+            ("ingress = { streaming = true }", "ingress.streaming"),
+            // `stream_timeout_secs` alone (without `streaming = true`) is already rejected earlier,
+            // by the generic `validate_ingress` ("requires ingress.streaming = true",
+            // `ingress_options_are_validated`); the allowlist's own entry for it is exercised directly
+            // below, since `streaming` would otherwise always fire first.
+            (
+                "paths = [\"/p\"]\ningress = { strip_prefix = true }",
+                "ingress.strip_prefix",
+            ),
+            (
+                "ingress = { max_body_size = \"1m\" }",
+                "ingress.max_body_size",
+            ),
+            (
+                "ingress = { streaming_paths = [\"/x\"] }",
+                "ingress.streaming_paths",
+            ),
+            ("ingress = { auth = \"forward\" }", "ingress.auth"),
+            (
+                "ingress = { auth_policy = \"one_factor\" }",
+                "ingress.auth_policy",
+            ),
+            (
+                "ingress = { auth_groups = [\"admins\"] }",
+                "ingress.auth_groups",
+            ),
+            (
+                "ingress = { auth_exempt_paths = [\"/x\"] }",
+                "ingress.auth_exempt_paths",
+            ),
+        ] {
+            let e = err(extra);
+            assert!(e.contains(needle), "{extra:?}: {e}");
+            assert!(e.contains("does not apply to kind = \"static\""), "{e}");
+        }
+        // `stream_timeout_secs` is still a named binding in the allowlist's own destructure (ADR
+        // 0069), exercised directly since `streaming` always fires first through the full
+        // `validate_app` chain above (a timeout without `streaming = true` is already rejected
+        // earlier anyway, by `validate_ingress`).
+        let timeout_only = crate::app::AppIngress {
+            stream_timeout_secs: 10,
+            ..crate::app::AppIngress::default()
+        };
+        let e = validate_static_ingress_allowlist(&name("a"), &timeout_only).unwrap_err();
+        assert!(e.contains("ingress.stream_timeout_secs"), "{e}");
+        // The allowlisted fields are fine together.
+        assert!(
+            validate_app(
+                &name("a"),
+                &spec("ingress = { access_log_skip_paths = [\"/healthz\"] }")
+            )
+            .is_ok()
+        );
+        assert!(validate_app(&name("a"), &spec("ingress.static = { clean_urls = true }")).is_ok());
+    }
+
+    #[test]
+    fn ingress_static_does_not_apply_to_a_container() {
+        let spec: AppSpec =
+            toml::from_str("image = \"i\"\ningress.static = { clean_urls = true }").unwrap();
+        let err = validate_app(&name("a"), &spec).unwrap_err();
+        assert!(
+            err.contains("`ingress.static` does not apply to kind = \"container\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn static_ingress_field_values_are_validated() {
+        let spec = |extra: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\npaths = [\"/blog\"]\ningress.static = {{ {extra} }}"
+            ))
+            .unwrap()
+        };
+        let check = |extra: &str| validate_app(&name("a"), &spec(extra));
+
+        // `not_found_page`: must end in `.html` and use the `paths` alphabet.
+        assert!(check("not_found_page = \"/404.html\"").is_ok());
+        let err = check("not_found_page = \"/404\"").unwrap_err();
+        assert!(err.contains("must end in \".html\""), "{err}");
+        let err = check("not_found_page = \"/a/../404.html\"").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.not_found_page"),
+            "{err}"
+        );
+
+        // `redirects[].from` must be inside the site's own `paths` (here, under `/blog`).
+        assert!(check("redirects = [{ from = \"/blog/old\", to = \"/blog/new\" }]").is_ok());
+        let err = check("redirects = [{ from = \"/other/old\", to = \"/blog/new\" }]").unwrap_err();
+        assert!(err.contains("is outside the site's own paths"), "{err}");
+        let err = check("redirects = [{ from = \"/blog/a b\", to = \"/x\" }]").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.redirects[].from"),
+            "{err}"
+        );
+
+        // `redirects[].to`: same alphabet, or an absolute `https://<host>/...`.
+        assert!(
+            check("redirects = [{ from = \"/blog/old\", to = \"https://other.example.com/new\" }]")
+                .is_ok()
+        );
+        for bad_to in [
+            "https://evil\".com/x",
+            "https://evil$(id).com/x",
+            "https://evil;x.com/x",
+            "/a\"b",
+        ] {
+            let err = check(&format!(
+                "redirects = [{{ from = \"/blog/old\", to = {bad_to:?} }}]"
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("invalid ingress.static.redirects[].to"),
+                "{bad_to}: {err}"
+            );
+        }
+
+        // Duplicate `from` entries are rejected (collide on the same `location = <path>`).
+        let err = check(
+            "redirects = [{ from = \"/blog/a\", to = \"/x\" }, { from = \"/blog/a\", to = \"/y\" }]",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ingress.static.redirects[].from") && err.contains("collides"),
+            "{err}"
+        );
+
+        // `feeds[].path`: the `paths` alphabet, syntax only (no containment rule).
+        assert!(check("feeds = [{ path = \"/feed.xml\", format = \"rss\" }]").is_ok());
+        let err = check("feeds = [{ path = \"feed.xml\", format = \"rss\" }]").unwrap_err();
+        assert!(err.contains("invalid ingress.static.feeds[].path"), "{err}");
+        let err = check(
+            "feeds = [{ path = \"/f\", format = \"rss\" }, { path = \"/f\", format = \"atom\" }]",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ingress.static.feeds[].path") && err.contains("collides"),
+            "{err}"
+        );
+
+        // A redirect and a feed sharing the same exact path collide too (#500 review: both render
+        // an exact `location = <path>`, so nginx would see a duplicate location without this check).
+        let err = check(
+            "redirects = [{ from = \"/blog/x\", to = \"/blog/y\" }], feeds = [{ path = \"/blog/x\", format = \"rss\" }]",
+        )
+        .unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+
+        // A redirect whose `from` equals one of the site's own non-root `paths` entries collides
+        // with that path's own exact `location = <path>` the ingress already renders.
+        let err = check("redirects = [{ from = \"/blog\", to = \"/blog2\" }]").unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+
+        // `cache_immutable_paths`: the `paths` alphabet.
+        assert!(check("cache_immutable_paths = [\"/assets\"]").is_ok());
+        let err = check("cache_immutable_paths = [\"assets\"]").unwrap_err();
+        assert!(
+            err.contains("invalid ingress.static.cache_immutable_paths"),
+            "{err}"
+        );
+
+        // `security_headers.csp`: printable ASCII, no `"`/`\`/`$`.
+        assert!(check("security_headers = { csp = \"default-src 'self'\" }").is_ok());
+        for bad_csp in ["bad\"csp", "bad\\csp", "bad$csp", "bad\ncsp"] {
+            let err = check(&format!("security_headers = {{ csp = {bad_csp:?} }}")).unwrap_err();
+            assert!(err.contains("security_headers.csp"), "{bad_csp:?}: {err}");
+        }
+        let huge_csp = "a".repeat(2049);
+        let err = check(&format!("security_headers = {{ csp = {huge_csp:?} }}")).unwrap_err();
+        assert!(err.contains("security_headers.csp"), "{err}");
+        // `hsts_max_age_secs` takes any `u32`, no extra validation.
+        assert!(check("security_headers = { hsts_max_age_secs = 31536000 }").is_ok());
+
+        // `redirects` and `feeds` together are capped.
+        let many_redirects: Vec<String> = (0..65)
+            .map(|i| format!("{{ from = \"/blog/r{i}\", to = \"/x\" }}"))
+            .collect();
+        let err = check(&format!("redirects = [{}]", many_redirects.join(", "))).unwrap_err();
+        assert!(err.contains("at most 64 entries"), "{err}");
+    }
+
+    #[test]
+    fn static_ingress_round_trips_and_an_empty_table_is_not_serialized() {
+        // Unset: the table does not appear at all.
+        let plain: crate::app::AppIngress = toml::from_str("").unwrap();
+        assert!(plain.static_.is_none());
+        let plain_spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        assert!(!toml::to_string(&plain_spec).unwrap().contains("static"));
+
+        // A fully populated table round-trips byte-for-byte through parse -> serialize -> parse.
+        let toml_src = r#"
+kind = "static"
+image = "i"
+domains = ["a.example.com"]
+
+[ingress.static]
+clean_urls = true
+not_found_page = "/404.html"
+cache_immutable_paths = ["/assets"]
+cache_revalidate = true
+
+[[ingress.static.redirects]]
+from = "/old"
+to = "/new"
+prefix = true
+
+[[ingress.static.feeds]]
+path = "/feed.xml"
+format = "rss"
+
+[ingress.static.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
+csp = "default-src 'self'"
+"#;
+        let spec: AppSpec = toml::from_str(toml_src).unwrap();
+        let opts = spec.ingress.static_.as_ref().expect("static_ set");
+        assert!(opts.clean_urls);
+        assert_eq!(opts.not_found_page.as_deref(), Some("/404.html"));
+        assert_eq!(opts.redirects[0].from, "/old");
+        assert!(opts.redirects[0].prefix);
+        assert_eq!(opts.feeds[0].format, crate::app::FeedFormat::Rss);
+        let reserialized = toml::to_string(&spec).unwrap();
+        let reparsed: AppSpec = toml::from_str(&reserialized).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn schema_v17_file_without_ingress_static_is_unchanged_by_the_v18_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 17\n[apps.a]\nimage = \"x:1\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(apps.apps[&name("a")].ingress.static_.is_none());
+        save_apps(&apps_path, &apps).unwrap();
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        assert!(!fs::read_to_string(&apps_path).unwrap().contains("static"));
+    }
+
+    #[test]
+    fn schema_v18_file_with_ingress_static_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "[apps.a]\nkind = \"static\"\nimage = \"x:1\"\ndomains = [\"a.example.com\"]\n[apps.a.ingress.static]\nclean_urls = true\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(
+            apps.apps[&name("a")]
+                .ingress
+                .static_
+                .as_ref()
+                .unwrap()
+                .clean_urls
+        );
+        save_apps(&apps_path, &apps).unwrap();
+        let reloaded = load_apps(&apps_path).unwrap();
+        assert_eq!(reloaded, apps);
+        assert!(
+            fs::read_to_string(&apps_path)
+                .unwrap()
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
+        );
     }
 }

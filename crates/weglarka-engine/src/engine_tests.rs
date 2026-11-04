@@ -4209,6 +4209,60 @@ domains = ["blog.example.com"]
         let err = h.rec.deploy(&name("blog"), false).await.unwrap_err();
         assert!(matches!(err, EngineError::Site(_)), "{err:?}");
     }
+
+    /// `ingress.static.not_found_page` (#104, ADR 0069) gets the same fail-closed gate as
+    /// `index.html` (ADR 0049): a release missing the file it names is rejected, `current` stays.
+    const SITE_WITH_NOT_FOUND_PAGE: &str = r#"
+[apps.blog]
+kind = "static"
+image = "registry.example.com/me/blog:latest"
+domains = ["blog.example.com"]
+
+[apps.blog.ingress.static]
+not_found_page = "/404.html"
+"#;
+
+    fn harness_with_not_found_page() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let h = Harness::build(
+            SITE_WITH_NOT_FOUND_PAGE,
+            ReconcilerOptions {
+                sites_root: Some(sites),
+                ..Default::default()
+            },
+            crash::Policy::disabled(),
+        );
+        drop(dir);
+        h
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_release_missing_the_custom_404_page_is_rejected() {
+        let h = harness_with_not_found_page();
+        // A complete release with the custom 404 page deploys normally.
+        publish(
+            &h,
+            'a',
+            &[("index.html", b"good"), ("404.html", b"not found")],
+        );
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+
+        // The next release has `index.html` but not the 404 page the spec names: rejected, `current`
+        // stays on the previous (good) release, same as a missing `index.html`.
+        publish(&h, 'b', &[("index.html", b"also good")]);
+        let outcome = h.rec.deploy(&name("blog"), false).await.unwrap();
+        let DeployOutcome::Failed { reason, .. } = outcome else {
+            panic!("expected a rejected deploy, got {outcome:?}");
+        };
+        assert!(reason.contains("404.html"), "{reason}");
+        let served = std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
+        assert_eq!(served, "good");
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
+    }
 }
 
 /// Sites with environments (issue #205): `track` environments follow the webhook, promote-only ones

@@ -23,9 +23,10 @@ use axum::http::request::Parts;
 use weglarka_api::{ContainerHealth, ShowAppResponse};
 use weglarka_model::admin_auth::{Principal, Scope};
 use weglarka_model::app::{
-    AppIngress, AppKind, AppSpec, ConfigMount, HealthGate, HostMount, HostPort, HttpProbe,
-    InstanceName, Resources, SecretBinding, SecretTarget, Security, SharedNetworkRef,
-    SharedVolumeRef, Strategy, VolumeMount,
+    AppIngress, AppKind, AppSpec, ConfigMount, Feed, FeedFormat, HealthGate, HostMount, HostPort,
+    HttpProbe, InstanceName, Redirect, Resources, SecretBinding, SecretTarget, Security,
+    SecurityHeaders, SecurityHeadersPreset, SharedNetworkRef, SharedVolumeRef, StaticIngress,
+    Strategy, VolumeMount,
 };
 use weglarka_model::identity::{
     AccessTokenFormat, AuthorizationPolicy, IngressAuth, OidcClientSpec, Pkce,
@@ -297,6 +298,7 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy,
         auth_groups,
         auth_exempt_paths,
+        static_,
     } = ingress;
     // The path lists are validated by the model to `[A-Za-z0-9_.-]` segments (`check_path_prefix`,
     // `check_skip_path`), `auth_groups` to `[A-Za-z0-9._-]{1,128}`: shapes that hold no credential.
@@ -311,6 +313,73 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy: auth_policy.map(read_authorization_policy),
         auth_groups,
         auth_exempt_paths,
+        static_: static_.map(read_static_ingress),
+    }
+}
+
+/// `StaticIngress` holds no secret (#104, ADR 0069: six rendering options, none of them a credential),
+/// so unlike `oidc`'s free-text fields this is a full pass-through, not a trim — still one function
+/// per nested type so a future field fails to compile here until it is decided too.
+fn read_static_ingress(ingress: StaticIngress) -> StaticIngress {
+    let StaticIngress {
+        clean_urls,
+        not_found_page,
+        cache_immutable_paths,
+        cache_revalidate,
+        redirects,
+        feeds,
+        security_headers,
+    } = ingress;
+    StaticIngress {
+        clean_urls,
+        not_found_page,
+        cache_immutable_paths,
+        cache_revalidate,
+        redirects: redirects.into_iter().map(read_redirect).collect(),
+        feeds: feeds.into_iter().map(read_feed).collect(),
+        security_headers: security_headers.map(read_security_headers),
+    }
+}
+
+fn read_redirect(redirect: Redirect) -> Redirect {
+    let Redirect { from, to, prefix } = redirect;
+    Redirect { from, to, prefix }
+}
+
+fn read_feed(feed: Feed) -> Feed {
+    let Feed { path, format } = feed;
+    Feed {
+        path,
+        format: read_feed_format(format),
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_feed_format(format: FeedFormat) -> FeedFormat {
+    match format {
+        FeedFormat::Rss => FeedFormat::Rss,
+        FeedFormat::Atom => FeedFormat::Atom,
+        FeedFormat::Json => FeedFormat::Json,
+    }
+}
+
+fn read_security_headers(headers: SecurityHeaders) -> SecurityHeaders {
+    let SecurityHeaders {
+        preset,
+        hsts_max_age_secs,
+        csp,
+    } = headers;
+    SecurityHeaders {
+        preset: read_security_headers_preset(preset),
+        hsts_max_age_secs,
+        csp,
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_security_headers_preset(preset: SecurityHeadersPreset) -> SecurityHeadersPreset {
+    match preset {
+        SecurityHeadersPreset::Baseline => SecurityHeadersPreset::Baseline,
     }
 }
 

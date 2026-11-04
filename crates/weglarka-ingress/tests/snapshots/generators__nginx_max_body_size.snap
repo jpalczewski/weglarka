@@ -18,6 +18,7 @@ http {
     fastcgi_temp_path /tmp/fastcgi;
     uwsgi_temp_path /tmp/uwsgi;
     scgi_temp_path /tmp/scgi;
+    absolute_redirect off;
 
     resolver 10.89.0.1 valid=1s ipv6=off;
     resolver_timeout 2s;

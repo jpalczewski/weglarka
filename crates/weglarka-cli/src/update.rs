@@ -405,13 +405,12 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
         spec.ingress.streaming = true;
     }
     if a.no_streaming {
-        spec.ingress = AppIngress {
-            strip_prefix: spec.ingress.strip_prefix,
-            max_body_size: spec.ingress.max_body_size,
-            access_log_skip_paths: std::mem::take(&mut spec.ingress.access_log_skip_paths),
-            streaming_paths: spec.ingress.streaming_paths.clone(),
-            ..AppIngress::default()
-        };
+        // Reset only the two streaming fields in place, rather than rebuilding `AppIngress` via
+        // `..AppIngress::default()`: the latter silently drops every field this flag doesn't name
+        // (`auth*`, and now `static_`/ADR 0069) back to its default on every `--no-streaming`, with
+        // no error and no diff shown to the operator before the write.
+        spec.ingress.streaming = false;
+        spec.ingress.stream_timeout_secs = AppIngress::DEFAULT_STREAM_TIMEOUT_SECS;
     }
     if a.no_streaming_paths {
         spec.ingress.streaming_paths.clear();
@@ -1430,6 +1429,29 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
 
         let s = apply_flags(s, &args(&["--no-streaming-paths"])).unwrap();
         assert!(s.ingress.is_default());
+    }
+
+    #[test]
+    fn no_streaming_does_not_drop_unrelated_ingress_fields() {
+        // #500 review: `--no-streaming` used to rebuild `AppIngress` via `..AppIngress::default()`
+        // naming only the fields it knew about, silently dropping every other one — `auth*` already,
+        // and now `ingress.static` (ADR 0069) too. It must reset only `streaming`/`stream_timeout_secs`.
+        let mut s = spec();
+        s.ingress.auth = weglarka_model::identity::IngressAuth::Forward;
+        s.ingress.auth_groups = vec!["admins".to_owned()];
+        s.ingress.static_ = Some(weglarka_model::app::StaticIngress {
+            clean_urls: true,
+            ..Default::default()
+        });
+        let both = apply_flags(s, &args(&["--streaming"])).unwrap();
+        let s = apply_flags(both, &args(&["--no-streaming"])).unwrap();
+        assert!(!s.ingress.streaming);
+        assert_eq!(
+            s.ingress.auth,
+            weglarka_model::identity::IngressAuth::Forward
+        );
+        assert_eq!(s.ingress.auth_groups, ["admins"]);
+        assert!(s.ingress.static_.is_some_and(|o| o.clean_urls));
     }
 
     #[test]

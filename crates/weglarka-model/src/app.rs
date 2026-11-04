@@ -821,6 +821,11 @@ pub struct AppIngress {
     /// non-browser clients with their own tokens. An entry ending in `/` is a prefix. Needs `auth = "forward"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth_exempt_paths: Vec<String>,
+    /// Per-site rendering options (#104, ADR 0069), only for `kind = "static"`. `static` is a Rust
+    /// keyword, hence the trailing underscore on the field (same convention as `RawJwk::use_` in
+    /// `admin_auth.rs`).
+    #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
+    pub static_: Option<StaticIngress>,
 }
 
 impl Default for AppIngress {
@@ -836,6 +841,7 @@ impl Default for AppIngress {
             auth_policy: None,
             auth_groups: Vec::new(),
             auth_exempt_paths: Vec::new(),
+            static_: None,
         }
     }
 }
@@ -902,6 +908,131 @@ pub fn check_skip_path(path: &str) -> Result<(), &'static str> {
 
 fn default_stream_timeout_secs() -> u64 {
     AppIngress::DEFAULT_STREAM_TIMEOUT_SECS
+}
+
+/// Whether `path` is served under `prefix` (`prefix` itself, or a segment-wise descendant of it); a
+/// `prefix` of `/` serves everything. Used to check a static site's own paths-derived options
+/// (`StaticIngress::redirects`) against `AppSpec::paths`, so the containment rule lives next to
+/// [`check_path_prefix`] instead of being re-derived from `weglarka-ingress`'s `PathPrefix` (a leaf
+/// crate that `weglarka-model` must not depend on, `crate-map.md`).
+pub fn path_is_within(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Per-site rendering options for `kind = "static"` (#104, ADR 0069): everything here only changes
+/// generated nginx output, never the container (there is none), so the whole struct stays outside
+/// `spec_hash` like the rest of [`AppIngress`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticIngress {
+    /// `try_files $uri $uri.html $uri/index.html =404;` instead of the default `$uri $uri/index.html`
+    /// (serves `/about` from `about.html`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clean_urls: bool,
+    /// `error_page 404 <page>;`. Must end in `.html` and use the same path alphabet as `AppSpec::paths`;
+    /// relative to the release root, like `index.html`. The deploy gate checks the file exists in the
+    /// release before switching `current` (ADR 0049), fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_found_page: Option<String>,
+    /// Prefixes (relative to the release root, like `not_found_page`) served with
+    /// `Cache-Control: public, max-age=31536000, immutable` (hashed build assets).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_immutable_paths: Vec<String>,
+    /// The rest of the site gets `Cache-Control: no-cache` instead of nginx's default heuristic.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_revalidate: bool,
+    /// 301 redirects, exact or prefix; `from`/`to` are public URL paths (or `to` an absolute
+    /// `https://<host>/...`), so unlike `not_found_page` they are not relative to the release root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<Redirect>,
+    /// Extra `location`s with a fixed `Content-Type`, for feeds nginx's static MIME table
+    /// (issue #498) does not cover unambiguously (`.xml` is ambiguous with a sitemap).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feeds: Vec<Feed>,
+    /// `add_header`s applied to every location of the site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeaders>,
+}
+
+/// One entry of [`StaticIngress::redirects`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redirect {
+    /// Public path redirected from; must be inside the site's own `paths` (validated in `state.rs`).
+    pub from: String,
+    /// Target of the redirect: a public path in the same alphabet as `from`, or an absolute
+    /// `https://<host>/...` (host in the same alphabet as `AppSpec::domains`, no injection characters).
+    pub to: String,
+    /// `false` (default): `from` matches only itself (`location = <from> { return 301 ... }`).
+    /// `true`: `from` also matches everything below it (`rewrite ^<from>(.*)$ <to>$1 permanent;`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefix: bool,
+}
+
+/// One entry of [`StaticIngress::feeds`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Feed {
+    /// Public path of the feed (same alphabet as `AppSpec::paths`).
+    pub path: String,
+    pub format: FeedFormat,
+}
+
+/// `Content-Type` of a [`Feed`]; the MIME values nginx's own static table (issue #498) cannot assign
+/// unambiguously from the extension alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedFormat {
+    Rss,
+    Atom,
+    Json,
+}
+
+impl FeedFormat {
+    /// The `default_type` the generator emits for this format.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Rss => "application/rss+xml",
+            Self::Atom => "application/atom+xml",
+            // JSON Feed (jsonfeed.org): `application/feed+json`, not the generic `application/json`,
+            // so a client can tell a feed from an ordinary JSON API response.
+            Self::Json => "application/feed+json",
+        }
+    }
+}
+
+/// `add_header`s a static site asks for on every one of its locations (#104, ADR 0069).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityHeaders {
+    /// Only variant today; reserved for future presets without another schema change.
+    #[serde(default)]
+    pub preset: SecurityHeadersPreset,
+    /// `Strict-Transport-Security: max-age=<n>`. Unset omits the header; no `includeSubDomains`/
+    /// `preload` in v1 — those extend the policy beyond this one site's own domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hsts_max_age_secs: Option<u32>,
+    /// `Content-Security-Policy` value, printable ASCII without `"`/`\`/`$`, at most 2048 bytes
+    /// (the one free-form exception: everything else here is an enum or a generator constant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csp: Option<String>,
+}
+
+/// A named bundle of headers [`SecurityHeaders::preset`] selects (own decision, ADR 0069 does not fix
+/// the exact set: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+/// `Referrer-Policy: strict-origin-when-cross-origin` — conservative defaults that never depend on the
+/// site's own markup, unlike a `Content-Security-Policy`, which stays an explicit opt-in via `csp`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityHeadersPreset {
+    #[default]
+    Baseline,
 }
 
 /// What an instance runs (ADR 0049). The default is a container; a `static` instance has no container
