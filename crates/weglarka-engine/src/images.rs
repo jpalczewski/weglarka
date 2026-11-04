@@ -15,9 +15,11 @@
 //! A retention pass runs under the image guard; `execute` takes the same guard, so a plan cannot be
 //! applied after the lock was dropped.
 //!
-//! Fail-closed: a corrupt/unsupported inventory, an unreadable journal or self-update record, or a
-//! host without capabilities disables the deletion it would need. `dry-run` and `doctor` share the
-//! same input builder and planner; they never adopt images or mutate bookkeeping.
+//! Fail-closed: a corrupt/unsupported inventory, an unreadable journal or self-update record, an
+//! adoption that cannot be recorded, or a reservation still `loading` blocks the whole pass
+//! ([`PruneReport::blocked`]: nothing is removed or forgotten); a host without capabilities
+//! disables only the platform deletion it would need. `dry-run` and `doctor` share the same input
+//! builder and planner; they never adopt images or mutate bookkeeping.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -112,8 +114,22 @@ pub struct PruneReport {
     /// Fail-closed explanations (corrupt bookkeeping, disabled platform-image deletion). A non-empty
     /// list is a diagnostic, never permission to delete more.
     pub diagnostics: Vec<String>,
-    /// A fail-closed condition disabled **all** destructive cleanup for this pass.
+    /// Provenance could not be read or written, so **all** destructive cleanup was disabled for this
+    /// pass: nothing was removed and nothing forgotten. The one exception is a failure to forget
+    /// images that were already removed (their stale records are harmless). `diagnostics` says why.
     pub blocked: bool,
+}
+
+impl PruneReport {
+    /// A pass that fail-closed on `reason` before removing anything.
+    fn blocked(dry_run: bool, reason: String) -> Self {
+        Self {
+            dry_run,
+            diagnostics: vec![format!("image retention is blocked: {reason}")],
+            blocked: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Proof that the engine's image lock is held while a retention plan is executed.
@@ -467,7 +483,9 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Begins an acquisition: a durable reservation in phase `loading`, published **before** any
-    /// pull/load/tag mutation. The caller must hold the image guard.
+    /// pull/load/tag mutation. While it is `loading` it protects whatever is being pulled by
+    /// blocking retention altogether; [`Self::advance_acquisition`] replaces that with the image's
+    /// identities. The caller must hold the image guard.
     pub(crate) async fn begin_acquisition(
         &self,
         guard: &ImageGuard<'_>,
@@ -486,8 +504,9 @@ impl<P: PodmanClient> Reconciler<P> {
             journal_ref: None,
             created_at: now_secs(),
         };
-        // The reservation is the protection itself until the image identity is known; the owner and
-        // repository are recorded on the inventory entry by [`Self::record_acquisition`].
+        // No image identity is known yet, so the reservation carries no protections; its `loading`
+        // phase blocks retention instead (see `refuse_while_loading`). The owner and repository are
+        // recorded on the inventory entry by [`Self::record_acquisition`].
         ReservationStore::reserve(self, guard, operation.clone(), &reservation).await?;
         Ok(operation)
     }
@@ -762,6 +781,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let st = state::load_state(&self.paths.state)?;
         let inventory = self.read_inventory()?;
         let reservations = self.read_reservations()?;
+        refuse_while_loading(&reservations)?;
         let journal = self.read_platform_journal()?;
         let self_update =
             weglarka_model::self_update::load(&self.bookkeeping_dir()).map_err(|e| {
@@ -790,29 +810,30 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         let requests = adopt_requests(&images, &apps, &inventory, &scope);
         if let Some(guard) = adopt {
-            // A real prune persists the adoptions **before** it can plan a removal from them: if the
-            // records cannot be written (full disk, read-only file), the images stay unattributed
-            // instead of being deleted without durable provenance. One read and one write for the
-            // whole batch; a conflicting image is skipped. A dry run only advertises.
-            match InventoryStore::record_many(self, guard, requests.clone()).await {
-                Ok(recorded) => {
-                    let recorded: BTreeSet<&str> = recorded
-                        .iter()
-                        .map(|image| image.image_id.as_str())
-                        .collect();
-                    for request in requests {
-                        if recorded.contains(request.image_id.as_str()) {
-                            upsert(&mut scoped, &request);
-                        } else {
-                            diagnostics.push(format!(
-                                "cannot record image provenance for {}: a digest is already \
-                                 recorded for another image",
-                                request.image_id
-                            ));
-                        }
-                    }
+            // A real prune persists the adoptions **before** it can plan a removal from them. If the
+            // batch cannot be written (full disk, read-only file) provenance is incomplete and the
+            // whole pass is blocked (`ImageBookkeeping`), not narrowed: nothing is removed. One
+            // read and one write for the whole batch; an image whose digest already names another
+            // image id is skipped (it stays unattributed). A dry run only advertises.
+            let recorded = InventoryStore::record_many(self, guard, requests.clone())
+                .await
+                .map_err(|e| {
+                    EngineError::ImageBookkeeping(format!("cannot record image provenance: {e}"))
+                })?;
+            let recorded: BTreeSet<&str> = recorded
+                .iter()
+                .map(|image| image.image_id.as_str())
+                .collect();
+            for request in requests {
+                if recorded.contains(request.image_id.as_str()) {
+                    upsert(&mut scoped, &request);
+                } else {
+                    diagnostics.push(format!(
+                        "cannot record image provenance for {}: a digest is already recorded \
+                         for another image",
+                        request.image_id
+                    ));
                 }
-                Err(e) => diagnostics.push(format!("cannot record image provenance: {e}")),
             }
         } else {
             for request in requests {
@@ -871,6 +892,10 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// The body of [`Self::prune_images`], under the engine lock.
+    ///
+    /// Fails closed on provenance: any error reading or writing the bookkeeping (inventory,
+    /// reservations, journal, adoption records) ends the pass with [`PruneReport::blocked`] and no
+    /// removal. A dry run adopts nothing and writes no file.
     pub(crate) async fn prune_images_locked(
         &self,
         held: &EngineGuard<'_>,
@@ -878,25 +903,47 @@ impl<P: PodmanClient> Reconciler<P> {
         scope: RetentionScope,
     ) -> Result<PruneReport, EngineError> {
         let guard = ImageGuard::new(held);
-        let prepared = self.prepare_retention(scope, Some(&guard)).await?;
-        let plan = ManagedRetentionPlanner.plan(&prepared.input());
-        let mut report = PruneReport {
-            diagnostics: prepared.diagnostics.clone(),
-            ..PruneReport::default()
+        let adopt = (!dry_run).then_some(&guard);
+        let prepared = match self.prepare_retention(scope, adopt).await {
+            Ok(prepared) => prepared,
+            Err(EngineError::ImageBookkeeping(reason)) => {
+                return Ok(PruneReport::blocked(dry_run, reason));
+            }
+            Err(e) => return Err(e),
         };
+        let plan = ManagedRetentionPlanner.plan(&prepared.input());
         if dry_run {
-            report.reclaimed_bytes = plan.reclaimable_bytes();
-            report.removed = plan.remove;
-            report.dry_run = true;
-            return Ok(report);
+            return Ok(PruneReport {
+                reclaimed_bytes: plan.reclaimable_bytes(),
+                removed: plan.remove,
+                dry_run: true,
+                diagnostics: prepared.diagnostics,
+                ..PruneReport::default()
+            });
         }
-        report = execute(&self.podman, &guard, plan).await;
+        // Prove the inventory can be written before the first removal: forgetting the removed
+        // images is the last step, and a pass that could not record its outcome must not start.
+        if !plan.is_empty()
+            && let Err(e) = self.check_inventory_writable()
+        {
+            return Ok(PruneReport::blocked(false, e.to_string()));
+        }
+        let mut report = execute(&self.podman, &guard, plan).await;
         report.diagnostics = prepared.diagnostics;
-        // A failed deletion keeps its record: only successfully removed images are forgotten.
+        // A failed deletion keeps its record: only successfully removed images are forgotten. A
+        // record that outlives its image is harmless (the planner skips an absent image), so a
+        // failed write here blocks further cleanup but undoes nothing.
         if let Err(e) = self.forget_removed(&guard, &report) {
+            report.blocked = true;
             report.diagnostics.push(e.to_string());
         }
         Ok(report)
+    }
+
+    /// Rewrites the inventory unchanged: succeeds only when a later [`Self::forget_removed`] can.
+    fn check_inventory_writable(&self) -> Result<(), EngineError> {
+        let inventory = self.read_inventory()?;
+        self.write_inventory(&inventory)
     }
 
     /// Removes the inventory records of images that were actually deleted.
@@ -943,6 +990,11 @@ impl<P: PodmanClient> Reconciler<P> {
             repository,
         };
         match self.prune_images_locked(held, false, scope).await {
+            Ok(report) if report.blocked => {
+                for diagnostic in &report.diagnostics {
+                    tracing::warn!(repo, %diagnostic, "image retention: blocked");
+                }
+            }
             Ok(report) if report.removed.is_empty() => {
                 for diagnostic in report.diagnostics {
                     tracing::warn!(repo, %diagnostic, "image retention: disabled");
@@ -996,6 +1048,29 @@ impl<P: PodmanClient> Reconciler<P> {
         let guard = self.acquire().await;
         self.retain_images_locked(&guard, &owner, repo).await;
     }
+}
+
+/// A reservation in phase `loading` has not learned its image id or digest yet, so it can name no
+/// protection: the pull it guards may have produced (or be about to replace) any local image. The
+/// only key available without a new field in `image-reservations.toml` is the phase itself, so while
+/// one exists retention is blocked for **every** owner and repository. It ends when the acquisition
+/// advances to `loaded` (identities protect from then on) or finishes, when the reservation is
+/// reclaimed after a reboot, or with `weglarka images reservations abandon`.
+fn refuse_while_loading(reservations: &Reservations) -> Result<(), EngineError> {
+    let loading: Vec<String> = reservations
+        .operations
+        .iter()
+        .filter(|entry| entry.reservation.phase == ReservationPhase::Loading)
+        .map(|entry| entry.operation_id.to_string())
+        .collect();
+    if loading.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::ImageBookkeeping(format!(
+        "image acquisition {} is still loading; retention waits for it to finish, or abandon it with \
+         `weglarka images reservations abandon <operation-id>` when its owner is gone",
+        loading.join(", ")
+    )))
 }
 
 /// The conflict an upsert rejects: one manifest digest never names two local image ids.
@@ -1683,7 +1758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_adoption_write_leaves_the_batch_out_of_the_plan() {
+    async fn a_failed_adoption_write_refuses_the_whole_batch() {
         use std::os::unix::fs::PermissionsExt;
 
         let (dir, rec) = reconciler();
@@ -1704,27 +1779,14 @@ mod tests {
             .prepare_retention(RetentionScope::AllManaged, Some(&guard))
             .await;
         restore(0o755);
-        let prepared = prepared.unwrap();
 
+        // The batch is not narrowed to what could be recorded: the whole input is refused.
+        let error = prepared.err().expect("a failed batch refuses the input");
         assert!(
-            prepared
-                .diagnostics
-                .iter()
-                .any(|d| d.contains("cannot record image provenance")),
-            "{:?}",
-            prepared.diagnostics
+            matches!(&error, EngineError::ImageBookkeeping(m)
+                if m.contains("cannot record image provenance")),
+            "{error:?}"
         );
-        assert!(
-            prepared.inventory.images.is_empty(),
-            "no image of a failed batch is attributed: {:?}",
-            prepared.inventory.images
-        );
-        let plan = ManagedRetentionPlanner.plan(&prepared.input());
-        assert!(
-            plan.remove.is_empty(),
-            "nothing is planned for removal: {plan:?}"
-        );
-        assert_eq!(plan.unattributed.len(), 3);
         assert!(!dir.path().join(INVENTORY_FILE_NAME).exists());
     }
 }
