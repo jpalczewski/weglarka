@@ -18,6 +18,21 @@ mod tests {
         }
     }
 
+    /// The same suite runs against `LibpodClient` in `weglarka-podman/tests/contract.rs`.
+    #[tokio::test]
+    async fn fake_passes_the_podman_contract() {
+        weglarka_model::podman_contract::run_reachable(&FakePodman::new()).await;
+    }
+
+    #[tokio::test]
+    async fn unreachable_fake_is_an_error_not_absent() {
+        let fake = FakePodman::new();
+        fake.set_unreachable(true);
+        weglarka_model::podman_contract::unreachable_is_an_error_not_absent(&fake).await;
+        fake.set_unreachable(false);
+        weglarka_model::podman_contract::run_reachable(&fake).await;
+    }
+
     #[test]
     fn registry_auth_failures_are_told_apart_from_missing_images() {
         let api = |status| PodmanError::Api {

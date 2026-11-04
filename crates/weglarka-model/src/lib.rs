@@ -26,6 +26,9 @@ pub mod limits;
 pub mod platform_transitions;
 pub mod platform_update;
 pub mod podman;
+/// Contract suite every `PodmanClient` implementation must pass (feature `testing`).
+#[cfg(feature = "testing")]
+pub mod podman_contract;
 pub mod release_set;
 pub mod secret_ops;
 pub mod secret_store;

@@ -28,4 +28,5 @@ weglarka-model.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true
+weglarka-model = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["net", "io-util", "time"] }

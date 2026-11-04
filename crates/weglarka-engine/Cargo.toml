@@ -36,5 +36,7 @@ insta.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 weglarka-engine = { path = ".", features = ["testing"] }
+# The PodmanClient contract suite (`podman_contract`) that the fake is held to.
+weglarka-model = { workspace = true, features = ["testing"] }
 # The libpod integration tests (`tests/`) drive the engine against a real Podman.
 weglarka-podman.workspace = true

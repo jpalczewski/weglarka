@@ -12,7 +12,8 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Token minting for tests of this crate and its consumers (admin_auth::testing).
+# Token minting (admin_auth::testing) and the PodmanClient contract suite (podman_contract) for tests
+# of this crate and its consumers.
 testing = []
 
 [dependencies]
