@@ -1,19 +1,7 @@
 //! Random values and comparisons for session ids, CSRF tokens and OIDC `state`/`nonce`.
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
-
-/// `bytes` random bytes from the OS, base64url without padding. The system generator failing means
-/// the host cannot give out randomness at all; nothing safe can continue, so this panics.
-pub fn random_b64url(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    SystemRandom::new()
-        .fill(&mut buf)
-        .expect("the operating system cannot provide random bytes");
-    URL_SAFE_NO_PAD.encode(buf)
-}
+use weglarka_oidc::random_b64url;
 
 /// A 256-bit identifier or secret token.
 pub fn random_token() -> String {

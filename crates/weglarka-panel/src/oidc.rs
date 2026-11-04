@@ -21,13 +21,12 @@ use weglarka_http::reqwest;
 use weglarka_http::{BodyError, error_chain, read_capped};
 use weglarka_model::admin_auth::{AuthError, JwkSet, TokenKind, verify};
 use weglarka_oidc::{
-    AuthorizationRequest, ClientAuth, DiscoveryPolicy, Endpoints, HttpResponse, Transport,
+    ClientAuth, CodeFlowRequest, DiscoveryPolicy, Endpoints, HttpResponse, Transport,
 };
 
 pub use weglarka_oidc::{Secret, TokenSet};
 
 use crate::config::PanelConfig;
-use crate::secure::{random_b64url, random_token};
 use crate::session::Clock;
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
@@ -230,26 +229,20 @@ impl OidcClient {
     /// Builds the authorization request: fresh `state`, `nonce` and PKCE verifier.
     pub async fn begin_login(&self) -> Result<AuthRequest, OidcError> {
         let endpoints = self.endpoints().await?;
-        let state = random_token();
-        let nonce = random_token();
-        let verifier = random_b64url(32);
-        let url = weglarka_oidc::authorization_url(
+        let flow = weglarka_oidc::begin_code_flow(
             &endpoints.authorization,
-            &AuthorizationRequest {
+            &CodeFlowRequest {
                 client_id: &self.config.oidc.client_id,
                 redirect_uri: &self.redirect_uri(),
                 scope: SCOPE,
                 audience: &self.config.oidc.audience,
-                state: &state,
-                nonce: &nonce,
-                verifier: &verifier,
             },
         );
         Ok(AuthRequest {
-            redirect: url.into(),
-            state,
-            nonce,
-            verifier: Secret::new(verifier),
+            redirect: flow.url.into(),
+            state: flow.state,
+            nonce: flow.nonce,
+            verifier: flow.verifier,
         })
     }
 
@@ -267,16 +260,13 @@ impl OidcClient {
     ) -> Result<TokenSet, OidcError> {
         let endpoints = self.endpoints().await?;
         let redirect_uri = self.redirect_uri();
-        Ok(weglarka_oidc::token_request(
+        Ok(weglarka_oidc::exchange_code(
             &self.http,
             &endpoints.token,
             self.client_auth(),
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", &redirect_uri),
-                ("code_verifier", verifier.expose()),
-            ],
+            code,
+            &redirect_uri,
+            verifier,
         )
         .await?)
     }

@@ -11,6 +11,7 @@
 
 mod device;
 mod discovery;
+mod flow;
 mod token;
 
 use std::fmt;
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 pub use device::{DeviceAuthorization, DevicePoll, device_authorization, poll_device_token};
 pub use discovery::{DiscoveryPolicy, Endpoints, discover};
+pub use flow::{CodeFlow, CodeFlowRequest, begin_code_flow, exchange_code, random_b64url};
 pub use token::{
     AuthorizationRequest, ClientAuth, TokenSet, authorization_url, pkce_challenge, refresh, revoke,
     token_request,
