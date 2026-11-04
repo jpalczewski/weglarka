@@ -269,8 +269,9 @@ pub async fn bootstrap<P: Platform>(
     })
 }
 
-/// Reverse command: refuses while a transaction is nonterminal, then removes the launcher jobs and
-/// restores the legacy daemon-only units. Panel unenrollment and the coordinator's own downgrade
+/// Reverse command: refuses while a transaction is nonterminal, then removes the launcher setup (jobs,
+/// the cron block, launcher-owned init scripts) and restores the legacy daemon-only units. OpenRC had
+/// no legacy units, so it ends with none. Panel unenrollment and the coordinator's own downgrade
 /// predicate are brief D's.
 pub async fn downgrade<P: Platform>(
     platform: &P,

@@ -106,7 +106,7 @@ enum PlatformAction {
         #[arg(long, default_value = DEFAULT_IMAGE)]
         image: String,
     },
-    /// Remove the service file.
+    /// Remove the service, the launcher jobs (units or cron block) and the init scripts.
     Remove,
     /// Show the service status.
     Status,
@@ -279,9 +279,17 @@ async fn run_platform<P: Platform>(
         PlatformAction::Remove => {
             platform.remove_launcher_setup().await?;
             platform.remove_service(SERVICE_NAME).await?;
-            println!(
-                "Removed the {SERVICE_NAME} service file, the self-update timer and the watchdog."
-            );
+            if platform.kind() == PlatformKind::Systemd {
+                println!(
+                    "Removed the {SERVICE_NAME} service file, the self-update timer, the watchdog \
+                     and the launcher job units."
+                );
+            } else {
+                println!(
+                    "Removed the OpenRC init scripts and the managed cron block; the \
+                     runtime user's other crontab lines are untouched."
+                );
+            }
         }
         PlatformAction::Status => {
             println!("{:?}", platform.service_status(SERVICE_NAME).await?);
@@ -313,7 +321,15 @@ async fn run_platform<P: Platform>(
         PlatformAction::Downgrade(args) => {
             let options = bootstrap_options(&args, &settings, host_dir, false)?;
             weglarka_daemon::bootstrap::downgrade(platform, &options).await?;
-            println!("Removed the launcher units and restored the legacy daemon-only units.");
+            if platform.kind() == PlatformKind::Systemd {
+                println!("Removed the launcher units and restored the legacy daemon-only units.");
+            } else {
+                println!(
+                    "Removed the launcher init scripts and the managed cron block. OpenRC has no \
+                     legacy daemon-only setup, so no daemon starts at boot until you run \
+                     `platform bootstrap` again."
+                );
+            }
         }
     }
     Ok(())
