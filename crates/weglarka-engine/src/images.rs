@@ -133,7 +133,8 @@ impl<'a> ImageGuard<'a> {
 }
 
 /// The contract's retention input: observed images/containers, durable provenance, protections and
-/// the requested scope. Planning is pure.
+/// the requested scope. Planning is pure. The scope narrows which inventory records may be removed;
+/// protections are never narrowed by it.
 pub struct RetentionInput<'a> {
     pub images: &'a [ImageInfo],
     pub containers: &'a [ContainerInfo],
@@ -147,8 +148,9 @@ pub trait RetentionPlanner {
     fn plan(&self, input: &RetentionInput<'_>) -> Plan;
 }
 
-/// The pure planner from the v1 contract. The caller has already scoped the inventory and resolved
-/// every protection; the planner only compares identities.
+/// The pure planner from the v1 contract. The caller has already resolved every protection; the
+/// planner applies the scope to the inventory and compares identities. An image outside the scope is
+/// neither removed nor kept: it is reported like an image without provenance.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ManagedRetentionPlanner;
 
@@ -186,7 +188,12 @@ impl RetentionPlanner for ManagedRetentionPlanner {
 
         let mut plan = Plan::default();
         let mut known: BTreeSet<&str> = BTreeSet::new();
-        for record in &input.inventory.images {
+        for record in input
+            .inventory
+            .images
+            .iter()
+            .filter(|record| in_scope(&input.scope, record))
+        {
             known.insert(record.image_id.as_str());
             let Some(image) = by_id.get(record.image_id.as_str()) else {
                 continue; // already gone: a complete observation proves absence later
@@ -221,6 +228,18 @@ impl RetentionPlanner for ManagedRetentionPlanner {
         plan.remove.sort_by(|a, b| a.id.cmp(&b.id));
         plan.unattributed.sort_by(|a, b| a.id.cmp(&b.id));
         plan
+    }
+}
+
+/// Whether `record` belongs to the retention `scope`: every record for [`RetentionScope::AllManaged`],
+/// only the records associated with that owner and repository otherwise.
+fn in_scope(scope: &RetentionScope, record: &ManagedImage) -> bool {
+    match scope {
+        RetentionScope::AllManaged => true,
+        RetentionScope::OwnerRepository { owner, repository } => record
+            .associations
+            .iter()
+            .any(|a| &a.owner == owner && &a.repository == repository),
     }
 }
 
@@ -452,8 +471,6 @@ impl<P: PodmanClient> Reconciler<P> {
     pub(crate) async fn begin_acquisition(
         &self,
         guard: &ImageGuard<'_>,
-        owner: Owner,
-        repository: Repository,
     ) -> Result<OperationId, EngineError> {
         let operation = next_operation_id("acquisition")?;
         let reservation = Reservation {
@@ -470,8 +487,7 @@ impl<P: PodmanClient> Reconciler<P> {
             created_at: now_secs(),
         };
         // The reservation is the protection itself until the image identity is known; the owner and
-        // repository are recorded on the inventory entry below.
-        let _ = (owner, repository);
+        // repository are recorded on the inventory entry by [`Self::record_acquisition`].
         ReservationStore::reserve(self, guard, operation.clone(), &reservation).await?;
         Ok(operation)
     }
@@ -803,19 +819,6 @@ impl<P: PodmanClient> Reconciler<P> {
                 upsert(&mut scoped, &request);
             }
         }
-        // Scope: automatic retention only considers the owner/repository of the completed operation.
-        if let RetentionScope::OwnerRepository {
-            owner,
-            repository: scoped_repository,
-        } = &scope
-        {
-            scoped.images.retain(|record| {
-                record
-                    .associations
-                    .iter()
-                    .any(|a| &a.owner == owner && &a.repository == scoped_repository)
-            });
-        }
         // Platform-image deletion stays disabled without the capability record, whatever the scope.
         if capability.is_err() {
             scoped.images.retain(|record| {
@@ -825,7 +828,12 @@ impl<P: PodmanClient> Reconciler<P> {
                     .any(|a| matches!(a.owner, Owner::PlatformDaemon))
             });
         }
-        if scoped.images.len() > weglarka_model::image_inventory::MAX_IMAGES {
+        let in_scope_images = scoped
+            .images
+            .iter()
+            .filter(|record| in_scope(&scope, record))
+            .count();
+        if in_scope_images > weglarka_model::image_inventory::MAX_IMAGES {
             return Err(EngineError::ImageBookkeeping(
                 "the image inventory exceeds its entry limit".into(),
             ));
@@ -1378,6 +1386,39 @@ mod tests {
         assert_eq!(plan.keep.len(), 1);
         assert_eq!(plan.unattributed.len(), 1);
         assert_eq!(plan.unattributed[0].id, full_id("2"));
+    }
+
+    #[test]
+    fn planner_applies_the_scope_to_the_inventory() {
+        let images = [image("1", 'a'), image("2", 'b')];
+        let inventory = Inventory::new(vec![
+            record("1", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),
+            record("2", Owner::PlatformDaemon, "ghcr.io/x/other", 'b'),
+        ])
+        .unwrap();
+        let protections = BTreeSet::new();
+        let plan = |scope| {
+            ManagedRetentionPlanner.plan(&RetentionInput {
+                images: &images,
+                containers: &[],
+                inventory: &inventory,
+                protections: &protections,
+                scope,
+            })
+        };
+
+        let scoped = plan(RetentionScope::OwnerRepository {
+            owner: Owner::PlatformDaemon,
+            repository: repo("ghcr.io/x/y"),
+        });
+        assert_eq!(
+            scoped.remove.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            [&full_id("1")],
+            "only the scoped repository is a candidate"
+        );
+        assert_eq!(scoped.unattributed.len(), 1, "{scoped:?}");
+
+        assert_eq!(plan(RetentionScope::AllManaged).remove.len(), 2);
     }
 
     fn reconciler() -> (tempfile::TempDir, Reconciler<FakePodman>) {

@@ -525,9 +525,7 @@ impl<P: PodmanClient> Reconciler<P> {
             instance: instance.clone(),
         };
         let repository = inventory_repository(&spec.image)?;
-        let operation = self
-            .begin_acquisition(guard, owner.clone(), repository.clone())
-            .await?;
+        let operation = self.begin_acquisition(guard).await?;
         let resolved = match self.resolve_digest(instance, reference).await {
             Ok(resolved) => resolved,
             Err(e) => {
