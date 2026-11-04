@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         RoleArg::Update(args) => run_worker(&host_dir, &cli.config, Role::Update, &args),
         RoleArg::Supervise(args) => run_worker(&host_dir, &cli.config, Role::Supervise, &args),
         RoleArg::Cli { args } => {
-            let generation = resolve(&host_dir, GenerationChoice::Active)?;
+            let generation = resolve_cached(&host_dir)?;
             // Replace the launcher with the CLI: its exit code, stdin and TTY pass through.
             exec_plan(&plan_cli(&generation, args)?)?;
             Ok(())
@@ -250,7 +250,12 @@ fn run_worker(
         println!("{} job is disabled in runtime-jobs.toml", job.as_str());
         return Ok(());
     }
-    let generation = resolve(host_dir, GenerationChoice::Active)?;
+    // The update job always hashes the binaries it is about to run (and may replace); the watchdog
+    // runs often enough that it trusts the root-owned verified-metadata record.
+    let generation = match role {
+        Role::Update => resolve(host_dir, GenerationChoice::Active)?,
+        _ => resolve_cached(host_dir)?,
+    };
     let plan = match role {
         Role::Update => plan_update(&generation, config)?,
         Role::Supervise => plan_supervise(&generation, config)?,
@@ -272,6 +277,16 @@ fn resolve(host_dir: &std::path::Path, choice: GenerationChoice) -> Result<Gener
     };
     GenerationStore::new(host_dir)
         .open(&digest)
+        .with_context(|| format!("opening generation {digest}"))
+}
+
+/// The active generation, skipping the hash of binaries whose metadata matches the record of their
+/// last full verification. Only the hot paths (the CLI and the watchdog) use it.
+fn resolve_cached(host_dir: &std::path::Path) -> Result<Generation> {
+    let selector = HostSelector::load(host_dir).context("reading host-tools.toml")?;
+    let digest = selector.active;
+    GenerationStore::new(host_dir)
+        .open_cached(&digest)
         .with_context(|| format!("opening generation {digest}"))
 }
 
