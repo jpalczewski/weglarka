@@ -188,6 +188,8 @@ struct State {
     next_id: u64,
     /// Subuid pool reported by `subuid_pool` (`None` = [`DEFAULT_SUBUID_POOL`]).
     uid_pool: Option<u64>,
+    /// The socket cannot be reached ([`FakePodman::set_unreachable`]).
+    unreachable: bool,
 }
 
 /// Production-sized subuid pool (production host: `1000000:2000000`).
@@ -215,6 +217,25 @@ impl FakePodman {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("fake podman mutex poisoned")
+    }
+
+    /// Makes the socket unreachable: `version`, `container_inspect`, `container_remove`,
+    /// `container_list`, `image_inspect` and `network_inspect` fail with `PodmanError::Unreachable`
+    /// instead of answering from the fake's state. Only these are covered (the ones the contract
+    /// suite in `weglarka_model::podman_contract` exercises); the rest of the fake keeps working.
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.lock().unreachable = unreachable;
+    }
+
+    /// `Err(Unreachable)` while [`Self::set_unreachable`] is on; the same error text shape as the
+    /// libpod client's (`<socket>: <what>: <cause>`).
+    fn reachable(&self) -> Result<()> {
+        if self.lock().unreachable {
+            return Err(PodmanError::Unreachable(
+                "fake podman socket: connecting: no such file or directory".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Subuid pool reported to the allocator (default [`DEFAULT_SUBUID_POOL`]); tests shrink it to
@@ -606,6 +627,7 @@ impl State {
 
 impl PodmanClient for FakePodman {
     async fn version(&self) -> Result<VersionInfo> {
+        self.reachable()?;
         Ok(VersionInfo {
             version: "6.1.0-fake".into(),
             api_version: "6.0.0".into(),
@@ -730,6 +752,7 @@ impl PodmanClient for FakePodman {
     }
 
     async fn container_remove(&self, name: &str, force: bool) -> Result<()> {
+        self.reachable()?;
         let mut s = self.lock();
         s.calls.push(Call::ContainerRemove(name.to_owned()));
         let running = s.container_mut(name)?.state == ContainerState::Running;
@@ -761,6 +784,7 @@ impl PodmanClient for FakePodman {
     }
 
     async fn container_inspect(&self, name: &str) -> Result<ContainerInfo> {
+        self.reachable()?;
         let s = self.lock();
         s.containers
             .get(name)
@@ -909,6 +933,7 @@ impl PodmanClient for FakePodman {
     }
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
+        self.reachable()?;
         let mut s = self.lock();
         s.list_calls += 1;
         Ok(s.containers
@@ -998,6 +1023,7 @@ impl PodmanClient for FakePodman {
     }
 
     async fn image_inspect(&self, reference: &str) -> Result<ImageInfo> {
+        self.reachable()?;
         let s = self.lock();
         // Like Podman, an image is also addressable by its ID.
         s.images
@@ -1249,6 +1275,7 @@ impl PodmanClient for FakePodman {
     }
 
     async fn network_inspect(&self, name: &str) -> Result<NetworkInfo> {
+        self.reachable()?;
         let s = self.lock();
         let index = s
             .networks
