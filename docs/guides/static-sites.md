@@ -56,11 +56,11 @@ one only re-renders the ingress, never recreates anything), and rejected with `k
 [apps.blog.ingress.static]
 clean_urls = true
 not_found_page = "/404.html"
-cache_immutable_paths = ["/_astro/"]
+cache_immutable_paths = ["/_astro"]
 cache_revalidate = true
 redirects = [
   { from = "/old-post", to = "/blog/new-post" },
-  { from = "/blog/", to = "/posts/", prefix = true },
+  { from = "/blog", to = "/posts", prefix = true },
 ]
 feeds = [{ path = "/rss.xml", format = "rss" }]
 
