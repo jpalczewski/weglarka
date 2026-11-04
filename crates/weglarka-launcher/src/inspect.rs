@@ -52,10 +52,11 @@ pub fn parse_inspect(stdout: &str) -> Option<InspectedContainer> {
 }
 
 /// Whether a failed inspect means the container does not exist (as opposed to an unreachable
-/// socket or any other Podman failure, which the caller must report).
+/// socket or any other Podman failure, which the caller must report). A missing socket file
+/// also reads "no such file or directory", which is not an absent container.
 pub fn is_absent(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("no such") || stderr.contains("not found")
+    (stderr.contains("no such") && !stderr.contains("no such file")) || stderr.contains("not found")
 }
 
 #[cfg(test)]
@@ -142,6 +143,11 @@ mod tests {
             (
                 "Cannot connect to Podman. Please verify your connection to the Linux system \
                  using `podman system connection list`",
+                false,
+            ),
+            (
+                "Error: unable to connect to Podman socket: dial unix \
+                 /run/user/1001/podman/podman.sock: connect: no such file or directory",
                 false,
             ),
             ("Error: permission denied", false),
