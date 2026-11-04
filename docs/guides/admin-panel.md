@@ -117,10 +117,10 @@ value (look in `podman logs` for the panel container). Empty values count as uns
 | Variable | Default | Meaning |
 |---|---|---|
 | `OIDC_CLIENT_ID` | required | Client id at the provider (the instance name; injected). |
-| `OIDC_ISSUER` | required | Issuer URL, compared byte for byte with the token's `iss` (injected). Must be `https://`. Plain `http://` is accepted only for a loopback IP address (`127.0.0.1`, `[::1]`, not `localhost`), meant for a test provider; the same rule applies to every endpoint the discovery document names. |
+| `OIDC_ISSUER` | required | Issuer URL, compared byte for byte with the token's `iss` (injected). Must be `https://`. Plain `http://` is accepted only for a loopback IP address (`127.0.0.1`, `[::1]`, not `localhost`), meant for a test provider; the same rule applies to every endpoint the discovery document names. Visible ASCII only (no spaces, control or Unicode format characters); the panel refuses to start otherwise, because `weglarka login` shows this value to the person signing in. |
 | `OIDC_CLIENT_SECRET` | required unless the file variable is set | Client secret (injected for `kind = "env"`). |
 | `OIDC_CLIENT_SECRET_FILE` | none | Path of a mounted secret file (first line, at most 4 KiB). Set it **or** `OIDC_CLIENT_SECRET`, not both. |
-| `PANEL_API_AUDIENCE` | required | The `aud` the daemon expects (`[admin.http] audience`); sent in the authorization request so tokens carry it. |
+| `PANEL_API_AUDIENCE` | required | The `aud` the daemon expects (`[admin.http] audience`); sent in the authorization request so tokens carry it. Visible ASCII only, at most 512 bytes. |
 | `PANEL_PUBLIC_URL` | required | The panel's public origin; the redirect URI is `<url>/auth/callback`. |
 | `PANEL_SESSION_IDLE_SECS` | `1800` | A session ends after this long without a request (60 to 86400); must not exceed the maximum. |
 | `PANEL_SESSION_MAX_SECS` | `28800` | A session ends this long after login, however active (300 to 604800). |
@@ -209,6 +209,12 @@ it forwards a request, byte for byte, to the daemon's token socket, so the CLI c
   back off and retry. A JSON request body may be 1 MiB; image archives (`push`) and volume imports 8 GiB.
 - **Streams** (logs, events) pass through unbuffered and end where the daemon ends them, including its `TokenExpired`
   frame when the token expires.
+
+- **One public sibling: `GET /_weglarka/api/login`.** It returns `{"issuer": …, "audience": …}` (the panel's
+  `OIDC_ISSUER` and `PANEL_API_AUDIENCE`, no secret, `Cache-Control: no-store`) so that `weglarka --host … login` needs no
+  flags. It needs no session or token, shares the relay's per-address rate limit, answers other methods with `405`, and
+  is the only route under the prefix that is not an admin endpoint. It sits under the relay prefix so that the
+  carve-out below already makes it reachable through forward auth.
 
 **Nothing to configure.** The instance listed in `[admin.http] clients` is the panel, and Węglarka carves the relay
 prefix `/_weglarka/api` out of that app's `location /` by itself (the same mechanism as

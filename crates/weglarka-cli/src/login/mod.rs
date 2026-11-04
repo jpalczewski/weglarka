@@ -6,6 +6,7 @@
 //! `credentials.toml` and never reach stdout, stderr, logs or errors.
 
 mod credentials;
+mod discovery;
 pub(crate) mod remote;
 mod transport;
 
@@ -15,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Args;
 use serde::Serialize;
 use weglarka_oidc::{
-    ClientAuth, DeviceAuthorization, DevicePoll, DiscoveryPolicy, Secret, Transport,
+    ClientAuth, DeviceAuthorization, DevicePoll, DiscoveryPolicy, Endpoints, Secret, TokenSet,
+    Transport,
 };
 
 use self::credentials::{HostEntry, Store, normalize_host};
@@ -26,17 +28,21 @@ use crate::output::emit;
 /// The scopes the CLI asks for: `groups` maps the person to the daemon's scopes,
 /// `offline_access` gives the refresh token that keeps the session alive.
 const SCOPE: &str = "openid profile groups offline_access";
+/// The one hint for every "sign in (again)" error; the issuer and audience come from the host.
+const LOGIN_HINT: &str = "run `weglarka --host <url> login`";
 /// A token with less than this left is refreshed before use.
 const REFRESH_SKEW_SECS: u64 = 60;
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// The identity provider's issuer URL, e.g. `https://auth.example.com`.
+    /// The identity provider's issuer URL, e.g. `https://auth.example.com`. Default: the one the
+    /// host publishes; given, it must equal that.
     #[arg(long, value_name = "URL")]
-    pub issuer: String,
-    /// The `[admin.http] audience` of the host (a token must carry it).
+    pub issuer: Option<String>,
+    /// The `[admin.http] audience` of the host (a token must carry it). Default: the one the host
+    /// publishes; given, it must equal that. With both flags nothing is fetched from the host.
     #[arg(long, value_name = "URL")]
-    pub audience: String,
+    pub audience: Option<String>,
     /// The provider's client id of the CLI (a public client with `device_flow = true`).
     #[arg(long, default_value = "weglarka-cli", value_name = "ID")]
     pub client_id: String,
@@ -58,7 +64,9 @@ struct LoggedOut {
     revoked: bool,
 }
 
-struct LoginRequest {
+/// What a sign-in is about; every login method (device grant now, `--browser` later) starts from one.
+#[derive(Debug)]
+struct LoginTarget {
     host: String,
     issuer: String,
     audience: String,
@@ -83,7 +91,9 @@ fn provider_error(e: weglarka_oidc::Error) -> CliError {
             format!("cannot reach the identity provider: {m}"),
         ),
         E::Discovery(m) => CliError::new(Kind::Config, format!("provider discovery failed: {m}"))
-            .with_hint("check --issuer: it must be the provider's exact issuer URL"),
+            .with_hint(format!(
+                "the issuer comes from the host (or --issuer); {LOGIN_HINT}"
+            )),
         // A rate limit or a short outage: nothing stored is dropped, the next command tries again.
         E::Throttled {
             status,
@@ -102,21 +112,17 @@ fn provider_error(e: weglarka_oidc::Error) -> CliError {
 
 /// `host` is the global `--host` (or `cli.toml`): where to sign in.
 pub async fn login(json: bool, host: Option<&str>, args: LoginArgs) -> Result<i32, CliError> {
-    let host = host.ok_or_else(|| {
-        CliError::usage("which host?").with_hint(
-            "pass the panel's address: `weglarka --host https://panel.example.com login --issuer … --audience …`",
-        )
-    })?;
-    let request = LoginRequest {
-        host: normalize_host(host)?,
-        issuer: args.issuer.trim().to_owned(),
-        audience: args.audience.trim().to_owned(),
-        client_id: args.client_id,
-    };
+    let host = host.ok_or_else(|| CliError::usage("which host?").with_hint(LOGIN_HINT))?;
+    let host = normalize_host(host)?;
+    let transport = http()?;
+    let store = Store::default_location()?;
+    let target = discovery::resolve_target(&transport, &store, &host, &args).await?;
+    // Always shown: the first login is the one the host controls (see `discovery`).
+    eprintln!("Signing in to {} with {}", target.host, target.issuer);
     let session = device_login(
-        &http()?,
-        &Store::default_location()?,
-        &request,
+        &transport,
+        &store,
+        &target,
         now_secs(),
         tokio::time::sleep,
         show_instructions,
@@ -141,10 +147,11 @@ fn show_instructions(auth: &DeviceAuthorization) {
     );
 }
 
+/// Discovery, the device grant and saving the session, in that order.
 async fn device_login<T, F>(
     transport: &T,
     store: &Store,
-    request: &LoginRequest,
+    target: &LoginTarget,
     now: u64,
     sleep: impl Fn(Duration) -> F,
     show: impl FnOnce(&DeviceAuthorization),
@@ -154,10 +161,28 @@ where
     T: Transport,
     F: Future<Output = ()>,
 {
-    let endpoints =
-        weglarka_oidc::discover(transport, &request.issuer, &DiscoveryPolicy::default())
-            .await
-            .map_err(provider_error)?;
+    let endpoints = weglarka_oidc::discover(transport, &target.issuer, &DiscoveryPolicy::default())
+        .await
+        .map_err(provider_error)?;
+    let (tokens, waited) = device_grant(transport, &endpoints, target, sleep, show, note).await?;
+    // `now` was taken before the person approved; the token is as old as the time spent waiting.
+    save_session(store, target, &tokens, now + waited.as_secs())
+}
+
+/// RFC 8628: asks for a code, shows it and polls until the person approves. Returns the tokens and
+/// how long the person took.
+async fn device_grant<T, F>(
+    transport: &T,
+    endpoints: &Endpoints,
+    target: &LoginTarget,
+    sleep: impl Fn(Duration) -> F,
+    show: impl FnOnce(&DeviceAuthorization),
+    note: impl Fn(&str),
+) -> Result<(TokenSet, Duration), CliError>
+where
+    T: Transport,
+    F: Future<Output = ()>,
+{
     let device_endpoint = endpoints.device_authorization.as_ref().ok_or_else(|| {
         CliError::new(
             Kind::Config,
@@ -168,9 +193,9 @@ where
     let auth = weglarka_oidc::device_authorization(
         transport,
         device_endpoint,
-        &request.client_id,
+        &target.client_id,
         SCOPE,
-        &request.audience,
+        &target.audience,
     )
     .await
     .map_err(|e| match e {
@@ -180,7 +205,7 @@ where
         )
         .with_hint(format!(
             "is `{}` a public client with `device_flow = true` and the scopes `{SCOPE}`?",
-            request.client_id
+            target.client_id
         )),
         other => provider_error(other),
     })?;
@@ -196,7 +221,7 @@ where
         match weglarka_oidc::poll_device_token(
             transport,
             &endpoints.token,
-            &request.client_id,
+            &target.client_id,
             &auth.device_code,
             interval,
         )
@@ -227,20 +252,28 @@ where
         }
     };
 
+    Ok((tokens, waited))
+}
+
+/// Stores the tokens of a finished sign-in under the host; `issued` is when they were handed out.
+fn save_session(
+    store: &Store,
+    target: &LoginTarget,
+    tokens: &TokenSet,
+    issued: u64,
+) -> Result<Session, CliError> {
     let session = Session {
-        host: request.host.clone(),
+        host: target.host.clone(),
         expires_in_secs: tokens.expires_in.as_secs(),
         refreshable: tokens.refresh.is_some(),
     };
-    // `now` was taken before the person approved; the token is as old as the time spent waiting.
-    let issued = now + waited.as_secs();
     store.update(|c| {
         c.hosts.insert(
-            request.host.clone(),
+            target.host.clone(),
             HostEntry {
-                issuer: request.issuer.clone(),
-                client_id: request.client_id.clone(),
-                audience: request.audience.clone(),
+                issuer: target.issuer.clone(),
+                client_id: target.client_id.clone(),
+                audience: target.audience.clone(),
                 access_token: tokens.access.expose().to_owned(),
                 access_expires: issued + tokens.expires_in.as_secs(),
                 refresh_token: tokens.refresh.as_ref().map(|t| t.expose().to_owned()),
@@ -256,8 +289,7 @@ fn expired() -> CliError {
 }
 
 fn not_signed_in(host: &str) -> CliError {
-    CliError::new(Kind::NotFound, format!("not signed in to {host}"))
-        .with_hint("run `weglarka login --host <url> --issuer <url> --audience <url>`")
+    CliError::new(Kind::NotFound, format!("not signed in to {host}")).with_hint(LOGIN_HINT)
 }
 
 /// `--host`, or the only host that has credentials.

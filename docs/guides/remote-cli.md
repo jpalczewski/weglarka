@@ -31,13 +31,31 @@ The client id is `cli` here; the CLI asks for `weglarka-cli` unless you pass `--
 ## Sign in
 
 ```bash
-weglarka login --host https://panel.example.com \
+weglarka --host https://panel.example.com login
+```
+
+The CLI reads the provider's issuer and the audience from the panel itself (`GET /_weglarka/api/login`, a public
+document with just those two values) and prints `Signing in to https://panel.example.com with https://auth.example.com`
+before it starts. A panel older than this feature answers `404`; then pass both explicitly, which also skips the request:
+
+```bash
+weglarka --host https://panel.example.com login \
   --issuer https://auth.example.com \
   --audience https://admin.example.com/api/
 ```
 
-The command prints a short code and an address; approve it in any browser (the provider applies its two-factor policy)
+Either flag may also be given alone, but it must equal what the panel publishes (byte for byte), otherwise the command
+stops. The command prints a short code and an address; approve it in any browser (the provider applies its two-factor policy)
 and the command finishes. Nothing needs to run on the machine's own browser, so it works over SSH.
+
+### Whom you trust when you sign in
+
+The host already receives your bearer token on every call, so the audience it publishes changes nothing. The issuer is
+the sensitive value: a malicious or hijacked host could name its own "identity provider" and ask you for credentials
+there. Check the issuer line the command prints before you approve anything. The CLI also remembers the issuer and
+audience per host and **refuses to change them** for a host you are signed in to (run `weglarka --host <url> logout`
+first). That protects later logins only, not the first one: the first sign-in to a host is trusted on first use, so
+type the address yourself rather than following a link.
 
 ```bash
 weglarka whoami        # the session; refreshes the token if it is about to expire
@@ -92,7 +110,10 @@ lists a `revocation_endpoint`); a provider that is down never leaves tokens behi
   `device_authorization_endpoint`. Authelia has one; check the version.
 - *the identity provider refused the sign-in request*: the client is not registered as a public client with
   `device_flow = true`, or the scopes or audience differ.
-- *provider discovery failed*: `--issuer` must equal the provider's issuer byte for byte (no trailing slash).
+- *the host does not publish its sign-in settings*: an older panel; pass `--issuer` and `--audience`.
+- *--issuer differs from the issuer the host publishes*: drop the flag, or check you are signing in to the right host.
+- *already signed in with a different issuer or audience*: the host's settings changed (or the host is not the one you signed in to before); `logout` first if that is expected.
+- *provider discovery failed*: the issuer must equal the provider's issuer byte for byte (no trailing slash).
 - *the identity provider asked to retry later*: the provider is rate limiting this client address (Authelia does after
   many rejected requests, for example a `weglarka login` left waiting for a long time). Nothing stored is lost; run the
   command again after the time in the hint.

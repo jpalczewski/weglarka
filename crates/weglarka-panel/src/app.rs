@@ -2,7 +2,8 @@
 //!
 //! - **public**: `GET /healthz` (no auth, no daemon call), `/static/*` (embedded, not secret), the
 //!   login flow, `GET /auth/login` and `GET /auth/callback`, and `/_weglarka/api/*`, the bearer-only relay to
-//!   the daemon ([`relay`], docs/decisions/0060);
+//!   the daemon ([`relay`], docs/decisions/0060), plus its one static sibling `GET /_weglarka/api/login`
+//!   (the sign-in settings `weglarka login` discovers);
 //! - **protected**: everything else, behind [`auth::require_session`], which is default-deny: no
 //!   valid session cookie, no answer but 401. State-changing requests there also need a CSRF token.
 //!
@@ -133,6 +134,11 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         // Bearer-only, outside `require_session` on purpose: no cookie ever authenticates here.
+        // The static discovery route wins over the wildcard below; other methods get 405.
+        .route(
+            weglarka_model::admin_auth::LOGIN_DISCOVERY_PATH,
+            get(relay::login_discovery),
+        )
         .route(&format!("{}/{{*rest}}", relay::PREFIX), any(relay::handle))
         .merge(protected)
         .layer(middleware::from_fn(headers::security_headers))

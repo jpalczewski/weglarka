@@ -91,8 +91,8 @@ fn discovery(device: bool, revocation: bool) -> String {
 const DEVICE: &str = r#"{"device_code":"DEVCODE","user_code":"ABCD-1234","verification_uri":"https://auth.example.com/device","expires_in":600,"interval":5}"#;
 const TOKENS: &str = r#"{"access_token":"ACCESS1","token_type":"Bearer","expires_in":900,"refresh_token":"REFRESH1"}"#;
 
-fn request() -> LoginRequest {
-    LoginRequest {
+fn request() -> LoginTarget {
+    LoginTarget {
         host: HOST.into(),
         issuer: "https://auth.example.com".into(),
         audience: "https://admin.example.com/api/".into(),
@@ -481,4 +481,213 @@ async fn nothing_secret_reaches_an_error_message() {
     // Counted so the helper above is not optimised into never failing.
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     assert_eq!(CALLS.fetch_add(1, Ordering::SeqCst), 0);
+}
+
+// --- discovery of the issuer and audience from the host ---
+
+const PUBLISHED: &str =
+    r#"{"issuer":"https://auth.example.com","audience":"https://admin.example.com/api/"}"#;
+
+fn args(issuer: Option<&str>, audience: Option<&str>) -> LoginArgs {
+    LoginArgs {
+        issuer: issuer.map(str::to_owned),
+        audience: audience.map(str::to_owned),
+        client_id: "weglarka-cli".into(),
+    }
+}
+
+async fn resolve(
+    provider: &Provider,
+    store: &Store,
+    args: &LoginArgs,
+) -> Result<LoginTarget, CliError> {
+    discovery::resolve_target(provider, store, HOST, args).await
+}
+
+#[tokio::test]
+async fn both_flags_fetch_nothing_from_the_host() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    let target = resolve(
+        &provider,
+        &store,
+        &args(
+            Some(" https://auth.example.com "),
+            Some("https://admin.example.com/api/"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(provider.requests().is_empty());
+    assert_eq!(target.issuer, "https://auth.example.com");
+    assert_eq!(target.audience, "https://admin.example.com/api/");
+}
+
+#[tokio::test]
+async fn without_flags_the_hosts_document_is_used() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    provider.say(200, PUBLISHED);
+    let target = resolve(&provider, &store, &args(None, None)).await.unwrap();
+    assert_eq!(
+        provider.requests(),
+        [(format!("{HOST}/_weglarka/api/login"), String::new())]
+    );
+    assert_eq!(target.host, HOST);
+    assert_eq!(target.issuer, "https://auth.example.com");
+    assert_eq!(target.audience, "https://admin.example.com/api/");
+    // One flag alone is fine when it matches.
+    let provider = Provider::default();
+    provider.say(200, PUBLISHED);
+    resolve(
+        &provider,
+        &store,
+        &args(Some("https://auth.example.com"), None),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_flag_that_differs_from_the_document_is_an_error() {
+    let (_dir, store) = store();
+    for (issuer, audience) in [
+        (Some("https://evil.example.org"), None),
+        (None, Some("https://other.example.com/")),
+        (Some("https://auth.example.com/"), None), // byte for byte
+    ] {
+        let provider = Provider::default();
+        provider.say(200, PUBLISHED);
+        let err = resolve(&provider, &store, &args(issuer, audience))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Kind::Config);
+        assert!(err.message.contains("differs"), "{}", err.message);
+    }
+}
+
+#[tokio::test]
+async fn an_older_panel_gets_a_hint_to_pass_the_flags() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    provider.say(404, "");
+    let err = resolve(&provider, &store, &args(None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::Config);
+    assert!(err.message.contains("does not publish"));
+    let hint = err.hint.unwrap();
+    assert!(hint.contains("--issuer") && hint.contains("--audience"));
+}
+
+#[tokio::test]
+async fn a_server_error_is_not_mistaken_for_an_older_panel() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    provider.say(503, "");
+    let err = resolve(&provider, &store, &args(None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::Unreachable);
+}
+
+#[tokio::test]
+async fn an_unusable_document_is_refused() {
+    let long = format!(
+        r#"{{"issuer":"https://auth.example.com","audience":"{}"}}"#,
+        "a".repeat(600)
+    );
+    let oversized = format!(
+        r#"{{"issuer":"https://auth.example.com","audience":"{}"}}"#,
+        "a".repeat(5000)
+    );
+    for body in [
+        "not json".to_owned(),
+        "{}".to_owned(),
+        oversized,
+        long,
+        r#"{"issuer":"https://auth.example.com","audience":"x\ny"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com","audience":""}"#.to_owned(),
+        r#"{"issuer":"http://auth.example.com","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://user:pw@auth.example.com","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/#frag","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"not a url","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u001b[2J","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\nTrusted: yes","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/ x","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u202e","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com/\u200b","audience":"a"}"#.to_owned(),
+        r#"{"issuer":"https://auth.example.com","audience":"a\u202eb"}"#.to_owned(),
+    ] {
+        let (_dir, store) = store();
+        let provider = Provider::default();
+        provider.say(200, &body);
+        let err = resolve(&provider, &store, &args(None, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Kind::Config, "{body:.80}");
+    }
+}
+
+#[tokio::test]
+async fn a_loopback_http_issuer_and_unknown_fields_are_accepted() {
+    let (_dir, store) = store();
+    let provider = Provider::default();
+    provider.say(
+        200,
+        r#"{"issuer":"http://127.0.0.1:9000","audience":"a","future":true}"#,
+    );
+    let target = resolve(&provider, &store, &args(None, None)).await.unwrap();
+    assert_eq!(target.issuer, "http://127.0.0.1:9000");
+}
+
+#[tokio::test]
+async fn a_known_host_cannot_be_moved_to_another_issuer_or_audience() {
+    let (_dir, store) = store();
+    signed_in(&store, 5_000, Some("R"));
+    // A different issuer is refused whether it came from flags or from the document.
+    let provider = Provider::default();
+    provider.say(
+        200,
+        r#"{"issuer":"https://evil.example.org","audience":"https://admin.example.com/api/"}"#,
+    );
+    let err = resolve(&provider, &store, &args(None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Kind::Config);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some("sign out first: `weglarka --host https://panel.example.com logout`")
+    );
+    let err = resolve(
+        &Provider::default(),
+        &store,
+        &args(
+            Some("https://auth.example.com"),
+            Some("https://other.example.com/"),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, Kind::Config);
+    // The stored session was not touched.
+    assert_eq!(store.read().unwrap().hosts[HOST].access_token, "OLDACCESS");
+
+    // The same issuer and audience sign in again without fuss.
+    let provider = Provider::default();
+    provider.say(200, PUBLISHED);
+    resolve(&provider, &store, &args(None, None)).await.unwrap();
+}
+
+#[tokio::test]
+async fn flags_with_hidden_characters_are_refused() {
+    let (_dir, store) = store();
+    let err = resolve(
+        &Provider::default(),
+        &store,
+        &args(Some("https://auth.example.com/\u{202e}"), Some("a")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, Kind::Usage);
 }

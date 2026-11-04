@@ -107,3 +107,19 @@ API through it is small, provided the relay adds no authority of its own.
 - **Panel mints its own CLI tokens:** a second token system next to the provider's, with its own revocation and 2FA story.
 - **Relay terminates auth and talks to the socket as the panel's identity:** it would make the panel the authority; the
   daemon must keep verifying the end user's token.
+
+## Addendum (2026-11-04): discovering the issuer and audience (#337)
+
+Decision 2 says the CLI discovers the provider from the panel. The route is `GET /_weglarka/api/login`
+(`weglarka_model::admin_auth::LOGIN_DISCOVERY_PATH`), answering `{"issuer", "audience"}` (`LoginDiscovery`, no secret, no
+client id, no endpoint hosts; `Cache-Control: no-store`). It is the one deliberate exception to "the endpoint table is the
+only relay route list": a static panel route registered beside the relay wildcard, never reaching `find_endpoint`, with the
+relay's per-address rate limit and no session. It lives under `RELAY_PREFIX` because the panel sits behind forward auth
+and the ingress already carves that prefix out of it, so the ingress needs no change.
+
+The CLI fetches it unless both `--issuer` and `--audience` are given (which keeps older panels working); a flag must equal
+the document byte for byte. The document is validated (https or loopback http issuer without userinfo or fragment, a short
+single-line audience). Trust: the host already receives the bearer, so its audience changes nothing; the issuer could point
+a malicious host's users at a phishing provider. The CLI therefore prints the issuer before signing in and refuses to
+replace the issuer or audience of a host it already has credentials for (`logout` first). This protects later logins, not
+the first one.
