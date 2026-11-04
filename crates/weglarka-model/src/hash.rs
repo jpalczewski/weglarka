@@ -453,12 +453,32 @@ env = { B = "2", A = "1" }
             auth_policy: Some(crate::identity::AuthorizationPolicy::OneFactor),
             auth_groups: vec!["admins".into()],
             auth_exempt_paths: vec!["/mcp/".into()],
+            static_: Some(crate::app::StaticIngress {
+                clean_urls: true,
+                not_found_page: Some("/404.html".into()),
+                cache_immutable_paths: vec!["/assets".into()],
+                cache_revalidate: true,
+                redirects: vec![crate::app::Redirect {
+                    from: "/old".into(),
+                    to: "/new".into(),
+                    prefix: false,
+                }],
+                feeds: vec![crate::app::Feed {
+                    path: "/feed.xml".into(),
+                    format: crate::app::FeedFormat::Rss,
+                }],
+                security_headers: Some(crate::app::SecurityHeaders {
+                    preset: crate::app::SecurityHeadersPreset::Baseline,
+                    hsts_max_age_secs: Some(31536000),
+                    csp: Some("default-src 'self'".into()),
+                }),
+            }),
         };
         s.paths = vec!["/api".into()];
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options and paths (issues #64, #130, #181, ADR 0033) only re-render nginx"
+            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104) only re-render nginx"
         );
     }
 
