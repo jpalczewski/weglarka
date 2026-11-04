@@ -226,6 +226,20 @@ pub fn run_plan(plan: &ExecPlan, timeout: Option<Duration>) -> Result<(), RunErr
     }
 }
 
+/// Replaces the launcher process with the plan's program and becomes it, so the CLI's exit code,
+/// stdin and terminal pass through unchanged and no supervising parent stays in memory. The `cli`
+/// role uses this after the generation is resolved and verified; `exec` is a safe API (no
+/// `pre_exec`, no `unsafe`) and only returns when the replacement fails.
+pub fn exec_plan(plan: &ExecPlan) -> Result<(), RunError> {
+    use std::os::unix::process::CommandExt;
+    let mut command = plan.command();
+    let error = command.exec();
+    Err(RunError::Spawn {
+        program: plan.program.clone(),
+        source: error,
+    })
+}
+
 /// Runs `weglarka-daemon host-preflight` for one verified generation.
 pub fn run_preflight(
     generation: &Generation,
