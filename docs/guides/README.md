@@ -60,6 +60,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [ACME certificates](acme.md) | HTTP-01 issuance and renewal (`[acme]`) |
 | [Wildcard certificates](wildcard-certificates.md) | DNS-01 (`[acme.dns]`) |
 | [Forward auth](forward-auth.md) | Login in front of an app via the identity provider (`ingress.auth`) |
+| [OAuth-protected resource paths](oauth-resources.md) | `ingress.oauth_resources`: an API path (MCP) that checks its own tokens, its generated metadata and the legacy redirect |
 | [Admin API tokens](admin-api-tokens.md) | A token listener for the panel and other clients, `read`/`admin` scopes from provider groups (`[admin.http]`) |
 | [Admin panel](admin-panel.md) | The read-mostly web UI: app definition, OIDC login, sessions, what viewers and admins see |
 | [Remote CLI](remote-cli.md) | `weglarka login` with the device flow, where the tokens are kept, `whoami`, `logout` |

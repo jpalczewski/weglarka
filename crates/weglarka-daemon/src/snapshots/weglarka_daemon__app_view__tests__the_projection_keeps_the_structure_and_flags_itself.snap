@@ -32,6 +32,9 @@ expression: shown
       ],
       "auth_exempt_paths": [
         "/mcp/"
+      ],
+      "oauth_resources": [
+        "/rpc"
       ]
     },
     "env": {

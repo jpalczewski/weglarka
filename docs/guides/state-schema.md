@@ -59,7 +59,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 20 | #545, #548 | optional `[sites.<site>.ingress.static]` (the static options of ADR 0069 shared by every environment) and `robots` per environment | [0075](../decisions/0075-site-level-static-options.md) | [site environments](site-environments.md) |
 | 21 | #497 | optional `[apps.<x>.ingress.security_headers]` (the static table's type) for `kind = "container"` | [0076](../decisions/0076-security-headers-for-container-apps.md) | [security headers](security-headers.md) |
 | 22 | #552 | optional `ingress_logs` in app specs (and `[logs] reader` in `weglarka.toml`) | [0072](../decisions/0072-ingress-log-reader.md) | [ingress log reader](ingress-log-reader.md) |
-| 23 | #215 | optional `ingress.oauth_resources` (accepted by the parser, every non-empty list rejected until the ingress PR lands) | [0078](../decisions/0078-oauth-protected-resources.md) | — (not enabled yet) |
+| 23 | #215 | optional `ingress.oauth_resources` | [0078](../decisions/0078-oauth-protected-resources.md) | [OAuth-protected resource paths](oauth-resources.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

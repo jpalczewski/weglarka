@@ -252,6 +252,11 @@ pub struct AddArgs {
     /// the app keeps the default (repeatable; e.g. `/user/events`). Ingress-only.
     #[arg(long = "streaming-path", value_name = "PATH", conflicts_with = "spec")]
     pub streaming_paths: Vec<String>,
+    /// OAuth-protected resource path (repeatable; e.g. `/mcp`): the app checks the tokens itself and
+    /// the ingress publishes the resource's discovery document at the host root. Needs `[identity]`.
+    /// Ingress-only.
+    #[arg(long = "oauth-resource", value_name = "PATH", conflicts_with = "spec")]
+    pub oauth_resources: Vec<String>,
     /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
     /// Also streams the request to the app instead of buffering it. Ingress-only.
     #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse, conflicts_with = "spec")]

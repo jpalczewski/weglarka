@@ -79,6 +79,15 @@ pub struct UpdateArgs {
     /// Remove all streaming paths.
     #[arg(long, conflicts_with = "spec")]
     pub no_streaming_paths: bool,
+    /// Replace the OAuth-protected resource paths (repeatable; e.g. `/mcp`): the app checks the
+    /// tokens itself, and the ingress publishes each resource's discovery document at the host root.
+    /// Needs `[identity]`. Ingress-only: nginx reload.
+    #[arg(long = "oauth-resource", value_name = "PATH",
+        conflicts_with_all = ["spec", "no_oauth_resources"])]
+    pub oauth_resources: Vec<String>,
+    /// Remove all OAuth-protected resource paths.
+    #[arg(long, conflicts_with = "spec")]
+    pub no_oauth_resources: bool,
     /// Request body limit, e.g. `4g`, `512m` or a byte count; `0` removes the limit (default 64m).
     /// Also streams the request to the app instead of buffering it. Ingress-only: nginx reload.
     #[arg(long, value_name = "SIZE", value_parser = BodySizeLimit::parse,
@@ -323,6 +332,8 @@ impl UpdateArgs {
             || self.max_body_size.is_some()
             || !self.streaming_paths.is_empty()
             || self.no_streaming_paths
+            || !self.oauth_resources.is_empty()
+            || self.no_oauth_resources
             || self.unset_max_body_size
             || !self.access_log_skip_paths.is_empty()
             || !self.remove_access_log_skip_paths.is_empty()
@@ -423,6 +434,13 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     }
     if !a.streaming_paths.is_empty() {
         spec.ingress.streaming_paths = a.streaming_paths.clone();
+    }
+    // OAuth-protected resources (#215, ADR 0078): the same set-like semantics as `streaming_paths`.
+    if a.no_oauth_resources {
+        spec.ingress.oauth_resources.clear();
+    }
+    if !a.oauth_resources.is_empty() {
+        spec.ingress.oauth_resources = a.oauth_resources.clone();
     }
     if a.max_body_size.is_some() {
         spec.ingress.max_body_size = a.max_body_size;
@@ -1497,6 +1515,58 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
 
         let s = apply_flags(s, &args(&["--no-streaming-paths"])).unwrap();
         assert!(s.ingress.is_default());
+    }
+
+    #[test]
+    fn oauth_resource_flags_set_replace_and_clear() {
+        let s = apply_flags(spec(), &args(&["--oauth-resource", "/mcp"])).unwrap();
+        assert_eq!(s.ingress.oauth_resources, ["/mcp"]);
+        assert!(
+            !s.ingress.streaming,
+            "a protected resource does not imply streaming"
+        );
+        assert!(args(&["--oauth-resource", "/mcp"]).has_edits());
+        assert!(args(&["--no-oauth-resources"]).has_edits());
+
+        // The flag replaces the list, like `--streaming-path`.
+        let s = apply_flags(
+            s,
+            &args(&["--oauth-resource", "/a", "--oauth-resource", "/b"]),
+        )
+        .unwrap();
+        assert_eq!(s.ingress.oauth_resources, ["/a", "/b"]);
+
+        // The streaming flags leave the list alone.
+        let both = apply_flags(s, &args(&["--streaming"])).unwrap();
+        let s = apply_flags(both, &args(&["--no-streaming"])).unwrap();
+        assert!(!s.ingress.streaming && s.ingress.oauth_resources.len() == 2);
+
+        let s = apply_flags(s, &args(&["--no-oauth-resources"])).unwrap();
+        assert!(s.ingress.is_default());
+
+        // Ingress-only: the dry-run diff shows the field.
+        let with = apply_flags(spec(), &args(&["--oauth-resource", "/mcp"])).unwrap();
+        assert!(spec_diff(&spec(), &with).contains("oauth_resources"));
+
+        // Mutually exclusive, and neither combines with `--spec`.
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            _a: UpdateArgs,
+        }
+        for bad in [
+            vec![
+                "w",
+                "ntfy",
+                "--oauth-resource",
+                "/mcp",
+                "--no-oauth-resources",
+            ],
+            vec!["w", "ntfy", "--oauth-resource", "/mcp", "--spec", "f"],
+            vec!["w", "ntfy", "--no-oauth-resources", "--spec", "f"],
+        ] {
+            assert!(W::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

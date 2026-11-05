@@ -130,6 +130,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     identity_base_config(d, &mut checks);
     oidc_credentials(d, &mut checks);
     identity_forward(d, &mut checks).await;
+    oauth_resources(d, &mut checks).await;
     admin_http(d, &mut checks).await;
     webhook(d, &mut checks).await;
     metrics(d, &mut checks);
@@ -3194,6 +3195,170 @@ async fn identity_forward<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCh
     }
 }
 
+/// Largest metadata body `ingress.oauth_resources` reads: the generated document is one short line.
+const OAUTH_METADATA_MAX_BYTES: usize = 8 * 1024;
+
+/// One `oauth_resources` entry of one app on one of its domains (#215, ADR 0078): the public path
+/// and the domain it is served on, which together name the resource URL.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OAuthResource {
+    /// The app's domain: the probe's `Host`, exactly as the metadata map is keyed.
+    domain: String,
+    /// The public path, e.g. `/mcp`.
+    path: String,
+}
+
+impl OAuthResource {
+    /// `https://<domain><path>` — what `resource` in the metadata must be, byte for byte (ADR 0078:
+    /// always `https`, and no trailing slash).
+    fn url(&self) -> String {
+        format!("https://{}{}", self.domain, self.path)
+    }
+
+    /// `/.well-known/oauth-protected-resource<path>` — RFC 9728 path insertion.
+    fn metadata_path(&self) -> String {
+        format!("/.well-known/oauth-protected-resource{}", self.path)
+    }
+}
+
+/// The pure part of [`oauth_resources`]: every (domain, resource) pair of every started app. An app
+/// with `start = false` renders no route at all, so probing it would only report a `404`; sorted and
+/// deduplicated, so the report is stable.
+fn oauth_resource_targets(apps: &AppsFile) -> Vec<OAuthResource> {
+    let mut out: Vec<OAuthResource> = apps
+        .apps
+        .values()
+        .filter(|spec| spec.start && !spec.ingress.oauth_resources.is_empty())
+        .flat_map(|spec| {
+            spec.domains.iter().flat_map(move |domain| {
+                spec.ingress
+                    .oauth_resources
+                    .iter()
+                    .map(move |path| OAuthResource {
+                        domain: domain.clone(),
+                        path: path.clone(),
+                    })
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The pure part of [`oauth_resources`]: the document names the resource the app declared and the
+/// `[identity]` issuer as its only authorization server. Whatever the answer says is text from the
+/// wire, so every interpolated value goes through [`detail`].
+fn oauth_metadata_matches(body: &[u8], url: &str, issuer: &str) -> Result<(), String> {
+    let doc: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("the metadata is not JSON: {}", detail(e)))?;
+    match doc.get("resource").and_then(serde_json::Value::as_str) {
+        Some(resource) if resource == url => {}
+        Some(resource) => {
+            return Err(format!(
+                "`resource` is {}, expected {url:?}",
+                detail(resource)
+            ));
+        }
+        None => return Err("the metadata has no `resource` string".to_owned()),
+    }
+    let Some(servers) = doc
+        .get("authorization_servers")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err("the metadata has no `authorization_servers` array".to_owned());
+    };
+    if !matches!(servers.as_slice(), [only] if only.as_str() == Some(issuer)) {
+        let shown = servers
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "`authorization_servers` is [{}], expected [{issuer:?}]",
+            detail(shown)
+        ));
+    }
+    Ok(())
+}
+
+/// The pure part of [`oauth_resources`]: whether any OIDC client of `apps.toml` — an app's own
+/// `[apps.<x>.oidc]` client or an external `[oidc_clients.<id>]` — lists `url` in `audience`.
+fn oauth_audience_listed(apps: &AppsFile, url: &str) -> bool {
+    apps.apps
+        .values()
+        .filter_map(|spec| spec.oidc.as_ref())
+        .any(|oidc| oidc.audience.iter().any(|a| a == url))
+        || apps
+            .oidc_clients
+            .values()
+            .any(|client| client.audience.iter().any(|a| a == url))
+}
+
+/// `ingress.oauth_resources` (#215, ADR 0078): for every resource of every started app, fetch the
+/// generated protected-resource metadata over the probe socket with the app's domain as `Host`, and
+/// check that `resource` and `authorization_servers` say what nginx was told to say — a mismatch
+/// means a discovering MCP client gets a document it cannot use. Then a warning (not an error) when
+/// no OIDC client lists the resource URL in `audience`: without one a client cannot ask for an
+/// RFC 8707 token scoped to the resource, but opaque-token setups are legitimate.
+///
+/// No app with resources and no `[identity]`: no line at all, like `identity.forward`.
+async fn oauth_resources<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    const ID: &str = "ingress.oauth_resources";
+    let Some(identity) = &d.host.identity else {
+        return; // the ingress plan refuses resources without `[identity]`
+    };
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let targets = oauth_resource_targets(&apps);
+    if targets.is_empty() {
+        return;
+    }
+    let socket = crate::ingress::probe_socket_path(&d.paths.nginx_conf_dir);
+    for target in targets {
+        let url = target.url();
+        let path = target.metadata_path();
+        let answer = match crate::health_probe::probe_get(
+            &socket,
+            &target.domain,
+            &path,
+            OAUTH_METADATA_MAX_BYTES,
+        )
+        .await
+        {
+            Ok(answer) if answer.status == 200 => {
+                oauth_metadata_matches(&answer.body, &url, &identity.issuer)
+            }
+            Ok(answer) => Err(format!("{path} answered {}", answer.status)),
+            Err(e) => Err(detail(e)),
+        };
+        match answer {
+            Ok(()) => {
+                out.push(ok(ID, format!("{url}: the metadata matches")));
+                if !oauth_audience_listed(&apps, &url) {
+                    out.push(check(
+                        ID,
+                        CheckStatus::Warn,
+                        format!("{url}: no OIDC client lists it in `audience`"),
+                        Some(
+                            "a client that asks for this resource with RFC 8707 needs the URL, byte for byte, in an app's `oidc.audience` or in `[oidc_clients.<id>] audience`; opaque-token setups are fine without it",
+                        ),
+                    ));
+                }
+            }
+            Err(message) => out.push(check(
+                ID,
+                CheckStatus::Fail,
+                format!("{url}: {message}"),
+                Some(
+                    "the metadata is rendered with the app's route: check that ingress applied the config; see docs/guides/oauth-resources.md",
+                ),
+            )),
+        }
+    }
+}
+
 async fn webhook<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let Some(mut addr) = d.webhook_addr() else {
         out.push(check(
@@ -3586,5 +3751,193 @@ mod container_log_tests {
         let missing = logs_reader_check(Some(&ghost), &apps("", "")).unwrap();
         assert_eq!(missing.status, CheckStatus::Warn);
         assert!(missing.message.contains("not a declared app"));
+    }
+}
+
+#[cfg(test)]
+mod oauth_resources_tests {
+    use super::*;
+
+    /// `app` serves one resource on two domains, `stopped` declares one but renders no route; the
+    /// audiences cover one of the three resource URLs.
+    const APPS: &str = r#"
+[apps.app]
+image = "ghcr.io/example/app:1"
+domains = ["app.example.com", "alt.example.com"]
+port = 8080
+
+[apps.app.ingress]
+auth = "forward"
+oauth_resources = ["/mcp"]
+
+[apps.app.oidc]
+audience = ["https://app.example.com/mcp"]
+
+[apps.stopped]
+image = "ghcr.io/example/app:1"
+domains = ["stopped.example.com"]
+port = 8080
+start = false
+
+[apps.stopped.ingress]
+oauth_resources = ["/rpc"]
+
+[oidc_clients.external]
+name = "External"
+audience = ["https://alt.example.com/mcp"]
+"#;
+
+    fn apps() -> AppsFile {
+        toml::from_str(APPS).unwrap()
+    }
+
+    fn metadata(resource: &str, servers: &str) -> String {
+        format!(
+            r#"{{"resource":{resource},"authorization_servers":[{servers}],"bearer_methods_supported":["header"]}}"#
+        )
+    }
+
+    #[test]
+    fn every_domain_of_a_started_app_is_probed_and_a_stopped_app_is_not() {
+        let targets = oauth_resource_targets(&apps());
+        let shown: Vec<(String, String)> = targets
+            .iter()
+            .map(|t| (t.url(), t.metadata_path()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "https://alt.example.com/mcp".to_owned(),
+                    "/.well-known/oauth-protected-resource/mcp".to_owned()
+                ),
+                (
+                    "https://app.example.com/mcp".to_owned(),
+                    "/.well-known/oauth-protected-resource/mcp".to_owned()
+                ),
+            ],
+            "sorted, and no route (and no probe) for start = false"
+        );
+        let plain: AppsFile =
+            toml::from_str("[apps.web]\nimage = \"i\"\ndomains = [\"a.example.com\"]\nport = 80\n")
+                .unwrap();
+        assert!(
+            oauth_resource_targets(&plain).is_empty(),
+            "nothing declares a resource, so the check is silent"
+        );
+    }
+
+    #[test]
+    fn the_matching_document_passes_and_a_mismatch_names_the_field() {
+        let url = "https://app.example.com/mcp";
+        let issuer = "https://auth.example.com";
+        assert!(
+            oauth_metadata_matches(
+                metadata(
+                    r#""https://app.example.com/mcp""#,
+                    r#""https://auth.example.com""#
+                )
+                .as_bytes(),
+                url,
+                issuer
+            )
+            .is_ok()
+        );
+        // A trailing slash is a different resource: the ADR matches byte for byte.
+        let err = oauth_metadata_matches(
+            metadata(
+                r#""https://app.example.com/mcp/""#,
+                r#""https://auth.example.com""#,
+            )
+            .as_bytes(),
+            url,
+            issuer,
+        )
+        .unwrap_err();
+        assert!(err.contains("`resource`"), "{err}");
+        assert!(err.contains("mcp/"), "the answer's value is shown: {err}");
+
+        let err = oauth_metadata_matches(
+            metadata(
+                r#""https://app.example.com/mcp""#,
+                r#""https://other.example.com""#,
+            )
+            .as_bytes(),
+            url,
+            issuer,
+        )
+        .unwrap_err();
+        assert!(err.contains("`authorization_servers`"), "{err}");
+        assert!(err.contains("other.example.com"), "{err}");
+
+        // Two servers, an empty list and a missing key are all mismatches.
+        for servers in [r#""https://auth.example.com", "https://b.example.com""#, ""] {
+            assert!(
+                oauth_metadata_matches(
+                    metadata(r#""https://app.example.com/mcp""#, servers).as_bytes(),
+                    url,
+                    issuer
+                )
+                .is_err(),
+                "{servers}"
+            );
+        }
+        for body in [
+            r#"{"resource":"https://app.example.com/mcp"}"#,
+            r#"{"authorization_servers":["https://auth.example.com"]}"#,
+            "not json",
+            "",
+        ] {
+            assert!(
+                oauth_metadata_matches(body.as_bytes(), url, issuer).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_answer_is_withheld_from_a_redacted_caller() {
+        // Whatever the wire says is free-form (the metadata location could be served by an app for a
+        // stale config): it goes through `detail`, so a `read` caller sees a marker instead.
+        let err = oauth_metadata_matches(
+            metadata(r#""https://app.example.com/leak""#, r#""""#).as_bytes(),
+            "https://app.example.com/mcp",
+            "https://auth.example.com",
+        )
+        .unwrap_err();
+        let mut checks = vec![check(
+            "ingress.oauth_resources",
+            CheckStatus::Fail,
+            err,
+            None,
+        )];
+        apply_access(Access::Redacted, &mut checks);
+        assert!(!checks[0].message.contains("leak"), "{}", checks[0].message);
+        assert!(
+            checks[0].message.contains(WITHHELD),
+            "{}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn the_audience_lookup_covers_app_clients_and_external_clients() {
+        let apps = apps();
+        assert!(
+            oauth_audience_listed(&apps, "https://app.example.com/mcp"),
+            "an app's own `oidc.audience`"
+        );
+        assert!(
+            oauth_audience_listed(&apps, "https://alt.example.com/mcp"),
+            "an external `[oidc_clients.<id>]` audience"
+        );
+        assert!(!oauth_audience_listed(
+            &apps,
+            "https://app.example.com/mcp/"
+        ));
+        assert!(!oauth_audience_listed(
+            &apps,
+            "https://stopped.example.com/rpc"
+        ));
     }
 }

@@ -957,6 +957,33 @@ fn add_accepts_streaming_paths() {
 }
 
 #[test]
+fn add_accepts_oauth_resources() {
+    let spec = build_spec(&add_args(&["--oauth-resource", "/mcp"])).unwrap();
+    assert_eq!(spec.ingress.oauth_resources, ["/mcp"]);
+    assert!(!spec.ingress.streaming);
+    // Without the flag the field stays out of the spec (and out of apps.toml).
+    assert!(build_spec(&add_args(&[])).unwrap().ingress.is_default());
+    // Same rules as the other spec flags: incompatible with --spec.
+    #[derive(clap::Parser)]
+    struct Add {
+        #[command(flatten)]
+        _a: AddArgs,
+    }
+    assert!(
+        Add::try_parse_from([
+            "add",
+            "ntfy",
+            "img",
+            "--oauth-resource",
+            "/mcp",
+            "--spec",
+            "f"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn add_accepts_streaming() {
     let spec = build_spec(&add_args(&["--streaming"])).unwrap();
     assert!(spec.ingress.streaming);
@@ -1109,6 +1136,25 @@ fn show_renders_the_metrics_opt_in_and_add_takes_the_flags() {
     .unwrap();
     assert_eq!(spec.metrics_port, Some(9100));
     assert_eq!(spec.metrics_path.as_deref(), Some("/m"));
+}
+
+#[test]
+fn show_renders_oauth_resources_and_add_takes_the_flag() {
+    // S3 of #215: the read view carries the list, so `apps show` prints it like `streaming_paths`
+    // (part of the spec's own TOML), and an app without resources prints no `[ingress]` block.
+    let mut app = show_app(true);
+    app.spec.ingress.oauth_resources = vec!["/mcp".into()];
+    let out = render_show(&app);
+    assert!(
+        out.contains("[ingress]") && out.contains("oauth_resources = [\"/mcp\"]"),
+        "{out}"
+    );
+    assert!(
+        !render_show(&show_app(true)).contains("oauth_resources"),
+        "an app without resources prints no ingress table"
+    );
+    let spec = build_spec(&add_args(&["--oauth-resource", "/mcp"])).unwrap();
+    assert_eq!(spec.ingress.oauth_resources, ["/mcp"]);
 }
 
 fn reload_response(action: ReloadAction) -> ReloadResponse {
