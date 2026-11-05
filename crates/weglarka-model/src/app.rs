@@ -878,6 +878,13 @@ pub struct AppIngress {
     /// `admin_auth.rs`).
     #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
     pub static_: Option<StaticIngress>,
+    /// Security headers for an ordinary container app (#497, ADR 0076), only for
+    /// `kind = "container"`. The same validated [`SecurityHeaders`] type as
+    /// `ingress.static.security_headers`; the app's own response wins when both set a header, so a
+    /// header is added only when the upstream did not send it. Ingress-only, like the rest of
+    /// `AppIngress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeaders>,
 }
 
 impl Default for AppIngress {
@@ -894,6 +901,7 @@ impl Default for AppIngress {
             auth_groups: Vec::new(),
             auth_exempt_paths: Vec::new(),
             static_: None,
+            security_headers: None,
         }
     }
 }
@@ -1100,7 +1108,8 @@ impl FeedFormat {
     }
 }
 
-/// `add_header`s a static site asks for on every one of its locations (#104, ADR 0069).
+/// `add_header`s an ingress location asks for (#104, ADR 0069 for a static site,
+/// #497, ADR 0076 for a container app): the same validated type in both places.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityHeaders {
@@ -1108,7 +1117,7 @@ pub struct SecurityHeaders {
     #[serde(default)]
     pub preset: SecurityHeadersPreset,
     /// `Strict-Transport-Security: max-age=<n>`. Unset omits the header; no `includeSubDomains`/
-    /// `preload` in v1 — those extend the policy beyond this one site's own domain.
+    /// `preload` in v1 — those extend the policy beyond this one domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hsts_max_age_secs: Option<u32>,
     /// `Content-Security-Policy` value, printable ASCII without `"`/`\`/`$`, at most 2048 bytes
@@ -1120,7 +1129,7 @@ pub struct SecurityHeaders {
 /// A named bundle of headers [`SecurityHeaders::preset`] selects (own decision, ADR 0069 does not fix
 /// the exact set: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
 /// `Referrer-Policy: strict-origin-when-cross-origin` — conservative defaults that never depend on the
-/// site's own markup, unlike a `Content-Security-Policy`, which stays an explicit opt-in via `csp`).
+/// app's own markup, unlike a `Content-Security-Policy`, which stays an explicit opt-in via `csp`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityHeadersPreset {

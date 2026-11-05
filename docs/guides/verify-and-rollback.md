@@ -80,6 +80,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
 | `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `apps.toml`, apps | `[apps.X.ingress.static]` (clean URLs, custom 404, cache headers, redirects, feeds, security headers) | [static sites](static-sites.md) |
+| `apps.toml`, apps | `[apps.X.ingress.security_headers]` (security headers of a container app) | [security headers](security-headers.md) |
 | `apps.toml` | the `[sites.<site>]` sections (declare the environments as plain `kind = "static"` apps if the sites must keep running) | [site environments](site-environments.md) |
 | `apps.toml`, sites | `[sites.<site>.ingress.static]` (the options shared by every environment) | [site environments](site-environments.md) |
 | `apps.toml`, sites | `robots` in `[sites.<site>.env.<env>]` and in `[apps.<x>.ingress.static]` | [static sites](static-sites.md) |

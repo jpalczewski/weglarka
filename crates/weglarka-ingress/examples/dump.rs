@@ -14,7 +14,9 @@
 //! `landing` (the whole `landing.example.eu`) and `docs` (`blog.example.eu/docs`, next to the `blog` container
 //! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`; `help`
 //! (`help.example.eu`) is a static site with every per-site option set (#104, ADR 0069: a redirect, a
-//! custom 404 page, a feed and security headers) for the same script.
+//! custom 404 page, a feed and security headers) for the same script. `secure` (`secure.example.eu`) is a
+//! container app with all three security headers (#497, ADR 0076) for
+//! `.github/scripts/test-security-headers.sh`.
 
 use std::collections::BTreeMap;
 
@@ -120,6 +122,18 @@ format = "rss"
 
 [apps.help.ingress.static.security_headers]
 preset = "baseline"
+csp = "default-src 'self'"
+
+# A container app with every security header (#497, ADR 0076), for
+# `.github/scripts/test-security-headers.sh`: the app's own response header must win over the ingress one.
+[apps.secure]
+image = "ghcr.io/x/secure:latest"
+domains = ["secure.example.eu"]
+port = 3000
+
+[apps.secure.ingress.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
 csp = "default-src 'self'"
 "#;
 

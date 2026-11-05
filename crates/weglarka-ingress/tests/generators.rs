@@ -1981,6 +1981,205 @@ preset = "baseline"
     assert!(server.contains("X-Content-Type-Options"), "{server}");
 }
 
+// --- Security headers for container apps (#497, ADR 0076) ------------------------------------------
+
+/// A container app with every header plus the location shapes that could drop an `add_header`
+/// (`streaming_paths`, forward-auth locations, `auth_exempt_paths`), next to one with a single `csp`.
+const SECURE_APPS: &str = r#"
+[apps.api]
+image = "ghcr.io/x/api:latest"
+domains = ["api.example.eu"]
+port = 3000
+
+[apps.api.ingress]
+streaming_paths = ["/events"]
+auth = "forward"
+auth_exempt_paths = ["/mcp/"]
+
+[apps.api.ingress.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
+csp = "default-src 'self'"
+
+[apps.web]
+image = "ghcr.io/x/web:latest"
+domains = ["web.example.eu"]
+port = 3000
+
+[apps.web.ingress.security_headers]
+csp = "default-src 'none'"
+"#;
+
+/// Forward auth without an `authelia` app in the sample: the provider is a variable upstream, so the
+/// plan only needs the section (the same rule the generator relies on in `edge`).
+fn secure_host(base: &str) -> weglarka_model::config::HostConfig {
+    weglarka_model::config::HostConfig::from_toml_str(&format!(
+        "{base}\n[identity]\nprovider = \"authelia\"\ninstance = \"authelia\"\nissuer = \"https://auth.example.eu\"\nupstream = \"authelia:9091\"\n"
+    ))
+    .unwrap()
+}
+
+const API_HEADERS: [(&str, &str, &str); 5] = [
+    (
+        "X-Content-Type-Options",
+        "x_content_type_options",
+        "nosniff",
+    ),
+    ("X-Frame-Options", "x_frame_options", "DENY"),
+    (
+        "Referrer-Policy",
+        "referrer_policy",
+        "strict-origin-when-cross-origin",
+    ),
+    (
+        "Strict-Transport-Security",
+        "strict_transport_security",
+        "max-age=31536000",
+    ),
+    (
+        "Content-Security-Policy",
+        "content_security_policy",
+        "default-src 'self'",
+    ),
+];
+
+/// The app `server { … }` block of `name` that actually proxies (`edge` also has a plain-HTTP
+/// redirect server for the same name).
+fn app_server_block(conf: &str, name: &str) -> String {
+    let block = conf
+        .split("    server {\n")
+        .skip(1)
+        .filter(|b| {
+            b.lines()
+                .any(|l| l.trim_start().starts_with("server_name ") && l.contains(name))
+        })
+        .find(|b| b.contains("proxy_pass $upstream;"))
+        .unwrap_or_else(|| panic!("no app server block for {name} in\n{conf}"));
+    block.split("\n    }").next().unwrap_or(block).to_owned()
+}
+
+/// The `location = <path> { … }` block at the given indentation, for asserting a location does NOT
+/// carry something it must not inherit.
+fn exact_location_block(conf: &str, path: &str) -> String {
+    let start = conf
+        .split(&format!("location = {path} {{\n"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no location = {path} in\n{conf}"));
+    start
+        .split("\n        }")
+        .next()
+        .unwrap_or(start)
+        .to_owned()
+}
+
+#[test]
+fn nginx_container_security_headers_snapshots() {
+    let a = apps(SECURE_APPS);
+    let behind = nginx::generate(&secure_host(HOST), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_container_security_headers_behind", behind);
+    let edge = nginx::generate(
+        &secure_host(EDGE_HOST),
+        &a,
+        &edge_opts(&["api.example.eu", "web.example.eu"]),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_container_security_headers_edge", edge);
+
+    for conf in [&behind, &edge] {
+        let api = app_server_block(conf, "api.example.eu");
+        // One `map` at `http {}` level per configured header, keyed on the app's own response header,
+        // so an upstream value wins and an empty answer lets the ingress add its own.
+        for (_, suffix, value) in API_HEADERS {
+            assert_eq!(
+                conf.matches(&format!("map $upstream_http_{suffix} $wg_api_{suffix} {{"))
+                    .count(),
+                1,
+                "{suffix}: {conf}"
+            );
+            assert!(
+                conf.contains(&format!("\"\" \"{value}\";\n        default \"\";")),
+                "{suffix}: {conf}"
+            );
+        }
+        // Every proxy location of the app carries every header (`add_header` at a level drops the
+        // inherited set), and each restates `X-Request-Id`.
+        let proxies = api.matches("proxy_pass $upstream;").count();
+        assert_eq!(
+            proxies, 5,
+            "root, streaming exact/below, exempt exact/below: {api}"
+        );
+        for (name, suffix, _) in API_HEADERS {
+            assert_eq!(
+                api.matches(&format!("add_header {name} $wg_api_{suffix} always;"))
+                    .count(),
+                proxies,
+                "{name}: {api}"
+            );
+        }
+        // Exactly one per proxy location: a protected one restates it in `write_proxy_headers`, an
+        // exempt one through the security header set (`add_header` at a level drops the inherited set).
+        assert_eq!(
+            api.matches("add_header X-Request-Id $request_id always;")
+                .count(),
+            proxies,
+            "{api}"
+        );
+        // The `authz` subrequest is not the app's location: it must never carry the app's headers.
+        let authz = exact_location_block(conf, "/internal/weglarka/authz");
+        assert!(!authz.contains("X-Frame-Options"), "{authz}");
+        assert!(!authz.contains("$wg_api_"), "{authz}");
+        // The other app's CSP stays out of this server and vice versa.
+        assert!(!api.contains("$wg_web_"), "{api}");
+        let web = app_server_block(conf, "web.example.eu");
+        assert!(web.contains(
+            "add_header Content-Security-Policy $wg_web_content_security_policy always;"
+        ));
+        assert!(!web.contains("$wg_api_"), "{web}");
+    }
+
+    // An app without the table renders none of it.
+    let plain = nginx::generate(&host(), &apps(ONE_APP), &opts()).unwrap();
+    assert!(!plain.contains("$upstream_http_"), "{plain}");
+}
+
+#[test]
+fn two_apps_with_security_headers_get_distinct_map_variables() {
+    // An instance name is `[a-z0-9-]`, so `-` → `_` is injective: `api-v1` and `api-v2` can never
+    // share a map target (nginx would refuse a duplicate `map`, and a shared variable would give one
+    // app the other's headers).
+    let a = apps(
+        r#"
+[apps.api-v1]
+image = "ghcr.io/x/api:latest"
+domains = ["v1.example.eu"]
+port = 3000
+[apps.api-v1.ingress.security_headers]
+preset = "baseline"
+
+[apps.api-v2]
+image = "ghcr.io/x/api:latest"
+domains = ["v2.example.eu"]
+port = 3000
+[apps.api-v2.ingress.security_headers]
+preset = "baseline"
+"#,
+    );
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    assert_eq!(
+        conf.matches("map $upstream_http_x_frame_options").count(),
+        2,
+        "{conf}"
+    );
+    assert!(conf.contains("$wg_api_v1_x_frame_options"), "{conf}");
+    assert!(conf.contains("$wg_api_v2_x_frame_options"), "{conf}");
+    let v1 = app_server_block(&conf, "v1.example.eu");
+    let v2 = app_server_block(&conf, "v2.example.eu");
+    assert!(v1.contains("$wg_api_v1_x_frame_options"), "{v1}");
+    assert!(!v1.contains("$wg_api_v2_"), "{v1}");
+    assert!(v2.contains("$wg_api_v2_x_frame_options"), "{v2}");
+    assert!(!v2.contains("$wg_api_v1_"), "{v2}");
+}
+
 // --- Forward auth (#89, ADR 0052): nginx `auth_request` in both modes -------------------------------
 
 const IDENTITY: &str = r#"

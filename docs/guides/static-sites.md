@@ -135,6 +135,8 @@ csp = "default-src 'self'"
   `Referrer-Policy` to every location of the site (the `baseline` preset, the only one today), plus an optional
   `Strict-Transport-Security` (`hsts_max_age_secs`, without `includeSubDomains`/`preload` — those apply beyond this
   one site's own domain) and an optional `csp` (printable ASCII, no `"`/`\`/`$`, at most 2048 bytes).
+  An ordinary container app uses the same table as `[apps.<x>.ingress.security_headers]`, where the app's own
+  response header wins over the ingress value — see [security headers](security-headers.md).
 
 Forward auth (#89) and HTTP Basic auth for static sites are tracked separately in
 [#169](https://github.com/jpalczewski/weglarka/issues/169); `ingress.auth*` stays rejected on a static site until

@@ -52,6 +52,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Path routing](path-routing.md) | `paths` and `strip_prefix` on one domain |
 | [Streaming](streaming.md) | SSE and long polling |
 | [Request body size](max-body-size.md) | `ingress.max_body_size` |
+| [Security headers](security-headers.md) | `ingress.security_headers` for a container app: preset, HSTS, CSP, the app-wins rule |
 | [Access log](access-log.md) | `ingress.access_log_skip_paths`, `weglarka access`, what `169.254.1.2` means |
 | [Edge mode](edge-mode.md) | nginx on 80/443 terminating TLS |
 | [Edge behind a CDN](edge-cdn.md) | Visitor address behind Cloudflare (`[ingress.cdn]`) |

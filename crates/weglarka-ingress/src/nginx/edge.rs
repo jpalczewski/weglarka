@@ -100,6 +100,9 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         write_proxy_headers(c, forwarded, None);
         c.blank();
         write_auth_maps(c, plan);
+        // Security headers of container apps (#497, ADR 0076): http-level `map`s keyed on the
+        // upstream response headers, so an app that sets its own keeps it.
+        super::security::write_maps(c, plan);
 
         write_default_server(c, o);
 
