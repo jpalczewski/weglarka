@@ -219,6 +219,8 @@ async fn run_self_update(settings: Settings, options: SelfUpdateArgs) -> Result<
 /// `weglarka-daemon supervise` — the host-side watchdog (issue #100). The timer runs it every
 /// minute; `platform install` installs both units.
 async fn run_supervise(settings: Settings) -> Result<()> {
+    // Issue #191: needs no Podman, so a dead socket below must not skip it.
+    weglarka_daemon::supervise::record_user_groups(&settings, std::time::SystemTime::now());
     let platform = systemd(&settings)?;
     let socket = host_socket(&settings, &platform).await?;
     let podman = LibpodClient::new(socket);

@@ -12,9 +12,15 @@
 //! supplementary gid as the overflow gid, which libpod's `top … hgroups` maps back through the subgid
 //! range (a group 2001 showed as 231069), so a comparison there reports false failures. Instead the
 //! **host-side** watchdog (`weglarka-daemon supervise`, the only process that runs as the runtime user
-//! on the host) compares the user's groups as `/etc/group` records them with the credentials its own
-//! `/proc/self/status` shows, and records the difference here. `doctor` turns a recorded difference
+//! on the host) compares the user's groups as `/etc/group` records them with the credentials of the
+//! user manager itself — `/proc/$MANAGERPID/status`, the process systemd names as the one that
+//! started the watchdog unit — and records the difference here. `doctor` turns a recorded difference
 //! into a warning.
+//!
+//! The watchdog's own credentials are not the answer: a manual `sudo -u <user> weglarka-daemon
+//! supervise` or a cron job gets a fresh group set from PAM/initgroups and would report "clean" while
+//! the user manager is still stale. Without `MANAGERPID` (not started by systemd) or when that process
+//! is not the runtime user's (a system unit, root), the check records nothing.
 //!
 //! The finding lives in its own file in the state directory (`<state dir>/user-groups.toml`, mode
 //! 0600) and is **tolerant** like `self-update.toml` and `webhook-deliveries.toml`: no
@@ -31,6 +37,9 @@ use serde::{Deserialize, Serialize};
 pub const FILE_NAME: &str = "user-groups.toml";
 /// Internal bookkeeping, like `self-update.toml` and `notifications.toml`.
 pub const FILE_MODE: u32 = 0o600;
+/// The watchdog runs every minute; a finding not refreshed for this long says nothing about now (the
+/// timer is gone, the job is disabled, or the check cannot run), like the conmon check's limit.
+pub const STALE_AFTER_SECS: u64 = 300;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UserGroupsError {
@@ -66,7 +75,9 @@ pub struct UserGroupsState {
     pub uid: u32,
     /// Groups of `/etc/group` that the user manager's credentials do not hold, in file order.
     pub missing: Vec<MissingGroup>,
-    /// Unix seconds of the check that recorded this finding (kept while the finding is unchanged).
+    /// Unix seconds since which `missing` has been what it is (kept while the finding is unchanged).
+    pub since: u64,
+    /// Unix seconds of the last check; older than [`STALE_AFTER_SECS`] means the finding is unknown.
     pub checked_at: u64,
 }
 
@@ -92,6 +103,25 @@ impl UserGroupsState {
             .iter()
             .map(|group| group.name.as_str())
             .collect()
+    }
+
+    /// Whether the last check is recent enough to describe the user manager now.
+    pub fn is_current(&self, now: u64) -> bool {
+        now.saturating_sub(self.checked_at) <= STALE_AFTER_SECS
+    }
+
+    /// The record to write after a check observed `self`: `since` carries over from `previous` while
+    /// the same user and the same missing groups are observed, so the age in `doctor` is the age of
+    /// the problem, not of the last wake-up.
+    pub fn after(mut self, previous: Option<&UserGroupsState>) -> UserGroupsState {
+        if let Some(previous) = previous
+            && previous.user == self.user
+            && previous.uid == self.uid
+            && previous.missing == self.missing
+        {
+            self.since = previous.since;
+        }
+        self
     }
 }
 
@@ -169,6 +199,17 @@ pub fn primary_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// The real uid of a `/proc/<pid>/status` (first field of the `Uid:` line).
+pub fn status_uid(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
 /// The supplementary gids of a `/proc/<pid>/status` (`Groups:` line, space separated). `None` when the
 /// line is absent — then the credentials are unknown and the check must stay silent.
 pub fn status_groups(status: &str) -> Option<Vec<u32>> {
@@ -201,23 +242,28 @@ pub fn missing_groups(entries: &[GroupEntry], user: &str, have: &[u32]) -> Vec<M
 }
 
 /// Builds the finding from the three files the host-side check reads: `/etc/passwd`, `/etc/group` and
-/// the check's own `/proc/self/status`.
+/// the user manager's `/proc/<pid>/status`.
 ///
 /// `None` when the files cannot answer the question (the user is not in `/etc/passwd`, the status has
-/// no `Groups:` line): a check that cannot see the facts must not invent a warning.
+/// no `Groups:` line, or it belongs to another user — the system manager, a root shell): a check that
+/// cannot see the facts must not invent a warning.
 pub fn inspect(
     passwd: &str,
     group_file: &str,
-    status: &str,
+    manager_status: &str,
     user: &str,
     now: u64,
 ) -> Option<UserGroupsState> {
     let (uid, _) = primary_ids(passwd, user)?;
-    let have = status_groups(status)?;
+    if status_uid(manager_status)? != uid {
+        return None;
+    }
+    let have = status_groups(manager_status)?;
     Some(UserGroupsState {
         user: user.to_owned(),
         uid,
         missing: missing_groups(&group_entries(group_file), user, &have),
+        since: now,
         checked_at: now,
     })
 }
@@ -305,7 +351,58 @@ adm:x:4:
             "an unknown user is not a finding"
         );
         // A `/proc/<pid>/status` without a `Groups:` line.
-        assert!(inspect(PASSWD, GROUP, "Name:\tsystemd\n", "weglarka", 1).is_none());
+        assert!(
+            inspect(
+                PASSWD,
+                GROUP,
+                "Name:\tsystemd\nUid:\t1001\t1001\t1001\t1001\n",
+                "weglarka",
+                1
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_manager_of_another_user_is_not_asked() {
+        // `MANAGERPID` of a system unit is PID 1 (root): its groups say nothing about the runtime
+        // user's manager, and comparing them would report every group as missing.
+        let root = "Name:\tsystemd\nUid:\t0\t0\t0\t0\nGroups:\t\n";
+        assert!(inspect(PASSWD, GROUP, root, "weglarka", 1).is_none());
+        assert_eq!(status_uid(root), Some(0));
+        assert_eq!(status_uid("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn since_carries_over_while_the_finding_is_unchanged() {
+        let first = inspect(PASSWD, GROUP, &status(&[1001, 998]), "weglarka", 100).unwrap();
+        let first = first.after(None);
+        assert_eq!((first.since, first.checked_at), (100, 100));
+
+        let again = inspect(PASSWD, GROUP, &status(&[1001, 998]), "weglarka", 160)
+            .unwrap()
+            .after(Some(&first));
+        assert_eq!(
+            (again.since, again.checked_at),
+            (100, 160),
+            "same problem, older"
+        );
+
+        let fixed = inspect(PASSWD, GROUP, &status(&[1001, 999, 998]), "weglarka", 220)
+            .unwrap()
+            .after(Some(&again));
+        assert_eq!(
+            (fixed.since, fixed.checked_at),
+            (220, 220),
+            "a change starts anew"
+        );
+    }
+
+    #[test]
+    fn a_finding_expires_when_the_watchdog_stops_refreshing_it() {
+        let found = inspect(PASSWD, GROUP, &status(&[1001]), "weglarka", 1_000).unwrap();
+        assert!(found.is_current(1_000 + STALE_AFTER_SECS));
+        assert!(!found.is_current(1_001 + STALE_AFTER_SECS));
     }
 
     #[test]
@@ -333,6 +430,7 @@ adm:x:4:
                 name: "systemd-journal".to_owned(),
                 gid: 999,
             }],
+            since: 1_769_999_000,
             checked_at: 1_770_000_000,
         };
         save(dir.path(), &state).unwrap();

@@ -65,7 +65,14 @@ grep Groups /proc/$(pgrep -u weglarka -x systemd)/status       # must list it
 
 Restarting `user@<uid>` stops **every** container of that user, the Węglarka daemon included. Its own unit is enabled
 with the user manager, so it comes back on its own, and its next reconcile starts the app containers that are down
-(they are started, not recreated). Apps with `start = false` ([stopped apps](stopped-apps.md)) stay stopped.
+(they are started, not recreated). Apps with `start = false` ([stopped apps](stopped-apps.md)) stay stopped. This
+relies on `podman.socket` being **enabled** (`systemctl --user -M weglarka@ enable podman.socket`, see
+[install](../install.md)): a socket that was only started does not come back with the user manager, and the daemon
+then has no Podman to talk to.
+
+The commands above are for systemd. On OpenRC there is no user manager: restart the services of the runtime user
+(`weglarka-podman` and `weglarka`) after `usermod`, and check the `Groups:` line of the running `podman system service`
+process instead.
 
 `group_add` makes the container keep **all** supplementary groups of the runtime user (crun `keep-groups`); the name
 list is a gate, not a selector. Keep the runtime user out of groups apps do not need. Inside the container the group
@@ -74,13 +81,25 @@ shows as `nobody`, which is expected. A numeric gid does not work in a mapped us
 The daemon container has no `/etc/passwd`, `/etc/group` or user manager, so it cannot check this itself — and checking
 inside the container is misleading, because an unmapped supplementary gid shows up as the overflow gid there. Instead
 the host-side watchdog (`weglarka-daemon supervise`, the `weglarka-watchdog.timer` that `platform install` sets up)
-compares the groups `/etc/group` records for the runtime user with the credentials the user manager really holds, once
-a minute, and `weglarka doctor` reports `host_mounts.apps` as a warning (`user manager credentials are stale: restart
-user@<uid>`) while a `group_add` group is missing. It clears on its own after the restart.
+compares the groups `/etc/group` records for the runtime user with the credentials the user manager really holds
+(`/proc/$MANAGERPID/status`, the manager systemd names when it starts the unit), once a minute, and `weglarka doctor`
+reports `host_mounts.groups` as a warning (`user manager credentials are stale: restart user@<uid>`) while a group an
+app requests in `group_add` is missing. It clears on its own within a minute of the restart. The warning names only the
+requested groups, never the runtime user's other memberships.
+
+The check is systemd-only: run by hand or from cron it has no `MANAGERPID` and records nothing (a fresh login gets the
+new groups and would hide the problem). When the watchdog has not refreshed its record for five minutes (timer
+removed, job disabled), `doctor` shows an `info` that it cannot tell instead of the old answer.
+
+It only detects a group the user manager **lacks**. The other direction — `usermod -rG` removing the runtime user from
+a group — is not reported yet: until `user@<uid>` restarts, the user manager and every `group_add` container keep the
+removed gid. Restart `user@<uid>` after removing a group as well.
 
 **Alternative without a new group.** If the files are only for one app and you would rather not change group
 membership, give the runtime user's **primary** group read access with a POSIX ACL: the primary group is already in
-every credential set, so no restart is needed.
+every credential set, so no restart is needed. This works only when the app's process runs as **root inside the
+container** (its gid 0 is the runtime user's primary group on the host). A non-root image user runs with a gid from the
+subgid range, which the ACL does not name, so for such an app the ACL grants nothing — use `group_add` instead.
 
 ```sh
 sudo setfacl -R  -m g:$(id -gn weglarka):rX /var/log/journal   # existing files and directories
