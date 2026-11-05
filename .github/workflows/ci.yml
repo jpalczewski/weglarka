@@ -564,6 +564,25 @@ jobs:
       - name: Panel image smoke test
         run: .github/scripts/smoke-panel.sh localhost/weglarka-panel:ci
 
+  # main only: deletes superseded cache entries (older lockfile generations of every Rust cache, duplicates of main's
+  # entries on PR refs), so the 10 GB quota never evicts what `main` restores (.github/scripts/cache-gc.sh). It runs
+  # after every job that writes a cache on main, also when one of them failed; only this job gets `actions: write`.
+  cache-gc:
+    needs: [check, musl, seed-ci-cache, podman-tests, smoke-behind, smoke-edge, smoke-panel, publish-image]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: .github/scripts/cache-gc.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   # main only: publishes and signs the images from the binaries `musl` just built (the `release` profile on
   # main), so nothing is compiled twice and the image does not wait for the tests below
   # (docs/decisions/0062). Tag pushes run release.yml directly.
