@@ -116,6 +116,9 @@ pub enum ImagesCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ReservationsCommand {
+    /// List the durable reservations with the operation IDs that `abandon` takes. A reservation of a
+    /// previous boot is reclaimed when the daemon starts; the rest needs `abandon`.
+    List,
     /// Abandon one reservation. This frees capacity without deleting provenance; only do it when the
     /// owner is known to be gone and no platform transaction references the operation.
     Abandon(AbandonReservationArgs),

@@ -5758,6 +5758,7 @@ mod retention {
     };
     use weglarka_model::platform_update::{
         CAPABILITIES_FILE_NAME, CapabilityRecord, CoordinationFeature, REQUIRED_FOR_PLATFORM_PRUNE,
+        Stage,
     };
     use weglarka_model::podman::TarStream;
     use weglarka_model::release_set::{Repository, StrictDigest};
@@ -6412,14 +6413,19 @@ mod retention {
         hex::encode(Sha256::digest(bytes))
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_full_reservation_file_is_recoverable_only_by_explicit_abandonment() {
-        let h = Harness::new(NTFY);
-        let operations: Vec<ReservationEntry> = (0..MAX_RESERVATIONS)
+    /// `count` `loading` reservations written by a boot that is gone.
+    fn stuck_reservations(h: &Harness, count: usize) {
+        let operations: Vec<ReservationEntry> = (0..count)
             .map(|n| ReservationEntry {
                 operation_id: OperationId::new(format!("stuck-{n}")).unwrap(),
                 reservation: Reservation {
-                    owner: ReservationOwner::new("engine", 1, "boot-gone", 1_700_000_000).unwrap(),
+                    owner: ReservationOwner::new(
+                        "engine",
+                        1,
+                        "boot-gone",
+                        1_700_000_000 + n as u64,
+                    )
+                    .unwrap(),
                     phase: ReservationPhase::Loading,
                     protections: Default::default(),
                     journal_ref: None,
@@ -6429,26 +6435,35 @@ mod retention {
             .collect();
         let text = Reservations::new(operations).unwrap().to_toml().unwrap();
         fsutil::write_atomic(
-            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            &state_dir(h).join(RESERVATIONS_FILE_NAME),
             text.as_bytes(),
             0o600,
         )
         .unwrap();
+    }
 
-        let error = h
-            .rec
-            .push_archive(
-                &name("ntfy"),
-                stream::iter([Ok(Bytes::from_static(b"x"))]).boxed(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("abandon"), "{error}");
+    /// A full file no longer fails an acquisition: the pull and the push go on without a
+    /// reservation, retention reports `blocked` and removes **nothing** (an unreserved image could
+    /// be at risk), and only an explicit abandonment brings the normal pass back.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_reservation_file_blocks_retention_but_not_the_deploy() {
+        let h = Harness::new(NTFY);
+        deploy(&h, "ntfy", 'a').await;
+        // A recorded leftover that a healthy pass would remove.
+        let leftover = 'e'.to_string().repeat(64);
+        h.fake.add_image(leftover_image('e'));
+        let mut inventory = read_inventory(&h);
+        inventory
+            .images
+            .push(owned(&leftover, app("ntfy"), REPO, 'e'));
+        write_inventory(&h, inventory.images);
+        stuck_reservations(&h, MAX_RESERVATIONS);
 
-        let stuck = OperationId::new("stuck-0").unwrap();
-        assert!(h.rec.abandon_reservation(&stuck).await.unwrap());
-        assert_eq!(reservations(&h).operations.len(), MAX_RESERVATIONS - 1);
-        // Capacity is back: the acquisition can reserve again.
+        // A pull deploy succeeds; its automatic retention is blocked.
+        h.fake
+            .set_pull_digest(&format!("{REPO}:latest"), digest('b'));
+        h.rec.deploy(&name("ntfy"), false).await.unwrap();
+        // So does a push.
         h.rec
             .push_archive(
                 &name("ntfy"),
@@ -6456,6 +6471,416 @@ mod retention {
             )
             .await
             .unwrap();
+
+        assert_eq!(
+            reservations(&h).operations.len(),
+            MAX_RESERVATIONS,
+            "no reservation was added or lost"
+        );
+        assert_eq!(h.fake.image_remove_calls(), 0, "nothing was removed");
+        assert!(ids(&h.fake.images()).contains(&leftover));
+        for dry_run in [true, false] {
+            let report = h.rec.prune_images(dry_run).await.unwrap();
+            assert!(report.blocked, "{report:?}");
+            assert!(report.removed.is_empty(), "{report:?}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.contains("full")
+                        && d.contains("weglarka images reservations abandon")),
+                "{report:?}"
+            );
+        }
+        assert_eq!(h.fake.image_remove_calls(), 0);
+        assert!(
+            h.rec
+                .retention_preview(RetentionScope::AllManaged)
+                .await
+                .is_err()
+        );
+        assert!(ids(&h.fake.images()).contains(&leftover));
+
+        // Capacity is back: retention is no longer blocked and removes the recorded leftover.
+        let stuck = OperationId::new("stuck-0").unwrap();
+        assert!(h.rec.abandon_reservation(&stuck).await.unwrap());
+        assert_eq!(reservations(&h).operations.len(), MAX_RESERVATIONS - 1);
+        let report = h.rec.prune_images(false).await.unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert!(ids(&report.removed).contains(&leftover), "{report:?}");
+    }
+
+    /// A failure to advance the reservation (the second write of the acquisition) releases it:
+    /// no `loading` reservation is left behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_advance_releases_the_deploy_reservation() {
+        let h = Harness::new(NTFY);
+        h.fake
+            .set_pull_digest(&format!("{REPO}:latest"), digest('a'));
+        crate::images::write_count::fail_nth_reservation_write(2);
+
+        let error = h.rec.deploy(&name("ntfy"), false).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("injected write failure"),
+            "{error}"
+        );
+        assert!(
+            reservations(&h).operations.is_empty(),
+            "{:?}",
+            reservations(&h)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_advance_releases_the_push_reservation() {
+        let h = Harness::new(NTFY);
+        crate::images::write_count::fail_nth_reservation_write(2);
+
+        let error = h
+            .rec
+            .push_archive(
+                &name("ntfy"),
+                stream::iter([Ok(Bytes::from_static(b"image-1"))]).boxed(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("injected write failure"),
+            "{error}"
+        );
+        assert!(
+            reservations(&h).operations.is_empty(),
+            "{:?}",
+            reservations(&h)
+        );
+    }
+
+    /// Startup reclamation: a reservation written by another boot goes, one of this boot stays.
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_removes_only_reservations_of_a_previous_boot() {
+        let h = Harness::new(NTFY);
+        let entry = |id: &str, boot: String| ReservationEntry {
+            operation_id: OperationId::new(id).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, boot, 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        };
+        let text = Reservations::new(vec![
+            entry("old-boot", "boot-gone".into()),
+            entry("this-boot", current_boot()),
+        ])
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        let listed = h.rec.list_reservations().unwrap().reservations;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot))
+                .collect::<Vec<_>>(),
+            [("old-boot", true), ("this-boot", false)]
+        );
+
+        let reclaimed = h.rec.reclaim_stale_reservations().await.unwrap();
+
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["old-boot"]
+        );
+        let left = h.rec.list_reservations().unwrap().reservations;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].operation_id, "this-boot");
+        // Nothing left to reclaim: a second call changes nothing.
+        assert!(h.rec.reclaim_stale_reservations().await.unwrap().is_empty());
+    }
+
+    /// `platform-update.toml` with one transaction in `stage` that lists `listed` among its
+    /// reservations.
+    fn write_transaction(h: &Harness, stage: Stage, listed: &[&str]) {
+        use weglarka_model::platform_update::{
+            JournalEndpoint, OwnerIdentity, PlatformUpdate, TransactionId, TransactionJournal,
+        };
+        let digest =
+            |c: char| StrictDigest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap();
+        let endpoint = JournalEndpoint {
+            daemon_repository: repo("ghcr.io/example/weglarka"),
+            daemon_digest: digest('a'),
+            tools_digest: digest('a'),
+            state_read: vec![17],
+            state_write: 17,
+            host_protocol: 1,
+        };
+        let journal = PlatformUpdate {
+            transaction: Some(TransactionJournal {
+                transaction_id: TransactionId::new("tx-1").unwrap(),
+                stage,
+                owner: OwnerIdentity {
+                    pid: 1,
+                    boot_id: "boot-gone".into(),
+                    started_at: 1,
+                    handoff_deadline: None,
+                },
+                old: endpoint.clone(),
+                target: endpoint,
+                release_set_digest: digest('c'),
+                reservations: listed
+                    .iter()
+                    .map(|id| OperationId::new(*id).unwrap())
+                    .collect(),
+                candidate: None,
+                ack: None,
+                selected_generation: None,
+                reason: None,
+                updated_at: 1,
+            }),
+            ..PlatformUpdate::default()
+        };
+        fsutil::write_atomic(
+            &state_dir(h).join(weglarka_model::platform_update::FILE_NAME),
+            journal.to_toml().unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+    }
+
+    /// Previous-boot `loading` reservations: `listed` (named by the transaction), `by-ref` (its
+    /// `journal_ref` names the transaction) and `plain`.
+    fn referenced_reservations(h: &Harness) {
+        let entry = |id: &str, journal_ref: Option<&str>| ReservationEntry {
+            operation_id: OperationId::new(id).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, "boot-gone", 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: journal_ref
+                    .map(|t| weglarka_model::platform_update::TransactionId::new(t).unwrap()),
+                created_at: 1_700_000_000,
+            },
+        };
+        let text = Reservations::new(vec![
+            entry("listed", None),
+            entry("by-ref", Some("tx-1")),
+            entry("plain", None),
+        ])
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(h).join(RESERVATIONS_FILE_NAME),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+    }
+
+    /// A previous-boot reservation survives while a nonterminal transaction references it — by its
+    /// `reservations` list or by the reservation's `journal_ref` — and `list` says so with the same
+    /// predicate.
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_spares_what_a_nonterminal_transaction_references() {
+        let h = Harness::new(NTFY);
+        referenced_reservations(&h);
+        write_transaction(&h, Stage::Prepared, &["listed"]);
+
+        let listed = h.rec.list_reservations().unwrap().reservations;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot, r.referenced))
+                .collect::<Vec<_>>(),
+            [
+                ("by-ref", true, Some(true)),
+                ("listed", true, Some(true)),
+                ("plain", true, Some(false))
+            ]
+        );
+
+        let reclaimed = h.rec.reclaim_stale_reservations().await.unwrap();
+
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["plain"]
+        );
+        let left: Vec<String> = h
+            .rec
+            .list_reservations()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .map(|r| r.operation_id)
+            .collect();
+        assert_eq!(left, ["by-ref", "listed"]);
+    }
+
+    /// Once the transaction is terminal nothing protects its reservations any more: they are
+    /// reclaimed, and the list no longer calls them referenced.
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_takes_what_a_terminal_transaction_referenced() {
+        let h = Harness::new(NTFY);
+        referenced_reservations(&h);
+        write_transaction(&h, Stage::Committed, &["listed"]);
+
+        assert!(
+            h.rec
+                .list_reservations()
+                .unwrap()
+                .reservations
+                .iter()
+                .all(|r| r.referenced == Some(false))
+        );
+        let reclaimed = h.rec.reclaim_stale_reservations().await.unwrap();
+
+        assert_eq!(reclaimed.len(), 3, "{reclaimed:?}");
+        assert!(h.rec.list_reservations().unwrap().reservations.is_empty());
+    }
+
+    /// A reservation stored with the `unknown-boot` placeholder may belong to the current boot (it
+    /// was written while the host reported none): it is never reclaimed and never listed as a
+    /// previous boot's, while a real previous boot's reservation next to it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_reservation_of_the_unknown_boot_placeholder_is_never_reclaimed() {
+        let h = Harness::new(NTFY);
+        let entry = |id: &str, boot: &str| ReservationEntry {
+            operation_id: OperationId::new(id).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, boot, 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        };
+        let text = Reservations::new(vec![
+            entry("placeholder", "unknown-boot"),
+            entry("gone", "boot-gone"),
+        ])
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        let listed = h.rec.list_reservations_in_boot(Some("boot-now")).unwrap();
+        assert_eq!(
+            listed
+                .reservations
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot))
+                .collect::<Vec<_>>(),
+            [("gone", true), ("placeholder", false)]
+        );
+        let reclaimed = h
+            .rec
+            .reclaim_stale_reservations_in_boot(Some("boot-now"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["gone"]
+        );
+        let left = h.rec.list_reservations().unwrap().reservations;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].operation_id, "placeholder");
+    }
+
+    /// A corrupt `platform-update.toml` makes the list degrade, not fail: every reservation is
+    /// there (the operator needs the ids), `referenced` is unknown and a warning names the file and
+    /// the error. Reclamation fails closed on the same file: nothing is reclaimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_corrupt_journal_degrades_the_list_and_blocks_reclaim() {
+        let h = Harness::new(NTFY);
+        referenced_reservations(&h);
+        let journal_path = state_dir(&h).join(weglarka_model::platform_update::FILE_NAME);
+        std::fs::write(&journal_path, "this is [not valid toml").unwrap();
+        let before = std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap();
+
+        let list = h.rec.list_reservations().unwrap();
+
+        assert_eq!(
+            list.reservations
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot, r.referenced))
+                .collect::<Vec<_>>(),
+            [
+                ("by-ref", true, None),
+                ("listed", true, None),
+                ("plain", true, None)
+            ]
+        );
+        assert_eq!(list.diagnostics.len(), 1, "{:?}", list.diagnostics);
+        assert!(
+            list.diagnostics[0].contains("platform-update.toml"),
+            "{:?}",
+            list.diagnostics
+        );
+
+        let error = h.rec.reclaim_stale_reservations().await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("platform-update.toml"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap(),
+            before,
+            "nothing was reclaimed"
+        );
+        // Fixing the file brings the references back.
+        std::fs::remove_file(&journal_path).unwrap();
+        let list = h.rec.list_reservations().unwrap();
+        assert!(list.diagnostics.is_empty());
+        assert!(list.reservations.iter().all(|r| r.referenced.is_some()));
+    }
+
+    /// Without a boot identity nothing proves a writer gone: no reclamation, and the list claims no
+    /// `previous_boot`.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_boot_reclaims_nothing() {
+        let h = Harness::new(NTFY);
+        referenced_reservations(&h);
+        let before = std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap();
+
+        let reclaimed = h
+            .rec
+            .reclaim_stale_reservations_in_boot(None)
+            .await
+            .unwrap();
+
+        assert!(reclaimed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap(),
+            before
+        );
+        let listed = h.rec.list_reservations_in_boot(None).unwrap().reservations;
+        assert_eq!(listed.len(), 3);
+        assert!(listed.iter().all(|r| !r.previous_boot));
     }
 
     #[tokio::test(start_paused = true)]

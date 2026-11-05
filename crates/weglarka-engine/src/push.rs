@@ -92,20 +92,30 @@ impl<P: PodmanClient> Reconciler<P> {
                 Ok(loaded) => loaded,
                 Err(e) => {
                     // Nothing was loaded: a failed acquisition releases its reservation.
-                    self.finish_acquisition(&image_guard, operation).await;
+                    self.release_acquisition(&image_guard, operation).await;
                     return Err(EngineError::PushLoad(e.to_string()));
                 }
             };
             let Some(digest) = loaded.digest else {
-                self.finish_acquisition(&image_guard, operation).await;
+                self.release_acquisition(&image_guard, operation).await;
                 return Err(EngineError::PushLoad(
                     "podman reports no digest for the loaded image".into(),
                 ));
             };
             // Advance **before** `image_tag`: from here a cancelled upload leaves a `loaded`
             // reservation that protects the image, never a tag without a record.
-            self.advance_acquisition(&image_guard, &operation, Some(&loaded.id), &digest)
-                .await?;
+            if let Some(operation) = &operation
+                && let Err(e) = self
+                    .advance_acquisition(&image_guard, operation, Some(&loaded.id), &digest)
+                    .await
+            {
+                // Still `loading`: release it rather than leak a reservation that blocks adoption.
+                // The archive is already loaded and, once released, the image has neither
+                // reservation nor record, so a later real retention pass may adopt and remove it.
+                self.release_acquisition(&image_guard, Some(operation.clone()))
+                    .await;
+                return Err(e);
+            }
             let recorded = match self
                 .record_acquisition(&image_guard, owner, repository, Some(&loaded.id), &digest)
                 .await
@@ -135,7 +145,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 .deploy_pushed_locked(&guard, instance, DigestSource::Local(&digest))
                 .await;
             if recorded {
-                self.finish_acquisition(&image_guard, operation).await;
+                self.release_acquisition(&image_guard, operation).await;
             }
             outcome
         };

@@ -403,6 +403,9 @@ pub async fn start_with<P: PodmanClient + 'static>(
             generated::DEBOUNCE,
         ))
     });
+    // Image reservations of a previous boot can never be completed: reclaim them once, now, before
+    // anything of this process can create one (a reservation of this boot is never touched).
+    images::reclaim_at_startup(&engine).await;
     // A daemon that died in the middle of `weglarka run` left its one-off container behind; this
     // process has no run yet, so every one found is stale (issue #106). Podman being down is not a
     // reason to refuse to start: the reconcile loop reports it.

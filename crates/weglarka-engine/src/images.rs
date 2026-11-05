@@ -31,13 +31,14 @@ use crate::reconcile::{EngineError, EngineGuard, Reconciler};
 use weglarka_model::app::{AppsFile, Digest, InstanceName};
 use weglarka_model::fsutil;
 use weglarka_model::image_inventory::{
-    Association, INVENTORY_FILE_NAME, ImageId, Inventory, ManagedImage, OperationId, Owner,
-    Protection, ProtectionIdentity, ProtectionReason, RESERVATIONS_FILE_NAME, Reservation,
-    ReservationEntry, ReservationOwner, ReservationPhase, Reservations, RetentionScope,
+    Association, INVENTORY_FILE_NAME, ImageId, Inventory, MAX_RESERVATIONS, ManagedImage,
+    OperationId, Owner, Protection, ProtectionIdentity, ProtectionReason, RESERVATIONS_FILE_NAME,
+    Reservation, ReservationEntry, ReservationOwner, ReservationPhase, Reservations,
+    RetentionScope,
 };
 use weglarka_model::platform_update::{
     CAPABILITIES_FILE_NAME, CapabilityError, CapabilityRecord, FILE_NAME as JOURNAL_FILE_NAME,
-    PlatformUpdate, platform_prune_allowed,
+    PlatformUpdate, TransactionJournal, platform_prune_allowed,
 };
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
@@ -56,6 +57,27 @@ pub(crate) mod write_count {
     thread_local! {
         static INVENTORY_WRITES: Cell<usize> = const { Cell::new(0) };
         static FAIL_IN: Cell<Option<usize>> = const { Cell::new(None) };
+        static RESERVATION_FAIL_IN: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// `true` when this reservation-file write must fail (see [`fail_nth_reservation_write`]).
+    pub(super) fn bump_reservation() -> bool {
+        RESERVATION_FAIL_IN.with(|fail| match fail.get() {
+            Some(1) => {
+                fail.set(None);
+                true
+            }
+            Some(n) => {
+                fail.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+
+    /// Makes the `n`th reservation-file write from now on (1 = the next one) fail once.
+    pub(crate) fn fail_nth_reservation_write(n: usize) {
+        RESERVATION_FAIL_IN.with(|fail| fail.set(Some(n)));
     }
 
     /// Counts one write; `true` when this write must fail (see [`fail_nth_write`]).
@@ -150,6 +172,48 @@ impl PruneReport {
             blocked: true,
             ..Self::default()
         }
+    }
+}
+
+/// One durable image reservation as `weglarka images reservations list` shows it: enough to decide
+/// whether `abandon` is safe, and nothing else (no protected image ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationInfo {
+    pub operation_id: String,
+    pub phase: ReservationPhase,
+    /// The writer's component (`engine`, ...) and process id.
+    pub component: String,
+    pub pid: u32,
+    /// Unix seconds when the operation started.
+    pub started_at: u64,
+    /// The writer's boot is not the current one: the next daemon start reclaims it, unless a
+    /// nonterminal platform transaction references it. Always `false` while the host reports no
+    /// boot identity (nothing can be reclaimed then).
+    pub previous_boot: bool,
+    /// A nonterminal platform transaction references it ([`references_reservation`]): it is not
+    /// reclaimed automatically while that transaction runs. `None`: unknown, because the platform
+    /// journal could not be read ([`ReservationList::diagnostics`] says why).
+    pub referenced: Option<bool>,
+    /// Number of image identities it protects (none while `loading`).
+    pub protections: usize,
+}
+
+/// The answer of [`Reconciler::list_reservations`]: every reservation, plus what could not be
+/// established while listing them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReservationList {
+    /// Oldest first.
+    pub reservations: Vec<ReservationInfo>,
+    /// Human-readable warnings, e.g. an unreadable `platform-update.toml`: listing is read-only and
+    /// is needed precisely when something is broken, so it degrades instead of failing.
+    pub diagnostics: Vec<String>,
+}
+
+impl ReservationList {
+    /// The file has no room left: acquisitions run unreserved and retention is blocked (the one
+    /// definition, shared with the engine's own checks).
+    pub fn is_full(&self) -> bool {
+        reservation_count_is_full(self.reservations.len())
     }
 }
 
@@ -354,11 +418,26 @@ impl PreparedRetention {
 /// The host's boot identity. A reservation is reclaimable only when this differs from the owner's
 /// boot; wall-clock time is never evidence.
 fn current_boot_id() -> String {
+    known_boot_id().unwrap_or_else(|| UNKNOWN_BOOT.to_owned())
+}
+
+/// The `boot_id` stored for a reservation written while the host reported no boot identity. It may
+/// belong to the current boot, so such a reservation is never treated as a previous boot's.
+const UNKNOWN_BOOT: &str = "unknown-boot";
+
+/// Whether a reservation written by `owner_boot` provably belongs to a boot other than `boot`.
+fn is_previous_boot(owner_boot: &str, boot: Option<&str>) -> bool {
+    owner_boot != UNKNOWN_BOOT && boot.is_some_and(|boot| owner_boot != boot)
+}
+
+/// The boot identity when the host reports one. Reclamation needs a *proof* that the writer's boot
+/// is gone, so it uses this and does nothing when it is `None` ([`current_boot_id`]'s placeholder
+/// would make every reservation look like another boot's, or the same one).
+fn known_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "unknown-boot".to_owned())
 }
 
 fn now_secs() -> u64 {
@@ -489,6 +568,13 @@ impl<P: PodmanClient> Reconciler<P> {
 
     fn write_reservations(&self, reservations: &Reservations) -> Result<(), EngineError> {
         let path = self.reservations_path();
+        #[cfg(test)]
+        if write_count::bump_reservation() {
+            return Err(EngineError::ImageBookkeeping(format!(
+                "{}: injected write failure",
+                path.display()
+            )));
+        }
         let text = reservations
             .to_toml()
             .map_err(|e| EngineError::ImageBookkeeping(format!("{}: {e}", path.display())))?;
@@ -512,10 +598,22 @@ impl<P: PodmanClient> Reconciler<P> {
     /// pull/load/tag mutation. While it is `loading` it protects whatever is being pulled by making
     /// retention skip adoption ([`loading_operations`]); [`Self::advance_acquisition`] replaces that
     /// with the image's identities. The caller must hold the image guard.
+    ///
+    /// `None` when the reservation file is full: the acquisition goes on without a reservation
+    /// (a full file must not fail a deploy), and retention reports `blocked` until capacity is back
+    /// ([`reservations_full`]), so nothing is removed while an unreserved image could be at risk.
     pub(crate) async fn begin_acquisition(
         &self,
         guard: &ImageGuard<'_>,
-    ) -> Result<OperationId, EngineError> {
+    ) -> Result<Option<OperationId>, EngineError> {
+        if reservations_full(&self.read_reservations()?) {
+            tracing::warn!(
+                capacity = MAX_RESERVATIONS,
+                "the image reservation file is full: continuing without a reservation, image cleanup \
+                 is blocked until one is abandoned (`weglarka images reservations abandon`)"
+            );
+            return Ok(None);
+        }
         let operation = next_operation_id("acquisition")?;
         let reservation = Reservation {
             owner: ReservationOwner::new(
@@ -534,7 +632,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // phase makes retention skip adoption instead (see [`loading_operations`]). The owner and repository are
         // recorded on the inventory entry by [`Self::record_acquisition`].
         ReservationStore::reserve(self, guard, operation.clone(), &reservation).await?;
-        Ok(operation)
+        Ok(Some(operation))
     }
 
     /// Advances a reservation to `loaded` with the identities that are now known, before any tag.
@@ -575,6 +673,23 @@ impl<P: PodmanClient> Reconciler<P> {
     pub(crate) async fn finish_acquisition(&self, guard: &ImageGuard<'_>, operation: OperationId) {
         if let Err(e) = ReservationStore::finish(self, guard, operation.clone()).await {
             tracing::warn!(operation = %operation, error = %e, "cannot release the image reservation");
+        }
+    }
+
+    /// [`Self::finish_acquisition`] for an acquisition that may have run without a reservation
+    /// (`None`: the file was full). Used on the failure paths, where no provenance was committed.
+    ///
+    /// It only drops the reservation; it does not touch the image. When the failure came after the
+    /// pull or load (a failed [`Self::advance_acquisition`]), the image is already pulled and tagged
+    /// and, once released, has neither a reservation nor a record, so a later real retention pass
+    /// can adopt it by repository name and remove it.
+    pub(crate) async fn release_acquisition(
+        &self,
+        guard: &ImageGuard<'_>,
+        operation: Option<OperationId>,
+    ) {
+        if let Some(operation) = operation {
+            self.finish_acquisition(guard, operation).await;
         }
     }
 
@@ -621,26 +736,113 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(true)
     }
 
+    /// Every durable reservation, oldest first, for `weglarka images reservations list`. Read-only
+    /// and lock-free: the file is replaced atomically, so a deploy in progress never blocks it.
+    ///
+    /// An unreadable or corrupt platform journal does not fail the listing (it is how an operator
+    /// finds the ids to `abandon` when something is broken): every reservation is returned with
+    /// `referenced: None` and a diagnostic names the file and the error. Reclamation, in contrast,
+    /// fails closed on the same condition ([`Self::reclaim_stale_reservations`]).
+    pub fn list_reservations(&self) -> Result<ReservationList, EngineError> {
+        self.list_reservations_in_boot(known_boot_id().as_deref())
+    }
+
+    pub(crate) fn list_reservations_in_boot(
+        &self,
+        boot: Option<&str>,
+    ) -> Result<ReservationList, EngineError> {
+        let reservations = self.read_reservations()?;
+        let mut diagnostics = Vec::new();
+        let journal = match self.read_platform_journal() {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "cannot tell which reservations a platform transaction references: {error}"
+                ));
+                None
+            }
+        };
+        let transaction = journal.as_ref().and_then(|journal| {
+            journal
+                .transaction
+                .as_ref()
+                .filter(|transaction| !transaction.is_terminal())
+        });
+        let mut list: Vec<ReservationInfo> = reservations
+            .operations
+            .into_iter()
+            .map(|entry| {
+                let ReservationEntry {
+                    operation_id,
+                    reservation,
+                } = entry;
+                let referenced = journal
+                    .is_some()
+                    .then(|| references_reservation(transaction, &operation_id, &reservation));
+                let Reservation {
+                    owner,
+                    phase,
+                    protections,
+                    journal_ref: _,
+                    created_at: _,
+                } = reservation;
+                let ReservationOwner {
+                    component,
+                    pid,
+                    boot_id,
+                    started_at,
+                } = owner;
+                ReservationInfo {
+                    operation_id: operation_id.to_string(),
+                    phase,
+                    component,
+                    pid,
+                    started_at,
+                    previous_boot: is_previous_boot(&boot_id, boot),
+                    referenced,
+                    protections: protections.len(),
+                }
+            })
+            .collect();
+        list.sort_by(|a, b| (a.started_at, &a.operation_id).cmp(&(b.started_at, &b.operation_id)));
+        Ok(ReservationList {
+            reservations: list,
+            diagnostics,
+        })
+    }
+
     /// Reclaims reservations whose owner boot is gone and that no nonterminal transaction
-    /// references. Never called from a deploy path (boot change only), and never based on elapsed
-    /// time. Returns the reclaimed operation ids.
+    /// references ([`references_reservation`]). Never called from a deploy path (boot change only),
+    /// and never based on elapsed time. Does nothing when the host reports no boot identity: without
+    /// it nothing proves a writer gone. Returns the reclaimed operation ids.
     pub async fn reclaim_stale_reservations(&self) -> Result<Vec<OperationId>, EngineError> {
-        let boot = current_boot_id();
+        self.reclaim_stale_reservations_in_boot(known_boot_id().as_deref())
+            .await
+    }
+
+    pub(crate) async fn reclaim_stale_reservations_in_boot(
+        &self,
+        boot: Option<&str>,
+    ) -> Result<Vec<OperationId>, EngineError> {
+        let Some(boot) = boot else {
+            tracing::warn!(
+                "the current boot identity is unknown: image reservations are not reclaimed"
+            );
+            return Ok(Vec::new());
+        };
         // Lock first: a transaction that starts after an earlier read of the journal could reference
         // a reservation this pass is about to reclaim.
         let _guard = self.acquire().await;
         let journal = self.read_platform_journal()?;
-        let referenced: BTreeSet<&OperationId> = journal
+        let transaction = journal
             .transaction
             .as_ref()
-            .filter(|transaction| !transaction.is_terminal())
-            .map(|transaction| transaction.reservations.iter().collect())
-            .unwrap_or_default();
+            .filter(|transaction| !transaction.is_terminal());
         let mut reservations = self.read_reservations()?;
         let mut reclaimed = Vec::new();
         reservations.operations.retain(|entry| {
-            let keep =
-                entry.reservation.owner.boot_id == boot || referenced.contains(&entry.operation_id);
+            let keep = !is_previous_boot(&entry.reservation.owner.boot_id, Some(boot))
+                || references_reservation(transaction, &entry.operation_id, &entry.reservation);
             if !keep {
                 reclaimed.push(entry.operation_id.clone());
             }
@@ -650,6 +852,9 @@ impl<P: PodmanClient> Reconciler<P> {
             return Ok(reclaimed);
         }
         self.write_reservations(&reservations)?;
+        for operation in &reclaimed {
+            tracing::info!(operation = %operation, "reclaimed an image reservation of a previous boot");
+        }
         Ok(reclaimed)
     }
 
@@ -735,11 +940,11 @@ impl<P: PodmanClient> ReservationStore for Reconciler<P> {
                 "reservation {operation} already exists"
             )));
         }
-        if reservations.operations.len() >= weglarka_model::image_inventory::MAX_RESERVATIONS {
+        if reservations_full(&reservations) {
             return Err(EngineError::ImageBookkeeping(format!(
                 "image reservations are full ({} operations); abandon one with \
                  `weglarka images reservations abandon <operation-id>`",
-                weglarka_model::image_inventory::MAX_RESERVATIONS
+                MAX_RESERVATIONS
             )));
         }
         reservations.operations.push(ReservationEntry {
@@ -807,6 +1012,14 @@ impl<P: PodmanClient> Reconciler<P> {
         let st = state::load_state(&self.paths.state)?;
         let inventory = self.read_inventory()?;
         let reservations = self.read_reservations()?;
+        if reservations_full(&reservations) {
+            // An acquisition may have run without a reservation while the file was full, so an image
+            // could be unprotected: fail closed instead of narrowing the pass.
+            return Err(EngineError::ImageBookkeeping(format!(
+                "image reservations are full ({MAX_RESERVATIONS} operations); abandon one with \
+                 `weglarka images reservations abandon <operation-id> --yes`"
+            )));
+        }
         let loading = loading_operations(&reservations);
         let journal = self.read_platform_journal()?;
         let self_update =
@@ -1088,6 +1301,32 @@ impl<P: PodmanClient> Reconciler<P> {
         let guard = self.acquire().await;
         self.retain_images_locked(&guard, &owner, repo).await;
     }
+}
+
+/// Whether the nonterminal platform `transaction` (if any) references a reservation: it lists the
+/// operation among its `reservations`, or the reservation's `journal_ref` names it. The one
+/// predicate behind both reclamation and `reservations list`, so the list never promises a
+/// protection reclamation does not honour (or the other way round). Once the transaction is
+/// terminal (or gone) the reservation is an ordinary one again.
+fn references_reservation(
+    transaction: Option<&TransactionJournal>,
+    operation: &OperationId,
+    reservation: &Reservation,
+) -> bool {
+    transaction.is_some_and(|transaction| {
+        transaction.reservations.contains(operation)
+            || reservation.journal_ref.as_ref() == Some(&transaction.transaction_id)
+    })
+}
+
+/// Whether the reservation file has no room left: acquisitions then run unreserved
+/// ([`Reconciler::begin_acquisition`]) and retention is blocked.
+fn reservations_full(reservations: &Reservations) -> bool {
+    reservation_count_is_full(reservations.operations.len())
+}
+
+fn reservation_count_is_full(count: usize) -> bool {
+    count >= MAX_RESERVATIONS
 }
 
 /// Operation ids of the reservations still in phase `loading`.
