@@ -545,7 +545,8 @@ pub struct ReservationView {
     /// The writer's boot is not the current one: the next daemon start reclaims it (unless a
     /// platform transaction references it).
     pub previous_boot: bool,
-    /// A platform transaction references it; it is never reclaimed automatically.
+    /// A nonterminal platform transaction references it; it is not reclaimed automatically while
+    /// that transaction runs.
     pub referenced: bool,
     /// Number of image identities it protects.
     pub protections: usize,

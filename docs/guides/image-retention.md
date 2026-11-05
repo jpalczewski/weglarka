@@ -48,8 +48,8 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   weglarka images reservations list --json
   ```
 
-  The `RECLAIM` column says `at next daemon start` (previous boot), `abandon only` (current boot) or `never (platform
-  transaction)`. Free one explicitly with:
+  The `RECLAIM` column says `at next daemon start` (previous boot), `abandon only` (current boot) or `while platform
+  transaction runs`. Free one explicitly with:
 
   ```sh
   weglarka images reservations abandon <operation-id> --yes
@@ -62,6 +62,15 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   `blocked` while the file is full: nothing is removed (automatic retention after a deploy, `images prune` and its dry
   run alike), and `doctor` warns on `runtime.images`. List the reservations and abandon those whose owner is gone;
   cleanup works again as soon as there is room.
+
+  **Limitation.** An unreserved acquisition has no reservation to bridge the gap between the pull and the moment
+  its provenance is recorded. If recording also fails in that deploy (for example a rollback image pulled unreserved
+  after the deploy's own reservation was released and freed a slot), the image has no durable protection once
+  capacity is back: nothing stops a later pass from treating it as unrecorded. It is not deleted for that reason
+  alone — an unrecorded image is only ever removed by adoption in an explicit `images prune` — but a container or
+  `state.toml` entry that uses it is its only protection until then. This is a deliberate exception to ADR 0067's
+  rule that acquisition keeps its protection "until provenance and a durable protection have been published", traded
+  for a full reservation file not failing deploys (a durable fix is tracked in #535).
 - **Platform images need a capability record.** Deleting an image owned by the platform daemon requires
   `host-capabilities.toml` with host protocol 1 and the coordination features image-lock, platform-update-lock,
   service-activation and reservation-phases. A missing file, an older protocol or a missing feature keeps those images

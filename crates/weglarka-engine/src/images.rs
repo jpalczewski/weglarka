@@ -38,7 +38,7 @@ use weglarka_model::image_inventory::{
 };
 use weglarka_model::platform_update::{
     CAPABILITIES_FILE_NAME, CapabilityError, CapabilityRecord, FILE_NAME as JOURNAL_FILE_NAME,
-    PlatformUpdate, platform_prune_allowed,
+    PlatformUpdate, TransactionJournal, platform_prune_allowed,
 };
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ImageInfo, PodmanClient, PodmanError, image_repo,
@@ -187,9 +187,11 @@ pub struct ReservationInfo {
     /// Unix seconds when the operation started.
     pub started_at: u64,
     /// The writer's boot is not the current one: the next daemon start reclaims it, unless a
-    /// nonterminal platform transaction references it.
+    /// nonterminal platform transaction references it. Always `false` while the host reports no
+    /// boot identity (nothing can be reclaimed then).
     pub previous_boot: bool,
-    /// A platform transaction references it (never reclaimed automatically).
+    /// A nonterminal platform transaction references it ([`references_reservation`]): it is not
+    /// reclaimed automatically while that transaction runs.
     pub referenced: bool,
     /// Number of image identities it protects (none while `loading`).
     pub protections: usize,
@@ -396,11 +398,17 @@ impl PreparedRetention {
 /// The host's boot identity. A reservation is reclaimable only when this differs from the owner's
 /// boot; wall-clock time is never evidence.
 fn current_boot_id() -> String {
+    known_boot_id().unwrap_or_else(|| "unknown-boot".to_owned())
+}
+
+/// The boot identity when the host reports one. Reclamation needs a *proof* that the writer's boot
+/// is gone, so it uses this and does nothing when it is `None` ([`current_boot_id`]'s placeholder
+/// would make every reservation look like another boot's, or the same one).
+fn known_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "unknown-boot".to_owned())
 }
 
 fn now_secs() -> u64 {
@@ -697,7 +705,18 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Every durable reservation, oldest first, for `weglarka images reservations list`. Read-only
     /// and lock-free: the file is replaced atomically, so a deploy in progress never blocks it.
     pub fn list_reservations(&self) -> Result<Vec<ReservationInfo>, EngineError> {
-        let boot = current_boot_id();
+        self.list_reservations_in_boot(known_boot_id().as_deref())
+    }
+
+    pub(crate) fn list_reservations_in_boot(
+        &self,
+        boot: Option<&str>,
+    ) -> Result<Vec<ReservationInfo>, EngineError> {
+        let journal = self.read_platform_journal()?;
+        let transaction = journal
+            .transaction
+            .as_ref()
+            .filter(|transaction| !transaction.is_terminal());
         let mut list: Vec<ReservationInfo> = self
             .read_reservations()?
             .operations
@@ -707,11 +726,12 @@ impl<P: PodmanClient> Reconciler<P> {
                     operation_id,
                     reservation,
                 } = entry;
+                let referenced = references_reservation(transaction, &operation_id, &reservation);
                 let Reservation {
                     owner,
                     phase,
                     protections,
-                    journal_ref,
+                    journal_ref: _,
                     created_at: _,
                 } = reservation;
                 let ReservationOwner {
@@ -726,8 +746,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     component,
                     pid,
                     started_at,
-                    previous_boot: boot_id != boot,
-                    referenced: journal_ref.is_some(),
+                    previous_boot: boot.is_some_and(|boot| boot_id != boot),
+                    referenced,
                     protections: protections.len(),
                 }
             })
@@ -737,25 +757,37 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Reclaims reservations whose owner boot is gone and that no nonterminal transaction
-    /// references. Never called from a deploy path (boot change only), and never based on elapsed
-    /// time. Returns the reclaimed operation ids.
+    /// references ([`references_reservation`]). Never called from a deploy path (boot change only),
+    /// and never based on elapsed time. Does nothing when the host reports no boot identity: without
+    /// it nothing proves a writer gone. Returns the reclaimed operation ids.
     pub async fn reclaim_stale_reservations(&self) -> Result<Vec<OperationId>, EngineError> {
-        let boot = current_boot_id();
+        self.reclaim_stale_reservations_in_boot(known_boot_id().as_deref())
+            .await
+    }
+
+    pub(crate) async fn reclaim_stale_reservations_in_boot(
+        &self,
+        boot: Option<&str>,
+    ) -> Result<Vec<OperationId>, EngineError> {
+        let Some(boot) = boot else {
+            tracing::warn!(
+                "the current boot identity is unknown: image reservations are not reclaimed"
+            );
+            return Ok(Vec::new());
+        };
         // Lock first: a transaction that starts after an earlier read of the journal could reference
         // a reservation this pass is about to reclaim.
         let _guard = self.acquire().await;
         let journal = self.read_platform_journal()?;
-        let referenced: BTreeSet<&OperationId> = journal
+        let transaction = journal
             .transaction
             .as_ref()
-            .filter(|transaction| !transaction.is_terminal())
-            .map(|transaction| transaction.reservations.iter().collect())
-            .unwrap_or_default();
+            .filter(|transaction| !transaction.is_terminal());
         let mut reservations = self.read_reservations()?;
         let mut reclaimed = Vec::new();
         reservations.operations.retain(|entry| {
-            let keep =
-                entry.reservation.owner.boot_id == boot || referenced.contains(&entry.operation_id);
+            let keep = entry.reservation.owner.boot_id == boot
+                || references_reservation(transaction, &entry.operation_id, &entry.reservation);
             if !keep {
                 reclaimed.push(entry.operation_id.clone());
             }
@@ -1214,6 +1246,22 @@ impl<P: PodmanClient> Reconciler<P> {
         let guard = self.acquire().await;
         self.retain_images_locked(&guard, &owner, repo).await;
     }
+}
+
+/// Whether the nonterminal platform `transaction` (if any) references a reservation: it lists the
+/// operation among its `reservations`, or the reservation's `journal_ref` names it. The one
+/// predicate behind both reclamation and `reservations list`, so the list never promises a
+/// protection reclamation does not honour (or the other way round). Once the transaction is
+/// terminal (or gone) the reservation is an ordinary one again.
+fn references_reservation(
+    transaction: Option<&TransactionJournal>,
+    operation: &OperationId,
+    reservation: &Reservation,
+) -> bool {
+    transaction.is_some_and(|transaction| {
+        transaction.reservations.contains(operation)
+            || reservation.journal_ref.as_ref() == Some(&transaction.transaction_id)
+    })
 }
 
 /// Whether the reservation file has no room left: acquisitions then run unreserved

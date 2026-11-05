@@ -145,3 +145,7 @@ and previous stay) are unchanged.
   removed) until capacity is back. A blocked pass is a 200 with the additive `PruneImagesResponse.blocked`, and
   `GET /v1/images/reservations` (`weglarka images reservations list`, admin scope) lists the operation IDs. No
   `apps.toml`/`state.toml` schema change.
+  Known limitation (#535): an acquisition that runs unreserved because the file is full has no durable protection
+  if recording its provenance also fails; this is an exception to ADR 0067's "until provenance and a durable
+  protection have been published". A reservation is also reclaimed on boot change only when no nonterminal platform
+  transaction lists it or names it through `journal_ref`, and not at all when the host reports no boot identity.

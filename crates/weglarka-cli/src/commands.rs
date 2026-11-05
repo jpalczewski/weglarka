@@ -760,10 +760,11 @@ pub(crate) fn render_reservations(r: &ListReservationsResponse, now: u64) -> Str
 }
 
 /// What happens to a reservation without the operator: only a previous boot's reservation is
-/// reclaimed (at the next daemon start), and not while a platform transaction references it.
+/// reclaimed (at the next daemon start), and not while a nonterminal platform transaction references
+/// it.
 fn reclaim_note(v: &ReservationView) -> &'static str {
     match (v.referenced, v.previous_boot) {
-        (true, _) => "never (platform transaction)",
+        (true, _) => "while platform transaction runs",
         (false, true) => "at next daemon start",
         (false, false) => "abandon only",
     }

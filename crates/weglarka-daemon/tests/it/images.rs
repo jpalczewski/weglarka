@@ -283,3 +283,66 @@ async fn a_full_reservation_file_answers_prune_as_blocked_and_doctor_warns() {
     assert_eq!(status, StatusCode::OK, "{value}");
     assert!(value.get("blocked").is_none(), "{value}");
 }
+
+/// A previous-boot reservation that a nonterminal platform transaction lists survives the startup
+/// reclaim (and the list says it is referenced); an unreferenced one next to it is reclaimed.
+#[tokio::test]
+async fn startup_spares_a_reservation_a_platform_transaction_references() {
+    use weglarka_model::platform_update::{
+        FILE_NAME, JournalEndpoint, OwnerIdentity, PlatformUpdate, Stage, TransactionId,
+        TransactionJournal,
+    };
+    use weglarka_model::release_set::{Repository, StrictDigest};
+    let builder = Builder::new();
+    write_reservations(
+        builder.root(),
+        &[
+            ("held".into(), "boot-gone".into()),
+            ("free".into(), "boot-gone".into()),
+        ],
+    );
+    let digest = StrictDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+    let endpoint = JournalEndpoint {
+        daemon_repository: Repository::new("ghcr.io/example/weglarka").unwrap(),
+        daemon_digest: digest.clone(),
+        tools_digest: digest.clone(),
+        state_read: vec![17],
+        state_write: 17,
+        host_protocol: 1,
+    };
+    let journal = PlatformUpdate {
+        transaction: Some(TransactionJournal {
+            transaction_id: TransactionId::new("tx-1").unwrap(),
+            stage: Stage::Prepared,
+            owner: OwnerIdentity {
+                pid: 1,
+                boot_id: "boot-gone".into(),
+                started_at: 1,
+                handoff_deadline: None,
+            },
+            old: endpoint.clone(),
+            target: endpoint,
+            release_set_digest: digest,
+            reservations: vec![weglarka_model::image_inventory::OperationId::new("held").unwrap()],
+            candidate: None,
+            ack: None,
+            selected_generation: None,
+            reason: None,
+            updated_at: 1,
+        }),
+        ..PlatformUpdate::default()
+    };
+    std::fs::write(
+        builder.root().join("state").join(FILE_NAME),
+        journal.to_toml().unwrap(),
+    )
+    .unwrap();
+    let h = builder.build().await;
+
+    let (status, list) = admin(&h, "GET", "/v1/images/reservations", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["reservations"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["reservations"][0]["operation_id"], "held");
+    assert_eq!(list["reservations"][0]["previous_boot"], true);
+    assert_eq!(list["reservations"][0]["referenced"], true);
+}
