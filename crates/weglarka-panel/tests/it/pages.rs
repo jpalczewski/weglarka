@@ -1400,16 +1400,17 @@ async fn access_rows_show_the_upstream_status_and_header_time() {
             upstream_header_time: "0.0123".into(),
             ..entry("/same", "same-status")
         }),
-        // A static site: no upstream, so no headers either — never `0.000 s`.
+        // A static site: nginx logs no upstream as empty — shown as `-`, never `0.000 s`.
+        AccessFrame::Entry(entry("/static", "no-upstream")),
+        // The app's name did not resolve: nginx answered the 502 itself.
         AccessFrame::Entry(AccessEntry {
-            upstream_status: "-".into(),
-            upstream_header_time: "-".into(),
-            ..entry("/static", "no-upstream")
+            status: 502,
+            ..entry("/gone", "nginx-502")
         }),
-        // A retry list, and an upstream code that differs from the badge.
+        // A retry list: the first attempt was refused, the second answered.
         AccessFrame::Entry(AccessEntry {
-            upstream_status: "502 : 200".into(),
-            upstream_header_time: "1.500, 0.020".into(),
+            upstream_status: "502, 200".into(),
+            upstream_header_time: "-, 0.020".into(),
             ..entry("/retry", "end-of-rows")
         }),
     ];
@@ -1423,21 +1424,16 @@ async fn access_rows_show_the_upstream_status_and_header_time() {
         .await
         .into_body();
     let text = read_until(&mut body, "end-of-rows", WAIT).await.unwrap();
+    assert!(text.contains("when it did not answer\">0.012 s<"), "{text}");
+    assert!(text.contains("when it did not answer\">-<"), "{text}");
+    assert!(text.contains(">-, 0.020<"), "{text}");
     assert!(
-        text.contains("title=\"time to response headers\">0.012 s<"),
+        text.contains(">502, 200<") && text.contains("title=\"upstream status"),
         "{text}"
     );
-    assert!(
-        text.contains("title=\"time to response headers\">-<"),
-        "{text}"
-    );
-    assert!(text.contains(">1.500, 0.020<"), "{text}");
-    assert!(
-        text.contains(">502 : 200<") && text.contains("title=\"upstream status"),
-        "{text}"
-    );
-    // Only the third row names an upstream status: the other two would repeat the badge or say `-`.
-    assert_eq!(text.matches("upstream status:").count(), 1, "{text}");
+    assert!(text.contains(">nginx<"), "{text}");
+    // Only the last two rows name an upstream status: the others would repeat the badge or say `-`.
+    assert_eq!(text.matches("upstream status:").count(), 2, "{text}");
     insta::assert_snapshot!("access_rows_upstream_fields", text);
 }
 
@@ -1459,7 +1455,7 @@ async fn hostile_access_entries_render_safely() {
             method: "M".repeat(100),
             remote_addr: "\"><b>".into(),
             upstream_status: "\"><b>502</b>\x1b[0m\u{202e}".into(),
-            upstream_header_time: "0.0\x00<script>alert(1)</script>\n".into(),
+            upstream_header_time: "0.004, \x00<script>alert(1)</script>\n".into(),
             ..entry("/last", "end-marker")
         }),
     ];

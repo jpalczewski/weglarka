@@ -715,11 +715,16 @@ fn access_row(entry: &AccessEntry) -> AccessRow {
     }
 }
 
-/// The upstream status to show next to the badge, or an empty string when it would only repeat the
-/// row: `-` (no upstream, a static site) and the visitor's own status are dropped, so the common row
-/// stays one glance wide. A different code (nginx answered `502` itself) and a retry list (`200 :
-/// 502`) do carry information, so they are shown.
+/// What to show next to the badge, or an empty string when it would only repeat the row. A `5xx`
+/// the app never answered (no attempt has a numeric header time: the name did not resolve, or the
+/// connection was refused — nginx then records `502` itself) reads `nginx`, the one case #463 is
+/// about. Otherwise a retry list (`502, 200`) or a code that differs from the badge is shown; an
+/// empty value (no upstream, a static site), `-` and the badge's own code are dropped, so the common
+/// row stays one glance wide.
 fn upstream_status(entry: &AccessEntry) -> String {
+    if entry.status >= 500 && !app_answered(&entry.upstream_header_time) {
+        return "nginx".to_owned();
+    }
     let text = clean_text(&entry.upstream_status, MAX_UPSTREAM_CHARS);
     if text.is_empty() || text == "-" || text == entry.status.to_string() {
         return String::new();
@@ -727,9 +732,19 @@ fn upstream_status(entry: &AccessEntry) -> String {
     text
 }
 
+/// Whether any attempt of a request got the app's response headers. nginx separates attempts with
+/// `, ` and upstream groups (an internal redirect) with ` : `.
+fn app_answered(header_time: &str) -> bool {
+    header_time.split([',', ':']).any(|t| {
+        t.trim()
+            .parse::<f64>()
+            .is_ok_and(|s| s.is_finite() && s >= 0.0)
+    })
+}
+
 /// A time nginx logs as text: a number of seconds like `request_time`, else the value itself (`-`
-/// when no headers arrived, or a list on retry). Formatting a `-` as `0.000 s` would claim a
-/// response that never came.
+/// when no headers arrived, or a list on retry); empty (no upstream was tried) is shown as `-`.
+/// Formatting a `-` as `0.000 s` would claim a response that never came.
 fn upstream_time(raw: &str) -> String {
     let text = clean_text(raw, MAX_UPSTREAM_CHARS);
     if text.is_empty() {
@@ -1145,12 +1160,24 @@ mod tests {
         let row = access_row(&entry(200, "-", "-"));
         assert!(row.upstream_status.is_empty());
         assert_eq!(row.upstream_header_time, "-");
-        // A different code (nginx answered itself) and a retry list are shown; so is a list of times.
-        let row = access_row(&entry(200, "502", "0.010"));
-        assert_eq!(row.upstream_status, "502");
-        let row = access_row(&entry(502, "502 : 200", "1.500, 0.020"));
-        assert_eq!(row.upstream_status, "502 : 200");
-        assert_eq!(row.upstream_header_time, "1.500, 0.020");
+        // A code that differs from the badge and a retry list are shown; so is a list of times.
+        let row = access_row(&entry(200, "404", "0.010"));
+        assert_eq!(row.upstream_status, "404");
+        let row = access_row(&entry(200, "502, 200", "-, 0.020"));
+        assert_eq!(row.upstream_status, "502, 200");
+        assert_eq!(row.upstream_header_time, "-, 0.020");
+        // A 502 the app answered itself repeats the badge; one it never answered is nginx's own,
+        // whether the connection was refused (`502`, `-`) or the name did not resolve (empty).
+        assert!(
+            access_row(&entry(502, "502", "0.000"))
+                .upstream_status
+                .is_empty()
+        );
+        assert_eq!(access_row(&entry(502, "502", "-")).upstream_status, "nginx");
+        assert_eq!(access_row(&entry(502, "", "")).upstream_status, "nginx");
+        let row = access_row(&entry(502, "502, 502", "-, -"));
+        assert_eq!(row.upstream_status, "nginx");
+        assert_eq!(row.upstream_header_time, "-, -");
         // Untrusted text: control characters and markup are stripped, the template escapes the rest.
         let row = access_row(&entry(
             200,
