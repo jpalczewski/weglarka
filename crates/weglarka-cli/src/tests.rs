@@ -1832,7 +1832,7 @@ fn reservation_view(
     id: &str,
     phase: &str,
     previous_boot: bool,
-    referenced: bool,
+    referenced: Option<bool>,
 ) -> ReservationView {
     ReservationView {
         operation_id: id.to_owned(),
@@ -1850,10 +1850,13 @@ fn reservation_view(
 fn reservations_list_renders_a_table() {
     let response = ListReservationsResponse {
         reservations: vec![
-            reservation_view("acquisition-1", "loading", true, false),
-            reservation_view("acquisition-2", "loaded", false, false),
-            reservation_view("acquisition-3", "coordinating", true, true),
+            reservation_view("acquisition-1", "loading", true, Some(false)),
+            reservation_view("acquisition-2", "loaded", false, Some(false)),
+            reservation_view("acquisition-3", "coordinating", true, Some(true)),
+            reservation_view("acquisition-4", "loading", true, None),
+            reservation_view("acquisition-5", "loading", false, None),
         ],
+        diagnostics: Vec::new(),
         capacity: 1024,
     };
     insta::assert_snapshot!(crate::commands::render_reservations(
@@ -1867,6 +1870,7 @@ fn an_empty_reservation_list_says_so() {
     let rendered = crate::commands::render_reservations(
         &ListReservationsResponse {
             reservations: Vec::new(),
+            diagnostics: Vec::new(),
             capacity: 1024,
         },
         0,
@@ -1877,7 +1881,13 @@ fn an_empty_reservation_list_says_so() {
 #[tokio::test(flavor = "current_thread")]
 async fn reservations_list_calls_the_endpoint() {
     let body = serde_json::to_string(&ListReservationsResponse {
-        reservations: vec![reservation_view("acquisition-1", "loading", true, false)],
+        reservations: vec![reservation_view(
+            "acquisition-1",
+            "loading",
+            true,
+            Some(false),
+        )],
+        diagnostics: Vec::new(),
         capacity: 1024,
     })
     .unwrap();

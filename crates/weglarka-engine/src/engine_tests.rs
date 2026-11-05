@@ -6585,7 +6585,7 @@ mod retention {
         )
         .unwrap();
 
-        let listed = h.rec.list_reservations().unwrap();
+        let listed = h.rec.list_reservations().unwrap().reservations;
         assert_eq!(
             listed
                 .iter()
@@ -6603,7 +6603,7 @@ mod retention {
                 .collect::<Vec<_>>(),
             ["old-boot"]
         );
-        let left = h.rec.list_reservations().unwrap();
+        let left = h.rec.list_reservations().unwrap().reservations;
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].operation_id, "this-boot");
         // Nothing left to reclaim: a second call changes nothing.
@@ -6698,16 +6698,16 @@ mod retention {
         referenced_reservations(&h);
         write_transaction(&h, Stage::Prepared, &["listed"]);
 
-        let listed = h.rec.list_reservations().unwrap();
+        let listed = h.rec.list_reservations().unwrap().reservations;
         assert_eq!(
             listed
                 .iter()
                 .map(|r| (r.operation_id.as_str(), r.previous_boot, r.referenced))
                 .collect::<Vec<_>>(),
             [
-                ("by-ref", true, true),
-                ("listed", true, true),
-                ("plain", true, false)
+                ("by-ref", true, Some(true)),
+                ("listed", true, Some(true)),
+                ("plain", true, Some(false))
             ]
         );
 
@@ -6724,6 +6724,7 @@ mod retention {
             .rec
             .list_reservations()
             .unwrap()
+            .reservations
             .into_iter()
             .map(|r| r.operation_id)
             .collect();
@@ -6742,13 +6743,63 @@ mod retention {
             h.rec
                 .list_reservations()
                 .unwrap()
+                .reservations
                 .iter()
-                .all(|r| !r.referenced)
+                .all(|r| r.referenced == Some(false))
         );
         let reclaimed = h.rec.reclaim_stale_reservations().await.unwrap();
 
         assert_eq!(reclaimed.len(), 3, "{reclaimed:?}");
-        assert!(h.rec.list_reservations().unwrap().is_empty());
+        assert!(h.rec.list_reservations().unwrap().reservations.is_empty());
+    }
+
+    /// A corrupt `platform-update.toml` makes the list degrade, not fail: every reservation is
+    /// there (the operator needs the ids), `referenced` is unknown and a warning names the file and
+    /// the error. Reclamation fails closed on the same file: nothing is reclaimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_corrupt_journal_degrades_the_list_and_blocks_reclaim() {
+        let h = Harness::new(NTFY);
+        referenced_reservations(&h);
+        let journal_path = state_dir(&h).join(weglarka_model::platform_update::FILE_NAME);
+        std::fs::write(&journal_path, "this is [not valid toml").unwrap();
+        let before = std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap();
+
+        let list = h.rec.list_reservations().unwrap();
+
+        assert_eq!(
+            list.reservations
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot, r.referenced))
+                .collect::<Vec<_>>(),
+            [
+                ("by-ref", true, None),
+                ("listed", true, None),
+                ("plain", true, None)
+            ]
+        );
+        assert_eq!(list.diagnostics.len(), 1, "{:?}", list.diagnostics);
+        assert!(
+            list.diagnostics[0].contains("platform-update.toml"),
+            "{:?}",
+            list.diagnostics
+        );
+
+        let error = h.rec.reclaim_stale_reservations().await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("platform-update.toml"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap(),
+            before,
+            "nothing was reclaimed"
+        );
+        // Fixing the file brings the references back.
+        std::fs::remove_file(&journal_path).unwrap();
+        let list = h.rec.list_reservations().unwrap();
+        assert!(list.diagnostics.is_empty());
+        assert!(list.reservations.iter().all(|r| r.referenced.is_some()));
     }
 
     /// Without a boot identity nothing proves a writer gone: no reclamation, and the list claims no
@@ -6770,7 +6821,7 @@ mod retention {
             std::fs::read_to_string(state_dir(&h).join(RESERVATIONS_FILE_NAME)).unwrap(),
             before
         );
-        let listed = h.rec.list_reservations_in_boot(None).unwrap();
+        let listed = h.rec.list_reservations_in_boot(None).unwrap().reservations;
         assert_eq!(listed.len(), 3);
         assert!(listed.iter().all(|r| !r.previous_boot));
     }

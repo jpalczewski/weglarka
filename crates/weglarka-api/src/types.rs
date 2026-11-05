@@ -525,6 +525,10 @@ pub struct PruneImagesResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReservationsResponse {
     pub reservations: Vec<ReservationView>,
+    /// Warnings about what could not be established (e.g. an unreadable `platform-update.toml`, in
+    /// which case every `referenced` is `null`). The list itself is still complete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
     /// How many reservations the file holds at most; at the limit new acquisitions run unreserved
     /// and cleanup is blocked.
     pub capacity: usize,
@@ -546,8 +550,11 @@ pub struct ReservationView {
     /// platform transaction references it).
     pub previous_boot: bool,
     /// A nonterminal platform transaction references it; it is not reclaimed automatically while
-    /// that transaction runs.
-    pub referenced: bool,
+    /// that transaction runs. `null`: unknown, the platform journal could not be read (see
+    /// [`ListReservationsResponse::diagnostics`]); then do not assume the next daemon start
+    /// reclaims it.
+    #[serde(default)]
+    pub referenced: Option<bool>,
     /// Number of image identities it protects.
     pub protections: usize,
 }

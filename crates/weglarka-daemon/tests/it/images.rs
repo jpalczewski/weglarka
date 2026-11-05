@@ -345,4 +345,41 @@ async fn startup_spares_a_reservation_a_platform_transaction_references() {
     assert_eq!(list["reservations"][0]["operation_id"], "held");
     assert_eq!(list["reservations"][0]["previous_boot"], true);
     assert_eq!(list["reservations"][0]["referenced"], true);
+    assert!(list.get("diagnostics").is_none(), "{list}");
+}
+
+/// A corrupt `platform-update.toml` leaves startup reclaim with nothing to go on (fail closed: no
+/// reservation is reclaimed, the daemon still starts), and the list degrades: every id is there,
+/// `referenced` is `null` and a diagnostic names the file.
+#[tokio::test]
+async fn a_corrupt_platform_journal_keeps_every_reservation_and_degrades_the_list() {
+    let builder = Builder::new();
+    write_reservations(
+        builder.root(),
+        &[
+            ("old-1".into(), "boot-gone".into()),
+            ("old-2".into(), "boot-gone".into()),
+        ],
+    );
+    std::fs::write(
+        builder
+            .root()
+            .join("state")
+            .join(weglarka_model::platform_update::FILE_NAME),
+        "this is [not valid toml",
+    )
+    .unwrap();
+    let h = builder.build().await;
+
+    let (status, list) = admin(&h, "GET", "/v1/images/reservations", None).await;
+
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rows = list["reservations"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "nothing was reclaimed: {list}");
+    for row in rows {
+        assert!(row["referenced"].is_null(), "{row}");
+        assert_eq!(row["previous_boot"], true);
+    }
+    let diagnostics = list["diagnostics"].to_string();
+    assert!(diagnostics.contains("platform-update.toml"), "{list}");
 }

@@ -191,10 +191,22 @@ pub struct ReservationInfo {
     /// boot identity (nothing can be reclaimed then).
     pub previous_boot: bool,
     /// A nonterminal platform transaction references it ([`references_reservation`]): it is not
-    /// reclaimed automatically while that transaction runs.
-    pub referenced: bool,
+    /// reclaimed automatically while that transaction runs. `None`: unknown, because the platform
+    /// journal could not be read ([`ReservationList::diagnostics`] says why).
+    pub referenced: Option<bool>,
     /// Number of image identities it protects (none while `loading`).
     pub protections: usize,
+}
+
+/// The answer of [`Reconciler::list_reservations`]: every reservation, plus what could not be
+/// established while listing them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReservationList {
+    /// Oldest first.
+    pub reservations: Vec<ReservationInfo>,
+    /// Human-readable warnings, e.g. an unreadable `platform-update.toml`: listing is read-only and
+    /// is needed precisely when something is broken, so it degrades instead of failing.
+    pub diagnostics: Vec<String>,
 }
 
 /// Proof that the engine's image lock is held while a retention plan is executed.
@@ -704,21 +716,37 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Every durable reservation, oldest first, for `weglarka images reservations list`. Read-only
     /// and lock-free: the file is replaced atomically, so a deploy in progress never blocks it.
-    pub fn list_reservations(&self) -> Result<Vec<ReservationInfo>, EngineError> {
+    ///
+    /// An unreadable or corrupt platform journal does not fail the listing (it is how an operator
+    /// finds the ids to `abandon` when something is broken): every reservation is returned with
+    /// `referenced: None` and a diagnostic names the file and the error. Reclamation, in contrast,
+    /// fails closed on the same condition ([`Self::reclaim_stale_reservations`]).
+    pub fn list_reservations(&self) -> Result<ReservationList, EngineError> {
         self.list_reservations_in_boot(known_boot_id().as_deref())
     }
 
     pub(crate) fn list_reservations_in_boot(
         &self,
         boot: Option<&str>,
-    ) -> Result<Vec<ReservationInfo>, EngineError> {
-        let journal = self.read_platform_journal()?;
-        let transaction = journal
-            .transaction
-            .as_ref()
-            .filter(|transaction| !transaction.is_terminal());
-        let mut list: Vec<ReservationInfo> = self
-            .read_reservations()?
+    ) -> Result<ReservationList, EngineError> {
+        let reservations = self.read_reservations()?;
+        let mut diagnostics = Vec::new();
+        let journal = match self.read_platform_journal() {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "cannot tell which reservations a platform transaction references: {error}"
+                ));
+                None
+            }
+        };
+        let transaction = journal.as_ref().and_then(|journal| {
+            journal
+                .transaction
+                .as_ref()
+                .filter(|transaction| !transaction.is_terminal())
+        });
+        let mut list: Vec<ReservationInfo> = reservations
             .operations
             .into_iter()
             .map(|entry| {
@@ -726,7 +754,9 @@ impl<P: PodmanClient> Reconciler<P> {
                     operation_id,
                     reservation,
                 } = entry;
-                let referenced = references_reservation(transaction, &operation_id, &reservation);
+                let referenced = journal
+                    .is_some()
+                    .then(|| references_reservation(transaction, &operation_id, &reservation));
                 let Reservation {
                     owner,
                     phase,
@@ -753,7 +783,10 @@ impl<P: PodmanClient> Reconciler<P> {
             })
             .collect();
         list.sort_by(|a, b| (a.started_at, &a.operation_id).cmp(&(b.started_at, &b.operation_id)));
-        Ok(list)
+        Ok(ReservationList {
+            reservations: list,
+            diagnostics,
+        })
     }
 
     /// Reclaims reservations whose owner boot is gone and that no nonterminal transaction

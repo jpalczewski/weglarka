@@ -734,6 +734,9 @@ fn unix_now() -> u64 {
 /// `images reservations list` output: one row per reservation, then a capacity line. `now` is a
 /// parameter so the output is reproducible.
 pub(crate) fn render_reservations(r: &ListReservationsResponse, now: u64) -> String {
+    for diagnostic in &r.diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
     if r.reservations.is_empty() {
         return format!("no image reservations (0/{})\n", r.capacity);
     }
@@ -764,9 +767,11 @@ pub(crate) fn render_reservations(r: &ListReservationsResponse, now: u64) -> Str
 /// it.
 fn reclaim_note(v: &ReservationView) -> &'static str {
     match (v.referenced, v.previous_boot) {
-        (true, _) => "while platform transaction runs",
-        (false, true) => "at next daemon start",
-        (false, false) => "abandon only",
+        (Some(true), _) => "while platform transaction runs",
+        (Some(false), true) => "at next daemon start",
+        // A reservation of this boot is never reclaimed, whatever the journal says.
+        (_, false) => "abandon only",
+        (None, true) => "unknown (journal unreadable)",
     }
 }
 

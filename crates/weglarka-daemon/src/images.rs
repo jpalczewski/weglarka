@@ -14,7 +14,7 @@ use weglarka_api::{
     AbandonReservationRequest, AbandonReservationResponse, ErrorCode, ListReservationsResponse,
     PruneImagesRequest, PruneImagesResponse, PrunedImage, ReservationView, endpoints,
 };
-use weglarka_engine::images::{PruneReport, ReservationInfo};
+use weglarka_engine::images::{PruneReport, ReservationInfo, ReservationList};
 use weglarka_engine::reconcile::Reconciler;
 use weglarka_model::image_inventory::{MAX_RESERVATIONS, ReservationPhase};
 use weglarka_model::podman::{ImageInfo, PodmanClient};
@@ -110,15 +110,16 @@ fn response(report: PruneReport) -> PruneImagesResponse {
 async fn list_reservations<P: PodmanClient + 'static>(
     State(d): Shared<P>,
 ) -> Result<Json<ListReservationsResponse>, Fail> {
-    let reservations = d
+    let ReservationList {
+        reservations,
+        diagnostics,
+    } = d
         .engine
         .list_reservations()
-        .map_err(|e| Fail::internal(e.to_string()))?
-        .into_iter()
-        .map(reservation_view)
-        .collect();
+        .map_err(|e| Fail::internal(e.to_string()))?;
     Ok(Json(ListReservationsResponse {
-        reservations,
+        reservations: reservations.into_iter().map(reservation_view).collect(),
+        diagnostics,
         capacity: MAX_RESERVATIONS,
     }))
 }

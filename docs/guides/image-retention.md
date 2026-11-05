@@ -49,7 +49,10 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   ```
 
   The `RECLAIM` column says `at next daemon start` (previous boot), `abandon only` (current boot) or `while platform
-  transaction runs`. Free one explicitly with:
+  transaction runs`. The list still works when `platform-update.toml` cannot be read: every reservation is shown, the
+  reference state is unknown (`unknown (journal unreadable)` for previous-boot rows, `"referenced": null` in `--json`),
+  and a warning names the file and the error. Startup reclamation, in contrast, fails closed on that file: it reclaims
+  nothing and logs a warning until the file is fixed. Free one explicitly with:
 
   ```sh
   weglarka images reservations abandon <operation-id> --yes
