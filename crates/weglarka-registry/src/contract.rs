@@ -117,6 +117,11 @@ async fn missing_objects_are_not_found(registry: &impl ReleaseRegistry, host: &s
         registry.blob(&empty, &missing_blob, MAX_BODY).await,
         "a blob of an unknown repository",
     );
+    // The first release set of a channel lists the tags of a repository nobody pushed to yet.
+    assert_not_found(
+        registry.tags(&empty).await,
+        "the tag list of an unknown repository",
+    );
 
     // A repository that exists but lacks the object.
     let repository = unique_repository(host, "populated");

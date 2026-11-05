@@ -85,6 +85,22 @@ pub struct ReconcileOutcome {
     pub skipped: Vec<String>,
 }
 
+/// Lists the release-set tags of `repository`. A repository that has never received a push answers
+/// `404` for its tag list (GHCR and `distribution`: `NAME_UNKNOWN`), which is the first release set
+/// of the first channel. That is an empty list only while the channel has no pointer yet: with a
+/// pointer the repository must exist, so a `404` then is a broken registry state, not a fresh one.
+async fn release_tags<R: ReleaseRegistry + ?Sized>(
+    registry: &R,
+    repository: &Repository,
+    has_pointer: bool,
+) -> Result<Vec<String>> {
+    match registry.tags(repository).await {
+        Ok(tags) => Ok(tags),
+        Err(error) if error.is_not_found() && !has_pointer => Ok(Vec::new()),
+        Err(error) => Err(error).context("cannot list the release-set tags"),
+    }
+}
+
 /// Fetches the signatures for `digest` and requires one to verify against `key`.
 async fn require_signature<R: ReleaseRegistry + ?Sized>(
     registry: &R,
@@ -463,10 +479,7 @@ pub async fn publish<R: ReleaseRegistry + ?Sized>(
         }));
     }
     let pointer = read_pointer_structure(registry, repository, spec.channel).await?;
-    let tags = registry
-        .tags(repository)
-        .await
-        .context("cannot list the release-set tags")?;
+    let tags = release_tags(registry, repository, pointer.is_some()).await?;
     let next = next_sequence(
         spec.channel,
         pointer.as_ref().map(|pointer| pointer.descriptor.sequence),
@@ -648,10 +661,7 @@ pub async fn reconcile<R: ReleaseRegistry + ?Sized>(
         .as_ref()
         .map(|pointer| pointer.sequence)
         .unwrap_or(0);
-    let tags = registry
-        .tags(repository)
-        .await
-        .context("cannot list the release-set tags")?;
+    let tags = release_tags(registry, repository, pointer.is_some()).await?;
     let mut candidates: Vec<(u64, String)> = tags
         .iter()
         .filter_map(|tag| parse_set_tag(channel, tag).map(|sequence| (sequence, tag.clone())))
@@ -1251,6 +1261,38 @@ mod tests {
                 .sequence,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn first_set_publishes_into_a_repository_that_does_not_exist_yet() {
+        // GHCR answers `404` for the tag list of a repository nobody pushed to; the first set of
+        // the first channel must treat that as "no tags", not as a registry failure.
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let daemon = image(&registry, DAEMON_REPO, "0.9.0", key.signing_key()).await;
+        let panel = image(&registry, PANEL_REPO, "0.3.0", key.signing_key()).await;
+        assert!(registry.tags(&repo()).await.unwrap_err().is_not_found());
+
+        let (published, promoted) = publish_signed(
+            &registry,
+            &spec(daemon, panel.clone(), "0.3.0", vec![panel]),
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published.sequence, 1);
+        assert!(promoted.pointer_moved);
+    }
+
+    #[tokio::test]
+    async fn reconcile_of_a_repository_that_does_not_exist_yet_moves_nothing() {
+        let key = TestSigningKey::generate().unwrap();
+        let registry = FakeReleaseRegistry::new();
+        let outcome = reconcile(&registry, &repo(), Channel::Stable, key.public_key())
+            .await
+            .unwrap();
+        assert_eq!(outcome.moved_to, None);
+        assert!(outcome.skipped.is_empty());
     }
 
     #[tokio::test]
