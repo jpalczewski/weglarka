@@ -53,8 +53,9 @@ paths:
 - **Tests run in CI the way production does:** the smoke test starts the daemon from the quadlet's arguments (no
   `/etc/passwd`, no `/etc/subuid` in the `scratch` image).
 - Acceptance on a host / in CI: `scripts/acceptance.sh` (canary, traffic, webhook 202/401/204, cleanup;
-  `--with-local-registry` adds a deploy from a webhook and a forced rollback — CI only). Image smoke tests:
-  `.github/scripts/smoke-image.sh` and `smoke-quadlet.sh` (arguments from `platform install`).
+  `--with-local-registry` adds a deploy from a webhook and a forced rollback — CI only). Image smoke tests
+  (`smoke-behind`): `.github/scripts/smoke-image.sh` and `smoke-quadlet.sh` (arguments from `platform install`); the
+  panel image is smoke-tested in `smoke-edge` (`.github/scripts/smoke-panel.sh`).
 - PRs build with the `ci` profile (no LTO, `opt-level = 1`, `codegen-units = 256`, still `panic = "abort"`);
   `main` and tags with the full `release` (`docs/decisions/0008`, addendum of 2026-11-05). A PR
   changing only documentation (`docs/**`, `*.md`, `.gitignore`) runs no builds — the job `changes` skips

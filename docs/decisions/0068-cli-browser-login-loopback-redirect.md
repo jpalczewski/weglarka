@@ -23,7 +23,7 @@ or ports, so the behaviour rests on the library source of the pinned version, no
 `public = true` client with PKCE is what the library treats as a native client.
 
 Branch (a) is therefore chosen: register `http://127.0.0.1/callback`, bind `127.0.0.1:0`, send the bound port in the
-request's `redirect_uri`. A test in the `identity-config` CI job validates that Authelia's own validator accepts such a
+request's `redirect_uri`. A step of the `check` CI job validates that Authelia's own validator accepts such a
 registration; an end-to-end login against Authelia is not covered (as for #294, which stays open for the panel).
 
 ## Decision

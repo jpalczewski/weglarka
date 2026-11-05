@@ -126,8 +126,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/check-action-pins.sh
 
-  # fmt → clippy → test in ONE job: the toolchain is installed once and the debug `target/`
-  # is shared, instead of three runners each paying for toolchain setup and a cold cache.
+  # fmt → clippy → test → Authelia config validation in ONE job: the toolchain is installed once and the debug
+  # `target/` is shared, instead of four runners each paying for toolchain setup and a cold cache.
   # The cache is written only on main (`save-if`); PRs restore main's cache read-only.
   check:
     needs: changes
@@ -149,72 +149,15 @@ jobs:
       - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
-
-  # The panel's client-side scripts (crates/weglarka-panel/assets/app.js) in a real browser: Playwright
-  # on the Bun runtime against a fixture server that serves the real template section, app.js and the
-  # vendored htmx under the panel's CSP (crates/weglarka-panel/e2e). No Rust build, so it runs in parallel.
-  # The job runs in the official Playwright image (#561): browsers and their system libraries come with it, so there
-  # is no `playwright install --with-deps` (apt-get against the Ubuntu mirrors) and no browser cache. The tag must
-  # match the `playwright` package in bun.lock (check-playwright-image.sh); a bump moves the tag and the digest.
-  panel-e2e:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    container:
-      image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
-    defaults:
-      run:
-        # A `container:` job defaults to `sh`, not bash.
-        shell: bash
-        working-directory: crates/weglarka-panel/e2e
-    steps:
-      - uses: actions/checkout@v7
-      - name: Playwright image matches bun.lock
-        run: ../../../.github/scripts/check-playwright-image.sh
-      # The image has no `unzip`, which oven-sh/setup-bun needs: fetch the release zip, verify its checksum and
-      # unpack it with Python's zipfile (in the image).
-      - name: Install Bun
-        timeout-minutes: 2
+      # The Authelia files weglarka-identity renders (#42 P3) must pass the provider's own validator: a renamed or
+      # misspelled field shows up here, not in production. It runs at the end of `check` instead of in a job of its
+      # own: the render reuses the debug `target/` this job already has (a separate job restored the whole 290 MB
+      # cache for one example), and the runner already has Docker. The image tag is pinned exactly (with its digest),
+      # so a new Authelia release changes nothing until someone bumps it on purpose. The fixtures come from the same
+      # sample inputs as the snapshot tests; go-yaml has to accept the JSON-as-YAML output.
+      - name: Render the Authelia fixtures and validate them
         env:
-          BUN_VERSION: 1.4.4
-          BUN_SHA256: bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c
-        run: |
-          set -euo pipefail
-          zip="$RUNNER_TEMP/bun.zip"
-          curl -fsSL -o "$zip" "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"
-          echo "$BUN_SHA256  $zip" | sha256sum -c -
-          python3 -I -m zipfile -e "$zip" "$RUNNER_TEMP/bun"
-          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" /usr/local/bin/bun
-          bun --version
-      - run: bun install --frozen-lockfile
-      - run: bun run test
-        env:
-          CI: "true"
-      - if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: panel-e2e-traces
-          path: crates/weglarka-panel/e2e/test-results
-          retention-days: 7
-
-  # The Authelia files weglarka-identity renders (#42 P3) must pass the provider's own validator: a renamed or
-  # misspelled field shows up here, not in production. The image tag is pinned exactly (with its digest), so a
-  # new Authelia release changes nothing until someone bumps it on purpose. The fixtures come from the same
-  # sample inputs as the snapshot tests; go-yaml has to accept the JSON-as-YAML output.
-  identity-config:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    env:
-      AUTHELIA_IMAGE: docker.io/authelia/authelia:4.39.22@sha256:936134132eaf01bfa2faf85055afbc1e0cc1cc5ca4547e9c06408fd0dd784646
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-debug-toolchain
-        with:
-          shared-key: check
-          save-if: false
-      - name: Render fixtures and validate them
+          AUTHELIA_IMAGE: docker.io/authelia/authelia:4.39.22@sha256:936134132eaf01bfa2faf85055afbc1e0cc1cc5ca4547e9c06408fd0dd784646
         run: |
           set -euo pipefail
           conf="$RUNNER_TEMP/authelia"
@@ -264,6 +207,54 @@ jobs:
             echo "::error::authelia accepted an unknown field in access-control.yml; the validation step is not checking anything"
             exit 1
           fi
+
+  # The panel's client-side scripts (crates/weglarka-panel/assets/app.js) in a real browser: Playwright
+  # on the Bun runtime against a fixture server that serves the real template section, app.js and the
+  # vendored htmx under the panel's CSP (crates/weglarka-panel/e2e). No Rust build, so it runs in parallel.
+  # The job runs in the official Playwright image (#561): browsers and their system libraries come with it, so there
+  # is no `playwright install --with-deps` (apt-get against the Ubuntu mirrors) and no browser cache. The tag must
+  # match the `playwright` package in bun.lock (check-playwright-image.sh); a bump moves the tag and the digest.
+  panel-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    defaults:
+      run:
+        # A `container:` job defaults to `sh`, not bash.
+        shell: bash
+        working-directory: crates/weglarka-panel/e2e
+    steps:
+      - uses: actions/checkout@v7
+      - name: Playwright image matches bun.lock
+        run: ../../../.github/scripts/check-playwright-image.sh
+      # The image has no `unzip`, which oven-sh/setup-bun needs: fetch the release zip, verify its checksum and
+      # unpack it with Python's zipfile (in the image).
+      - name: Install Bun
+        timeout-minutes: 2
+        env:
+          BUN_VERSION: 1.4.4
+          BUN_SHA256: bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/bun.zip"
+          curl -fsSL -o "$zip" "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"
+          echo "$BUN_SHA256  $zip" | sha256sum -c -
+          python3 -I -m zipfile -e "$zip" "$RUNNER_TEMP/bun"
+          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" /usr/local/bin/bun
+          bun --version
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+        env:
+          CI: "true"
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: panel-e2e-traces
+          path: crates/weglarka-panel/e2e/test-results
+          retention-days: 7
 
   # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-model +
   # weglarka-ingress) and Docker. Its dependency graph is a fraction of the workspace's, so the job has its own small
@@ -598,25 +589,11 @@ jobs:
       # TLS + ACME through nginx, no Traefik file, and a certificate change reloads nginx without a recreate.
       - name: Image smoke test in edge mode (TLS, no Traefik)
         run: .github/scripts/smoke-image.sh localhost/weglarka:ci bin/weglarka "$WEGLARKA_PODMAN_SOCKET" scripts/acceptance.sh edge
-      - name: Podman service log
-        if: failure()
-        run: cat "$RUNNER_TEMP/podman-service.log" || true
-
-  # The panel image (ADR 0057, decision 9), built from the same musl artifact as the daemon image and run the way an
-  # operator runs it: read-only root, no capabilities, no-new-privileges. No Podman socket is needed, so the job only
-  # installs a rootless Podman and the script talks to the container over a published loopback port.
-  smoke-panel:
-    needs: [changes, musl]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/podman-rootless
-      - uses: actions/download-artifact@v8
-        with:
-          name: musl-bin
-          path: bin
-      - name: Build the image from the prebuilt binary
+      # The panel image (ADR 0057, decision 9), built from the same musl artifact and run the way an operator runs
+      # it: read-only root, no capabilities, no-new-privileges. The script never touches the Podman socket (it talks
+      # to the container over a published loopback port), so this shares the rootless Podman above instead of
+      # installing a second one in a job of its own.
+      - name: Build the panel image from the prebuilt binary
         run: |
           set -euo pipefail
           chmod +x bin/weglarka-panel
@@ -624,12 +601,15 @@ jobs:
           podman images
       - name: Panel image smoke test
         run: .github/scripts/smoke-panel.sh localhost/weglarka-panel:ci
+      - name: Podman service log
+        if: failure()
+        run: cat "$RUNNER_TEMP/podman-service.log" || true
 
   # main only: deletes superseded cache entries (older lockfile generations of every Rust cache, duplicates of main's
   # entries on PR refs), so the 10 GB quota never evicts what `main` restores (.github/scripts/cache-gc.sh). It runs
   # after every job that writes a cache on main, also when one of them failed; only this job gets `actions: write`.
   cache-gc:
-    needs: [check, musl, seed-ci-cache, podman-tests, smoke-behind, smoke-edge, smoke-panel, publish-image]
+    needs: [check, musl, seed-ci-cache, podman-tests, smoke-behind, smoke-edge, publish-image]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
