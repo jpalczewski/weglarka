@@ -42,7 +42,8 @@ email = "ops@example.com"            # optional: CA contact address (expiry noti
   under `/.well-known/acme-challenge/` (skipped in CI).
 - **Behind a CDN:** domains proxied by Cloudflare validate through the proxy, see [ACME behind a CDN](acme-behind-cdn.md).
 - **Not supported (yet):** several names in one per-domain certificate, a custom CA other than `directory_url`.
-  Wildcard certificates via DNS-01: [wildcard certificates](wildcard-certificates.md).
+  Wildcard certificates via DNS-01, and whether a domain next to a wildcard keeps its own pair, are in
+  [wildcard certificates](wildcard-certificates.md).
 
 ## Rollback
 
