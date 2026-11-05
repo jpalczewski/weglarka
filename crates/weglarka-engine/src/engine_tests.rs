@@ -2811,6 +2811,46 @@ mod metrics_network {
 
 // ── The metrics scraper on the metrics networks (issue #365) ────────────────
 
+mod container_log {
+    use super::*;
+    use weglarka_model::podman::{ContainerLog, LogDriver};
+
+    const LOG: ContainerLog = ContainerLog {
+        driver: LogDriver::K8sFile,
+        max_size: Some(10 << 20),
+    };
+
+    /// The log setting reaches the serving container, yet leaves `spec_hash` alone: a daemon restarted
+    /// with a new `[logs]` recreates nothing (ADR 0074).
+    #[tokio::test(start_paused = true)]
+    async fn applies_to_new_containers_without_changing_the_hash() {
+        let plain = Harness::new(NTFY);
+        plain.fake.set_pull_digest(IMAGE, digest('a'));
+        plain.rec.reconcile().await.unwrap();
+        assert_eq!(plain.fake.container_spec("ntfy").unwrap().log, None);
+
+        let logged = Harness::with_options(
+            NTFY,
+            ReconcilerOptions {
+                container_log: Some(LOG),
+                ..Default::default()
+            },
+        );
+        logged.fake.set_pull_digest(IMAGE, digest('a'));
+        logged.rec.reconcile().await.unwrap();
+        assert_eq!(logged.fake.container_spec("ntfy").unwrap().log, Some(LOG));
+        assert_eq!(
+            logged.fake.containers()[0].log_driver.as_deref(),
+            Some("k8s-file")
+        );
+        assert_eq!(
+            plain.state("ntfy").spec_hash,
+            logged.state("ntfy").spec_hash,
+            "the log setting must not enter spec_hash"
+        );
+    }
+}
+
 mod scraper {
     use super::*;
     use crate::run::RunOptions;

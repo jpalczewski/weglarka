@@ -232,6 +232,8 @@ pub(crate) fn app_container_base(
         healthcheck: None,
         id_mapping: None,
         security: spec.security.clone(),
+        // Set by the callers that create long-lived containers: one-off `run`s keep the host default.
+        log: None,
     }
 }
 
@@ -826,6 +828,7 @@ impl<P: PodmanClient> Reconciler<P> {
         );
         let range = prepared.range;
         prepared.apply(&mut container);
+        container.log = self.options.container_log;
         let started = async {
             self.podman.container_create(&container).await?;
             self.podman.container_start(&name).await
@@ -939,6 +942,7 @@ impl<P: PodmanClient> Reconciler<P> {
             &configs,
         );
         prepared.apply(&mut container);
+        container.log = self.options.container_log;
 
         let failed = |reason: String| Launched {
             hash: hash.clone(),

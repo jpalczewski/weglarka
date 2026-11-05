@@ -258,6 +258,7 @@ mod tests {
             memory_limit: None,
             oom_killed: false,
             conmon_pid: None,
+            log_driver: None,
         }
     }
 

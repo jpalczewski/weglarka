@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{InstanceName, MemoryLimit};
+use crate::app::{ByteSize, InstanceName, MemoryLimit};
 use crate::events::Severity;
+use crate::podman::{ContainerLog, LogDriver};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +130,13 @@ pub struct LogsConfig {
     /// `30` (days) by default; `"unlimited"` keeps the rotated files forever.
     #[serde(default = "LogsConfig::default_retention")]
     pub retention: LogRetention,
+    /// Log driver of the containers Węglarka creates (apps, nginx, forwarder; not `run`/`forward`),
+    /// issue #554, ADR 0074. Absent leaves it to `containers.conf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_driver: Option<LogDriver>,
+    /// Size bound of one container's `k8s-file` log (`"10m"`); invalid with `journald`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_max_size: Option<ByteSize>,
 }
 
 impl LogsConfig {
@@ -149,7 +157,29 @@ impl LogsConfig {
         *self == Self::default()
     }
 
+    /// What the engine and the ingress put on the containers they create; `None` = unset.
+    pub fn container_log(&self) -> Option<ContainerLog> {
+        self.container_driver.map(|driver| ContainerLog {
+            driver,
+            max_size: self.container_max_size.map(ByteSize::bytes),
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        match (self.container_driver, self.container_max_size) {
+            (None, Some(_)) => {
+                return Err(
+                    "[logs] container_max_size needs container_driver = \"k8s-file\"".to_owned(),
+                );
+            }
+            (Some(LogDriver::Journald), Some(_)) => {
+                return Err(
+                    "[logs] container_max_size applies to k8s-file only: journald retention is the host's (journald.conf)"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
         match self.retention {
             LogRetention::Days(days) if !(1..=Self::MAX_DAYS).contains(&days) => Err(format!(
                 "[logs] retention = {days}: expected 1..={} days or \"unlimited\"",
@@ -164,6 +194,8 @@ impl Default for LogsConfig {
     fn default() -> Self {
         Self {
             retention: Self::default_retention(),
+            container_driver: None,
+            container_max_size: None,
         }
     }
 }
@@ -1364,6 +1396,55 @@ kind = "systemd"
                     assert!(error.contains(message), "{src}: {error}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn container_log_settings_parse_and_validate() {
+        let absent = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert_eq!(absent.logs.container_log(), None);
+
+        let cfg = HostConfig::from_toml_str(&format!(
+            "{SAMPLE}\n[logs]\ncontainer_driver = \"k8s-file\"\ncontainer_max_size = \"10m\""
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let log = cfg.logs.container_log().unwrap();
+        assert_eq!(log.driver, LogDriver::K8sFile);
+        assert_eq!(log.max_size, Some(10 << 20));
+        assert!(
+            toml::to_string(&cfg)
+                .unwrap()
+                .contains("container_max_size = \"10m\"")
+        );
+
+        let journald = HostConfig::from_toml_str(&format!(
+            "{SAMPLE}\n[logs]\ncontainer_driver = \"journald\""
+        ))
+        .unwrap();
+        journald.validate().unwrap();
+        assert_eq!(journald.logs.container_log().unwrap().max_size, None);
+
+        for (src, message) in [
+            (
+                "[logs]\ncontainer_driver = \"journald\"\ncontainer_max_size = \"1m\"",
+                "k8s-file only",
+            ),
+            (
+                "[logs]\ncontainer_max_size = \"1m\"",
+                "needs container_driver",
+            ),
+            ("[logs]\ncontainer_driver = \"syslog\"", "unknown variant"),
+            (
+                "[logs]\ncontainer_driver = \"k8s-file\"\ncontainer_max_size = 0",
+                "invalid size",
+            ),
+        ] {
+            let error = match HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}")) {
+                Err(e) => e.to_string(),
+                Ok(host) => host.validate().expect_err(src),
+            };
+            assert!(error.contains(message), "{src}: {error}");
         }
     }
 

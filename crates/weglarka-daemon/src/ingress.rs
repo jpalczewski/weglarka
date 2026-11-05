@@ -621,6 +621,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 // The forwarder and nginx are never given `internal_hosts`: they are the targets.
                 host_aliases: vec![],
                 security,
+                log: self.host.logs.container_log(),
             })
             .await?;
         podman.container_start(FORWARDER_CONTAINER).await?;
@@ -990,6 +991,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 keep_groups: false,
                 host_aliases: vec![],
                 security: nginx_security(),
+                log: self.host.logs.container_log(),
             })
             .await?;
         podman.container_start(NGINX_CONTAINER).await?;

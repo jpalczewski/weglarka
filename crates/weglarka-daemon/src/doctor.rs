@@ -121,6 +121,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
     logs(d, &mut checks);
+    container_logs(d, &mut checks).await;
     acme(d, scan_certificates(d).await.as_deref(), &mut checks);
     generated(d, &mut checks);
     identity_provider(d, &mut checks).await;
@@ -3161,5 +3162,157 @@ port = 80
             stale_group_add(&apps, &found.missing),
             vec!["alloy: systemd-journal".to_owned()]
         );
+    }
+}
+
+/// `logs.container_driver` (issue #554, ADR 0074): only with `[logs] container_driver`. The setting is
+/// not in `spec_hash`, so containers created before it keep their driver until the next create; this
+/// names them. Short-lived `run`/`forward` containers and containers Węglarka did not create are left out.
+async fn container_logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Some(want) = d.host.logs.container_log() else {
+        return;
+    };
+    match d
+        .engine
+        .podman()
+        .container_list(&ContainerFilter::default())
+        .await
+    {
+        Ok(containers) => out.push(container_log_check(want, &containers)),
+        Err(e) => out.push(check(
+            "logs.container_driver",
+            CheckStatus::Warn,
+            format!("cannot list containers: {}", detail(e)),
+            None,
+        )),
+    }
+}
+
+/// The pure part of [`container_logs`].
+fn container_log_check(
+    want: weglarka_model::podman::ContainerLog,
+    containers: &[weglarka_model::podman::ContainerInfo],
+) -> DoctorCheck {
+    use weglarka_model::podman::LogDriver;
+    const ID: &str = "logs.container_driver";
+    let managed = |c: &&weglarka_model::podman::ContainerInfo| {
+        let long_lived = labels_has(c, labels::INSTANCE)
+            || c.name == NGINX_CONTAINER
+            || c.name == FORWARDER_CONTAINER;
+        long_lived && !labels_has(c, labels::RUN) && !labels_has(c, labels::FORWARD)
+    };
+    let mut stale: Vec<&str> = containers
+        .iter()
+        .filter(managed)
+        .filter(|c| {
+            c.log_driver
+                .as_deref()
+                .is_some_and(|d| d != want.driver.as_str())
+        })
+        .map(|c| c.name.as_str())
+        .collect();
+    stale.sort_unstable();
+    let driver = want.driver.as_str();
+    if !stale.is_empty() {
+        let shown = stale.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+        let more = stale.len().saturating_sub(5);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        return check(
+            ID,
+            CheckStatus::Warn,
+            format!(
+                "{} container(s) still use another log driver than {driver}: {shown}{more}",
+                stale.len()
+            ),
+            Some(
+                "the setting applies when a container is created: deploy the app again with --force, or restart the daemon container for nginx and the forwarder",
+            ),
+        );
+    }
+    if want.driver == LogDriver::K8sFile && want.max_size.is_none() {
+        return check(
+            ID,
+            CheckStatus::Warn,
+            "k8s-file logs have no size bound: a chatty container can fill the disk",
+            Some("set [logs] container_max_size (for example \"10m\") and recreate the containers"),
+        );
+    }
+    ok(ID, format!("containers use the {driver} log driver"))
+}
+
+fn labels_has(c: &weglarka_model::podman::ContainerInfo, key: &str) -> bool {
+    c.labels.contains_key(key)
+}
+
+#[cfg(test)]
+mod container_log_tests {
+    use super::*;
+    use weglarka_model::podman::{ContainerInfo, ContainerLog, ContainerState, LogDriver};
+
+    fn container(name: &str, labels: &[&str], driver: Option<&str>) -> ContainerInfo {
+        ContainerInfo {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            image: String::new(),
+            image_id: String::new(),
+            labels: labels
+                .iter()
+                .map(|l| ((*l).to_owned(), String::new()))
+                .collect(),
+            state: ContainerState::Running,
+            exit_code: None,
+            health: None,
+            restarts: 0,
+            started_at: None,
+            networks: vec![],
+            addresses: vec![],
+            published_ports: vec![],
+            memory_limit: None,
+            oom_killed: false,
+            conmon_pid: None,
+            log_driver: driver.map(str::to_owned),
+        }
+    }
+
+    const FILE: ContainerLog = ContainerLog {
+        driver: LogDriver::K8sFile,
+        max_size: Some(10 << 20),
+    };
+
+    #[test]
+    fn names_only_long_lived_containers_with_another_driver() {
+        let list = [
+            container("a", &[labels::INSTANCE], Some("journald")),
+            container("b", &[labels::INSTANCE], Some("k8s-file")),
+            container(
+                "wg-run.a.1",
+                &[labels::INSTANCE, labels::RUN],
+                Some("journald"),
+            ),
+            container("foreign", &[], Some("journald")),
+            container(NGINX_CONTAINER, &[], Some("journald")),
+        ];
+        let c = container_log_check(FILE, &list);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.message.contains("2 container(s)"), "{}", c.message);
+        assert!(c.message.contains("a, weglarka-nginx"), "{}", c.message);
+    }
+
+    #[test]
+    fn warns_on_an_unbounded_file_driver_and_is_ok_otherwise() {
+        let list = [container("a", &[labels::INSTANCE], Some("k8s-file"))];
+        let unbounded = ContainerLog {
+            max_size: None,
+            ..FILE
+        };
+        assert_eq!(
+            container_log_check(unbounded, &list).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(container_log_check(FILE, &list).status, CheckStatus::Ok);
     }
 }

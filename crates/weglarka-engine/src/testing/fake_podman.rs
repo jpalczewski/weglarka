@@ -361,6 +361,7 @@ impl FakePodman {
                 memory_limit: None,
                 oom_killed: false,
                 conmon_pid: None,
+                log_driver: None,
             },
         );
     }
@@ -787,6 +788,13 @@ impl PodmanClient for FakePodman {
                 memory_limit: spec.resources.memory.map(|m| m.bytes()),
                 oom_killed: false,
                 conmon_pid: None,
+                // libpod always reports a driver; an unset one is `containers.conf`'s, which the
+                // fake models as the journald default.
+                log_driver: Some(
+                    spec.log
+                        .map_or("journald", |log| log.driver.as_str())
+                        .to_owned(),
+                ),
             },
         );
         Ok(id)

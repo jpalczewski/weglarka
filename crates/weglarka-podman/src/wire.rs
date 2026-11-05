@@ -175,6 +175,18 @@ pub(crate) struct CreateContainer<'a> {
     /// `["git.example.org:host-gateway"]` reaches what the host publishes on all its IPv4 addresses.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hostadd: Vec<String>,
+    /// `SpecGenerator.log_configuration`; omitted unless the spec picks a driver, so the request
+    /// stays byte-for-byte what it was and `containers.conf` decides (ADR 0074).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_configuration: Option<LogConfiguration>,
+}
+
+/// libpod's `LogConfigLibpod`. `size` is the `--log-opt max-size` in bytes (`k8s-file` only).
+#[derive(Serialize)]
+struct LogConfiguration {
+    driver: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
 }
 
 /// Options of a tmpfs mount from `security.tmpfs` (writable, no devices or setuid).
@@ -463,6 +475,10 @@ impl<'a> CreateContainer<'a> {
                 .iter()
                 .map(|domain| format!("{domain}:{HOST_GATEWAY}"))
                 .collect(),
+            log_configuration: spec.log.map(|log| LogConfiguration {
+                driver: log.driver.as_str(),
+                size: log.max_size,
+            }),
         }
     }
 }
@@ -511,6 +527,15 @@ pub(crate) struct InspectContainer {
 struct InspectHostConfig {
     /// Memory limit in bytes; `0` = none.
     memory: u64,
+    log_config: InspectLogConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+struct InspectLogConfig {
+    /// Driver name as libpod stored it (`journald`, `k8s-file`, …); empty when it reports none.
+    #[serde(rename = "Type")]
+    kind: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -637,6 +662,8 @@ impl InspectContainer {
             conmon_pid: u32::try_from(self.state.conmon_pid)
                 .ok()
                 .filter(|pid| *pid > 0),
+            log_driver: (!self.host_config.log_config.kind.is_empty())
+                .then_some(self.host_config.log_config.kind),
         }
     }
 }
@@ -1948,5 +1975,48 @@ mod tests {
         spec.keep_groups = false;
         let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
         assert!(body.get("annotations").is_none());
+    }
+
+    /// `log_configuration` appears only when the spec picks a driver (ADR 0074); `size` only for a bound.
+    #[test]
+    fn create_container_log_configuration() {
+        use weglarka_model::podman::{ContainerLog, LogDriver};
+        let mut spec = ContainerSpec::new("a", "i");
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert!(body.get("log_configuration").is_none(), "{body}");
+        spec.log = Some(ContainerLog {
+            driver: LogDriver::Journald,
+            max_size: None,
+        });
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(
+            body["log_configuration"],
+            serde_json::json!({"driver": "journald"})
+        );
+        spec.log = Some(ContainerLog {
+            driver: LogDriver::K8sFile,
+            max_size: Some(10 << 20),
+        });
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert_eq!(
+            body["log_configuration"],
+            serde_json::json!({"driver": "k8s-file", "size": 10_485_760})
+        );
+    }
+
+    #[test]
+    fn inspect_reads_the_log_driver() {
+        let info = |json: &str| {
+            serde_json::from_str::<InspectContainer>(json)
+                .unwrap()
+                .into_domain()
+        };
+        assert_eq!(
+            info(r#"{"HostConfig":{"LogConfig":{"Type":"k8s-file","Size":"10MB"}}}"#)
+                .log_driver
+                .as_deref(),
+            Some("k8s-file")
+        );
+        assert_eq!(info("{}").log_driver, None);
     }
 }
