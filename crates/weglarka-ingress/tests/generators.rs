@@ -2953,6 +2953,20 @@ fn oauth_discovery_paths_are_claims_on_every_domain_of_the_app() {
         matches!(&err, IngressError::PathConflict { path_a, path_b, .. } if path_a == "/mcp" || path_b == "/mcp"),
         "{err}"
     );
+    // An app without resources that owns the legacy discovery path exactly collides with the
+    // redirect, whichever of the two apps the plan sees first.
+    for name in ["aaa", "zzz"] {
+        let err = gen_(&format!(
+            "[apps.{name}]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/.well-known/oauth-authorization-server\"]\nport = 3001\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, IngressError::PathConflict { path_a, path_b, .. }
+                if path_a == "/.well-known/oauth-authorization-server"
+                    && path_b == "/.well-known/oauth-authorization-server"),
+            "{name}: {err}"
+        );
+    }
     // Two resources on one domain, each inside its own app's prefix, are fine.
     let a = apps(
         "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\

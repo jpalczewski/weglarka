@@ -450,6 +450,10 @@ impl<'a> Plan<'a> {
         let webhook_domain = Domain::new(host.webhook.domain.clone())?;
         // Who claimed which prefix on a domain; the webhook domain is exclusive (no entry to share).
         let mut claimed: BTreeMap<Domain, Vec<(&InstanceName, PathPrefix)>> = BTreeMap::new();
+        // Domains whose servers render the legacy authorization server redirect, and the first
+        // resource app that claimed it there (#215, ADR 0078).
+        let mut discovery_claimed: BTreeMap<Domain, &InstanceName> = BTreeMap::new();
+        let authorization_server = PathPrefix::new(OAUTH_AUTHORIZATION_SERVER_PATH)?;
         let mut routes = Vec::new();
 
         for (instance, spec) in apps {
@@ -517,14 +521,9 @@ impl<'a> Plan<'a> {
                     .collect::<Result<Vec<_>, _>>()?,
             );
             // The legacy discovery path is one redirect per server, so two resource apps on one domain
-            // both claim it without a conflict; every other overlap with it still is one.
-            let discovery = if oauth_resources.is_empty() {
-                None
-            } else {
-                let path = PathPrefix::new(OAUTH_AUTHORIZATION_SERVER_PATH)?;
-                claims.push(path.clone());
-                Some(path)
-            };
+            // share it; it is tracked apart from `claims` (`discovery_claimed`), so any other claim
+            // that overlaps it is a conflict whichever app comes first.
+            let discovery = !oauth_resources.is_empty();
             // Only an app served at `/` can carve a location out of its catch-all, like the
             // streaming and exempt paths above.
             let admin_relay = paths.len() == 1
@@ -560,9 +559,7 @@ impl<'a> Plan<'a> {
                     .chain(admin_relay.then_some(&relay))
                     .chain(&claims)
                 {
-                    if let Some((other, other_path)) = others
-                        .iter()
-                        .find(|(_, q)| path.overlaps(q) && Some(q) != discovery.as_ref())
+                    if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
                     {
                         // Two catch-alls are the pre-#130 "domain already taken" case.
                         if path.is_root() && other_path.is_root() {
@@ -577,15 +574,45 @@ impl<'a> Plan<'a> {
                         });
                     }
                 }
-                others.extend(
+                // The legacy discovery redirect of a resource app (#215, ADR 0078) against every
+                // other claim on the domain, in both directions.
+                let own = || {
                     paths
                         .iter()
                         .chain(&streaming)
                         .chain(auth_exempt.iter().map(|e| &e.path))
                         .chain(admin_relay.then_some(&relay))
                         .chain(&claims)
-                        .map(|p| (instance, p.clone())),
-                );
+                };
+                let conflict = if discovery {
+                    others
+                        .iter()
+                        .find(|(_, q)| q.overlaps(&authorization_server))
+                        .map(|(other, q)| {
+                            ((*other).clone(), q.clone(), authorization_server.clone())
+                        })
+                } else {
+                    None
+                };
+                let conflict = conflict.or_else(|| {
+                    let other = discovery_claimed.get(&domain)?;
+                    own()
+                        .find(|p| p.overlaps(&authorization_server))
+                        .map(|p| ((*other).clone(), authorization_server.clone(), p.clone()))
+                });
+                if let Some((other, path_a, path_b)) = conflict {
+                    return Err(IngressError::PathConflict {
+                        domain: raw.clone(),
+                        a: other,
+                        path_a: path_a.to_string(),
+                        b: instance.clone(),
+                        path_b: path_b.to_string(),
+                    });
+                }
+                if discovery {
+                    discovery_claimed.entry(domain.clone()).or_insert(instance);
+                }
+                others.extend(own().map(|p| (instance, p.clone())));
                 domains.push(domain);
             }
             domains.sort();
