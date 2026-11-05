@@ -45,6 +45,11 @@ a site has no upstream to apply them to.
    never a mixture.
 4. The previous release stays on disk next to the new one; older releases are removed.
 
+A served site has no container, so its runtime state is `serving` (`runtime: "serving"` in the API, `serving` in the
+CLI): `apps show` and `apps list` would otherwise call a site that is up `missing`. A site that is pinned but whose
+`current` link is gone or points at another release is `missing`, and `weglarka doctor` reports it once, in
+`sites.current` (the container drift check does not repeat it).
+
 A deploy whose digest already has a complete release on disk does not export the image again — it only switches
 `current`. Redeploying the previous release therefore does not need the image store or the registry (both
 `weglarka apps rollback` and `weglarka promote --rollback` use the same path); with `--force` and the same digest
@@ -76,7 +81,8 @@ rejected, its partial directory is removed and `current` stays untouched.
 - `sites.current` — for every static app with a pinned digest, `current` points at `releases/<digest-prefix>` and that
   release has the required files (`index.html` and a configured `not_found_page`). A broken link is a warning;
   `weglarka deploy <app> --force` switches `current` (re-exporting the image only when the release is missing or
-  incomplete).
+  incomplete). It is the one place a broken link is reported: the site shows as `missing`, but `state.drift` stays
+  quiet so the same problem is not listed twice.
 
 ## Per-site options
 

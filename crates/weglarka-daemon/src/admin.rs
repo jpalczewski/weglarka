@@ -1,6 +1,7 @@
 //! Admin API (axum) on a unix socket. Paths and methods come from `weglarka_api::endpoints`.
 
 use std::collections::BTreeMap;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +27,9 @@ use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
 use weglarka_engine::deploy::ReloadOutcome;
 use weglarka_engine::reconcile::EngineError;
 use weglarka_engine::run::{RunOptions, RunOutcome};
+use weglarka_engine::sites::served_release;
 use weglarka_engine::volumes::RemoveAppOptions;
-use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::app::{AppKind, AppSpec, InstanceName};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, LogChunk, LogSource, PodmanClient,
@@ -308,18 +310,51 @@ pub(crate) fn runtime_state(c: Option<&ContainerInfo>) -> RuntimeState {
     }
 }
 
-/// Runtime state that also knows the `start = false` intent: a provisioned app has a pinned digest
-/// but no container, i.e. Podman reports it as `Missing` while the spec says "not started by
-/// design" — [`RuntimeState::NotStarted`]. Everything else falls back to [`runtime_state`].
+/// Runtime state that also knows the intents that leave no container: a provisioned app
+/// (`start = false`, [`RuntimeState::NotStarted`]) and a `kind = "static"` site that serves the
+/// release of its pinned digest ([`RuntimeState::Serving`], issue #547). Everything else falls back
+/// to [`runtime_state`].
+///
+/// `served` is [`served_flag`]'s answer: `None` unless the spec is static, so a caller without the
+/// sites root reports a static app as `Missing` rather than claiming it is served.
 pub(crate) fn runtime_state_for(
     spec: &AppSpec,
     state: Option<&AppState>,
     container: Option<&ContainerInfo>,
+    served: Option<bool>,
 ) -> RuntimeState {
     match (container, state) {
+        // A static site has no container by design (ADR 0049): `current` pointing at the release of
+        // the pinned digest *is* its deploy. One that does not serve anything stays `Missing`;
+        // doctor's `sites.current` says why.
+        (None, _) if spec.kind == AppKind::Static => {
+            if served == Some(true) {
+                RuntimeState::Serving
+            } else {
+                RuntimeState::Missing
+            }
+        }
         (None, Some(s)) if !spec.start && s.current.is_some() => RuntimeState::NotStarted,
         _ => runtime_state(container),
     }
+}
+
+/// The served-release flag [`runtime_state_for`] needs (issue #547): `None` for a `kind =
+/// "container"` app, `Some(serving)` for a static site — whether `current` serves the release of its
+/// pinned digest (false when it was never deployed or does not serve it).
+///
+/// Reads one symlink, so it is synchronous and local; no libpod call is involved.
+fn served_flag(
+    sites_root: &FsPath,
+    name: &InstanceName,
+    spec: &AppSpec,
+    state: Option<&AppState>,
+) -> Option<bool> {
+    (spec.kind == AppKind::Static).then(|| {
+        state
+            .and_then(|s| s.current.as_ref())
+            .is_some_and(|digest| served_release(sites_root, name, spec, digest).is_served())
+    })
 }
 
 async fn containers_by_instance<P: PodmanClient>(
@@ -343,6 +378,7 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
     let apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
     let st = state::load_state(&d.paths.state.state).map_err(Fail::internal)?;
     let containers = containers_by_instance(d).await;
+    let sites_root = d.paths.sites_root();
     Ok(apps
         .apps
         .iter()
@@ -357,7 +393,12 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
                 domains: spec.domains.clone(),
                 // Podman unavailable → unknown; `Missing` + a log warning (details: doctor).
                 runtime: update::with_waiting(
-                    runtime_state_for(spec, app_state, container),
+                    runtime_state_for(
+                        spec,
+                        app_state,
+                        container,
+                        served_flag(&sites_root, name, spec, app_state),
+                    ),
                     app_state,
                 ),
                 digest: app_state.and_then(|s| s.current.clone()),
@@ -432,6 +473,7 @@ async fn show_app<P: PodmanClient + 'static>(
         }
     }
     let app_state = st.apps.get(&name);
+    let served = served_flag(&d.paths.sites_root(), &name, &spec, app_state);
     // Only an `admin` caller learns it (the redacted view is the read-scope allowlist).
     let reconciled = match access {
         Access::Redacted => None,
@@ -445,7 +487,14 @@ async fn show_app<P: PodmanClient + 'static>(
         configs,
         host_mounts,
         reconciled,
-        ..show_response(access, name.clone(), spec, app_state, container.as_ref())
+        ..show_response(
+            access,
+            name.clone(),
+            spec,
+            app_state,
+            container.as_ref(),
+            served,
+        )
     }))
 }
 
@@ -562,12 +611,14 @@ pub(crate) async fn view_after_mutation<P: PodmanClient + 'static>(
         .await
         .ok();
     let app_state = st.apps.get(&name);
+    let served = served_flag(&d.paths.sites_root(), &name, &spec, app_state);
     Ok(show_response(
         access,
         name,
         spec,
         app_state,
         container.as_ref(),
+        served,
     ))
 }
 

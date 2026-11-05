@@ -20,10 +20,6 @@ expression: parsed
           "path": "/config.json"
         }
       ],
-      "health": {
-        "attempts": 5,
-        "window_secs": 30
-      },
       "auto_update": true
     }
   }

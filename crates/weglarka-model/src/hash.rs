@@ -400,6 +400,13 @@ env = { B = "2", A = "1" }
             base,
             hash(&|s| s.health.http = Some(crate::app::HttpProbe::default()))
         );
+        // The gate defaults are what an absent `health` field means: writing them explicitly (or
+        // omitting them from `apps.toml`, issue #547) must not recreate a container.
+        assert_eq!(
+            base,
+            hash(&|s| s.health = crate::app::HealthGate::default()),
+            "the default gate hashes as before"
+        );
     }
 
     #[test]

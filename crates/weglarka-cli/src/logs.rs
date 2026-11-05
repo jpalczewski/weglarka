@@ -669,6 +669,8 @@ pub async fn run(json: bool, o: &Overrides, a: LogsArgs) -> Result<i32, CliError
             let names: Vec<String> = list
                 .apps
                 .iter()
+                // Only an app with a container has container logs; a `kind = "static"` site is
+                // `Serving` without one (issue #547), so it is not picked here.
                 .filter(|app| {
                     matches!(app.runtime, RuntimeState::Running | RuntimeState::Unhealthy)
                 })

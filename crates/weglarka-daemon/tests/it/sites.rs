@@ -325,7 +325,69 @@ async fn doctor_warns_about_a_current_release_that_does_not_match_state() {
     h.running.stop().await;
 }
 
-// ── `apps rollback` (issue #103) ─────────────────────────────────────────────
+// ── `runtime` and drift of a static site (issue #547) ─────────────────────────
+
+/// A static site has no container by design, so after a successful deploy `apps show`/`apps list`
+/// report `serving` and `doctor` sees no drift.
+#[tokio::test]
+async fn a_static_site_that_serves_its_pinned_release_is_serving() {
+    let h = served_release_harness(false).await;
+    let (status, show) = admin(&h, "GET", "/v1/apps/blog", None).await;
+    assert_eq!(status, StatusCode::OK, "{show}");
+    assert_eq!(show["runtime"], "serving", "{show}");
+    // `health` is rejected in a static spec, so the default gate must not show up as if it were one.
+    assert!(show["spec"].get("health").is_none(), "{show}");
+    assert!(show["health"].is_null(), "{show}");
+
+    let (status, list) = admin(&h, "GET", "/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["apps"][0]["runtime"], "serving", "{list}");
+
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let drift = doctor_check(&report, "state.drift").expect("state.drift reported");
+    assert_eq!(drift["status"], "ok", "{drift}");
+    let current = doctor_check(&report, "sites.current").expect("sites.current reported");
+    assert_eq!(current["status"], "ok", "{current}");
+    h.running.stop().await;
+}
+
+/// A pinned static site whose `current` is gone (or points elsewhere) is `missing`, and doctor says
+/// so once: in `sites.current`, not again as drift.
+#[tokio::test]
+async fn a_static_site_that_does_not_serve_its_pinned_release_is_missing() {
+    let h = served_release_harness(false).await;
+    std::fs::remove_file(blog_site(&h).join("current")).unwrap();
+
+    let (_, show) = admin(&h, "GET", "/v1/apps/blog", None).await;
+    assert_eq!(show["runtime"], "missing", "{show}");
+    let (_, list) = admin(&h, "GET", "/v1/apps", None).await;
+    assert_eq!(list["apps"][0]["runtime"], "missing", "{list}");
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let drift = doctor_check(&report, "state.drift").expect("state.drift reported");
+    assert_eq!(drift["status"], "ok", "{drift}");
+    let current = doctor_check(&report, "sites.current").expect("sites.current reported");
+    assert_eq!(current["status"], "warn", "{current}");
+    assert!(
+        current["message"].as_str().unwrap().contains("blog"),
+        "{current}"
+    );
+
+    // `current` pointing at another (complete) release is the same verdict.
+    let other = install_release_at(&h.root, 'c', "three");
+    point_current_at(&h.root, &other);
+    let (_, show) = admin(&h, "GET", "/v1/apps/blog", None).await;
+    assert_eq!(show["runtime"], "missing", "{show}");
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let current = doctor_check(&report, "sites.current").expect("sites.current reported");
+    assert_eq!(current["status"], "warn", "{current}");
+    assert!(
+        current["message"].as_str().unwrap().contains("expected"),
+        "{current}"
+    );
+    h.running.stop().await;
+}
+
+// ── `apps rollback` (issue #103) ─────────────────────────────────────────────────
 
 fn digest_of(c: char) -> Digest {
     Digest::new(blog_digest_for(c)).unwrap()

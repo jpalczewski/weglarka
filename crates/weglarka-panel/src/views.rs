@@ -43,11 +43,13 @@ fn humanize(name: &str) -> String {
 
 pub fn runtime_badge(state: RuntimeState) -> Badge {
     let class = match state {
-        RuntimeState::Running => "ok",
+        RuntimeState::Running | RuntimeState::Serving => "ok",
         RuntimeState::Unhealthy => "fail",
         RuntimeState::Missing => "fail",
         RuntimeState::Stopped | RuntimeState::NotStarted => "muted",
         RuntimeState::WaitingForSecret => "warn",
+        // A state from a newer daemon: not a problem we can name, so no verdict.
+        RuntimeState::Unknown => "muted",
     };
     Badge::new(class, humanize(&name_of(&state)))
 }

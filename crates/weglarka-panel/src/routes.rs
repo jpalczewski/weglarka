@@ -260,7 +260,11 @@ pub async fn dashboard(req: Req) -> Response {
     let running = status
         .apps
         .iter()
-        .filter(|a| a.runtime == RuntimeState::Running)
+        .filter(|a| {
+            // A static site serving its release is up: it has no container, but visitors get the
+            // site (issue #547).
+            matches!(a.runtime, RuntimeState::Running | RuntimeState::Serving)
+        })
         .count();
     let attention = status
         .apps

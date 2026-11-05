@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
-use weglarka_engine::sites::{ReleaseGate, SiteReleases, release_id};
+use weglarka_engine::sites::{ServedRelease, release_id, served_release};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::{IngressMode, LogRetention};
 use weglarka_model::labels;
@@ -504,7 +504,7 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
     let in_flight = d.engine.in_flight();
     let mut problems = Vec::new();
     let mut active = Vec::new();
-    for name in apps.apps.keys() {
+    for (name, spec) in &apps.apps {
         if let Some(a) = in_flight.as_ref()
             && &a.instance == name
         {
@@ -512,10 +512,11 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
             continue;
         }
         let app_state = st.apps.get(name);
+        let pinned = app_state.and_then(|s| s.current.as_ref());
         let container = containers
             .iter()
             .find(|c| c.name == labels::container_name(name));
-        match (app_state.and_then(|s| s.current.as_ref()), container) {
+        match (pinned, container) {
             (None, _) => match app_state.and_then(|s| s.failed.as_ref()) {
                 Some(failed) => problems.push(format!(
                     "{name}: first deploy failed: {}",
@@ -523,6 +524,10 @@ async fn desired_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck
                 )),
                 None => problems.push(format!("{name}: not deployed yet")),
             },
+            // A static site has no container by design (ADR 0049): `current` pointing at the release
+            // of the pinned digest *is* the deploy (issue #547). A link that is broken or points
+            // elsewhere is `sites.current`'s to report, so it is not repeated here.
+            (Some(_), None) if spec.kind == AppKind::Static => {}
             (Some(_), None) => problems.push(format!("{name}: missing container")),
             (Some(_), Some(c)) => {
                 if c.state != ContainerState::Running {
@@ -915,7 +920,7 @@ fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     if !apps.apps.values().any(|spec| spec.kind == AppKind::Static) {
         return;
     }
-    let root = d.paths.nginx_conf_dir.join("sites");
+    let root = d.paths.sites_root();
     let hint = "create the directory writable by the runtime user, or deploy a site once (the daemon creates it)";
     out.push(match std::fs::metadata(&root) {
         Err(e) => check(
@@ -1032,7 +1037,7 @@ fn sites_current<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         return;
     }
     let st = state::load_state(&d.paths.state.state).unwrap_or_default();
-    let root = d.paths.nginx_conf_dir.join("sites");
+    let root = d.paths.sites_root();
     let mut checked = 0usize;
     let mut broken = Vec::new();
     for (name, spec) in static_apps {
@@ -1041,18 +1046,13 @@ fn sites_current<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         };
         checked += 1;
         let id = release_id(digest);
-        let releases = SiteReleases::new(root.join(name.as_str()));
-        let gate = ReleaseGate::for_spec(spec);
-        match releases.current_id() {
-            Some(link) if link == id => {
-                if let Err(e) = gate.check(&releases.release_dir(&id)) {
-                    broken.push(format!("{name}: releases/{id}: {e}"));
-                }
-            }
-            Some(link) => broken.push(format!(
+        match served_release(&root, name, spec, digest) {
+            ServedRelease::Served => {}
+            ServedRelease::Incomplete(e) => broken.push(format!("{name}: releases/{id}: {e}")),
+            ServedRelease::Other(link) => broken.push(format!(
                 "{name}: current -> releases/{link}, expected releases/{id}"
             )),
-            None => broken.push(format!(
+            ServedRelease::NoCurrent => broken.push(format!(
                 "{name}: current does not point at a release (expected releases/{id})"
             )),
         }

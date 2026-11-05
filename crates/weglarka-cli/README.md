@@ -76,6 +76,12 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   turns a live `start = true` into `false` (a provisioning spec file reused for `--spec`, or `--no-start`) with a
   usage error, naming the effect; `--allow-stop` writes it anyway, and `apps start`/`apps stop` are unaffected
   (issue #462).
+- A `kind = "static"` site ([static sites](../../docs/guides/static-sites.md)) has no container at all: `status`,
+  `apps list` and `apps show` report it as `serving` (`serving` in JSON) while `current` points at the release of its
+  pinned digest, and as `missing` when it does not (doctor's `sites.current` says why). `health` is rejected in a
+  static spec, so such a spec never carries one; a **default** gate (`attempts = 5`, `window_secs = 30`, no probe) is
+  omitted from every spec — `apps.toml`, `apps show`/`--json` and `--spec` round-trips included — because that is what
+  an absent field means.
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
 - Secrets: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
   is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes). `secrets remove

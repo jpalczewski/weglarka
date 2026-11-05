@@ -74,8 +74,7 @@ impl<P: PodmanClient> Reconciler<P> {
         digest: &Digest,
     ) -> bool {
         self.options.sites.as_ref().is_none_or(|sites| {
-            SiteReleases::new(sites.root.join(instance.as_str()))
-                .serves(&release_id(digest), &ReleaseGate::for_spec(spec))
+            crate::sites::served_release(&sites.root, instance, spec, digest).is_served()
         })
     }
 

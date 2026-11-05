@@ -5,4 +5,6 @@ mod extract;
 mod releases;
 
 pub use extract::{ExtractLimits, ExtractReport, SiteError, extract_release};
-pub use releases::{ReleaseError, ReleaseGate, SiteReleases, release_id};
+pub use releases::{
+    ReleaseError, ReleaseGate, ServedRelease, SiteReleases, release_id, served_release,
+};
