@@ -12,7 +12,7 @@ use hyper::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use weglarka_daemon::github::{DELIVERY_HEADER, EVENT_HEADER, SIGNATURE_HEADER, sign};
-use weglarka_daemon::{Settings, start};
+use weglarka_daemon::{Running, Settings, start};
 use weglarka_engine::testing::{Call, FakePodman};
 use weglarka_model::config::HostConfig;
 use weglarka_model::podman::PodmanClient;
@@ -947,4 +947,121 @@ async fn acme_dns_refuses_to_start_with_a_world_readable_or_missing_token() {
     .err()
     .expect("a missing token file must stop the daemon");
     assert!(err.to_string().contains("[acme.dns] token_file"), "{err}");
+}
+
+const VALID_PEM: &str = include_str!("fixtures/valid-until-2200.pem");
+const EXPIRED_PEM: &str = include_str!("fixtures/expired-2021.pem");
+
+/// A certificate pair as the ingress serves it: `<stem>.crt` plus `<stem>.key`.
+fn seed_pair(tls: &Path, stem: &str, chain: &str) {
+    std::fs::create_dir_all(tls).unwrap();
+    std::fs::write(tls.join(format!("{stem}.crt")), chain).unwrap();
+    std::fs::write(tls.join(format!("{stem}.key")), "key").unwrap();
+}
+
+/// The `checks` array of a running daemon's doctor report.
+async fn doctor_report(running: &Running<FakePodman>) -> Vec<Value> {
+    let (status, v) = admin_running(running, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    v["checks"].as_array().unwrap().clone()
+}
+
+/// The `acme.shadowed` check of a running daemon, or `None` when the report has no such check.
+async fn acme_shadowed(running: &Running<FakePodman>) -> Option<Value> {
+    doctor_report(running)
+        .await
+        .into_iter()
+        .find(|c| c["id"] == "acme.shadowed")
+}
+
+#[tokio::test]
+async fn doctor_reports_own_pairs_that_shadow_a_valid_wildcard() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let token = dir.path().join("cf-token");
+    std::fs::write(&token, "cf-secret-token\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let running = start(
+        edge_settings_with(dir.path(), &acme_dns_section(&token)),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+
+    // A pair carried over from another proxy for the webhook domain, next to a valid wildcard that
+    // covers it (issue #210). nginx keeps serving the own pair, so the hint only names the files.
+    let tls = running.daemon.ingress.tls_dir();
+    seed_pair(&tls, "hooks.example.eu", VALID_PEM);
+    seed_pair(&tls, "_wildcard.example.eu", VALID_PEM);
+
+    let checks = doctor_report(&running).await;
+    let check = |id: &str| {
+        checks
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} check"))
+    };
+    let shadowed = check("acme.shadowed");
+    assert_eq!(shadowed["status"], "info", "{shadowed}");
+    assert_eq!(
+        shadowed["message"],
+        "own certificate pair(s) shadow a valid wildcard: hooks.example.eu (by *.example.eu)"
+    );
+    assert!(
+        shadowed["hint"]
+            .as_str()
+            .unwrap()
+            .contains("delete tls/<domain>.crt"),
+        "{shadowed}"
+    );
+    // The own pair is still what nginx serves: `acme.certs` and `ingress.tls` do not change.
+    assert_eq!(check("acme.certs")["status"], "ok", "{shadowed}");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_reports_no_shadowing_without_a_valid_wildcard_or_a_dns_solver() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // An own pair next to an expired wildcard: nothing is shadowed.
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let token = dir.path().join("cf-token");
+    std::fs::write(&token, "cf-secret-token\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let running = start(
+        edge_settings_with(dir.path(), &acme_dns_section(&token)),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+    let tls = running.daemon.ingress.tls_dir();
+    seed_pair(&tls, "hooks.example.eu", VALID_PEM);
+    seed_pair(&tls, "_wildcard.example.eu", EXPIRED_PEM);
+    assert!(acme_shadowed(&running).await.is_none());
+    running.stop().await;
+
+    // No `[acme.dns]`: there is no wildcard to shadow.
+    let dir = tempfile::Builder::new()
+        .prefix("wg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = start(
+        edge_settings_with(
+            dir.path(),
+            "[acme]\naccept_terms = true\ndirectory_url = \"https://acme.invalid/directory\"\n",
+        ),
+        FakePodman::new(),
+    )
+    .await
+    .unwrap();
+    let tls = running.daemon.ingress.tls_dir();
+    seed_pair(&tls, "hooks.example.eu", VALID_PEM);
+    seed_pair(&tls, "_wildcard.example.eu", VALID_PEM);
+    assert!(acme_shadowed(&running).await.is_none());
+    running.stop().await;
 }

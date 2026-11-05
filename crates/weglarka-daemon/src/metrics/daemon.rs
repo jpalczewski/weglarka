@@ -314,6 +314,7 @@ mod tests {
             wildcard: false,
             not_after,
             covered_by: covered_by.map(str::to_owned),
+            shadowed_by: None,
         };
         let certs = vec![
             cert("a.example.com", Some(at), None),
@@ -325,6 +326,7 @@ mod tests {
                 wildcard: true,
                 not_after: Some(wild),
                 covered_by: None,
+                shadowed_by: None,
             },
         ];
         assert_eq!(
