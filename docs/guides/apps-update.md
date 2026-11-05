@@ -20,11 +20,41 @@ When the daemon is busy with another deploy (the health gate can take tens of se
 | `--shared-network` (`shared_networks` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container — see [shared networks](shared-networks.md) |
 | image (`apps update <app> <image>`) | deploys immediately: pull, health gate, rollback on failure |
 | `--auto-update` / `--no-auto-update` | write only; affects subsequent webhooks |
-| `--start` / `--no-start` (`start` in `--spec`) | `start = false` removes the container (the volume and UID range stay), `start = true` deploys immediately: pull, health gate, rollback on failure. `spec-hash` unchanged — see [stopped apps](stopped-apps.md) |
+| `--start` / `--no-start` (`start` in `--spec`) | `start = false` removes the container (the volume and UID range stay), `start = true` deploys immediately: pull, health gate, rollback on failure. `spec-hash` unchanged — see [stopped apps](stopped-apps.md). A write that turns `start` off on a running app is refused without `--allow-stop` — see below |
 | `--command` (`command` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the flags replace the whole argument vector, and `--command none` restores the image's `CMD` — see [container command](container-command.md) |
 | `--host-port` (`host_ports` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the published port is recreated together with the container — see [host ports](host-ports.md) |
 | `internal_hosts` in `--spec` (no flag) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the `/etc/hosts` entries are fixed when it is created — see [reaching your own domains](internal-hosts.md) |
 | `--config-mount` (`configs` in `--spec`), `--reload-signal` | the `configs` list changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); file **contents** are not in the hash, so apply content changes with `weglarka apps reload`. `reload_signal` is outside the hash and only affects reload — see [host configs](host-configs.md) |
+
+## `start` in a spec file is persisted desired state
+
+`start` is not an option of `apps add`: it is the desired state that the reconciler converges to (see
+[stopped apps](stopped-apps.md)). A spec file written for provisioning — `start = false`, so that the first `apps add`
+creates the volumes, the UID range and the pinned digest but no container — therefore still means "stopped" when the same
+file is reused for `apps update --spec`, and that update would take a running app down. The flip is not part of
+`spec-hash` either, so nothing else in the output would hint at it.
+
+`apps update` therefore refuses a write that turns `start` from `true` (the live spec) to `false` (the new spec):
+
+```console
+$ weglarka apps update web --spec provisioning.toml
+error: this stops web: the new spec sets `start = false`
+hint: pass `--allow-stop` if that is intended, or stop the app explicitly with `weglarka apps stop web`
+```
+
+- The refusal covers both forms: a spec file (`--spec`) and the flag edit (`--no-start`). It is decided from the specs
+  alone — a running app loses its container, and one whose container is `stopped`/`missing` (with `start = true`, so the
+  reconciler would restart it) would never come back. Nothing is sent: the check runs after the current spec is read and
+  before the `PUT`, with exit code 64.
+- `--allow-stop` writes the spec as it is. On its own it is not an edit (`nothing to change`).
+- `weglarka apps stop <app>` / `weglarka apps start <app>` are the explicit way to flip the flag and are not affected by
+  the guard.
+- Keeping one spec file for provisioning and updates: remove the `start = false` line once the app is meant to run, or
+  keep a separate file for provisioning.
+- `--dry-run` never fails on this: `start` appears in the spec diff (`+ start = false`) and the run prints
+  `would stop web (start: true -> false): a real run is refused without --allow-stop`. In JSON the additive field is
+  `would_stop: true`, absent when the write stops nothing.
+- `weglarka apps diff <app> --spec file.toml` is unchanged: the same diff, exit code 8 when it differs.
 
 ## Waiting for the result: `--wait`
 

@@ -23,7 +23,8 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   purge flags are part of the printed path (`?purge_volumes=true&purge_secrets=true`). The secret value
   is masked.
 - `apps update <name>`: read-modify-write of the whole spec (`GET`, apply flags, `PUT`); `--dry-run` shows the
-  diff (`{"dry_run","method","path","changed","diff","body"}`), a no-op sends nothing (`{"changed":false,…}`).
+  diff (`{"dry_run","method","path","changed","diff","body"}`, plus `"would_stop":true` when the write would
+  stop a running app — issue #462), a no-op sends nothing (`{"changed":false,…}`).
   Output: `UpdateAppResponse`; exit 6 when the image change was rolled back. A spec bound to unset secrets shows
   runtime `waiting-for-secret` (`waiting_for_secret` in JSON) with `state.waiting_for_secrets`.
 - Spec flags without `--spec`: `--volume NAME=/PATH[:ro]` (repeatable) adds a private named volume;
@@ -71,7 +72,10 @@ Socket: `--socket` / `WEGLARKA_SOCKET`, otherwise `admin.socket` from `weglarka.
   webhook deploys. Output: `UpdateAppResponse` (a deploy that only provisions reports outcome `provisioned`); a
   flip that is already in place sends nothing (`{"changed":false,"app":…}`). Runtime state: `not-started`
   (`not_started` in JSON). `start = true` is the default and is omitted from the `AppSpec` TOML/JSON, so a spec
-  without `start` means the app runs.
+  without `start` means the app runs. Because `start` is **desired state**, `apps update` refuses a write that
+  turns a live `start = true` into `false` (a provisioning spec file reused for `--spec`, or `--no-start`) with a
+  usage error, naming the effect; `--allow-stop` writes it anyway, and `apps start`/`apps stop` are unaffected
+  (issue #462).
 - Idempotency: `apps remove --ignore-missing`. `apps add --spec file.toml` takes a whole `AppSpec`.
 - Secrets: `secrets set <app> <name>` reads stdin or `--from-file`; passing the value as an argument
   is impossible. One trailing `\n` is trimmed by default (`--raw` keeps the bytes). `secrets remove

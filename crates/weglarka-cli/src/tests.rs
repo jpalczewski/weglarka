@@ -1324,6 +1324,13 @@ fn update_flags_flip_start() {
     assert!(Up::try_parse_from(["up", "ntfy", "--start", "--no-start"]).is_err());
     assert!(Up::try_parse_from(["up", "ntfy", "--start", "--spec", "f"]).is_err());
     assert!(Up::try_parse_from(["up", "ntfy", "--no-start", "--spec", "f"]).is_err());
+
+    // #462: the escape hatch for a write that turns `start` off. It is not an edit on its own and
+    // it combines with both the flag edit and `--spec` (that is where it is needed most).
+    assert!(update_args(&["--allow-stop"]).allow_stop);
+    assert!(!update_args(&[]).allow_stop);
+    assert!(update_args(&["--no-start", "--allow-stop"]).allow_stop);
+    assert!(update_args(&["--spec", "f", "--allow-stop"]).allow_stop);
 }
 
 #[tokio::test(flavor = "current_thread")]
