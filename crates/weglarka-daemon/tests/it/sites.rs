@@ -7,7 +7,7 @@ use crate::common::*;
 use hyper::StatusCode;
 use serde_json::{Value, json};
 use weglarka_engine::sites::release_id;
-use weglarka_model::app::Digest;
+use weglarka_model::app::{Digest, InstanceName};
 use weglarka_model::state;
 
 fn blog() -> Value {
@@ -163,7 +163,68 @@ domains = ["blog.example.com"]
 "#;
 
 fn blog_digest() -> String {
-    format!("sha256:{}", "a".repeat(64))
+    blog_digest_for('a')
+}
+
+fn blog_digest_for(c: char) -> String {
+    format!("sha256:{}", c.to_string().repeat(64))
+}
+
+/// `<sites root>/blog/releases` (the daemon's default under `<state>/nginx`).
+fn blog_site(h: &Harness) -> std::path::PathBuf {
+    h.root.join("state/nginx/sites/blog")
+}
+
+fn install_release_at(root: &std::path::Path, c: char, body: &str) -> String {
+    let raw = blog_digest_for(c);
+    let id = release_id(&Digest::new(&raw).unwrap());
+    let release = root.join("state/nginx/sites/blog/releases").join(&id);
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("index.html"), body).unwrap();
+    id
+}
+
+fn point_current_at(root: &std::path::Path, id: &str) {
+    let site = root.join("state/nginx/sites/blog");
+    let _ = std::fs::remove_file(site.join("current"));
+    std::os::unix::fs::symlink(
+        std::path::Path::new("releases").join(id),
+        site.join("current"),
+    )
+    .unwrap();
+}
+
+fn write_blog_state(root: &std::path::Path, current: Option<char>, previous: Option<char>) {
+    let mut text = String::from("[apps.blog]\n");
+    if let Some(c) = current {
+        text.push_str(&format!("current = \"{}\"\n", blog_digest_for(c)));
+    }
+    if let Some(c) = previous {
+        text.push_str(&format!("previous = \"{}\"\n", blog_digest_for(c)));
+    }
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(root.join("state/state.toml"), text).unwrap();
+}
+
+/// A static site serving `b` with `a` retained as `previous`, both releases complete on disk.
+async fn rollback_harness() -> Harness {
+    let builder = Builder::new().apps(BLOG_SITE);
+    let root = builder.root().to_owned();
+    install_release_at(&root, 'a', "one");
+    let current = install_release_at(&root, 'b', "two");
+    write_blog_state(&root, Some('b'), Some('a'));
+    point_current_at(&root, &current);
+    builder.build().await
+}
+
+/// A static site with a current release but no `previous` in `state.toml`.
+async fn no_previous_harness() -> Harness {
+    let builder = Builder::new().apps(BLOG_SITE);
+    let root = builder.root().to_owned();
+    let current = install_release_at(&root, 'b', "two");
+    write_blog_state(&root, Some('b'), None);
+    point_current_at(&root, &current);
+    builder.build().await
 }
 
 async fn static_harness() -> Harness {
@@ -261,5 +322,106 @@ async fn doctor_warns_about_a_current_release_that_does_not_match_state() {
     let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
     let check = doctor_check(&report, "sites.current").expect("sites.current reported");
     assert_eq!(check["status"], "ok", "{check}");
+    h.running.stop().await;
+}
+
+// ── `apps rollback` (issue #103) ─────────────────────────────────────────────
+
+fn digest_of(c: char) -> Digest {
+    Digest::new(blog_digest_for(c)).unwrap()
+}
+
+#[tokio::test]
+async fn apps_rollback_switches_a_static_site_to_its_previous_release() {
+    let h = rollback_harness().await;
+    let (status, body) = admin(&h, "POST", "/v1/apps/blog/rollback", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from"], json!(blog_digest_for('b')));
+    assert_eq!(body["to"], json!(blog_digest_for('a')));
+    assert_eq!(body["reused_release"], true);
+    assert_eq!(
+        std::fs::read_to_string(blog_site(&h).join("current/index.html")).unwrap(),
+        "one"
+    );
+
+    let st = state::load_state(&h.root.join("state/state.toml")).unwrap();
+    let blog = st.apps.get(&InstanceName::new("blog").unwrap()).unwrap();
+    assert_eq!(blog.current, Some(digest_of('a')));
+    assert_eq!(blog.previous, Some(digest_of('b')));
+    let failed = blog.failed.as_ref().expect("the left digest is recorded");
+    assert_eq!(failed.digest, digest_of('b'));
+    assert_eq!(failed.reason, "rolled back by the operator");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn apps_rollback_maps_every_refusal() {
+    // An unknown instance is a 404.
+    let h = harness().await;
+    let (status, body) = admin(&h, "POST", "/v1/apps/ghost/rollback", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+    h.running.stop().await;
+
+    // A container app is a 400 that points at the rollback that applies to it. `start = false`
+    // keeps the first reconcile a quick provision, so the engine lock is free for the request.
+    let h = Builder::new()
+        .apps("[apps.ntfy]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nstart = false\n")
+        .build()
+        .await;
+    deployed(&h, "ntfy").await;
+    let (status, body) = admin(&h, "POST", "/v1/apps/ntfy/rollback", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("weglarka apps update ntfy"),
+        "{body}"
+    );
+    h.running.stop().await;
+
+    // A static site without a previous release is a 409 and nothing changes.
+    let h = no_previous_harness().await;
+    let (status, body) = admin(&h, "POST", "/v1/apps/blog/rollback", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "conflict");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no previous release to return to"),
+        "{body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(blog_site(&h).join("current/index.html")).unwrap(),
+        "two"
+    );
+    let st = state::load_state(&h.root.join("state/state.toml")).unwrap();
+    let blog = st.apps.get(&InstanceName::new("blog").unwrap()).unwrap();
+    assert_eq!(blog.current, Some(digest_of('b')));
+    assert_eq!(blog.previous, None);
+    h.running.stop().await;
+
+    // A site environment is a 400 that points at `promote --rollback`.
+    let h = harness().await;
+    declare_blog(&h).await;
+    let (status, body) = admin(&h, "POST", "/v1/apps/blog-dev/rollback", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("weglarka promote blog dev --rollback"),
+        "{body}"
+    );
+    let st = state::load_state(&h.root.join("state/state.toml")).unwrap();
+    assert_eq!(
+        st.apps
+            .get(&InstanceName::new("blog-dev").unwrap())
+            .and_then(|a| a.current.clone()),
+        None
+    );
     h.running.stop().await;
 }

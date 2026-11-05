@@ -46,8 +46,9 @@ a site has no upstream to apply them to.
 4. The previous release stays on disk next to the new one; older releases are removed.
 
 A deploy whose digest already has a complete release on disk does not export the image again — it only switches
-`current`. Redeploying the previous release therefore does not need the image store or the registry (a future
-`weglarka promote --rollback` uses the same path); with `--force` and the same digest the release being served is kept.
+`current`. Redeploying the previous release therefore does not need the image store or the registry (both
+`weglarka apps rollback` and `weglarka promote --rollback` use the same path); with `--force` and the same digest
+the release being served is kept.
 
 A failed deploy leaves the served release untouched and records the digest as failed (`weglarka apps show`).
 
@@ -129,9 +130,26 @@ that lands.
 A site that needs both is declared once with environments, and the production one changes only by an explicit
 promotion: see [site environments](site-environments.md).
 
+## Rolling back
+
+`weglarka apps rollback blog` returns the site to the release in `state.toml`'s `previous` and records the release
+it left as failed (`rolled back by the operator`). With the previous release still on disk — retention keeps two —
+this is a pure `current` symlink switch: neither the image store nor the registry is used. When only the release
+directory is missing but the image is still local, Węglarka exports and extracts it again; it pulls only when the
+image is gone too.
+
+The digest left behind stays `failed`, so a webhook redelivery or a plain `weglarka deploy blog` does not undo the
+rollback (it is reported as a known bad digest). Go forward again deliberately with `weglarka deploy blog
+--force`; a newly pushed digest is not marked and deploys normally. A site without a `previous` release is refused
+with a 409.
+
+The command applies to a `kind = "static"` site that is not owned by a site environment. A container app is refused
+(400): it rolls back automatically when its health gate fails, and manually with `weglarka apps update` (see
+[verification and rollback](verify-and-rollback.md)). An environment of a `[sites]` site is also refused (400) with
+the hint `weglarka promote <site> <env> --rollback` (see [site environments](site-environments.md)).
+
 ## Limits of this release
 
-- Rolling back to the previous release by command is tracked in #103.
 - HTTP Basic auth, and forward auth, for static sites are tracked in #169.
 - Static sites are served only by Węglarka's own nginx; the host must run with ingress enabled.
 

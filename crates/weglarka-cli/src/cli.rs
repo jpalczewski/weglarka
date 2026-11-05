@@ -44,7 +44,7 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Manage apps (add/update/start/stop/reload/remove/list/show).
+    /// Manage apps (add/update/start/stop/reload/rollback/remove/list/show).
     #[command(subcommand)]
     Apps(AppsCommand),
     /// Run a command once in a fresh container of an app (its image, env, secrets, volumes, configs
@@ -211,6 +211,10 @@ pub enum AppsCommand {
     /// Reload the app's configs without recreating the container: sends the spec's `reload_signal`,
     /// or restarts the container when the spec sets none. Changes no desired state.
     Reload(ReloadArgs),
+    /// Return a static site to its previous release (no image or registry needed when that release
+    /// is still on disk). Container apps roll back on a failed health gate; site environments use
+    /// `weglarka promote <site> <env> --rollback`.
+    Rollback(RollbackArgs),
     /// Remove an app instance.
     Remove(RemoveArgs),
     /// List apps.
@@ -310,6 +314,13 @@ pub struct ReloadArgs {
     /// publish a renamed file.
     #[arg(long)]
     pub recreate: bool,
+}
+
+/// Flags of `apps rollback`: the static site to return to its `previous` release.
+#[derive(Debug, Args)]
+pub struct RollbackArgs {
+    /// Instance name.
+    pub name: String,
 }
 
 #[derive(Debug, Args)]

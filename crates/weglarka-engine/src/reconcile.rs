@@ -134,6 +134,16 @@ pub enum EngineError {
     /// `apps reload` of an app whose container is not running: there is nothing to signal or restart.
     #[error("app {0} has no running container; use `weglarka apps start {0}`")]
     ReloadNotRunning(InstanceName),
+    /// `apps rollback` of an instance that has no previous release (nothing was changed).
+    #[error("{0}")]
+    RollbackRefused(String),
+    /// `apps rollback` of an instance that is not a static site: container apps roll back through the
+    /// health gate or `apps update`, site environments through `weglarka promote`.
+    #[error("{0}")]
+    RollbackUnsupported(String),
+    /// The fallback release build of `apps rollback` failed; the served release is untouched.
+    #[error("{0}")]
+    RollbackFailed(String),
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),

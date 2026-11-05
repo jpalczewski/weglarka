@@ -46,6 +46,12 @@ Changing the image through `update` deploys immediately (pull, health gate; a fa
 previous digest, exit code 6). Return to `:latest` the same way, with `--auto-update`:
 `weglarka apps update ntfy ghcr.io/jpalczewski/ntfy.zig:latest --auto-update`.
 
+For a `kind = "static"` site use `weglarka apps rollback <app>`: it switches to the `previous` release and needs
+neither the registry nor the image when that release is still on disk. The digest it leaves is marked failed, so a
+webhook or a plain deploy does not undo it — go forward again with `weglarka deploy <app> --force`; a newly
+pushed digest deploys normally. Container apps are excluded from this command, and a site environment uses
+`weglarka promote <site> <env> --rollback`. See [static sites](static-sites.md).
+
 ## Rolling Węglarka back to an older version
 
 The TOML files use `deny_unknown_fields`, and `apps.toml` and `state.toml` may carry a `schema_version`. A daemon that

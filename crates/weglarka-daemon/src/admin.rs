@@ -18,8 +18,8 @@ use weglarka_api::{
     DeployRequest, DeployResponse, ErrorCode, HealthResponse,
     HostMountStatus as ApiHostMountStatus, HostMountView, ListAppsResponse, ListSecretsResponse,
     NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse, ReloadAction, ReloadRequest,
-    ReloadResponse, RunFrame, RunRequest, RuntimeState, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse, endpoints,
+    ReloadResponse, RollbackResponse, RunFrame, RunRequest, RuntimeState, SecretInfo,
+    SetSecretRequest, ShowAppResponse, StatusResponse, endpoints,
 };
 use weglarka_engine::config_mounts::{self, MountStatus, MountView};
 use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
@@ -134,6 +134,10 @@ impl From<EngineError> for Fail {
             // `apps reload` of an app whose container is not running: nothing to signal or restart.
             // The engine message already points at `apps start`.
             e @ EngineError::ReloadNotRunning(_) => Fail(ErrorCode::Conflict, e.to_string()),
+            // `apps rollback` (issue #103): a wrong kind or a site-owned instance is the request's
+            // fault (400); a static site without a previous release is a conflict (409).
+            EngineError::RollbackUnsupported(message) => Fail::invalid(message),
+            e @ EngineError::RollbackRefused(_) => Fail(ErrorCode::Conflict, e.to_string()),
             // `weglarka run` (issue #106): nothing was created for any of these.
             e @ (EngineError::RunNotDeployed(_) | EngineError::RunLimit(_)) => {
                 Fail(ErrorCode::Conflict, e.to_string())
@@ -208,6 +212,7 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         )
         .route(endpoints::APPS_DEPLOY.path, post(deploy_app::<P>))
         .route(endpoints::APPS_RELOAD.path, post(reload_app::<P>))
+        .route(endpoints::APPS_ROLLBACK.path, post(rollback_app::<P>))
         .route(endpoints::APPS_RUN.path, post(run_app::<P>))
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
@@ -740,6 +745,27 @@ async fn reload_app<P: PodmanClient + 'static>(
         action,
         signal,
         configs: config_views(&d, &spec),
+    }))
+}
+
+// ── Static-site rollback (issue #103) ───────────────────────────────────────
+
+/// `POST /v1/apps/{name}/rollback`: return a `kind = "static"` site to its `previous` release. A
+/// complete release on disk is a pure symlink switch (no image export, no registry); otherwise the
+/// image is re-extracted first. Container apps are refused (400) — their rollback is the health gate
+/// or `apps update` — and so are site environments (`weglarka promote --rollback`); a site without a
+/// previous release is a 409.
+async fn rollback_app<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(raw): Path<String>,
+) -> ApiResult<Response> {
+    let name = parse_name(&raw)?;
+    let report = mutating(d.engine.rollback_site(&name)).await?;
+    d.changed();
+    Ok(json(RollbackResponse {
+        from: report.from,
+        to: report.to,
+        reused_release: report.reused_release,
     }))
 }
 
