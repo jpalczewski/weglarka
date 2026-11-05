@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{
     AppIngress, AppKind, AppSpec, AppsFile, Digest, HostPort, InstanceName, SecretTarget,
-    SharedVolumeName, StaticIngress, normalize_signal, valid_config_source, valid_mount_target,
-    valid_volume_name,
+    SecurityHeaders, SharedVolumeName, StaticIngress, normalize_signal, valid_config_source,
+    valid_mount_target, valid_volume_name,
 };
 use crate::fsutil::write_atomic;
 use crate::hash::SpecHash;
@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -187,6 +187,14 @@ fn site_static_options_v20(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v20 → v21: security headers for ordinary container apps (#497, ADR 0076).
+/// `[apps.<x>.ingress.security_headers]` is optional and defaults to unset, so a v20 document needs
+/// no data transformation — the marker records that the file may carry the table. A no-op that must
+/// accept a hand-edited file which already has it.
+fn container_security_headers_v21(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -210,6 +218,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     static_ingress_options_v18,
     internal_hosts_v19,
     site_static_options_v20,
+    container_security_headers_v21,
 ];
 
 const _: () = assert!(
@@ -483,6 +492,13 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         }
         return Ok(());
     }
+    // A static site keeps `ingress.static.security_headers`: the container key here would render
+    // nothing, so point at the right one instead of only rejecting it.
+    if spec.ingress.security_headers.is_some() {
+        return Err(format!(
+            "{name}: `ingress.security_headers` does not apply to kind = \"static\"; set `ingress.static.security_headers` instead"
+        ));
+    }
     let defaults: AppSpec = toml::from_str("image = \"i\"").expect("minimal spec parses");
     let rejected = [
         ("port", spec.port.is_some()),
@@ -545,6 +561,8 @@ fn validate_static_ingress_allowlist(
         auth_exempt_paths,
         // Validated separately, by `validate_static_ingress_values`.
         static_: _,
+        // Rejected above with the key a static site should use instead (`ingress.static.security_headers`).
+        security_headers: _,
     } = ingress;
     let rejected = [
         ("ingress.streaming", *streaming),
@@ -665,10 +683,8 @@ fn validate_static_ingress_values(
             ));
         }
     }
-    if let Some(headers) = &opts.security_headers
-        && let Some(csp) = &headers.csp
-    {
-        validate_static_csp(name, csp)?;
+    if let Some(headers) = &opts.security_headers {
+        validate_security_headers(name, "ingress.static", headers)?;
     }
     Ok(())
 }
@@ -708,13 +724,22 @@ fn validate_static_redirect_to(name: &InstanceName, to: &str) -> Result<(), Stri
 }
 
 /// `security_headers.csp`: printable ASCII (spaces allowed, no control characters) without
-/// `"`/`\`/`$` — the same injection guard as the rest of `StaticIngress` — and at most 2048 bytes
-/// (ADR 0069).
-fn validate_static_csp(name: &InstanceName, csp: &str) -> Result<(), String> {
+/// `"`/`\`/`$` — the same injection guard as the rest of the ingress options — and at most 2048 bytes
+/// (ADR 0069). `prefix` is the table the operator wrote (`ingress.static` for a site, `ingress` for a
+/// container app), so the error names the key that is actually wrong; `hsts_max_age_secs` is a typed
+/// `u32` and needs no further check.
+fn validate_security_headers(
+    name: &InstanceName,
+    prefix: &str,
+    headers: &SecurityHeaders,
+) -> Result<(), String> {
     const MAX_CSP_BYTES: usize = 2048;
+    let Some(csp) = &headers.csp else {
+        return Ok(());
+    };
     if csp.is_empty() || csp.len() > MAX_CSP_BYTES {
         return Err(format!(
-            "{name}: ingress.static.security_headers.csp must be 1..={MAX_CSP_BYTES} bytes"
+            "{name}: {prefix}.security_headers.csp must be 1..={MAX_CSP_BYTES} bytes"
         ));
     }
     let ok = csp
@@ -722,7 +747,7 @@ fn validate_static_csp(name: &InstanceName, csp: &str) -> Result<(), String> {
         .all(|b| (b.is_ascii_graphic() || b == b' ') && !matches!(b, b'"' | b'\\' | b'$'));
     if !ok {
         return Err(format!(
-            "{name}: ingress.static.security_headers.csp must be printable ASCII without '\"', '\\\\' or '$'"
+            "{name}: {prefix}.security_headers.csp must be printable ASCII without '\"', '\\\\' or '$'"
         ));
     }
     Ok(())
@@ -838,6 +863,15 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
                 return Err(format!("{name}: duplicate streaming path {path:?}"));
             }
         }
+    }
+    // The container flavour of #497 (ADR 0076): the same validated `SecurityHeaders` type as
+    // `ingress.static.security_headers`, rendered by the proxy to the app. A static site's own table
+    // is validated with `ingress.static` by `validate_static_ingress_values` instead; this one is
+    // skipped for it so the error names the key a site should use (`validate_static`).
+    if spec.kind == AppKind::Container
+        && let Some(headers) = &ingress.security_headers
+    {
+        validate_security_headers(name, "ingress", headers)?;
     }
     Ok(())
 }
@@ -2320,6 +2354,133 @@ csp = "default-src 'self'"
         let reserialized = toml::to_string(&spec).unwrap();
         let reparsed: AppSpec = toml::from_str(&reserialized).unwrap();
         assert_eq!(spec, reparsed);
+    }
+
+    /// #497, ADR 0076: `ingress.security_headers` reuses the static table's type and validation, and
+    /// each error names the container key.
+    #[test]
+    fn container_security_headers_are_validated_like_the_static_ones() {
+        let check = |extra: &str| -> Result<(), String> {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .map_err(|e| e.message().to_owned())?;
+            validate_app(&name("a"), &spec)
+        };
+
+        assert!(
+            check(
+                "ingress = { security_headers = { preset = \"baseline\", hsts_max_age_secs = 31536000, csp = \"default-src 'self'\" } }"
+            )
+            .is_ok()
+        );
+        // Only `csp` is free-form; the preset and HSTS are typed by serde.
+        let err = check("ingress = { security_headers = { preset = \"paranoid\" } }").unwrap_err();
+        assert!(err.contains("unknown variant"), "{err}");
+        let err = check("ingress = { security_headers = { hsts_max_age_secs = -1 } }").unwrap_err();
+        assert!(err.contains("invalid value"), "{err}");
+        for bad_csp in ["bad\"csp", "bad\\csp", "bad$csp", "bad\ncsp"] {
+            let err = check(&format!(
+                "ingress = {{ security_headers = {{ csp = {bad_csp:?} }} }}"
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("ingress.security_headers.csp"),
+                "{bad_csp:?}: {err}"
+            );
+        }
+        let huge_csp = "a".repeat(2049);
+        let err = check(&format!(
+            "ingress = {{ security_headers = {{ csp = {huge_csp:?} }} }}"
+        ))
+        .unwrap_err();
+        assert!(err.contains("ingress.security_headers.csp"), "{err}");
+        // `deny_unknown_fields` holds for the nested table too: no free-form header names.
+        let err = check("ingress = { security_headers = { x_frame_options = \"SAMEORIGIN\" } }")
+            .unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn ingress_security_headers_on_a_static_site_name_the_static_key() {
+        let spec: AppSpec = toml::from_str(
+            "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\ningress.security_headers = { csp = \"default-src 'self'\" }\n",
+        )
+        .unwrap();
+        let err = validate_app(&name("a"), &spec).unwrap_err();
+        assert!(
+            err.contains("`ingress.security_headers` does not apply to kind = \"static\""),
+            "{err}"
+        );
+        assert!(err.contains("ingress.static.security_headers"), "{err}");
+    }
+
+    #[test]
+    fn container_security_headers_round_trip() {
+        // Unset: the table does not appear at all.
+        let plain: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        assert!(plain.ingress.security_headers.is_none());
+        assert!(
+            !toml::to_string(&plain)
+                .unwrap()
+                .contains("security_headers")
+        );
+
+        let toml_src = r#"
+image = "i"
+domains = ["a.example.com"]
+
+[ingress.security_headers]
+preset = "baseline"
+hsts_max_age_secs = 31536000
+csp = "default-src 'self'"
+"#;
+        let spec: AppSpec = toml::from_str(toml_src).unwrap();
+        let headers = spec
+            .ingress
+            .security_headers
+            .as_ref()
+            .expect("security_headers set");
+        assert_eq!(headers.hsts_max_age_secs, Some(31536000));
+        assert_eq!(headers.csp.as_deref(), Some("default-src 'self'"));
+        let reserialized = toml::to_string(&spec).unwrap();
+        assert!(
+            reserialized.contains("[ingress.security_headers]"),
+            "{reserialized}"
+        );
+        let reparsed: AppSpec = toml::from_str(&reserialized).unwrap();
+        assert_eq!(spec, reparsed);
+    }
+
+    #[test]
+    fn schema_v20_file_with_container_security_headers_round_trips() {
+        // #497, ADR 0076: v21 adds an optional `[apps.<x>.ingress.security_headers]`. The step is a
+        // no-op, so a v20 document loads unchanged and the first write stamps v21.
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 20\n[apps.a]\nimage = \"x:1\"\ndomains = [\"a.example.com\"]\n\
+             [apps.a.ingress.security_headers]\ncsp = \"default-src 'self'\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(
+            apps.apps[&name("a")]
+                .ingress
+                .security_headers
+                .as_ref()
+                .and_then(|h| h.csp.as_deref()),
+            Some("default-src 'self'")
+        );
+        save_apps(&apps_path, &apps).unwrap();
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        assert!(
+            fs::read_to_string(&apps_path)
+                .unwrap()
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
+        );
     }
 
     #[test]

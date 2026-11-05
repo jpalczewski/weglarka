@@ -337,6 +337,13 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.29.77.201 > "$RUNNER_TEMP/neighbor.conf"
           .github/scripts/test-forwarded-headers.sh "$RUNNER_TEMP/trusted.conf" "$RUNNER_TEMP/untrusted.conf" \
             "$RUNNER_TEMP/peer.conf" "$RUNNER_TEMP/neighbor.conf"
+      # Security headers of a container app (#497, ADR 0076): the ingress adds them only when the app's own
+      # response does not carry them, so an app-built CSP/nonce or `X-Frame-Options: SAMEORIGIN` survives.
+      - name: Security headers of a container app
+        run: |
+          set -euo pipefail
+          cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/security-headers.conf"
+          .github/scripts/test-security-headers.sh "$RUNNER_TEMP/security-headers.conf"
       # Forward auth (#89, docs/decisions/0052): both modes must pass `nginx -t` without the identity provider
       # running (its upstream is a variable resolved per request), and in `behind` a stub provider drives every
       # outcome of the `auth_request` contract — redirect, deny, identity headers, exempt paths, the probe

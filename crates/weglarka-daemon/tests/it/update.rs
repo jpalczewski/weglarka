@@ -166,6 +166,63 @@ async fn max_body_size_change_touches_only_ingress_and_reloads_nginx() {
 }
 
 #[tokio::test]
+async fn security_headers_change_touches_only_ingress_and_reloads_nginx() {
+    // #497, ADR 0076: `ingress.security_headers` is routing-only, like `max_body_size`. Adding it to
+    // a running app must re-render nginx and leave the container (and `spec_hash`) untouched.
+    let h = harness().await;
+    add(&h, "ntfy", spec("nz.example.eu")).await;
+    deployed(&h, "ntfy").await;
+    let conf = || read(&h.root.join("state/nginx/nginx.conf"));
+    eventually("nginx config for the app", || async {
+        conf().contains("nz.example.eu")
+    })
+    .await;
+    let before = show(&h, "ntfy").await;
+    let creates = creates_of(&h.fake, "ntfy");
+    let reloads = |fake: &FakePodman| {
+        fake.calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ContainerKill { signal, .. } if signal == "HUP"))
+            .count()
+    };
+    let reloads_before = reloads(&h.fake);
+
+    let headers =
+        json!({ "preset": "baseline", "hsts_max_age_secs": 31536000, "csp": "default-src 'self'" });
+    let mut secure = spec("nz.example.eu");
+    secure["ingress"] = json!({ "security_headers": headers });
+    let (s, v) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({ "spec": secure }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["deploy"].is_null(), "{v}");
+    assert_eq!(v["app"]["spec"]["ingress"]["security_headers"], headers);
+    eventually("nginx config with the app's headers", || async {
+        let conf = conf();
+        conf.contains("map $upstream_http_x_frame_options $wg_ntfy_x_frame_options {")
+            && conf.contains(
+                "add_header Content-Security-Policy $wg_ntfy_content_security_policy always;",
+            )
+    })
+    .await;
+    assert!(
+        reloads(&h.fake) > reloads_before,
+        "nginx was not reloaded: {:?}",
+        h.fake.calls()
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = show(&h, "ntfy").await;
+    assert_eq!(after["state"]["generation"], before["state"]["generation"]);
+    assert_eq!(after["state"]["spec_hash"], before["state"]["spec_hash"]);
+    assert_eq!(creates_of(&h.fake, "ntfy"), creates);
+
+    // The same CSP guard as the static table: refused before anything is saved.
+    let mut bad = spec("nz.example.eu");
+    bad["ingress"] = json!({ "security_headers": { "csp": "bad\"csp" } });
+    let (s, _) = admin(&h, "PUT", "/v1/apps/ntfy", Some(json!({ "spec": bad }))).await;
+    assert!(s.is_client_error(), "{s}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn streaming_change_touches_only_ingress_and_reloads_nginx() {
     let h = harness().await;
     add(&h, "ntfy", spec("nz.example.eu")).await;

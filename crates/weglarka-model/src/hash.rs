@@ -494,12 +494,33 @@ env = { B = "2", A = "1" }
                 }),
                 robots: Some(crate::app::Robots::Noindex),
             }),
+            security_headers: Some(crate::app::SecurityHeaders {
+                preset: crate::app::SecurityHeadersPreset::Baseline,
+                hsts_max_age_secs: Some(31536000),
+                csp: Some("default-src 'self'".into()),
+            }),
         };
         s.paths = vec!["/api".into()];
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104, ADR 0075) only re-render nginx"
+            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104, ADR 0075, #497) only re-render nginx"
+        );
+    }
+
+    #[test]
+    fn container_security_headers_only_re_render_nginx() {
+        // #497, ADR 0076: `ingress.security_headers` is an ingress option like `static_`, so adding
+        // it to a running app must not recreate the container.
+        let mut s = spec();
+        s.ingress.security_headers = Some(crate::app::SecurityHeaders {
+            preset: crate::app::SecurityHeadersPreset::Baseline,
+            hsts_max_age_secs: Some(31536000),
+            csp: Some("default-src 'self'".into()),
+        });
+        assert_eq!(
+            spec_hash(&spec(), &digest('a')),
+            spec_hash(&s, &digest('a'))
         );
     }
 

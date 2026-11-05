@@ -10,6 +10,7 @@ use super::common::{
     AuthVars, Forwarded, set_app, write_auth_request, write_authz_location, write_proxy_headers,
 };
 use super::conf::Conf;
+use super::security;
 use crate::plan::{AppRoute, ExemptPath, PathPrefix, Plan, RouteBackend};
 
 /// Where nginx sends traffic: a container (`proxy_pass`) or a static site's directory (ADR 0049).
@@ -192,6 +193,7 @@ impl Backend<'_> {
         c: &mut Conf,
         location: &Location<'_>,
         ingress: &AppIngress,
+        instance: &weglarka_model::app::InstanceName,
         forwarded: &Forwarded,
         site_prefix: &str,
     ) {
@@ -255,6 +257,15 @@ impl Backend<'_> {
                 // The first `proxy_set_header` of a level drops every inherited one: repeat the
                 // whole set, this time with `Remote-*` from the authz answer.
                 write_proxy_headers(c, forwarded, Some(AuthVars));
+            }
+            // Security headers (#497, ADR 0076) go next to `X-Request-Id` so an `add_header` of
+            // this location cannot drop either; the `authz` subrequest location is a different
+            // function and never carries them. A location without forward auth has no `add_header`
+            // of its own yet, so the variable set restates `X-Request-Id` for it.
+            if let (Backend::Container { .. }, Some(headers)) =
+                (self, ingress.security_headers.as_ref())
+            {
+                security::write_headers(c, instance, headers, location.auth);
             }
         });
     }
@@ -586,7 +597,14 @@ pub(super) fn write_app_locations(
             path.as_str().to_owned()
         };
         for location in path_locations(app, path, name, directory) {
-            backend.write_location(c, &location, &app.ingress, forwarded, &site_prefix);
+            backend.write_location(
+                c,
+                &location,
+                &app.ingress,
+                app.instance,
+                forwarded,
+                &site_prefix,
+            );
         }
         if let Backend::Directory { root } = &backend
             && let Some(opts) = app.ingress.static_.as_ref()

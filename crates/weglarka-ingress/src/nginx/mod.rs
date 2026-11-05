@@ -36,6 +36,7 @@ mod conf;
 mod edge;
 mod location;
 mod options;
+mod security;
 
 use std::collections::BTreeMap;
 

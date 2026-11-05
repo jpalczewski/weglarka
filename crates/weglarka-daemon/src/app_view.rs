@@ -299,6 +299,7 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_groups,
         auth_exempt_paths,
         static_,
+        security_headers,
     } = ingress;
     // The path lists are validated by the model to `[A-Za-z0-9_.-]` segments (`check_path_prefix`,
     // `check_skip_path`), `auth_groups` to `[A-Za-z0-9._-]{1,128}`: shapes that hold no credential.
@@ -314,6 +315,9 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_groups,
         auth_exempt_paths,
         static_: static_.map(read_static_ingress),
+        // Same type, same reasoning as the static table: a rendering setting, never a credential,
+        // and `csp` is the app's own policy text, so it is passed through like the static one.
+        security_headers: security_headers.map(read_security_headers),
     }
 }
 

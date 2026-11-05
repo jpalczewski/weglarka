@@ -15,6 +15,7 @@ When the daemon is busy with another deploy (the health gate can take tens of se
 | `--domain` / `--remove-domain` | ingress only (nginx reload, Traefik file); the container is unchanged |
 | `--path` / `--remove-path`, `--strip-prefix` / `--no-strip-prefix` | ingress only (nginx reload); the container is not recreated — see [path routing](path-routing.md) |
 | `--streaming` / `--no-streaming`, `--max-body-size` / `--unset-max-body-size` | ingress only (nginx reload); the container is not recreated — see [streaming](streaming.md) and [max body size](max-body-size.md) |
+| `ingress.security_headers` in `--spec` (no flag) | ingress only (nginx reload); the container is not recreated and `spec-hash` is unchanged — see [security headers](security-headers.md) |
 | `--env`/`--unset-env`, `--port`/`--unset-port`, `--secret-env`/`--secret-mount`/`--unbind-secret`, volumes, limits, `health.command` | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull) |
 | `--shared-volume` (`shared_volumes` in `--spec`) | like volumes: changes `spec-hash` → the next reconcile recreates the container within the shared UID group range (a change of `target`/`read_only` too). A range change with existing private volumes is rejected — see [shared volumes](shared-volumes.md). An empty list hashes as before |
 | `--shared-network` (`shared_networks` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container — see [shared networks](shared-networks.md) |
