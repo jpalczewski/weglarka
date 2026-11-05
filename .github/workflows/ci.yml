@@ -24,26 +24,35 @@ concurrency:
 jobs:
   # Docs-only PRs (`docs/**`, `*.md`, `.gitignore`) do not build anything: every heavy job below is
   # gated on `changes.code`. On `main` the output is always `true`, so a push there gets the full run.
+  # No checkout: a PR's file list is one paginated API call, which is cheaper than the `fetch-depth: 0` clone
+  # the merge-base diff needed. The job itself stays — `paths-ignore` cannot skip a required check, and it has
+  # to report green on a docs-only PR.
   changes:
     runs-on: ubuntu-24.04
+    # Only the changed-files list of a PR is read; nothing from the repository itself.
+    permissions:
+      pull-requests: read
     outputs:
       code: ${{ steps.detect.outputs.code }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: Detect code changes
         id: detect
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # One path per line, over every page of the PR's files (100 per page). A rename carries its old path
+          # in `previous_filename`, and a move between code and `docs/` in either direction is a code change, so
+          # both paths are classified.
+          changed=$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
           echo "changed files:"; printf '%s\n' "$changed"
           code=false
           while IFS= read -r file; do
@@ -470,16 +479,40 @@ jobs:
         with:
           shared-key: check
           save-if: false
+      # Cargo unifies features per invocation, so a single-package `cargo test -p …` per suite compiles the shared
+      # crates again and again (the engine graph twice, `weglarka-registry` without `testing`). The three filtered
+      # runs below therefore share one package selection: this build compiles it once, and they only execute the
+      # test binaries it produced. `weglarka-registry/testing` is what selects the registry's `contract` target
+      # (`required-features`).
       # Without WEGLARKA_PODMAN_SOCKET the tests skip themselves — here the variable is set,
-      # so `--nocapture` shows that nothing was skipped.
+      # so `--nocapture` shows that nothing was skipped. This suite is the one run that selects its package alone
+      # (running a whole package needs `--lib`, which would also run every other crate's unit tests).
       - run: cargo test -p weglarka-podman -- --nocapture
         env:
           # CI pins the stack: a server that is not Podman 6 fails `version_is_podman_6` here (skipped elsewhere).
           WEGLARKA_PODMAN_EXPECT_V6: "1"
+      - name: Build the filtered suites' test binaries once
+        run: >-
+          cargo test --no-run
+          -p weglarka-podman -p weglarka-engine -p weglarka-daemon -p weglarka-registry
+          --features weglarka-registry/testing
       # The engine tests that drive the engine against this Podman (they skip without WEGLARKA_PODMAN_SOCKET).
-      - run: cargo test -p weglarka-engine --test volumes --test image_save --test ingress_identity -- --nocapture
+      # The package list and `--features` must match the build above exactly, otherwise cargo compiles again;
+      # packages without a target of the requested name are ignored, so only the engine's three binaries run.
+      - run: >-
+          cargo test
+          -p weglarka-podman -p weglarka-engine -p weglarka-daemon -p weglarka-registry
+          --features weglarka-registry/testing
+          --test volumes --test image_save --test ingress_identity
+          -- --nocapture
       # The Prometheus targets generator against the real `promtool` of the official image (#366, ADR 0064).
-      - run: "cargo test -p weglarka-daemon --test it -- promtool:: --nocapture"
+      # Same selection as above; only the daemon has an `it` binary, so only it runs.
+      - run: >-
+          cargo test
+          -p weglarka-podman -p weglarka-engine -p weglarka-daemon -p weglarka-registry
+          --features weglarka-registry/testing
+          --test it
+          -- promtool:: --nocapture
       # The registry contract suite against a real registry (distribution, loopback HTTP): the same cases
       # the fakes pass in unit tests (#492). The image is pinned like the one in scripts/acceptance.sh.
       - name: Start a local registry
@@ -493,7 +526,14 @@ jobs:
           done
           echo "the local registry did not come up" >&2
           exit 1
-      - run: cargo test -p weglarka-registry --features testing --test contract -- --nocapture
+      # `contract` is a target of two packages, so the test name picks the registry's suite (the libpod contract
+      # suite already ran with the podman package above, and runs 0 tests here). Same selection as the build above.
+      - run: >-
+          cargo test
+          -p weglarka-podman -p weglarka-engine -p weglarka-daemon -p weglarka-registry
+          --features weglarka-registry/testing
+          --test contract
+          -- http_registry_meets_the_contract --nocapture
         env:
           WEGLARKA_REGISTRY_URL: 127.0.0.1:5000
       - name: Stop the local registry
