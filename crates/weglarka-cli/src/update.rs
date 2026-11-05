@@ -141,9 +141,15 @@ pub struct UpdateArgs {
     /// Set `start = true` and deploy the app now (a provisioned app gets its container).
     #[arg(long, conflicts_with_all = ["spec", "no_start"])]
     pub start: bool,
-    /// Set `start = false`: remove the container; volumes, the uid range and the pinned image digest stay.
+    /// Set `start = false`: remove the container; volumes, the uid range and the pinned image digest
+    /// stay. On a running app this needs `--allow-stop`, like any other write that turns `start` off.
     #[arg(long, conflicts_with = "spec")]
     pub no_start: bool,
+    /// Allow the update to turn `start` off, which stops a running app (issue #462). Without the
+    /// flag that write is refused: `start` is persisted desired state, so a spec file kept from
+    /// provisioning would stop the app. `apps stop` stops it without the flag.
+    #[arg(long)]
+    pub allow_stop: bool,
     #[command(flatten)]
     pub spec_flags: crate::spec_flags::SpecFlags,
     /// Replace the whole spec with an AppSpec TOML file (instead of the flags above); `-` = stdin.
@@ -587,8 +593,25 @@ struct UpdateDryRun {
     /// `env` keys the live spec has and the new one drops (`--spec` is a full replacement).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     removes_env: Vec<String>,
+    /// The write turns `start` off on an app that has it on: a real run is refused without
+    /// `--allow-stop` (issue #462). Never set by `apps start`/`apps stop`, which exist to flip it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    would_stop: bool,
     diff: String,
     body: UpdateAppRequest,
+}
+
+/// Whether writing `new` turns the persisted `start` off while the live spec had it on (issue
+/// #462). `start` is desired state, not an `apps add` option: a spec file kept from provisioning
+/// (`start = false` so the first `apps add` creates nothing) and reused for `apps update --spec`
+/// therefore **stops** the app — on one host that took an identity provider down.
+///
+/// The runtime state does not make the write safe: `running`/`unhealthy` lose the container right
+/// away, and `stopped`/`missing` mean the app was meant to be up (`start = true`, so the reconciler
+/// restarts it) and would never come back. The flip is therefore refused in every case, and the
+/// flags say so before anything is sent.
+fn would_stop(live: &ShowAppResponse, new: &AppSpec) -> bool {
+    live.spec.start && !new.start
 }
 
 /// `env` keys present in `old` and absent from `new`: the silent casualties of a full replacement
@@ -654,6 +677,7 @@ fn emit_update_dry_run(
     current: &AppSpec,
     diff: String,
     req: UpdateAppRequest,
+    would_stop: bool,
 ) {
     let out = UpdateDryRun {
         dry_run: true,
@@ -662,26 +686,41 @@ fn emit_update_dry_run(
         changed: !diff.is_empty(),
         redacted_base,
         removes_env: removed_env_keys(current, &req.spec),
+        would_stop,
         diff,
         body: req,
     };
-    emit(json, &out, || {
-        let mut s = format!("dry-run: {} {}\n", out.method, out.path);
-        if out.redacted_base {
-            s.push_str(REDACTED_BASE_NOTE);
-        }
-        s.push_str(&if out.changed {
-            format!(
-                "spec changes:\n{}{}",
-                out.diff,
-                render_removals(&out.removes_env)
-            )
-        } else {
-            "no changes to the spec\n".to_owned()
-        });
-        s.push_str("nothing was sent\n");
-        s
+    // Every caller puts the app name in `params` (it builds the request path).
+    let app = params
+        .iter()
+        .find(|(k, _)| *k == "name")
+        .map_or("", |(_, v)| v);
+    emit(json, &out, || render_dry_run(&out, app));
+}
+
+/// Human output of `--dry-run`: the request, the spec diff, and the `start` guard a real run would
+/// apply (issue #462).
+fn render_dry_run(out: &UpdateDryRun, app: &str) -> String {
+    let mut s = format!("dry-run: {} {}\n", out.method, out.path);
+    if out.redacted_base {
+        s.push_str(REDACTED_BASE_NOTE);
+    }
+    s.push_str(&if out.changed {
+        format!(
+            "spec changes:\n{}{}",
+            out.diff,
+            render_removals(&out.removes_env)
+        )
+    } else {
+        "no changes to the spec\n".to_owned()
     });
+    if out.would_stop {
+        s.push_str("would stop ");
+        s.push_str(app);
+        s.push_str(" (start: true -> false): a real run is refused without --allow-stop\n");
+    }
+    s.push_str("nothing was sent\n");
+    s
 }
 
 pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32, CliError> {
@@ -704,11 +743,31 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
         }
     };
     let diff = spec_diff(&current.spec, &new_spec);
+    let stops = would_stop(&current, &new_spec);
     let req = UpdateAppRequest { spec: new_spec };
 
     if a.dry_run {
-        emit_update_dry_run(json, &params, current.redacted, &current.spec, diff, req);
+        emit_update_dry_run(
+            json,
+            &params,
+            current.redacted,
+            &current.spec,
+            diff,
+            req,
+            stops,
+        );
         return Ok(exit::OK);
+    }
+    // Refuse *before* the write: the daemon replaces the spec as a whole and the flip is not part
+    // of the spec hash, so nothing else would hint at the app going down (issue #462).
+    if stops && !a.allow_stop {
+        return Err(CliError::usage(format!(
+            "this stops {name}: the new spec sets `start = false`"
+        ))
+        .with_hint(format!(
+            "pass `--allow-stop` if that is intended, or stop the app explicitly with `weglarka \
+             apps stop {name}`"
+        )));
     }
     if diff.is_empty() {
         let out = NoChange {
@@ -853,7 +912,9 @@ async fn set_start(
     let diff = spec_diff(&current.spec, &new_spec);
     let req = UpdateAppRequest { spec: new_spec };
     if a.dry_run {
-        emit_update_dry_run(json, &params, false, &current.spec, diff, req);
+        // No guard here: `apps start`/`apps stop` are the explicit way to flip `start`, so the
+        // dry run never claims a real run would be refused (`would_stop: false`).
+        emit_update_dry_run(json, &params, false, &current.spec, diff, req, false);
         return Ok(exit::OK);
     }
     let resp: UpdateAppResponse = client
@@ -1616,12 +1677,12 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         );
     }
 
-    fn show_json() -> String {
+    fn show_with(spec: AppSpec, runtime: RuntimeState) -> String {
         serde_json::to_string(&ShowAppResponse {
             name: InstanceName::new("ntfy").unwrap(),
-            spec: spec(),
+            spec,
             state: Default::default(),
-            runtime: RuntimeState::Running,
+            runtime,
             configs: None,
             host_mounts: None,
             restarts: None,
@@ -1631,6 +1692,201 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             reconciled: None,
         })
         .unwrap()
+    }
+
+    fn show_json() -> String {
+        show_with(spec(), RuntimeState::Running)
+    }
+
+    /// `UpdateAppResponse` JSON with no deploy (the daemon only saved the spec).
+    fn update_json(app: &str) -> String {
+        serde_json::to_string(&UpdateAppResponse {
+            app: serde_json::from_str(app).unwrap(),
+            deploy: None,
+        })
+        .unwrap()
+    }
+
+    fn spec_with_start(start: bool) -> AppSpec {
+        AppSpec { start, ..spec() }
+    }
+
+    /// A spec file kept from provisioning: it made the first `apps add` create nothing.
+    fn provisioning_spec_file(path: &Path) {
+        std::fs::write(path, toml::to_string(&spec_with_start(false)).unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_that_would_stop_the_app_is_refused_without_allow_stop() {
+        let show = show_json();
+        let m = mock(move |method, _| match method {
+            "GET" => (200, show.clone()),
+            _ => (200, update_json(&show_json())),
+        })
+        .await;
+        let o = overrides(&m);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("provisioning.toml");
+        provisioning_spec_file(&file);
+
+        // `--spec` with `start = false` on a running app: refused, named effect, nothing sent.
+        let mut a = args(&[]);
+        a.spec = Some(file.clone());
+        let err = apps_update(false, &o, a).await.unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
+        assert_eq!(
+            err.message,
+            "this stops ntfy: the new spec sets `start = false`"
+        );
+        let hint = err.hint.clone().unwrap_or_default();
+        assert!(hint.contains("--allow-stop"), "{hint}");
+        assert!(hint.contains("weglarka apps stop ntfy"), "{hint}");
+
+        // A flag edit that turns `start` off is the same write, so the same refusal.
+        let err = apps_update(false, &o, args(&["--no-start"]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), exit::USAGE);
+        assert_eq!(
+            err.message,
+            "this stops ntfy: the new spec sets `start = false`"
+        );
+        assert!(
+            m.seen.lock().unwrap().iter().all(|s| s.method == "GET"),
+            "a refused update must not PUT"
+        );
+
+        // `--allow-stop` writes exactly that spec.
+        let mut a = args(&["--allow-stop"]);
+        a.spec = Some(file.clone());
+        assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);
+        {
+            let seen = m.seen.lock().unwrap();
+            let last = seen.last().unwrap();
+            assert_eq!(last.method, "PUT");
+            let body: serde_json::Value = serde_json::from_str(&last.body).unwrap();
+            assert_eq!(body["spec"]["start"], serde_json::json!(false));
+        }
+
+        // `apps stop` is not affected by the guard: it exists to turn `start` off.
+        let code = apps_stop(
+            true,
+            &o,
+            StartStopArgs {
+                name: "ntfy".into(),
+                dry_run: false,
+                wait: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, exit::OK);
+        assert_eq!(m.seen.lock().unwrap().last().unwrap().method, "PUT");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_that_starts_the_app_or_keeps_start_is_not_refused() {
+        // `start = false` -> `true` (`--start` on a provisioned app).
+        let show = show_with(spec_with_start(false), RuntimeState::NotStarted);
+        let m = mock(move |method, _| match method {
+            "GET" => (200, show.clone()),
+            _ => (200, update_json(&show_json())),
+        })
+        .await;
+        let o = overrides(&m);
+        assert_eq!(
+            apps_update(true, &o, args(&["--start"])).await.unwrap(),
+            exit::OK
+        );
+        {
+            let seen = m.seen.lock().unwrap();
+            let body: serde_json::Value = serde_json::from_str(&seen[1].body).unwrap();
+            // `start = true` is the default and is not serialized, so absence means "runs".
+            assert!(body["spec"].get("start").is_none(), "{body}");
+        }
+
+        // A spec file that keeps `start = true` (the default, not even written) needs no flag.
+        let show = show_json();
+        let m = mock(move |method, _| match method {
+            "GET" => (200, show.clone()),
+            _ => (200, update_json(&show_json())),
+        })
+        .await;
+        let o = overrides(&m);
+        let mut other = spec();
+        other.domains.push("new.example.eu".into());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("spec.toml");
+        std::fs::write(&file, toml::to_string(&other).unwrap()).unwrap();
+        let mut a = args(&[]);
+        a.spec = Some(file);
+        assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);
+        assert_eq!(m.seen.lock().unwrap().last().unwrap().method, "PUT");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dry_run_names_the_stop_and_does_not_fail() {
+        // The diff shows the flip even though `start = true` is not serialized in TOML.
+        let stopped = spec_with_start(false);
+        let diff = spec_diff(&spec(), &stopped);
+        assert!(diff.contains("+ start = false"), "{diff}");
+
+        let live: ShowAppResponse = serde_json::from_str(&show_json()).unwrap();
+        assert!(would_stop(&live, &stopped));
+        assert!(!would_stop(&live, &spec()), "unchanged start");
+        let mut provisioned = live.clone();
+        provisioned.spec.start = false;
+        assert!(!would_stop(&provisioned, &spec()), "false -> true");
+
+        let out = UpdateDryRun {
+            dry_run: true,
+            method: "PUT",
+            path: "/v1/apps/ntfy".into(),
+            changed: true,
+            redacted_base: false,
+            removes_env: Vec::new(),
+            would_stop: true,
+            diff: diff.clone(),
+            body: UpdateAppRequest {
+                spec: stopped.clone(),
+            },
+        };
+        let text = render_dry_run(&out, "ntfy");
+        assert!(
+            text.contains("would stop ntfy (start: true -> false)"),
+            "{text}"
+        );
+        assert!(text.contains("--allow-stop"), "{text}");
+        assert!(text.ends_with("nothing was sent\n"), "{text}");
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["would_stop"], serde_json::json!(true));
+        assert_eq!(json["body"]["spec"]["start"], serde_json::json!(false));
+
+        // Additive field: absent, and no line, when the write stops nothing.
+        let quiet = UpdateDryRun {
+            would_stop: false,
+            ..out
+        };
+        assert!(
+            serde_json::to_value(&quiet)
+                .unwrap()
+                .get("would_stop")
+                .is_none()
+        );
+        assert!(!render_dry_run(&quiet, "ntfy").contains("would stop"));
+
+        // End to end: a real `--dry-run` exits 0 and sends only the GET.
+        let show = show_json();
+        let m = mock(move |_, _| (200, show.clone())).await;
+        let o = overrides(&m);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("provisioning.toml");
+        provisioning_spec_file(&file);
+        let mut a = args(&[]);
+        a.spec = Some(file);
+        a.dry_run = true;
+        assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);
+        assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
     }
 
     #[tokio::test(flavor = "current_thread")]
