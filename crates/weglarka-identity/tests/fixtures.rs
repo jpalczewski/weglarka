@@ -177,6 +177,7 @@ impl Forward {
             instance: &self.name,
             domains: &self.spec.domains,
             paths: &self.spec.paths,
+            exempt_paths: &self.spec.ingress.auth_exempt_paths,
             policy: self.spec.ingress.auth_policy,
             groups: &self.spec.ingress.auth_groups,
         }

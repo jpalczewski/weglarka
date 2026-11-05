@@ -69,7 +69,7 @@ http.server.ThreadingHTTPServer(("0.0.0.0", 9091), Handler).serve_forever()
 PY
 
 docker network create "$net" >/dev/null
-docker run -d --name wg-auth-app --network "$net" --network-alias panel --network-alias open \
+docker run -d --name wg-auth-app --network "$net" --network-alias panel --network-alias open --network-alias backend \
   docker.io/traefik/whoami:v1.10.4 --port 3000 >/dev/null
 docker run -d --name wg-auth-idp --network "$net" --network-alias authelia -v "$work:/srv:ro" \
   docker.io/library/python:3-alpine python3 -u /srv/idp.py >/dev/null
@@ -166,6 +166,28 @@ expect 'protected, query with dots' "$(status_line "$(call panel.example.eu '/a?
 expect 'resource, query with %25' "$(status_line "$(call panel.example.eu '/mcp/x?a=100%25&b=c;d')")" '200 '
 out=$(call panel.example.eu /mcpx)
 expect 'sibling of a resource path' "$(status_line "$out")" '302 '
+
+# A prefix app (#612): `/receipts` keeps forward auth, `/mcp` and `/.well-known` are exempt as a whole and
+# `/receipts/public/` is exempt below its prefix. `strip_prefix` is on, so the upstream sees the stripped path.
+expect 'prefix app, protected' "$(status_line "$(call api.example.eu /receipts/list)")" '302 '
+expect 'prefix app, protected exact' "$(status_line "$(call api.example.eu /receipts)")" '302 '
+out=$(call api.example.eu /receipts/list -H 'Cookie: session=alice' "${forged[@]}")
+expect 'prefix app, session' "$(status_line "$out")" '200 '
+expect 'prefix app, session' "$out" 'Remote-User: alice'
+reject 'prefix app, session' "$out" 'Mallory'
+for path in /mcp /mcp/ /mcp/tools/list /.well-known/oauth-protected-resource /receipts/public/ /receipts/public/a; do
+  out=$(call api.example.eu "$path" "${forged[@]}")
+  expect "prefix app, exempt $path" "$(status_line "$out")" '200 '
+  reject "prefix app, exempt $path" "$out" 'Remote-'
+  reject "prefix app, exempt $path" "$out" 'Mallory'
+done
+# The prefix is stripped on an exempt location below it, like on the prefix's own.
+expect 'prefix app, strip' "$(call api.example.eu /receipts/public/a)" 'GET /public/a'
+expect 'prefix app, strip' "$(call api.example.eu /mcp/tools/list)" 'GET /tools/list'
+expect 'prefix app, guard' "$(status_line "$(call api.example.eu '/mcp/..;/admin')")" '400 '
+expect 'prefix app, guard' "$(status_line "$(call api.example.eu '/receipts/public/%5cx')")" '400 '
+# Siblings of an exempt path are not exempt.
+expect 'prefix app, sibling' "$(status_line "$(call api.example.eu /receipts/publicx)")" '302 '
 
 # A body-carrying request is guarded like a GET: no session, no upstream.
 expect 'POST, no session' "$(status_line "$(call panel.example.eu /api -X POST -d x=1)")" '302 '

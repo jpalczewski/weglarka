@@ -159,6 +159,11 @@ impl PathPrefix {
         &self.0
     }
 
+    /// Whether `other` is this prefix or lies below it (`/` contains everything).
+    pub fn contains(&self, other: &Self) -> bool {
+        weglarka_model::app::path_is_within(&other.0, &self.0)
+    }
+
     /// Two prefixes overlap when equal or when one is a segment-wise ancestor of the other
     /// (`/api` vs `/api/v2`, but not `/api` vs `/apiary`). The root is the designed catch-all and
     /// never counts as a conflict with a longer prefix.
@@ -505,7 +510,7 @@ impl<'a> Plan<'a> {
                     reason: "is reserved for the forward-auth subrequest",
                 });
             }
-            let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming)?;
+            let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming, &paths)?;
             let oauth_resources =
                 oauth_resource_paths(instance, spec, &paths, &streaming, &auth_exempt)?;
             // The resource locations and the generated discovery documents of the app (#215, ADR 0078):
@@ -644,13 +649,14 @@ impl<'a> Plan<'a> {
     }
 }
 
-/// Normalized `auth_exempt_paths` of an app that uses forward auth, checked against its streaming
-/// paths: both render `location = p` and `location ^~ p/`, so any overlap is a duplicate location or
+/// Normalized `auth_exempt_paths` of an app that uses forward auth, checked against its `paths` (an
+/// entry must equal a prefix or lie below one) and its streaming paths: both render `location = p` and `location ^~ p/`, so any overlap is a duplicate location or
 /// an ambiguous carve-out. Empty for an app without forward auth (the model rejects the field there).
 fn exempt_paths(
     instance: &InstanceName,
     ingress: &AppIngress,
     streaming: &[PathPrefix],
+    paths: &[PathPrefix],
 ) -> Result<Vec<ExemptPath>, IngressError> {
     if ingress.auth != IngressAuth::Forward {
         return Ok(Vec::new());
@@ -677,6 +683,14 @@ fn exempt_paths(
         *by_path.entry(PathPrefix::new(body)?).or_default() |= prefix;
     }
     for path in by_path.keys() {
+        // Each exempt location is rendered next to the location of the prefix it lies in; one
+        // outside every prefix of the app would punch a hole into a path the app does not own.
+        if !paths.iter().any(|p| p.contains(path)) {
+            return Err(IngressError::InvalidPath {
+                value: path.to_string(),
+                reason: "is not equal to or below any of the app's `paths`",
+            });
+        }
         if let Some(streaming) = streaming.iter().find(|s| path.overlaps(s)) {
             return Err(IngressError::ExemptOverlap {
                 app: instance.clone(),

@@ -2517,6 +2517,156 @@ fn exempt_paths_must_not_collide_with_streaming_paths_or_other_apps() {
     assert!(matches!(gen_(&a), Err(IngressError::PathConflict { .. })));
 }
 
+/// A backend routed by `paths` next to a frontend at `/` on one domain (#612): `/receipts` keeps forward
+/// auth, `/mcp` and `/.well-known` are exempt as a whole, `/receipts/public/` below its prefix.
+const PREFIX_EXEMPT_APPS: &str = r#"
+[apps.authelia]
+image = "ghcr.io/authelia/authelia:latest"
+domains = ["auth.example.eu"]
+port = 9091
+
+[apps.frontend]
+image = "ghcr.io/x/frontend:latest"
+domains = ["example.com"]
+port = 3000
+ingress = { auth = "forward" }
+
+[apps.backend]
+image = "ghcr.io/x/backend:latest"
+domains = ["example.com"]
+paths = ["/receipts", "/mcp", "/.well-known"]
+port = 3001
+ingress = { auth = "forward", auth_exempt_paths = ["/mcp/", "/.well-known/", "/receipts/public/", "/receipts/health"] }
+"#;
+
+#[test]
+fn exempt_paths_on_a_prefix_app_are_rendered_beside_their_prefix() {
+    let a = apps(PREFIX_EXEMPT_APPS);
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_forward_prefix_exempt", conf);
+    let server = server_block(&conf, "example.com");
+    // No location header twice (nginx refuses a duplicate).
+    let mut headers: Vec<&str> = server
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("location ") && l.ends_with('{'))
+        .collect();
+    let count = headers.len();
+    headers.sort_unstable();
+    headers.dedup();
+    assert_eq!(headers.len(), count, "{server}");
+    // `/receipts` keeps forward auth; so does the unlisted subtree beside the exempt entries.
+    for header in ["location = /receipts {", "location ^~ /receipts/ {"] {
+        let block = location_block(&server, header);
+        assert!(
+            block.contains("auth_request /internal/weglarka/authz;"),
+            "{block}"
+        );
+        assert!(
+            block.contains("proxy_set_header Remote-User $wg_user;"),
+            "{block}"
+        );
+    }
+    // Everything exempt: no `auth_request`, no identity values, the path guard, the upstream.
+    for header in [
+        "location = /mcp {",
+        "location ^~ /mcp/ {",
+        "location = /.well-known {",
+        "location ^~ /.well-known/ {",
+        "location = /receipts/public {",
+        "location ^~ /receipts/public/ {",
+        "location = /receipts/health {",
+    ] {
+        let block = location_block(&server, header);
+        assert!(!block.contains("auth_request"), "{block}");
+        assert!(!block.contains("$wg_"), "{block}");
+        assert!(block.contains("return 400;"), "{block}");
+        assert!(block.contains("proxy_pass $upstream;"), "{block}");
+        assert!(block.contains("http://backend:3001"), "{block}");
+    }
+    assert!(
+        !server.contains("location ^~ /receipts/health/"),
+        "{server}"
+    );
+    // The frontend at `/` is untouched and still protected.
+    let root = location_block(&server, "location / {");
+    assert!(root.contains("auth_request"), "{root}");
+    // Identity headers are emptied for every client at `http {}`; an exempt location sets none.
+    assert!(
+        conf.contains("proxy_set_header Remote-User \"\";"),
+        "{conf}"
+    );
+}
+
+#[test]
+fn exempt_paths_below_a_stripped_prefix_strip_it_too() {
+    let a = apps(&PREFIX_EXEMPT_APPS.replace(
+        "ingress = { auth = \"forward\", auth_exempt_paths",
+        "ingress = { auth = \"forward\", strip_prefix = true, auth_exempt_paths",
+    ));
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_forward_prefix_exempt_strip", conf);
+    let server = server_block(&conf, "example.com");
+    for header in [
+        "location = /receipts/public {",
+        "location ^~ /receipts/public/ {",
+        "location = /receipts/health {",
+    ] {
+        let block = location_block(&server, header);
+        assert!(
+            block.contains("rewrite ^/receipts/(.*)$ /$1 break;"),
+            "{block}"
+        );
+    }
+    // A prefix exempt as a whole keeps its own rewrites.
+    let mcp = location_block(&server, "location ^~ /mcp/ {");
+    assert!(mcp.contains("rewrite ^/mcp/(.*)$ /$1 break;"), "{mcp}");
+    assert!(!mcp.contains("auth_request"), "{mcp}");
+    let exact = location_block(&server, "location = /mcp {");
+    assert!(exact.contains("rewrite ^ / break;"), "{exact}");
+}
+
+#[test]
+fn a_prefix_name_without_a_slash_exempts_only_the_exact_path() {
+    let a = apps(&PREFIX_EXEMPT_APPS.replace(
+        "[\"/mcp/\", \"/.well-known/\", \"/receipts/public/\", \"/receipts/health\"]",
+        "[\"/mcp\"]",
+    ));
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    let server = server_block(&conf, "example.com");
+    assert!(!location_block(&server, "location = /mcp {").contains("auth_request"));
+    assert!(location_block(&server, "location ^~ /mcp/ {").contains("auth_request"));
+}
+
+#[test]
+fn exempt_paths_of_a_prefix_app_are_checked_against_the_other_apps_and_the_prefixes() {
+    let gen_ = |extra: &str| {
+        let a = apps(&format!("{PREFIX_EXEMPT_APPS}{extra}"));
+        nginx::generate(&identity_host(HOST), &a, &opts())
+    };
+    // Another app on the domain owns a path below the exempt entry.
+    let other = "[apps.other]\nimage = \"i\"\ndomains = [\"example.com\"]\npaths = [\"/mcp/v2\"]\nport = 3002\n";
+    assert!(matches!(
+        gen_(other),
+        Err(IngressError::PathConflict { .. })
+    ));
+    // ... or a path below an exempt entry that lies below a prefix.
+    let other = "[apps.other]\nimage = \"i\"\ndomains = [\"example.com\"]\npaths = [\"/receipts/public/x\"]\nport = 3002\n";
+    assert!(matches!(
+        gen_(other),
+        Err(IngressError::PathConflict { .. })
+    ));
+    // An unrelated app on the same domain is fine.
+    let other = "[apps.other]\nimage = \"i\"\ndomains = [\"example.com\"]\npaths = [\"/blog\"]\nport = 3002\n";
+    gen_(other).unwrap();
+    // An entry outside every prefix is refused by the plan too (the model refuses it first).
+    let a = apps(&PREFIX_EXEMPT_APPS.replace("\"/receipts/health\"", "\"/other/\""));
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &a, &opts()),
+        Err(IngressError::InvalidPath { .. })
+    ));
+}
+
 #[test]
 fn the_authz_path_is_reserved_and_the_authz_subrequest_drops_client_identity() {
     let a = apps(

@@ -11,7 +11,9 @@
 //! `nginx-forward` / `nginx-edge-forward` (#89) render the forward-auth sample for
 //! `.github/scripts/test-forward-auth.sh`: `panel` (`panel.example.eu`, forward auth, `/health` exempt,
 //! `/mcp` an OAuth-protected resource, #215/ADR 0078) and `open` (no auth, `/v1/rpc` a resource) are
-//! upstreams on port 3000, the provider `authelia` answers on 9091.
+//! upstreams on port 3000, as is `backend` (`api.example.eu`, prefixes `/receipts`, `/mcp` and `/.well-known`,
+//! the last two exempt as a whole, `/receipts/public/` exempt below a prefix, #612); the provider `authelia`
+//! answers on 9091.
 //! `landing` (the whole `landing.example.eu`) and `docs` (`blog.example.eu/docs`, next to the `blog` container
 //! app on the same domain) are static sites (ADR 0049) for `.github/scripts/test-static.sh`; `help`
 //! (`help.example.eu`) is a static site with every per-site option set (#104, ADR 0069: a redirect, a
@@ -163,6 +165,13 @@ image = "ghcr.io/x/open:latest"
 domains = ["open.example.eu"]
 port = 3000
 ingress = { oauth_resources = ["/v1/rpc"] }
+
+[apps.backend]
+image = "ghcr.io/x/backend:latest"
+domains = ["api.example.eu"]
+paths = ["/receipts", "/mcp", "/.well-known"]
+port = 3000
+ingress = { auth = "forward", strip_prefix = true, auth_exempt_paths = ["/mcp/", "/.well-known/", "/receipts/public/"] }
 "#;
 
 fn main() {

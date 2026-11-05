@@ -307,9 +307,28 @@ fn a_probed_path_needs_no_exemption() {
 }
 
 #[test]
-fn exempt_paths_do_not_combine_with_path_prefixes() {
-    let s = spec("paths = [\"/p\"]\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/x/\"]");
-    assert!(lexical_err(&s).contains("auth_exempt_paths"));
+fn exempt_paths_on_a_prefix_app_must_lie_within_a_prefix() {
+    let fwd_paths = |paths: &str, exempt: &str| {
+        spec(&format!(
+            "paths = {paths}\n[ingress]\nauth = \"forward\"\nauth_exempt_paths = {exempt}"
+        ))
+    };
+    let paths = "[\"/receipts\", \"/mcp\", \"/.well-known\"]";
+    // Equal to a prefix (with and without the slash), or below one.
+    lexical(&fwd_paths(
+        paths,
+        "[\"/mcp/\", \"/.well-known/\", \"/receipts/public/\", \"/receipts/health\"]",
+    ))
+    .unwrap();
+    lexical(&fwd_paths(paths, "[\"/mcp\"]")).unwrap();
+    // Outside every prefix, or only sharing a string prefix with one.
+    for bad in ["[\"/x/\"]", "[\"/mcpx/\"]", "[\"/receipt/\"]"] {
+        let err = lexical_err(&fwd_paths(paths, bad));
+        assert!(err.contains("outside the app's `paths`"), "{bad}: {err}");
+        assert!(err.contains("/receipts"), "{err}");
+    }
+    // A catch-all next to other prefixes contains everything.
+    lexical(&fwd_paths("[\"/\", \"/a\"]", "[\"/b/\"]")).unwrap();
     lexical(&spec("paths = [\"/p\"]\n[ingress]\nauth = \"forward\"")).unwrap();
 }
 

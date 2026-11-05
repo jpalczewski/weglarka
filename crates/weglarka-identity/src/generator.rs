@@ -74,6 +74,7 @@ impl ConfigGenerator for AutheliaGenerator {
                 instance,
                 domains: &spec.domains,
                 paths: &spec.paths,
+                exempt_paths: &spec.ingress.auth_exempt_paths,
                 policy: spec.ingress.auth_policy,
                 groups: &spec.ingress.auth_groups,
             })
