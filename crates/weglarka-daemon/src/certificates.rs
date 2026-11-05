@@ -40,6 +40,7 @@ pub(crate) struct Cert {
     pub covered_by: Option<String>,
     /// For a domain with a readable certificate of its own: the apex of a valid wildcard that would
     /// cover it. nginx serves the own pair first, so the pair shadows that wildcard (issue #210).
+    /// Never set with `[acme.dns] prefer_wildcard`, which makes the wildcard the served pair.
     pub shadowed_by: Option<String>,
 }
 
@@ -49,15 +50,20 @@ impl Cert {
         &self.names[0]
     }
 
-    /// Own `notAfter` first: an expired certificate of its own is reported even next to a wildcard.
+    /// A domain a wildcard serves is `covered` whatever its own (possibly stale) pair says: with
+    /// `[acme.dns] prefer_wildcard` that pair is not the one nginx serves (issue #210, ADR 0077).
+    /// Otherwise the own `notAfter` wins: an expired certificate of its own is reported even next to a
+    /// wildcard.
     pub fn status(&self, now: SystemTime, window: Duration) -> CertStatus {
+        if self.covered_by.is_some() {
+            return CertStatus::Covered;
+        }
         match self.not_after {
             Some(at) => match at.duration_since(now) {
                 Err(_) => CertStatus::Expired,
                 Ok(left) if left <= window => CertStatus::RenewalDue,
                 Ok(_) => CertStatus::Valid,
             },
-            None if self.covered_by.is_some() => CertStatus::Covered,
             None => CertStatus::Missing,
         }
     }
@@ -130,17 +136,23 @@ fn collect_with(
         tls.join(format!("{stem}.key")).exists().then_some(chain)
     };
     let apexes: &[String] = config.dns.as_ref().map_or(&[], |dns| &dns.wildcards);
+    // `[acme.dns] prefer_wildcard` makes the wildcard of a covering apex the pair nginx serves, even
+    // when the domain keeps a pair of its own (issue #210, `docs/decisions/0077`).
+    let prefer_wildcard = config.dns.as_ref().is_some_and(|dns| dns.prefer_wildcard);
     let mut certs = Vec::new();
     for domain in domains {
         // Without a readable file of its own a valid wildcard may serve it (issue #97); an
         // unparseable file of its own is just missing.
         let chain = read(domain);
-        // The same lookup answers the mirror question, and at most one of them applies: with a pair
-        // of its own, a valid wildcard would be shadowed by that pair (issue #210, precedence
-        // unchanged).
-        let covering = || crate::acme::covering_wildcard(tls, apexes, domain, now, not_after);
-        let covered_by = if chain.is_none() { covering() } else { None };
-        let shadowed_by = if chain.is_some() { covering() } else { None };
+        // The same lookup answers both questions, and at most one of them applies: the wildcard is what
+        // nginx serves for a covered domain — because the domain has no pair of its own, or because the
+        // preference outranks that pair — and only otherwise does the own pair shadow the wildcard.
+        let covering = crate::acme::covering_wildcard(tls, apexes, domain, now, not_after);
+        let (covered_by, shadowed_by) = if chain.is_some() && !prefer_wildcard {
+            (None, covering)
+        } else {
+            (covering, None)
+        };
         certs.push(Cert {
             id: domain.clone(),
             names: vec![domain.clone()],
@@ -313,6 +325,43 @@ mod tests {
         assert_eq!(by_id(&certs, "_wildcard.example.com").shadowed_by, None);
         // The wildcard covers one label only: `x.own.example.com` is two labels below the apex.
         assert_eq!(by_id(&certs, "x.own.example.com").shadowed_by, None);
+    }
+
+    /// `[acme.dns] prefer_wildcard` (issue #210): the wildcard is the pair that is served, so the
+    /// domain's own pair shadows nothing and the row reads `covered` — the pair stays on disk.
+    #[test]
+    fn with_the_preference_the_wildcard_serves_a_domain_that_keeps_its_own_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        write(dir.path(), "_wildcard.example.com", now + 60 * DAY);
+        write(dir.path(), "own.example.com", now + 80 * DAY);
+        write(dir.path(), "stale.example.com", now - DAY);
+        let dns = "[acme.dns]\nprovider = \"cloudflare\"\ntoken_file = \"/t\"\n\
+                   wildcards = [\"example.com\"]\n";
+        let domains = ["own.example.com".to_owned(), "stale.example.com".to_owned()];
+        let w = window(&config(""));
+        // Off: the own pair is the served one, as before the setting existed.
+        let plain = collect_with(dir.path(), &config(dns), &domains, now, &fake_not_after);
+        let own = by_id(&plain, "own.example.com");
+        assert_eq!(own.covered_by, None);
+        assert_eq!(own.shadowed_by.as_deref(), Some("example.com"));
+        assert_eq!(own.status(now, w), CertStatus::Valid);
+        // On: the wildcard serves both, and neither pair is reported as shadowing anything.
+        let preferred = collect_with(
+            dir.path(),
+            &config(&format!("{dns}prefer_wildcard = true\n")),
+            &domains,
+            now,
+            &fake_not_after,
+        );
+        for domain in &domains {
+            let row = by_id(&preferred, domain);
+            assert_eq!(row.covered_by.as_deref(), Some("example.com"), "{domain}");
+            assert_eq!(row.shadowed_by, None, "{domain}");
+            // Covered even though an (expired) pair of its own is still on disk.
+            assert_eq!(row.status(now, w), CertStatus::Covered, "{domain}");
+            assert!(row.not_after.is_some(), "{domain}: the pair is still read");
+        }
     }
 
     #[test]

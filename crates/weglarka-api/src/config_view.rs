@@ -176,6 +176,10 @@ pub struct AcmeDnsView {
     pub provider: DnsProviderKind,
     pub wildcards: Vec<String>,
     pub propagation_secs: u64,
+    /// A domain covered by a valid wildcard is served with the wildcard even when it has a pair of
+    /// its own (issue #210, `docs/decisions/0077`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_wildcard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

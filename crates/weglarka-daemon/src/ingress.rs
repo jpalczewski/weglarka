@@ -15,7 +15,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -380,6 +380,7 @@ impl<P: PodmanClient> IngressManager<P> {
         } else {
             options.certificates = r.certificates.to_vec();
             options.wildcard_certificates = r.wildcards.to_vec();
+            options.prefer_wildcard = self.prefer_wildcard();
             options.tls_fingerprint = r.tls_fingerprint.map(str::to_owned);
             options.proxy_socket_dir = Some(SOCKET_CONTAINER_DIR.to_owned());
             options.cdn = cdn_trust(&self.host, self.cdn_ranges.get().map(|r| &**r))?;
@@ -661,6 +662,16 @@ impl<P: PodmanClient> IngressManager<P> {
         Ok(())
     }
 
+    /// `[acme.dns] prefer_wildcard` (issue #210, `docs/decisions/0077`): a domain covered by a wildcard
+    /// is served with it even when it has a pair of its own. Off when there is no `[acme.dns]` at all.
+    fn prefer_wildcard(&self) -> bool {
+        self.host
+            .acme
+            .as_ref()
+            .and_then(|acme| acme.dns.as_ref())
+            .is_some_and(|dns| dns.prefer_wildcard)
+    }
+
     /// `nginx.conf` atomically (the directory is mounted, so the `rename` is visible in the container).
     fn write_conf(&self, conf: &str) -> Result<bool, IngressApplyError> {
         let path = self.conf_path();
@@ -774,6 +785,16 @@ impl<P: PodmanClient> IngressManager<P> {
                 wildcards.push(apex);
             }
         }
+        // Only with the preference does a wildcard outrank an own pair, so only then must an expired
+        // one stop counting as covering (issue #210, `docs/decisions/0077`). The fingerprint below
+        // keeps describing every pair in `tls/`, as it always has.
+        limit_wildcards(
+            &tls,
+            &mut wildcards,
+            self.prefer_wildcard(),
+            SystemTime::now(),
+            &crate::acme::real_not_after,
+        );
         let fingerprint = if material.is_empty() {
             empty_fingerprint()
         } else {
@@ -1249,6 +1270,30 @@ fn empty_fingerprint() -> String {
     hex::encode(&Sha256::digest(b"no tls material")[..4])
 }
 
+/// Drops the wildcard apexes that may not outrank a domain's own pair. With `prefer_wildcard` an own
+/// pair normally loses to the wildcard (issue #210, `docs/decisions/0077`), so a wildcard whose chain
+/// is expired — or no longer readable — must not count as covering: the domain falls back to its own
+/// pair until a renewed wildcard changes the TLS material. Only the `.crt` is read, never the key.
+/// Without the preference every pair in `tls/` counts, exactly as before the setting existed.
+fn limit_wildcards(
+    tls: &Path,
+    apexes: &mut Vec<Domain>,
+    prefer_wildcard: bool,
+    now: SystemTime,
+    not_after: &dyn Fn(&[u8]) -> Option<SystemTime>,
+) {
+    if !prefer_wildcard {
+        return;
+    }
+    apexes.retain(|apex| {
+        let chain = fs::read(tls.join(format!("{WILDCARD_CERT_PREFIX}{apex}.crt")));
+        chain
+            .ok()
+            .and_then(|chain| not_after(&chain))
+            .is_some_and(|at| at > now)
+    });
+}
+
 /// Seconds/nanoseconds of a file's mtime; `0` when the platform does not report it.
 fn mtime_nanos(meta: &fs::Metadata) -> u128 {
     meta.modified()
@@ -1500,5 +1545,44 @@ mod tests {
             ingress_hash("i", bind, None, 8080, 8443, r, &hardened),
             ingress_hash("i", bind, None, 8080, 8443, r, &no_nnp)
         );
+    }
+
+    /// `[acme.dns] prefer_wildcard` (issue #210): a wildcard outranks an own pair only while its chain
+    /// is unexpired; with the default the scan keeps counting every pair in `tls/`.
+    #[test]
+    fn an_expired_wildcard_stops_covering_a_domain_only_with_the_preference() {
+        use weglarka_acme::testing::FakeAcme;
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let write = |apex: &str, at: SystemTime| {
+            std::fs::write(
+                dir.path().join(format!("_wildcard.{apex}.crt")),
+                FakeAcme::chain_expiring_at(at),
+            )
+            .unwrap();
+        };
+        write(
+            "fresh.example.org",
+            now + Duration::from_secs(80 * 24 * 3600),
+        );
+        write("old.example.org", now - Duration::from_secs(3600));
+        // A chain the reader cannot parse counts as expired, like a missing one.
+        std::fs::write(dir.path().join("_wildcard.junk.example.org.crt"), "x").unwrap();
+        let not_after = |chain: &[u8]| {
+            let text = std::str::from_utf8(chain).ok()?;
+            let secs = text.strip_prefix("FAKE-CERT not_after=")?.parse().ok()?;
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+        };
+        let apexes = || {
+            ["fresh.example.org", "old.example.org", "junk.example.org"]
+                .map(|apex| Domain::new(apex).unwrap())
+                .to_vec()
+        };
+        let mut kept = apexes();
+        limit_wildcards(dir.path(), &mut kept, true, now, &not_after);
+        assert_eq!(kept, [Domain::new("fresh.example.org").unwrap()]);
+        let mut untouched = apexes();
+        limit_wildcards(dir.path(), &mut untouched, false, now, &not_after);
+        assert_eq!(untouched, apexes(), "the default changes nothing");
     }
 }
