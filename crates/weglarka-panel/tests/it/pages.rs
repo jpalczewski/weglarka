@@ -1393,6 +1393,55 @@ async fn the_daemon_gets_only_the_reencoded_query_with_follow() {
 }
 
 #[tokio::test]
+async fn access_rows_show_the_upstream_status_and_header_time() {
+    let entries = vec![
+        AccessFrame::Entry(AccessEntry {
+            upstream_status: "200".into(),
+            upstream_header_time: "0.0123".into(),
+            ..entry("/same", "same-status")
+        }),
+        // A static site: no upstream, so no headers either — never `0.000 s`.
+        AccessFrame::Entry(AccessEntry {
+            upstream_status: "-".into(),
+            upstream_header_time: "-".into(),
+            ..entry("/static", "no-upstream")
+        }),
+        // A retry list, and an upstream code that differs from the badge.
+        AccessFrame::Entry(AccessEntry {
+            upstream_status: "502 : 200".into(),
+            upstream_header_time: "1.500, 0.020".into(),
+            ..entry("/retry", "end-of-rows")
+        }),
+    ];
+    let site = site(Script {
+        access: vec![(entries, true)],
+        ..Script::default()
+    })
+    .await;
+    let admin = login(&site, "tok-admin");
+    let mut body = open_stream(&site, &admin, "/apps/web/access/stream", None)
+        .await
+        .into_body();
+    let text = read_until(&mut body, "end-of-rows", WAIT).await.unwrap();
+    assert!(
+        text.contains("title=\"time to response headers\">0.012 s<"),
+        "{text}"
+    );
+    assert!(
+        text.contains("title=\"time to response headers\">-<"),
+        "{text}"
+    );
+    assert!(text.contains(">1.500, 0.020<"), "{text}");
+    assert!(
+        text.contains(">502 : 200<") && text.contains("title=\"upstream status"),
+        "{text}"
+    );
+    // Only the third row names an upstream status: the other two would repeat the badge or say `-`.
+    assert_eq!(text.matches("upstream status:").count(), 1, "{text}");
+    insta::assert_snapshot!("access_rows_upstream_fields", text);
+}
+
+#[tokio::test]
 async fn hostile_access_entries_render_safely() {
     let hostile = vec![
         AccessFrame::Entry(entry(
@@ -1409,6 +1458,8 @@ async fn hostile_access_entries_render_safely() {
             request_time: f64::from(u16::MAX),
             method: "M".repeat(100),
             remote_addr: "\"><b>".into(),
+            upstream_status: "\"><b>502</b>\x1b[0m\u{202e}".into(),
+            upstream_header_time: "0.0\x00<script>alert(1)</script>\n".into(),
             ..entry("/last", "end-marker")
         }),
     ];

@@ -258,6 +258,10 @@ pub struct AccessRow {
     pub class: &'static str,
     pub bytes: u64,
     pub request_time: String,
+    /// The upstream's status; empty when it repeats the badge (see `live::access_row`).
+    pub upstream_status: String,
+    /// Time to the upstream's response headers: `0.012 s`, or the raw `-`/list.
+    pub upstream_header_time: String,
     pub remote: String,
     pub user_agent: String,
 }
