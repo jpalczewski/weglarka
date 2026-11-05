@@ -47,8 +47,8 @@ use weglarka_model::state;
 
 use crate::admin::{Fail, parse_name};
 use crate::app::Daemon;
-use crate::log_retention::{ACCESS_LOG, completed_file_date};
 use crate::stream::{CallerSub, Ended, StreamDeadline, stream_response, unix_secs};
+use weglarka_model::ingress_logs::{self, LogKind};
 
 /// Frames queued between the pump and the response body: small, so a slow client holds back the
 /// reading of the Podman stream instead of buffering the log in memory.
@@ -371,7 +371,7 @@ impl History {
     /// rotated file (or on no file at all), the new current file starts at zero; when it ended on
     /// `access.log`, the open descriptor is reused, so no line written during history is lost.
     fn into_follow(self, dir: PathBuf) -> (Follow, bool) {
-        let current = dir.join(ACCESS_LOG);
+        let current = dir.join(ingress_logs::shared().current(LogKind::Access));
         let same = self.path.as_deref() == Some(current.as_path());
         (
             Follow {
@@ -462,24 +462,23 @@ impl Follow {
 /// old worker kept appending after the rename), which is the right lower bound. A file whose mtime
 /// cannot be read is kept: the timestamp filter in `Scan` still decides per line.
 fn select_files(dir: &StdPath, since: SystemTime) -> VecDeque<PathBuf> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return VecDeque::new(),
+    let layout = ingress_logs::shared();
+    let Ok(found) = layout.completed(dir) else {
+        return VecDeque::new();
     };
     let mut completed = Vec::new();
-    let mut current = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == ACCESS_LOG {
-            current = Some(entry.path());
-        } else if completed_file_date(&name).is_some() {
-            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-            if modified.is_none_or(|m| m >= since) {
-                completed.push((modified, entry.path()));
-            }
+    for (kind, _, path) in found {
+        if kind != LogKind::Access {
+            continue;
+        }
+        let modified = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if modified.is_none_or(|m| m >= since) {
+            completed.push((modified, path));
         }
     }
+    let current = Some(dir.join(layout.current(LogKind::Access))).filter(|p| p.exists());
     completed.sort_by_key(|(modified, _)| *modified);
     completed
         .into_iter()
@@ -989,7 +988,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("access-2026-11-02.log");
         let recent = dir.path().join("access-2026-11-03.log");
-        let current = dir.path().join(ACCESS_LOG);
+        let current = dir
+            .path()
+            .join(ingress_logs::shared().current(LogKind::Access));
         std::fs::write(&old, b"old\n").unwrap();
         std::fs::write(&recent, b"recent\n").unwrap();
         std::fs::write(&current, b"current\n").unwrap();
@@ -1116,7 +1117,9 @@ mod tests {
     async fn follow_drains_the_old_file_after_a_rename() {
         use std::io::Write as _;
         let d = tempfile::tempdir().unwrap();
-        let path = d.path().join(ACCESS_LOG);
+        let path = d
+            .path()
+            .join(ingress_logs::shared().current(LogKind::Access));
         std::fs::write(
             &path, b"a
 ",

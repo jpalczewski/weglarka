@@ -26,22 +26,20 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use weglarka_model::config::LogRetention;
 use weglarka_model::fsutil::write_atomic;
+use weglarka_model::ingress_logs::parse_date;
+use weglarka_model::ingress_logs::{self, LogKind, ensure_dir};
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::secrets::rfc3339_utc;
 
 use crate::ingress::IngressManager;
 
-/// Current access log (nginx opens it through the master).
-pub const ACCESS_LOG: &str = "access.log";
-/// Current error log.
-pub const ERROR_LOG: &str = "error.log";
 /// Sidecar with the UTC date the current files belong to. It keeps a restart after midnight from
 /// merging two days into one rotated file.
 const LOG_DATE_MARKER: &str = ".logdate";
 /// How often the worker checks whether a day boundary passed. One hour bounds the delay; the check
 /// itself is a directory scan of at most `retention + 1` files.
 const PERIOD: Duration = Duration::from_secs(3600);
-/// Filenames of rotated files are `<stem>-YYYY-MM-DD.log` (or `.N.log` after a rare collision).
+/// Length of a `YYYY-MM-DD` date.
 const DATE_LEN: usize = 10;
 
 /// What one retention pass did.
@@ -155,13 +153,16 @@ pub fn spawn<P: PodmanClient + 'static>(
 /// files is missing even though the marker says the day was rotated. The second case is the recovery
 /// path for a crash between `rename` and `SIGHUP`.
 fn needs_reopen(dir: &Path, rotated: bool) -> bool {
-    rotated || !dir.join(ACCESS_LOG).is_file() || !dir.join(ERROR_LOG).is_file()
+    rotated
+        || LogKind::ALL
+            .iter()
+            .any(|&kind| !dir.join(layout().current(kind)).is_file())
 }
 
 /// One pass, pure enough to test with a fixed clock: rotate if the current files belong to an
 /// earlier UTC day, prune completed files, and report what is left.
 pub fn retention_pass(dir: &Path, now: SystemTime, retention: LogRetention) -> io::Result<Report> {
-    ensure_logs_dir(dir)?;
+    ensure_dir(dir)?;
     let today = utc_date(now);
     let rotated = rotate_if_due(dir, &today)?;
     let (mut deleted, mut freed_bytes) = (0, 0);
@@ -178,18 +179,6 @@ pub fn retention_pass(dir: &Path, now: SystemTime, retention: LogRetention) -> i
         files,
         bytes,
     })
-}
-
-/// Creates the log directory (`0700`) when it does not exist yet. The ingress manager does the same
-/// on every apply; this makes the worker independent of the startup order.
-fn ensure_logs_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 /// Renames the current files when the sidecar says they belong to an earlier UTC day. Returns
@@ -210,8 +199,8 @@ fn rotate_if_due(dir: &Path, today: &str) -> io::Result<bool> {
     }
 
     let mut rotated = false;
-    for (name, stem) in [(ACCESS_LOG, "access"), (ERROR_LOG, "error")] {
-        let source = dir.join(name);
+    for kind in LogKind::ALL {
+        let source = dir.join(layout().current(kind));
         let meta = match fs::symlink_metadata(&source) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -220,7 +209,7 @@ fn rotate_if_due(dir: &Path, today: &str) -> io::Result<bool> {
         if !meta.file_type().is_file() || meta.len() == 0 {
             continue;
         }
-        let target = dated_path(dir, stem, &logical);
+        let target = dated_path(dir, kind, &logical);
         fs::rename(&source, &target)?;
         rotated = true;
     }
@@ -231,8 +220,8 @@ fn rotate_if_due(dir: &Path, today: &str) -> io::Result<bool> {
 /// Date of the current file when there is no sidecar yet (the first run after an upgrade, or a
 /// directory restored from a backup). When neither file exists the current day is the answer.
 fn current_mtime_date(dir: &Path, today: &str) -> String {
-    for name in [ACCESS_LOG, ERROR_LOG] {
-        if let Ok(meta) = fs::metadata(dir.join(name))
+    for kind in LogKind::ALL {
+        if let Ok(meta) = fs::metadata(dir.join(layout().current(kind)))
             && let Ok(modified) = meta.modified()
         {
             return utc_date(modified);
@@ -242,8 +231,9 @@ fn current_mtime_date(dir: &Path, today: &str) -> String {
 }
 
 /// `access-YYYY-MM-DD.log`, with `.1`, `.2`, … appended only when a crash left the same date behind.
-fn dated_path(dir: &Path, stem: &str, date: &str) -> PathBuf {
-    let first = dir.join(format!("{stem}-{date}.log"));
+fn dated_path(dir: &Path, kind: LogKind, date: &str) -> PathBuf {
+    let stem = kind.stem();
+    let first = dir.join(layout().dated(kind, date));
     if !first.exists() {
         return first;
     }
@@ -272,21 +262,14 @@ fn prune(dir: &Path, today: &str, days: u32) -> io::Result<(u64, u64)> {
     let today = parse_date(today).unwrap_or(0);
     let mut files = 0;
     let mut bytes = 0;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(date) = completed_file_date(&name) else {
+    for (_, date, path) in layout().completed(dir)? {
+        let Some(date) = parse_date(&date) else {
             continue;
         };
         if today - date < i64::from(days) {
             continue;
         }
-        let path = entry.path();
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let meta = entry.metadata()?;
+        let meta = fs::symlink_metadata(&path)?;
         fs::remove_file(&path)?;
         files += 1;
         bytes += meta.len();
@@ -296,82 +279,38 @@ fn prune(dir: &Path, today: &str, days: u32) -> io::Result<(u64, u64)> {
 
 /// Counts the current and completed log files and their total size, for `doctor`.
 pub fn scan(dir: &Path) -> io::Result<(u64, u64)> {
-    let mut files = 0;
-    let mut bytes = 0;
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let completed = match layout().completed(dir) {
+        Ok(completed) => completed,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
         Err(e) => return Err(e),
     };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name != ACCESS_LOG && name != ERROR_LOG && completed_file_date(&name).is_none() {
-            continue;
+    let mut files = 0;
+    let mut bytes = 0;
+    let current = LogKind::ALL
+        .iter()
+        .map(|&kind| dir.join(layout().current(kind)));
+    for path in current.chain(completed.into_iter().map(|(_, _, path)| path)) {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {
+                files += 1;
+                bytes += meta.len();
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        files += 1;
-        bytes += meta.len();
     }
     Ok((files, bytes))
 }
 
-/// Date encoded in `access-YYYY-MM-DD.log` / `error-YYYY-MM-DD[.N].log`; `None` for anything else.
-pub(crate) fn completed_file_date(name: &str) -> Option<i64> {
-    let rest = name
-        .strip_prefix("access-")
-        .or_else(|| name.strip_prefix("error-"))?;
-    if rest.len() < DATE_LEN + ".log".len() {
-        return None;
-    }
-    let (date, tail) = rest.split_at(DATE_LEN);
-    let tail = tail.strip_prefix('.')?;
-    if tail != "log" && !tail.ends_with(".log") {
-        return None;
-    }
-    parse_date(date)
+/// The directory layout the worker operates on.
+fn layout() -> ingress_logs::LogDir {
+    ingress_logs::shared()
 }
 
 /// UTC calendar date (`YYYY-MM-DD`) of a `SystemTime`.
 pub(crate) fn utc_date(now: SystemTime) -> String {
     rfc3339_utc(now)[..DATE_LEN].to_owned()
-}
-
-/// `YYYY-MM-DD` to days since 1970-01-01 (Hinnant's `days_from_civil`); `None` for an invalid date.
-pub(crate) fn parse_date(date: &str) -> Option<i64> {
-    if date.len() != DATE_LEN || date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        let part = &date[range];
-        if part.bytes().all(|b| b.is_ascii_digit()) {
-            part.parse().ok()
-        } else {
-            None
-        }
-    };
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let month_len = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if !(1..=month_len).contains(&day) {
-        return None;
-    }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
 }
 
 #[cfg(test)]
@@ -380,6 +319,9 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    const ACCESS_LOG: &str = "access.log";
+    const ERROR_LOG: &str = "error.log";
 
     fn at(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
@@ -402,21 +344,6 @@ mod tests {
         assert_eq!(parse_date("2026-11-04"), Some(20_761));
         assert_eq!(parse_date("2026-11-4"), None);
         assert_eq!(parse_date("2026-11-04x"), None);
-    }
-
-    #[test]
-    fn completed_file_names_are_recognised_and_others_ignored() {
-        for (name, want) in [
-            ("access-2026-11-04.log", Some(20_761)),
-            ("error-2026-11-04.log", Some(20_761)),
-            ("access-2026-11-04.1.log", Some(20_761)),
-            ("access-2026-11-04.txt", None),
-            ("access.log", None),
-            ("notes.txt", None),
-            ("access-2026-13-04.log", None),
-        ] {
-            assert_eq!(completed_file_date(name), want, "{name}");
-        }
     }
 
     #[test]

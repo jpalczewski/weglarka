@@ -27,6 +27,7 @@ use weglarka_ingress::{Domain, nginx, traefik};
 use weglarka_model::app::{AppKind, AppSpec, InstanceName, Security};
 use weglarka_model::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
 use weglarka_model::fsutil::write_atomic;
+use weglarka_model::ingress_logs;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerFilter, ContainerSpec, ContainerState, NetworkSpec, PodmanClient,
@@ -293,7 +294,7 @@ impl<P: PodmanClient> IngressManager<P> {
         self.ensure_probe_dir()?;
         // The logs directory exists before the container starts: nginx opens both files while it
         // parses the config, and a missing directory would make `nginx -t`/the start fail.
-        self.ensure_logs_dir()?;
+        ingress_logs::ensure_dir(&self.logs_dir).map_err(io_err(&self.logs_dir))?;
 
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
         // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
@@ -452,15 +453,6 @@ impl<P: PodmanClient> IngressManager<P> {
         let dir = self.probe_dir();
         fs::create_dir_all(&dir).map_err(io_err(&dir))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(io_err(&dir))
-    }
-
-    /// `0700` directory of the daemon-owned request logs. Only the daemon user (container uid 0 of
-    /// nginx, mapped to the same host user) opens the files; the worker inherits their descriptors,
-    /// so it needs no permission on the directory itself.
-    fn ensure_logs_dir(&self) -> Result<(), IngressApplyError> {
-        let dir = &self.logs_dir;
-        fs::create_dir_all(dir).map_err(io_err(dir))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))
     }
 
     /// Re-opens nginx's log files after the retention worker renamed them (ADR 0070). `SIGHUP`
