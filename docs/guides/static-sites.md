@@ -69,8 +69,9 @@ rejected, its partial directory is removed and `current` stays untouched.
 
 `weglarka doctor` reports two static-site checks (only while at least one `kind = "static"` app is declared):
 
-- `sites.directory` — the sites root exists, is a directory and is writable by the daemon; otherwise the check fails
-  with the path and mode (doctor never creates or repairs it).
+- `sites.directory` — the sites root exists, is a directory, is owned by the daemon's user and is writable by it;
+  otherwise the check fails with the path and mode (doctor never creates or repairs it). A group- or world-writable
+  root is a warning: anyone who can write it decides what nginx serves.
 - `sites.current` — for every static app with a pinned digest, `current` points at `releases/<digest-prefix>` and that
   release has the required files (`index.html` and a configured `not_found_page`). A broken link is a warning;
   `weglarka deploy <app> --force` switches `current` (re-exporting the image only when the release is missing or

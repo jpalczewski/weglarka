@@ -2,7 +2,7 @@
 //! Host checks (subuid, linger, cgroups…) are done by `weglarka doctor --preflight`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
@@ -934,7 +934,21 @@ fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ),
         Ok(meta) => {
             let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o300 != 0o300 {
+            // The owner bits only describe the daemon when it owns the directory; the state
+            // directory is the daemon's own, so its owner stands in for the runtime uid.
+            let daemon_uid = std::fs::metadata(&d.paths.state_dir).map(|m| m.uid()).ok();
+            if daemon_uid.is_some_and(|uid| uid != meta.uid()) {
+                check(
+                    "sites.directory",
+                    CheckStatus::Fail,
+                    format!(
+                        "sites root {} is owned by uid {}, not by the daemon's uid",
+                        root.display(),
+                        meta.uid()
+                    ),
+                    Some(hint),
+                )
+            } else if mode & 0o300 != 0o300 {
                 let hint = format!(
                     "chmod u+wx {}: the daemon must write releases there, nginx only reads them",
                     root.display()
@@ -954,6 +968,20 @@ fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                     CheckStatus::Fail,
                     format!("cannot read sites root {}: {}", root.display(), detail(&e)),
                     Some(hint),
+                )
+            } else if mode & 0o022 != 0 {
+                let hint = format!(
+                    "chmod go-w {}: anyone who can write the sites root decides what nginx serves",
+                    root.display()
+                );
+                check(
+                    "sites.directory",
+                    CheckStatus::Warn,
+                    format!(
+                        "sites root {} is group/world-writable ({mode:o})",
+                        root.display()
+                    ),
+                    Some(&hint),
                 )
             } else {
                 ok(

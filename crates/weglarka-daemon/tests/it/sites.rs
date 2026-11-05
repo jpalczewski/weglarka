@@ -206,6 +206,22 @@ async fn doctor_reports_the_sites_directory() {
 
     let root = h.root.join("state/nginx/sites");
     std::fs::create_dir_all(&root).unwrap();
+    // Group-writable: anyone in the group could plant what nginx serves.
+    std::fs::set_permissions(
+        &root,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o775),
+    )
+    .unwrap();
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = doctor_check(&report, "sites.directory").expect("sites.directory reported");
+    assert_eq!(check["status"], "warn", "{check}");
+
+    // Explicit, so the result does not depend on the test runner's umask.
+    std::fs::set_permissions(
+        &root,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
     let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
     let check = doctor_check(&report, "sites.directory").expect("sites.directory reported");
     assert_eq!(check["status"], "ok", "{check}");
