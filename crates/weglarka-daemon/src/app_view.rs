@@ -473,10 +473,11 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         oidc,
         metrics_port,
         metrics_path,
+        internal_hosts,
     } = spec;
-    // `image`, `domains`, `paths`, `depends_on`, `reload_signal` and `group_add` are names the model
-    // validates (an image reference, DNS names, path prefixes, instance names, a signal name, group
-    // names) and are shown as configured.
+    // `image`, `domains`, `paths`, `depends_on`, `reload_signal`, `group_add` and `internal_hosts` are
+    // names the model validates (an image reference, DNS names, path prefixes, instance names, a signal
+    // name, group names) and are shown as configured.
     AppSpec {
         kind: read_kind(kind),
         image,
@@ -510,6 +511,7 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         // `[A-Za-z0-9_.-]` segments, no query or fragment), so neither can carry a credential.
         metrics_port,
         metrics_path,
+        internal_hosts,
     }
 }
 

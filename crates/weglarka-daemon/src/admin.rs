@@ -559,6 +559,9 @@ async fn add_app<P: PodmanClient + 'static>(
         // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
         weglarka_model::host_ports::validate(&d.host, &apps)
             .map_err(|e| Fail::invalid(e.to_string()))?;
+        // And an `internal_hosts` entry may only name a domain this host serves (issue #303).
+        weglarka_model::internal_hosts::validate(&d.host, &apps)
+            .map_err(|e| Fail::invalid(e.to_string()))?;
         // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
         weglarka_model::depends::validate(&apps).map_err(Fail::invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps)

@@ -219,6 +219,8 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         oidc: None,
         metrics_port: None,
         metrics_path: None,
+        // `internal_hosts` (#303) is set in `apps.toml` or through the admin API, like `oidc`.
+        internal_hosts: Vec::new(),
         shared_networks: vec![],
         host_ports: Vec::new(),
         depends_on: Vec::new(),

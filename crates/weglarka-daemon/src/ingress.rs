@@ -626,6 +626,8 @@ impl<P: PodmanClient> IngressManager<P> {
                 healthcheck: None,
                 id_mapping: None,
                 keep_groups: false,
+                // The forwarder and nginx are never given `internal_hosts`: they are the targets.
+                host_aliases: vec![],
                 security,
             })
             .await?;
@@ -994,6 +996,7 @@ impl<P: PodmanClient> IngressManager<P> {
                 // the 0600 keys; the worker stays in the reserved ingress range (docs/decisions/0036).
                 id_mapping: Some(volumes::ingress_id_mapping(range)),
                 keep_groups: false,
+                host_aliases: vec![],
                 security: nginx_security(),
             })
             .await?;
