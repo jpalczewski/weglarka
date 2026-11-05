@@ -2545,6 +2545,433 @@ port = 9091
     );
 }
 
+// --- OAuth-protected resources (#215, ADR 0078) ---------------------------------------------------
+
+/// Three shapes in one config: a forward app with a resource, an app without forward auth with one, and
+/// two apps that share a domain with one each (their metadata is rendered once per server, so the
+/// legacy authorization server redirect must not appear twice there).
+const OAUTH_APPS: &str = r#"
+[apps.authelia]
+image = "ghcr.io/authelia/authelia:latest"
+domains = ["auth.example.eu"]
+port = 9091
+
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "forward", oauth_resources = ["/mcp"] }
+
+[apps.api]
+image = "ghcr.io/x/api:latest"
+domains = ["api.example.eu"]
+port = 3001
+ingress = { oauth_resources = ["/v1/rpc"] }
+
+[apps.alpha]
+image = "ghcr.io/x/alpha:latest"
+domains = ["shared.example.eu"]
+paths = ["/alpha"]
+port = 3002
+ingress = { oauth_resources = ["/alpha/rpc"] }
+
+[apps.beta]
+image = "ghcr.io/x/beta:latest"
+domains = ["shared.example.eu"]
+paths = ["/beta"]
+port = 3003
+ingress = { oauth_resources = ["/beta/rpc"] }
+"#;
+
+const OAUTH_DOMAINS: &[&str] = &[
+    "auth.example.eu",
+    "panel.example.eu",
+    "api.example.eu",
+    "shared.example.eu",
+    "weglarka.example.eu",
+];
+
+/// `behind` and `edge`, each as `(conf, is_edge)`: every assertion below holds in both modes, and the
+/// `edge` app server next to the plain-HTTP redirect server is the TLS one.
+fn oauth_confs() -> Vec<(String, bool)> {
+    let a = apps(OAUTH_APPS);
+    vec![
+        (
+            nginx::generate(&identity_host(HOST), &a, &opts()).unwrap(),
+            false,
+        ),
+        (
+            nginx::generate(&identity_host(EDGE_HOST), &a, &edge_opts(OAUTH_DOMAINS)).unwrap(),
+            true,
+        ),
+    ]
+}
+
+fn oauth_server(conf: &str, domain: &str, is_edge: bool) -> String {
+    if is_edge {
+        tls_server(conf, domain)
+    } else {
+        server_block(conf, domain)
+    }
+}
+
+#[test]
+fn oauth_resources_snapshots_in_both_modes() {
+    for (conf, is_edge) in oauth_confs() {
+        if is_edge {
+            insta::assert_snapshot!("nginx_edge_oauth_resources", conf);
+        } else {
+            insta::assert_snapshot!("nginx_oauth_resources", conf);
+        }
+    }
+}
+
+#[test]
+fn a_resource_location_streams_and_never_asks_the_provider() {
+    for (conf, is_edge) in oauth_confs() {
+        let panel = oauth_server(&conf, "panel.example.eu", is_edge);
+        // The catch-all is protected, the resource path is not: the app checks the token itself.
+        let root = location_block(&panel, "location / {");
+        assert!(
+            root.contains("auth_request /internal/weglarka/authz;"),
+            "{root}"
+        );
+        for header in ["location = /mcp {", "location ^~ /mcp/ {"] {
+            let resource = location_block(&panel, header);
+            assert!(!resource.contains("auth_request"), "{resource}");
+            assert!(!resource.contains("$wg_"), "{resource}");
+            // No `proxy_set_header` of its own, so the http-level set applies — `Remote-*` stripped.
+            assert!(!resource.contains("Remote-"), "{resource}");
+            assert!(!resource.contains("proxy_set_header"), "{resource}");
+            // The streaming directives of `streaming_paths`, and the app's own upstream.
+            assert!(resource.contains("proxy_buffering off;"), "{resource}");
+            assert!(
+                resource.contains("proxy_request_buffering off;"),
+                "{resource}"
+            );
+            assert!(resource.contains("proxy_read_timeout 3600s;"), "{resource}");
+            assert!(resource.contains("proxy_send_timeout 3600s;"), "{resource}");
+            assert!(
+                resource.contains("set $upstream \"http://panel:3000\";"),
+                "{resource}"
+            );
+            // The raw-URI guard of an exempt location: `/mcp/..;/admin` must not reach a protected path.
+            assert!(resource.contains("return 400;"), "{resource}");
+        }
+        // An app without forward auth gets the same locations without the guard.
+        let api = oauth_server(&conf, "api.example.eu", is_edge);
+        let resource = location_block(&api, "location = /v1/rpc {");
+        assert!(!resource.contains("auth_request"), "{resource}");
+        assert!(!resource.contains("return 400;"), "{resource}");
+        assert!(!resource.contains("Remote-"), "{resource}");
+        assert!(resource.contains("proxy_buffering off;"), "{resource}");
+        assert!(
+            resource.contains("set $upstream \"http://api:3001\";"),
+            "{resource}"
+        );
+    }
+}
+
+#[test]
+fn the_metadata_document_is_literal_and_unknown_hosts_get_404() {
+    for (conf, is_edge) in oauth_confs() {
+        // One http-level map over every domain that serves a resource, `default ""` for the rest.
+        assert_eq!(conf.matches("map $host $wg_oauth_origin {").count(), 1);
+        for domain in [
+            "panel.example.eu",
+            "api.example.eu",
+            "shared.example.eu",
+            "auth.example.eu",
+        ] {
+            let line = format!("{domain} \"https://{domain}\";");
+            assert_eq!(conf.contains(&line), domain != "auth.example.eu", "{line}");
+        }
+        assert!(conf.contains("default \"\";"), "{conf}");
+        let panel = oauth_server(&conf, "panel.example.eu", is_edge);
+        let metadata = location_block(
+            &panel,
+            "location = /.well-known/oauth-protected-resource/mcp {",
+        );
+        assert!(
+            metadata.contains("if ($wg_oauth_origin = \"\") { return 404; }"),
+            "{metadata}"
+        );
+        assert!(
+            metadata.contains("default_type application/json;"),
+            "{metadata}"
+        );
+        for header in [
+            "add_header Cache-Control \"public, max-age=300\" always;",
+            "add_header Access-Control-Allow-Origin \"*\" always;",
+            "add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;",
+            "add_header Access-Control-Allow-Headers \"*\" always;",
+        ] {
+            assert!(metadata.contains(header), "{header}: {metadata}");
+        }
+        assert!(
+            metadata.contains("if ($request_method = OPTIONS) { return 204; }"),
+            "{metadata}"
+        );
+        // The document names the literal origin, never `$host`: no client-sent byte reaches it.
+        assert!(
+            metadata.contains(
+                r#"return 200 '{"resource":"$wg_oauth_origin/mcp","authorization_servers":["https://auth.example.eu"],"bearer_methods_supported":["header"]}';"#
+            ),
+            "{metadata}"
+        );
+        assert!(!metadata.contains("$host"), "{metadata}");
+        assert!(!metadata.contains("auth_request"), "{metadata}");
+        // The legacy discovery is one redirect per server that serves a resource, never a proxy.
+        assert_eq!(
+            panel
+                .matches("location = /.well-known/oauth-authorization-server {")
+                .count(),
+            1
+        );
+        let redirect = location_block(
+            &panel,
+            "location = /.well-known/oauth-authorization-server {",
+        );
+        assert!(
+            redirect.contains(
+                "return 302 https://auth.example.eu/.well-known/oauth-authorization-server;"
+            ),
+            "{redirect}"
+        );
+        assert!(!redirect.contains("proxy_pass"), "{redirect}");
+        // The provider's and the webhook's servers get none of it.
+        for domain in ["auth.example.eu", "weglarka.example.eu"] {
+            let other = oauth_server(&conf, domain, is_edge);
+            assert!(
+                !other.contains("oauth-protected-resource"),
+                "{domain}: {other}"
+            );
+            assert!(
+                !other.contains("oauth-authorization-server"),
+                "{domain}: {other}"
+            );
+        }
+        // Two resources on one server: both metadata locations, one redirect.
+        let shared = oauth_server(&conf, "shared.example.eu", is_edge);
+        assert_eq!(
+            shared
+                .matches("location = /.well-known/oauth-protected-resource/")
+                .count(),
+            2,
+            "{shared}"
+        );
+        assert_eq!(
+            shared
+                .matches("location = /.well-known/oauth-authorization-server {")
+                .count(),
+            1,
+            "{shared}"
+        );
+        // A resource of a `paths`-routed app keeps the public path: no rewrite to the upstream.
+        let alpha = location_block(&shared, "location = /alpha/rpc {");
+        assert!(!alpha.contains("rewrite"), "{alpha}");
+        assert!(
+            alpha.contains("set $upstream \"http://alpha:3002\";"),
+            "{alpha}"
+        );
+        assert!(
+            shared.contains("\"resource\":\"$wg_oauth_origin/alpha/rpc\""),
+            "{shared}"
+        );
+    }
+}
+
+#[test]
+fn a_config_without_resources_renders_none_of_it() {
+    // `[identity]` and forward auth without resources: no map, no discovery, nothing to differ. (The
+    // `insta` snapshots of the same layouts pin that the bytes did not change at all.)
+    let behind = nginx::generate(&identity_host(HOST), &apps(MANY_APPS), &opts()).unwrap();
+    let edge = nginx::generate(
+        &identity_host(EDGE_HOST),
+        &apps(FORWARD_APPS),
+        &edge_opts(FORWARD_DOMAINS),
+    )
+    .unwrap();
+    for conf in [behind, edge] {
+        for noise in [
+            "wg_oauth_origin",
+            "oauth-protected-resource",
+            "oauth-authorization-server",
+        ] {
+            assert!(!conf.contains(noise), "{noise}: {conf}");
+        }
+    }
+}
+
+#[test]
+fn oauth_resources_fail_closed_without_a_usable_provider() {
+    let a = apps(OAUTH_APPS);
+    // Without `[identity]` the metadata would name no issuer: refuse the plan, keep the last config.
+    assert!(matches!(
+        nginx::generate(&host(), &a, &opts()),
+        Err(IngressError::OAuthResourceWithoutIdentity(_))
+    ));
+    // The provider itself may not declare resources (its document would name it as the resource's
+    // authorization server).
+    let mut provider = a.clone();
+    provider
+        .get_mut(&InstanceName::new("authelia").unwrap())
+        .unwrap()
+        .ingress
+        .oauth_resources = vec!["/mcp".into()];
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &provider, &opts()),
+        Err(IngressError::OAuthResourceProvider(_))
+    ));
+    // A directory backend has no token check of its own.
+    let site = apps(
+        "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+         [apps.site]\nkind = \"static\"\nimage = \"i\"\ndomains = [\"site.example.eu\"]\n\
+         ingress = { oauth_resources = [\"/mcp\"] }\n",
+    );
+    assert!(matches!(
+        nginx::generate(&identity_host(HOST), &site, &opts()),
+        Err(IngressError::OAuthResourceStatic(_))
+    ));
+}
+
+#[test]
+fn oauth_resources_must_not_overlap_streaming_or_exempt_paths() {
+    let gen_ = |ingress: &str| {
+        let a = apps(&format!(
+            "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+             [apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\nport = 3000\n\
+             ingress = {{ {ingress} }}\n"
+        ));
+        nginx::generate(&identity_host(HOST), &a, &opts())
+    };
+    for (resource, streaming) in [
+        ("/mcp", "/mcp"),
+        ("/mcp/events", "/mcp"),
+        ("/mcp", "/mcp/events"),
+    ] {
+        let err = gen_(&format!(
+            "oauth_resources = [\"{resource}\"], streaming_paths = [\"{streaming}\"]"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                IngressError::OAuthResourceOverlap {
+                    kind: "streaming",
+                    ..
+                }
+            ),
+            "{resource} vs {streaming}: {err}"
+        );
+    }
+    // The same for a forward app's exempt paths, which render the same location pair.
+    let err =
+        gen_("auth = \"forward\", oauth_resources = [\"/mcp\"], auth_exempt_paths = [\"/mcp/\"]")
+            .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            IngressError::OAuthResourceOverlap {
+                kind: "auth_exempt_paths",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    // A sibling path is not an overlap.
+    assert!(
+        gen_("oauth_resources = [\"/mcp\"], streaming_paths = [\"/mcpx\"]").is_ok(),
+        "segment-wise comparison"
+    );
+}
+
+#[test]
+fn oauth_resources_stay_inside_the_apps_paths_and_refuse_strip_prefix() {
+    let gen_ = |paths: &str, ingress: &str| {
+        let a = apps(&format!(
+            "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+             [apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\nport = 3000\n\
+             paths = [{paths}]\ningress = {{ {ingress} }}\n"
+        ));
+        nginx::generate(&identity_host(HOST), &a, &opts())
+    };
+    // A prefix-routed app answers only inside its own prefix, so a resource outside it would be a
+    // second claim on the domain.
+    for (paths, resource) in [
+        ("\"/docs\"", "/mcp"),
+        ("\"/docs\"", "/docsx"),
+        ("\"/a\", \"/b\"", "/c/mcp"),
+    ] {
+        let err = gen_(paths, &format!("oauth_resources = [\"{resource}\"]")).unwrap_err();
+        assert!(
+            matches!(err, IngressError::OAuthResourceOutsidePaths { .. }),
+            "{paths} vs {resource}: {err}"
+        );
+    }
+    // Inside the prefix it renders, unstripped; `strip_prefix` would need prefix arithmetic.
+    assert!(gen_("\"/docs\"", "oauth_resources = [\"/docs/mcp\"]").is_ok());
+    let err = gen_(
+        "\"/docs\"",
+        "strip_prefix = true, oauth_resources = [\"/docs/mcp\"]",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, IngressError::OAuthResourceStripPrefix(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn oauth_discovery_paths_are_claims_on_every_domain_of_the_app() {
+    let gen_ = |other: &str| {
+        let a = apps(&format!(
+            "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+             [apps.panel]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\nport = 3000\n\
+             ingress = {{ oauth_resources = [\"/mcp\"] }}\n{other}\n"
+        ));
+        nginx::generate(&identity_host(HOST), &a, &opts())
+    };
+    // Another app's prefix that covers a generated well-known path.
+    for path in ["/.well-known", "/.well-known/oauth-protected-resource"] {
+        let err = gen_(&format!(
+            "[apps.other]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"{path}\"]\nport = 3001\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, IngressError::PathConflict { .. }),
+            "{path}: {err}"
+        );
+    }
+    // The same resource path on a shared domain: the resource itself is a claim, so an app that owns
+    // that prefix collides with it.
+    let err = gen_(
+        "[apps.other]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/mcp\"]\nport = 3001\n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, IngressError::PathConflict { path_a, path_b, .. } if path_a == "/mcp" || path_b == "/mcp"),
+        "{err}"
+    );
+    // Two resources on one domain, each inside its own app's prefix, are fine.
+    let a = apps(
+        "[apps.authelia]\nimage = \"i\"\ndomains = [\"auth.example.eu\"]\nport = 9091\n\
+         [apps.alpha]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/a\"]\nport = 3000\n\
+         ingress = { oauth_resources = [\"/a/rpc\"] }\n\
+         [apps.beta]\nimage = \"i\"\ndomains = [\"panel.example.eu\"]\npaths = [\"/b\"]\nport = 3001\n\
+         ingress = { oauth_resources = [\"/b/rpc\"] }\n",
+    );
+    let conf = nginx::generate(&identity_host(HOST), &a, &opts()).unwrap();
+    let panel = server_block(&conf, "panel.example.eu");
+    assert_eq!(
+        panel
+            .matches("location = /.well-known/oauth-protected-resource/")
+            .count(),
+        2,
+        "{panel}"
+    );
+}
+
 // --- the admin API relay of an `[admin.http] clients` app (docs/decisions/0060) -------------------
 
 const ADMIN_HTTP: &str = r#"

@@ -17,6 +17,14 @@ pub const WEBHOOK_UPSTREAM_HOST: &str = "weglarka";
 /// The internal location every protected location asks (docs/decisions/0052); no app path may be it.
 pub(crate) const AUTHZ_PATH: &str = "/internal/weglarka/authz";
 
+/// Discovery space of an OAuth-protected resource (RFC 9728, #215, ADR 0078): the document of `/p` sits at
+/// `<this>/p`, i.e. one path segment inserted below the well-known prefix.
+pub const OAUTH_PROTECTED_RESOURCE_PREFIX: &str = "/.well-known/oauth-protected-resource";
+
+/// The authorization server metadata path a client written against the 2025-03-26 MCP spec fetches from
+/// the API host; Węglarka redirects it to the issuer (#215, ADR 0078).
+pub const OAUTH_AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IngressError {
     #[error("invalid domain {value:?}: {reason}")]
@@ -59,6 +67,37 @@ pub enum IngressError {
         exempt: String,
         streaming: String,
     },
+    #[error("app {0} declares oauth_resources, but weglarka.toml has no [identity] section")]
+    OAuthResourceWithoutIdentity(InstanceName),
+    #[error(
+        "app {0} is the identity provider and cannot declare oauth_resources (its own discovery documents would name the provider as the resource's authorization server)"
+    )]
+    OAuthResourceProvider(InstanceName),
+    #[error(
+        "app {0} is a static site and cannot declare oauth_resources (it has no token check of its own)"
+    )]
+    OAuthResourceStatic(InstanceName),
+    #[error(
+        "app {app}: oauth_resources entry {resource:?} overlaps {kind} path {path:?} (the resource location already implies both settings)"
+    )]
+    OAuthResourceOverlap {
+        app: InstanceName,
+        resource: String,
+        kind: &'static str,
+        path: String,
+    },
+    #[error(
+        "app {app}: oauth_resources entry {resource:?} is not inside any of its paths ({paths})"
+    )]
+    OAuthResourceOutsidePaths {
+        app: InstanceName,
+        resource: String,
+        paths: String,
+    },
+    #[error(
+        "app {0} declares oauth_resources and ingress.strip_prefix = true, which is not supported yet (the public path would need prefix arithmetic)"
+    )]
+    OAuthResourceStripPrefix(InstanceName),
 }
 
 /// Domain name after strict validation: lowercase ASCII, digits and `-`, ≥2 labels,
@@ -268,6 +307,10 @@ pub struct AppRoute<'a> {
     /// `auth_exempt_paths` (#89), normalized: empty unless the app uses forward auth. Sorted, one
     /// entry per path.
     pub auth_exempt: Vec<ExemptPath>,
+    /// `oauth_resources` (#215, ADR 0078), normalized: public paths whose tokens the app checks
+    /// itself. Sorted, without duplicates; each one gets its own locations and a generated discovery
+    /// document on every domain of the app.
+    pub oauth_resources: Vec<PathPrefix>,
     /// The app is an `[admin.http] clients` instance routed at `/`: its
     /// [`RELAY_PREFIX`](weglarka_model::admin_auth::RELAY_PREFIX) is carved out of the catch-all, without
     /// forward auth and with the long-lived stream settings and the upload body limit
@@ -279,6 +322,12 @@ impl AppRoute<'_> {
     /// Whether nginx asks the identity provider before serving this app.
     pub fn forward_auth(&self) -> bool {
         self.ingress.auth == IngressAuth::Forward
+    }
+
+    /// Whether this app declares OAuth-protected resources that nginx must render (#215, ADR 0078).
+    /// A `start = false` app renders no route at all, so its resources render nothing either.
+    pub fn has_oauth_resources(&self) -> bool {
+        self.active && !self.oauth_resources.is_empty()
     }
 }
 
@@ -341,6 +390,30 @@ impl<'a> Plan<'a> {
         self.identity
             .as_ref()
             .filter(|_| self.apps.iter().any(|app| app.active && app.forward_auth()))
+    }
+
+    /// The provider, when an *active* app declares OAuth-protected resources: their discovery
+    /// documents name its issuer, and the generated legacy discovery location redirects to it. `None`
+    /// renders neither, so a config without resources stays byte for byte as before (#215, ADR 0078).
+    pub fn oauth_resources(&self) -> Option<&IdentityRoute> {
+        self.identity
+            .as_ref()
+            .filter(|_| self.apps.iter().any(|app| app.has_oauth_resources()))
+    }
+
+    /// Domains serving at least one OAuth-protected resource, sorted and without duplicates: the keys
+    /// of the `$wg_oauth_origin` map, so the generated documents name a literal origin that no client
+    /// value can steer (#215, ADR 0078).
+    pub fn oauth_domains(&self) -> Vec<&Domain> {
+        let mut domains: Vec<&Domain> = self
+            .apps
+            .iter()
+            .filter(|app| app.has_oauth_resources())
+            .flat_map(|app| &app.domains)
+            .collect();
+        domains.sort();
+        domains.dedup();
+        domains
     }
 
     /// Every `(domain, path)` of every app, sorted by domain then path.
@@ -429,6 +502,29 @@ impl<'a> Plan<'a> {
                 });
             }
             let auth_exempt = exempt_paths(instance, &spec.ingress, &streaming)?;
+            let oauth_resources =
+                oauth_resource_paths(instance, spec, &paths, &streaming, &auth_exempt)?;
+            // The resource locations and the generated discovery documents of the app (#215, ADR 0078):
+            // they are claims on every domain of the app like a path prefix, so another app covering one
+            // is a conflict, and so is the same resource path on two apps of one domain.
+            let mut claims: Vec<PathPrefix> = oauth_resources.clone();
+            claims.extend(
+                oauth_resources
+                    .iter()
+                    .map(|resource| {
+                        PathPrefix::new(format!("{OAUTH_PROTECTED_RESOURCE_PREFIX}{resource}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            // The legacy discovery path is one redirect per server, so two resource apps on one domain
+            // both claim it without a conflict; every other overlap with it still is one.
+            let discovery = if oauth_resources.is_empty() {
+                None
+            } else {
+                let path = PathPrefix::new(OAUTH_AUTHORIZATION_SERVER_PATH)?;
+                claims.push(path.clone());
+                Some(path)
+            };
             // Only an app served at `/` can carve a location out of its catch-all, like the
             // streaming and exempt paths above.
             let admin_relay = paths.len() == 1
@@ -462,8 +558,11 @@ impl<'a> Plan<'a> {
                     .chain(&streaming)
                     .chain(auth_exempt.iter().map(|e| &e.path))
                     .chain(admin_relay.then_some(&relay))
+                    .chain(&claims)
                 {
-                    if let Some((other, other_path)) = others.iter().find(|(_, q)| path.overlaps(q))
+                    if let Some((other, other_path)) = others
+                        .iter()
+                        .find(|(_, q)| path.overlaps(q) && Some(q) != discovery.as_ref())
                     {
                         // Two catch-alls are the pre-#130 "domain already taken" case.
                         if path.is_root() && other_path.is_root() {
@@ -484,6 +583,7 @@ impl<'a> Plan<'a> {
                         .chain(&streaming)
                         .chain(auth_exempt.iter().map(|e| &e.path))
                         .chain(admin_relay.then_some(&relay))
+                        .chain(&claims)
                         .map(|p| (instance, p.clone())),
                 );
                 domains.push(domain);
@@ -497,6 +597,7 @@ impl<'a> Plan<'a> {
                 active: spec.start,
                 ingress: spec.ingress.clone(),
                 auth_exempt,
+                oauth_resources,
                 admin_relay,
             });
         }
@@ -563,6 +664,97 @@ fn exempt_paths(
         .collect())
 }
 
+/// Normalized `oauth_resources` of an app (#215, ADR 0078), checked against the carve-outs that render the
+/// same `location` pair and against the prefixes the app is routed under. Each entry is a full public
+/// path, so on `paths`-routed apps it must lie inside one of the app's prefixes (the request reaches the
+/// upstream unstripped, like a `streaming_paths` entry); `strip_prefix` would need prefix arithmetic.
+fn oauth_resource_paths(
+    instance: &InstanceName,
+    spec: &AppSpec,
+    paths: &[PathPrefix],
+    streaming: &[PathPrefix],
+    auth_exempt: &[ExemptPath],
+) -> Result<Vec<PathPrefix>, IngressError> {
+    let mut resources = spec
+        .ingress
+        .oauth_resources
+        .iter()
+        .map(PathPrefix::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    if resources.is_empty() {
+        return Ok(resources);
+    }
+    // A resource is only routed: the app's own token check is the whole gate, and a directory served by
+    // nginx has none (the model refuses the field for `kind = "static"` already).
+    if spec.kind != AppKind::Container {
+        return Err(IngressError::OAuthResourceStatic(instance.clone()));
+    }
+    if spec.ingress.strip_prefix {
+        return Err(IngressError::OAuthResourceStripPrefix(instance.clone()));
+    }
+    for resource in &resources {
+        // The model refuses `/` and the reserved prefixes; the plan is the last gate before the text.
+        if resource.is_root() {
+            return Err(IngressError::InvalidPath {
+                value: resource.to_string(),
+                reason: "an oauth resource must not be the app's catch-all",
+            });
+        }
+        if resource.as_str() == AUTHZ_PATH {
+            return Err(IngressError::InvalidPath {
+                value: AUTHZ_PATH.to_owned(),
+                reason: "is reserved for the forward-auth subrequest",
+            });
+        }
+        if let Some(path) = streaming.iter().find(|p| p.overlaps(resource)) {
+            return Err(IngressError::OAuthResourceOverlap {
+                app: instance.clone(),
+                resource: resource.to_string(),
+                kind: "streaming",
+                path: path.to_string(),
+            });
+        }
+        if let Some(path) = auth_exempt
+            .iter()
+            .map(|e| &e.path)
+            .find(|p| p.overlaps(resource))
+        {
+            return Err(IngressError::OAuthResourceOverlap {
+                app: instance.clone(),
+                resource: resource.to_string(),
+                kind: "auth_exempt_paths",
+                path: path.to_string(),
+            });
+        }
+        // A resource is a sub-path of the app, never a second claim on the domain: it must stay inside
+        // the prefix (or the catch-all) the app already answers on.
+        if !paths.iter().any(|prefix| covers(prefix, resource)) {
+            return Err(IngressError::OAuthResourceOutsidePaths {
+                app: instance.clone(),
+                resource: resource.to_string(),
+                paths: paths
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+    }
+    resources.sort();
+    Ok(resources)
+}
+
+/// True when `path` is `prefix` itself or lies below it, compared by whole segments (`/mcp` covers
+/// `/mcp/v2` but not `/mcpx`); the root covers everything.
+fn covers(prefix: &PathPrefix, path: &PathPrefix) -> bool {
+    prefix.is_root()
+        || path == prefix
+        || path
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// The provider route, resolved only when an app asks for forward auth. Fail closed: a forward app
 /// without `[identity]` (or the provider itself behind forward auth) refuses the whole plan, so the
 /// last good `nginx.conf` stays instead of a config that serves the app unprotected.
@@ -571,18 +763,32 @@ fn identity_route(
     apps: &BTreeMap<InstanceName, AppSpec>,
     routes: &[AppRoute<'_>],
 ) -> Result<Option<IdentityRoute>, IngressError> {
-    let Some(first) = routes.iter().find(|r| r.forward_auth()) else {
+    // The metadata of an OAuth-protected resource names the issuer too (#215, ADR 0078), so either
+    // feature needs the provider resolved — and fails closed without it.
+    let Some(first) = routes
+        .iter()
+        .find(|r| r.forward_auth() || !r.oauth_resources.is_empty())
+    else {
         return Ok(None);
     };
-    let identity = host
-        .identity
-        .as_ref()
-        .ok_or_else(|| IngressError::ForwardWithoutIdentity(first.instance.clone()))?;
-    if apps
-        .get(&identity.instance)
-        .is_some_and(|provider| provider.ingress.auth == IngressAuth::Forward)
-    {
-        return Err(IngressError::ForwardProvider(identity.instance.clone()));
+    let identity = host.identity.as_ref().ok_or_else(|| {
+        if first.oauth_resources.is_empty() {
+            IngressError::ForwardWithoutIdentity(first.instance.clone())
+        } else {
+            IngressError::OAuthResourceWithoutIdentity(first.instance.clone())
+        }
+    })?;
+    if let Some(provider) = apps.get(&identity.instance) {
+        if provider.ingress.auth == IngressAuth::Forward {
+            return Err(IngressError::ForwardProvider(identity.instance.clone()));
+        }
+        // The provider's own discovery document would name itself as the resource's authorization
+        // server, and its `.well-known` space is the one Węglarka renders for other apps.
+        if !provider.ingress.oauth_resources.is_empty() {
+            return Err(IngressError::OAuthResourceProvider(
+                identity.instance.clone(),
+            ));
+        }
     }
     let bad = |name, reason: String| IngressError::InvalidOption { name, reason };
     check_issuer(&identity.issuer).map_err(|r| bad("identity.issuer", r.to_owned()))?;
