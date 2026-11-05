@@ -45,6 +45,7 @@ or `weglarka apps update forge --streaming-path /user/events` (repeatable; repla
 - Entries use the syntax of `paths` (`/seg[/seg…]`). `/` is rejected (use `streaming = true`), as are duplicates, a list combined with `streaming = true` (redundant), and a list on an app that routes under `paths` prefixes (see [path routing](path-routing.md)).
 - A streaming path must not fall under a prefix another app owns on the same domain: the ingress plan rejects it as a path conflict.
 - Ingress only, like `streaming`: nginx reload, no container recreation, no `spec-hash` change.
+- An OAuth-protected API (an MCP endpoint) does not need an entry here: `ingress.oauth_resources` renders the same long-lived settings **without** `auth_request`, plus the resource's discovery document — see [OAuth-protected resource paths](oauth-resources.md).
 
 ## Rollback
 

@@ -824,6 +824,8 @@ auth = "forward"
 auth_policy = "one_factor"
 auth_groups = ["staff"]
 auth_exempt_paths = ["/mcp/"]
+# #215, ADR 0078: the projection carries the resource list as it is (`paths` syntax, no credential).
+oauth_resources = ["/rpc"]
 [oidc]
 redirect_uris = ["https://a.example.com/callback?token=s3cret2", "https://b.example.com/cb"]
 scopes = ["openid", "groups"]

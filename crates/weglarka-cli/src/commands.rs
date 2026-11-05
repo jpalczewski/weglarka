@@ -205,6 +205,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
             max_body_size: a.max_body_size,
             access_log_skip_paths: a.access_log_skip_paths.clone(),
             streaming_paths: a.streaming_paths.clone(),
+            oauth_resources: a.oauth_resources.clone(),
             ..Default::default()
         },
         env: a.env.iter().cloned().collect(),

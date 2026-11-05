@@ -205,6 +205,9 @@ unchanged.
   socket. A missing or wrong provider does not stop the daemon (the admin API must stay up to repair it); forward-auth apps
   are refused until it is fixed, which is fail closed.
 - `oidc.credentials`: an app with a confidential client has both its secret and its digest.
+- `ingress.oauth_resources`: for every `oauth_resources` path of a started app, the generated protected-resource
+  metadata names that `resource` and this issuer, plus a warning when no OIDC client lists the URL in `audience` —
+  see [OAuth-protected resource paths](oauth-resources.md).
 - `generated.identity`: the last result of the pipeline.
 - `state.orphan_secrets`: secrets left by removed apps (`apps remove --purge-secrets` clears them).
 
