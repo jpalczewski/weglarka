@@ -546,7 +546,9 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await
         {
             // The reservation never reached `loaded`: release it instead of leaking a `loading`
-            // one that disables adoption until an operator abandons it.
+            // one that disables adoption until an operator abandons it. The image is already
+            // pulled and tagged, and after the release it has neither reservation nor record, so a
+            // later real retention pass may adopt and remove it (nothing else uses it yet).
             self.release_acquisition(guard, Some(operation.clone()))
                 .await;
             return Err(e);
@@ -563,11 +565,22 @@ impl<P: PodmanClient> Reconciler<P> {
         {
             // Provenance could not be saved: keep the reservation (and its protection) rather than
             // releasing the image into cleanup, and report without failing a healthy deploy.
-            tracing::warn!(
-                %instance,
-                error = %e,
-                "cannot record image provenance; image cleanup is disabled for this operation"
-            );
+            if operation.is_some() {
+                tracing::warn!(
+                    %instance,
+                    error = %e,
+                    "cannot record image provenance; image cleanup is disabled for this operation"
+                );
+            } else {
+                // No reservation either (the file is full): nothing protects this image durably.
+                tracing::warn!(
+                    %instance,
+                    error = %e,
+                    "cannot record image provenance and the image reservation file is full; image \
+                     cleanup stays blocked only until there is room in the reservation file again \
+                     (#535)"
+                );
+            }
             return Ok(resolved);
         }
         if let Some(operation) = operation {

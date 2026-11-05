@@ -31,9 +31,11 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   daemon serializes it with deploys (during a deploy it answers `busy`, like the other mutations). A dry run and the
   `doctor` check use the same planner as the real prune, so they report the same list. Neither adopts images nor writes
   any file: `managed-images.toml` and `image-reservations.toml` are byte-identical before and after a dry run.
-- **Images with no provenance are reported, never removed.** Their count appears as an informational `doctor` line. An
-  image that matches a current repository name may still be adopted by an explicit prune (the repository policy of
-  ADR 0020); nothing is attributed by age, size, labels or digest alone.
+- **Images with no provenance are reported, never removed — by a dry run or by the planner alone.** Their count
+  appears as an informational `doctor` line. An image that matches a current repository name can be adopted, and then
+  removed, by any **real** (non-dry-run) retention pass: an explicit `images prune`, or the automatic cleanup after a
+  deploy of the same app (within that app's scope). That is the repository policy of ADR 0020; nothing is attributed
+  by age, size, labels or digest alone.
 - **Durable reservations.** An archive upload or pull publishes an operation in `image-reservations.toml` **before**
   `image_load`/pull, advances it to `loaded` with the image ID and digest before any `image_tag`, and holds the image
   lock through the deploy. A disconnect or cancellation therefore leaves a recoverable reservation, never a tagged but
@@ -48,7 +50,7 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   weglarka images reservations list --json
   ```
 
-  The `RECLAIM` column says `at next daemon start` (previous boot), `abandon only` (current boot) or `while platform
+  The `RECLAIM` column says `at next daemon start` (previous boot), `abandon (or host reboot)` (current boot) or `while platform
   transaction runs`. The list still works when `platform-update.toml` cannot be read: every reservation is shown, the
   reference state is unknown (`unknown (journal unreadable)` for previous-boot rows, `"referenced": null` in `--json`),
   and a warning names the file and the error. Startup reclamation, in contrast, fails closed on that file: it reclaims
@@ -67,13 +69,14 @@ update design in [ADR 0067](../decisions/0067-managed-images-and-platform-update
   cleanup works again as soon as there is room.
 
   **Limitation.** An unreserved acquisition has no reservation to bridge the gap between the pull and the moment
-  its provenance is recorded. If recording also fails in that deploy (for example a rollback image pulled unreserved
-  after the deploy's own reservation was released and freed a slot), the image has no durable protection once
-  capacity is back: nothing stops a later pass from treating it as unrecorded. It is not deleted for that reason
-  alone — an unrecorded image is only ever removed by adoption in an explicit `images prune` — but a container or
-  `state.toml` entry that uses it is its only protection until then. This is a deliberate exception to ADR 0067's
-  rule that acquisition keeps its protection "until provenance and a durable protection have been published", traded
-  for a full reservation file not failing deploys (a durable fix is tracked in #535).
+  its provenance is recorded. Example: a deploy's first pull takes the last free slot, so the rollback image it pulls
+  next runs unreserved; if recording that image's provenance fails, it has neither a reservation nor a record. When
+  the deploy then releases its own reservation the file is no longer full, the retention pass after the deploy runs
+  unblocked, and that unrecorded image can be adopted by repository name and removed — by that automatic pass or by a
+  later explicit `images prune`. A container or `state.toml` entry that uses the image protects it until then. This
+  is a deliberate exception to ADR 0067's rule that acquisition keeps its protection "until provenance and a durable
+  protection have been published", traded for a full reservation file not failing deploys (a durable fix is tracked
+  in #535).
 - **Platform images need a capability record.** Deleting an image owned by the platform daemon requires
   `host-capabilities.toml` with host protocol 1 and the coordination features image-lock, platform-update-lock,
   service-activation and reservation-phases. A missing file, an older protocol or a missing feature keeps those images

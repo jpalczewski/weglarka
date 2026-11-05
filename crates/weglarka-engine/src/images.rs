@@ -209,6 +209,14 @@ pub struct ReservationList {
     pub diagnostics: Vec<String>,
 }
 
+impl ReservationList {
+    /// The file has no room left: acquisitions run unreserved and retention is blocked (the one
+    /// definition, shared with the engine's own checks).
+    pub fn is_full(&self) -> bool {
+        reservation_count_is_full(self.reservations.len())
+    }
+}
+
 /// Proof that the engine's image lock is held while a retention plan is executed.
 ///
 /// [`execute`] takes a `&ImageGuard`, so a plan computed under the lock cannot be applied after the
@@ -410,7 +418,16 @@ impl PreparedRetention {
 /// The host's boot identity. A reservation is reclaimable only when this differs from the owner's
 /// boot; wall-clock time is never evidence.
 fn current_boot_id() -> String {
-    known_boot_id().unwrap_or_else(|| "unknown-boot".to_owned())
+    known_boot_id().unwrap_or_else(|| UNKNOWN_BOOT.to_owned())
+}
+
+/// The `boot_id` stored for a reservation written while the host reported no boot identity. It may
+/// belong to the current boot, so such a reservation is never treated as a previous boot's.
+const UNKNOWN_BOOT: &str = "unknown-boot";
+
+/// Whether a reservation written by `owner_boot` provably belongs to a boot other than `boot`.
+fn is_previous_boot(owner_boot: &str, boot: Option<&str>) -> bool {
+    owner_boot != UNKNOWN_BOOT && boot.is_some_and(|boot| owner_boot != boot)
 }
 
 /// The boot identity when the host reports one. Reclamation needs a *proof* that the writer's boot
@@ -660,7 +677,12 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// [`Self::finish_acquisition`] for an acquisition that may have run without a reservation
-    /// (`None`: the file was full). Used on the failure paths, where nothing durable was committed.
+    /// (`None`: the file was full). Used on the failure paths, where no provenance was committed.
+    ///
+    /// It only drops the reservation; it does not touch the image. When the failure came after the
+    /// pull or load (a failed [`Self::advance_acquisition`]), the image is already pulled and tagged
+    /// and, once released, has neither a reservation nor a record, so a later real retention pass
+    /// can adopt it by repository name and remove it.
     pub(crate) async fn release_acquisition(
         &self,
         guard: &ImageGuard<'_>,
@@ -776,7 +798,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     component,
                     pid,
                     started_at,
-                    previous_boot: boot.is_some_and(|boot| boot_id != boot),
+                    previous_boot: is_previous_boot(&boot_id, boot),
                     referenced,
                     protections: protections.len(),
                 }
@@ -819,7 +841,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut reservations = self.read_reservations()?;
         let mut reclaimed = Vec::new();
         reservations.operations.retain(|entry| {
-            let keep = entry.reservation.owner.boot_id == boot
+            let keep = !is_previous_boot(&entry.reservation.owner.boot_id, Some(boot))
                 || references_reservation(transaction, &entry.operation_id, &entry.reservation);
             if !keep {
                 reclaimed.push(entry.operation_id.clone());
@@ -1300,7 +1322,11 @@ fn references_reservation(
 /// Whether the reservation file has no room left: acquisitions then run unreserved
 /// ([`Reconciler::begin_acquisition`]) and retention is blocked.
 fn reservations_full(reservations: &Reservations) -> bool {
-    reservations.operations.len() >= MAX_RESERVATIONS
+    reservation_count_is_full(reservations.operations.len())
+}
+
+fn reservation_count_is_full(count: usize) -> bool {
+    count >= MAX_RESERVATIONS
 }
 
 /// Operation ids of the reservations still in phase `loading`.

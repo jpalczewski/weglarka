@@ -382,8 +382,8 @@ pub const IMAGES_PRUNE: Endpoint = Endpoint {
     body: Body::NoAppData,
 };
 /// `GET` → [`ListReservationsResponse`](crate::ListReservationsResponse). The durable image
-/// reservations with the `operation_id` that `abandon` takes. `admin`: it names writer processes and
-/// boots (no image ids).
+/// reservations with the `operation_id` that `abandon` takes. `admin`: it exposes writer process ids
+/// and whether the writer's boot is the current one (no image ids).
 pub const IMAGES_RESERVATIONS_LIST: Endpoint = Endpoint {
     method: Method::Get,
     path: "/v1/images/reservations",

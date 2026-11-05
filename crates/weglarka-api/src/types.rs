@@ -520,8 +520,8 @@ pub struct PruneImagesResponse {
 }
 
 /// `GET /v1/images/reservations`: the durable image reservations (`image-reservations.toml`), so an
-/// operator can find the `operation_id` that `abandon` needs. Admin scope: it names writer
-/// processes and boots.
+/// operator can find the `operation_id` that `abandon` needs. Admin scope: it exposes writer
+/// process ids and whether the writer's boot is the current one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReservationsResponse {
     pub reservations: Vec<ReservationView>,

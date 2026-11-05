@@ -110,6 +110,8 @@ impl<P: PodmanClient> Reconciler<P> {
                     .await
             {
                 // Still `loading`: release it rather than leak a reservation that blocks adoption.
+                // The archive is already loaded and, once released, the image has neither
+                // reservation nor record, so a later real retention pass may adopt and remove it.
                 self.release_acquisition(&image_guard, Some(operation.clone()))
                     .await;
                 return Err(e);

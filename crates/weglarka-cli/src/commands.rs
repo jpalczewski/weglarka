@@ -770,7 +770,7 @@ fn reclaim_note(v: &ReservationView) -> &'static str {
         (Some(true), _) => "while platform transaction runs",
         (Some(false), true) => "at next daemon start",
         // A reservation of this boot is never reclaimed, whatever the journal says.
-        (_, false) => "abandon only",
+        (_, false) => "abandon (or host reboot)",
         (None, true) => "unknown (journal unreadable)",
     }
 }

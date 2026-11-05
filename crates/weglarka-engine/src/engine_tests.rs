@@ -6753,6 +6753,63 @@ mod retention {
         assert!(h.rec.list_reservations().unwrap().reservations.is_empty());
     }
 
+    /// A reservation stored with the `unknown-boot` placeholder may belong to the current boot (it
+    /// was written while the host reported none): it is never reclaimed and never listed as a
+    /// previous boot's, while a real previous boot's reservation next to it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_reservation_of_the_unknown_boot_placeholder_is_never_reclaimed() {
+        let h = Harness::new(NTFY);
+        let entry = |id: &str, boot: &str| ReservationEntry {
+            operation_id: OperationId::new(id).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 1, boot, 1_700_000_000).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        };
+        let text = Reservations::new(vec![
+            entry("placeholder", "unknown-boot"),
+            entry("gone", "boot-gone"),
+        ])
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        fsutil::write_atomic(
+            &state_dir(&h).join(RESERVATIONS_FILE_NAME),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        let listed = h.rec.list_reservations_in_boot(Some("boot-now")).unwrap();
+        assert_eq!(
+            listed
+                .reservations
+                .iter()
+                .map(|r| (r.operation_id.as_str(), r.previous_boot))
+                .collect::<Vec<_>>(),
+            [("gone", true), ("placeholder", false)]
+        );
+        let reclaimed = h
+            .rec
+            .reclaim_stale_reservations_in_boot(Some("boot-now"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reclaimed
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["gone"]
+        );
+        let left = h.rec.list_reservations().unwrap().reservations;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].operation_id, "placeholder");
+    }
+
     /// A corrupt `platform-update.toml` makes the list degrade, not fail: every reservation is
     /// there (the operator needs the ids), `referenced` is unknown and a warning names the file and
     /// the error. Reclamation fails closed on the same file: nothing is reclaimed.

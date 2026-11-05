@@ -678,8 +678,10 @@ async fn image_retention<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChe
     }
     // Authored here, so it needs no `detail(..)`: a full reservation file lets deploys go on but
     // blocks all cleanup, which the generic "bookkeeping unavailable" line would not explain.
+    // The early return below skips the unused-image summary while the file is full: retention is
+    // blocked then, so there is no trustworthy plan to summarize.
     if let Ok(list) = d.engine.list_reservations()
-        && list.reservations.len() >= weglarka_model::image_inventory::MAX_RESERVATIONS
+        && list.is_full()
     {
         out.push(check(
             "runtime.images",
