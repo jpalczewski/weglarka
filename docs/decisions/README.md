@@ -83,3 +83,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0074](0074-container-log-driver.md) | Explicit log driver and size bound for containers |
 | [0075](0075-site-level-static-options.md) | Static options shared by a site's environments, and a per-environment `robots` |
 | [0076](0076-security-headers-for-container-apps.md) | Security headers for container apps |
+| [0077](0077-wildcard-precedence-over-own-pairs.md) | Opt-in wildcard precedence over a domain's own certificate pair |
