@@ -55,7 +55,8 @@ paths:
 - Acceptance on a host / in CI: `scripts/acceptance.sh` (canary, traffic, webhook 202/401/204, cleanup;
   `--with-local-registry` adds a deploy from a webhook and a forced rollback — CI only). Image smoke tests:
   `.github/scripts/smoke-image.sh` and `smoke-quadlet.sh` (arguments from `platform install`).
-- PRs build with the `ci` profile (thin LTO); `main` and tags with the full `release` (`docs/decisions/0008`). A PR
+- PRs build with the `ci` profile (no LTO, `opt-level = 1`, `codegen-units = 256`, still `panic = "abort"`);
+  `main` and tags with the full `release` (`docs/decisions/0008`, addendum of 2026-11-05). A PR
   changing only documentation (`docs/**`, `*.md`, `.gitignore`) runs no builds — the job `changes` skips
   `check`/`nginx-e2e`/`musl`/`podman-tests`/`smoke-behind`/`smoke-edge`/`panel-e2e`; `changes` and `pr-title` always run. A push to
   `main` with documentation only runs neither CI nor Release (`paths-ignore`) — the image is not rebuilt then; `v*` tags

@@ -102,8 +102,16 @@ strip = true
 panic = "abort"
 opt-level = "z"
 
-# Pull-request builds (docs/decisions/0008): same code, much cheaper to link; `main` and tags use `release`.
+# Pull-request builds (docs/decisions/0008): same code, much cheaper to build; `main` and tags use `release`.
+# Nothing here is a production artifact — the smoke jobs only prove behaviour — so the profile drops LTO and
+# `opt-level = "z"` for a plain `opt-level = 1` with many codegen units and no debug info/ symbols.
+# `panic = "abort"` and `strip` stay as in `release`; do not go down to `dev`: the smoke windows
+# (`--health-window 4`) were never timed on unoptimized binaries.
 [profile.ci]
 inherits = "release"
-lto = "thin"
-codegen-units = 16
+lto = false
+opt-level = 1
+codegen-units = 256
+debug = 0
+strip = "symbols"
+panic = "abort"
