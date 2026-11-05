@@ -143,6 +143,9 @@ pub enum StopFailure {
     DeadConmon,
     /// A stop that failed and left the container running (a timeout, a busy runtime).
     LeftRunning,
+    /// A stop that failed mid-way: libpod reports a transient state such as `stopping`, which the
+    /// client maps to [`ContainerState::Unknown`] — not proof that the container is down.
+    LeftStopping,
 }
 
 #[derive(Default)]
@@ -801,6 +804,13 @@ impl PodmanClient for FakePodman {
                 });
             }
             Some(StopFailure::LeftRunning) => {
+                return Err(PodmanError::Api {
+                    status: 500,
+                    message: "container stop timed out".into(),
+                });
+            }
+            Some(StopFailure::LeftStopping) => {
+                s.container_mut(name)?.state = ContainerState::Unknown;
                 return Err(PodmanError::Api {
                     status: 500,
                     message: "container stop timed out".into(),

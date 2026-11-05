@@ -121,6 +121,11 @@ mod tests {
         let info = fake.container_inspect("app").await.unwrap();
         assert_eq!(info.state, ContainerState::Running);
 
+        fake.script_next_stop_failure(StopFailure::LeftStopping);
+        assert!(fake.container_stop("app", 10).await.is_err());
+        let info = fake.container_inspect("app").await.unwrap();
+        assert_eq!(info.state, ContainerState::Unknown);
+
         // A stop of a missing container is `NotFound`, scripted failure or not.
         fake.script_next_stop_failure(StopFailure::DeadConmon);
         assert!(matches!(

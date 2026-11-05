@@ -360,8 +360,10 @@ impl<P: PodmanClient> Reconciler<P> {
     /// A container whose conmon died is still reported `running` by libpod, and its `stop` answers
     /// HTTP 500 (`conmon exited prematurely`) while ending the container as `exited` with exit code
     /// -1 (measured on Podman 6.1.3, issue #470). The state observed after the failed call decides —
-    /// never the error text: not running (or gone) → `warn` and carry on, still running or not
-    /// inspectable → the stop error stands.
+    /// never the error text: definitely down (`exited`, `stopped`, `created`) or gone → `warn` and
+    /// carry on; anything else (`running`, `paused`, a transient libpod state such as `stopping`
+    /// that maps to `unknown`) or not inspectable → the stop error stands. Not for paths that touch
+    /// the container's data while it is down (`volumes import` keeps a strict stop).
     pub(crate) async fn stop_for_restart(&self, name: &str) -> Result<(), EngineError> {
         let error = match self
             .podman
@@ -372,7 +374,12 @@ impl<P: PodmanClient> Reconciler<P> {
             Err(e) => e,
         };
         match self.podman.container_inspect(name).await {
-            Ok(info) if info.state != ContainerState::Running => {
+            Ok(info)
+                if matches!(
+                    info.state,
+                    ContainerState::Exited | ContainerState::Stopped | ContainerState::Created
+                ) =>
+            {
                 tracing::warn!(
                     container = %name,
                     state = ?info.state,

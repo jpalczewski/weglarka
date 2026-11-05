@@ -396,6 +396,28 @@ async fn deploy_replaces_a_container_whose_stop_lost_its_conmon() {
     assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
 }
 
+/// A stop that failed with the old container still running aborts the deploy before the old
+/// container is removed (issue #470): only a container that is definitely down is replaced.
+#[tokio::test(start_paused = true)]
+async fn deploy_keeps_the_old_container_when_its_stop_fails_and_it_keeps_running() {
+    let h = Harness::new(NTFY);
+    let ntfy = name("ntfy");
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_next_stop_failure(StopFailure::LeftRunning);
+    let before = h.fake.calls().len();
+    h.rec.deploy(&ntfy, false).await.unwrap_err();
+    let calls = h.fake.calls()[before..].to_vec();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::ContainerRemove(_))),
+        "the old container is not removed: {calls:?}"
+    );
+    assert_eq!(h.state("ntfy").current, Some(digest('a')));
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
 #[tokio::test(start_paused = true)]
 async fn rollback_uses_local_image_when_registry_cannot_serve_it() {
     let h = Harness::new(NTFY);
@@ -2279,6 +2301,25 @@ async fn reload_returns_the_stop_error_while_the_container_keeps_running() {
         "a container that is still running is not started again"
     );
     assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// A failed stop that leaves a transient libpod state (`stopping` → `Unknown`) is not proof the
+/// container is down: reload returns the stop error and does not start it (issue #470).
+#[tokio::test(start_paused = true)]
+async fn reload_returns_the_stop_error_while_the_container_is_still_stopping() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.script_next_stop_failure(StopFailure::LeftStopping);
+    let before = h.fake.calls().len();
+    h.rec.reload(&name("ntfy")).await.unwrap_err();
+    assert!(
+        !h.fake.calls()[before..]
+            .iter()
+            .any(|c| matches!(c, Call::ContainerStart(_))),
+        "a container that may still be running is not started again"
+    );
 }
 
 // ---------- crash loops and failing healthchecks (issue #112) ----------

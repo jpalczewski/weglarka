@@ -819,9 +819,12 @@ impl<P: PodmanClient> Reconciler<P> {
             .await
             .is_ok_and(|c| c.state == ContainerState::Running);
         if was_running {
-            // An import stops the app and starts it again below, so a stop that fails because the
-            // conmon already died must not abort it (issue #470).
-            self.stop_for_restart(&app_container).await?;
+            // Strict on purpose, unlike reload and deploy (issue #470): the import writes into the
+            // app's volume, and a failed stop does not prove the app's processes are gone. After a
+            // dead-conmon failure the container is `exited`; `apps reload` brings it back.
+            self.podman
+                .container_stop(&app_container, self.options.stop_timeout_secs)
+                .await?;
         }
         if replace {
             self.podman
@@ -1524,19 +1527,28 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
     }
 
-    /// A conmon that died under the running app does not abort the import: the stop error is
-    /// tolerated because the container is not running any more, the import runs and the app is
-    /// started again (issue #470).
+    /// A stop that fails aborts the import before anything is written, even when the container
+    /// ends `exited` (a dead conmon, issue #470): the failed stop does not prove the app's
+    /// processes are gone, so the volume is not touched.
     #[tokio::test(start_paused = true)]
-    async fn import_survives_a_stop_of_a_container_whose_conmon_died() {
+    async fn import_is_refused_when_the_stop_of_the_app_fails() {
         let e = env(APP);
         e.rec.reconcile().await.unwrap();
+        let before = e.fake.calls().len();
         e.fake.script_next_stop_failure(StopFailure::DeadConmon);
         e.rec
             .import_volume(&name("szklana"), "data", ImportMode::Own, tar(), WAIT)
             .await
-            .unwrap();
-        assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
+            .unwrap_err();
+        let calls = e.fake.calls()[before..].to_vec();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::VolumeImport(_))),
+            "nothing is imported after a failed stop: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::ContainerStart(_))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
