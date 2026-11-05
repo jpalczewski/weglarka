@@ -2104,6 +2104,53 @@ async fn group_add_needs_the_allowlist_and_sets_keep_groups() {
     assert!(h.fake.container_spec("alloy").is_none());
 }
 
+/// `internal_hosts` reaches `ContainerSpec::host_aliases`, so Podman writes the domains into the
+/// container's `/etc/hosts` (issue #303); clearing it recreates the app once and deleting it from the
+/// spec leaves the field empty again.
+#[tokio::test(start_paused = true)]
+async fn internal_hosts_reach_the_container_as_host_aliases() {
+    let apps = format!("{NTFY}internal_hosts = [\"git.example.org\", \"auth.example.org\"]\n");
+    let h = Harness::new(&apps);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    assert!(h.rec.reconcile().await.unwrap().is_clean());
+    assert_eq!(
+        h.fake.container_spec("ntfy").unwrap().host_aliases,
+        vec!["git.example.org".to_owned(), "auth.example.org".to_owned()]
+    );
+
+    // A different list is a different container (`/etc/hosts` is fixed at create): the app is
+    // recreated although its image did not change.
+    let before = h.fake.calls().len();
+    let apps = format!("{NTFY}internal_hosts = [\"git.example.org\"]\n");
+    h.set_apps(&apps);
+    assert!(h.rec.reconcile().await.unwrap().is_clean());
+    assert_eq!(
+        h.fake.container_spec("ntfy").unwrap().host_aliases,
+        vec!["git.example.org".to_owned()]
+    );
+    let calls = h.fake.calls();
+    assert_eq!(
+        calls[before..]
+            .iter()
+            .filter(|c| **c == Call::ContainerCreate("ntfy".into()))
+            .count(),
+        1,
+        "a changed host list recreates the container: {:?}",
+        &calls[before..]
+    );
+
+    // Removing the field clears it: no leftover entry after the app stops resolving anything.
+    h.set_apps(NTFY);
+    assert!(h.rec.reconcile().await.unwrap().is_clean());
+    assert!(
+        h.fake
+            .container_spec("ntfy")
+            .unwrap()
+            .host_aliases
+            .is_empty()
+    );
+}
+
 /// A broken config fails the deploy **before** the old container is touched: no stop, no remove, no
 /// rollback that would only bring back the same broken spec.
 #[tokio::test(start_paused = true)]

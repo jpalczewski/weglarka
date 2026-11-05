@@ -170,11 +170,19 @@ pub(crate) struct CreateContainer<'a> {
     /// OCI annotations; only `run.oci.keep_original_groups` today (ADR 0045).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     annotations: BTreeMap<&'static str, &'static str>,
+    /// `SpecGenerator.hostadd`: extra `/etc/hosts` entries, `<host>:<ip>`. Podman resolves the reserved
+    /// `host-gateway` to its containers-internal address at every container **start** (issue #303), so
+    /// `["git.example.org:host-gateway"]` reaches what the host publishes on all its IPv4 addresses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hostadd: Vec<String>,
 }
 
 /// Options of a tmpfs mount from `security.tmpfs` (writable, no devices or setuid).
 /// crun annotation behind `podman run --group-add keep-groups` (ADR 0045).
 const KEEP_ORIGINAL_GROUPS: &str = "run.oci.keep_original_groups";
+/// `hostadd` value standing for "the host's containers-internal address" (`--add-host d:host-gateway`);
+/// Podman substitutes it at every container start (issue #303, ADR 0071).
+const HOST_GATEWAY: &str = "host-gateway";
 const TMPFS_OPTIONS: [&str; 3] = ["rw", "nosuid", "nodev"];
 
 #[derive(Serialize)]
@@ -450,6 +458,11 @@ impl<'a> CreateContainer<'a> {
             } else {
                 BTreeMap::new()
             },
+            hostadd: spec
+                .host_aliases
+                .iter()
+                .map(|domain| format!("{domain}:{HOST_GATEWAY}"))
+                .collect(),
         }
     }
 }
@@ -1898,6 +1911,25 @@ mod tests {
             ..ContainerSpec::new("a", "i")
         };
         insta::assert_json_snapshot!(CreateContainer::new(&spec));
+    }
+
+    /// `host_aliases` become `hostadd` entries with Podman's reserved `host-gateway` address
+    /// (issue #303): `<domain>:host-gateway`, which Podman resolves to `169.254.1.2` and writes into
+    /// `/etc/hosts` at every container start. Omitted when the app resolves nothing, so an app without
+    /// `internal_hosts` sends the same create body as before.
+    #[test]
+    fn create_container_host_aliases() {
+        let mut spec = ContainerSpec {
+            host_aliases: vec!["auth.example.org".into(), "git.example.org".into()],
+            ..ContainerSpec::new(
+                "git",
+                "ghcr.io/example/git@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            )
+        };
+        insta::assert_json_snapshot!(CreateContainer::new(&spec));
+        spec.host_aliases.clear();
+        let body = serde_json::to_value(CreateContainer::new(&spec)).unwrap();
+        assert!(body.get("hostadd").is_none(), "{body}");
     }
 
     #[test]

@@ -233,6 +233,11 @@ pub struct ContainerSpec {
     /// groups, not a chosen one; access checks use the host gids even though the container shows
     /// them as `nobody`.
     pub keep_groups: bool,
+    /// Domains the container resolves to Podman's `host-gateway` (`--add-host <domain>:host-gateway`,
+    /// issue #303): written into the container's `/etc/hosts` at every start, resolved by Podman to
+    /// its containers-internal IPv4 address (`169.254.1.2` unless `containers.conf` says otherwise).
+    /// The route reaches only what the host publishes on `0.0.0.0` or its public IPv4.
+    pub host_aliases: Vec<String>,
     /// Hardening from the spec (read-only root, tmpfs, capabilities, no-new-privileges).
     pub security: crate::app::Security,
 }
@@ -265,6 +270,7 @@ impl ContainerSpec {
             healthcheck: None,
             id_mapping: None,
             keep_groups: false,
+            host_aliases: Vec::new(),
             security: crate::app::Security::default(),
         }
     }

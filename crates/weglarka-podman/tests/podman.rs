@@ -844,3 +844,61 @@ async fn a_long_log_line_is_several_stamped_records() {
     assert!(records.len() > 2, "the long line was not split: {ends:?}");
     client.container_remove(&name, true).await.unwrap();
 }
+
+/// `host_aliases` become `<domain>:host-gateway` entries that Podman resolves at every container
+/// start and writes into `/etc/hosts` (issue #303, ADR 0071). Measured on rootless Podman 6: the
+/// address is Podman's containers-internal one (`169.254.1.2` by default), and the connection it
+/// serves reaches the host's published ports. `host_containers_internal_ip = "none"` makes the start
+/// fail instead, so this test also guards that the route exists at all.
+#[tokio::test]
+async fn host_aliases_are_written_into_etc_hosts() {
+    let Some(socket) = socket() else { return };
+    let client = LibpodClient::new(socket.clone());
+    let name = format!("wg-it-hosts-{}", run_id());
+    let _cleanup = Cleanup {
+        socket: socket.clone(),
+        containers: vec![name.clone()],
+        networks: vec![],
+        secrets: vec![],
+        images: vec![],
+    };
+    let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.last(), Some(Ok(PullEvent::Complete { .. }))),
+        "{events:?}"
+    );
+    let mut s = spec(&name, BTreeMap::new());
+    s.image = BUSYBOX.into();
+    s.command = vec!["sleep".into(), "60".into()];
+    s.restart = RestartPolicy::No;
+    s.host_aliases = vec!["git.example.org".into(), "auth.example.org".into()];
+    client.container_create(&s).await.unwrap();
+    client.container_start(&name).await.unwrap();
+
+    let grep = |domain: &str| {
+        vec![
+            "grep".to_owned(),
+            "-qE".to_owned(),
+            format!(r"^169\.254\.1\.2[[:space:]]+{domain}$"),
+            "/etc/hosts".to_owned(),
+        ]
+    };
+    for domain in ["git.example.org", "auth.example.org"] {
+        let code = timeout(STEP, client.container_exec(&name, &grep(domain)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0, "no 169.254.1.2 {domain} entry in /etc/hosts");
+    }
+    // A domain that was not asked for is not resolved that way.
+    let code = timeout(
+        STEP,
+        client.container_exec(&name, &grep("hooks.example.org")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(code, 0, "an unlisted domain must not be mapped");
+}

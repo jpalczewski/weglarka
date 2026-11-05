@@ -223,6 +223,10 @@ pub(crate) fn app_container_base(
         // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
         mounts: config_binds(configs),
         keep_groups: !spec.group_add.is_empty(),
+        // Domains this host serves (issue #303, ADR 0071): Podman writes them into `/etc/hosts` at
+        // every start, so a deploy, a blue-green challenger and a one-off run all resolve them the
+        // same way. Validated against the host's domains before the spec gets here.
+        host_aliases: spec.internal_hosts.clone(),
         volumes: vec![],
         resources: spec.resources.clone(),
         healthcheck: None,
