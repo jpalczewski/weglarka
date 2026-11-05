@@ -24,7 +24,7 @@ use weglarka_api::{ContainerHealth, ShowAppResponse};
 use weglarka_model::admin_auth::{Principal, Scope};
 use weglarka_model::app::{
     AppIngress, AppKind, AppSpec, ConfigMount, Feed, FeedFormat, HealthGate, HostMount, HostPort,
-    HttpProbe, InstanceName, Redirect, Resources, SecretBinding, SecretTarget, Security,
+    HttpProbe, InstanceName, Redirect, Resources, Robots, SecretBinding, SecretTarget, Security,
     SecurityHeaders, SecurityHeadersPreset, SharedNetworkRef, SharedVolumeRef, StaticIngress,
     Strategy, VolumeMount,
 };
@@ -329,6 +329,7 @@ fn read_static_ingress(ingress: StaticIngress) -> StaticIngress {
         redirects,
         feeds,
         security_headers,
+        robots,
     } = ingress;
     StaticIngress {
         clean_urls,
@@ -338,6 +339,14 @@ fn read_static_ingress(ingress: StaticIngress) -> StaticIngress {
         redirects: redirects.into_iter().map(read_redirect).collect(),
         feeds: feeds.into_iter().map(read_feed).collect(),
         security_headers: security_headers.map(read_security_headers),
+        robots: robots.map(read_robots),
+    }
+}
+
+#[allow(clippy::needless_match)] // the copy is the point: no wildcard arm
+fn read_robots(robots: Robots) -> Robots {
+    match robots {
+        Robots::Noindex => Robots::Noindex,
     }
 }
 

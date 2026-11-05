@@ -183,10 +183,9 @@ impl<P: PodmanClient> Reconciler<P> {
         let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
         sites.insert(site, spec);
         apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
-        for (name, spec) in &apps.apps {
-            state::validate_app(name, spec).map_err(EngineError::PromoteInvalid)?;
-        }
-        weglarka_model::depends::validate(&apps).map_err(EngineError::PromoteInvalid)?;
+        // The whole candidate set, so the same rules as `apps add`/`apps update` apply and an error
+        // in a shared site option names the site and environment, not just the expanded instance.
+        state::validate_apps(&apps).map_err(EngineError::PromoteInvalid)?;
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 

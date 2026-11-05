@@ -57,6 +57,69 @@ async fn a_declared_site_expands_into_instances_but_apps_toml_keeps_only_the_sit
     h.running.stop().await;
 }
 
+/// A site whose static options are declared once for every environment, with `robots` overridden in
+/// the preview only (#545/#548, ADR 0075).
+fn docs() -> Value {
+    json!({ "spec": {
+        "kind": "static",
+        "image": "registry.example.com/me/docs",
+        "ingress": { "static": {
+            "not_found_page": "/404.html",
+            "cache_immutable_paths": ["/_astro"],
+        }},
+        "env": {
+            "dev": { "track": "main", "domains": ["dev.example.com"], "robots": "noindex" },
+            "prod": { "promote_from": "dev", "domains": ["example.com"] },
+        }
+    }})
+}
+
+#[tokio::test]
+async fn a_declared_site_shares_its_static_options_and_overrides_robots_per_environment() {
+    let h = harness().await;
+    let (status, body) = admin(&h, "PUT", "/v1/sites/docs", Some(docs())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let static_options = |app: &Value| app["spec"]["ingress"]["static"].clone();
+    let (status, dev) = admin(&h, "GET", "/v1/apps/docs-dev", None).await;
+    assert_eq!(status, StatusCode::OK, "{dev}");
+    let (status, prod) = admin(&h, "GET", "/v1/apps/docs-prod", None).await;
+    assert_eq!(status, StatusCode::OK, "{prod}");
+    for app in [&dev, &prod] {
+        let opts = static_options(app);
+        assert_eq!(opts["not_found_page"], "/404.html");
+        assert_eq!(opts["cache_immutable_paths"], json!(["/_astro"]));
+    }
+    assert_eq!(static_options(&dev)["robots"], "noindex");
+    assert!(
+        static_options(&prod).get("robots").is_none(),
+        "the preview's robots is not inherited by production: {prod}"
+    );
+
+    // The site table is what `apps.toml` keeps: no expanded instance, options under `[sites]`.
+    let text = std::fs::read_to_string(h.root.join("state/apps.toml")).unwrap();
+    assert!(text.contains("[sites.docs.ingress.static]"), "{text}");
+    assert!(text.contains("[sites.docs.env.dev]"), "{text}");
+    assert!(!text.contains("[apps."), "{text}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn an_invalid_shared_static_option_is_refused() {
+    let h = harness().await;
+    let mut bad = docs();
+    bad["spec"]["ingress"]["static"]["not_found_page"] = json!("/404.txt");
+    let (status, body) = admin(&h, "PUT", "/v1/sites/docs", Some(bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["message"].as_str().unwrap();
+    // The error names the table the operator edited, not only the expanded instance.
+    assert!(message.contains("site docs, environment dev"), "{body}");
+    assert!(message.contains("not_found_page"), "{body}");
+    let (status, _) = admin(&h, "GET", "/v1/sites/docs", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was written");
+    h.running.stop().await;
+}
+
 #[tokio::test]
 async fn expanded_instances_cannot_be_edited_or_removed_through_apps() {
     let h = harness().await;

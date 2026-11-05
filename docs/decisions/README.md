@@ -81,3 +81,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0072](0072-ingress-log-reader.md) | One read-only reader of the ingress log files |
 | [0073](0073-per-app-ingress-log-retention.md) | Per-app ingress log files and retention |
 | [0074](0074-container-log-driver.md) | Explicit log driver and size bound for containers |
+| [0075](0075-site-level-static-options.md) | Static options shared by a site's environments, and a per-environment `robots` |

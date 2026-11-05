@@ -1726,6 +1726,84 @@ fn a_static_site_without_a_release_answers_503() {
 
 // --- Static site per-site options (#104, ADR 0069) ---------------------------------------------------
 
+/// A static site that must not be indexed (#545, ADR 0075) while it also serves a hashed asset
+/// directory and security headers — the `X-Robots-Tag` header has to be restated in every location
+/// that emits an `add_header` of its own, because such a location drops the inherited set.
+const SITE_WITH_ROBOTS: &str = r#"
+[apps.docs]
+kind = "static"
+image = "ghcr.io/x/docs:latest"
+domains = ["docs.example.eu"]
+
+[apps.docs.ingress.static]
+not_found_page = "/404.html"
+cache_immutable_paths = ["/_astro"]
+robots = "noindex"
+
+[apps.docs.ingress.static.security_headers]
+hsts_max_age_secs = 31536000
+"#;
+
+const NOINDEX: &str = "add_header X-Robots-Tag \"noindex, nofollow\" always;";
+
+#[test]
+fn nginx_static_site_with_robots_snapshots() {
+    let a = apps(SITE_WITH_ROBOTS);
+    let behind = nginx::generate(&host(), &a, &opts()).unwrap();
+    insta::assert_snapshot!("nginx_static_robots_behind", behind);
+    let edge = nginx::generate(&edge_host(), &a, &edge_opts(&["docs.example.eu"])).unwrap();
+    insta::assert_snapshot!("nginx_static_robots_edge", edge);
+
+    for conf in [&behind, &edge] {
+        // Both of the site's locations (the root one and the cache one) carry the header, and each
+        // restates `X-Request-Id`, which an `add_header` of its own would otherwise drop — on top of
+        // the `server`-level one every `server` block already sets.
+        assert_eq!(conf.matches(NOINDEX).count(), 2, "{conf}");
+        assert!(
+            conf.matches("add_header X-Request-Id $request_id always;")
+                .count()
+                >= 3,
+            "{conf}"
+        );
+        assert!(conf.contains("location ^~ /_astro/ {"), "{conf}");
+        assert!(conf.contains("error_page 404 /404.html;"), "{conf}");
+        assert!(
+            conf.contains("add_header Strict-Transport-Security \"max-age=31536000\" always;"),
+            "{conf}"
+        );
+    }
+    // A site without `robots` never sends the header.
+    let plain = nginx::generate(&host(), &apps(SITE_APPS), &opts()).unwrap();
+    assert!(!plain.contains("X-Robots-Tag"), "{plain}");
+}
+
+#[test]
+fn robots_on_a_plain_static_app_is_the_same_option() {
+    // `[apps.<x>.ingress.static] robots` works without `[sites]` too (#545): the option lives in
+    // `StaticIngress`, which is shared by both shapes.
+    let a = apps(
+        r#"
+[apps.docs]
+kind = "static"
+image = "ghcr.io/x/docs:latest"
+domains = ["docs.example.eu"]
+
+[apps.docs.ingress.static]
+robots = "noindex"
+"#,
+    );
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    assert_eq!(conf.matches(NOINDEX).count(), 1, "{conf}");
+    // `robots` alone is already an `add_header` of the location's own, so `X-Request-Id` is restated
+    // next to it (twice in the file: the `server`-level one and this one).
+    assert!(
+        conf.matches("add_header X-Request-Id $request_id always;")
+            .count()
+            >= 2,
+        "{conf}"
+    );
+}
+
 /// One static site with every `ingress.static` option set.
 const SITE_WITH_EVERY_OPTION: &str = r#"
 [apps.docs]

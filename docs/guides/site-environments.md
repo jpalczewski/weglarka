@@ -43,6 +43,47 @@ environment in its `SITE` column. Rules checked when `apps.toml` is read:
 - the instances are **not** written back to `apps.toml`: change a site with `weglarka sites declare` (or by editing the
   `[sites]` section), not with `apps update` or `apps remove`, which answer 409 and name the site.
 
+## Static options shared by every environment
+
+The rendering options of [static sites](static-sites.md) are declared **once** for the whole site, in
+`[sites.<site>.ingress.static]`, and every environment gets them; `robots` is the one field an environment may
+override ([ADR 0075](../decisions/0075-site-level-static-options.md)):
+
+```toml
+[sites.blog]
+kind = "static"
+image = "ghcr.io/me/blog"
+
+[sites.blog.ingress.static]          # shared by every environment
+not_found_page = "/404.html"
+cache_immutable_paths = ["/_astro"]
+security_headers = { hsts_max_age_secs = 31536000 }
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+robots = "noindex"                   # the only per-environment override
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+```
+
+`robots = "noindex"` sends `X-Robots-Tag: noindex, nofollow` on every location of that environment, so the preview
+stays out of search results while production serves the same digest without the header. Leaving `robots` unset in an
+environment means "no header", unless the shared table sets it — then the shared value applies.
+
+- Everything else (`not_found_page`, `cache_*`, `redirects`, `feeds`, `security_headers`) is the same for every
+  environment; there is no per-environment copy of it. A promotion never changes it: domains, paths and rendering
+  options belong to the environment, only the artifact moves.
+- The shared options are validated on each expanded instance, so `redirects[].from` must stay inside that
+  environment's own `paths`. A rejected option names the site and environment (`site blog, environment dev (instance
+  blog-dev): …`).
+- `not_found_page` is checked against the release being served, as for any static site: an environment whose release
+  lacks the page is refused until you deploy one that contains it.
+- `weglarka sites declare blog --spec blog.toml` takes the same body, shared table and per-environment `robots`
+  included.
+
 ## What the webhook does
 
 A push of `ghcr.io/me/blog:main` deploys `blog-dev` only. A promote-only environment never resolves a tag: it has
@@ -73,7 +114,8 @@ A promotion is a deploy of `blog-prod`: it keeps the usual `current` / `previous
 - `--digest` takes any digest of the site's repository. If the image was pruned, it is pulled with the credentials of
   the target instance ([private registries](first-app.md)); otherwise nothing is pulled.
 - `--rollback` returns to the target's `previous` digest; promoting again toggles back.
-- Only the artifact moves. Domains and paths stay per environment.
+- Only the artifact moves. Domains, paths and the rendering options stay where they are (including a
+  per-environment `robots`).
 - The dry run reports digests and generations; Węglarka does not record deploy times.
 
 ## Removing a site
@@ -87,9 +129,11 @@ Like `apps remove`, this leaves the unpacked releases under `<nginx_conf_dir>/si
 
 ## Rollback
 
-`[sites]` raises the state schema to version 13 ([state schema](state-schema.md)). Before downgrading Węglarka, remove
-the `[sites.*]` sections from `apps.toml` and drop the `schema_version` marker, or restore `apps.toml` and `state.toml`
-from the pre-upgrade backup; an older daemon rejects the unknown section. To keep the environments running, first add
+`[sites]` raised the state schema to version 13 and the shared static options with `robots` to 20 ([state
+schema](state-schema.md)). Before downgrading Węglarka, remove the `[sites.*]` sections from `apps.toml` and drop the
+`schema_version` marker, or restore `apps.toml` and `state.toml` from the pre-upgrade backup; an older daemon rejects
+the unknown section. Before downgrading below schema 20 remove `[sites.<site>.ingress]` and every environment's
+`robots` (or restore the files from before the upgrade). To keep the environments running, first add
 them as plain apps, for example `weglarka apps add blog-prod --spec …` with `kind = "static"` and the digest you want
 pinned via `weglarka push blog-prod --image ghcr.io/me/blog@sha256:…` — the state entries of `blog-dev` and `blog-prod`
 are ordinary instance state and carry over.
