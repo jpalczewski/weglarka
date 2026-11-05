@@ -52,7 +52,7 @@ async fn doctor_reports_the_host_side_conmon_check() {
     assert_eq!(clean["status"], "ok", "{clean}");
 
     // Two containers libpod still calls `running` without a live conmon: the operator has to act, and
-    // the fix is the reload of each app.
+    // the fix is a recreate of each app.
     conmon::record(
         &state_dir,
         &Report {
@@ -66,7 +66,7 @@ async fn doctor_reports_the_host_side_conmon_check() {
     assert_eq!(dead["status"], "fail", "{dead}");
     assert_eq!(
         dead["hint"],
-        "restart each one: `weglarka apps reload blog`, `weglarka apps reload ntfy`"
+        "recreate each one: `weglarka apps reload blog --recreate`, `weglarka apps reload ntfy --recreate`"
     );
     assert!(
         dead["message"].as_str().unwrap().contains("blog, ntfy"),

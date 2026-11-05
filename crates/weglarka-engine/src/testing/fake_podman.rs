@@ -212,6 +212,8 @@ struct State {
     uid_pool: Option<u64>,
     /// The socket cannot be reached ([`FakePodman::set_unreachable`]).
     unreachable: bool,
+    /// `container_list` never answers ([`FakePodman::set_list_hangs`]).
+    list_hangs: bool,
 }
 
 /// Production-sized subuid pool (production host: `1000000:2000000`).
@@ -307,6 +309,20 @@ impl FakePodman {
 
     pub fn clear_pull_failure(&self, reference: &str) {
         self.lock().pull_failures.remove(reference);
+    }
+
+    /// `container_list` stays pending forever while on: a libpod stuck on a container lock (the
+    /// caller's timeout is what is under test).
+    pub fn set_list_hangs(&self, hangs: bool) {
+        self.lock().list_hangs = hangs;
+    }
+
+    /// Sets `ContainerInfo::conmon_pid` of an existing container (the fake reports `None`, like a
+    /// libpod that said nothing, until a test sets one).
+    pub fn set_conmon_pid(&self, name: &str, pid: Option<u32>) {
+        if let Some(c) = self.lock().containers.get_mut(name) {
+            c.conmon_pid = pid;
+        }
     }
 
     /// Replaces the labels of an existing container (a container Węglarka labelled, added by hand).
@@ -1005,6 +1021,9 @@ impl PodmanClient for FakePodman {
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
         self.reachable()?;
+        if self.lock().list_hangs {
+            return std::future::pending().await;
+        }
         let mut s = self.lock();
         s.list_calls += 1;
         Ok(s.containers

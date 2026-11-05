@@ -36,6 +36,11 @@ use crate::settings::Settings;
 /// once a minute.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound of the conmon check (one libpod listing plus an inspect per suspect). The libpod
+/// client has no request timeout, and a stuck libpod (a container lock held by a hung stop) must not
+/// hold the run until systemd kills the oneshot: the check is then reported as unavailable.
+pub const CONMON_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Outcome of one watchdog wake-up: the conmon check of the containers (issue #470) and the
 /// supervision of a self-update switch in flight (issue #100).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +63,12 @@ impl std::fmt::Display for Report {
     }
 }
 
-/// One watchdog run: check the conmons, then — when the self-update fallback is on and no other
-/// host-side run holds the lock — probe the daemon and supervise the switch.
+/// One watchdog run: supervise a self-update switch first — when the fallback is on and no other
+/// host-side run holds the lock, probe the daemon and decide — then check the conmons.
+///
+/// The order matters: the fallback is time-critical and its deadline arithmetic uses `now`, while
+/// the conmon check asks libpod, which can hang. The check gets its own clock (`now` plus the time
+/// the switch took) and [`CONMON_CHECK_TIMEOUT`]; a failed switch still lets it run.
 pub async fn run<P, Pl>(
     podman: &P,
     platform: &Pl,
@@ -70,15 +79,38 @@ where
     P: PodmanClient,
     Pl: Platform,
 {
-    let conmon = conmon::check(
-        podman,
-        &conmon::ProcConmon::host(),
-        &settings.paths.state_dir,
-        secs(now),
-    )
-    .await;
-    let watch = supervise_switch(podman, platform, settings, now).await?;
-    Ok(Report { conmon, watch })
+    let started = std::time::Instant::now();
+    let watch = supervise_switch(podman, platform, settings, now).await;
+    let conmon = check_conmons(podman, settings, now + started.elapsed()).await;
+    Ok(Report {
+        conmon,
+        watch: watch?,
+    })
+}
+
+/// [`conmon::check`] bounded by [`CONMON_CHECK_TIMEOUT`].
+async fn check_conmons<P: PodmanClient>(
+    podman: &P,
+    settings: &Settings,
+    now: SystemTime,
+) -> conmon::Summary {
+    let liveness = conmon::ProcConmon::host();
+    let check = conmon::check(podman, &liveness, &settings.paths.state_dir, secs(now));
+    match tokio::time::timeout(CONMON_CHECK_TIMEOUT, check).await {
+        Ok(summary) => summary,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CONMON_CHECK_TIMEOUT.as_secs(),
+                "libpod did not answer the conmon check in time"
+            );
+            conmon::Summary::Unavailable {
+                reason: format!(
+                    "libpod did not answer within {}s",
+                    CONMON_CHECK_TIMEOUT.as_secs()
+                ),
+            }
+        }
+    }
 }
 
 /// The self-update half of the run (issue #100): skip when the feature is off or another run is
@@ -299,23 +331,28 @@ mod tests {
         }
     }
 
-    /// Issue #470: the conmon check must run even on a host without `[self_update]` — that section is
-    /// about Węglarka's own image, and the app containers are broken either way.
-    #[tokio::test]
-    async fn a_host_without_self_update_still_gets_the_conmon_check() {
+    fn settings_without_self_update(dir: &Path) -> Settings {
         use weglarka_model::config::HostConfig;
 
-        let dir = tempfile::tempdir().unwrap();
         let host = HostConfig::from_toml_str(&format!(
             "[ingress]\nmode = \"behind\"\nbind = \"127.0.0.1:18080\"\n\
              [admin]\nsocket = \"{root}/admin.sock\"\n\
              [webhook]\nlisten = \"127.0.0.1:0\"\ndomain = \"hooks.example.eu\"\n\
              [state]\ndir = \"{root}/state\"\n",
-            root = dir.path().display()
+            root = dir.display()
         ))
         .unwrap();
-        let settings = Settings::from_host(host, dir.path().join("weglarka.toml"));
+        let settings = Settings::from_host(host, dir.join("weglarka.toml"));
         std::fs::create_dir_all(&settings.paths.state_dir).unwrap();
+        settings
+    }
+
+    /// Issue #470: the conmon check must run even on a host without `[self_update]` — that section is
+    /// about Węglarka's own image, and the app containers are broken either way.
+    #[tokio::test]
+    async fn a_host_without_self_update_still_gets_the_conmon_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_without_self_update(dir.path());
 
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let fake = weglarka_engine::testing::FakePodman::new();
@@ -326,5 +363,28 @@ mod tests {
         let recorded = conmon::load(&settings.paths.state_dir).expect("the run records the check");
         assert_eq!(recorded.checked_at, Some(1_000));
         assert!(recorded.affected.is_empty());
+    }
+
+    /// A libpod that never answers the listing must not hold the run until systemd kills it: the
+    /// switch half runs first, and the conmon check gives up after [`CONMON_CHECK_TIMEOUT`].
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_libpod_does_not_hold_the_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_without_self_update(dir.path());
+        let fake = weglarka_engine::testing::FakePodman::new();
+        fake.set_list_hangs(true);
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let report = run(&fake, &NoPlatform, &settings, now).await.unwrap();
+        assert_eq!(report.watch, WatchReport::Disabled);
+        assert!(
+            matches!(&report.conmon, conmon::Summary::Unavailable { reason } if reason.contains("30s")),
+            "{report}"
+        );
+        assert!(report.is_success());
+        assert!(
+            conmon::load(&settings.paths.state_dir).is_none(),
+            "nothing is recorded without an answer"
+        );
     }
 }
