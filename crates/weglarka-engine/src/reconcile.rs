@@ -144,6 +144,18 @@ pub enum EngineError {
     /// The fallback release build of `apps rollback` failed; the served release is untouched.
     #[error("{0}")]
     RollbackFailed(String),
+    /// `apps update` that changes only `ingress.static` for a static site whose served release lacks
+    /// a file the new spec names (issue #501): nginx would reload referencing a page that is not
+    /// there. Nothing was changed; the request's fault.
+    #[error(
+        "the release {instance} currently serves cannot satisfy the new spec: {source}; deploy it \
+         to build a release that does (`weglarka deploy {instance}`)"
+    )]
+    ServedReleaseUnsatisfied {
+        instance: InstanceName,
+        #[source]
+        source: crate::sites::ReleaseError,
+    },
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),

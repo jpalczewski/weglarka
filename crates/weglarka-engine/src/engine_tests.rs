@@ -4894,6 +4894,96 @@ not_found_page = "/404.html"
         assert_eq!(st.current, Some(digest('a')));
         assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
     }
+
+    /// The spec `apps.toml` holds now (what an `apps update` just wrote).
+    fn spec(h: &Harness, instance: &str) -> weglarka_model::app::AppSpec {
+        weglarka_model::state::load_apps(&h.rec.paths().apps)
+            .unwrap()
+            .apps
+            .remove(&name(instance))
+            .unwrap()
+    }
+
+    /// Issue #501: an `apps update` that changes only `ingress.static` deploys nothing, so the
+    /// served release is checked directly — a release built before `not_found_page` existed cannot
+    /// satisfy the new spec, and the update must not reach the ingress reload.
+    #[tokio::test(start_paused = true)]
+    async fn an_ingress_only_update_the_served_release_cannot_satisfy_is_rejected() {
+        let h = harness();
+        // The served release predates the custom 404 page: it has no `404.html`.
+        publish(&h, 'a', &[("index.html", b"<h1>hi</h1>")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+
+        // Only `ingress.static.not_found_page` changes: no image and no `start` change, no deploy.
+        h.set_apps(SITE_WITH_NOT_FOUND_PAGE);
+        let err = h
+            .rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ServedReleaseUnsatisfied { .. }),
+            "{err:?}"
+        );
+        // The message carries the deploy gate's own reason, so the operator sees what is missing.
+        assert!(err.to_string().contains("404.html"), "{err}");
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+
+        // Dropping the option makes the very same release acceptable again.
+        h.set_apps(SITE);
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+    }
+
+    /// The other side: a served release that already has the named file passes, so adding the option
+    /// to a site whose build contains the page is not refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_served_release_that_has_the_named_page_is_accepted() {
+        let h = harness_with_not_found_page();
+        publish(&h, 'a', &[("index.html", b"hi"), ("404.html", b"gone")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+    }
+
+    /// Nothing a reload could break: an undeployed site (nginx answers 503), a release-gone pin, a
+    /// container app and a daemon without a sites root are all accepted.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_served_means_nothing_to_check() {
+        let h = harness_with_not_found_page();
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+
+        let h = harness();
+        h.set_apps(AS_CONTAINER);
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+
+        let pin = |h: &Harness| {
+            let mut st = weglarka_model::state::load_state(&h.rec.paths().state).unwrap();
+            st.apps.entry(name("blog")).or_default().current = Some(digest('a'));
+            weglarka_model::state::save_state(&h.rec.paths().state, &st).unwrap();
+        };
+
+        // Pinned, but no `current` link on disk: doctor's `sites.current` reports it, the next deploy
+        // rebuilds the release.
+        let h = harness();
+        pin(&h);
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+
+        // Without a sites root no site is served at all.
+        let h = Harness::new(SITE_WITH_NOT_FOUND_PAGE);
+        pin(&h);
+        h.rec
+            .check_served_release(&name("blog"), &spec(&h, "blog"))
+            .unwrap();
+    }
 }
 
 /// Sites with environments (issue #205): `track` environments follow the webhook, promote-only ones
