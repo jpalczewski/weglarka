@@ -42,6 +42,20 @@ inode and keep the offset; a collector that tails by name sees the file shrink t
 are deleted, but a deleted file stays on disk until the collector closes it, so close handles for files that
 disappeared.
 
+## Upgrading an existing collector
+
+Before ADR 0072 the directory was `0700`, so a collector that already pointed at these files (through a host-side bind
+and a `host_mounts` entry) got `permission denied`. The daemon widens the directory to `0750` on its first ingress
+apply or hourly retention pass after the upgrade, but a collector that failed to open the files earlier may not try
+again: Grafana Alloy's `loki.source.file`, for instance, does not retry a failed `stat` and needs a restart
+(`weglarka apps reload <app>`, or a redeploy). Switching such a collector to `ingress_logs = true` recreates it anyway;
+remove its old `host_mounts` entry for `/var/log/weglarka-ingress` in the same update, because `ingress_logs` refuses a
+second mount on that target, then drop the path from `[runtime] host_mounts` and the host-side bind.
+
+When you remove `[logs] reader`, the app is blocked in reconcile, but a container that is already running keeps the
+mount until it is restarted (the same as `host_mounts` and `group_add`). Restart or stop the old reader to cut its
+access at once.
+
 ## Your collector's retention is part of the promise
 
 The [retention guarantee](log-retention.md) covers the files in the state directory only. Whatever the collector
