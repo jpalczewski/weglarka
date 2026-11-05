@@ -38,6 +38,9 @@ pub(crate) struct Cert {
     pub not_after: Option<SystemTime>,
     /// For a domain without a certificate of its own: the wildcard apex that serves it.
     pub covered_by: Option<String>,
+    /// For a domain with a readable certificate of its own: the apex of a valid wildcard that would
+    /// cover it. nginx serves the own pair first, so the pair shadows that wildcard (issue #210).
+    pub shadowed_by: Option<String>,
 }
 
 impl Cert {
@@ -132,17 +135,19 @@ fn collect_with(
         // Without a readable file of its own a valid wildcard may serve it (issue #97); an
         // unparseable file of its own is just missing.
         let chain = read(domain);
-        let covered_by = if chain.is_none() {
-            crate::acme::covering_wildcard(tls, apexes, domain, now, not_after)
-        } else {
-            None
-        };
+        // The same lookup answers the mirror question, and at most one of them applies: with a pair
+        // of its own, a valid wildcard would be shadowed by that pair (issue #210, precedence
+        // unchanged).
+        let covering = || crate::acme::covering_wildcard(tls, apexes, domain, now, not_after);
+        let covered_by = if chain.is_none() { covering() } else { None };
+        let shadowed_by = if chain.is_some() { covering() } else { None };
         certs.push(Cert {
             id: domain.clone(),
             names: vec![domain.clone()],
             wildcard: false,
             not_after: chain.and_then(|chain| not_after(&chain)),
             covered_by,
+            shadowed_by,
         });
     }
     for apex in apexes {
@@ -153,6 +158,7 @@ fn collect_with(
             id: stem,
             wildcard: true,
             covered_by: None,
+            shadowed_by: None,
         });
     }
     certs
@@ -279,6 +285,53 @@ mod tests {
         assert!(wildcard.wildcard);
         assert_eq!(wildcard.names, ["*.example.com", "example.com"]);
         assert_eq!(wildcard.status(now, w), CertStatus::Valid);
+    }
+
+    #[test]
+    fn an_own_pair_shadows_the_valid_wildcard_that_would_serve_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        write(dir.path(), "_wildcard.example.com", now + 60 * DAY);
+        write(dir.path(), "own.example.com", now + 80 * DAY);
+        let config = config(
+            "[acme.dns]\nprovider = \"cloudflare\"\ntoken_file = \"/t\"\nwildcards = [\"example.com\"]\n",
+        );
+        let domains = [
+            "own.example.com".to_owned(),
+            "plain.example.com".to_owned(),
+            "x.own.example.com".to_owned(),
+        ];
+        let certs = collect_with(dir.path(), &config, &domains, now, &fake_not_after);
+        let w = window(&config);
+        let own = by_id(&certs, "own.example.com");
+        assert_eq!(own.shadowed_by.as_deref(), Some("example.com"));
+        // The precedence itself does not change: the own pair is still the one that is served.
+        assert_eq!(own.covered_by, None);
+        assert_eq!(own.status(now, w), CertStatus::Valid);
+        // A domain served by the wildcard shadows nothing, and neither does a wildcard row.
+        assert_eq!(by_id(&certs, "plain.example.com").shadowed_by, None);
+        assert_eq!(by_id(&certs, "_wildcard.example.com").shadowed_by, None);
+        // The wildcard covers one label only: `x.own.example.com` is two labels below the apex.
+        assert_eq!(by_id(&certs, "x.own.example.com").shadowed_by, None);
+    }
+
+    #[test]
+    fn an_expired_wildcard_shadows_no_own_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        write(dir.path(), "_wildcard.example.com", now - DAY);
+        write(dir.path(), "own.example.com", now + 80 * DAY);
+        let config = config(
+            "[acme.dns]\nprovider = \"cloudflare\"\ntoken_file = \"/t\"\nwildcards = [\"example.com\"]\n",
+        );
+        let certs = collect_with(
+            dir.path(),
+            &config,
+            &["own.example.com".to_owned()],
+            now,
+            &fake_not_after,
+        );
+        assert_eq!(by_id(&certs, "own.example.com").shadowed_by, None);
     }
 
     #[test]

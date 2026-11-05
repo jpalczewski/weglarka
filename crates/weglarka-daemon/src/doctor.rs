@@ -2077,6 +2077,107 @@ fn acme<P: PodmanClient>(
             ),
         ));
     }
+    if let Some(shadowed) = shadowed_check(certs) {
+        out.push(shadowed);
+    }
+}
+
+/// `acme.shadowed` (issue #210): a domain with a certificate pair of its own is served by that pair,
+/// not by a valid wildcard that would cover it, and the worker keeps renewing it per domain. The
+/// precedence is by design ([`certificates::Cert::shadowed_by`]), so this only names the pairs an
+/// operator may delete; a host without `[acme.dns]` has no wildcard rows and nothing is shadowed.
+fn shadowed_check(certs: &[certificates::Cert]) -> Option<DoctorCheck> {
+    let mut shadowed: Vec<(&str, &str)> = certs
+        .iter()
+        .filter(|c| !c.wildcard)
+        .filter_map(|c| Some((c.label(), c.shadowed_by.as_deref()?)))
+        .collect();
+    if shadowed.is_empty() {
+        return None;
+    }
+    shadowed.sort_unstable();
+    let pairs: Vec<String> = shadowed
+        .iter()
+        .map(|(domain, apex)| format!("{domain} (by *.{apex})"))
+        .collect();
+    Some(check(
+        "acme.shadowed",
+        CheckStatus::Info,
+        format!(
+            "own certificate pair(s) shadow a valid wildcard: {}",
+            pairs.join(", ")
+        ),
+        Some(
+            "nginx serves a domain's own pair before a covering wildcard and the ACME worker keeps \
+             renewing it; delete tls/<domain>.crt and tls/<domain>.key to serve the domain with the \
+             wildcard",
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod shadowed_tests {
+    use super::*;
+
+    fn cert(
+        id: &str,
+        not_after: bool,
+        covered_by: Option<&str>,
+        shadowed_by: Option<&str>,
+    ) -> certificates::Cert {
+        certificates::Cert {
+            id: id.to_owned(),
+            names: vec![id.to_owned()],
+            wildcard: false,
+            not_after: not_after.then(std::time::SystemTime::now),
+            covered_by: covered_by.map(str::to_owned),
+            shadowed_by: shadowed_by.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn own_pairs_shadowing_a_wildcard_are_named_in_order() {
+        let certs = vec![
+            cert("shop.example.com", true, None, Some("example.com")),
+            cert("blog.example.com", true, None, Some("example.com")),
+            cert("app.example.com", false, Some("example.com"), None),
+        ];
+        let found = shadowed_check(&certs).expect("two pairs shadow the wildcard");
+        assert_eq!(found.id, "acme.shadowed");
+        assert_eq!(found.status, CheckStatus::Info);
+        assert_eq!(
+            found.message,
+            "own certificate pair(s) shadow a valid wildcard: \
+             blog.example.com (by *.example.com), shop.example.com (by *.example.com)"
+        );
+        assert!(
+            found
+                .hint
+                .unwrap_or_default()
+                .contains("delete tls/<domain>.crt"),
+            "the hint names the remedy"
+        );
+    }
+
+    #[test]
+    fn nothing_shadowed_is_no_check() {
+        // A domain served by the wildcard, a domain with a pair and no wildcard at all, and a
+        // wildcard row itself (wildcards never shadow anything).
+        let certs = vec![
+            cert("app.example.com", false, Some("example.com"), None),
+            cert("own.example.com", true, None, None),
+            certificates::Cert {
+                id: "_wildcard.example.com".to_owned(),
+                names: vec!["*.example.com".to_owned(), "example.com".to_owned()],
+                wildcard: true,
+                not_after: Some(std::time::SystemTime::now()),
+                covered_by: None,
+                shadowed_by: Some("example.com".to_owned()),
+            },
+        ];
+        assert!(shadowed_check(&certs).is_none());
+        assert!(shadowed_check(&[]).is_none());
+    }
 }
 
 /// `[acme.dns]` (issue #97): the provider, the token file and the state of every wildcard
