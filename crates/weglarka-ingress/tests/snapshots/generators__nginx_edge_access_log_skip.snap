@@ -40,7 +40,7 @@ http {
         default "-";
     }
     log_format weglarka escape=json
-        '{"time":"$time_iso8601","app":"$app","host":"$host","remote_addr":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_response_time":"$upstream_response_time","request_id":"$request_id","user_agent":"$http_user_agent"}';
+        '{"time":"$time_iso8601","app":"$app","host":"$host","remote_addr":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_response_time":"$upstream_response_time","upstream_status":"$upstream_status","upstream_addr":"$upstream_addr","upstream_header_time":"$upstream_header_time","request_length":$request_length,"server_protocol":"$server_protocol","request_id":"$request_id","user_agent":"$http_user_agent"}';
     # Paths an app asked to keep out of the access log (while they succeed).
     map "$app $uri" $weglarka_skip_path {
         default 0;

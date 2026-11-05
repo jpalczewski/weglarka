@@ -33,8 +33,21 @@ pub struct AccessEntry {
     pub bytes_sent: u64,
     /// Seconds.
     pub request_time: f64,
-    /// `-` or a list on retry, as nginx prints it.
+    /// As nginx prints it: seconds, a list on retry (`, ` between attempts), `-` for an attempt that
+    /// got no response, empty when no upstream was tried (a static site, an app name that did not
+    /// resolve) — `escape=json` logs a missing variable as empty, not `-`.
     pub upstream_response_time: String,
+    /// The upstream's status, in the same shape. nginx records `502` itself for an attempt it could
+    /// not connect to, so only a numeric `upstream_header_time` shows that the app answered.
+    pub upstream_status: String,
+    /// Seconds to the upstream's response headers, in the same shape: the latency a visitor feels.
+    /// Unlike `request_time`, it does not grow with a long-lived stream.
+    pub upstream_header_time: String,
+    /// `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0` or `HTTP/3.0`, as nginx logged it.
+    pub server_protocol: String,
+    /// Bytes nginx read for the request (line, headers and body; for HTTP/2 the frame payloads).
+    /// `None` for a line logged before the field existed.
+    pub request_length: Option<u64>,
     pub request_id: String,
     pub user_agent: String,
 }
@@ -123,6 +136,10 @@ mod tests {
             bytes_sent: 12,
             request_time: 0.25,
             upstream_response_time: "0.001".into(),
+            upstream_status: "404".into(),
+            upstream_header_time: "0.001".into(),
+            server_protocol: "HTTP/2.0".into(),
+            request_length: Some(128),
             request_id: "abc".into(),
             user_agent: "curl/8 \"quoted\"".into(),
         }

@@ -48,8 +48,26 @@ weglarka --json access web -f | jq -r .remote_addr
 
 Each line is `time status method host path request_time remote_addr request_id`; `--json` prints one JSON object per
 request (`time`, `host`, `remote_addr`, `peer` behind a CDN, `method`, `path`, `status`, `bytes_sent`, `request_time`,
-`upstream_response_time`, `request_id`, `user_agent`). Paths, hosts and user agents are chosen by the visitor, so on a
-terminal control characters are replaced and a path can never start a line of its own.
+`upstream_response_time`, `upstream_status`, `upstream_header_time`, `server_protocol`, `request_length`, `request_id`,
+`user_agent`). Paths, hosts and user agents are chosen by the visitor, so on a terminal control characters are
+replaced and a path can never start a line of its own.
+
+The `upstream_*` fields describe the app behind nginx and are strings, as nginx prints them: a number of seconds or a
+status, a list when nginx retried (`502, 200`, first attempt first), `-` for an attempt that got no response, and
+empty when nginx tried no upstream at all. `upstream_header_time` is the latency a visitor feels — the time to the
+app's response headers — also for long-lived responses (SSE, websockets, ntfy subscriptions) where `request_time` is
+the whole connection.
+
+A `502` is the app's own answer exactly when `upstream_header_time` is a number. Otherwise nginx produced it:
+`upstream_header_time` is `-` when the connection to the app was refused (`upstream_status` is then `502` too, as
+nginx records it), and both are empty when the app's name did not resolve — the usual case while its container is
+being recreated, because nginx looks the name up per request. A static site has no upstream, so its `upstream_*`
+fields are empty. `upstream_addr` (the internal container address) stays in the raw `access.log` only and is
+deliberately not part of the API, the CLI or the panel. Lines logged before these fields existed have them empty and
+`request_length` `null`.
+
+The ingress error log (`error.log`) is a separate stream in the same directory, rotated and deleted by the same
+retention; see [log retention](log-retention.md).
 
 | Flag | Meaning |
 |---|---|
