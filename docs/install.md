@@ -94,6 +94,11 @@ Firewall rules (including those for `host_ports`) are not checked. Exit codes: 0
 same name, so the same file works for the daemon and for the CLI on the host):
 
 ```toml
+# A top-level key: it must stay above the first [table], or TOML assigns it to that table.
+# Directory with the apps' configuration files (see the host-configs guide). Mounted read-only into Węglarka's container.
+# Absolute, or relative to the directory of weglarka.toml. Unset = feature disabled.
+# config_root = "/var/lib/weglarka/config"
+
 [runtime]
 user = "weglarka"
 # Ports published on the host < 1024 (`host_ports`, see the host-ports guide): the host must have
@@ -138,10 +143,6 @@ retention = 30
 # Limits for unpacking a static site's image (kind = "static", see the static-sites guide).
 # max_files = 100000
 # max_bytes = "1g"                                       # bytes or <n>[k|m|g]; both values must be > 0
-
-# Directory with the apps' configuration files (see the host-configs guide). Mounted read-only into Węglarka's container.
-# Absolute, or relative to the directory of weglarka.toml. Unset = feature disabled.
-# config_root = "/var/lib/weglarka/config"
 
 [platform]
 kind = "systemd"

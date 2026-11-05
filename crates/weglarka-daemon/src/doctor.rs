@@ -936,8 +936,27 @@ fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             let mode = meta.permissions().mode() & 0o777;
             // The owner bits only describe the daemon when it owns the directory; the state
             // directory is the daemon's own, so its owner stands in for the runtime uid.
-            let daemon_uid = std::fs::metadata(&d.paths.state_dir).map(|m| m.uid()).ok();
-            if daemon_uid.is_some_and(|uid| uid != meta.uid()) {
+            // Strict on purpose: the daemon creates the root itself, and a root owned by another user
+            // (even if group-writable) lets that user decide what nginx serves.
+            let daemon_uid = std::fs::metadata(&d.paths.state_dir).map(|m| m.uid());
+            if let Err(e) = &daemon_uid {
+                check(
+                    "sites.directory",
+                    CheckStatus::Warn,
+                    format!(
+                        "cannot tell the daemon's uid from the state directory {}: {}; the owner of {} is not checked",
+                        d.paths.state_dir.display(),
+                        detail(e),
+                        root.display()
+                    ),
+                    None,
+                )
+            } else if daemon_uid.as_ref().is_ok_and(|uid| *uid != meta.uid()) {
+                let hint = format!(
+                    "chown {} to the user that owns {} (the daemon's runtime user)",
+                    root.display(),
+                    d.paths.state_dir.display()
+                );
                 check(
                     "sites.directory",
                     CheckStatus::Fail,
@@ -946,7 +965,7 @@ fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                         root.display(),
                         meta.uid()
                     ),
-                    Some(hint),
+                    Some(&hint),
                 )
             } else if mode & 0o300 != 0o300 {
                 let hint = format!(

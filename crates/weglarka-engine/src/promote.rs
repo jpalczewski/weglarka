@@ -128,12 +128,15 @@ impl<P: PodmanClient> Reconciler<P> {
         }
 
         // The image is normally local already (it is `current` or `previous` somewhere); only an
-        // explicit digest of a pruned release pulls, with the target's registry credentials.
+        // explicit digest of a pruned release pulls, with the target's registry credentials. A
+        // release still complete on disk (the usual `--rollback`) needs no image at all.
         let image_guard = ImageGuard::new(&guard);
         let mut slot = AcquisitionSlot::default();
         let result = async {
-            self.ensure_image(&image_guard, &target, &spec, &digest, None, &mut slot)
-                .await?;
+            if !self.has_complete_release(&target, &spec, &digest) {
+                self.ensure_image(&image_guard, &target, &spec, &digest, None, &mut slot)
+                    .await?;
+            }
             let mut outcome = self
                 .deploy_locked_from(&guard, &target, false, DigestSource::Local(&digest))
                 .await?;
