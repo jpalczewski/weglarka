@@ -215,6 +215,7 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         configs: Vec::new(),
         host_mounts: Vec::new(),
         group_add: Vec::new(),
+        ingress_logs: false,
         reload_signal: None,
         strategy: Default::default(),
         oidc: None,

@@ -131,6 +131,8 @@ recreate and is bounded by the retention period; follow starts at the byte/inode
 not repeated within one connection. A rotation during follow can still lose a line written by an old worker at the
 switch, and reconnecting with `--since` can show a line twice; both are best-effort, as before.
 
+A collector app can read the files directly; see [the ingress log reader](ingress-log-reader.md).
+
 ## Disk use
 
 Retention bounds age, not the daily volume. At roughly 300 bytes per JSON line, 100 000 requests a day is about

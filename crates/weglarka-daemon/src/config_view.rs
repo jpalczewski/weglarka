@@ -49,8 +49,7 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         acme,
         identity,
         metrics,
-        // Read by `status`/`doctor`, not part of this view.
-        logs: _,
+        logs,
         // Static-site extraction limits are engine policy; they do not change the app's shape.
         sites: _,
     } = host;
@@ -68,6 +67,9 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         acme: acme.as_ref().map(acme_view),
         identity: identity.as_ref().map(identity_view),
         metrics: metrics.as_ref().map(metrics_view),
+        // Retention and the container log driver are read by `status`/`doctor`; the reader is part of
+        // the app-facing contract (which instance may set `ingress_logs`).
+        logs_reader: logs.reader.clone(),
     }
 }
 

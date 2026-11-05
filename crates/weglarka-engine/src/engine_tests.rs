@@ -2105,6 +2105,74 @@ async fn group_add_needs_the_allowlist_and_sets_keep_groups() {
     assert!(h.fake.container_spec("alloy").is_none());
 }
 
+/// `ingress_logs` (issue #552, ADR 0072): the configured reader gets the log root read-only at the
+/// fixed target plus keep-groups; any other app is blocked and a deploy is refused before anything
+/// is created; a `host_mounts` entry on the same target is a clear error.
+#[tokio::test(start_paused = true)]
+async fn ingress_logs_mount_is_read_only_and_reserved_for_the_reader() {
+    use weglarka_model::ingress_logs::READER_DIR;
+    let apps = "[apps.collector]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n\
+                health = { attempts = 1, window_secs = 1 }\ningress_logs = true\n";
+    let reader = |name: &str| crate::reconcile::IngressLogReader {
+        instance: InstanceName::new(name).unwrap(),
+        root: "/srv/state/ingress-logs".into(),
+    };
+    let with_reader = |name: &str| ReconcilerOptions {
+        ingress_log_reader: Some(reader(name)),
+        ..Default::default()
+    };
+
+    let h = Harness::with_options(apps, with_reader("collector"));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let report = h.rec.reconcile().await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    let spec = h.fake.container_spec("collector").unwrap();
+    assert_eq!(
+        spec.mounts,
+        vec![BindMount {
+            source: "/srv/state/ingress-logs".into(),
+            target: READER_DIR.into(),
+            read_only: true,
+        }]
+    );
+    assert!(spec.keep_groups, "the 0750 directory is reached by group");
+
+    // Another app is the reader: this one is blocked, nothing is created, a deploy is refused.
+    let h = Harness::with_options(apps, with_reader("other"));
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    assert!(!h.rec.reconcile().await.unwrap().is_clean());
+    assert!(h.fake.container_spec("collector").is_none());
+    let name = InstanceName::new("collector").unwrap();
+    let err = h.rec.deploy(&name, true).await.unwrap_err().to_string();
+    assert!(err.contains("`[logs] reader`"), "{err}");
+    assert!(h.fake.container_spec("collector").is_none());
+
+    // No reader configured at all.
+    let h = Harness::new(apps);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    assert!(!h.rec.reconcile().await.unwrap().is_clean());
+    assert!(h.fake.container_spec("collector").is_none());
+
+    // The same target from `host_mounts` would be a duplicate mount.
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().canonicalize().unwrap();
+    let dup = format!(
+        "{apps}host_mounts = [{{ source = {:?}, target = {READER_DIR:?} }}]\n",
+        other.display().to_string()
+    );
+    let h = Harness::with_options(
+        &dup,
+        ReconcilerOptions {
+            host_mounts: vec![other],
+            ..with_reader("collector")
+        },
+    );
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    let err = h.rec.deploy(&name, true).await.unwrap_err().to_string();
+    assert!(err.contains("already uses"), "{err}");
+    assert!(h.fake.container_spec("collector").is_none());
+}
+
 /// `internal_hosts` reaches `ContainerSpec::host_aliases`, so Podman writes the domains into the
 /// container's `/etc/hosts` (issue #303); clearing it recreates the app once and deleting it from the
 /// spec leaves the field empty again.

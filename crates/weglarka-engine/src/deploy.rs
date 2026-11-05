@@ -222,7 +222,8 @@ pub(crate) fn app_container_base(
         // Host config mounts: always read-only, and the **canonical** path is what mounts, so a
         // symlink swapped between the check and the mount cannot redirect the bind (ADR 0028).
         mounts: config_binds(configs),
-        keep_groups: !spec.group_add.is_empty(),
+        // `ingress_logs` needs the runtime user's primary group to reach the `0750` log directory (ADR 0072).
+        keep_groups: !spec.group_add.is_empty() || spec.ingress_logs,
         // Domains this host serves (issue #303, ADR 0071): Podman writes them into `/etc/hosts` at
         // every start, so a deploy, a blue-green challenger and a one-off run all resolve them the
         // same way. Validated against the host's domains before the spec gets here.
@@ -285,6 +286,7 @@ impl<P: PodmanClient> Reconciler<P> {
     /// `host_mounts` (issue #178). Both are canonical paths, mounted read-only by [`config_binds`].
     pub(crate) fn resolve_mounts(
         &self,
+        instance: &InstanceName,
         spec: &AppSpec,
     ) -> Result<Vec<crate::config_mounts::Resolved>, EngineError> {
         let mut mounts =
@@ -296,6 +298,23 @@ impl<P: PodmanClient> Reconciler<P> {
             crate::host_mounts::resolve_all(&self.options.host_mounts, spec)
                 .map_err(|e| EngineError::Configs(e.to_string()))?,
         );
+        if spec.ingress_logs {
+            let root = crate::host_mounts::check_ingress_logs(
+                self.options.ingress_log_reader.as_ref(),
+                instance,
+            )
+            .map_err(|e| EngineError::Configs(e.to_string()))?;
+            let target = weglarka_model::ingress_logs::READER_DIR;
+            if mounts.iter().any(|m| m.target == target) {
+                return Err(EngineError::Configs(format!(
+                    "`ingress_logs` mounts the ingress logs at {target}, which another mount of the app already uses; change that mount's target"
+                )));
+            }
+            mounts.push(crate::config_mounts::Resolved {
+                source: root.to_path_buf(),
+                target: target.to_owned(),
+            });
+        }
         Ok(mounts)
     }
 
@@ -335,7 +354,7 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> Result<ReloadOutcome, EngineError> {
         let spec = self.load_spec(instance)?;
         // Same precondition as a deploy: a config that cannot be mounted is not reloadable either.
-        self.resolve_mounts(&spec)?;
+        self.resolve_mounts(instance, &spec)?;
         let name = labels::container_name(instance);
         let info = match self.podman.container_inspect(&name).await {
             Ok(info) => info,
@@ -733,7 +752,7 @@ impl<P: PodmanClient> Reconciler<P> {
         // A config mount that cannot be resolved fails the deploy **before** the old container is
         // touched (no stop/remove, and no rollback that would only restore the same broken spec,
         // ADR 0028). The resolved canonical paths are what `launch` mounts.
-        let mut configs = self.resolve_mounts(spec)?;
+        let mut configs = self.resolve_mounts(instance, spec)?;
         // Shared by deploys and one-off runs (incl. the validation run), so a container of the
         // consumer always sees the generated versions.
         configs.extend(self.generated_mounts(instance)?);
@@ -1427,7 +1446,7 @@ impl<P: PodmanClient> Reconciler<P> {
         slot: &mut AcquisitionSlot,
     ) -> Result<DeployOutcome, EngineError> {
         // Config mounts are validated before anything is pinned or touched, exactly like a deploy.
-        self.resolve_mounts(spec)?;
+        self.resolve_mounts(instance, spec)?;
         let _activity = self.begin_activity(instance, ActivityKind::Provision);
         // Same order as a deploy: the uid range is allocated (and persisted) before the pull, so a
         // failed pull does not lose it and the next pass can retry with the same range.

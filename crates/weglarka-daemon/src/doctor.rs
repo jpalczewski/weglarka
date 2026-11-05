@@ -111,6 +111,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     configs(d, &mut checks);
     host_mounts_daemon_overlap(d, &mut checks);
     host_mounts(d, &mut checks);
+    logs_reader(d, &mut checks);
     sites(d, &mut checks);
     sites_directory(d, &mut checks);
     sites_current(d, &mut checks);
@@ -1117,6 +1118,62 @@ fn overlap_check(settings: &crate::settings::Settings) -> Option<DoctorCheck> {
                  writes cannot also be mounted read-only",
             ),
         )
+    })
+}
+
+/// `logs.reader` (issue #552, ADR 0072): which app reads the ingress logs, FAIL when another app asks
+/// for `ingress_logs`, warn when `[logs] reader` names an app that is missing or does not set it.
+/// Silent when nothing is configured and nothing asks.
+fn logs_reader<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    out.extend(logs_reader_check(d.host.logs.reader.as_ref(), &apps));
+}
+
+fn logs_reader_check(reader: Option<&InstanceName>, apps: &AppsFile) -> Option<DoctorCheck> {
+    const ID: &str = "logs.reader";
+    let intruders: Vec<String> = apps
+        .apps
+        .iter()
+        .filter(|(name, spec)| spec.ingress_logs && Some(*name) != reader)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if !intruders.is_empty() {
+        let hint = match reader {
+            Some(r) => format!("only `{r}` may set `ingress_logs`; remove it from the others"),
+            None => "set `[logs] reader` in weglarka.toml to the one app that reads the ingress \
+                     logs, or remove `ingress_logs`"
+                .to_owned(),
+        };
+        return Some(check(
+            ID,
+            CheckStatus::Fail,
+            format!(
+                "`ingress_logs` is set on {} but is reserved for the `[logs] reader` app",
+                intruders.join(", ")
+            ),
+            Some(&hint),
+        ));
+    }
+    let reader = reader?;
+    Some(match apps.apps.get(reader) {
+        None => check(
+            ID,
+            CheckStatus::Warn,
+            format!("`[logs] reader` names `{reader}`, which is not a declared app"),
+            Some("add the app or correct `[logs] reader` in weglarka.toml"),
+        ),
+        Some(spec) if !spec.ingress_logs => check(
+            ID,
+            CheckStatus::Warn,
+            format!("`[logs] reader` is `{reader}`, but the app does not set `ingress_logs`"),
+            Some("run `weglarka apps update <name> --ingress-logs`"),
+        ),
+        Some(_) => ok(
+            ID,
+            format!("`{reader}` reads the ingress logs (read-only, at /var/log/weglarka-ingress)"),
+        ),
     })
 }
 
@@ -3384,5 +3441,37 @@ mod container_log_tests {
             CheckStatus::Warn
         );
         assert_eq!(container_log_check(FILE, &list).status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn logs_reader_reports_the_reader_and_refuses_everyone_else() {
+        let apps = |collector: &str, other: &str| -> AppsFile {
+            toml::from_str(&format!(
+                "[apps.collector]\nimage = \"i\"\n{collector}\n[apps.web]\nimage = \"i\"\n{other}\n"
+            ))
+            .unwrap()
+        };
+        let reader: InstanceName = InstanceName::new("collector").unwrap();
+        // Nothing configured, nothing asks: silent.
+        assert!(logs_reader_check(None, &apps("", "")).is_none());
+        let ok = logs_reader_check(Some(&reader), &apps("ingress_logs = true", "")).unwrap();
+        assert_eq!(
+            (ok.id.as_str(), ok.status),
+            ("logs.reader", CheckStatus::Ok)
+        );
+        assert!(ok.message.contains("collector"));
+        // Another app asks (with or without a reader configured).
+        for configured in [Some(&reader), None] {
+            let bad = logs_reader_check(configured, &apps("", "ingress_logs = true")).unwrap();
+            assert_eq!(bad.status, CheckStatus::Fail);
+            assert!(bad.message.contains("web"), "{}", bad.message);
+        }
+        // The reader is configured but does not opt in, or does not exist.
+        let idle = logs_reader_check(Some(&reader), &apps("", "")).unwrap();
+        assert_eq!(idle.status, CheckStatus::Warn);
+        let ghost: InstanceName = InstanceName::new("ghost").unwrap();
+        let missing = logs_reader_check(Some(&ghost), &apps("", "")).unwrap();
+        assert_eq!(missing.status, CheckStatus::Warn);
+        assert!(missing.message.contains("not a declared app"));
     }
 }

@@ -1692,6 +1692,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             runtime,
             configs: None,
             host_mounts: None,
+            ingress_logs: None,
             restarts: None,
             health: None,
             started_at: None,

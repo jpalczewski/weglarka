@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -195,6 +195,14 @@ fn container_security_headers_v21(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v21 → v22: `ingress_logs` on an app and `[logs] reader` in `weglarka.toml` (#552, ADR 0072).
+/// The flag is optional and defaults to `false`, so a v21 document needs no data transformation —
+/// the marker records that the file may carry it. A no-op that accepts a hand-edited file which
+/// already has it.
+fn ingress_log_reader_v22(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -219,6 +227,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     internal_hosts_v19,
     site_static_options_v20,
     container_security_headers_v21,
+    ingress_log_reader_v22,
 ];
 
 const _: () = assert!(
@@ -518,6 +527,7 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         ("start", !spec.start),
         ("host_mounts", !spec.host_mounts.is_empty()),
         ("group_add", !spec.group_add.is_empty()),
+        ("ingress_logs", spec.ingress_logs),
         ("strategy", spec.strategy != defaults.strategy),
         ("oidc", spec.oidc.is_some()),
         ("metrics_port", spec.metrics_port.is_some()),

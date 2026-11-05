@@ -482,6 +482,7 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         reload_signal,
         host_mounts,
         group_add,
+        ingress_logs,
         strategy,
         oidc,
         metrics_port,
@@ -518,6 +519,8 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         reload_signal,
         host_mounts: host_mounts.into_iter().map(read_host_mount).collect(),
         group_add,
+        // A bool; the instance is checked against `[logs] reader` when the spec is written.
+        ingress_logs,
         strategy: read_strategy(strategy),
         oidc: oidc.map(read_oidc),
         // A port number, and a path the model validates to the `paths` shape (`check_path_prefix`:
@@ -601,7 +604,9 @@ pub(crate) fn show_response(
     container: Option<&ContainerInfo>,
     served: Option<bool>,
 ) -> ShowAppResponse {
+    let ingress_logs = spec.ingress_logs.then_some(true);
     ShowAppResponse {
+        ingress_logs,
         runtime: with_waiting(
             runtime_state_for(&spec, app_state, container, served),
             app_state,

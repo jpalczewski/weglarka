@@ -307,6 +307,14 @@ pub struct SitesOptions {
     pub limits: ExtractLimits,
 }
 
+/// The one app allowed to read the ingress logs and the host directory it reads (issue #552).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressLogReader {
+    pub instance: weglarka_model::app::InstanceName,
+    /// Host log root (`<state dir>/ingress-logs`), mounted read-only at `READER_DIR`.
+    pub root: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
@@ -324,6 +332,9 @@ pub struct ReconcilerOptions {
     pub host_mounts: Vec<PathBuf>,
     /// Allowlist for apps' `group_add` (`[runtime] group_add`, issue #178).
     pub group_add: Vec<String>,
+    /// The ingress log reader (`[logs] reader`, ADR 0072): the instance that may set `ingress_logs`
+    /// and the host log root it gets mounted read-only. `None` = no app may read the logs.
+    pub ingress_log_reader: Option<IngressLogReader>,
     /// How long a blue-green switch keeps the old container serving after the new one joined the app
     /// network: at least the ingress resolver's cache lifetime, so no request still resolves to a
     /// container that is about to stop (ADR 0046).
@@ -351,6 +362,7 @@ impl Default for ReconcilerOptions {
             config_root: None,
             host_mounts: Vec::new(),
             group_add: Vec::new(),
+            ingress_log_reader: None,
             switch_drain: Duration::from_secs(3),
             sites: None,
             admin_token: None,
@@ -974,7 +986,7 @@ impl<P: PodmanClient> Reconciler<P> {
             } else if let Some(why) = unranged.get(name) {
                 blocked = true;
                 report.blocked.push((name.clone(), why.clone()));
-            } else if let Err(e) = self.resolve_mounts(spec) {
+            } else if let Err(e) = self.resolve_mounts(name, spec) {
                 // A config mount that cannot be mounted is not a deploy failure: the running container
                 // stays as it is until the operator fixes the root or the file (ADR 0028).
                 blocked = true;

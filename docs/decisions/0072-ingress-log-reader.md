@@ -26,7 +26,7 @@ unreachable for a container that does not mount it.
 **Reader (the plan of the follow-up PR, #552).**
 
 - One reader per host: `[logs] reader = "<instance>"` (a later list is an additive change). An app opts in with
-  `ingress_logs = true` (in `spec_hash` only when `true`, `apps.toml` schema 20); any other app asking for it is
+  `ingress_logs = true` (in `spec_hash` only when `true`, `apps.toml` schema 22); any other app asking for it is
   refused (400 on write, blocked in reconcile, `doctor` check `logs.reader`).
 - The log root is bind-mounted read-only at `/var/log/weglarka-ingress` in the reader, together with `keep_groups`.
 
@@ -48,6 +48,9 @@ read-only bind mount of a `0750 <runtime user>:<primary group>` directory holdin
 - Every app that has `group_add` with `keep-groups` now carries the runtime user's primary group, as before; the
   difference is that the group now means something on one directory. Such an app still cannot reach the files unless
   the directory is mounted into it, and only the configured reader gets that mount.
+- The reader is documented in `docs/guides/ingress-log-reader.md`. The mount is the log root, so per-app
+  subdirectories (ADR 0073) are covered. An app that sets `ingress_logs` and also has a `host_mounts` entry on
+  `/var/log/weglarka-ingress` is refused.
 - The group must stay small. Any other member of the runtime user's primary group can read visitor addresses;
   `docs/guides/log-retention.md` shows how to check with `getent group`. A user with a private primary group (the
   default of `useradd`) has no other members.

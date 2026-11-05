@@ -77,6 +77,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `ingress.access_log_skip_paths` (`weglarka apps update <app> --remove-access-log-skip-path <path>`) | [access log](access-log.md) |
 | `apps.toml`, apps | `configs` and `reload_signal` | [host configs](host-configs.md) |
 | `apps.toml`, apps | `host_mounts`, `group_add` | [host mounts](host-mounts.md) |
+| `apps.toml`, apps | `ingress_logs` (`weglarka apps update <app> --no-ingress-logs`) | [ingress log reader](ingress-log-reader.md) |
 | `apps.toml`, secret bindings | `uid`/`gid` on mounted secrets (`kind = "mount"`) | [first app](first-app.md) |
 | `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `apps.toml`, apps | `[apps.X.ingress.static]` (clean URLs, custom 404, cache headers, redirects, feeds, security headers) | [static sites](static-sites.md) |
@@ -99,6 +100,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[monitor]` | [crash detection](crash-detection.md) |
 | `weglarka.toml` | `[self_update]`, together with `systemctl --user disable --now weglarka-self-update.timer weglarka-watchdog.timer` | [self-update](self-update.md) |
 | `weglarka.toml` | `[runtime] host_mounts`, `[runtime] group_add` | [host mounts](host-mounts.md) |
+| `weglarka.toml` | `[logs] reader` | [ingress log reader](ingress-log-reader.md) |
 | `weglarka.toml` | `config_root` | [host configs](host-configs.md) |
 | `weglarka.toml` | `[webhook.forgejo]` | [webhooks](webhooks.md) |
 | `weglarka.toml` | `[identity]` | [identity provider](identity-provider.md) |

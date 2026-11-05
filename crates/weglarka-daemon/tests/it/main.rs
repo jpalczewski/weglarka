@@ -19,6 +19,7 @@ mod host_ports;
 mod identity;
 mod images;
 mod ingress;
+mod ingress_logs;
 mod logs;
 mod memory;
 mod metrics;
