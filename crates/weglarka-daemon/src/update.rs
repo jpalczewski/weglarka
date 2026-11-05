@@ -95,15 +95,6 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
         // over the set that would be written. A uid-range change with existing volume data is
         // refused too — the old container and its files stay untouched.
         candidate::validate_app(&d, &name, &req.spec, &apps)?;
-        // `ingress.static` options name files of the release (issue #501): an update that changes
-        // only those deploys nothing, so the release nginx serves right now has to satisfy the new
-        // spec — otherwise the reload would reference a page that is not there. Checked before
-        // anything is written, so a refused update persists nothing. A redeploying update (image or
-        // `start`) runs the deploy gate itself. Unchanged options need no check at all.
-        let redeploys = old.image != req.spec.image || old.start != req.spec.start;
-        if !redeploys && old.ingress.static_ != req.spec.ingress.static_ {
-            d.engine.check_served_release(&name, &req.spec)?;
-        }
         d.engine.check_range_change(&name, &req.spec).await?;
         mutating(d.engine.upsert_app(name.clone(), req.spec.clone())).await?;
         (old.image, old.start)

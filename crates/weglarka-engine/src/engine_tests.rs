@@ -4948,6 +4948,62 @@ not_found_page = "/404.html"
             .unwrap();
     }
 
+    /// Decision table of [`Reconciler::check_static_change`] — the one place `upsert_app` and a
+    /// re-declared site (issue #572) decide whether the served release has to satisfy the new spec:
+    /// only an `ingress.static`-only change of an already stored static spec is checked. A change of
+    /// `image`, `start` or `kind` deploys, and that deploy runs the full gate itself.
+    #[tokio::test(start_paused = true)]
+    async fn only_an_ingress_only_change_of_a_stored_static_spec_is_checked() {
+        let h = harness();
+        // The served release predates the custom 404 page.
+        publish(&h, 'a', &[("index.html", b"<h1>hi</h1>")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        let old = spec(&h, "blog");
+        h.set_apps(SITE_WITH_NOT_FOUND_PAGE);
+        let new = spec(&h, "blog");
+
+        // Only the options change: checked, and this release cannot satisfy them.
+        assert!(matches!(
+            h.rec.check_static_change(&name("blog"), Some(&old), &new),
+            Err(EngineError::ServedReleaseUnsatisfied { .. })
+        ));
+        // A new instance stores no old spec and is served by nothing yet.
+        h.rec
+            .check_static_change(&name("blog"), None, &new)
+            .unwrap();
+        // Unchanged options need no check at all.
+        h.rec
+            .check_static_change(&name("blog"), Some(&old), &old)
+            .unwrap();
+        h.rec
+            .check_static_change(&name("blog"), Some(&new), &new)
+            .unwrap();
+
+        // An image or `start` change deploys, and the deploy gate checks the new release itself.
+        let mut redeployed = new.clone();
+        redeployed.image = "registry.example.com/me/blog:next".into();
+        h.rec
+            .check_static_change(&name("blog"), Some(&old), &redeployed)
+            .unwrap();
+        let mut started = new.clone();
+        started.start = !old.start;
+        h.rec
+            .check_static_change(&name("blog"), Some(&old), &started)
+            .unwrap();
+
+        // A container renders no release options, and a kind flip rebuilds the runtime.
+        let mut container = new.clone();
+        container.kind = weglarka_model::app::AppKind::Container;
+        h.rec
+            .check_static_change(&name("blog"), Some(&old), &container)
+            .unwrap();
+        let mut flipped = old.clone();
+        flipped.kind = weglarka_model::app::AppKind::Container;
+        h.rec
+            .check_static_change(&name("blog"), Some(&old), &flipped)
+            .unwrap();
+    }
+
     /// Nothing a reload could break: an undeployed site (nginx answers 503), a release-gone pin, a
     /// container app and a daemon without a sites root are all accepted.
     #[tokio::test(start_paused = true)]

@@ -141,9 +141,11 @@ impl From<EngineError> for Fail {
             // fault (400); a static site without a previous release is a conflict (409).
             EngineError::RollbackUnsupported(message) => Fail::invalid(message),
             e @ EngineError::RollbackRefused(_) => Fail(ErrorCode::Conflict, e.to_string()),
-            // An `ingress.static`-only update naming a file the served release lacks (issue #501):
-            // nothing was written, and the engine message already says to deploy the site first.
-            e @ EngineError::ServedReleaseUnsatisfied { .. } => Fail::invalid(e.to_string()),
+            // An `ingress.static`-only update naming a file the served release lacks (issue #501),
+            // or a re-declared site whose shared options name one (issue #572): nothing was written,
+            // and the engine message already says which release has to change first.
+            e @ (EngineError::ServedReleaseUnsatisfied { .. }
+            | EngineError::SiteServedReleaseUnsatisfied { .. }) => Fail::invalid(e.to_string()),
             // `weglarka run` (issue #106): nothing was created for any of these.
             e @ (EngineError::RunNotDeployed(_) | EngineError::RunLimit(_)) => {
                 Fail(ErrorCode::Conflict, e.to_string())
