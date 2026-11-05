@@ -6213,8 +6213,10 @@ mod retention {
     };
     use weglarka_model::platform_update::{
         CAPABILITIES_FILE_NAME, CapabilityRecord, CoordinationFeature, REQUIRED_FOR_PLATFORM_PRUNE,
-        Stage,
     };
+    // Used only by the Linux-gated reclaim tests.
+    #[cfg(target_os = "linux")]
+    use weglarka_model::platform_update::Stage;
     use weglarka_model::podman::TarStream;
     use weglarka_model::release_set::{Repository, StrictDigest};
 
@@ -7013,6 +7015,7 @@ mod retention {
     }
 
     /// Startup reclamation: a reservation written by another boot goes, one of this boot stays.
+    #[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
     #[tokio::test(start_paused = true)]
     async fn reclaim_removes_only_reservations_of_a_previous_boot() {
         let h = Harness::new(NTFY);
@@ -7067,6 +7070,7 @@ mod retention {
 
     /// `platform-update.toml` with one transaction in `stage` that lists `listed` among its
     /// reservations.
+    #[cfg(target_os = "linux")]
     fn write_transaction(h: &Harness, stage: Stage, listed: &[&str]) {
         use weglarka_model::platform_update::{
             JournalEndpoint, OwnerIdentity, PlatformUpdate, TransactionId, TransactionJournal,
@@ -7147,6 +7151,7 @@ mod retention {
     /// A previous-boot reservation survives while a nonterminal transaction references it — by its
     /// `reservations` list or by the reservation's `journal_ref` — and `list` says so with the same
     /// predicate.
+    #[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
     #[tokio::test(start_paused = true)]
     async fn reclaim_spares_what_a_nonterminal_transaction_references() {
         let h = Harness::new(NTFY);
@@ -7188,6 +7193,7 @@ mod retention {
 
     /// Once the transaction is terminal nothing protects its reservations any more: they are
     /// reclaimed, and the list no longer calls them referenced.
+    #[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
     #[tokio::test(start_paused = true)]
     async fn reclaim_takes_what_a_terminal_transaction_referenced() {
         let h = Harness::new(NTFY);
@@ -7268,6 +7274,7 @@ mod retention {
     /// A corrupt `platform-update.toml` makes the list degrade, not fail: every reservation is
     /// there (the operator needs the ids), `referenced` is unknown and a warning names the file and
     /// the error. Reclamation fails closed on the same file: nothing is reclaimed.
+    #[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
     #[tokio::test(start_paused = true)]
     async fn a_corrupt_journal_degrades_the_list_and_blocks_reclaim() {
         let h = Harness::new(NTFY);

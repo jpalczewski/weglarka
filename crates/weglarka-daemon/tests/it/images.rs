@@ -181,6 +181,7 @@ fn this_boot() -> String {
 
 /// Starting the daemon reclaims the reservations a previous boot left (their `boot_id` differs from
 /// the current one) and leaves one of this boot alone; `GET /v1/images/reservations` shows the rest.
+#[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
 #[tokio::test]
 async fn startup_reclaims_reservations_of_a_previous_boot() {
     let builder = Builder::new();
@@ -286,6 +287,7 @@ async fn a_full_reservation_file_answers_prune_as_blocked_and_doctor_warns() {
 
 /// A previous-boot reservation that a nonterminal platform transaction lists survives the startup
 /// reclaim (and the list says it is referenced); an unreferenced one next to it is reclaimed.
+#[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
 #[tokio::test]
 async fn startup_spares_a_reservation_a_platform_transaction_references() {
     use weglarka_model::platform_update::{
@@ -351,6 +353,7 @@ async fn startup_spares_a_reservation_a_platform_transaction_references() {
 /// A corrupt `platform-update.toml` leaves startup reclaim with nothing to go on (fail closed: no
 /// reservation is reclaimed, the daemon still starts), and the list degrades: every id is there,
 /// `referenced` is `null` and a diagnostic names the file.
+#[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
 #[tokio::test]
 async fn a_corrupt_platform_journal_keeps_every_reservation_and_degrades_the_list() {
     let builder = Builder::new();
