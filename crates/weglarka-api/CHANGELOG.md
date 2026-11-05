@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.8...weglarka-api-v0.0.9) - 2026-11-05
+
+### Added
+
+- *(acme)* prefer_wildcard serves covered domains with the wildcard ([#604](https://github.com/jpalczewski/weglarka/pull/604))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+
+### Fixed
+
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+
 ## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.7...weglarka-api-v0.0.8) - 2026-11-05
 
 ### Added

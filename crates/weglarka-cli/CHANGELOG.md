@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.2...weglarka-cli-v0.1.3) - 2026-11-05
+
+### Added
+
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+
+### Fixed
+
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(cli)* refuse an apps update that would stop a running app without --allow-stop ([#565](https://github.com/jpalczewski/weglarka/pull/565))
+
 ## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.1...weglarka-cli-v0.1.2) - 2026-11-05
 
 ### Added

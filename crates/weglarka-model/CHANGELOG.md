@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.7...weglarka-model-v0.0.8) - 2026-11-05
+
+### Added
+
+- *(acme)* prefer_wildcard serves covered domains with the wildcard ([#604](https://github.com/jpalczewski/weglarka/pull/604))
+- *(ingress)* shared certificate choice with an optional wildcard preference ([#600](https://github.com/jpalczewski/weglarka/pull/600))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(ingress)* security headers for container apps ([#574](https://github.com/jpalczewski/weglarka/pull/574))
+- *(daemon)* group-readable ingress log directory ([#573](https://github.com/jpalczewski/weglarka/pull/573))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Fixed
+
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(daemon)* validate the candidate apps.toml once for add, update and sites ([#564](https://github.com/jpalczewski/weglarka/pull/564))
+
+### Other
+
+- *(model)* one module for the ingress log layout and retention helpers ([#558](https://github.com/jpalczewski/weglarka/pull/558))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.6...weglarka-model-v0.0.7) - 2026-11-05
 
 ### Added

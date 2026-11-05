@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/jpalczewski/weglarka/compare/v0.0.8...v0.0.9) - 2026-11-05
+
+### Added
+
+- *(acme)* prefer_wildcard serves covered domains with the wildcard ([#604](https://github.com/jpalczewski/weglarka/pull/604))
+- *(daemon)* doctor hint for own certificate pairs shadowing a wildcard ([#601](https://github.com/jpalczewski/weglarka/pull/601))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(ingress)* security headers for container apps ([#574](https://github.com/jpalczewski/weglarka/pull/574))
+- *(daemon)* group-readable ingress log directory ([#573](https://github.com/jpalczewski/weglarka/pull/573))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Fixed
+
+- *(engine)* check shared static options against the served releases on sites declare ([#585](https://github.com/jpalczewski/weglarka/pull/585))
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(daemon)* gate ingress-only static updates on the served release ([#567](https://github.com/jpalczewski/weglarka/pull/567))
+- *(daemon)* validate the candidate apps.toml once for add, update and sites ([#564](https://github.com/jpalczewski/weglarka/pull/564))
+- *(daemon)* refuse host_mounts entries that overlap daemon-writable mounts ([#559](https://github.com/jpalczewski/weglarka/pull/559))
+- *(engine)* refuse kind changes on update and require a served release for static sites ([#549](https://github.com/jpalczewski/weglarka/pull/549))
+
+### Other
+
+- *(daemon)* share the deploy mapping and app view between add and update ([#568](https://github.com/jpalczewski/weglarka/pull/568))
+- *(model)* one module for the ingress log layout and retention helpers ([#558](https://github.com/jpalczewski/weglarka/pull/558))
+- gate tests that read /proc to Linux ([#550](https://github.com/jpalczewski/weglarka/pull/550))
+
 ## [0.0.8](https://github.com/jpalczewski/weglarka/compare/v0.0.7...v0.0.8) - 2026-11-05
 
 ### Added

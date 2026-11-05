@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.7...weglarka-engine-v0.0.8) - 2026-11-05
+
+### Added
+
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Fixed
+
+- *(engine)* check shared static options against the served releases on sites declare ([#585](https://github.com/jpalczewski/weglarka/pull/585))
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(engine)* refuse kind changes on update and require a served release for static sites ([#549](https://github.com/jpalczewski/weglarka/pull/549))
+
+### Other
+
+- *(engine)* check static ingress options against the served release ([#566](https://github.com/jpalczewski/weglarka/pull/566))
+- gate tests that read /proc to Linux ([#550](https://github.com/jpalczewski/weglarka/pull/550))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.6...weglarka-engine-v0.0.7) - 2026-11-05
 
 ### Added
