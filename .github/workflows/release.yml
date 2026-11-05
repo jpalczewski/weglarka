@@ -552,8 +552,9 @@ jobs:
         run: |
           set -euo pipefail
           payload() { jq -r "$1" "$2" 2>/dev/null || true; }
-          schema=$(grep -oE 'SCHEMA_VERSION: u32 = [0-9]+' crates/weglarka-model/src/state.rs | grep -oE '[0-9]+')
-          [ -n "$schema" ] || { echo "::error::cannot read the state schema version"; exit 1; }
+          # Anchored on the public constant only: `u32` and `IMPLICIT_SCHEMA_VERSION` must not add digits.
+          schema=$(sed -nE 's/^pub const SCHEMA_VERSION: u32 = ([0-9]+);$/\1/p' crates/weglarka-model/src/state.rs)
+          [[ "$schema" =~ ^[0-9]+$ ]] || { echo "::error::cannot read the state schema version (got '$schema')"; exit 1; }
 
           args=(--channel "$CHANNEL" --revision "$GITHUB_SHA" --release-repository "$RELEASE_REPOSITORY"
                 --daemon-crate crates/weglarka-daemon --panel-crate crates/weglarka-panel --cli-crate crates/weglarka-cli
