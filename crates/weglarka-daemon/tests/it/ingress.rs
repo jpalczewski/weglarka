@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use hyper::StatusCode;
+
 use weglarka_daemon::ingress::{ApplyReport, IngressApplyError, IngressManager, NginxAction};
 use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions};
 use weglarka_engine::testing::{Call, FakePodman};
@@ -10,6 +12,8 @@ use weglarka_model::config::HostConfig;
 use weglarka_model::podman::{PodmanClient, PodmanError};
 use weglarka_model::secrets::FileSecretStore;
 use weglarka_model::state::{self, StatePaths};
+
+use crate::common::{Builder, Harness, admin};
 
 fn spec(domain: &str) -> AppSpec {
     toml::from_str(&format!(
@@ -852,4 +856,124 @@ async fn edge_self_update_keeps_the_forwarder_and_a_changed_publish_replaces_it(
             .id,
         forwarder.id
     );
+}
+
+/// `ingress.internal_hosts` (issue #303, ADR 0071): the static doctor check for apps that resolve
+/// domains this host serves through Podman's `host-gateway`. Nothing is spawned, so it reports the two
+/// facts the configuration decides — an IPv4 listener on the host and, in `edge`, a certificate pair.
+#[tokio::test]
+async fn doctor_reports_internal_hosts_as_a_static_check() {
+    // `git` reaches `auth` over the host, the OIDC case of the issue; no certificate pair exists yet,
+    // and in `edge` an internal call is terminated like a visitor's request.
+    let apps = "[apps.git]
+image = \"ghcr.io/x/y:latest\"
+domains = [\"git.example.org\"]
+port = 3000
+health = { attempts = 1, window_secs = 1 }
+internal_hosts = [\"auth.example.org\"]
+
+[apps.auth]
+image = \"ghcr.io/x/y:latest\"
+domains = [\"auth.example.org\"]
+port = 9091
+health = { attempts = 1, window_secs = 1 }
+";
+    let h = edge_harness("0.0.0.0:18080", "0.0.0.0:18443", apps).await;
+    let (status, v) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let check = doctor_check(&v, "ingress.internal_hosts");
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("git -> auth.example.org"),
+        "{check}"
+    );
+    assert!(
+        check["hint"].as_str().unwrap().contains("<domain>.crt"),
+        "the missing pair is named: {check}"
+    );
+    h.running.stop().await;
+}
+
+/// The route is IPv4 only: a TLS listener on the loopback is not the host, so a listed domain could
+/// never be reached, and the check says so instead of blaming the certificate.
+#[tokio::test]
+async fn doctor_warns_about_a_loopback_tls_listener_for_internal_hosts() {
+    let apps = "[apps.git]
+image = \"ghcr.io/x/y:latest\"
+domains = [\"git.example.org\"]
+port = 3000
+health = { attempts = 1, window_secs = 1 }
+internal_hosts = [\"git.example.org\"]
+";
+    let h = edge_harness("127.0.0.1:18080", "127.0.0.1:18443", apps).await;
+    let (status, v) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let check = doctor_check(&v, "ingress.internal_hosts");
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("127.0.0.1:18443"),
+        "{check}"
+    );
+    assert!(
+        check["hint"].as_str().unwrap().contains("0.0.0.0"),
+        "{check}"
+    );
+    h.running.stop().await;
+}
+
+/// A host that serves the domain and publishes on every address reports `ok`, and the message names
+/// the shared client address of internal calls in `edge`.
+#[tokio::test]
+async fn doctor_accepts_internal_hosts_with_a_certificate_pair() {
+    let apps = "[apps.git]
+image = \"ghcr.io/x/y:latest\"
+domains = [\"git.example.org\"]
+port = 3000
+health = { attempts = 1, window_secs = 1 }
+internal_hosts = [\"git.example.org\"]
+";
+    let h = edge_harness("0.0.0.0:18080", "0.0.0.0:18443", apps).await;
+    // The pair an operator (or the ACME worker) puts in `tls/`; the daemon scans the directory on
+    // every `apply`, so the check sees it without a restart.
+    let tls = h.running.daemon.ingress.tls_dir();
+    std::fs::create_dir_all(&tls).unwrap();
+    std::fs::write(tls.join("git.example.org.crt"), "cert").unwrap();
+    std::fs::write(tls.join("git.example.org.key"), "key").unwrap();
+    let (status, v) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let check = doctor_check(&v, "ingress.internal_hosts");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["message"].as_str().unwrap().contains("169.254.1.2"),
+        "{check}"
+    );
+    h.running.stop().await;
+}
+
+/// An `edge` daemon with `apps.toml` written before the start (the startup validation reads it).
+async fn edge_harness(bind: &str, https_bind: &str, apps: &str) -> Harness {
+    Builder::new()
+        .ingress(&format!(
+            "[ingress]\nmode = \"edge\"\nbind = \"{bind}\"\nhttps_bind = \"{https_bind}\"\n"
+        ))
+        .apps(apps)
+        .build()
+        .await
+}
+
+/// One check of a `GET /v1/doctor` answer.
+fn doctor_check(report: &serde_json::Value, id: &str) -> serde_json::Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check in {report}"))
+        .clone()
 }

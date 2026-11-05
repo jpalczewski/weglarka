@@ -84,6 +84,9 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
         // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
         // by another app), as in `add`. Both see the candidate app set.
         weglarka_model::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
+        // `internal_hosts` (issue #303): only domains this host serves, as in `add`.
+        weglarka_model::internal_hosts::validate(&d.host, &apps)
+            .map_err(|e| invalid(e.to_string()))?;
         // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
         weglarka_model::depends::validate(&apps).map_err(invalid)?;
         weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;

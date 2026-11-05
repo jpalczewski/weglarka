@@ -41,7 +41,10 @@ impl fmt::Display for SpecHash {
 /// `configs` (issue #118, `docs/decisions/0028-config-root-mounts.md`) is appended last the same way:
 /// the **list** of host config mounts is a container setting, while the file content is deliberately
 /// outside the hash — editing a config must not recreate the container. `reload_signal` is omitted
-/// entirely: it only affects `apps reload`, never what the container is made of.
+/// entirely: it only affects `apps reload`, never what the container is made of. `internal_hosts`
+/// (issue #303) is appended last the same way: the `/etc/hosts` entries are resolved at every container
+/// start but fixed when it is created, so a change recreates the app while an unset field hashes
+/// exactly as before.
 #[derive(Serialize)]
 struct HashInput<'a> {
     format: &'static str,
@@ -97,6 +100,12 @@ struct HashInput<'a> {
     /// scraper reads it.
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_port: Option<u16>,
+    /// `internal_hosts` (issue #303): the `/etc/hosts` entries Podman writes at container start, so
+    /// the list is a container setting and a change recreates the app. Sorted (the order in the spec
+    /// is not meaningful) and skipped while empty, so an app that does not use the field hashes
+    /// exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    internal_hosts: Vec<&'a str>,
 }
 
 /// One shared-volume mount as it enters the hash: the volume name and the mount point.
@@ -181,6 +190,9 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         })
         .collect();
     shared_networks.sort_by(|a, b| a.name.cmp(b.name));
+    let mut internal_hosts: Vec<&str> = spec.internal_hosts.iter().map(String::as_str).collect();
+    internal_hosts.sort_unstable();
+    internal_hosts.dedup();
     let input = HashInput {
         format: HASH_FORMAT,
         image_digest,
@@ -199,6 +211,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         host_mounts,
         group_add,
         metrics_port: spec.metrics_port,
+        internal_hosts,
     };
     let json = serde_json::to_vec(&input).expect("hash input is always serializable");
     SpecHash(hex::encode(Sha256::digest(json)))
@@ -714,6 +727,29 @@ env = { B = "2", A = "1" }
         assert_eq!(
             with(&["adm", "systemd-journal"]),
             with(&["systemd-journal", "adm"])
+        );
+    }
+
+    /// `internal_hosts` (issue #303) is fixed at container create, so it rejoins the hash — but only
+    /// when set: an app that never uses the field must survive an upgrade without a recreate.
+    #[test]
+    fn internal_hosts_recreate_but_absence_and_order_do_not() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let with = |hosts: &[&str]| {
+            let mut s = spec();
+            s.internal_hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
+            spec_hash(&s, &digest('a'))
+        };
+        assert_eq!(base, with(&[]), "an unset field must not change the hash");
+        assert_ne!(base, with(&["auth.example.org"]));
+        assert_ne!(
+            with(&["auth.example.org"]),
+            with(&["git.example.org"]),
+            "which domain the app resolves is part of the hash"
+        );
+        assert_eq!(
+            with(&["auth.example.org", "git.example.org"]),
+            with(&["git.example.org", "auth.example.org"])
         );
     }
 

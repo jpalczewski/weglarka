@@ -895,6 +895,42 @@ pub fn check_path_prefix(path: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Syntax of a domain (`AppSpec::domains`, `internal_hosts`, the ingress route table): 1-253 bytes,
+/// dot-separated `[a-z0-9-]` labels of 1-63 bytes that neither start nor end with `-`, at least two
+/// labels, and a last label that is not numeric. It lands in `nginx.conf` and in a container's
+/// `/etc/hosts`, so the check lives next to the type and is shared by spec validation and the ingress
+/// generator.
+pub fn check_domain(domain: &str) -> Result<(), &'static str> {
+    if domain.is_empty() || domain.len() > 253 {
+        return Err("length must be 1-253");
+    }
+    let mut labels = 0;
+    let mut last = "";
+    for label in domain.split('.') {
+        labels += 1;
+        last = label;
+        if !(1..=63).contains(&label.len()) {
+            return Err("label length must be 1-63");
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err("only [a-z0-9-] and '.' allowed");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("label must not start or end with '-'");
+        }
+    }
+    if labels < 2 {
+        return Err("at least two labels required");
+    }
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("last label must not be numeric");
+    }
+    Ok(())
+}
+
 /// Syntax of an `access_log_skip_paths` entry: `/seg[/seg…]` with an optional trailing `/` (which makes
 /// it a prefix), segments of `[A-Za-z0-9_.-]`, no empty or dot segments, at most 128 bytes. A bare `/`
 /// would silence the whole app and is rejected. It lands in `nginx.conf`, hence the strict alphabet.
@@ -1170,6 +1206,14 @@ pub struct AppSpec {
     /// hash: only the scraper reads it, the container is not made of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_path: Option<String>,
+    /// Domains **this host itself serves** that the container must resolve (issue #303,
+    /// `docs/decisions/0071-internal-hosts-host-gateway.md`): Podman writes them into the container's
+    /// `/etc/hosts` as `host-gateway` (`169.254.1.2`), so the app reaches the ingress the way a
+    /// visitor does. Not a hosts-file override — every entry must be a `domains` entry of some app,
+    /// the `[webhook] domain` or the `[identity]` issuer, and the route is IPv4 only. Part of the
+    /// spec hash only when non-empty, because the entry is fixed at container create.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_hosts: Vec<String>,
 }
 
 impl AppSpec {

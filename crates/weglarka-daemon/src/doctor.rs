@@ -1804,6 +1804,17 @@ fn acme_dns(
     }
 }
 
+/// Whether `tls/` holds a pair that serves `domain`: its own `<domain>.crt`/`.key`, or a wildcard
+/// pair of an apex that covers it. The single lookup shared by `ingress.tls` and
+/// `ingress.internal_hosts`.
+fn has_certificate(tls: &std::path::Path, wildcards: &[String], domain: &str) -> bool {
+    let own =
+        tls.join(format!("{domain}.crt")).is_file() && tls.join(format!("{domain}.key")).is_file();
+    own || wildcards
+        .iter()
+        .any(|apex| weglarka_model::config::wildcard_covers(apex, domain))
+}
+
 /// `edge` (issue #95): every routed domain needs `<domain>.crt` + `<domain>.key` in the TLS
 /// directory, otherwise its HTTPS handshake is refused (the plain-HTTP redirect still works). A
 /// warning, not a failure: without `[acme]` the operator places the files, and a host without any
@@ -1817,13 +1828,7 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let wildcards = wildcard_apexes_on_disk(&tls);
     let missing: Vec<&str> = domains
         .iter()
-        .filter(|domain| {
-            let own = tls.join(format!("{domain}.crt")).is_file()
-                && tls.join(format!("{domain}.key")).is_file();
-            !own && !wildcards
-                .iter()
-                .any(|apex| weglarka_model::config::wildcard_covers(apex, domain))
-        })
+        .filter(|domain| !has_certificate(&tls, &wildcards, domain))
         .map(String::as_str)
         .collect();
     if missing.is_empty() {
@@ -1848,6 +1853,104 @@ fn ingress_tls<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             }),
         ));
     }
+}
+
+/// `ingress.internal_hosts` (issue #303, ADR 0071): apps that resolve domains this host serves through
+/// Podman's `host-gateway`. Static only — nothing is spawned (an active probe is a separate task), so
+/// the check reports the two facts the configuration already decides: the route is IPv4 and reaches
+/// only a listener published on every address or the host's public IPv4, and in `edge` a listed domain
+/// needs its certificate pair exactly like a visitor's request does. A feature that is off adds no line.
+fn ingress_internal_hosts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // `state.apps` already reports this
+    };
+    let entries: Vec<(&str, &str)> = apps
+        .apps
+        .iter()
+        .flat_map(|(name, spec)| {
+            spec.internal_hosts
+                .iter()
+                .map(move |domain| (name.as_str(), domain.as_str()))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let listed: Vec<String> = entries
+        .iter()
+        .map(|(app, domain)| format!("{app} -> {domain}"))
+        .collect();
+    let edge = d.host.ingress.mode == IngressMode::Edge;
+    // Podman hands pasta an IPv4 host-gateway only, and a loopback publish is not the host from inside
+    // a container (measured, issue #303).
+    let unreachable_bind = d
+        .host
+        .ingress
+        .https_bind
+        .filter(|_| edge)
+        .filter(|bind| bind.ip().is_loopback() || bind.ip().is_ipv6());
+    if let Some(bind) = unreachable_bind {
+        out.push(check(
+            "ingress.internal_hosts",
+            CheckStatus::Warn,
+            format!(
+                "{} resolve through Podman's host-gateway, but the TLS listener publishes on {bind}: \
+                 the route is IPv4 only and is not the host loopback, so the connection is refused",
+                listed.join(", ")
+            ),
+            Some(
+                "set [ingress] https_bind = \"0.0.0.0:443\" (or the host's public IPv4): the \
+                 host-gateway address reaches only what the host publishes there",
+            ),
+        ));
+        return;
+    }
+    // In `edge` the internal call is a visitor: nginx terminates its TLS with the domain's certificate.
+    let missing: Vec<&str> = if edge {
+        let tls = d.ingress.tls_dir();
+        let wildcards = wildcard_apexes_on_disk(&tls);
+        let mut missing: Vec<&str> = entries
+            .iter()
+            .map(|(_, domain)| *domain)
+            .filter(|domain| !has_certificate(&tls, &wildcards, domain))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    } else {
+        Vec::new()
+    };
+    if !missing.is_empty() {
+        out.push(check(
+            "ingress.internal_hosts",
+            CheckStatus::Warn,
+            format!(
+                "{} resolve through Podman's host-gateway, but there is no certificate pair for: {} \
+                 (in {})",
+                listed.join(", "),
+                missing.join(", "),
+                d.ingress.tls_dir().display()
+            ),
+            Some(
+                "internal calls are terminated by the same certificate as visitors' requests; put \
+                 <domain>.crt/.key there or enable [acme]",
+            ),
+        ));
+        return;
+    }
+    let from = if edge {
+        "internal calls arrive from 169.254.1.2, Podman's containers-internal address (all apps share \
+         it)"
+    } else {
+        "internal calls arrive from the address Traefik publishes on"
+    };
+    out.push(ok(
+        "ingress.internal_hosts",
+        format!(
+            "{} reach this host through Podman's host-gateway; {from}",
+            listed.join(", ")
+        ),
+    ));
 }
 
 /// `edge` (issue #162, ADR 0043): the client address survives only through the port forwarder
@@ -2209,6 +2312,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         ));
     }
     ingress_routes(d, out);
+    ingress_internal_hosts(d, out);
     if d.host.ingress.mode == IngressMode::Edge {
         ingress_tls(d, out);
         ingress_client_ip(d, out).await;

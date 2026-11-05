@@ -100,6 +100,12 @@ Decision: [ADR 0054](../decisions/0054-health-probe-socket.md).
   [notifications](notifications.md)) still uses the TCP port, so it gets the redirect in `edge`.
 - The socket path (`<nginx_conf_dir>/probe/probe.sock`) must be shorter than 108 bytes.
 
+## Apps reaching this host's domains
+
+An app that calls a domain this host serves (the identity provider, another app, the webhook) resolves it through
+Podman's `host-gateway` with [`internal_hosts`](internal-hosts.md) — internal calls then arrive from `169.254.1.2`
+like a request from the same host, and `https_bind` must publish on every address or the host's public IPv4.
+
 ## Requirements and security
 
 - Ports < 1024 need a sysctl and `[runtime] allow_privileged_host_ports = true`; `doctor --preflight` has the

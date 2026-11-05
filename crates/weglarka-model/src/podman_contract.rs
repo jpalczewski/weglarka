@@ -8,7 +8,7 @@
 //! The cases here use only names that cannot exist on a real host, so they are safe to run against
 //! a Podman that also serves other workloads.
 
-use crate::podman::{ContainerFilter, PodmanClient, PodmanError};
+use crate::podman::{ContainerFilter, ContainerSpec, PodmanClient, PodmanError};
 
 /// A name no container, image or network on a real host will have.
 pub const MISSING: &str = "weglarka-contract-missing";
@@ -21,6 +21,7 @@ pub async fn run_reachable(client: &impl PodmanClient) {
     missing_image_is_not_found(client).await;
     missing_network_is_not_found(client).await;
     unmatched_label_filter_lists_nothing(client).await;
+    create_of_an_unpulled_image_is_not_found(client).await;
 }
 
 /// Inspecting or removing a container that does not exist answers `NotFound` — the answer the
@@ -65,6 +66,20 @@ pub async fn unmatched_label_filter_lists_nothing(client: &impl PodmanClient) {
     assert!(
         matches!(&listed, Ok(containers) if containers.is_empty()),
         "container_list with an unmatched label: {listed:?}"
+    );
+}
+
+/// `container_create` from an image that was never pulled answers `NotFound` — the engine's "pull it
+/// first" branch — and never creates anything. The fake accepts images it was told about and has to
+/// answer the same way for the rest. Nothing is created here, so the case is safe on a host that also
+/// serves other workloads (the `/etc/hosts` side of `ContainerSpec::host_aliases`, which needs a
+/// container, is covered against a real Podman in `weglarka-podman/tests/podman.rs`).
+pub async fn create_of_an_unpulled_image_is_not_found(client: &impl PodmanClient) {
+    let spec = ContainerSpec::new(MISSING, MISSING_IMAGE);
+    let created = client.container_create(&spec).await;
+    assert!(
+        matches!(created, Err(PodmanError::NotFound(_))),
+        "container_create from an unpulled image: {created:?}"
     );
 }
 

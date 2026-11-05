@@ -77,3 +77,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0068](0068-cli-browser-login-loopback-redirect.md) | `weglarka login --browser`: authorization code flow on a loopback redirect |
 | [0069](0069-static-site-ingress-options.md) | Static sites: per-site rendering options |
 | [0070](0070-ingress-log-retention.md) | Daemon-owned ingress logs with a retention period |
+| [0071](0071-internal-hosts-host-gateway.md) | Apps reach their own domains through Podman's host-gateway (internal_hosts) |

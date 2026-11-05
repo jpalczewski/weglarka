@@ -75,6 +75,8 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         oidc: None,
         metrics_port: None,
         metrics_path: None,
+        // `internal_hosts` (issue #303) only changes a container's `/etc/hosts`, never the routing.
+        internal_hosts: vec![],
     };
     spec.domains.shrink_to_fit();
     BTreeMap::from([(InstanceName::new("app").unwrap(), spec)])

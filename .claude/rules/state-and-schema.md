@@ -28,7 +28,7 @@ paths:
   ADR 0019).
 - Per-feature schema bumps recorded elsewhere: configs (ADR 0028) → `apps.toml` `schema_version = 2` (no-op step), mounted
   secret owner (ADR 0037) → `schema_version = 7` (no-op step), identity (ADR 0051/0052) → schema 14, OIDC `device_flow` (ADR 0060) → schema 15, per-app
-  `metrics_port`/`metrics_path` (#364) → schema 16; see the
+  `metrics_port`/`metrics_path` (#364) → schema 16, per-app `internal_hosts` (#303, ADR 0071) → schema 19; see the
   matching rules ([engine-and-deploy.md](engine-and-deploy.md), [identity-and-admin-tokens.md](identity-and-admin-tokens.md)).
 
 ## Entry points
