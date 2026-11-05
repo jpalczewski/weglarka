@@ -11,11 +11,11 @@ use weglarka_api::{
     ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
     ListAppsResponse, ListReservationsResponse, ListSecretsResponse, NotifyStatusResponse,
     NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
-    ReloadRequest, ReloadResponse, ReservationView, SecretInfo, SetSecretRequest, ShowAppResponse,
-    StatusResponse,
+    ReloadRequest, ReloadResponse, ReservationView, RollbackResponse, SecretInfo, SetSecretRequest,
+    ShowAppResponse, StatusResponse,
 };
 use weglarka_model::app::{
-    AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
+    AppIngress, AppSpec, Digest, HealthGate, InstanceName, SecretBinding, SecretTarget,
 };
 use weglarka_model::secret_store::valid_secret_name;
 use weglarka_model::units::human_bytes;
@@ -23,7 +23,7 @@ use weglarka_model::units::human_bytes;
 use crate::cli::{
     AbandonReservationArgs, AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs,
     ImagesCommand, NotifyCommand, PruneImagesArgs, ReloadArgs, RemoveArgs, ReservationsCommand,
-    SecretRemoveArgs, SecretSetArgs, SecretsCommand,
+    RollbackArgs, SecretRemoveArgs, SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, append_query, request_path};
 use crate::error::{CliError, Kind, exit};
@@ -49,6 +49,7 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         }
         Command::Apps(AppsCommand::Stop(a)) => crate::update::apps_stop(json, &overrides, a).await,
         Command::Apps(AppsCommand::Reload(a)) => apps_reload(json, &overrides, a).await,
+        Command::Apps(AppsCommand::Rollback(a)) => apps_rollback(json, &overrides, a).await,
         Command::Apps(AppsCommand::Remove(a)) => apps_remove(json, &overrides, a).await,
         Command::Apps(AppsCommand::List) => apps_list(json, &overrides).await,
         Command::Apps(AppsCommand::Show { name }) => apps_show(json, &overrides, &name).await,
@@ -382,6 +383,25 @@ fn reload_conflict(err: CliError, name: &InstanceName) -> CliError {
     } else {
         err
     }
+}
+
+/// `apps rollback`: returns a static site to its previous release (issue #103). The daemon refuses
+/// container apps and site environments; the error carries the command that applies to them.
+pub(crate) async fn apps_rollback(
+    json: bool,
+    o: &Overrides,
+    a: RollbackArgs,
+) -> Result<i32, CliError> {
+    let name = instance(&a.name)?;
+    let resp: RollbackResponse = client(o)?
+        .call(
+            endpoints::APPS_ROLLBACK,
+            &[("name", name.as_str())],
+            None::<&()>,
+        )
+        .await?;
+    emit(json, &resp, || render_rollback(&name, &resp));
+    Ok(exit::OK)
 }
 
 // ---------- deploy / status ----------
@@ -991,6 +1011,28 @@ pub(crate) fn render_reload(r: &ReloadResponse) -> String {
         out.push_str(&render_configs(configs));
     }
     out
+}
+
+/// `apps rollback` output (issue #103): both digests and whether the release was already on disk.
+pub(crate) fn render_rollback(name: &InstanceName, r: &RollbackResponse) -> String {
+    let note = if r.reused_release {
+        "release on disk, no image needed"
+    } else {
+        "release rebuilt from the image"
+    };
+    format!(
+        "{name}: rolled back {} → {} ({note})\n",
+        short_sha256(&r.from),
+        short_sha256(&r.to)
+    )
+}
+
+/// `sha256:<64 hex>` → `sha256:<12 hex>…`.
+fn short_sha256(digest: &Digest) -> String {
+    match digest.as_str().strip_prefix("sha256:") {
+        Some(hex) if hex.len() > 12 => format!("sha256:{}…", hex.get(..12).unwrap_or(hex)),
+        _ => digest.to_string(),
+    }
 }
 
 /// `[configs]` section shared by `apps show` and `apps reload`: one line per declared mount with the

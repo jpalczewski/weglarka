@@ -639,6 +639,17 @@ pub struct ReloadResponse {
     pub configs: Option<Vec<ConfigMountView>>,
 }
 
+/// `POST /v1/apps/{name}/rollback` (issue #103) → the static site now serves `to` instead of `from`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackResponse {
+    /// The digest the site served before the rollback.
+    pub from: Digest,
+    /// The digest it serves afterwards (`previous` in `state.toml`).
+    pub to: Digest,
+    /// The previous release was complete on disk: only `current` moved, no image was exported.
+    pub reused_release: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub api_version: String,

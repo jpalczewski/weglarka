@@ -4325,6 +4325,7 @@ health = { attempts = 3, window_secs = 6 }
 /// Static sites (ADR 0049): a pinned image is unpacked into a release and `current` is switched.
 mod static_sites {
     use super::*;
+    use crate::sites::release_id;
 
     const SITE: &str = r#"
 [apps.blog]
@@ -4392,6 +4393,14 @@ domains = ["blog.example.com"]
         h.fake.set_pull_digest(SITE_IMAGE, digest(d));
         h.fake.script_image_archive(&digest(d), archive(files));
         digest(d)
+    }
+
+    fn pulls(h: &Harness) -> usize {
+        h.fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::ImagePull(_)))
+            .count()
     }
 
     #[tokio::test(start_paused = true)]
@@ -4475,6 +4484,146 @@ domains = ["blog.example.com"]
         let served = std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
         assert_eq!(served, "a");
         assert_eq!(h.state("blog").current, Some(digest('a')));
+    }
+
+    /// Issue #103, ADR 0049: a rollback reuses the retained release and never touches the registry
+    /// or the image store, even when both are gone.
+    #[tokio::test(start_paused = true)]
+    async fn rollback_reuses_the_previous_release_with_the_registry_unreachable() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"one")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        publish(&h, 'b', &[("index.html", b"two")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+
+        // The registry is gone and neither release's image is in the local store any more.
+        for d in ['a', 'b'] {
+            let pinned = format!("registry.example.com/me/blog@{}", digest(d));
+            h.fake.forget_image_reference(&pinned);
+            h.fake.fail_pull(&pinned, "registry unreachable");
+        }
+        h.fake.fail_pull(SITE_IMAGE, "registry unreachable");
+        let saves = h.fake.image_save_calls();
+        let pulls_before = pulls(&h);
+
+        let report = h.rec.rollback_site(&name("blog")).await.unwrap();
+
+        assert_eq!(report.from, digest('b'));
+        assert_eq!(report.to, digest('a'));
+        assert!(report.reused_release, "the release on disk is reused");
+        assert_eq!(h.fake.image_save_calls(), saves, "no image export");
+        assert_eq!(pulls(&h), pulls_before, "no pull");
+        assert_eq!(
+            std::fs::read_link(sites(&h).join("blog/current")).unwrap(),
+            std::path::Path::new("releases").join(release_id(&digest('a')))
+        );
+        assert_eq!(
+            std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap(),
+            "one"
+        );
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.previous, Some(digest('b')));
+        let failed = st.failed.expect("the digest left behind is recorded");
+        assert_eq!(failed.digest, digest('b'));
+        assert_eq!(failed.reason, "rolled back by the operator");
+    }
+
+    /// The previous release directory is gone but its image is local: the rollback re-extracts it
+    /// (no pull) and reports that the fast path was not taken.
+    #[tokio::test(start_paused = true)]
+    async fn rollback_rebuilds_a_missing_release_from_the_local_image() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"one")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        publish(&h, 'b', &[("index.html", b"two")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        std::fs::remove_dir_all(
+            sites(&h)
+                .join("blog/releases")
+                .join(release_id(&digest('a'))),
+        )
+        .unwrap();
+        let saves = h.fake.image_save_calls();
+        let pulls_before = pulls(&h);
+
+        let report = h.rec.rollback_site(&name("blog")).await.unwrap();
+
+        assert!(!report.reused_release, "the release was rebuilt");
+        assert_eq!(h.fake.image_save_calls(), saves + 1, "one image export");
+        assert_eq!(pulls(&h), pulls_before, "the local image is enough");
+        assert_eq!(
+            std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap(),
+            "one"
+        );
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.previous, Some(digest('b')));
+        assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
+    }
+
+    /// The digest a rollback leaves is `failed`, so the old tag cannot undo the rollback; a new
+    /// digest deploys normally and clears the marker.
+    #[tokio::test(start_paused = true)]
+    async fn after_a_rollback_the_left_digest_is_known_bad_and_a_new_digest_clears_it() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"one")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        publish(&h, 'b', &[("index.html", b"two")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        h.rec.rollback_site(&name("blog")).await.unwrap();
+
+        // The tag still points at `b`: a webhook redelivery is skipped as a known bad digest.
+        publish(&h, 'b', &[("index.html", b"two")]);
+        let out = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::KnownBad { .. }), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap(),
+            "one"
+        );
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('a')));
+        assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
+
+        // A new digest is not `failed`: it deploys and clears the marker.
+        publish(&h, 'c', &[("index.html", b"three")]);
+        let out = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap(),
+            "three"
+        );
+        let st = h.state("blog");
+        assert_eq!(st.current, Some(digest('c')));
+        assert_eq!(st.previous, Some(digest('a')));
+        assert_eq!(st.failed, None);
+    }
+
+    /// Every refusal happens before the release or `state.toml` is touched.
+    #[tokio::test(start_paused = true)]
+    async fn rollback_refusals_leave_state_and_current_unchanged() {
+        let h = Harness::new(NTFY);
+        let err = h.rec.rollback_site(&name("ntfy")).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::RollbackUnsupported(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("weglarka apps update ntfy"),
+            "{err}"
+        );
+        assert_eq!(h.state("ntfy").current, None);
+
+        let h = harness();
+        let err = h.rec.rollback_site(&name("blog")).await.unwrap_err();
+        assert!(matches!(err, EngineError::RollbackRefused(_)), "{err:?}");
+        assert!(err.to_string().contains("no previous release"), "{err}");
+        assert_eq!(h.state("blog").current, None);
+        assert!(!sites(&h).join("blog/current").exists());
+
+        let err = h.rec.rollback_site(&name("ghost")).await.unwrap_err();
+        assert!(matches!(err, EngineError::UnknownInstance(_)), "{err:?}");
+        assert_eq!(h.state("blog").current, None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4719,6 +4868,25 @@ domains = ["example.com"]
         let h = harness();
         let err = h.rec.deploy(&name("blog-prod"), false).await.unwrap_err();
         assert!(matches!(err, EngineError::PromoteOnly(_)), "{err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_of_a_site_environment_points_at_promote() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        let err = h.rec.rollback_site(&name("blog-dev")).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::RollbackUnsupported(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("weglarka promote blog dev --rollback"),
+            "{err}"
+        );
+        assert_eq!(served(&h, "blog-dev"), "one");
+        assert_eq!(h.state("blog-dev").current, Some(digest('a')));
     }
 
     #[tokio::test(start_paused = true)]

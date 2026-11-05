@@ -109,5 +109,8 @@ daemon extracts it into a per-release directory under `<nginx_conf_dir>/sites/` 
   `weglarka.toml` is outside the state schema, so there is no schema bump; a downgrade must remove the table
   because of `deny_unknown_fields`.
 - **A complete retained release is reused.** If `releases/<id>` already passes the gate, a deploy switches
-  `current` to it without exporting the image. Redeploying the previous release — including the future
-  `promote --rollback` command (#103) — therefore does not depend on the image store or the registry.
+  `current` to it without exporting the image. Redeploying the previous release — including `promote --rollback`
+  and `apps rollback` (#103) — therefore does not depend on the image store or the registry.
+- **A rollback marks the digest it leaves.** `weglarka apps rollback` records the release it returns from as
+  `failed` (`rolled back by the operator`), so a webhook redelivery or a plain deploy cannot undo it; a new digest
+  deploys normally and `weglarka deploy --force` goes forward again.

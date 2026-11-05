@@ -22,6 +22,17 @@ use weglarka_model::state::{self, FailedDeploy, StateFile};
 /// Releases kept per site: the one being served and the previous one (retention 1, like images).
 const KEPT_RELEASES: usize = 2;
 
+/// What `weglarka apps rollback` did (issue #103): the site now serves `to` instead of `from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackReport {
+    /// The digest `current` pointed at before the rollback.
+    pub from: Digest,
+    /// The digest `current` points at afterwards (`state.toml`'s `previous`).
+    pub to: Digest,
+    /// The release for `to` was complete on disk, so only `current` moved: no image was exported.
+    pub reused_release: bool,
+}
+
 impl<P: PodmanClient> Reconciler<P> {
     /// Whether `digest`'s release of the static site `instance` is complete on disk, so deploying it
     /// only switches `current` and needs neither the local image nor the registry (ADR 0049).
@@ -44,6 +55,89 @@ impl<P: PodmanClient> Reconciler<P> {
                 "static sites need a sites root and a scratch directory; the daemon configures none"
                     .into(),
             )
+        })
+    }
+
+    /// `weglarka apps rollback` (issue #103, ADR 0049): return a static site to its `previous` release.
+    ///
+    /// A complete release for `previous` is switched without touching the image store or the registry;
+    /// otherwise the image is ensured locally (pulled only when it is gone) and the release is
+    /// extracted again. The digest that is left becomes `failed`, so a webhook redelivery or a plain
+    /// deploy does not immediately undo the rollback — `weglarka deploy <app> --force` moves forward.
+    pub async fn rollback_site(
+        &self,
+        instance: &InstanceName,
+    ) -> Result<RollbackReport, EngineError> {
+        let guard = self.acquire().await;
+        let apps = state::load_apps(&self.paths.apps)?;
+        let spec = apps
+            .apps
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
+        if spec.kind != AppKind::Static {
+            return Err(EngineError::RollbackUnsupported(format!(
+                "{instance} is not a static site: container apps roll back automatically when the health gate fails, or manually with `weglarka apps update {instance} <image>:<tag>` (see docs/guides/verify-and-rollback.md)"
+            )));
+        }
+        if let Some(origin) = apps.origin(instance) {
+            return Err(EngineError::RollbackUnsupported(format!(
+                "{instance} is managed by site {site}, environment {env}; roll it back with `weglarka promote {site} {env} --rollback`",
+                site = origin.site,
+                env = origin.env,
+            )));
+        }
+
+        let st = state::load_state(&self.paths.state)?;
+        let cur = st.apps.get(instance).cloned().unwrap_or_default();
+        let previous = cur.previous.clone().ok_or_else(|| {
+            EngineError::RollbackRefused(format!("{instance} has no previous release to return to"))
+        })?;
+        let from = cur.current.clone().ok_or_else(|| {
+            EngineError::RollbackRefused(format!(
+                "{instance} has no current release to roll back from"
+            ))
+        })?;
+        let gate = ReleaseGate::for_spec(&spec);
+        let releases = SiteReleases::new(self.sites()?.root.join(instance.as_str()));
+        let reused_release = releases.is_complete(&release_id(&previous), &gate);
+
+        // Same guard/slot/retention sequence as `promote`: `ensure_image` only matters when the
+        // release has to be built again, and the deploy itself reuses a complete release.
+        let image_guard = ImageGuard::new(&guard);
+        let mut slot = AcquisitionSlot::default();
+        let result = async {
+            if !reused_release {
+                self.ensure_image(&image_guard, instance, &spec, &previous, None, &mut slot)
+                    .await?;
+            }
+            self.deploy_locked_from(&guard, instance, true, DigestSource::Local(&previous))
+                .await
+        }
+        .await;
+        slot.finish(self, &image_guard).await;
+        let outcome = result?;
+        self.retain_for_outcome(Some(&guard), instance, &outcome)
+            .await;
+        if let DeployOutcome::Failed { reason, .. } = &outcome {
+            return Err(EngineError::RollbackFailed(format!(
+                "cannot roll back {instance} to {previous}: {reason}"
+            )));
+        }
+
+        // The tag still points at `from`: without this a webhook redelivery or a plain deploy would
+        // undo the rollback at once. `failed` is skipped as `KnownBad` unless forced, while a newly
+        // pushed digest is not marked and deploys normally.
+        let mut st: StateFile = state::load_state(&self.paths.state)?;
+        st.apps.entry(instance.clone()).or_default().failed = Some(FailedDeploy {
+            digest: from.clone(),
+            reason: "rolled back by the operator".into(),
+        });
+        state::save_state(&self.paths.state, &st)?;
+        Ok(RollbackReport {
+            from,
+            to: previous,
+            reused_release,
         })
     }
 

@@ -137,6 +137,15 @@ pub const APPS_RELOAD: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `POST` an empty body → [`RollbackResponse`](crate::RollbackResponse). Returns a `kind = "static"`
+/// site to its `previous` release (issue #103, ADR 0049); container apps and site environments are
+/// refused (400), and a site without a previous release is a 409. Changes only `state.toml`.
+pub const APPS_ROLLBACK: Endpoint = Endpoint {
+    method: Method::Post,
+    path: "/v1/apps/{name}/rollback",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
 /// `POST` [`RunRequest`](crate::RunRequest) → a stream of [`RunFrame`](crate::RunFrame)s
 /// (`application/vnd.weglarka.run-stream`). Runs a command once in a fresh container of the app
 /// (its image, env, secrets, volumes, configs and networks; never its `host_ports` or ingress
@@ -485,6 +494,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     APPS_DEPLOY,
     APPS_PUSH_IMAGE,
     APPS_RELOAD,
+    APPS_ROLLBACK,
     APPS_RUN,
     APPS_FORWARD,
     APPS_LOGS,

@@ -8,18 +8,20 @@ use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
     ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
     DoctorCheck, DoctorReport, ErrorCode, ListReservationsResponse, NotifyStatusResponse,
-    PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse, ReservationView, RuntimeState,
-    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
+    PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse, ReservationView,
+    RollbackResponse, RuntimeState, SetSecretRequest, ShowAppResponse, UpdateAppResponse,
+    endpoints,
 };
-use weglarka_model::app::{AppSpec, InstanceName};
+use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::config::HostConfig;
 
-use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, SecretRemoveArgs, StartStopArgs};
+use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, RollbackArgs, SecretRemoveArgs, StartStopArgs};
 use crate::client::{ApiClient, expand_path};
 use crate::commands::{
-    apps_reload, apps_remove, build_spec, notify_status, notify_test, read_secret_value,
-    remove_dry_run, remove_query, remove_suffix, render_notify_status, render_reload, render_show,
-    secret_name, secret_remove_dry_run, secrets_remove,
+    apps_reload, apps_remove, apps_rollback, build_spec, notify_status, notify_test,
+    read_secret_value, remove_dry_run, remove_query, remove_suffix, render_notify_status,
+    render_reload, render_rollback, render_show, secret_name, secret_remove_dry_run,
+    secrets_remove,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -1219,6 +1221,86 @@ async fn reload_of_a_stopped_app_hints_at_apps_start() {
         "hint: {:?}",
         err.hint
     );
+}
+
+fn rollback_response(reused_release: bool) -> RollbackResponse {
+    RollbackResponse {
+        from: Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        to: Digest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        reused_release,
+    }
+}
+
+#[test]
+fn rollback_rendering_covers_both_paths() {
+    let name = InstanceName::new("blog").unwrap();
+    assert_eq!(
+        render_rollback(&name, &rollback_response(true)),
+        "blog: rolled back sha256:aaaaaaaaaaaa… → sha256:bbbbbbbbbbbb… (release on disk, no image needed)\n"
+    );
+    assert_eq!(
+        render_rollback(&name, &rollback_response(false)),
+        "blog: rolled back sha256:aaaaaaaaaaaa… → sha256:bbbbbbbbbbbb… (release rebuilt from the image)\n"
+    );
+}
+
+#[test]
+fn rollback_command_parses_the_name() {
+    let cli = crate::cli::Cli::try_parse_from(["weglarka", "apps", "rollback", "blog"]).unwrap();
+    match cli.command {
+        crate::cli::Command::Apps(crate::cli::AppsCommand::Rollback(a)) => {
+            assert_eq!(a.name, "blog");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_rollback_posts_the_rollback_endpoint() {
+    let response = serde_json::to_string(&rollback_response(true)).unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    let code = apps_rollback(
+        true,
+        &overrides(&m),
+        RollbackArgs {
+            name: "blog".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("POST", "/v1/apps/blog/rollback")
+    );
+    assert!(seen[0].body.is_empty(), "body: {:?}", seen[0].body);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apps_rollback_reports_the_daemon_message() {
+    let m = mock(|_, _| {
+        (
+            409,
+            api_err(
+                ErrorCode::Conflict,
+                "blog has no previous release to return to",
+            ),
+        )
+    })
+    .await;
+    let err = apps_rollback(
+        false,
+        &overrides(&m),
+        RollbackArgs {
+            name: "blog".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.exit_code(), exit::CONFLICT);
+    assert_eq!(err.message, "blog has no previous release to return to");
 }
 
 #[test]
