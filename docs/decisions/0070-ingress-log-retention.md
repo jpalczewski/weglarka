@@ -29,6 +29,8 @@ rotates them once per UTC day and deletes completed files after `[logs] retentio
 1. **Location and permissions.** `<state dir>/ingress-logs`, mode `0700`, owned by the runtime user. It is a separate
    writable bind mount at `/var/log/weglarka` in the nginx container, *not* a subdirectory of `<nginx_conf_dir>`: a
    backup of the configuration must never contain visitor addresses.
+   *Addendum (2026-11-05): the mode is now `0750`, owned by the runtime user and its primary group, so a log reader can
+   be granted access; see [ADR 0072](0072-ingress-log-reader.md).*
 2. **Config.** `[logs] retention = 30` in `weglarka.toml`; valid values are `1..=3650` days or the explicit string
    `"unlimited"`. The source is `LogRetention` (`Days(u32)` / `Unlimited`); `0` is rejected on purpose. A host setting,
    not an app setting: nginx writes one shared log for every app, so per-app retention would need separate files.

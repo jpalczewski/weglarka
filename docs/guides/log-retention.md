@@ -29,13 +29,30 @@ pass.
 ## Where the files are
 
 ```text
-<state dir>/ingress-logs/          # mode 0700, only the runtime user
+<state dir>/ingress-logs/          # mode 0750, runtime user + its primary group
 ├── access.log                     # current day
 ├── error.log                      # current day
 ├── .logdate                       # UTC date the current files belong to
 ├── access-2026-11-03.log          # completed days
 └── error-2026-11-03.log
 ```
+
+The directory is owned by the runtime user and that user's primary group, mode `0750`: the owner writes, members of
+the group may list and read, everyone else has no access. nginx's worker (uid 101) is neither, and it needs no access:
+it inherits the descriptors the master opened. The daemon sets the mode on every start and every hourly pass, but only
+when it differs: a `0700` directory from an older version is widened once, `o` bits and `g+w` are removed, and a
+correct directory (including a POSIX ACL someone added to it) is not touched.
+
+**Who can read it.** Only processes that carry the runtime user's primary group, for example a log collector started
+with `group_add = ["keep-groups"]` (ADR 0045). That group should have no other members, otherwise those users can read
+visitor addresses too. Check it:
+
+```bash
+getent group "$(id -gn weglarka)"    # replace weglarka with the runtime user; the member list should be empty
+```
+
+(An empty last field is normal: the user's primary group lists no members in `/etc/group`.) The directory is still
+invisible to a container without the bind mount. See [ADR 0072](../decisions/0072-ingress-log-reader.md).
 
 The directory is a writable bind mount at `/var/log/weglarka` in the nginx container. It is deliberately outside
 `<nginx_conf_dir>`, so a backup of the configuration does not copy visitor addresses. A backup of the **state

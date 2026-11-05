@@ -458,8 +458,8 @@ impl<P: PodmanClient> IngressManager<P> {
     /// Re-opens nginx's log files after the retention worker renamed them (ADR 0070). `SIGHUP`
     /// parses the (unchanged) config and opens the files in the **master**, which then starts new
     /// workers that inherit the descriptors. `SIGUSR1` would make the worker (uid 101) open the
-    /// path itself, and it cannot: the directory is `0700` and the files are `0644`, both owned by
-    /// the daemon's user. A no-op when nginx does not run; its next start opens the new files.
+    /// path itself, and it cannot: the directory is `0750` and the files are `0644`, both owned by
+    /// the daemon's user and its group (the worker is neither). A no-op when nginx does not run; its next start opens the new files.
     pub async fn reopen_logs(&self) -> Result<(), IngressApplyError> {
         let _g = self.apply_lock.lock().await;
         let podman = self.engine.podman();
@@ -942,8 +942,8 @@ impl<P: PodmanClient> IngressManager<P> {
             target: nginx::PROBE_CONTAINER_DIR.to_owned(),
             read_only: false,
         });
-        // Both modes: the daemon-owned request logs (issue #502, ADR 0070). Writable, but no other
-        // local user can reach the directory.
+        // Both modes: the daemon-owned request logs (issue #502, ADR 0070). Writable, mode `0750`
+        // (daemon user and its primary group, ADR 0072); no other local user can reach the directory.
         mounts.push(BindMount {
             source: self.logs_dir.display().to_string(),
             target: nginx::LOG_CONTAINER_DIR.to_owned(),

@@ -1,7 +1,7 @@
 //! Retention of the daemon-owned ingress request logs (issue #502, ADR 0070).
 //!
 //! nginx writes `access.log` and `error.log` into `<state dir>/ingress-logs` (a writable bind mount,
-//! `0700`, owned by the daemon's user). The daemon rotates the two files once per UTC day and deletes
+//! `0750`, owned by the daemon's user and its primary group, ADR 0072). The daemon rotates the two files once per UTC day and deletes
 //! completed files after `[logs] retention`. The access log contains visitor IP addresses, which is
 //! why this is the daemon's job and not Podman's: the container runtime only offers size-based
 //! rotation, not a retention period.

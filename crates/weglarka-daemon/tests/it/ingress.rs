@@ -499,8 +499,8 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
     let logs_dir = manager.logs_dir();
     assert_eq!(
         std::fs::metadata(logs_dir).unwrap().permissions().mode() & 0o777,
-        0o700,
-        "the access log contains visitor IPs"
+        0o750,
+        "group-readable for a log reader, closed to other users (ADR 0072)"
     );
     assert!(
         spec.mounts.iter().any(|m| {
