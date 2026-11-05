@@ -678,6 +678,51 @@ impl From<MemoryLimit> for String {
     }
 }
 
+/// A positive byte count for host settings (`[logs] container_max_size`). Same syntax as
+/// [`MemoryLimit`]: an integer (bytes) or `<n>[k|m|g]`; serialized in the largest exact unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MemoryRepr", into = "String")]
+pub struct ByteSize(u64);
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid size {0:?}: expected bytes or <n>[k|m|g], > 0")]
+pub struct InvalidByteSize(pub String);
+
+impl ByteSize {
+    pub fn from_bytes(bytes: u64) -> Result<Self, InvalidByteSize> {
+        if bytes == 0 || i64::try_from(bytes).is_err() {
+            Err(InvalidByteSize(bytes.to_string()))
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+
+    pub fn parse(text: &str) -> Result<Self, InvalidByteSize> {
+        let err = || InvalidByteSize(text.to_owned());
+        Self::from_bytes(parse_binary_size(text).ok_or_else(err)?).map_err(|_| err())
+    }
+}
+
+impl TryFrom<MemoryRepr> for ByteSize {
+    type Error = InvalidByteSize;
+    fn try_from(value: MemoryRepr) -> Result<Self, Self::Error> {
+        match value {
+            MemoryRepr::Bytes(b) => Self::from_bytes(b),
+            MemoryRepr::Text(t) => Self::parse(&t),
+        }
+    }
+}
+
+impl From<ByteSize> for String {
+    fn from(value: ByteSize) -> Self {
+        format_binary_size(value.0)
+    }
+}
+
 /// CPU limit in thousandths of a CPU (`cpus = 1.5` → 1500). TOML accepts a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]

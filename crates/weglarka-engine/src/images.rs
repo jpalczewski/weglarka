@@ -1692,6 +1692,7 @@ mod tests {
             memory_limit: None,
             oom_killed: false,
             conmon_pid: None,
+            log_driver: None,
         }];
         let inventory = Inventory::new(vec![
             record("1", Owner::PlatformDaemon, "ghcr.io/x/y", 'a'),

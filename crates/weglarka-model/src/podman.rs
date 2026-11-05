@@ -240,6 +240,38 @@ pub struct ContainerSpec {
     pub host_aliases: Vec<String>,
     /// Hardening from the spec (read-only root, tmpfs, capabilities, no-new-privileges).
     pub security: crate::app::Security,
+    /// Log driver and size bound (`[logs] container_driver`/`container_max_size`, ADR 0074). `None`
+    /// sends no `log_configuration`, so `containers.conf` decides, as before.
+    pub log: Option<ContainerLog>,
+}
+
+/// Log drivers Węglarka can pick for its containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LogDriver {
+    /// systemd journal; retention is the host's (`journald.conf`), shared by every unit.
+    #[serde(rename = "journald")]
+    Journald,
+    /// A file next to the container's runtime state; lives and dies with the container.
+    #[serde(rename = "k8s-file")]
+    K8sFile,
+}
+
+impl LogDriver {
+    /// The name libpod uses for the driver (`log_configuration.driver`, `HostConfig.LogConfig.Type`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Journald => "journald",
+            Self::K8sFile => "k8s-file",
+        }
+    }
+}
+
+/// How one container's output is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerLog {
+    pub driver: LogDriver,
+    /// Size bound in bytes (conmon rotates by truncating); `k8s-file` only, `None` = unbounded.
+    pub max_size: Option<u64>,
 }
 
 impl ContainerSpec {
@@ -272,6 +304,7 @@ impl ContainerSpec {
             keep_groups: false,
             host_aliases: Vec::new(),
             security: crate::app::Security::default(),
+            log: None,
         }
     }
 }
@@ -388,6 +421,8 @@ pub struct ContainerInfo {
     /// PID. libpod keeps reporting `running` with this stale value after conmon dies (issue #470), so
     /// only a check on the host — where that PID lives — can tell the two apart.
     pub conmon_pid: Option<u32>,
+    /// Log driver libpod recorded (`HostConfig.LogConfig.Type`); `None` when it reports none.
+    pub log_driver: Option<String>,
 }
 
 /// One running container's resource use as `PodmanClient::container_stats` reports it. Only the fields a

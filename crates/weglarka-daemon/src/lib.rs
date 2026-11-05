@@ -366,6 +366,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         config_root: paths.config_root.clone(),
         host_mounts: host.runtime.host_mounts.clone(),
         group_add: host.runtime.group_add.clone(),
+        container_log: host.logs.container_log(),
         sites: Some(sites),
         // The token admin API socket, mounted into the `[admin.http] clients` only (ADR 0056).
         admin_token: host.admin.http.as_ref().map(|http| {

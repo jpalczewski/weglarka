@@ -324,6 +324,10 @@ pub struct ReconcilerOptions {
     /// `[metrics] scraper` (issue #365): the instance kept on the metrics networks. `None` = no app
     /// is joined; a managed container left on them by an earlier scraper is still detached.
     pub metrics_scraper: Option<crate::scraper::MetricsScraper>,
+    /// Log driver and size bound for the serving app containers (`[logs] container_driver`, ADR 0074);
+    /// `None` leaves the choice to `containers.conf`. Not part of `spec_hash`: it applies from the next
+    /// container create. One-off `run` and `forward` containers never get it.
+    pub container_log: Option<weglarka_model::podman::ContainerLog>,
 }
 
 impl Default for ReconcilerOptions {
@@ -339,6 +343,7 @@ impl Default for ReconcilerOptions {
             sites: None,
             admin_token: None,
             metrics_scraper: None,
+            container_log: None,
         }
     }
 }
@@ -1217,6 +1222,7 @@ mod tests {
             memory_limit: None,
             oom_killed: false,
             conmon_pid: None,
+            log_driver: None,
         }
     }
     fn target(inst: &str, pinned: Option<char>) -> (Target, SpecHash) {

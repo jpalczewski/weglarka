@@ -86,7 +86,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `metrics_port`, `metrics_path` (`weglarka apps update <app> --metrics-port none`) | [metrics](metrics.md) |
 | `apps.toml`, apps | `internal_hosts` | [reaching your own domains](internal-hosts.md) |
 | `apps.toml`, apps | `ingress.auth_policy`, `ingress.auth_groups` (generated into the provider's access rules since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
-| `weglarka.toml` | `[logs]` (whole section) | [log retention](log-retention.md) |
+| `weglarka.toml` | `[logs]` (whole section; at least `container_driver` and `container_max_size`) | [log retention](log-retention.md) |
 | `weglarka.toml` | `[sites]` (whole section) | [static sites](static-sites.md) |
 | `weglarka.toml` | `[runtime] allow_privileged_host_ports` | [host ports](host-ports.md) |
 | `weglarka.toml` | `[runtime] dependency_wait_secs` | [dependencies](dependencies.md) |
@@ -118,6 +118,12 @@ that would otherwise have no retention. The directory contains personal data (vi
 `[logs]` section **and** `<state dir>/ingress-logs`; the older daemon does not know the directory and does not prune
 it, and it recreates nginx with the old mounts to log to stdout again. Nothing changes in `apps.toml`, `state.toml` or
 `schema_version`.
+
+**Upgrading to the release with the container log driver ([ADR 0074](../decisions/0074-container-log-driver.md)):** the
+new `[logs] container_driver` / `container_max_size` keys are optional and applied only when a container is created, so
+nothing is recreated on upgrade. On a downgrade remove both keys (the older `HostConfig` rejects unknown fields);
+containers keep the driver they were created with until their next recreate. Nothing changes in `apps.toml`,
+`state.toml` or `schema_version`.
 
 Notes:
 

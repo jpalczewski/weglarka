@@ -63,10 +63,41 @@ A privacy policy for a site behind Węglarka can therefore say, for example: “
 containing IP addresses for 30 days (at most 31 days) and then deletes them.” Use the value from your own
 `weglarka.toml`.
 
+## Container logs (app, nginx, forwarder)
+
+What a container prints to stdout/stderr (`weglarka logs`) is stored by Podman, not by Węglarka, and may contain
+secrets or visitor addresses the app logs itself. Without configuration `containers.conf` picks the driver, which
+differs between hosts. Pin it ([ADR 0074](../decisions/0074-container-log-driver.md)):
+
+```toml
+# weglarka.toml
+[logs]
+container_driver = "k8s-file"   # or "journald"
+container_max_size = "10m"      # k8s-file only: bytes or <n>[k|m|g]
+```
+
+| Driver | Where the output lives | How long |
+|---|---|---|
+| `journald` | the host's systemd journal | until the host's journal retention removes it (`SystemMaxUse=`, `MaxRetentionSec=` in `journald.conf`); shared by every unit and **not managed by Węglarka**. Needs systemd: not available on Alpine/OpenRC hosts |
+| `k8s-file` | a file in the container's runtime directory | until the container is removed (every deploy, recreate or `apps remove` deletes it); with `container_max_size` also bounded: when the file reaches the size, conmon truncates it and the oldest output is lost |
+
+- `container_max_size` with `journald` (or without a driver) is rejected when the config is read.
+- Unset keeps the create request unchanged, so `containers.conf` decides, as before.
+- Applies to app containers and to nginx and the forwarder. It does **not** apply to `weglarka run` and `weglarka
+  forward` containers, which keep the host default and live only briefly.
+- It is **not** part of an app's spec hash: changing it recreates nothing. A container uses the new setting from its
+  next create (a deploy, `deploy --force`, or the next recreate of nginx or the forwarder). `weglarka doctor` check
+  `logs.container_driver` lists the containers still on another driver, and warns when `k8s-file` has no size bound.
+- No time-based period exists for container output yet (planned with the log collector). For a privacy policy: with
+  `k8s-file` you can say the output is kept at most until the app's next deploy and at most the configured size; with
+  `journald` the period is whatever the host's journal retention is, which Węglarka neither sets nor checks. A size
+  bound is not an age bound: a quiet app can keep old lines for a long time.
+
 ## What this does not cover
 
-- **App container logs.** `weglarka logs` streams what the app's container printed; Podman stores it. Węglarka does
-  not keep or prune those files. If an app logs visitor addresses itself, configure its own retention or avoid logging
+- **Age-based retention of app container logs.** `weglarka logs` streams what the app's container printed; Podman
+  stores it. Węglarka can pin the driver and a size bound (see [Container logs](#container-logs-app-nginx-forwarder))
+  but does not prune by age. If an app logs visitor addresses itself, configure its own retention or avoid logging
   them.
 - **Traefik's logs in `behind` mode.** Traefik is outside Węglarka and has its own log configuration and retention.
 - **The daemon's journal.** The daemon does not log request lines, but the journal is managed by systemd.
@@ -94,7 +125,9 @@ successful requests out with [`access_log_skip_paths`](access-log.md).
 This is not a state-file schema change: nothing in `apps.toml` or `state.toml` changes and `SCHEMA_VERSION` stays 18.
 `[logs]` is host configuration, and an older daemon's `HostConfig` has `deny_unknown_fields`:
 
-1. Remove the `[logs]` section from `weglarka.toml` before starting the older daemon.
+1. Remove the `[logs]` section from `weglarka.toml` before starting the older daemon. (A daemon that has
+   ingress retention but not container logs refuses only `container_driver` and `container_max_size`: remove those two
+   keys. Containers already created keep their driver; nothing else changes.)
 2. Remove `<state dir>/ingress-logs` (or restore the directory from a backup). It contains personal data and the older
    daemon does not prune it.
 3. Expect the older daemon to recreate nginx once (old hash format) and to write request logs to stdout again. Old

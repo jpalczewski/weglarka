@@ -930,6 +930,7 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             memory_limit: None,
             oom_killed: false,
             conmon_pid: None,
+            log_driver: None,
         };
         let shown = show_response(Access::Full, name(), spec(), None, Some(&container));
         assert_eq!(shown.restarts, Some(2));
