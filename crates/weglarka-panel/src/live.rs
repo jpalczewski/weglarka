@@ -65,6 +65,8 @@ const MAX_METHOD_CHARS: usize = 16;
 const MAX_PATH_CHARS: usize = 300;
 const MAX_ADDR_CHARS: usize = 64;
 const MAX_AGENT_CHARS: usize = 200;
+/// An upstream status or header time: one code, or a short list of them on retry.
+const MAX_UPSTREAM_CHARS: usize = 32;
 /// A longer line is cut (characters).
 const MAX_LINE_CHARS: usize = 2_000;
 /// Lines kept from one chunk of daemon output; the rest are counted, not stored.
@@ -706,8 +708,51 @@ fn access_row(entry: &AccessEntry) -> AccessRow {
         },
         bytes: entry.bytes_sent,
         request_time,
+        upstream_status: upstream_status(entry),
+        upstream_header_time: upstream_time(&entry.upstream_header_time),
         remote: clean_text(&entry.remote_addr, MAX_ADDR_CHARS),
         user_agent: clean_text(&entry.user_agent, MAX_AGENT_CHARS),
+    }
+}
+
+/// What to show next to the badge, or an empty string when it would only repeat the row. A `5xx`
+/// the app never answered (no attempt has a numeric header time: the name did not resolve, or the
+/// connection was refused — nginx then records `502` itself) reads `nginx`, the one case #463 is
+/// about. Otherwise a retry list (`502, 200`) or a code that differs from the badge is shown; an
+/// empty value (no upstream, a static site), `-` and the badge's own code are dropped, so the common
+/// row stays one glance wide.
+fn upstream_status(entry: &AccessEntry) -> String {
+    if entry.status >= 500 && !app_answered(&entry.upstream_header_time) {
+        return "nginx".to_owned();
+    }
+    let text = clean_text(&entry.upstream_status, MAX_UPSTREAM_CHARS);
+    if text.is_empty() || text == "-" || text == entry.status.to_string() {
+        return String::new();
+    }
+    text
+}
+
+/// Whether any attempt of a request got the app's response headers. nginx separates attempts with
+/// `, ` and upstream groups (an internal redirect) with ` : `.
+fn app_answered(header_time: &str) -> bool {
+    header_time.split([',', ':']).any(|t| {
+        t.trim()
+            .parse::<f64>()
+            .is_ok_and(|s| s.is_finite() && s >= 0.0)
+    })
+}
+
+/// A time nginx logs as text: a number of seconds like `request_time`, else the value itself (`-`
+/// when no headers arrived, or a list on retry); empty (no upstream was tried) is shown as `-`.
+/// Formatting a `-` as `0.000 s` would claim a response that never came.
+fn upstream_time(raw: &str) -> String {
+    let text = clean_text(raw, MAX_UPSTREAM_CHARS);
+    if text.is_empty() {
+        return "-".to_owned();
+    }
+    match text.parse::<f64>() {
+        Ok(secs) if secs.is_finite() && secs >= 0.0 => format!("{secs:.3} s"),
+        _ => text,
     }
 }
 
@@ -1096,6 +1141,58 @@ mod tests {
         assert_eq!(clean_text("abc", 3), "abc");
         let huge = "é".repeat(1_000_000);
         assert_eq!(clean_text(&huge, 10).chars().count(), 11);
+    }
+
+    #[test]
+    fn the_access_row_shows_upstream_status_and_header_time() {
+        let entry = |status: u16, upstream_status: &str, upstream_header_time: &str| AccessEntry {
+            status,
+            upstream_status: upstream_status.into(),
+            upstream_header_time: upstream_header_time.into(),
+            ..AccessEntry::default()
+        };
+        // A number of seconds is formatted like `request_time`.
+        let row = access_row(&entry(200, "200", "0.0123"));
+        assert_eq!(row.upstream_header_time, "0.012 s");
+        // The upstream's status repeats the badge, so it is left out.
+        assert!(row.upstream_status.is_empty());
+        // `-`: no upstream (a static site) is no news, and no headers is not `0.000 s`.
+        let row = access_row(&entry(200, "-", "-"));
+        assert!(row.upstream_status.is_empty());
+        assert_eq!(row.upstream_header_time, "-");
+        // A code that differs from the badge and a retry list are shown; so is a list of times.
+        let row = access_row(&entry(200, "404", "0.010"));
+        assert_eq!(row.upstream_status, "404");
+        let row = access_row(&entry(200, "502, 200", "-, 0.020"));
+        assert_eq!(row.upstream_status, "502, 200");
+        assert_eq!(row.upstream_header_time, "-, 0.020");
+        // A 502 the app answered itself repeats the badge; one it never answered is nginx's own,
+        // whether the connection was refused (`502`, `-`) or the name did not resolve (empty).
+        assert!(
+            access_row(&entry(502, "502", "0.000"))
+                .upstream_status
+                .is_empty()
+        );
+        assert_eq!(access_row(&entry(502, "502", "-")).upstream_status, "nginx");
+        assert_eq!(access_row(&entry(502, "", "")).upstream_status, "nginx");
+        let row = access_row(&entry(502, "502, 502", "-, -"));
+        assert_eq!(row.upstream_status, "nginx");
+        assert_eq!(row.upstream_header_time, "-, -");
+        // Untrusted text: control characters and markup are stripped, the template escapes the rest.
+        let row = access_row(&entry(
+            200,
+            "<img src=x>\x1b[0m\u{202e}502",
+            "0.0\x00<script>\n",
+        ));
+        assert_eq!(row.upstream_status, "<img src=x>[0m502");
+        assert_eq!(row.upstream_header_time, "0.0<script>");
+        // A long retry list is cut to the field's width.
+        let row = access_row(&entry(200, "-1", &"0.001, ".repeat(100)));
+        assert_eq!(
+            row.upstream_header_time.chars().count(),
+            MAX_UPSTREAM_CHARS + 1
+        );
+        assert!(row.upstream_header_time.ends_with('…'));
     }
 
     #[test]

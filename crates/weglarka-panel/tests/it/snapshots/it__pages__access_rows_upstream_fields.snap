@@ -1,0 +1,15 @@
+---
+source: crates/weglarka-panel/tests/it/pages.rs
+expression: text
+---
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/same</span> <span class="badge badge-ok">200</span> <span class="num">512 B</span> <span class="num" title="time to the app's response headers; - when it did not answer">0.012 s</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">same-status</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/static</span> <span class="badge badge-ok">200</span> <span class="num">512 B</span> <span class="num" title="time to the app's response headers; - when it did not answer">-</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">no-upstream</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/gone</span> <span class="badge badge-fail">502</span> <span class="num muted" title="upstream status: what the app answered per attempt; nginx when the app never answered">nginx</span> <span class="num">512 B</span> <span class="num" title="time to the app's response headers; - when it did not answer">-</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">nginx-502</span></div>
+
+event: rows
+data: <div class="line access"><time>2026-10-31T12:00:00Z</time> <span class="method">GET</span> <span class="path">/retry</span> <span class="badge badge-ok">200</span> <span class="num muted" title="upstream status: what the app answered per attempt; nginx when the app never answered">502, 200</span> <span class="num">512 B</span> <span class="num" title="time to the app's response headers; - when it did not answer">-, 0.020</span> <span class="num">0.013 s</span> <span class="addr">203.0.113.7</span> <span class="agent">end-of-rows</span></div>

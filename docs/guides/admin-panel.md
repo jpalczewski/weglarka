@@ -150,7 +150,10 @@ value (look in `podman logs` for the panel container). Empty values count as uns
   use up the session's live-stream slots. The stream closes when you leave the page or start another one. The panel
   parses the filter itself and forwards only what it parsed (a filter it does not accept is answered `400` without
   repeating the input); every field of an entry (path, user agent and the rest come from clients) is cut, stripped of
-  control and direction-changing characters and escaped. The page keeps the newest 1000 rows.
+  control and direction-changing characters and escaped. A row also shows the time to the upstream's response headers
+  (`-` when no headers arrived) and the upstream's status when it differs from the code the visitor got or is a retry
+  list; a `5xx` the app never answered (its name did not resolve or the connection was refused) is marked `nginx`.
+  The page keeps the newest 1000 rows.
 - Resource use (memory, CPU, processes, network and block I/O of each container, the same numbers as
   `weglarka stats`) is `read` scope, so viewers see it too. The app page's "Resources" section reloads a fragment every
   10 seconds (htmx polling, no stream, so it costs no live-stream slot). Polling is passive: like the streams it does not count as activity, so a tab left open does not defeat `PANEL_SESSION_IDLE_SECS`, and when the session has ended the section says so and stops polling, also behind forward auth, where the ingress
