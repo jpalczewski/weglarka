@@ -4688,6 +4688,107 @@ domains = ["blog.example.com"]
         assert_eq!(st.failed.map(|f| f.digest), Some(digest('b')));
     }
 
+    const AS_CONTAINER: &str = r#"
+[apps.blog]
+image = "registry.example.com/me/blog:latest"
+domains = ["blog.example.com"]
+port = 8080
+"#;
+
+    async fn reconciled(h: &Harness) -> bool {
+        let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+        let st = load_state(&h.rec.paths().state).unwrap();
+        let container = h.fake.containers().into_iter().find(|c| c.name == "blog");
+        h.rec
+            .is_reconciled(
+                &name("blog"),
+                &apps.apps[&name("blog")],
+                st.apps.get(&name("blog")),
+                container.as_ref(),
+            )
+            .await
+    }
+
+    /// Issue #546: a hand-edited `container` → `static` flip leaves the container's digest as the
+    /// pin. The pin alone must not read as "deployed": the site is released first, and only then
+    /// does the leftover container go.
+    #[tokio::test(start_paused = true)]
+    async fn a_kind_flip_releases_the_site_before_dropping_the_container() {
+        let h = harness();
+        h.set_apps(AS_CONTAINER);
+        publish(&h, 'a', &[("index.html", b"<h1>hi</h1>")]);
+        h.rec.reconcile().await.unwrap();
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+        assert_eq!(h.fake.containers().len(), 1);
+
+        h.set_apps(SITE);
+        assert!(!reconciled(&h).await, "pinned but no release is served");
+
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(matches!(
+            single(&report),
+            ActionOutcome::Deployed(DeployOutcome::Deployed { .. })
+        ));
+        assert_eq!(
+            std::fs::read(sites(&h).join("blog/current/index.html")).unwrap(),
+            b"<h1>hi</h1>"
+        );
+        assert_eq!(h.fake.containers().len(), 1, "container stays until served");
+
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(matches!(single(&report), ActionOutcome::Removed));
+        assert!(h.fake.containers().is_empty());
+        assert!(reconciled(&h).await);
+        assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+    }
+
+    /// A failed release for the stale pin is reported as blocked, not re-extracted every pass, and
+    /// the container keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_release_for_a_pinned_digest_is_blocked_not_retried() {
+        let h = harness();
+        h.set_apps(AS_CONTAINER);
+        publish(&h, 'a', &[("index.html", b"x")]);
+        h.rec.reconcile().await.unwrap();
+
+        h.set_apps(SITE);
+        // The tag now resolves to a newer digest than the stale pin, and its archive is unusable:
+        // the extraction fails.
+        h.fake.set_pull_digest(SITE_IMAGE, digest('b'));
+        h.fake
+            .script_image_archive(&digest('b'), b"not a tar".to_vec());
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(
+            matches!(
+                single(&report),
+                ActionOutcome::Deployed(DeployOutcome::Failed { .. })
+            ),
+            "{:?}",
+            report.actions
+        );
+        assert_eq!(h.state("blog").failed.map(|f| f.digest), Some(digest('b')));
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+
+        let pulls_before = pulls(&h);
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.actions.is_empty(), "{:?}", report.actions);
+        assert_eq!(report.blocked.len(), 1);
+        assert_eq!(pulls(&h), pulls_before);
+        assert_eq!(h.fake.containers().len(), 1);
+        assert!(!reconciled(&h).await);
+    }
+
+    /// Without a sites root a pinned site plans no deploy: it would fail with a site error on every pass.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_sites_directory_a_pinned_site_plans_nothing() {
+        let h = Harness::new(SITE);
+        let mut st = weglarka_model::state::load_state(&h.rec.paths().state).unwrap();
+        st.apps.entry(name("blog")).or_default().current = Some(digest('a'));
+        weglarka_model::state::save_state(&h.rec.paths().state, &st).unwrap();
+        assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+        assert!(reconciled(&h).await);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn without_a_sites_directory_the_deploy_is_refused() {
         let h = Harness::new(SITE);

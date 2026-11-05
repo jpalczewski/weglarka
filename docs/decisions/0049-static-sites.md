@@ -114,3 +114,9 @@ daemon extracts it into a per-release directory under `<nginx_conf_dir>/sites/` 
 - **A rollback marks the digest it leaves.** `weglarka apps rollback` records the release it returns from as
   `failed` (`rolled back by the operator`), so a webhook redelivery or a plain deploy cannot undo it; a new digest
   deploys normally and `weglarka deploy --force` goes forward again.
+- **`kind` is fixed after `add` (#546).** `apps update` refuses a change of `kind` with `409 conflict` before anything
+  is persisted: the state files record no kind, so a flip would leave the old runtime's digest as the pin and the
+  app unserved. To switch kind, remove the app and add it again. A hand-edited flip in `apps.toml` is made safe
+  instead: reconcile treats a static site as deployed only when the pinned digest's release is the one `current`
+  serves (not merely pinned), deploys it otherwise, and removes a leftover container only after the site is served.
+  A failed release for the pinned digest is reported as blocked and not retried until `deploy`.

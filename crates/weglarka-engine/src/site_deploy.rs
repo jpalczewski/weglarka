@@ -49,6 +49,23 @@ impl<P: PodmanClient> Reconciler<P> {
             })
     }
 
+    /// Whether `digest` is the release `current` actually serves for the static site `instance`: the
+    /// pin in `state.toml` alone says nothing (after a `kind` flip it can be a container image digest).
+    /// A daemon without a sites root serves no sites at all and a deploy would only fail with
+    /// [`EngineError::Site`] before recording anything, so there the pin counts as enough — reconcile
+    /// plans no deploy that would error on every pass.
+    pub(crate) fn serves_release(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+    ) -> bool {
+        self.options.sites.as_ref().is_none_or(|sites| {
+            SiteReleases::new(sites.root.join(instance.as_str()))
+                .serves(&release_id(digest), &ReleaseGate::for_spec(spec))
+        })
+    }
+
     fn sites(&self) -> Result<&SitesOptions, EngineError> {
         self.options.sites.as_ref().ok_or_else(|| {
             EngineError::Site(
