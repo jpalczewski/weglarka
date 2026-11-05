@@ -214,16 +214,19 @@ impl<P: PodmanClient> Reconciler<P> {
         // The same served-release gate as an ingress-only `apps update` (issue #501): declaring
         // deploys nothing, so an environment whose release lacks a shared option's file would break
         // the next ingress reload. A new environment has no stored spec and is deployed first. On
-        // refusal nothing is written.
+        // refusal nothing is written. Unlike `apps update`, a changed `image` (a new `track` tag)
+        // is no exemption here: a declare never deploys, so the served release stays the old one.
         for (instance, origin) in &apps.origins {
             if origin.site != site {
                 continue;
             }
-            let Some(new) = apps.apps.get(instance) else {
+            let (Some(old), Some(new)) = (before.get(instance), apps.apps.get(instance)) else {
                 continue;
             };
-            self.check_static_change(instance, before.get(instance), new)
-                .map_err(|e| with_site_context(e, origin))?;
+            if old.ingress.static_ != new.ingress.static_ {
+                self.check_served_release(instance, new)
+                    .map_err(|e| with_site_context(e, origin))?;
+            }
         }
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }

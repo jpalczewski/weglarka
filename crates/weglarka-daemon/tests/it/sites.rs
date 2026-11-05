@@ -760,6 +760,29 @@ async fn a_re_declare_adding_a_shared_static_option_the_served_release_lacks_is_
 }
 
 #[tokio::test]
+async fn a_re_declare_that_also_changes_the_tracked_tag_is_still_checked() {
+    // A new `track` changes the instance's `image`, which exempts an `apps update` (a deploy
+    // follows). A declare deploys nothing, so `dev` keeps serving the release without the page.
+    let h = declared_site_harness(false).await;
+    let apps_toml = h.root.join("state/apps.toml");
+    let before = read(&apps_toml);
+
+    let mut site = blog_with_not_found_page();
+    site["spec"]["env"]["dev"]["track"] = json!("next");
+    let (status, body) = admin(&h, "PUT", "/v1/sites/blog", Some(site)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("site blog, environment dev (instance blog-dev)"),
+        "{body}"
+    );
+    assert_eq!(read(&apps_toml), before);
+    h.running.stop().await;
+}
+
+#[tokio::test]
 async fn a_re_declare_adding_a_shared_static_option_the_served_release_has_is_accepted() {
     let h = declared_site_harness(true).await;
     let (status, body) = admin(
