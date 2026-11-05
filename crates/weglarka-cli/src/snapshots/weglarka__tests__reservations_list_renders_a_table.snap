@@ -1,0 +1,9 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: "crate::commands::render_reservations(&response, 1_700_000_000 + 3 * 3600 + 5)"
+---
+OPERATION      PHASE         OWNER        AGE  RECLAIM
+acquisition-1  loading       engine:4242  3h   at next daemon start
+acquisition-2  loaded        engine:4242  3h   abandon only
+acquisition-3  coordinating  engine:4242  3h   never (platform transaction)
+3/1024 reservation(s)

@@ -676,6 +676,26 @@ async fn image_retention<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChe
         ));
         return;
     }
+    // Authored here, so it needs no `detail(..)`: a full reservation file lets deploys go on but
+    // blocks all cleanup, which the generic "bookkeeping unavailable" line would not explain.
+    if let Ok(reservations) = d.engine.list_reservations()
+        && reservations.len() >= weglarka_model::image_inventory::MAX_RESERVATIONS
+    {
+        out.push(check(
+            "runtime.images",
+            CheckStatus::Warn,
+            format!(
+                "the image reservation file is full ({} operations): deploys go on without a \
+                 reservation and image cleanup is blocked",
+                reservations.len()
+            ),
+            Some(
+                "list them with `weglarka images reservations list`, then free capacity with \
+                 `weglarka images reservations abandon <operation-id> --yes` once the owner is gone",
+            ),
+        ));
+        return;
+    }
     let (plan, diagnostics) = match d
         .engine
         .retention_preview(weglarka_model::image_inventory::RetentionScope::AllManaged)
@@ -702,8 +722,9 @@ async fn image_retention<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorChe
             diagnostic,
             Some(
                 "platform-image retention waits for `weglarka platform bootstrap` to write \
-                 host-capabilities.toml; a stuck image acquisition is ended with `weglarka images \
-                 reservations abandon <operation-id> --yes` once its owner is gone",
+                 host-capabilities.toml; a stuck image acquisition of this boot is listed by `weglarka images \
+                 reservations list` and ended with `weglarka images reservations abandon \
+                 <operation-id> --yes` once its owner is gone",
             ),
         ));
     }

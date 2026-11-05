@@ -9,12 +9,14 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::routing::post;
+use axum::routing::{get, post};
 use weglarka_api::{
-    AbandonReservationRequest, AbandonReservationResponse, ErrorCode, PruneImagesRequest,
-    PruneImagesResponse, PrunedImage, endpoints,
+    AbandonReservationRequest, AbandonReservationResponse, ErrorCode, ListReservationsResponse,
+    PruneImagesRequest, PruneImagesResponse, PrunedImage, ReservationView, endpoints,
 };
-use weglarka_engine::images::PruneReport;
+use weglarka_engine::images::{PruneReport, ReservationInfo};
+use weglarka_engine::reconcile::Reconciler;
+use weglarka_model::image_inventory::{MAX_RESERVATIONS, ReservationPhase};
 use weglarka_model::podman::{ImageInfo, PodmanClient};
 
 use crate::admin::{Fail, mutating};
@@ -26,9 +28,33 @@ pub fn routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> {
     Router::new()
         .route(endpoints::IMAGES_PRUNE.path, post(prune_images::<P>))
         .route(
+            endpoints::IMAGES_RESERVATIONS_LIST.path,
+            get(list_reservations::<P>),
+        )
+        .route(
             endpoints::IMAGES_RESERVATION_ABANDON.path,
             post(abandon_reservation::<P>),
         )
+}
+
+/// Reclaims the reservations a previous boot left behind (`reclaim_stale_reservations`): once, at
+/// daemon start, before the first reconcile or deploy can create a reservation of this boot. A
+/// reservation of the current boot is never touched, nor one a nonterminal platform transaction
+/// references. Bookkeeping trouble is logged, never fatal: cleanup stays disabled and `doctor` says
+/// why.
+pub async fn reclaim_at_startup<P: PodmanClient>(engine: &Reconciler<P>) {
+    match engine.reclaim_stale_reservations().await {
+        Ok(reclaimed) if reclaimed.is_empty() => {}
+        Ok(reclaimed) => {
+            let operations: Vec<String> = reclaimed.iter().map(ToString::to_string).collect();
+            tracing::info!(
+                reclaimed = operations.len(),
+                operations = %operations.join(", "),
+                "reclaimed image reservations left by a previous boot"
+            );
+        }
+        Err(error) => tracing::warn!(%error, "cannot reclaim stale image reservations"),
+    }
 }
 
 /// `POST /v1/images/prune`. The body is optional: no body (or `{}`) removes, `{"dry_run": true}`
@@ -46,23 +72,22 @@ async fn prune_images<P: PodmanClient + 'static>(
             .map_err(|e| Fail(ErrorCode::InvalidRequest, format!("invalid JSON body: {e}")))?
     };
     let report = mutating(d.engine.prune_images(request.dry_run)).await?;
-    Ok(Json(reply(report)?))
+    Ok(Json(reply(report)))
 }
 
-/// A blocked pass (provenance could not be read or written) is an error, not an empty report: the
-/// operator must see that cleanup did not run, and the response has no field for it.
-fn reply(report: PruneReport) -> Result<PruneImagesResponse, Fail> {
-    if report.blocked {
-        let removed = report.removed.len();
-        let mut message = report.diagnostics.join("; ");
-        if removed > 0 {
-            message.push_str(&format!(
-                "; {removed} image(s) had already been removed in this pass"
-            ));
-        }
-        return Err(Fail::internal(message));
+/// A blocked pass (provenance could not be read or written) is a normal answer with `blocked: true`
+/// and the reason in `diagnostics`, so `--json` callers and the CLI see what happened (and the true
+/// `removed` list when only the final write failed). It is not an HTTP error: the request itself
+/// was valid and served.
+fn reply(report: PruneReport) -> PruneImagesResponse {
+    let mut response = response(report);
+    if response.blocked && !response.removed.is_empty() {
+        response.diagnostics.push(format!(
+            "{} image(s) had already been removed in this pass",
+            response.removed.len()
+        ));
     }
-    Ok(response(report))
+    response
 }
 
 fn response(report: PruneReport) -> PruneImagesResponse {
@@ -76,6 +101,55 @@ fn response(report: PruneReport) -> PruneImagesResponse {
             .map(|(id, error)| format!("{id}: {error}"))
             .collect(),
         diagnostics: report.diagnostics,
+        blocked: report.blocked,
+    }
+}
+
+/// `GET /v1/images/reservations`: the durable reservations, oldest first. Read-only: it does not
+/// wait for a running deploy.
+async fn list_reservations<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+) -> Result<Json<ListReservationsResponse>, Fail> {
+    let reservations = d
+        .engine
+        .list_reservations()
+        .map_err(|e| Fail::internal(e.to_string()))?
+        .into_iter()
+        .map(reservation_view)
+        .collect();
+    Ok(Json(ListReservationsResponse {
+        reservations,
+        capacity: MAX_RESERVATIONS,
+    }))
+}
+
+/// An allowlist projection: every field of [`ReservationInfo`] is bound, none with `..`.
+fn reservation_view(info: ReservationInfo) -> ReservationView {
+    let ReservationInfo {
+        operation_id,
+        phase,
+        component,
+        pid,
+        started_at,
+        previous_boot,
+        referenced,
+        protections,
+    } = info;
+    ReservationView {
+        operation_id,
+        phase: match phase {
+            ReservationPhase::Loading => "loading",
+            ReservationPhase::Loaded => "loaded",
+            ReservationPhase::Deploying => "deploying",
+            ReservationPhase::Coordinating => "coordinating",
+        }
+        .to_owned(),
+        component,
+        pid,
+        started_at,
+        previous_boot,
+        referenced,
+        protections,
     }
 }
 
@@ -108,17 +182,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_blocked_report_is_an_error_naming_the_reason() {
+    fn a_blocked_report_is_a_response_naming_the_reason() {
         let report = PruneReport {
             blocked: true,
             diagnostics: vec!["image retention is blocked: managed-images.toml: bad".into()],
             ..PruneReport::default()
         };
-        let Err(Fail(code, message)) = reply(report) else {
-            panic!("a blocked pass must not look like an empty prune");
-        };
-        assert_eq!(code, ErrorCode::Internal);
-        assert!(message.contains("managed-images.toml"), "{message}");
+        let response = reply(report);
+        assert!(
+            response.blocked,
+            "a blocked pass must not look like an empty prune"
+        );
+        assert!(response.removed.is_empty());
+        assert!(response.diagnostics[0].contains("managed-images.toml"));
     }
 
     #[test]
@@ -138,18 +214,19 @@ mod tests {
             diagnostics: vec!["managed-images.toml: disk full".into()],
             ..PruneReport::default()
         };
-        let Err(Fail(_, message)) = reply(report) else {
-            panic!("a blocked pass must be an error");
-        };
-        assert!(message.contains("disk full"), "{message}");
+        let response = reply(report);
+        assert!(response.blocked);
+        assert_eq!(response.removed.len(), 2, "the true removed list is kept");
+        let text = response.diagnostics.join("; ");
+        assert!(text.contains("disk full"), "{text}");
         assert!(
-            message.contains("2 image(s) had already been removed"),
-            "{message}"
+            text.contains("2 image(s) had already been removed"),
+            "{text}"
         );
     }
 
     #[test]
-    fn an_unblocked_report_is_a_response() {
-        assert!(reply(PruneReport::default()).is_ok());
+    fn an_unblocked_report_is_not_blocked() {
+        assert!(!reply(PruneReport::default()).blocked);
     }
 }

@@ -381,6 +381,15 @@ pub const IMAGES_PRUNE: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `GET` → [`ListReservationsResponse`](crate::ListReservationsResponse). The durable image
+/// reservations with the `operation_id` that `abandon` takes. `admin`: it names writer processes and
+/// boots (no image ids).
+pub const IMAGES_RESERVATIONS_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/images/reservations",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
 /// `POST` [`AbandonReservationRequest`](crate::AbandonReservationRequest) →
 /// [`AbandonReservationResponse`](crate::AbandonReservationResponse). Explicitly frees one durable
 /// image reservation after operator confirmation; elapsed time never authorizes reclamation.
@@ -505,6 +514,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     CONFIG,
     DOCTOR,
     IMAGES_PRUNE,
+    IMAGES_RESERVATIONS_LIST,
     IMAGES_RESERVATION_ABANDON,
     NOTIFICATIONS_STATUS,
     NOTIFICATIONS_TEST,

@@ -9,9 +9,10 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     AbandonReservationRequest, AbandonReservationResponse, AddAppRequest, AppSummary,
     ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
-    ListAppsResponse, ListSecretsResponse, NotifyStatusResponse, NotifyTestResponse,
-    PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction, ReloadRequest,
-    ReloadResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
+    ListAppsResponse, ListReservationsResponse, ListSecretsResponse, NotifyStatusResponse,
+    NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
+    ReloadRequest, ReloadResponse, ReservationView, SecretInfo, SetSecretRequest, ShowAppResponse,
+    StatusResponse,
 };
 use weglarka_model::app::{
     AppIngress, AppSpec, HealthGate, InstanceName, SecretBinding, SecretTarget,
@@ -71,6 +72,9 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
         Command::Sites(c) => crate::sites::run(json, &overrides, c).await,
         Command::Promote(a) => crate::sites::promote(json, &overrides, a).await,
         Command::Images(ImagesCommand::Prune(a)) => images_prune(json, &overrides, a).await,
+        Command::Images(ImagesCommand::Reservations(ReservationsCommand::List)) => {
+            images_reservations_list(json, &overrides).await
+        }
         Command::Images(ImagesCommand::Reservations(ReservationsCommand::Abandon(a))) => {
             images_reservations_abandon(json, &overrides, a).await
         }
@@ -700,11 +704,78 @@ pub(crate) async fn images_prune(
         .call(endpoints::IMAGES_PRUNE, &[], Some(&request))
         .await?;
     emit(json, &response, || render_prune(&response));
-    Ok(if response.failed.is_empty() {
+    // A blocked pass (cleanup disabled by a bookkeeping problem) did not do what was asked, so it
+    // fails like a refused removal does.
+    Ok(if response.failed.is_empty() && !response.blocked {
         exit::OK
     } else {
         exit::INTERNAL
     })
+}
+
+/// `images reservations list`: the durable reservations, with the operation IDs `abandon` needs.
+pub(crate) async fn images_reservations_list(json: bool, o: &Overrides) -> Result<i32, CliError> {
+    let response: ListReservationsResponse = client(o)?
+        .call(endpoints::IMAGES_RESERVATIONS_LIST, &[], None::<&()>)
+        .await?;
+    emit(json, &response, || {
+        render_reservations(&response, unix_now())
+    });
+    Ok(exit::OK)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `images reservations list` output: one row per reservation, then a capacity line. `now` is a
+/// parameter so the output is reproducible.
+pub(crate) fn render_reservations(r: &ListReservationsResponse, now: u64) -> String {
+    if r.reservations.is_empty() {
+        return format!("no image reservations (0/{})\n", r.capacity);
+    }
+    let rows = r
+        .reservations
+        .iter()
+        .map(|v| {
+            vec![
+                v.operation_id.clone(),
+                v.phase.clone(),
+                format!("{}:{}", v.component, v.pid),
+                age(now.saturating_sub(v.started_at)),
+                reclaim_note(v).to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut out = table(&["OPERATION", "PHASE", "OWNER", "AGE", "RECLAIM"], &rows);
+    out.push_str(&format!(
+        "{}/{} reservation(s)\n",
+        r.reservations.len(),
+        r.capacity
+    ));
+    out
+}
+
+/// What happens to a reservation without the operator: only a previous boot's reservation is
+/// reclaimed (at the next daemon start), and not while a platform transaction references it.
+fn reclaim_note(v: &ReservationView) -> &'static str {
+    match (v.referenced, v.previous_boot) {
+        (true, _) => "never (platform transaction)",
+        (false, true) => "at next daemon start",
+        (false, false) => "abandon only",
+    }
+}
+
+fn age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// `images reservations abandon <id>`: the explicit operator command from the contract. It refuses
@@ -769,6 +840,20 @@ pub(crate) fn render_prune(r: &PruneImagesResponse) -> String {
     } else {
         format!("{} reclaimed", human_bytes(r.reclaimed_bytes))
     };
+    if r.blocked {
+        // Stdout, not just a warning: `--json` callers get the flag, people get this line.
+        out.push_str(&format!(
+            "image cleanup is BLOCKED: {}\n",
+            if r.removed.is_empty() {
+                "nothing was removed".to_owned()
+            } else {
+                format!(
+                    "{} image(s) were removed before the failure (see below)",
+                    r.removed.len()
+                )
+            }
+        ));
+    }
     out.push_str(&format!("{what} {} image(s), {space}\n", r.removed.len()));
     for failure in &r.failed {
         eprintln!("warning: could not remove {failure}");

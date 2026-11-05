@@ -511,6 +511,44 @@ pub struct PruneImagesResponse {
     /// `host-capabilities.toml` is absent/incomplete. A diagnostic is never permission to delete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// Provenance could not be read or written, so cleanup was disabled for this pass: nothing was
+    /// removed, with one exception — when only the final write that forgets removed images failed,
+    /// `removed` lists the images that are already gone. `diagnostics` says why. Absent in answers
+    /// of older daemons (`false`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
+}
+
+/// `GET /v1/images/reservations`: the durable image reservations (`image-reservations.toml`), so an
+/// operator can find the `operation_id` that `abandon` needs. Admin scope: it names writer
+/// processes and boots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListReservationsResponse {
+    pub reservations: Vec<ReservationView>,
+    /// How many reservations the file holds at most; at the limit new acquisitions run unreserved
+    /// and cleanup is blocked.
+    pub capacity: usize,
+}
+
+/// One reservation of [`ListReservationsResponse`]. Never carries image ids or digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationView {
+    pub operation_id: String,
+    /// `loading` (pull or upload started, image not known yet), `loaded` (image identity recorded),
+    /// `deploying` or `coordinating` (a platform update drives it).
+    pub phase: String,
+    /// The writer's component (`engine`) and process id.
+    pub component: String,
+    pub pid: u32,
+    /// Unix seconds when the operation started.
+    pub started_at: u64,
+    /// The writer's boot is not the current one: the next daemon start reclaims it (unless a
+    /// platform transaction references it).
+    pub previous_boot: bool,
+    /// A platform transaction references it; it is never reclaimed automatically.
+    pub referenced: bool,
+    /// Number of image identities it protects.
+    pub protections: usize,
 }
 
 /// `POST /v1/images/reservations/abandon`: explicit operator abandonment of one durable image

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
     ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
-    DoctorCheck, DoctorReport, ErrorCode, NotifyStatusResponse, PruneImagesResponse, PrunedImage,
-    ReloadAction, ReloadResponse, RuntimeState, SetSecretRequest, ShowAppResponse,
-    UpdateAppResponse, endpoints,
+    DoctorCheck, DoctorReport, ErrorCode, ListReservationsResponse, NotifyStatusResponse,
+    PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse, ReservationView, RuntimeState,
+    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
 };
 use weglarka_model::app::{AppSpec, InstanceName};
 use weglarka_model::config::HostConfig;
@@ -1709,6 +1709,7 @@ async fn images_prune_sends_the_dry_run_flag_and_renders_the_report() {
         reclaimed_bytes: 5 * 1024 * 1024,
         failed: Vec::new(),
         diagnostics: Vec::new(),
+        blocked: false,
     })
     .unwrap();
     let m = mock(move |_, _| (200, response.clone())).await;
@@ -1741,6 +1742,7 @@ async fn images_prune_sends_the_dry_run_flag_and_renders_the_report() {
         reclaimed_bytes: 5 * 1024 * 1024,
         failed: Vec::new(),
         diagnostics: Vec::new(),
+        blocked: false,
     };
     let rendered = crate::commands::render_prune(&report);
     assert!(
@@ -1763,6 +1765,7 @@ async fn images_prune_with_failures_exits_non_zero() {
         reclaimed_bytes: 0,
         failed: vec!["deadbeef: image is in use by a container".to_owned()],
         diagnostics: Vec::new(),
+        blocked: false,
     })
     .unwrap();
     let m = mock(move |_, _| (200, response.clone())).await;
@@ -1775,6 +1778,119 @@ async fn images_prune_with_failures_exits_non_zero() {
     .unwrap();
     assert_eq!(code, exit::INTERNAL);
     assert_eq!(m.seen.lock().unwrap()[0].body, r#"{"dry_run":false}"#);
+}
+
+/// A blocked pass is a 200 with `blocked: true`: the CLI says so on stdout and fails the command,
+/// for a real prune and for a dry run (which could not plan).
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocked_prune_prints_a_blocked_line_and_exits_non_zero() {
+    let response = serde_json::to_string(&PruneImagesResponse {
+        dry_run: false,
+        removed: Vec::new(),
+        reclaimed_bytes: 0,
+        failed: Vec::new(),
+        diagnostics: vec!["image retention is blocked: managed-images.toml: bad".to_owned()],
+        blocked: true,
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    for dry_run in [false, true] {
+        let code = crate::commands::images_prune(
+            true,
+            &overrides(&m),
+            crate::cli::PruneImagesArgs { dry_run },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, exit::INTERNAL, "dry_run={dry_run}");
+    }
+    let rendered = crate::commands::render_prune(&PruneImagesResponse {
+        blocked: true,
+        ..PruneImagesResponse::default()
+    });
+    assert!(
+        rendered.contains("image cleanup is BLOCKED: nothing was removed"),
+        "{rendered}"
+    );
+}
+
+/// An answer of an older daemon has no `blocked` field: it reads as `false`, and a non-blocked
+/// answer still serializes without it (old clients keep working).
+#[test]
+fn prune_response_blocked_is_additive() {
+    let old: PruneImagesResponse =
+        serde_json::from_str(r#"{"dry_run":false,"removed":[],"reclaimed_bytes":0}"#).unwrap();
+    assert!(!old.blocked);
+    assert!(
+        !serde_json::to_string(&PruneImagesResponse::default())
+            .unwrap()
+            .contains("blocked")
+    );
+}
+
+fn reservation_view(
+    id: &str,
+    phase: &str,
+    previous_boot: bool,
+    referenced: bool,
+) -> ReservationView {
+    ReservationView {
+        operation_id: id.to_owned(),
+        phase: phase.to_owned(),
+        component: "engine".to_owned(),
+        pid: 4242,
+        started_at: 1_700_000_000,
+        previous_boot,
+        referenced,
+        protections: 2,
+    }
+}
+
+#[test]
+fn reservations_list_renders_a_table() {
+    let response = ListReservationsResponse {
+        reservations: vec![
+            reservation_view("acquisition-1", "loading", true, false),
+            reservation_view("acquisition-2", "loaded", false, false),
+            reservation_view("acquisition-3", "coordinating", true, true),
+        ],
+        capacity: 1024,
+    };
+    insta::assert_snapshot!(crate::commands::render_reservations(
+        &response,
+        1_700_000_000 + 3 * 3600 + 5
+    ));
+}
+
+#[test]
+fn an_empty_reservation_list_says_so() {
+    let rendered = crate::commands::render_reservations(
+        &ListReservationsResponse {
+            reservations: Vec::new(),
+            capacity: 1024,
+        },
+        0,
+    );
+    assert_eq!(rendered, "no image reservations (0/1024)\n");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reservations_list_calls_the_endpoint() {
+    let body = serde_json::to_string(&ListReservationsResponse {
+        reservations: vec![reservation_view("acquisition-1", "loading", true, false)],
+        capacity: 1024,
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, body.clone())).await;
+    let code = crate::commands::images_reservations_list(true, &overrides(&m))
+        .await
+        .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("GET", "/v1/images/reservations")
+    );
 }
 
 #[test]
