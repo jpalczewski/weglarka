@@ -1,0 +1,492 @@
+//! Detection of app containers that libpod reports as `running` while their conmon is dead
+//! (issue #470).
+//!
+//! Measured on rootless Podman 6.1.3: after a container's conmon is killed, `inspect` and
+//! `/containers/json` keep reporting `running` with the stale `State.ConmonPid`, and the health
+//! status freezes at its last value because the health timer lived in the conmon's unit. Nothing
+//! derived from libpod state can see that, and the daemon runs in a container, so it cannot reach
+//! the host's PIDs. The host-side watchdog (`weglarka-daemon supervise`, every minute from
+//! `weglarka-watchdog.timer`) can: it checks that every running app container's conmon PID is still
+//! a live `conmon` and records the affected instances in `<state dir>/conmon-check.toml`, which the
+//! daemon's `doctor` reads as the check `podman.conmon`.
+//!
+//! The file is deliberately **outside** the state schema: it is a host-side observation whose loss
+//! costs nothing (the next watchdog run rewrites it a minute later), the watchdog — not the engine —
+//! is its writer, and a new field in `state.toml` would break a rollback to an older daemon
+//! (`deny_unknown_fields`, ADR 0023). It follows `webhook-deliveries.toml` (ADR 0035): no schema
+//! marker, mode 0600, atomic write, tolerant read.
+//!
+//! Report only: nothing here repairs anything. `weglarka apps reload <app>` (stop → start) starts a
+//! fresh conmon for the container; an automatic repair is a follow-up (issue #470).
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use weglarka_api::{CheckStatus, DoctorCheck};
+use weglarka_model::fsutil;
+use weglarka_model::labels;
+use weglarka_model::podman::{ContainerFilter, ContainerInfo, ContainerState, PodmanClient};
+
+/// `/proc` of the host the watchdog runs on: never configurable, and only the watchdog reads it.
+pub const PROC_ROOT: &str = "/proc";
+
+/// File in the state directory (written by the watchdog, read by `doctor`).
+pub const FILE_NAME: &str = "conmon-check.toml";
+/// Internal bookkeeping, like `self-update.toml`.
+pub const FILE_MODE: u32 = 0o600;
+
+/// `comm` of a conmon process: the kernel's name of the executable, truncated to 15 bytes, never a
+/// command line — so no argument of another process can pass for it.
+pub const CONMON_COMM: &str = "conmon";
+
+/// How old a report may be before `doctor` stops trusting it. The watchdog runs once a minute, so a
+/// report older than this means the timer is not running any more; the check says that instead of
+/// reporting a stale "all clear".
+pub const STALE_AFTER_SECS: u64 = 300;
+
+/// One host-side observation, as the watchdog writes it and `doctor` reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Report {
+    /// Unix seconds of the observation ([`weglarka_model::self_update::secs`]); `None` in a file
+    /// written by hand.
+    pub checked_at: Option<u64>,
+    /// Instances whose running container has no live conmon, sorted and deduplicated.
+    pub affected: Vec<String>,
+}
+
+impl Report {
+    /// How old the observation is, in seconds; `None` for a file without a timestamp.
+    fn age_secs(&self, now: u64) -> Option<u64> {
+        self.checked_at.map(|at| now.saturating_sub(at))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReportError {
+    #[error("cannot serialize the conmon report: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+pub fn path(state_dir: &Path) -> PathBuf {
+    state_dir.join(FILE_NAME)
+}
+
+/// The recorded observation, or `None` when there is none to trust: never written (the watchdog is
+/// not installed or has not run yet), unreadable, or malformed. A malformed file is logged and
+/// treated as absent — this is bookkeeping, and the next watchdog run rewrites it.
+pub fn load(state_dir: &Path) -> Option<Report> {
+    let path = path(state_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "cannot read the host-side conmon check; treating it as absent"
+            );
+            return None;
+        }
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    match toml::from_str::<Report>(&text) {
+        Ok(report) => Some(report),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "ignoring a malformed host-side conmon check; it is rewritten on the next watchdog run"
+            );
+            None
+        }
+    }
+}
+
+/// Records one observation atomically (mode 0600), replacing the previous one.
+pub fn record(state_dir: &Path, report: &Report) -> Result<(), ReportError> {
+    let path = path(state_dir);
+    let text = toml::to_string(report)?;
+    fsutil::write_atomic(&path, text.as_bytes(), FILE_MODE)
+        .map_err(|source| ReportError::Write { path, source })
+}
+
+/// Whether a conmon PID is still alive. Injected so that the decision logic is pure and the tests
+/// never touch the machine's `/proc`.
+pub trait ConmonLiveness: Send + Sync {
+    fn is_alive(&self, pid: u32) -> bool;
+}
+
+/// The real probe: `/proc/<pid>/comm` must exist and read `conmon`.
+///
+/// `kill(pid, 0)` alone would accept a recycled PID of an unrelated process; the `comm` check is what
+/// makes "the conmon of this container" honest.
+pub struct ProcConmon {
+    root: PathBuf,
+}
+
+impl ProcConmon {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The `/proc` of the host the watchdog runs on.
+    pub fn host() -> Self {
+        Self::new(PROC_ROOT)
+    }
+}
+
+impl ConmonLiveness for ProcConmon {
+    fn is_alive(&self, pid: u32) -> bool {
+        // A comma-free, single-segment join: `comm` of another user's process is unreadable, which is
+        // correctly "not our conmon".
+        match std::fs::read_to_string(self.root.join(pid.to_string()).join("comm")) {
+            Ok(comm) => comm.trim_end() == CONMON_COMM,
+            Err(_) => false,
+        }
+    }
+}
+
+/// What one pass over the container list found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observation {
+    /// Running app containers whose conmon PID was probed.
+    pub checked: usize,
+    /// Instances with at least one such container whose conmon is gone (sorted, deduplicated).
+    pub affected: Vec<String>,
+}
+
+/// Probes the conmon of every running app container.
+///
+/// Only containers carrying the instance label are considered — the app container, its blue-green
+/// challenger and the retiring one; one-off `run`/`forward`/import containers carry other labels and
+/// are out of scope — and only those libpod reports as `running`: a stopped, created or exited
+/// container has no conmon to lose. A running container that libpod reports without a conmon PID is
+/// skipped rather than guessed at: `None` is "libpod said nothing", not evidence of a dead conmon.
+pub fn observe(containers: &[ContainerInfo], liveness: &impl ConmonLiveness) -> Observation {
+    let mut observation = Observation::default();
+    let mut instance_containers: Vec<(&str, u32)> = containers
+        .iter()
+        .filter(|c| c.state == ContainerState::Running)
+        .filter_map(|c| Some((c.labels.get(labels::INSTANCE)?.as_str(), c.conmon_pid?)))
+        .collect();
+    // One order everywhere: the report is written as text, and a stable order keeps diffs readable.
+    instance_containers.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+    for (instance, pid) in instance_containers {
+        observation.checked += 1;
+        if !liveness.is_alive(pid) {
+            observation.affected.push(instance.to_owned());
+        }
+    }
+    observation.affected.dedup();
+    observation
+}
+
+/// Outcome of one watchdog run of the check; the caller prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Summary {
+    /// Every probed app container has a live conmon.
+    Ok { checked: usize },
+    /// These instances have a running container without a live conmon.
+    Affected { instances: Vec<String> },
+    /// libpod could not be asked; nothing was recorded.
+    Unavailable { reason: String },
+}
+
+impl std::fmt::Display for Summary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok { checked: 0 } => f.write_str("no running app container to check"),
+            Self::Ok { checked } => write!(
+                f,
+                "{checked} running app container(s) checked, every conmon alive"
+            ),
+            Self::Affected { instances } => write!(
+                f,
+                "no live conmon for {} — `weglarka apps reload <app>` restarts the container with a fresh one",
+                instances.join(", ")
+            ),
+            Self::Unavailable { reason } => write!(f, "conmon check skipped: {reason}"),
+        }
+    }
+}
+
+/// One watchdog run of the check: list the containers, probe the conmons, record the observation.
+///
+/// A failed listing is reported, not fatal: the self-update supervision of the same run must still
+/// happen, and the previous report stays on disk (an old "all clear" is caught by
+/// [`STALE_AFTER_SECS`]).
+pub async fn check<P: PodmanClient>(
+    podman: &P,
+    liveness: &impl ConmonLiveness,
+    state_dir: &Path,
+    now: u64,
+) -> Summary {
+    let containers = match podman.container_list(&ContainerFilter::default()).await {
+        Ok(containers) => containers,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list the containers for the conmon check");
+            return Summary::Unavailable {
+                reason: e.to_string(),
+            };
+        }
+    };
+    let observation = observe(&containers, liveness);
+    let report = Report {
+        checked_at: Some(now),
+        affected: observation.affected.clone(),
+    };
+    if let Err(e) = record(state_dir, &report) {
+        tracing::warn!(error = %e, "cannot record the host-side conmon check");
+    }
+    if observation.affected.is_empty() {
+        Summary::Ok {
+            checked: observation.checked,
+        }
+    } else {
+        tracing::warn!(
+            instances = %observation.affected.join(", "),
+            "container reported as running without a live conmon (issue #470)"
+        );
+        Summary::Affected {
+            instances: observation.affected,
+        }
+    }
+}
+
+/// The `doctor` line for one recorded observation (pure: the caller loads the file and passes the
+/// clock).
+///
+/// `fail`, not `warn`: the container keeps answering "running" while nothing keeps it alive — its
+/// log, its health timer and its DNS registration are all gone — so the operator has to act.
+pub fn doctor_check(report: Option<&Report>, path: &Path, now: u64) -> DoctorCheck {
+    const ID: &str = "podman.conmon";
+    const TIMER_HINT: &str = "the check runs from the host-side watchdog; `platform install` installs weglarka-watchdog.timer";
+    let Some(report) = report else {
+        return DoctorCheck::info(
+            ID,
+            format!("no host-side conmon check yet ({})", path.display()),
+        )
+        .with_hint(TIMER_HINT);
+    };
+    if !report.affected.is_empty() {
+        return DoctorCheck::fail(
+            ID,
+            format!(
+                "no live conmon for: {} (reported as running by libpod, but nothing keeps them alive)",
+                report.affected.join(", ")
+            ),
+        )
+        .with_hint(format!(
+            "restart each one: {}",
+            report
+                .affected
+                .iter()
+                .map(|app| format!("`weglarka apps reload {app}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    match report.age_secs(now) {
+        Some(age) if age > STALE_AFTER_SECS => DoctorCheck::new(
+            ID,
+            CheckStatus::Warn,
+            format!(
+                "the last host-side conmon check is {age}s old (it runs every minute); a dead conmon would be invisible"
+            ),
+        )
+        .with_hint(TIMER_HINT),
+        Some(age) => DoctorCheck::ok(
+            ID,
+            format!("every running app container has a live conmon (checked {age}s ago)"),
+        ),
+        None => DoctorCheck::ok(
+            ID,
+            format!("every running app container has a live conmon ({})", path.display()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// A liveness probe with a fixed set of live PIDs: the detection logic is pure, so no test reads
+    /// the machine's `/proc`.
+    struct Alive(Vec<u32>);
+
+    impl ConmonLiveness for Alive {
+        fn is_alive(&self, pid: u32) -> bool {
+            self.0.contains(&pid)
+        }
+    }
+
+    fn container(name: &str, state: ContainerState, conmon_pid: Option<u32>) -> ContainerInfo {
+        ContainerInfo {
+            id: format!("id-{name}"),
+            name: name.to_owned(),
+            image: "example.com/app:1".to_owned(),
+            image_id: "sha256:0".to_owned(),
+            labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_owned())]),
+            state,
+            exit_code: None,
+            health: None,
+            restarts: 0,
+            started_at: None,
+            networks: Vec::new(),
+            addresses: Vec::new(),
+            published_ports: Vec::new(),
+            memory_limit: None,
+            oom_killed: false,
+            conmon_pid,
+        }
+    }
+
+    #[test]
+    fn a_running_container_without_a_live_conmon_is_reported_by_instance() {
+        let containers = [
+            container("ok", ContainerState::Running, Some(10)),
+            container("dead", ContainerState::Running, Some(20)),
+            // Not running: no conmon to lose, whatever the stale PID says.
+            container("stopped", ContainerState::Exited, Some(30)),
+            container("never", ContainerState::Created, Some(40)),
+            // libpod reports nothing: skipped, not guessed at.
+            container("unknown", ContainerState::Running, None),
+        ];
+        let observation = observe(&containers, &Alive(vec![10]));
+        assert_eq!(observation.checked, 2);
+        assert_eq!(observation.affected, ["dead"]);
+    }
+
+    #[test]
+    fn a_container_without_the_instance_label_is_not_an_app_container() {
+        let mut one_off = container("wg-run.ntfy.tok", ContainerState::Running, Some(20));
+        one_off.labels.clear();
+        one_off
+            .labels
+            .insert(labels::RUN.to_owned(), "true".to_owned());
+        let observation = observe(&[one_off], &Alive(Vec::new()));
+        assert_eq!(observation.checked, 0);
+        assert!(observation.affected.is_empty());
+    }
+
+    #[test]
+    fn two_containers_of_one_instance_report_the_instance_once() {
+        // A blue-green deploy leaves the challenger and the retiring container next to the main one.
+        let containers = [
+            container("app", ContainerState::Running, Some(20)),
+            container("app", ContainerState::Running, Some(21)),
+        ];
+        let observation = observe(&containers, &Alive(Vec::new()));
+        assert_eq!(observation.checked, 2);
+        assert_eq!(observation.affected, ["app"]);
+    }
+
+    #[test]
+    fn the_probe_requires_the_pid_of_a_conmon_and_not_a_recycled_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |pid: u32, comm: &str| {
+            std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(pid.to_string()).join("comm"), comm).unwrap();
+        };
+        write(10, "conmon\n");
+        write(11, "nginx\n");
+        let probe = ProcConmon::new(root);
+        assert!(probe.is_alive(10));
+        assert!(!probe.is_alive(11), "a recycled PID of another process");
+        assert!(!probe.is_alive(12), "a PID that is not running");
+    }
+
+    #[test]
+    fn the_report_round_trips_and_a_malformed_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load(dir.path()).is_none(), "nothing written yet");
+        record(
+            dir.path(),
+            &Report {
+                checked_at: Some(1_000),
+                affected: vec!["ntfy".to_owned()],
+            },
+        )
+        .unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.checked_at, Some(1_000));
+        assert_eq!(loaded.affected, ["ntfy"]);
+        // Mode 0600: the file lists app names, and the state directory is group- and world-readable.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, FILE_MODE);
+
+        std::fs::write(path(dir.path()), "not toml at all [").unwrap();
+        assert!(load(dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_check_records_an_empty_report_when_every_conmon_lives() {
+        use weglarka_engine::testing::FakePodman;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakePodman::new();
+        // FakePodman containers report no conmon PID, so nothing is probed and nothing is affected.
+        let summary = check(&fake, &Alive(Vec::new()), dir.path(), 7).await;
+        assert_eq!(summary, Summary::Ok { checked: 0 });
+        let recorded = load(dir.path()).unwrap();
+        assert_eq!(recorded.checked_at, Some(7));
+        assert!(recorded.affected.is_empty());
+    }
+
+    #[test]
+    fn doctor_fails_with_the_reload_command_and_is_quiet_without_data() {
+        let path = Path::new("/state/conmon-check.toml");
+        let empty = Report {
+            checked_at: Some(1_000),
+            affected: Vec::new(),
+        };
+        let ok = doctor_check(Some(&empty), path, 1_030);
+        assert_eq!(ok.id, "podman.conmon");
+        assert_eq!(ok.status, CheckStatus::Ok);
+        assert_eq!(
+            ok.message,
+            "every running app container has a live conmon (checked 30s ago)"
+        );
+
+        let dead = Report {
+            checked_at: Some(1_000),
+            affected: vec!["blog".to_owned(), "ntfy".to_owned()],
+        };
+        let fail = doctor_check(Some(&dead), path, 1_030);
+        assert_eq!(fail.status, CheckStatus::Fail);
+        assert_eq!(
+            fail.hint.as_deref(),
+            Some("restart each one: `weglarka apps reload blog`, `weglarka apps reload ntfy`")
+        );
+        assert!(fail.message.contains("blog, ntfy"));
+
+        // No file at all: the watchdog is not installed (or has not run yet) — advice, not a failure.
+        let absent = doctor_check(None, path, 1_030);
+        assert_eq!(absent.status, CheckStatus::Info);
+        assert!(absent.message.contains("/state/conmon-check.toml"));
+
+        // A dead conmon outranks a stale report: the failure is the operator's problem.
+        let stale = doctor_check(Some(&dead), path, 9_999);
+        assert_eq!(stale.status, CheckStatus::Fail);
+
+        let stale_ok = doctor_check(Some(&empty), path, 9_999);
+        assert_eq!(stale_ok.status, CheckStatus::Warn);
+        assert!(stale_ok.message.contains("8999s old"));
+    }
+}

@@ -348,6 +348,17 @@ async fn full_lifecycle() {
         info.networks.contains(&net_b),
         "connected network is reported"
     );
+    // Issue #470: a running container reports the host PID of its conmon. That PID is the only handle
+    // on a container libpod keeps calling `running` after its conmon died, so the host-side watchdog
+    // probes it and requires `/proc/<pid>/comm` to be `conmon` (not a recycled PID).
+    let conmon_pid = info
+        .conmon_pid
+        .expect("a running container reports ConmonPid");
+    assert!(conmon_pid > 1, "conmon pid: {conmon_pid}");
+    // The suite can also drive a remote libpod socket, where that PID is not in this `/proc`.
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{conmon_pid}/comm")) {
+        assert_eq!(comm.trim_end(), "conmon", "the reported PID is conmon's");
+    }
     // The published mapping took effect, not just got accepted at create: inspect reports the
     // requested loopback binding and the actual host-port assignment for the container port.
     // This image (pause) does not listen on 8080, so there is deliberately no TCP connect check.

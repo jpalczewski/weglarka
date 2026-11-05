@@ -1,5 +1,5 @@
-//! `weglarka-daemon supervise` — the host-side watchdog of a self-update switch in flight
-//! (issue #100, `docs/decisions/0034`).
+//! `weglarka-daemon supervise` — the host-side watchdog: the self-update fallback of a switch in
+//! flight (issue #100, `docs/decisions/0034`) and the conmon check of the app containers (issue #470).
 //!
 //! The switcher pins a new digest in the service definition and restarts the service; the daemon
 //! inside the container cannot tell whether that image ever came up. This module runs from the user
@@ -9,8 +9,14 @@
 //! `weglarka_model::self_update::supervise` into a pinned rollback — the previous digest restored in
 //! the service definition and the service restarted.
 //!
-//! Everything that needs a decision is in `weglarka-model` (`self_update`; pure, injected clock); this module is the
-//! thin host-side I/O around it: lock, probe and the two commands the fallback needs.
+//! The same wake-up is the one place that can see a dead container conmon: libpod keeps reporting such
+//! a container as `running`, and the daemon (in a container) cannot reach the host's PIDs. The check
+//! runs from here, independently of `[self_update]`, and records what it found for `doctor`
+//! ([`crate::conmon`]).
+//!
+//! Everything that needs a decision is in `weglarka-model` (`self_update`; pure, injected clock) and
+//! in [`crate::conmon`]; this module is the thin host-side I/O around them: lock, probe and the two
+//! commands the fallback needs.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -18,7 +24,9 @@ use std::time::{Duration, SystemTime};
 use weglarka_api::endpoints;
 use weglarka_engine::platform::Platform;
 use weglarka_model::podman::PodmanClient;
+use weglarka_model::self_update::secs;
 
+use crate::conmon;
 use crate::self_update::{self, WatchReport};
 use crate::settings::Settings;
 
@@ -28,8 +36,54 @@ use crate::settings::Settings;
 /// once a minute.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One watchdog run: skip when the feature is off or another run is active, probe, then supervise.
+/// Outcome of one watchdog wake-up: the conmon check of the containers (issue #470) and the
+/// supervision of a self-update switch in flight (issue #100).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub conmon: conmon::Summary,
+    pub watch: WatchReport,
+}
+
+impl Report {
+    /// `false` only for the self-update outcomes that need the operator: a dead conmon is reported by
+    /// `doctor` (and repaired by hand), and failing the timer every minute would add noise, not work.
+    pub fn is_success(&self) -> bool {
+        self.watch.is_success()
+    }
+}
+
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; {}", self.conmon, self.watch)
+    }
+}
+
+/// One watchdog run: check the conmons, then — when the self-update fallback is on and no other
+/// host-side run holds the lock — probe the daemon and supervise the switch.
 pub async fn run<P, Pl>(
+    podman: &P,
+    platform: &Pl,
+    settings: &Settings,
+    now: SystemTime,
+) -> Result<Report, self_update::Error>
+where
+    P: PodmanClient,
+    Pl: Platform,
+{
+    let conmon = conmon::check(
+        podman,
+        &conmon::ProcConmon::host(),
+        &settings.paths.state_dir,
+        secs(now),
+    )
+    .await;
+    let watch = supervise_switch(podman, platform, settings, now).await?;
+    Ok(Report { conmon, watch })
+}
+
+/// The self-update half of the run (issue #100): skip when the feature is off or another run is
+/// active, probe the daemon's health, then decide.
+async fn supervise_switch<P, Pl>(
     podman: &P,
     platform: &Pl,
     settings: &Settings,
@@ -123,6 +177,9 @@ mod tests {
 
     use std::time::Duration;
 
+    use weglarka_engine::platform::{PlatformError, ServiceSpec, ServiceStatus, UnitFile};
+    use weglarka_model::config::PlatformKind;
+
     use crate::self_update::lock_state;
 
     async fn serve(dir: &Path, answer: &'static [u8]) -> std::path::PathBuf {
@@ -201,5 +258,73 @@ mod tests {
             lock_state(dir.path()).unwrap().is_some(),
             "the lock is released with the run"
         );
+    }
+
+    /// Every method is a bug: without `[self_update]` the run must not touch the service manager.
+    struct NoPlatform;
+
+    impl Platform for NoPlatform {
+        fn kind(&self) -> PlatformKind {
+            unreachable!()
+        }
+        async fn runtime_socket(&self, _: &str) -> Result<std::path::PathBuf, PlatformError> {
+            unreachable!()
+        }
+        async fn install_service(&self, _: &ServiceSpec) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn remove_service(&self, _: &str) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn service_status(&self, _: &str) -> Result<ServiceStatus, PlatformError> {
+            unreachable!()
+        }
+        async fn install_user_units(&self, _: &[UnitFile]) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn remove_user_units(&self, _: &[&str]) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn restart_service(&self, _: &str) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn reset_failed(&self, _: &str) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn set_timer(&self, _: &str, _: bool) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        async fn remove_launcher_setup(&self) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+    }
+
+    /// Issue #470: the conmon check must run even on a host without `[self_update]` — that section is
+    /// about Węglarka's own image, and the app containers are broken either way.
+    #[tokio::test]
+    async fn a_host_without_self_update_still_gets_the_conmon_check() {
+        use weglarka_model::config::HostConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = HostConfig::from_toml_str(&format!(
+            "[ingress]\nmode = \"behind\"\nbind = \"127.0.0.1:18080\"\n\
+             [admin]\nsocket = \"{root}/admin.sock\"\n\
+             [webhook]\nlisten = \"127.0.0.1:0\"\ndomain = \"hooks.example.eu\"\n\
+             [state]\ndir = \"{root}/state\"\n",
+            root = dir.path().display()
+        ))
+        .unwrap();
+        let settings = Settings::from_host(host, dir.path().join("weglarka.toml"));
+        std::fs::create_dir_all(&settings.paths.state_dir).unwrap();
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let fake = weglarka_engine::testing::FakePodman::new();
+        let report = run(&fake, &NoPlatform, &settings, now).await.unwrap();
+        assert_eq!(report.watch, WatchReport::Disabled);
+        assert_eq!(report.conmon, conmon::Summary::Ok { checked: 0 });
+        assert!(report.is_success());
+        let recorded = conmon::load(&settings.paths.state_dir).expect("the run records the check");
+        assert_eq!(recorded.checked_at, Some(1_000));
+        assert!(recorded.affected.is_empty());
     }
 }

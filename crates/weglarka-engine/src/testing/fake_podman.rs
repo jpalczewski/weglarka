@@ -343,6 +343,7 @@ impl FakePodman {
                 started_at: Some(FAKE_STARTED_AT.to_owned()),
                 memory_limit: None,
                 oom_killed: false,
+                conmon_pid: None,
             },
         );
     }
@@ -763,6 +764,7 @@ impl PodmanClient for FakePodman {
                 published_ports: spec.publish.clone(),
                 memory_limit: spec.resources.memory.map(|m| m.bytes()),
                 oom_killed: false,
+                conmon_pid: None,
             },
         );
         Ok(id)

@@ -542,6 +542,9 @@ struct InspectState {
     started_at: String,
     #[serde(rename = "OOMKilled")]
     oom_killed: bool,
+    /// Host PID of the container's conmon; `0` when libpod has none (a container that never started).
+    /// libpod does not clear it when conmon dies (issue #470), so the value is stale, not authoritative.
+    conmon_pid: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -618,6 +621,9 @@ impl InspectContainer {
             published_ports,
             memory_limit: (self.host_config.memory > 0).then_some(self.host_config.memory),
             oom_killed: self.state.oom_killed,
+            conmon_pid: u32::try_from(self.state.conmon_pid)
+                .ok()
+                .filter(|pid| *pid > 0),
         }
     }
 }
@@ -1186,6 +1192,27 @@ mod tests {
             "libpod `RestartCount` maps to `ContainerInfo::restarts`"
         );
         assert_eq!(info.started_at.as_deref(), Some("2026-10-23T10:00:01Z"));
+        assert_eq!(
+            info.conmon_pid,
+            Some(2_147_480),
+            "libpod `State.ConmonPid` maps to `ContainerInfo::conmon_pid`"
+        );
+    }
+
+    #[test]
+    fn conmon_pid_is_absent_when_libpod_reports_zero_or_missing() {
+        // A container that never started: libpod reports `0`.
+        let info = decode::<InspectContainer>(
+            br#"{"Id":"1","Name":"n","State":{"Status":"created","ConmonPid":0}}"#,
+        )
+        .unwrap()
+        .into_domain();
+        assert_eq!(info.conmon_pid, None);
+        // An older response without the field.
+        let info = decode::<InspectContainer>(fixture!("inspect_container_exited.json"))
+            .unwrap()
+            .into_domain();
+        assert_eq!(info.conmon_pid, None);
     }
 
     #[test]

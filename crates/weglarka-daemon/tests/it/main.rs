@@ -8,6 +8,7 @@ mod common;
 mod access;
 mod certificates_config;
 mod configs;
+mod conmon;
 mod daemon;
 mod depends_on;
 mod events;

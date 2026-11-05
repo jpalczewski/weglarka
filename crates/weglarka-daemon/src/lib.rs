@@ -14,6 +14,9 @@ pub mod bootstrap;
 pub mod cdn;
 pub mod certificates;
 pub mod config_view;
+/// Detection of containers whose conmon died while libpod still calls them running (issue #470):
+/// the host-side watchdog records it, `doctor` reports it.
+pub mod conmon;
 pub mod doctor;
 pub mod events;
 pub mod forgejo;

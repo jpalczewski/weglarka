@@ -257,6 +257,7 @@ mod tests {
             published_ports: vec![],
             memory_limit: None,
             oom_killed: false,
+            conmon_pid: None,
         }
     }
 
