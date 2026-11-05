@@ -6,7 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
-use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
+use weglarka_engine::sites::{ReleaseGate, SiteReleases, release_id};
+use weglarka_model::app::{AppKind, AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::{IngressMode, LogRetention};
 use weglarka_model::labels;
 use weglarka_model::podman::{
@@ -110,6 +111,8 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     configs(d, &mut checks);
     host_mounts(d, &mut checks);
     sites(d, &mut checks);
+    sites_directory(d, &mut checks);
+    sites_current(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     shared_network_state(d, &mut checks).await;
     orphan_networks(d, &mut checks).await;
@@ -897,6 +900,132 @@ fn sites<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                 unpromoted.join(", ")
             ),
             Some("`weglarka promote <site> <env>` after the source environment has a release"),
+        )
+    });
+}
+
+/// `sites.directory` (ADR 0049): the directory static releases live in. Silent while no
+/// `kind = "static"` app is declared. Report-only: it never creates or repairs the directory.
+fn sites_directory<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    if !apps.apps.values().any(|spec| spec.kind == AppKind::Static) {
+        return;
+    }
+    let root = d.paths.nginx_conf_dir.join("sites");
+    let hint = "create the directory writable by the runtime user, or deploy a site once (the daemon creates it)";
+    out.push(match std::fs::metadata(&root) {
+        Err(e) => check(
+            "sites.directory",
+            CheckStatus::Fail,
+            format!(
+                "sites root {} is not available: {}",
+                root.display(),
+                detail(&e)
+            ),
+            Some(hint),
+        ),
+        Ok(meta) if !meta.is_dir() => check(
+            "sites.directory",
+            CheckStatus::Fail,
+            format!("sites root {} is not a directory", root.display()),
+            Some(hint),
+        ),
+        Ok(meta) => {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o300 != 0o300 {
+                let hint = format!(
+                    "chmod u+wx {}: the daemon must write releases there, nginx only reads them",
+                    root.display()
+                );
+                check(
+                    "sites.directory",
+                    CheckStatus::Fail,
+                    format!(
+                        "sites root {} is not writable by the daemon ({mode:o})",
+                        root.display()
+                    ),
+                    Some(&hint),
+                )
+            } else if let Err(e) = std::fs::read_dir(&root) {
+                check(
+                    "sites.directory",
+                    CheckStatus::Fail,
+                    format!("cannot read sites root {}: {}", root.display(), detail(&e)),
+                    Some(hint),
+                )
+            } else {
+                ok(
+                    "sites.directory",
+                    format!("sites root {} ({mode:o})", root.display()),
+                )
+            }
+        }
+    });
+}
+
+/// `sites.current` (ADR 0049): every deployed static app's `current` points at the release of its
+/// pinned digest and that release passes its gate (`index.html`, plus a configured 404 page).
+/// Silent while no `kind = "static"` app is declared; report-only.
+fn sites_current<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // reported by `state.apps_file`
+    };
+    let static_apps: Vec<(&InstanceName, &AppSpec)> = apps
+        .apps
+        .iter()
+        .filter(|(_, spec)| spec.kind == AppKind::Static)
+        .collect();
+    if static_apps.is_empty() {
+        return;
+    }
+    let st = state::load_state(&d.paths.state.state).unwrap_or_default();
+    let root = d.paths.nginx_conf_dir.join("sites");
+    let mut checked = 0usize;
+    let mut broken = Vec::new();
+    for (name, spec) in static_apps {
+        let Some(digest) = st.apps.get(name).and_then(|state| state.current.as_ref()) else {
+            continue; // never deployed
+        };
+        checked += 1;
+        let id = release_id(digest);
+        let releases = SiteReleases::new(root.join(name.as_str()));
+        let gate = ReleaseGate::for_spec(spec);
+        match releases.current_id() {
+            Some(link) if link == id => {
+                if let Err(e) = gate.check(&releases.release_dir(&id)) {
+                    broken.push(format!("{name}: releases/{id}: {e}"));
+                }
+            }
+            Some(link) => broken.push(format!(
+                "{name}: current -> releases/{link}, expected releases/{id}"
+            )),
+            None => broken.push(format!(
+                "{name}: current does not point at a release (expected releases/{id})"
+            )),
+        }
+    }
+    out.push(if broken.is_empty() {
+        ok(
+            "sites.current",
+            if checked == 0 {
+                "no static site has a release yet".to_owned()
+            } else {
+                format!("{checked} static sites serve the release of their pinned digest")
+            },
+        )
+    } else {
+        check(
+            "sites.current",
+            CheckStatus::Warn,
+            format!(
+                "static sites whose `current` is broken: {}",
+                broken.join(", ")
+            ),
+            Some(
+                "`weglarka deploy <app> --force` switches `current` (re-exporting only when the release is missing or incomplete)",
+            ),
         )
     });
 }

@@ -1,7 +1,7 @@
 //! Deploy of a `kind = "static"` instance (ADR 0049): pull → export → extract into a release directory →
 //! atomic `current` symlink switch. There is no container, no secrets and no health gate; the gate is the
-//! release itself (it extracted cleanly and has an `index.html`), so a failed deploy never touches the
-//! release that is being served.
+//! release itself (it extracted cleanly and has the files its gate names), so a failed deploy never
+//! touches the release that is being served.
 
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -12,33 +12,22 @@ use futures_util::StreamExt;
 
 use crate::deploy::{AcquisitionSlot, DeployOutcome, DigestSource, pinned_ref};
 use crate::images::ImageGuard;
-use crate::reconcile::{ActivityKind, EngineError, Reconciler};
-use crate::sites::{ExtractLimits, extract_release};
+use crate::reconcile::{ActivityKind, EngineError, Reconciler, SitesOptions};
+use crate::sites::{ReleaseError, ReleaseGate, SiteReleases, extract_release, release_id};
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::events::Event;
 use weglarka_model::podman::{PodmanClient, TarStream};
 use weglarka_model::state::{self, FailedDeploy, StateFile};
 
-/// Subdirectory of the sites root for exported archives that are being unpacked.
-const SCRATCH_DIR: &str = ".tmp";
 /// Releases kept per site: the one being served and the previous one (retention 1, like images).
 const KEPT_RELEASES: usize = 2;
 
-/// Directory name of a release: the leading hex of its digest.
-pub(crate) fn release_id(digest: &Digest) -> String {
-    digest
-        .as_str()
-        .trim_start_matches("sha256:")
-        .chars()
-        .take(20)
-        .collect()
-}
-
 impl<P: PodmanClient> Reconciler<P> {
-    fn sites_root(&self) -> Result<&Path, EngineError> {
-        self.options.sites_root.as_deref().ok_or_else(|| {
+    fn sites(&self) -> Result<&SitesOptions, EngineError> {
+        self.options.sites.as_ref().ok_or_else(|| {
             EngineError::Site(
-                "static sites need a sites directory; the daemon configures none".into(),
+                "static sites need a sites root and a scratch directory; the daemon configures none"
+                    .into(),
             )
         })
     }
@@ -53,7 +42,10 @@ impl<P: PodmanClient> Reconciler<P> {
         source: DigestSource<'_>,
         slot: &mut AcquisitionSlot,
     ) -> Result<DeployOutcome, EngineError> {
-        let sites_root = self.sites_root()?.to_owned();
+        let sites = self.sites()?.clone();
+        // Older versions kept the exported archive under the nginx-mounted sites root; a deploy is
+        // the first chance to remove that leftover when the daemon was not restarted after upgrading.
+        let _ = std::fs::remove_dir_all(sites.root.join(".tmp"));
         let _activity = self.begin_activity(instance, ActivityKind::Deploy);
         let mut st: StateFile = state::load_state(&self.paths.state)?;
         let cur = st.apps.get(instance).cloned().unwrap_or_default();
@@ -72,24 +64,27 @@ impl<P: PodmanClient> Reconciler<P> {
                 return Err(e);
             }
         };
-        let site_dir = sites_root.join(instance.as_str());
+        let site_dir = sites.root.join(instance.as_str());
+        let releases = SiteReleases::new(site_dir.clone());
+        let gate = ReleaseGate::for_spec(spec);
         let id = release_id(&digest);
         if !force {
             if cur.failed.as_ref().is_some_and(|f| f.digest == digest) {
                 return Ok(DeployOutcome::KnownBad { digest });
             }
-            if cur.current.as_ref() == Some(&digest) && serves(&site_dir, &id) {
+            if cur.current.as_ref() == Some(&digest) && releases.serves(&id, &gate) {
                 return Ok(DeployOutcome::Unchanged { digest });
             }
         }
 
         let generation = cur.generation + 1;
         let released = self
-            .release(&sites_root, &site_dir, &id, instance, spec, &digest)
+            .release(&sites, &site_dir, &id, instance, spec, &digest)
             .await;
         let entry = st.apps.entry(instance.clone()).or_default();
         entry.generation = generation;
         if let Err(reason) = released {
+            let reason = reason.to_string();
             entry.failed = Some(FailedDeploy {
                 digest: digest.clone(),
                 reason: reason.clone(),
@@ -111,6 +106,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .into_iter()
             .flatten()
             .map(release_id)
+            .take(KEPT_RELEASES)
             .collect();
         state::save_state(&self.paths.state, &st)?;
         self.events.emit(Event::DeployOk {
@@ -118,84 +114,85 @@ impl<P: PodmanClient> Reconciler<P> {
             digest: digest.clone(),
             generation,
         });
-        prune_releases(&site_dir, &keep).await;
+        let _ = tokio::task::spawn_blocking(move || releases.prune(&keep)).await;
         Ok(DeployOutcome::Deployed { digest, generation })
     }
 
     /// Exports the image, unpacks it and switches `current`. `Err` carries the operator-facing reason; the
     /// served release is untouched unless the switch itself succeeded.
+    ///
+    /// A complete release for `id` is reused as-is: redeploying a retained release (the previous one, or
+    /// a rollback) needs neither the image store nor the registry.
     async fn release(
         &self,
-        sites_root: &Path,
+        sites: &SitesOptions,
         site_dir: &Path,
         id: &str,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
-    ) -> Result<(), String> {
-        let scratch = sites_root.join(SCRATCH_DIR);
+    ) -> Result<(), ReleaseError> {
+        let releases = SiteReleases::new(site_dir.to_owned());
+        let gate = ReleaseGate::for_spec(spec);
+        if releases.is_complete(id, &gate) {
+            let (releases, id) = (releases, id.to_owned());
+            return tokio::task::spawn_blocking(move || releases.switch_to(&id, &gate))
+                .await
+                .map_err(|source| ReleaseError::Blocking {
+                    context: "switch task",
+                    source,
+                })?;
+        }
+
+        let scratch = sites.scratch.clone();
         let archive = scratch.join(format!("{instance}-{id}.tar"));
         let result = async {
             let stream = self
                 .podman
                 .image_save(&pinned_ref(&spec.image, digest))
                 .await
-                .map_err(|e| format!("cannot export the image: {e}"))?;
+                .map_err(|e| ReleaseError::Export(e.to_string()))?;
             write_archive(&scratch, &archive, stream).await?;
-            let releases = site_dir.join("releases");
-            let partial = releases.join(format!("{id}.partial"));
-            let (a, p, r) = (archive.clone(), partial.clone(), releases.clone());
-            // `not_found_page` (#104, ADR 0069) gets the same fail-closed gate as `index.html`
-            // (ADR 0049): the release is rejected and `current` stays untouched when the custom 404
-            // page it names does not exist, rather than having nginx serve a confusing bare 404.
-            let not_found_page = spec
-                .ingress
-                .static_
-                .as_ref()
-                .and_then(|opts| opts.not_found_page.clone());
+            let (a, extract_store, check_gate, extract_id, limits) = (
+                archive.clone(),
+                releases.clone(),
+                gate.clone(),
+                id.to_owned(),
+                sites.limits,
+            );
             tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(&r).map_err(|e| format!("{}: {e}", r.display()))?;
+                let releases_dir = extract_store.releases_dir();
+                std::fs::create_dir_all(&releases_dir).map_err(|source| ReleaseError::Io {
+                    path: releases_dir.clone(),
+                    source,
+                })?;
+                let partial = extract_store.partial_dir(&extract_id);
                 // A leftover from a crashed deploy.
-                let _ = std::fs::remove_dir_all(&p);
-                extract_release(&a, &p, &ExtractLimits::default()).map_err(|e| e.to_string())?;
-                if !p.join("index.html").is_file() {
-                    let _ = std::fs::remove_dir_all(&p);
-                    return Err("the site has no index.html at its root".to_owned());
-                }
-                if let Some(page) = &not_found_page {
-                    // `not_found_page` is a release-relative path like `index.html` (ADR 0069), always
-                    // starting with `/` (`check_path_prefix`); strip it to join under the release dir.
-                    let relative = page.trim_start_matches('/');
-                    if !p.join(relative).is_file() {
-                        let _ = std::fs::remove_dir_all(&p);
-                        return Err(format!(
-                            "the site has no {page} at its root (ingress.static.not_found_page)"
-                        ));
-                    }
+                let _ = std::fs::remove_dir_all(&partial);
+                extract_release(&a, &partial, &limits)?;
+                if let Err(e) = check_gate.check(&partial) {
+                    let _ = std::fs::remove_dir_all(&partial);
+                    return Err(e);
                 }
                 Ok(())
             })
             .await
-            .map_err(|e| format!("extraction task failed: {e}"))??;
-            let (site, id) = (site_dir.to_owned(), id.to_owned());
-            tokio::task::spawn_blocking(move || publish(&site, &id))
+            .map_err(|source| ReleaseError::Blocking {
+                context: "extraction task",
+                source,
+            })??;
+            let (publish_store, publish_id) = (releases, id.to_owned());
+            tokio::task::spawn_blocking(move || publish_store.publish(&publish_id, &gate))
                 .await
-                .map_err(|e| format!("switch task failed: {e}"))?
+                .map_err(|source| ReleaseError::Blocking {
+                    context: "switch task",
+                    source,
+                })?
         }
         .await;
         let _ = std::fs::remove_file(&archive);
         result
     }
-}
-
-/// Whether `current` already points at a complete release `id`.
-fn serves(site_dir: &Path, id: &str) -> bool {
-    std::fs::read_link(site_dir.join("current")).is_ok_and(|t| t == Path::new("releases").join(id))
-        && site_dir
-            .join("releases")
-            .join(id)
-            .join("index.html")
-            .is_file()
 }
 
 /// Streams the exported image into a private scratch file: the archive is never held in memory, and a
@@ -204,27 +201,36 @@ async fn write_archive(
     scratch: &Path,
     archive: &Path,
     mut stream: TarStream,
-) -> Result<(), String> {
+) -> Result<(), ReleaseError> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
     let (dir, file) = (scratch.to_owned(), archive.to_owned());
-    let writer = tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let writer = tokio::task::spawn_blocking(move || -> Result<(), ReleaseError> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
+            .map_err(|source| ReleaseError::Io {
+                path: dir.clone(),
+                source,
+            })?;
         let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&file)
-            .map_err(|e| format!("{}: {e}", file.display()))?;
+            .map_err(|source| ReleaseError::Io {
+                path: file.clone(),
+                source,
+            })?;
         while let Some(chunk) = rx.blocking_recv() {
-            out.write_all(&chunk)
-                .map_err(|e| format!("{}: {e}", file.display()))?;
+            out.write_all(&chunk).map_err(|source| ReleaseError::Io {
+                path: file.clone(),
+                source,
+            })?;
         }
-        out.flush().map_err(|e| format!("{}: {e}", file.display()))
+        out.flush()
+            .map_err(|source| ReleaseError::Io { path: file, source })
     });
     let mut export = Ok(());
     while let Some(chunk) = stream.next().await {
@@ -236,51 +242,15 @@ async fn write_archive(
                 }
             }
             Err(e) => {
-                export = Err(format!("cannot export the image: {e}"));
+                export = Err(ReleaseError::Export(e.to_string()));
                 break;
             }
         }
     }
     drop(tx);
-    let written = writer
-        .await
-        .map_err(|e| format!("archive writer failed: {e}"))?;
+    let written = writer.await.map_err(|source| ReleaseError::Blocking {
+        context: "archive writer",
+        source,
+    })?;
     export.and(written)
-}
-
-/// Moves the unpacked `releases/<id>.partial` into place and points `current` at it with one `rename(2)`,
-/// so a request sees either the old site or the new one, never a mixture.
-fn publish(site_dir: &Path, id: &str) -> Result<(), String> {
-    let releases = site_dir.join("releases");
-    let (partial, release) = (releases.join(format!("{id}.partial")), releases.join(id));
-    if release.join("index.html").is_file() {
-        // Same digest deployed again (`--force`): the content is identical, keep what is served.
-        let _ = std::fs::remove_dir_all(&partial);
-    } else {
-        let _ = std::fs::remove_dir_all(&release);
-        std::fs::rename(&partial, &release).map_err(|e| format!("{}: {e}", release.display()))?;
-    }
-    let tmp = site_dir.join("current.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(Path::new("releases").join(id), &tmp)
-        .map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, site_dir.join("current"))
-        .map_err(|e| format!("{}: {e}", site_dir.join("current").display()))
-}
-
-/// Removes every release directory except those in `keep` (and any `.partial` leftovers). Best effort.
-async fn prune_releases(site_dir: &Path, keep: &[String]) {
-    let (releases, keep) = (site_dir.join("releases"), keep.to_vec());
-    let _ = tokio::task::spawn_blocking(move || {
-        let Ok(entries) = std::fs::read_dir(&releases) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if keep.len() <= KEPT_RELEASES && !keep.contains(&name) {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    })
-    .await;
 }

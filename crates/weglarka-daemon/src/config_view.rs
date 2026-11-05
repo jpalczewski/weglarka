@@ -51,6 +51,8 @@ pub(crate) fn project(host: &HostConfig) -> ConfigView {
         metrics,
         // Read by `status`/`doctor`, not part of this view.
         logs: _,
+        // Static-site extraction limits are engine policy; they do not change the app's shape.
+        sites: _,
     } = host;
     ConfigView {
         runtime: runtime_view(runtime),

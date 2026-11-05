@@ -161,6 +161,7 @@ struct State {
     stats_error: Option<String>,
     list_calls: usize,
     image_list_calls: usize,
+    image_save_calls: usize,
     /// Scripted `storage_info` (`None` = [`DEFAULT_STORAGE`]) and its injected failure.
     storage: Option<StorageInfo>,
     storage_error: Option<String>,
@@ -557,6 +558,11 @@ impl FakePodman {
     /// this counts retention runs (also kept out of [`Call`]).
     pub fn image_list_calls(&self) -> usize {
         self.lock().image_list_calls
+    }
+
+    /// How many times `image_save` was called, including calls that failed.
+    pub fn image_save_calls(&self) -> usize {
+        self.lock().image_save_calls
     }
 
     pub fn containers(&self) -> Vec<ContainerInfo> {
@@ -1488,6 +1494,7 @@ impl PodmanClient for FakePodman {
     async fn image_save(&self, reference: &str) -> Result<TarStream> {
         let mut s = self.lock();
         s.calls.push(Call::ImageSave(reference.to_owned()));
+        s.image_save_calls += 1;
         let archive = reference
             .rsplit_once('@')
             .and_then(|(_, d)| Digest::new(d).ok())

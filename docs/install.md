@@ -134,6 +134,11 @@ dir = "/var/lib/weglarka"                                  # apps.toml, state.to
 # Default 30. See the log-retention guide.
 retention = 30
 
+[sites]
+# Limits for unpacking a static site's image (kind = "static", see the static-sites guide).
+# max_files = 100000
+# max_bytes = "1g"                                       # bytes or <n>[k|m|g]; both values must be > 0
+
 # Directory with the apps' configuration files (see the host-configs guide). Mounted read-only into Węglarka's container.
 # Absolute, or relative to the directory of weglarka.toml. Unset = feature disabled.
 # config_root = "/var/lib/weglarka/config"
@@ -146,7 +151,7 @@ pids_limit = 256                                           # process/thread limi
 
 The guides for the optional parts of this file: [Host ports](guides/host-ports.md) (`allow_privileged_host_ports`),
 [Edge mode](guides/edge-mode.md) (`mode = "edge"`), [Host configs](guides/host-configs.md) (`config_root`),
-[Log retention](guides/log-retention.md) (`[logs]`).
+[Log retention](guides/log-retention.md) (`[logs]`), [Static sites](guides/static-sites.md) (`[sites]`).
 
 `[runtime] socket` is **not needed**: `platform install` works out the socket on the host
 (`/run/user/<uid>/podman/podman.sock`) and passes it to the container in the `WEGLARKA_PODMAN_SOCKET` variable in

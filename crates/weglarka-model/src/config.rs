@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::InstanceName;
+use crate::app::{InstanceName, MemoryLimit};
 use crate::events::Severity;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +24,10 @@ pub struct HostConfig {
     /// Retention of the ingress request logs (issue #502). Absent keeps the default (30 days).
     #[serde(default, skip_serializing_if = "LogsConfig::is_default")]
     pub logs: LogsConfig,
+    /// Extraction limits for static sites (`kind = "static"`, ADR 0049, #102). Absent keeps the
+    /// defaults (100 000 files, 1 GiB).
+    #[serde(default, skip_serializing_if = "SitesConfig::is_default")]
+    pub sites: SitesConfig,
     /// Host directory with the app config files/directories that `apps.toml`'s `configs` mount
     /// (issue #118, `docs/decisions/0028-config-root-mounts.md`). Absolute, or relative to the
     /// directory of `weglarka.toml` (the caller resolves it, like `[state] dir`). Unset = the
@@ -65,6 +69,7 @@ impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.ingress.validate()?;
         self.logs.validate()?;
+        self.sites.validate()?;
         validate_host_mount_allowlist(&self.runtime.host_mounts)?;
         validate_group_allowlist(&self.runtime.group_add)?;
         // Public ingress ports below 1024 are rootless Podman's privileged-port problem
@@ -159,6 +164,59 @@ impl Default for LogsConfig {
     fn default() -> Self {
         Self {
             retention: Self::default_retention(),
+        }
+    }
+}
+
+/// `[sites]` (issue #102, ADR 0049): bounds for unpacking one static site's image. The archive is
+/// untrusted, so extraction fails closed when it has more files or bytes than this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SitesConfig {
+    /// Maximum number of files and directories (explicit and implicit) created for one release.
+    #[serde(default = "SitesConfig::default_max_files")]
+    pub max_files: u64,
+    /// Maximum total size of the file contents in one release: bytes or `<n>[k|m|g]`, greater than
+    /// zero ([`MemoryLimit`]).
+    #[serde(default = "SitesConfig::default_max_bytes")]
+    pub max_bytes: MemoryLimit,
+}
+
+impl SitesConfig {
+    /// Same default as `ExtractLimits::default()` in the engine.
+    pub const DEFAULT_MAX_FILES: u64 = 100_000;
+    /// Same default as `ExtractLimits::default()` in the engine.
+    pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+    fn default_max_files() -> u64 {
+        Self::DEFAULT_MAX_FILES
+    }
+
+    fn default_max_bytes() -> MemoryLimit {
+        MemoryLimit::from_bytes(Self::DEFAULT_MAX_BYTES).expect("the default byte limit is > 0")
+    }
+
+    /// True when the value is exactly the default; the table then stays out of a serialized config.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_files == 0 {
+            return Err("[sites] max_files = 0: expected at least one file".to_owned());
+        }
+        if self.max_bytes.bytes() == 0 {
+            return Err("[sites] max_bytes = 0: expected a positive size".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Default for SitesConfig {
+    fn default() -> Self {
+        Self {
+            max_files: Self::default_max_files(),
+            max_bytes: Self::default_max_bytes(),
         }
     }
 }
@@ -1264,6 +1322,48 @@ kind = "systemd"
             ("[logs]\nretention = 3651", "1..=3650"),
             ("[logs]\nbogus = 1", "unknown field"),
             ("[logs]\nretention = \"forever\"", "did not match"),
+        ] {
+            let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}"));
+            match cfg {
+                Err(error) => assert!(error.to_string().contains(message), "{src}: {error}"),
+                Ok(host) => {
+                    let error = host.validate().expect_err(src);
+                    assert!(error.contains(message), "{src}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sites_limits_default_when_absent_and_parse_files_and_bytes() {
+        let absent = HostConfig::from_toml_str(SAMPLE).unwrap();
+        assert_eq!(absent.sites.max_files, 100_000);
+        assert_eq!(absent.sites.max_bytes.bytes(), 1024 * 1024 * 1024);
+        assert!(absent.sites.is_default());
+        absent.validate().unwrap();
+        assert!(
+            !toml::to_string(&absent).unwrap().contains("[sites]"),
+            "the default stays out of the serialized config"
+        );
+
+        for (src, files, bytes) in [
+            ("[sites]\nmax_files = 10\nmax_bytes = \"2m\"", 10, 2 << 20),
+            ("[sites]\nmax_bytes = 1048576", 100_000, 1 << 20),
+        ] {
+            let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}")).unwrap();
+            assert_eq!(cfg.sites.max_files, files, "{src}");
+            assert_eq!(cfg.sites.max_bytes.bytes(), bytes, "{src}");
+            assert!(!cfg.sites.is_default());
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn sites_limits_reject_zero_and_unknown_fields() {
+        for (src, message) in [
+            ("[sites]\nmax_files = 0", "max_files = 0"),
+            ("[sites]\nmax_bytes = 0", "invalid memory limit"),
+            ("[sites]\nbogus = 1", "unknown field"),
         ] {
             let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{src}"));
             match cfg {

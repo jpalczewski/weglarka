@@ -6,6 +6,8 @@ use crate::common::*;
 
 use hyper::StatusCode;
 use serde_json::{Value, json};
+use weglarka_engine::sites::release_id;
+use weglarka_model::app::Digest;
 use weglarka_model::state;
 
 fn blog() -> Value {
@@ -148,5 +150,100 @@ async fn removing_a_site_drops_its_instances() {
     assert!(apps["apps"].as_array().unwrap().is_empty());
     let (status, _) = admin(&h, "DELETE", "/v1/sites/blog", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    h.running.stop().await;
+}
+
+/// The static-site doctor checks (`sites.directory`, `sites.current`, ADR 0049, #101): silent
+/// without a `kind = "static"` app, and report-only.
+const BLOG_SITE: &str = r#"
+[apps.blog]
+kind = "static"
+image = "registry.example.com/me/blog:latest"
+domains = ["blog.example.com"]
+"#;
+
+fn blog_digest() -> String {
+    format!("sha256:{}", "a".repeat(64))
+}
+
+async fn static_harness() -> Harness {
+    let builder = Builder::new().apps(BLOG_SITE);
+    std::fs::create_dir_all(builder.root().join("state")).unwrap();
+    std::fs::write(
+        builder.root().join("state/state.toml"),
+        format!("[apps.blog]\ncurrent = \"{}\"\n", blog_digest()),
+    )
+    .unwrap();
+    builder.build().await
+}
+
+fn doctor_check<'a>(report: &'a Value, id: &str) -> Option<&'a Value> {
+    report["checks"]
+        .as_array()?
+        .iter()
+        .find(|check| check["id"] == id)
+}
+
+#[tokio::test]
+async fn doctor_is_quiet_about_static_sites_without_a_static_app() {
+    let h = harness().await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    assert!(
+        doctor_check(&report, "sites.directory").is_none(),
+        "{report}"
+    );
+    assert!(doctor_check(&report, "sites.current").is_none(), "{report}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_reports_the_sites_directory() {
+    let h = static_harness().await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = doctor_check(&report, "sites.directory").expect("sites.directory reported");
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(check["hint"].is_string(), "{check}");
+
+    let root = h.root.join("state/nginx/sites");
+    std::fs::create_dir_all(&root).unwrap();
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = doctor_check(&report, "sites.directory").expect("sites.directory reported");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains(&root.display().to_string()),
+        "{check}"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_warns_about_a_current_release_that_does_not_match_state() {
+    let h = static_harness().await;
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = doctor_check(&report, "sites.current").expect("sites.current reported");
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"].as_str().unwrap().contains("blog"),
+        "{check}"
+    );
+
+    // A complete release plus the relative `current` link makes the check pass.
+    let id = release_id(&Digest::new(blog_digest()).unwrap());
+    let site = h.root.join("state/nginx/sites/blog");
+    let release = site.join("releases").join(&id);
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("index.html"), "<h1>hi</h1>").unwrap();
+    std::os::unix::fs::symlink(
+        std::path::Path::new("releases").join(&id),
+        site.join("current"),
+    )
+    .unwrap();
+
+    let (_, report) = admin(&h, "GET", "/v1/doctor", None).await;
+    let check = doctor_check(&report, "sites.current").expect("sites.current reported");
+    assert_eq!(check["status"], "ok", "{check}");
     h.running.stop().await;
 }
