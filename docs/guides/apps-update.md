@@ -23,6 +23,7 @@ When the daemon is busy with another deploy (the health gate can take tens of se
 | `--start` / `--no-start` (`start` in `--spec`) | `start = false` removes the container (the volume and UID range stay), `start = true` deploys immediately: pull, health gate, rollback on failure. `spec-hash` unchanged — see [stopped apps](stopped-apps.md) |
 | `--command` (`command` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the flags replace the whole argument vector, and `--command none` restores the image's `CMD` — see [container command](container-command.md) |
 | `--host-port` (`host_ports` in `--spec`) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the published port is recreated together with the container — see [host ports](host-ports.md) |
+| `internal_hosts` in `--spec` (no flag) | changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); the `/etc/hosts` entries are fixed when it is created — see [reaching your own domains](internal-hosts.md) |
 | `--config-mount` (`configs` in `--spec`), `--reload-signal` | the `configs` list changes `spec-hash` → the next reconcile recreates the container from the pinned digest (no pull); file **contents** are not in the hash, so apply content changes with `weglarka apps reload`. `reload_signal` is outside the hash and only affects reload — see [host configs](host-configs.md) |
 
 ## Waiting for the result: `--wait`

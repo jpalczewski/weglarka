@@ -48,6 +48,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 |---|---|
 | [Host ports](host-ports.md) | `host_ports` (non-HTTP services such as SSH) |
 | [Shared networks](shared-networks.md) | `shared_networks` between apps |
+| [Reaching your own domains](internal-hosts.md) | `internal_hosts`: an app calls a domain this host serves (Podman's host-gateway) |
 | [Path routing](path-routing.md) | `paths` and `strip_prefix` on one domain |
 | [Streaming](streaming.md) | SSE and long polling |
 | [Request body size](max-body-size.md) | `ingress.max_body_size` |

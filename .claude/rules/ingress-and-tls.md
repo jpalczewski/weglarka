@@ -5,7 +5,7 @@ paths:
   - "crates/weglarka-dns/**"
   - "crates/weglarka-daemon/src/{ingress,health_probe,acme,cdn,forwarder}.rs"
   - ".github/scripts/test-*.sh"
-  - "docs/guides/{edge-mode,edge-cdn,acme,acme-behind-cdn,wildcard-certificates,path-routing,forward-auth,max-body-size,streaming,static-sites,access-log,host-ports}.md"
+  - "docs/guides/{edge-mode,edge-cdn,acme,acme-behind-cdn,wildcard-certificates,path-routing,forward-auth,max-body-size,streaming,static-sites,access-log,host-ports,internal-hosts}.md"
 ---
 
 # Ingress, edge mode, TLS and ACME
@@ -36,6 +36,14 @@ paths:
   rename is followed by `nginx -t` + **SIGHUP** through `IngressManager::reopen_logs()`, serialized with `apply`;
   never `USR1` (the worker uid 101 cannot open the daemon-owned `0700` directory, and nginx would keep writing to the
   renamed file). `weglarka access` reads the files; keep the mount set narrow and the directory private.
+
+- **Apps reach their own domains (#303, ADR 0071):** `AppSpec::internal_hosts` becomes
+  `ContainerSpec::host_aliases` → `CreateContainer.hostadd = ["<domain>:host-gateway"]`, which Podman resolves to
+  `169.254.1.2` and writes into `/etc/hosts` at every container start (IPv4 only; `host_containers_internal_ip` in
+  `containers.conf` decides the address, `none` makes the start fail). It is part of `spec_hash` only when non-empty,
+  every entry must be a domain this host serves (`weglarka_model::internal_hosts::validate`), and `doctor`'s static
+  `ingress.internal_hosts` check warns about a loopback/IPv6 `https_bind` or a missing certificate pair. Internal
+  calls arrive from `169.254.1.2` in `edge` — never trust or rate-limit on that address.
 
 - **Admin relay carve-out (ADR 0060):** `Plan::build` sets `AppRoute::admin_relay` for an `[admin.http] clients` app served
   at `/`, and the nginx generator renders `RELAY_PREFIX` (`weglarka_model::admin_auth`) as unguarded, long-lived locations
