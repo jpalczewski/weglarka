@@ -59,17 +59,19 @@ If the new image does not start at all, a manual pin also works:
 
 A self-update replaces the **image**; the `weglarka-daemon` binary the timers run is host-side and is not replaced with it (that handoff is [ADR 0067](../decisions/0067-managed-images-and-platform-updates.md) work, issue #203). When the new image raises `state::SCHEMA_VERSION`, the older host binaries cannot read `state.toml` any more and stop:
 
-- `weglarka-self-update.service` fails, the journal says "schema version N is newer than this daemon supports (M)";
+- `weglarka-self-update.service` fails; the journal shows "self-update stopped: the state is newer than the host binaries" and the run's result "refused: the state files are at schema N, but the host binaries support only schema M …" (a host binary from before this reporting prints "schema version N is newer than this daemon supports (M)" instead);
 - `self-update.toml` records the stop with `host_tools_stale = true` — "the state files are at schema N, but the host binaries support only schema M …";
 - `weglarka doctor` reports the `self_update` check as **fail** with that message and the fix, instead of the misleading "the switcher has not run recently".
 
 A host binary older than this reporting records nothing, so there the journal message is the only trace. Apps keep running either way; only the automatic update is stopped (a stopped switcher must not replace the image while it cannot tell what the state needs — [ADR 0023](../decisions/0023-state-schema-version.md)). Recovery:
 
 1. install the host binaries (`weglarka-daemon`, `weglarka`) from the **same release as the running image** — from the release tarball or by extracting them from the image, see [installation](../install.md#host-binaries) and [verifying the image and binaries](../install.md#verifying-the-image-and-binaries);
-2. make the timers use them: `platform install` on a daemon-only setup, `platform bootstrap` on the launcher setup ([platform updates](platform-updates.md));
+2. make the timers use them: `platform install` on a daemon-only setup;
 3. check: `weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --check` and `weglarka doctor | grep self_update`.
 
-The recorded error stays until the next successful run (the interval still applies; `--force` retries now) and does not block it.
+The first run that can read the state again clears the recorded stop, also when the image is already the running one, so `doctor` returns to `ok` right after step 3 (without `--check`, the next timer run does it once the interval has passed).
+
+**Launcher setup.** There the timers run the active **generation** from the generation store, not `/usr/local/bin`, so installing new binaries changes nothing, and `platform bootstrap` refuses a host that is already bootstrapped with another generation. An in-place refresh of the generation is not implemented yet (ADR 0067, issue #203). The existing commands allow a detour that has not been verified end to end: `platform downgrade` (back to the daemon-only setup, see [platform updates](platform-updates.md); on OpenRC this leaves no daemon running until the next step), then `platform bootstrap --generation sha256:<digest of the running image> --dry-run` with the new binaries, and the same without `--dry-run` once the plan looks right.
 
 **6. Trial on the host (optional).** CI has no user systemd, so the watchdog behavior is checked by hand:
 

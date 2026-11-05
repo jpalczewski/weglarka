@@ -254,8 +254,8 @@ pub fn stale_host_tools_message(found: u32, supported: u32) -> String {
         "the state files are at schema {found}, but the host binaries support only schema \
          {supported}: the running daemon is newer than the tools on this host, so the switcher \
          cannot tell what the state needs. Install the host binaries from the same release as the \
-         running image (docs/install.md, section `Host binaries`) and re-run `platform install` \
-         (`platform bootstrap` on the launcher setup); see docs/guides/self-update.md"
+         running image (docs/install.md, section `Host binaries`) and re-run `platform install`; \
+         the launcher setup has no in-place refresh yet, see docs/guides/self-update.md"
     )
 }
 
@@ -322,6 +322,16 @@ impl SelfUpdateState {
     /// Forgets the previous failure (a different digest is being tried).
     pub fn clear_error(&mut self) {
         self.error = None;
+    }
+
+    /// Drops a recorded host-tools stop (issue #203) and says whether there was one; any other
+    /// recorded error stays.
+    pub fn clear_stale_host_tools(&mut self) -> bool {
+        let stale = self.error.as_ref().is_some_and(|e| e.host_tools_stale);
+        if stale {
+            self.error = None;
+        }
+        stale
     }
 
     /// Reconciles `pending` with the digest this daemon really runs; see [`Confirmation`].

@@ -209,6 +209,7 @@ where
         Ok(schema) => schema,
         Err(e) => return refuse_newer_state(&state_dir, &mut st, e, now),
     };
+    host_tools_fixed(&state_dir, &mut st)?;
 
     // `--force` is the documented override for the schema gate (a deliberate downgrade); it never
     // overrides the signature check.
@@ -356,6 +357,7 @@ where
         Ok(schema) => schema,
         Err(e) => return refuse_newer_state(state_dir, st, e, now),
     };
+    host_tools_fixed(state_dir, st)?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
         && !options.force
@@ -404,6 +406,17 @@ fn newer_state_schema(error: &Error) -> Option<(u32, u32)> {
         }) => Some((*found, *supported)),
         _ => None,
     }
+}
+
+/// Clears a recorded host-tools stop once this binary reads the state again (issue #203): the
+/// operator refreshed the host binaries, so the `doctor` failure must not outlive the cause. Other
+/// errors stay — they are about a digest and are cleared by the run that resolves them.
+fn host_tools_fixed(state_dir: &Path, st: &mut SelfUpdateState) -> Result<(), Error> {
+    if st.clear_stale_host_tools() {
+        tracing::info!("self-update resumed: the host binaries read the state again");
+        state::save(state_dir, st)?;
+    }
+    Ok(())
 }
 
 /// Turns "`state.toml` is newer than this host binary" into a refusal that is written down
@@ -804,12 +817,15 @@ where
                 .as_ref()
                 .is_some_and(|e| e.host_tools_stale && e.message == reason)
             {
-                st.record_stale_host_tools(found, supported, Some(switch.to.clone()), now);
+                // `None`, like the switcher: the stop is about the host tools, not about
+                // `switch.to`, and a digest here would make `failed_for` refuse that image later.
+                st.record_stale_host_tools(found, supported, None, now);
                 state::save(state_dir, st)?;
             }
             return Ok(WatchReport::GivenUp { reason });
         }
     };
+    host_tools_fixed(state_dir, st)?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
     {
@@ -1436,6 +1452,55 @@ dir = "{root}/state"
         );
     }
 
+    /// The normal #203 recovery: the operator installs the new host binaries and runs `--check`;
+    /// the image is the one already running (`UpToDate`), and the stop must not outlive its cause.
+    #[tokio::test]
+    async fn a_fixed_host_clears_the_recorded_stop() {
+        let ctx = Ctx::new(true);
+        std::fs::write(&ctx.settings.paths.state.state, "schema_version = 99\n").unwrap();
+        assert!(matches!(
+            ctx.run(Options::default()).await,
+            Report::Refused { .. }
+        ));
+        assert!(ctx.state().error.is_some_and(|e| e.host_tools_stale));
+
+        // New host binaries: the state is readable again. The pulled digest is already `current`.
+        std::fs::remove_file(&ctx.settings.paths.state.state).unwrap();
+        let running = digest_of('a');
+        ctx.pulled_digest(&running);
+        let mut st = ctx.state();
+        st.current = Some(running);
+        ctx.save_state(&st);
+        let report = ctx
+            .run(Options {
+                check: true,
+                ..Options::default()
+            })
+            .await;
+        assert!(matches!(report, Report::UpToDate { .. }), "{report:?}");
+        assert_eq!(
+            ctx.state().error,
+            None,
+            "the stop is cleared by a readable state"
+        );
+    }
+
+    /// A refusal about a digest is not touched by the host-tools clean-up.
+    #[test]
+    fn only_the_host_tools_stop_is_cleared() {
+        let mut st = SelfUpdateState::default();
+        st.record_error(
+            "unsigned image",
+            Some(digest_of('c')),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(!st.clear_stale_host_tools());
+        assert!(st.error.is_some());
+        st.record_stale_host_tools(99, 1, None, SystemTime::UNIX_EPOCH);
+        assert!(st.clear_stale_host_tools());
+        assert_eq!(st.error, None);
+    }
+
     #[tokio::test]
     async fn a_newer_state_stops_the_watchdog_fallback_and_reports_it() {
         let ctx = Ctx::new(true);
@@ -1463,7 +1528,11 @@ dir = "{root}/state"
         assert_eq!(ctx.platform.restarts(), 0);
         let error = ctx.state().error.expect("the stop is recorded");
         assert!(error.host_tools_stale);
-        assert_eq!(error.digest, Some(switch_to));
+        assert_eq!(
+            error.digest, None,
+            "the stop is not about the switched-to image"
+        );
+        assert!(!ctx.state().failed_for(&switch_to));
 
         // The watchdog wakes every minute; a second run must not rewrite the file for the same
         // reason.

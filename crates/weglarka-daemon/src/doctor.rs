@@ -364,7 +364,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         (
             CheckStatus::Fail,
             Some(
-                "install the host binaries from the same release as the running image (docs/install.md, section `Host binaries`) and re-run `platform install`; `docs/guides/self-update.md` has the step",
+                "install the host binaries from the same release as the running image (docs/install.md, section `Host binaries`) and re-run `platform install` (the launcher setup has no in-place refresh yet); `docs/guides/self-update.md` has the steps",
             ),
         )
     } else if state.error.is_some() {
