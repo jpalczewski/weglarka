@@ -15,6 +15,7 @@ provider = "cloudflare"
 token_file = "/var/lib/weglarka/cloudflare-token"   # a 0600 file, absolute path
 wildcards = ["example.com"]                          # apexes: creates *.example.com + example.com
 propagation_secs = 30                                # optional (default 30): wait after publishing the TXT records
+prefer_wildcard = false                              # optional (default false): the wildcard outranks an own pair
 ```
 
 - **Cloudflare token:** create an API token with `Zone → Zone → Read` and `Zone → DNS → Edit` permissions
@@ -33,17 +34,19 @@ propagation_secs = 30                                # optional (default 30): wa
   before certificate. The name contains no `*`.
 - **Which domains a wildcard serves:** the apex and domains **one label below** (`example.com`,
   `app.example.com`, `pr-42.example.com`; not `a.b.example.com`). nginx picks the certificate by domain name: **an
-  own `<domain>.crt|key` pair always wins**, otherwise it takes the wildcard of the longest matching apex
-  (`tls/_wildcard.<apex>.crt|key`), and a domain without any pair still has no TLS server (handshake rejected, as
-  in [edge mode](edge-mode.md)). A wildcard reaches `nginx.conf` like any certificate: through `nginx -t` +
-  SIGHUP, without recreating the container. A wildcard pair put there by hand (without `[acme.dns]`) works the
-  same way, but you are responsible for the certificate really covering `*.<apex>` and `<apex>`.
+  own `<domain>.crt|key` pair wins** unless `prefer_wildcard` says otherwise, otherwise it takes the wildcard of
+  the longest matching apex (`tls/_wildcard.<apex>.crt|key`), and a domain without any pair still has no TLS server
+  (handshake rejected, as in [edge mode](edge-mode.md)). A wildcard reaches `nginx.conf` like any certificate:
+  through `nginx -t` + SIGHUP, without recreating the container. A wildcard pair put there by hand (without
+  `[acme.dns]`) works the same way, but you are responsible for the certificate really covering `*.<apex>` and
+  `<apex>`.
 - **What about per-domain certificates:** the worker does not order an HTTP-01 certificate for a domain that
   (1) has no certificate of its own and (2) is covered by a valid (existing, unexpired) wildcard from
   `wildcards`. The wildcard goes first in a pass, so a new domain (e.g. a PR preview, #105) is served right away
   without a separate order. A domain that **already has** its own certificate keeps being renewed (nginx prefers
   the own one, so an expired one must not remain); to move it to the wildcard, remove its `tls/<domain>.crt|key`
-  and wait for the next pass. A failed or expired wildcard = domains fall back to their own HTTP-01 certificates.
+  and wait for the next pass, or set `[acme.dns] prefer_wildcard` (see below), which leaves the pair on disk. A
+  failed or expired wildcard = domains fall back to their own HTTP-01 certificates.
 - **`doctor`:** `acme.dns` (provider, token file mode) and `acme.wildcards` (missing/expired/due for renewal).
   A missing wildcard before the first pass is a `warn`. `acme.certs` and `ingress.tls` (and `doctor --preflight`)
   treat a domain covered by a wildcard as served.
@@ -54,9 +57,44 @@ propagation_secs = 30                                # optional (default 30): wa
 - **Live test (opt-in):** on a separate development zone; skipped in CI, and the adapter and solver logic is
   tested against a Cloudflare API fake.
 
+## Precedence: the wildcard or the domain's own pair
+
+A routed domain is served with its own pair (`tls/<domain>.crt|key`) when one exists, and with the wildcard of the
+longest covering apex only otherwise. That is right for a pair you placed deliberately, but it means every covered
+domain keeps its own renewal over HTTP-01 — also the pairs a host carried over from another proxy, or the ones
+issued before `[acme.dns]` existed.
+
+`prefer_wildcard` flips that precedence for covered domains:
+
+```toml
+[acme.dns]
+provider = "cloudflare"
+token_file = "/var/lib/weglarka/cloudflare-token"
+wildcards = ["example.com"]
+prefer_wildcard = true
+```
+
+- **What it does:** a domain covered by a valid (existing, unexpired) wildcard is served with the wildcard even
+  when it has a pair of its own, and the worker stops renewing that pair. One selection rule decides this for the
+  generator, the worker and `GET /v1/certificates` (`docs/decisions/0077`), so they cannot disagree.
+- **Your pairs are never touched:** the daemon does not delete, move or rewrite anything in `tls/`. A pair that is
+  no longer served simply stops being renewed and stays as a fallback; delete it whenever you like.
+- **Fallback:** a wildcard that failed to renew or has expired does not count as covering any more (in this mode
+  the daemon reads only its `.crt`), so the worker orders the domain's own certificate over HTTP-01 again. That
+  path needs what HTTP-01 always needs — port 80 reachable, or the [CDN](acme-behind-cdn.md) / zone rule — and a
+  pair that was not renewed for months may itself be expired by then, which is the one renewal the fallback
+  cannot avoid.
+- **When to use it:** a host migrated from another proxy (its old per-domain pairs sit in `tls/`), or per-domain
+  certificates issued before `[acme.dns]` was configured, with a wildcard that covers them reliably.
+- **`doctor`:** without the setting, `acme.shadowed` lists the domains whose own pair shadows a valid wildcard and
+  suggests either remedy — deleting `tls/<domain>.crt|key` or setting `prefer_wildcard`. With the setting the
+  check stays silent, and such a domain is reported as `covered` by `GET /v1/certificates`.
+- **Default:** `false` — nothing changes in what is served or renewed, byte for byte.
+
 ## Rollback
 
 `[acme.dns]` is a new sub-block of the `[acme]` section with `deny_unknown_fields`, so **an older daemon refuses
 to start** until you remove it (the same as `[acme]` in [ACME certificates](acme.md)). Remove `[acme.dns]` and
-restart (this includes `propagation_secs`, which an older daemon does not know); issued wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
+restart (this includes `propagation_secs` and `prefer_wildcard`, which an older daemon does not know); issued
+wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
 dashboard. `apps.toml`/`state.toml` did not change (no schema version bump).

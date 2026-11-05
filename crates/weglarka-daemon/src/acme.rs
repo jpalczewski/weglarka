@@ -6,8 +6,9 @@
 //! [`weglarka_acme::Manager`] to issue or renew what is missing or inside the renewal window, emits
 //! the resulting events and, when a file changed, asks the ingress to apply — it rescans `tls/` and
 //! reloads nginx (`nginx -t` + SIGHUP), it never recreates the container (ADR 0036). The wildcard
-//! certificates go through a second manager (same store, a DNS-01 solver); the ingress does not
-//! serve them yet, so every routed domain keeps its own HTTP-01 certificate.
+//! certificates go through a second manager (same store, a DNS-01 solver); a routed domain is then
+//! served by the wildcard of the apex that covers it (ADR 0039), while a domain with a pair of its own
+//! keeps it — unless `[acme.dns] prefer_wildcard` makes the wildcard win (ADR 0077).
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,8 @@ use weglarka_acme::{
 };
 use weglarka_dns::{Cloudflare, DnsError, DnsProvider, RecordHandle};
 use weglarka_model::config::{
-    AcmeConfig, AcmeDnsConfig, DnsProviderKind, WILDCARD_CERT_PREFIX, wildcard_covers,
+    AcmeConfig, AcmeDnsConfig, CertChoice, DnsProviderKind, WILDCARD_CERT_PREFIX,
+    choose_certificate, wildcard_covers,
 };
 use weglarka_model::events::{Event, EventSink};
 use weglarka_model::secret_store::SecretValue;
@@ -114,6 +116,9 @@ struct DnsIssuer<C, P> {
     specs: Vec<CertSpec>,
     /// The apexes behind `specs`, to decide which domains a wildcard already covers.
     apexes: Vec<String>,
+    /// `[acme.dns] prefer_wildcard`: a covered domain is served with the wildcard even when it has a
+    /// pair of its own, so that pair stops being renewed (issue #210, `docs/decisions/0077`).
+    prefer_wildcard: bool,
 }
 
 pub struct AcmeWorker<C, P = DnsBackend> {
@@ -162,13 +167,14 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
 
     /// Adds a wildcard certificate (`*.<apex>` and `<apex>`, stored as `_wildcard.<apex>`) per
     /// apex, ordered over DNS-01 through `provider`. `client` is a second ACME client for the same
-    /// account: a manager owns its client.
+    /// account: a manager owns its client. `prefer_wildcard` is `[acme.dns] prefer_wildcard`.
     pub fn with_dns(
         mut self,
         client: C,
         provider: P,
         wildcards: &[String],
         propagation: Duration,
+        prefer_wildcard: bool,
     ) -> Result<Self, AcmeError> {
         let specs = wildcards
             .iter()
@@ -184,6 +190,7 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
             manager,
             specs,
             apexes: wildcards.to_vec(),
+            prefer_wildcard,
         });
         Ok(self)
     }
@@ -295,12 +302,15 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
         }
     }
 
-    /// One single-name certificate per routed domain, except a domain that has no certificate of its
-    /// own and is covered by a valid wildcard on disk (it is served with the wildcard, issue #97). A
-    /// domain that already has its own certificate keeps being renewed — nginx prefers it, so letting
-    /// it expire would serve an expired certificate — and a failed or missing wildcard falls back to
-    /// per-domain issuance. A name that cannot be a public DNS name (nothing an ACME CA would sign)
-    /// is skipped with a warning.
+    /// One single-name certificate per routed domain, except a domain a wildcard serves: with the
+    /// preference `[acme.dns] prefer_wildcard` a covered domain is served by the wildcard even when it
+    /// has a pair of its own (so that pair is neither renewed nor touched, issue #210,
+    /// `docs/decisions/0077`), and without it only a domain that has no pair of its own is skipped
+    /// (issue #97). A domain that already has its own certificate otherwise keeps being renewed —
+    /// nginx prefers it, so letting it expire would serve an expired certificate — and a failed or
+    /// missing wildcard falls back to per-domain issuance. The decision is [`choose_certificate`], the
+    /// same rule the ingress renders. A name that cannot be a public DNS name (nothing an ACME CA
+    /// would sign) is skipped with a warning.
     fn specs(&self, now: SystemTime) -> Result<Vec<CertSpec>, String> {
         let apps = state::load_apps(&self.apps_path).map_err(|e| e.to_string())?;
         let mut domains = vec![self.webhook_domain.clone()];
@@ -326,15 +336,22 @@ impl<C: AcmeClient + CertInspector, P: DnsProvider> AcmeWorker<C, P> {
                     .map(|(apex, _)| apex.as_str())
             })
             .collect();
+        let prefer_wildcard = self.dns.as_ref().is_some_and(|dns| dns.prefer_wildcard);
         Ok(domains
             .iter()
             .filter(|domain| {
                 let own = self.tls.join(format!("{domain}.crt")).exists();
-                let covered = !own && covering.iter().any(|apex| wildcard_covers(apex, domain));
-                if covered {
-                    tracing::debug!(%domain, "served by a wildcard certificate, no certificate of its own");
+                match choose_certificate(domain, own, &covering, prefer_wildcard) {
+                    Some(CertChoice::Wildcard(apex)) => {
+                        tracing::debug!(
+                            %domain,
+                            %apex,
+                            "served by a wildcard certificate, no certificate of its own"
+                        );
+                        false
+                    }
+                    _ => true,
                 }
-                !covered
             })
             .filter_map(|domain| match CertSpec::single(domain) {
                 Ok(spec) => Some(spec),
@@ -468,6 +485,7 @@ pub fn build<P: weglarka_model::podman::PodmanClient + 'static>(
                 backend,
                 &dns.wildcards,
                 Duration::from_secs(dns.propagation_secs),
+                dns.prefer_wildcard,
             )
             .map_err(|e| StartError::Acme(format!("[acme.dns] {e}")))?;
     }
@@ -538,10 +556,20 @@ mod tests {
     }
 
     fn rig(apps_toml: &str) -> Rig {
-        rig_with_wildcards(apps_toml, &[])
+        rig_with_preference(apps_toml, &[], false)
     }
 
     fn rig_with_wildcards(apps_toml: &str, wildcards: &[&str]) -> Rig {
+        rig_with_preference(apps_toml, wildcards, false)
+    }
+
+    /// `[acme.dns] prefer_wildcard = true` (issue #210): a covered domain is served with the wildcard
+    /// even when it has a pair of its own.
+    fn rig_preferring_wildcard(apps_toml: &str, wildcards: &[&str]) -> Rig {
+        rig_with_preference(apps_toml, wildcards, true)
+    }
+
+    fn rig_with_preference(apps_toml: &str, wildcards: &[&str], prefer_wildcard: bool) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("acme")).unwrap();
         let apps_path = dir.path().join("apps.toml");
@@ -586,6 +614,7 @@ mod tests {
                     SharedDns(dns.clone()),
                     &apexes,
                     Duration::ZERO,
+                    prefer_wildcard,
                 )
                 .unwrap()
         };
@@ -738,6 +767,45 @@ mod tests {
         assert!(orders.contains(&"blog.example.eu".to_owned()), "{orders:?}");
     }
 
+    /// `[acme.dns] prefer_wildcard` (issue #210): the wildcard serves `blog.example.eu` now, so its own
+    /// pair is neither renewed nor removed — it waits on disk for a wildcard that fails.
+    #[tokio::test]
+    async fn with_the_preference_a_covered_own_pair_is_not_renewed() {
+        let rig = rig_preferring_wildcard(APPS, &["example.eu"]);
+        let tls = rig.dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let soon = FakeAcme::chain_expiring_at(SystemTime::now() + DAYS(5));
+        std::fs::write(tls.join("blog.example.eu.crt"), &soon).unwrap();
+        std::fs::write(tls.join("blog.example.eu.key"), "old").unwrap();
+        assert!(rig.worker.pass().await);
+        let orders: Vec<String> = rig
+            .fake
+            .0
+            .orders()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert!(
+            !orders.contains(&"blog.example.eu".to_owned()),
+            "covered by the wildcard: {orders:?}"
+        );
+        // `www.blog.example.eu` is two labels below the apex, which no wildcard covers.
+        assert!(
+            orders.contains(&"www.blog.example.eu".to_owned()),
+            "{orders:?}"
+        );
+        assert_eq!(orders[0], "_wildcard.example.eu");
+        // The pair the operator has is left exactly as it was, never deleted or moved.
+        assert_eq!(
+            std::fs::read(tls.join("blog.example.eu.crt")).unwrap(),
+            soon
+        );
+        assert_eq!(
+            std::fs::read(tls.join("blog.example.eu.key")).unwrap(),
+            b"old"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_wildcard_falls_back_to_a_certificate_per_domain() {
         let rig = rig_with_wildcards(APPS, &["example.eu"]);
@@ -765,6 +833,41 @@ mod tests {
             1,
             "the issued certificates are applied"
         );
+    }
+
+    /// With the preference the fallback still works: no valid wildcard on disk means per-domain
+    /// issuance, including the renewal of a pair the wildcard would otherwise have replaced.
+    #[tokio::test]
+    async fn with_the_preference_a_failed_wildcard_falls_back_to_a_certificate_per_domain() {
+        let rig = rig_preferring_wildcard(APPS, &["example.eu"]);
+        let tls = rig.dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let soon = FakeAcme::chain_expiring_at(SystemTime::now() + DAYS(5));
+        std::fs::write(tls.join("blog.example.eu.crt"), soon).unwrap();
+        std::fs::write(tls.join("blog.example.eu.key"), "old").unwrap();
+        rig.fake.0.fail_next("DNS propagation timed out");
+        assert!(!rig.worker.pass().await);
+        assert_eq!(
+            certs_on_disk(&rig),
+            [
+                "blog.example.eu.crt",
+                "hook.example.eu.crt",
+                "site.example.org.crt",
+                "www.blog.example.eu.crt"
+            ]
+        );
+        let orders: Vec<String> = rig
+            .fake
+            .0
+            .orders()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert!(
+            orders.contains(&"blog.example.eu".to_owned()),
+            "the own pair is renewed over HTTP-01 again: {orders:?}"
+        );
+        assert_eq!(rig.worker.status().snapshot().failures.len(), 1);
     }
 
     #[test]
@@ -802,6 +905,7 @@ mod tests {
             SharedDns(rig.dns.clone()),
             &["Not A Domain".into()],
             Duration::ZERO,
+            false,
         );
         assert!(err.is_err());
     }

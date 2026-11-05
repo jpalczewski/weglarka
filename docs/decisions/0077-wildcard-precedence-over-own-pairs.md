@@ -1,6 +1,6 @@
 # 0077 — Opt-in wildcard precedence over a domain's own certificate pair
 
-Status: proposed (2026-11-05, issue #210)
+Status: accepted (2026-11-05, issue #210)
 
 ## Problem
 

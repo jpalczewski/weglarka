@@ -107,6 +107,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[admin.http]` (the unix socket keeps working; remove the panel app first and `[identity]` last) | [admin API tokens](admin-api-tokens.md), [admin panel](admin-panel.md) |
 | `weglarka.toml` | `[acme]` (or set `enabled = false` before rolling back to a release that knows it) | [ACME certificates](acme.md) |
 | `weglarka.toml` | `[acme.dns]` | [wildcard certificates](wildcard-certificates.md) |
+| `weglarka.toml` | `[acme.dns] prefer_wildcard` (the line; the rest of the section can stay on a daemon that knows `[acme.dns]`) | [wildcard certificates](wildcard-certificates.md) |
 | `weglarka.toml` | `[ingress.cdn]` | [edge behind a CDN](edge-cdn.md) |
 | `weglarka.toml`, edge mode | set `mode = "behind"`, remove `https_bind`, restore `traefik_dynamic_file` | [edge mode](edge-mode.md) |
 

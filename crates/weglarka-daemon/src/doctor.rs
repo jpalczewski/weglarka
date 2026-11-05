@@ -2110,7 +2110,7 @@ fn shadowed_check(certs: &[certificates::Cert]) -> Option<DoctorCheck> {
         Some(
             "nginx serves a domain's own pair before a covering wildcard and the ACME worker keeps \
              renewing it; delete tls/<domain>.crt and tls/<domain>.key to serve the domain with the \
-             wildcard",
+             wildcard, or set `[acme.dns] prefer_wildcard = true`",
         ),
     ))
 }
@@ -2177,6 +2177,18 @@ mod shadowed_tests {
         ];
         assert!(shadowed_check(&certs).is_none());
         assert!(shadowed_check(&[]).is_none());
+    }
+
+    /// `[acme.dns] prefer_wildcard` (issue #210): with the preference the wildcard is the pair that is
+    /// served, so the reader sets no `shadowed_by` and the check stays silent.
+    #[test]
+    fn with_the_preference_nothing_is_shadowed() {
+        let certs = vec![
+            // `collect_with` reports a covered domain, with or without a pair of its own.
+            cert("own.example.com", true, Some("example.com"), None),
+            cert("app.example.com", false, Some("example.com"), None),
+        ];
+        assert!(shadowed_check(&certs).is_none());
     }
 }
 

@@ -257,11 +257,13 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
                 token_file: _,
                 wildcards,
                 propagation_secs,
+                prefer_wildcard,
             } = dns;
             AcmeDnsView {
                 provider: *provider,
                 wildcards: wildcards.clone(),
                 propagation_secs: *propagation_secs,
+                prefer_wildcard: *prefer_wildcard,
             }
         }),
     }
@@ -380,6 +382,7 @@ email = "SECRET-acme-contact@example.org"
 provider = "cloudflare"
 token_file = "/SECRET/cloudflare-token"
 wildcards = ["example.com"]
+prefer_wildcard = true
 
 [identity]
 provider = "authelia"
@@ -463,6 +466,8 @@ domain = "hooks.example.com"
             v["acme"]["dns"]["wildcards"],
             serde_json::json!(["example.com"])
         );
+        // The precedence knob is public configuration (issue #210, docs/decisions/0077).
+        assert_eq!(v["acme"]["dns"]["prefer_wildcard"], true);
         assert_eq!(v["identity"]["instance"], "authelia");
     }
 }

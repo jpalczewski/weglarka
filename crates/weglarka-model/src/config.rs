@@ -947,10 +947,21 @@ pub struct AcmeDnsConfig {
     /// checks once, and a record its resolvers cannot see yet fails the order.
     #[serde(default = "default_propagation_secs")]
     pub propagation_secs: u64,
+    /// Serve a domain covered by a valid wildcard with the wildcard even when it has a pair of its
+    /// own, and stop renewing that pair (which stays on disk as a fallback, issue #210,
+    /// `docs/decisions/0077`). Off by default: an own pair wins, exactly as before the setting
+    /// existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prefer_wildcard: bool,
 }
 
 fn default_propagation_secs() -> u64 {
     30
+}
+
+/// Skips a `false` flag when serializing, so a config without the option keeps its shape.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// File-stem prefix of a wildcard certificate in the TLS directory: `_wildcard.<apex>.crt|key`
@@ -1953,6 +1964,29 @@ domain = "weglarka.example.com"
         ));
         assert!(dns_parse_fails("wildcards = [\"example.eu\"]\n"));
         assert!(dns_parse_fails("token_file = \"/t\"\n"));
+    }
+
+    #[test]
+    fn prefer_wildcard_is_off_unless_the_operator_asks_for_it() {
+        let dns = |extra: &str| {
+            let src = format!(
+                "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n\
+                 token_file = \"/var/lib/weglarka/cf-token\"\nwildcards = [\"example.eu\"]\n{extra}"
+            );
+            HostConfig::from_toml_str(&src)
+                .unwrap()
+                .acme
+                .unwrap()
+                .dns
+                .unwrap()
+        };
+        assert!(!dns("").prefer_wildcard);
+        assert!(dns("prefer_wildcard = true\n").prefer_wildcard);
+        assert!(!dns("prefer_wildcard = false\n").prefer_wildcard);
+        // Still a `deny_unknown_fields` section: a misspelt key is an error, never ignored.
+        assert!(dns_parse_fails(
+            "token_file = \"/t\"\nwildcards = [\"example.eu\"]\nprefer_wildcards = true\n"
+        ));
     }
 
     fn dns_parse_fails(extra: &str) -> bool {
