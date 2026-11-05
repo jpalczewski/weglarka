@@ -429,6 +429,9 @@ mod tests {
         create(&d.path().join("error-2026-10-04.log"), b"old");
         create(&d.path().join("access.log"), b"current");
         create(&d.path().join("notes.txt"), b"not a log");
+        // The current files belong to the pass's day; without the marker the rotation would read
+        // the real mtime of `access.log` and rotate it on any other day.
+        fs::write(d.path().join(LOG_DATE_MARKER), "2026-11-04\n").unwrap();
 
         let report = retention_pass(d.path(), at(1_793_750_400), LogRetention::Days(30)).unwrap();
         // 2026-11-04 minus 30 days is 2026-10-05; files dated on or before it are gone.
