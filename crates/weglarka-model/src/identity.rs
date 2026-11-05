@@ -897,13 +897,22 @@ pub fn validate_external_client(id: &ClientId, client: &ExternalClientSpec) -> R
 pub fn validate_file(file: &AppsFile) -> Result<(), String> {
     for (id, client) in &file.oidc_clients {
         validate_external_client(id, client)?;
-        if InstanceName::new(id.as_str()).is_ok_and(|n| file.apps.contains_key(&n)) {
+        if let Some(instance) = shadowed_instance(file, id) {
             return Err(format!(
-                "oidc_clients.{id}: the id equals the instance {id:?}, whose OIDC client id it would shadow"
+                "oidc_clients.{id}: the id equals the instance {instance:?}, whose OIDC client id it would shadow"
             ));
         }
     }
     Ok(())
+}
+
+/// The instance an `[oidc_clients.<id>]` entry would shadow, i.e. the instance of the same name.
+/// Every instance can get a client named after it, so such a pair cannot coexist. Exposed so the
+/// daemon can answer the collision as a conflict rather than a malformed request (issue #461)
+/// without re-deriving the condition.
+pub fn shadowed_instance<'a>(file: &'a AppsFile, id: &ClientId) -> Option<&'a InstanceName> {
+    let name = InstanceName::new(id.as_str()).ok()?;
+    file.apps.get_key_value(&name).map(|(name, _)| name)
 }
 
 /// Host-aware rules of forward auth (docs/decisions/0052): an app with `ingress.auth = "forward"`

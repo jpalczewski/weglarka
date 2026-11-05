@@ -129,6 +129,37 @@ async fn an_undeclared_network_is_rejected_and_nothing_is_written() {
     h.running.stop().await;
 }
 
+/// `apps update` used to skip `shared_networks::validate` (#461, tracking #77): a bad membership
+/// passed validation and only failed in `save_apps`, i.e. as a `500` reported in the daemon log.
+#[tokio::test]
+async fn an_update_joining_an_undeclared_network_is_a_400() {
+    let h = harness().await;
+    add(&h, "kajet-api", spec("api.example.eu")).await;
+
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/kajet-api",
+        Some(json!({ "spec": member_spec("nope", &[]) })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("undeclared shared network"),
+        "{body}"
+    );
+    // The rejected candidate was not saved: the app still has no shared network (`[]` is omitted
+    // from the read view, so the field is absent).
+    assert!(
+        show(&h, "kajet-api").await["spec"]["shared_networks"].is_null(),
+        "the rejected candidate was not saved"
+    );
+    h.running.stop().await;
+}
+
 #[tokio::test]
 async fn removal_is_refused_while_members_exist() {
     let h = harness().await;

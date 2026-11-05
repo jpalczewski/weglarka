@@ -34,9 +34,10 @@ use weglarka_model::labels;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state::{self, AppState};
 
-use crate::admin::{Fail, validate_host_rules};
+use crate::admin::Fail;
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::app_view::{Access, show_response};
+use crate::candidate;
 
 /// Runtime state with "waiting for secret" taking the place of `Missing`: there is no container
 /// because the bound secrets are not set yet. (With a running container the app keeps `Running`;
@@ -61,8 +62,6 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
     let name = InstanceName::new(&raw).map_err(|e| invalid(e.to_string()))?;
     let req: UpdateAppRequest =
         serde_json::from_slice(&body).map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
-    state::validate_app(&name, &req.spec).map_err(invalid)?;
-    validate_host_rules(&d, &name, &req.spec)?;
 
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
@@ -93,19 +92,11 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
             .apps
             .insert(name.clone(), req.spec.clone())
             .ok_or_else(|| Fail(ErrorCode::NotFound, format!("unknown app: {name}")))?;
-        // Shared volumes (issue #33): a mount of an undeclared volume is rejected here with the
-        // `weglarka volumes add` hint, and a uid-range change with existing volume data is refused
-        // before anything is persisted — the old container and its files stay untouched.
-        weglarka_model::shared_volumes::validate(&apps).map_err(invalid)?;
-        // Host-wide `host_ports` rules first, then domains/ports must be renderable (and not taken
-        // by another app), as in `add`. Both see the candidate app set.
-        weglarka_model::host_ports::validate(&d.host, &apps).map_err(|e| invalid(e.to_string()))?;
-        // `internal_hosts` (issue #303): only domains this host serves, as in `add`.
-        weglarka_model::internal_hosts::validate(&d.host, &apps)
-            .map_err(|e| invalid(e.to_string()))?;
-        // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
-        weglarka_model::depends::validate(&apps).map_err(invalid)?;
-        weglarka_ingress::Plan::build(&d.host, &apps.apps).map_err(|e| invalid(e.to_string()))?;
+        // The same candidate-set validation as `apps add` and `sites declare` (issue #461): shared
+        // volumes and networks, `depends_on`, host ports, `internal_hosts` and the ingress plan, all
+        // over the set that would be written. A uid-range change with existing volume data is
+        // refused too — the old container and its files stay untouched.
+        candidate::validate_app(&d, &name, &req.spec, &apps)?;
         d.engine.check_range_change(&name, &req.spec).await?;
         match tokio::time::timeout(
             MUTATION_TIMEOUT,

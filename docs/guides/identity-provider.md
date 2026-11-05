@@ -134,7 +134,9 @@ weglarka oidc clients remove forge
 ```
 
 Generate a digest with `authelia crypto hash generate pbkdf2 --variant sha512 --iterations 310000 --password <secret>`.
-A client id must not equal any app name. An external client can set `allowed_groups` too (the same rules as above).
+An `[oidc_clients.<id>]` id must not equal any instance name, because every instance can get a client named after it:
+the daemon then refuses to add an app with that name (`409 Conflict`) until the client is removed or renamed. An external
+client can set `allowed_groups` too (the same rules as above).
 
 ### Device authorization grant
 

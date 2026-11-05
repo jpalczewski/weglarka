@@ -22,6 +22,7 @@ use weglarka_model::state::{self, StateFile};
 
 use crate::admin::{Fail, deploy_result, mutating, parse_json};
 use crate::app::Daemon;
+use crate::candidate;
 use crate::volumes;
 
 type Shared<P> = State<Arc<Daemon<P>>>;
@@ -104,13 +105,14 @@ async fn declare_site<P: PodmanClient + 'static>(
     let req: DeclareSiteRequest = parse_json(&body)?;
     {
         let _g = d.desired_lock.lock().await;
-        // The candidate set must be renderable (domains free, paths valid) before it is saved.
+        // The candidate set must be renderable (domains free, paths valid) and satisfy every
+        // cross-app rule before it is saved — the same validation as `apps add`/`apps update`
+        // (issue #461).
         let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
         let mut sites = apps.sites.clone();
         sites.insert(name.clone(), req.spec.clone());
         apps.set_sites(sites).map_err(Fail::invalid)?;
-        weglarka_ingress::Plan::build(&d.host, &apps.apps)
-            .map_err(|e| Fail::invalid(e.to_string()))?;
+        candidate::validate_set(&d, &apps)?;
         mutating(d.engine.declare_site(name, req.spec)).await?;
     }
     d.changed();

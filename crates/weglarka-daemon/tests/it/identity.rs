@@ -190,6 +190,38 @@ async fn external_clients_live_in_apps_toml_and_the_list_survives_app_churn() {
     h.running.stop().await;
 }
 
+/// Issue #461: an `[oidc_clients.<id>]` id equal to an instance name collides with the client every
+/// instance can get, so adding that app is a conflict with the model's message — not the `500`
+/// `save_apps` used to produce after the request had been accepted.
+#[tokio::test]
+async fn an_app_named_like_an_external_client_is_a_conflict() {
+    let h = Builder::new().sections(IDENTITY).build().await;
+    let client = json!({ "spec": {
+        "name": "Forge",
+        "redirect_uris": ["https://git.example.com/user/oauth2/authelia/callback"],
+        "public": true
+    }});
+    let (s, v) = admin(&h, "PUT", "/v1/oidc-clients/forge", Some(client)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+
+    let (s, v) = post_app(&h, "forge", spec("forge.example.com")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("would shadow"),
+        "{v}"
+    );
+    // Nothing was written, no deploy was started, and the client is still there.
+    let (s, _) = admin(&h, "GET", "/v1/apps/forge", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(
+        !read(&h.root.join("state/apps.toml")).contains("[apps.forge]"),
+        "the candidate was not saved"
+    );
+    let (_, list) = admin(&h, "GET", "/v1/oidc-clients", None).await;
+    assert!(list["clients"]["forge"].is_object(), "{list}");
+    h.running.stop().await;
+}
+
 #[tokio::test]
 async fn the_provider_cannot_be_removed_or_misconfigured() {
     let h = with_provider().await;
