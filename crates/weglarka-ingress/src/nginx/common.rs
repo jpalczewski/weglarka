@@ -48,13 +48,19 @@ impl AuthVars {
 pub(super) use crate::plan::AUTHZ_PATH as AUTHZ_LOCATION;
 
 /// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
-/// end up in logs); `upstream_response_time` is a string (`-` or a list on retry).
+/// end up in logs); `upstream_response_time`, `upstream_status`, `upstream_addr` and
+/// `upstream_header_time` are strings (`-`, or a list on retry for the ones nginx repeats per
+/// attempt); `request_length` is numeric. `upstream_addr` is the internal container address, so it
+/// stays in the file log and is deliberately not part of `weglarka_api::AccessEntry`.
 pub const LOG_FORMAT: &str = concat!(
     "{\"time\":\"$time_iso8601\",\"app\":\"$app\",\"host\":\"$host\",",
     "\"remote_addr\":\"$remote_addr\",\"method\":\"$request_method\",\"path\":\"$uri\",",
     "\"status\":$status,\"bytes_sent\":$body_bytes_sent,\"request_time\":$request_time,",
-    "\"upstream_response_time\":\"$upstream_response_time\",\"request_id\":\"$request_id\",",
-    "\"user_agent\":\"$http_user_agent\"}"
+    "\"upstream_response_time\":\"$upstream_response_time\",",
+    "\"upstream_status\":\"$upstream_status\",\"upstream_addr\":\"$upstream_addr\",",
+    "\"upstream_header_time\":\"$upstream_header_time\",",
+    "\"request_length\":$request_length,\"server_protocol\":\"$server_protocol\",",
+    "\"request_id\":\"$request_id\",\"user_agent\":\"$http_user_agent\"}"
 );
 
 /// The fixed part of every mode: the process preamble and the `events` block.

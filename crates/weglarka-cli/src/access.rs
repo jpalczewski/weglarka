@@ -140,6 +140,10 @@ fn json_line(entry: &AccessEntry, terminal: bool) -> String {
         method: clean(&entry.method),
         path: clean(&entry.path),
         upstream_response_time: clean(&entry.upstream_response_time),
+        upstream_status: clean(&entry.upstream_status),
+        upstream_header_time: clean(&entry.upstream_header_time),
+        server_protocol: clean(&entry.server_protocol),
+        request_length: entry.request_length,
         request_id: clean(&entry.request_id),
         user_agent: clean(&entry.user_agent),
         ..entry.clone()
@@ -276,6 +280,11 @@ mod tests {
             path: path.into(),
             status: 404,
             request_time: 0.0125,
+            upstream_response_time: "0.004".into(),
+            upstream_status: "200".into(),
+            upstream_header_time: "0.003".into(),
+            server_protocol: "HTTP/1.1".into(),
+            request_length: 321,
             request_id: "abc".into(),
             user_agent: "curl/8".into(),
             ..Default::default()
@@ -478,6 +487,8 @@ mod tests {
     fn json_lines_are_the_entry_and_sanitised_on_a_terminal() {
         let mut e = entry("/a\u{9b}31m\u{202e}");
         e.user_agent = "ua\u{1b}[2J".into();
+        e.upstream_status = "50\u{9b}2".into();
+        e.server_protocol = "HTTP/1.1\u{202e}".into();
         let piped: AccessEntry = serde_json::from_str(&json_line(&e, false)).unwrap();
         assert_eq!(piped, e);
         let line = json_line(&e, true);
@@ -485,6 +496,8 @@ mod tests {
         let tty: AccessEntry = serde_json::from_str(&line).unwrap();
         assert_eq!(tty.path, "/a\u{fffd}31m\u{fffd}");
         assert_eq!(tty.user_agent, "ua\u{fffd}[2J");
+        assert_eq!(tty.upstream_status, "50\u{fffd}2");
+        assert_eq!(tty.server_protocol, "HTTP/1.1\u{fffd}");
         assert!(!line.contains("\"app\""));
     }
 

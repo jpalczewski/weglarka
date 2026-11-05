@@ -48,8 +48,20 @@ weglarka --json access web -f | jq -r .remote_addr
 
 Each line is `time status method host path request_time remote_addr request_id`; `--json` prints one JSON object per
 request (`time`, `host`, `remote_addr`, `peer` behind a CDN, `method`, `path`, `status`, `bytes_sent`, `request_time`,
-`upstream_response_time`, `request_id`, `user_agent`). Paths, hosts and user agents are chosen by the visitor, so on a
-terminal control characters are replaced and a path can never start a line of its own.
+`upstream_response_time`, `upstream_status`, `upstream_header_time`, `server_protocol`, `request_length`, `request_id`,
+`user_agent`). Paths, hosts and user agents are chosen by the visitor, so on a terminal control characters are
+replaced and a path can never start a line of its own.
+
+The `upstream_*` fields describe the app behind nginx. `upstream_header_time` is the latency a visitor feels — the time
+to the upstream's response headers — also for long-lived responses (SSE, websockets, ntfy subscriptions) where
+`request_time` is the whole connection. `upstream_status` tells two `502`s apart: when nginx could not reach the app
+(the container is being recreated) it logs `502` itself while `upstream_header_time` is `-`, because no headers ever
+arrived; when the app answered `502`, `upstream_header_time` is a number. A static site has no upstream, so its
+`upstream_*` fields are `-`. `upstream_addr` (the internal container address) stays in the raw `access.log` only and is
+deliberately not part of the API, the CLI or the panel.
+
+The ingress error log (`error.log`) is a separate stream in the same directory, rotated and deleted by the same
+retention; see [log retention](log-retention.md).
 
 | Flag | Meaning |
 |---|---|

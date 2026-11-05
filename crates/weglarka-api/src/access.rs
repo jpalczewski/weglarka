@@ -35,6 +35,16 @@ pub struct AccessEntry {
     pub request_time: f64,
     /// `-` or a list on retry, as nginx prints it.
     pub upstream_response_time: String,
+    /// The upstream's response status; `-` when there was no upstream (a static site), `502` when
+    /// nginx could not connect. A list on retry, as nginx prints it.
+    pub upstream_status: String,
+    /// Time to the upstream's response headers in seconds, as nginx prints it; `-` when no headers
+    /// arrived. Unlike `request_time`, this does not grow with a long-lived stream.
+    pub upstream_header_time: String,
+    /// `HTTP/1.1` or `HTTP/2.0`, as nginx logged it.
+    pub server_protocol: String,
+    /// Bytes of the request line and headers.
+    pub request_length: u64,
     pub request_id: String,
     pub user_agent: String,
 }
@@ -123,6 +133,10 @@ mod tests {
             bytes_sent: 12,
             request_time: 0.25,
             upstream_response_time: "0.001".into(),
+            upstream_status: "404".into(),
+            upstream_header_time: "0.001".into(),
+            server_protocol: "HTTP/2.0".into(),
+            request_length: 128,
             request_id: "abc".into(),
             user_agent: "curl/8 \"quoted\"".into(),
         }

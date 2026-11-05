@@ -832,6 +832,11 @@ mod tests {
             ("$body_bytes_sent", "1234"),
             ("$request_time", "0.005"),
             ("$upstream_response_time", "0.004"),
+            ("$upstream_status", "200"),
+            ("$upstream_addr", "10.89.0.5:8080"),
+            ("$upstream_header_time", "0.003"),
+            ("$request_length", "321"),
+            ("$server_protocol", "HTTP/1.1"),
             ("$request_id", "0123456789abcdef"),
             ("$http_user_agent", "curl/8.0"),
         ]
@@ -856,8 +861,13 @@ mod tests {
             };
             assert_eq!(app, "web", "{line}");
             assert_eq!(
-                (entry.status, entry.bytes_sent, entry.request_time),
-                (200, 1234, 0.005),
+                (
+                    entry.status,
+                    entry.bytes_sent,
+                    entry.request_time,
+                    entry.request_length
+                ),
+                (200, 1234, 0.005, 321),
                 "{line}"
             );
             for (got, want) in [
@@ -866,6 +876,9 @@ mod tests {
                 (&entry.method, "GET"),
                 (&entry.path, "/index.html"),
                 (&entry.upstream_response_time, "0.004"),
+                (&entry.upstream_status, "200"),
+                (&entry.upstream_header_time, "0.003"),
+                (&entry.server_protocol, "HTTP/1.1"),
                 (&entry.request_id, "0123456789abcdef"),
                 (&entry.user_agent, "curl/8.0"),
             ] {
