@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -203,6 +203,14 @@ fn ingress_log_reader_v22(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v22 → v23: OAuth-protected resource paths (#215, ADR 0078). `AppIngress::oauth_resources` is an
+/// optional list (default empty), so a v22 document needs no data transformation — the marker
+/// records that the file may carry it. A no-op that accepts a hand-edited file which already has
+/// it.
+fn oauth_resources_v23(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -228,6 +236,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     site_static_options_v20,
     container_security_headers_v21,
     ingress_log_reader_v22,
+    oauth_resources_v23,
 ];
 
 const _: () = assert!(
@@ -569,6 +578,8 @@ fn validate_static_ingress_allowlist(
         auth_policy,
         auth_groups,
         auth_exempt_paths,
+        // A container app's own token checks, which a directory backend has none of (#215, ADR 0078).
+        oauth_resources,
         // Validated separately, by `validate_static_ingress_values`.
         static_: _,
         // Rejected above with the key a static site should use instead (`ingress.static.security_headers`).
@@ -589,6 +600,7 @@ fn validate_static_ingress_allowlist(
         ("ingress.auth_policy", auth_policy.is_some()),
         ("ingress.auth_groups", !auth_groups.is_empty()),
         ("ingress.auth_exempt_paths", !auth_exempt_paths.is_empty()),
+        ("ingress.oauth_resources", !oauth_resources.is_empty()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
         return Err(format!(
@@ -883,7 +895,91 @@ fn validate_ingress(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
     {
         validate_security_headers(name, "ingress", headers)?;
     }
+    // OAuth-protected resources (#215, ADR 0078) are a container-app feature like the headers above:
+    // `validate_static`'s allowlist rejects the field for `kind = "static"` with the message a site
+    // should see, so it is only checked here for a container app.
+    if spec.kind == AppKind::Container {
+        validate_oauth_resources(name, spec)?;
+    }
     Ok(())
+}
+
+/// Prefixes the generated config owns, so an OAuth resource must not claim one (#215, ADR 0078):
+/// `/.well-known` is the discovery space the generator renders, `/internal/weglarka` is the
+/// forward-auth subrequest (`AUTHZ_PATH` in `weglarka-ingress`) and `/_weglarka` is the panel's relay
+/// to the daemon. A resource below them would fight a `location` Węglarka writes itself.
+const RESERVED_INGRESS_PREFIXES: [&str; 3] = ["/.well-known", "/internal/weglarka", "/_weglarka"];
+
+/// At most this many OAuth-protected resources per app (#215, ADR 0078): each entry is two `location`
+/// blocks plus its discovery routes in every server of the app, so the bound keeps a reload cheap.
+const MAX_OAUTH_RESOURCES: usize = 16;
+
+/// True when `path` is `prefix` itself or lies below it, compared by whole segments: `/mcp` covers
+/// `/mcp/v2` but not `/mcpx` (#215, ADR 0078). Both arguments are absolute paths.
+fn path_covers(prefix: &str, path: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `ingress.oauth_resources` (#215, ADR 0078): an entry is rendered into `nginx.conf` as its own
+/// `location` plus a generated discovery document, so its syntax and its neighbours are checked here
+/// rather than trusted from the generator. Cross-app claims (the well-known paths on a shared domain)
+/// and the overlap with `streaming_paths`/`auth_exempt_paths` need every app and are the ingress
+/// plan's job (S2 of #215).
+fn validate_oauth_resources(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
+    let resources = &spec.ingress.oauth_resources;
+    if resources.is_empty() {
+        return Ok(());
+    }
+    if spec.domains.is_empty() {
+        return Err(format!(
+            "{name}: ingress.oauth_resources requires at least one domain"
+        ));
+    }
+    if resources.len() > MAX_OAUTH_RESOURCES {
+        return Err(format!(
+            "{name}: ingress.oauth_resources accepts at most {MAX_OAUTH_RESOURCES} entries"
+        ));
+    }
+    for path in resources {
+        crate::app::check_path_prefix(path).map_err(|reason| {
+            format!("{name}: invalid ingress.oauth_resources entry {path:?}: {reason}")
+        })?;
+        if path == "/" {
+            return Err(format!(
+                "{name}: ingress.oauth_resources must not be \"/\": it would take over the whole app"
+            ));
+        }
+        for reserved in RESERVED_INGRESS_PREFIXES {
+            if path_covers(reserved, path) {
+                return Err(format!(
+                    "{name}: ingress.oauth_resources entry {path:?} is under the reserved prefix {reserved:?}"
+                ));
+            }
+        }
+    }
+    for (i, path) in resources.iter().enumerate() {
+        for other in &resources[..i] {
+            if path == other {
+                return Err(format!(
+                    "{name}: duplicate ingress.oauth_resources entry {path:?}"
+                ));
+            }
+            // An entry already covers everything below it, so nesting one inside another would
+            // render two locations for the same request.
+            if path_covers(other, path) || path_covers(path, other) {
+                return Err(format!(
+                    "{name}: ingress.oauth_resources entry {path:?} overlaps {other:?} (an entry covers everything below it)"
+                ));
+            }
+        }
+    }
+    // Gate (ADR 0078): lifted by the ingress PR of #215.
+    Err(format!(
+        "{name}: ingress.oauth_resources is not enabled in this release"
+    ))
 }
 
 /// Hardening values end up in the container spec verbatim, so they are checked strictly.
@@ -1493,6 +1589,130 @@ mod tests {
             let err = ok(extra).unwrap_err();
             assert!(err.contains(needle), "{extra}: {err}");
         }
+    }
+
+    /// #215, ADR 0078: the lexical rules of `ingress.oauth_resources`, and the gate that refuses any
+    /// non-empty list until the ingress PR renders it. Every accepted case stops at the gate, so a
+    /// lexical error is distinguishable from "not enabled yet".
+    #[test]
+    fn oauth_resources_are_validated() {
+        let check = |extra: &str| -> Result<(), String> {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"i\"\ndomains = [\"a.example.com\"]\n{extra}"
+            ))
+            .unwrap();
+            validate_app(&name("a"), &spec)
+        };
+        // Lexically fine: the only complaint left is the gate.
+        let sixteen: Vec<String> = (0..16).map(|i| format!("/r{i}")).collect();
+        for extra in [
+            "ingress = { oauth_resources = [\"/mcp\"] }".to_owned(),
+            "ingress = { oauth_resources = [\"/mcp\", \"/mcpx\", \"/a/b-c_d.e\"] }".to_owned(),
+            format!("ingress = {{ oauth_resources = {sixteen:?} }}"),
+        ] {
+            let err = check(&extra).unwrap_err();
+            assert!(
+                err.contains("ingress.oauth_resources is not enabled in this release"),
+                "{extra}: {err}"
+            );
+        }
+        let seventeen: Vec<String> = (0..17).map(|i| format!("/r{i}")).collect();
+        let long = format!("/{}", "a".repeat(200));
+        for (extra, needle) in [
+            (
+                "ingress = { oauth_resources = [\"x\"] }".to_owned(),
+                "invalid ingress.oauth_resources entry",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/mcp/\"] }".to_owned(),
+                "invalid ingress.oauth_resources entry",
+            ),
+            (
+                format!("ingress = {{ oauth_resources = [{long:?}] }}"),
+                "invalid ingress.oauth_resources entry",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/\"] }".to_owned(),
+                "must not be \"/\"",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/.well-known\"] }".to_owned(),
+                "reserved prefix",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/.well-known/oauth-protected-resource\"] }"
+                    .to_owned(),
+                "reserved prefix",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/internal/weglarka/authz\"] }".to_owned(),
+                "reserved prefix",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/_weglarka\"] }".to_owned(),
+                "reserved prefix",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/_weglarka/api\"] }".to_owned(),
+                "reserved prefix",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/mcp\", \"/mcp\"] }".to_owned(),
+                "duplicate ingress.oauth_resources entry",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/mcp\", \"/mcp/v2\"] }".to_owned(),
+                "overlaps",
+            ),
+            (
+                "ingress = { oauth_resources = [\"/mcp/v2\", \"/mcp\"] }".to_owned(),
+                "overlaps",
+            ),
+            (
+                format!("ingress = {{ oauth_resources = {seventeen:?} }}"),
+                "at most 16 entries",
+            ),
+        ] {
+            let err = check(&extra).unwrap_err();
+            assert!(err.contains(needle), "{extra}: {err}");
+            assert!(
+                err.starts_with("a: ") && err.contains("oauth_resources"),
+                "{extra}: {err}"
+            );
+        }
+        // A resource is a claim on a host, so it needs one.
+        let no_domain: AppSpec =
+            toml::from_str("image = \"i\"\ningress = { oauth_resources = [\"/mcp\"] }").unwrap();
+        assert!(
+            validate_app(&name("a"), &no_domain)
+                .unwrap_err()
+                .contains("ingress.oauth_resources requires at least one domain")
+        );
+        // Nothing set is fine: the field is optional and renders byte for byte as before.
+        assert!(check("ingress = { streaming = true }").is_ok());
+    }
+
+    /// #215, ADR 0078: an empty list is omitted from the TOML (so a spec without the feature is
+    /// byte-identical to before), and a set one is a plain string list that round-trips.
+    #[test]
+    fn oauth_resources_round_trip() {
+        let empty: AppSpec =
+            toml::from_str("image = \"i\"\ndomains = [\"a.example.com\"]\n").unwrap();
+        assert!(empty.ingress.oauth_resources.is_empty());
+        assert!(!toml::to_string(&empty).unwrap().contains("oauth_resources"));
+
+        let spec: AppSpec = toml::from_str(
+            "image = \"i\"\ndomains = [\"a.example.com\"]\n\
+             ingress = { oauth_resources = [\"/mcp\", \"/api/v2\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(spec.ingress.oauth_resources, ["/mcp", "/api/v2"]);
+        let reserialized = toml::to_string(&spec).unwrap();
+        assert!(
+            reserialized.contains("oauth_resources = [\"/mcp\", \"/api/v2\"]"),
+            "{reserialized}"
+        );
+        assert_eq!(toml::from_str::<AppSpec>(&reserialized).unwrap(), spec);
     }
 
     #[test]
@@ -2168,6 +2388,10 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
                 "ingress = { auth_exempt_paths = [\"/x\"] }",
                 "ingress.auth_exempt_paths",
             ),
+            (
+                "ingress = { oauth_resources = [\"/mcp\"] }",
+                "ingress.oauth_resources",
+            ),
         ] {
             let e = err(extra);
             assert!(e.contains(needle), "{extra:?}: {e}");
@@ -2491,6 +2715,31 @@ csp = "default-src 'self'"
                 .unwrap()
                 .contains(&format!("schema_version = {SCHEMA_VERSION}"))
         );
+    }
+
+    #[test]
+    fn schema_v22_file_without_oauth_resources_is_stamped_v23() {
+        // #215, ADR 0078: v23 adds the optional `ingress.oauth_resources`. The step is a no-op, so a
+        // v22 document loads unchanged and the first write stamps v23 — and a spec without the field
+        // keeps serialising without it.
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 22\n[apps.a]\nimage = \"x:1\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(apps.apps[&name("a")].ingress.oauth_resources.is_empty());
+        save_apps(&apps_path, &apps).unwrap();
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        let text = fs::read_to_string(&apps_path).unwrap();
+        assert!(
+            text.contains(&format!("schema_version = {SCHEMA_VERSION}")),
+            "{text}"
+        );
+        assert!(!text.contains("oauth_resources"), "{text}");
     }
 
     #[test]
