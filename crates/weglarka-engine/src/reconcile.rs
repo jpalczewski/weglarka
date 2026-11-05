@@ -16,6 +16,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::crash;
 use crate::deploy::{DeployOutcome, DigestSource};
+use crate::sites::ExtractLimits;
 use crate::volumes::RemoveAppOptions;
 use crate::waiting::{apply_waiting, missing_secrets};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName};
@@ -272,6 +273,18 @@ pub enum SecretChangePolicy {
     NextDeploy,
 }
 
+/// Where static sites live on disk and how much of one release may be unpacked (ADR 0049, #101/#102).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitesOptions {
+    /// `<nginx_conf_dir>/sites`: the releases nginx serves.
+    pub root: PathBuf,
+    /// Daemon-private scratch for the exported image archive (`<state dir>/sites-tmp`), never
+    /// mounted into nginx.
+    pub scratch: PathBuf,
+    /// Extraction limits, from `[sites]` in `weglarka.toml`.
+    pub limits: ExtractLimits,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerOptions {
     pub secret_change: SecretChangePolicy,
@@ -293,9 +306,9 @@ pub struct ReconcilerOptions {
     /// network: at least the ingress resolver's cache lifetime, so no request still resolves to a
     /// container that is about to stop (ADR 0046).
     pub switch_drain: Duration,
-    /// Directory the static sites' releases are unpacked into (`<nginx_conf_dir>/sites`, ADR 0049).
+    /// Static sites' release directory and extraction limits (`<nginx_conf_dir>/sites`, ADR 0049).
     /// `None` = the daemon serves no static sites: deploying one fails with a clear error.
-    pub sites_root: Option<PathBuf>,
+    pub sites: Option<SitesOptions>,
     /// The token admin API socket and the instances that get it (`[admin.http]`, ADR 0056).
     pub admin_token: Option<crate::admin_token::AdminTokenMount>,
     /// `[metrics] scraper` (issue #365): the instance kept on the metrics networks. `None` = no app
@@ -313,7 +326,7 @@ impl Default for ReconcilerOptions {
             host_mounts: Vec::new(),
             group_add: Vec::new(),
             switch_drain: Duration::from_secs(3),
-            sites_root: None,
+            sites: None,
             admin_token: None,
             metrics_scraper: None,
         }

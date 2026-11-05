@@ -12,8 +12,9 @@ use crate::crash;
 use crate::deploy::{DeployOutcome, ReloadOutcome};
 use crate::reconcile::{
     Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
-    ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
+    ReconcilerOptions, RecreateReason, SecretChangePolicy, SitesOptions, Trigger,
 };
+use crate::sites::ExtractLimits;
 use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman, StopFailure};
 use crate::volumes::RemoveAppOptions;
 use weglarka_model::app::{Digest, InstanceName};
@@ -4356,12 +4357,21 @@ domains = ["blog.example.com"]
     }
 
     fn harness() -> Harness {
+        harness_with(ExtractLimits::default())
+    }
+
+    fn harness_with(limits: ExtractLimits) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let sites = dir.path().join("sites");
+        let scratch = dir.path().join("sites-tmp");
         let h = Harness::build(
             SITE,
             ReconcilerOptions {
-                sites_root: Some(sites),
+                sites: Some(SitesOptions {
+                    root: sites,
+                    scratch,
+                    limits,
+                }),
                 ..Default::default()
             },
             crash::Policy::disabled(),
@@ -4371,7 +4381,11 @@ domains = ["blog.example.com"]
     }
 
     fn sites(h: &Harness) -> std::path::PathBuf {
-        h.rec.options.sites_root.clone().unwrap()
+        h.rec.options.sites.as_ref().unwrap().root.clone()
+    }
+
+    fn scratch(h: &Harness) -> std::path::PathBuf {
+        h.rec.options.sites.as_ref().unwrap().scratch.clone()
     }
 
     fn publish(h: &Harness, d: char, files: &[(&str, &[u8])]) -> Digest {
@@ -4443,6 +4457,70 @@ domains = ["blog.example.com"]
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_retained_release_is_redeployed_without_exporting_the_image() {
+        let h = harness();
+        publish(&h, 'a', &[("index.html", b"a")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        publish(&h, 'b', &[("index.html", b"b")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert_eq!(h.state("blog").previous, Some(digest('a')));
+
+        // Back to the retained release: it is complete, so only `current` moves and the image is not
+        // exported (the fake would have no archive scripted for this second save).
+        h.fake.set_pull_digest(SITE_IMAGE, digest('a'));
+        let saves = h.fake.image_save_calls();
+        let out = h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(matches!(out, DeployOutcome::Deployed { .. }), "{out:?}");
+        assert_eq!(h.fake.image_save_calls(), saves, "the release is reused");
+        let served = std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
+        assert_eq!(served, "a");
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_exported_archive_goes_to_the_daemon_scratch_directory() {
+        let h = harness();
+        let root = sites(&h);
+        // A leftover of an older version that wrote the archive under the nginx mount.
+        std::fs::create_dir_all(root.join(".tmp")).unwrap();
+        std::fs::write(root.join(".tmp/old.tar"), b"x").unwrap();
+        publish(&h, 'a', &[("index.html", b"a")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert!(
+            !root.join(".tmp").exists(),
+            "the sites root (mounted into nginx) keeps no scratch archive"
+        );
+        let scratch = scratch(&h);
+        assert!(scratch.is_dir(), "the scratch directory was used");
+        let leftovers: Vec<_> = std::fs::read_dir(&scratch).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extraction_limits_come_from_the_options() {
+        let h = harness_with(ExtractLimits {
+            max_files: 1,
+            max_bytes: 1024 * 1024,
+        });
+        publish(&h, 'a', &[("index.html", b"a")]);
+        h.rec.deploy(&name("blog"), false).await.unwrap();
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+
+        publish(&h, 'b', &[("index.html", b"b"), ("about.html", b"extra")]);
+        let outcome = h.rec.deploy(&name("blog"), false).await.unwrap();
+        let DeployOutcome::Failed { reason, .. } = outcome else {
+            panic!("expected the second file to trip max_files, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("more than 1 files and directories"),
+            "{reason}"
+        );
+        let served = std::fs::read_to_string(sites(&h).join("blog/current/index.html")).unwrap();
+        assert_eq!(served, "a");
+        assert_eq!(h.state("blog").current, Some(digest('a')));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_broken_site_never_replaces_the_one_being_served() {
         let h = harness();
         publish(&h, 'a', &[("index.html", b"good")]);
@@ -4487,7 +4565,11 @@ not_found_page = "/404.html"
         let h = Harness::build(
             SITE_WITH_NOT_FOUND_PAGE,
             ReconcilerOptions {
-                sites_root: Some(sites),
+                sites: Some(SitesOptions {
+                    root: sites,
+                    scratch: dir.path().join("sites-tmp"),
+                    limits: ExtractLimits::default(),
+                }),
                 ..Default::default()
             },
             crash::Policy::disabled(),
@@ -4572,7 +4654,11 @@ domains = ["example.com"]
         let h = Harness::build(
             SITES,
             ReconcilerOptions {
-                sites_root: Some(dir.path().join("sites")),
+                sites: Some(SitesOptions {
+                    root: dir.path().join("sites"),
+                    scratch: dir.path().join("sites-tmp"),
+                    limits: ExtractLimits::default(),
+                }),
                 ..Default::default()
             },
             crash::Policy::disabled(),
@@ -4595,7 +4681,7 @@ domains = ["example.com"]
     }
 
     fn served(h: &Harness, instance: &str) -> String {
-        let root = h.rec.options.sites_root.clone().unwrap();
+        let root = h.rec.options.sites.as_ref().unwrap().root.clone();
         std::fs::read_to_string(root.join(instance).join("current/index.html")).unwrap()
     }
 

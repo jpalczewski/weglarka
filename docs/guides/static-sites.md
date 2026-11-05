@@ -37,14 +37,45 @@ a site has no upstream to apply them to.
 
 1. The image is pulled and its digest is pinned in `state.toml`, as for apps.
 2. Węglarka exports the image and unpacks the single layer into
-   `<nginx_conf_dir>/sites/<site>/releases/<digest-prefix>/`. The unpacker refuses absolute paths, `..`, symlinks, hard
-   links, device files, multi-layer images and archives over the size or file-count limit; nothing is switched when it
-   refuses.
+   `<nginx_conf_dir>/sites/<site>/releases/<digest-prefix>/`. The archive itself is streamed into a
+   daemon-private scratch directory (`<state dir>/sites-tmp`), never into the directory nginx mounts. The unpacker
+   refuses absolute paths, `..`, symlinks, hard links, device files, multi-layer images and archives over the size or
+   file-count limit; nothing is switched when it refuses.
 3. The relative symlink `current` is replaced with one `rename(2)`, so a visitor sees the old site or the new one,
    never a mixture.
 4. The previous release stays on disk next to the new one; older releases are removed.
 
+A deploy whose digest already has a complete release on disk does not export the image again — it only switches
+`current`. Redeploying the previous release therefore does not need the image store or the registry (a future
+`weglarka promote --rollback` uses the same path); with `--force` and the same digest the release being served is kept.
+
 A failed deploy leaves the served release untouched and records the digest as failed (`weglarka apps show`).
+
+## Extraction limits
+
+The unpacker bounds an untrusted archive ([ADR 0049](../decisions/0049-static-sites.md), #102). The defaults are
+100 000 files and directories and 1 GiB of content; set `[sites]` in `weglarka.toml` to change them:
+
+```toml
+[sites]
+max_files = 100000
+max_bytes = "1g"    # bytes or <n>[k|m|g]; both values must be greater than zero
+```
+
+`max_files` counts the files and the implicit parent directories a release needs. A release that trips a limit is
+rejected, its partial directory is removed and `current` stays untouched.
+
+## Health checks
+
+`weglarka doctor` reports two static-site checks (only while at least one `kind = "static"` app is declared):
+
+- `sites.directory` — the sites root exists, is a directory, is owned by the daemon's user and is writable by it;
+  otherwise the check fails with the path and mode (doctor never creates or repairs it). A group- or world-writable
+  root is a warning: anyone who can write it decides what nginx serves.
+- `sites.current` — for every static app with a pinned digest, `current` points at `releases/<digest-prefix>` and that
+  release has the required files (`index.html` and a configured `not_found_page`). A broken link is a warning;
+  `weglarka deploy <app> --force` switches `current` (re-exporting the image only when the release is missing or
+  incomplete).
 
 ## Per-site options
 
@@ -107,8 +138,11 @@ promotion: see [site environments](site-environments.md).
 ## Rollback
 
 `kind` raised the state schema to version 12; `[apps.<x>.ingress.static]` (per-site options, #104) raised it again to
-18 ([state schema](state-schema.md)). Before downgrading Węglarka below schema 12, remove the `kind = "static"` apps
-from `apps.toml`; before downgrading below schema 18, remove every `[apps.<x>.ingress.static]` table — either way,
-restoring `apps.toml` and `state.toml` from the pre-upgrade backup works too. Drop the `schema_version` marker
-afterwards; an older daemon rejects the unknown field or table. Files under `<nginx_conf_dir>/sites/` are ignored by
-older versions and can be deleted by hand.
+18 ([state schema](state-schema.md)). `[sites]` in `weglarka.toml` is not part of the state schema, but
+`weglarka.toml` also uses `deny_unknown_fields`: **remove the `[sites]` table before downgrading** to a release that
+does not know it (or restore `weglarka.toml` from before the upgrade). Before downgrading Węglarka below schema 12,
+remove the `kind = "static"` apps from `apps.toml`; before downgrading below schema 18, remove every
+`[apps.<x>.ingress.static]` table — either way, restoring `apps.toml` and `state.toml` from the pre-upgrade backup
+works too. Drop the `schema_version` marker afterwards; an older daemon rejects the unknown field or table. Files
+under `<nginx_conf_dir>/sites/` and the daemon-private `<state dir>/sites-tmp` are ignored by older versions and can
+be deleted by hand.

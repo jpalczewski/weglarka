@@ -66,7 +66,8 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use weglarka_engine::config_mounts::ConfigError;
-use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions};
+use weglarka_engine::reconcile::{Reconciler, ReconcilerOptions, SitesOptions};
+use weglarka_engine::sites::ExtractLimits;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::secret_ops::SecretOps;
 use weglarka_model::secret_store::SecretStore;
@@ -345,6 +346,19 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let events: Arc<dyn weglarka_model::events::EventSink> =
         Arc::new(weglarka_model::history::FanOut::new(sinks));
     self_update::confirm_startup(&podman, &paths.state_dir, events.as_ref()).await;
+    // Static sites live in the one directory nginx mounts (ADR 0049, ADR 0036). The exported image
+    // archive is untrusted and goes to the daemon's own state directory instead; older releases kept
+    // it under `<nginx_conf_dir>/sites/.tmp`, so remove that leftover once, best effort.
+    let sites_root = paths.nginx_conf_dir.join("sites");
+    let _ = std::fs::remove_dir_all(sites_root.join(".tmp"));
+    let sites = SitesOptions {
+        root: sites_root,
+        scratch: paths.state_dir.join("sites-tmp"),
+        limits: ExtractLimits {
+            max_files: host.sites.max_files,
+            max_bytes: host.sites.max_bytes.bytes(),
+        },
+    };
     // The engine resolves and mounts an app's `configs` against the same root the API and doctor
     // read (issue #118); `None` keeps the feature off.
     let defaults = ReconcilerOptions::default();
@@ -352,8 +366,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         config_root: paths.config_root.clone(),
         host_mounts: host.runtime.host_mounts.clone(),
         group_add: host.runtime.group_add.clone(),
-        // Static sites live in the one directory nginx mounts (ADR 0049, ADR 0036).
-        sites_root: Some(paths.nginx_conf_dir.join("sites")),
+        sites: Some(sites),
         // The token admin API socket, mounted into the `[admin.http] clients` only (ADR 0056).
         admin_token: host.admin.http.as_ref().map(|http| {
             weglarka_engine::admin_token::AdminTokenMount {

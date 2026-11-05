@@ -96,3 +96,18 @@ daemon extracts it into a per-release directory under `<nginx_conf_dir>/sites/` 
   the CI contract (`COPY dist/ /`) never needs; reconsider only if someone has a real need.
 - **A separate `SiteSpec` type.** Duplicates webhooks, secrets, domains, reconcile and `Plan::build`. The cost
   of the `kind` field is conditional validation, which `validate_app` already does for other combinations.
+
+## Addendum (2026-11-05)
+
+- **Scratch archive outside the nginx mount.** The raw, untrusted exported image archive is written to the
+  daemon's state directory (`<state dir>/sites-tmp`, created 0700, file 0600), not under
+  `<nginx_conf_dir>/sites/.tmp`. Extraction still writes the release into the directory nginx mounts; nothing is
+  renamed from scratch, so only the extracted tree needs to be visible to nginx. This keeps the most exposed
+  process's mount free of attacker-controlled archives.
+- **Limits are configuration.** The extractor's file-count and byte limits are `[sites] max_files` /
+  `max_bytes` in `weglarka.toml` (defaults: 100 000 files and 1 GiB), validated to be greater than zero.
+  `weglarka.toml` is outside the state schema, so there is no schema bump; a downgrade must remove the table
+  because of `deny_unknown_fields`.
+- **A complete retained release is reused.** If `releases/<id>` already passes the gate, a deploy switches
+  `current` to it without exporting the image. Redeploying the previous release — including the future
+  `promote --rollback` command (#103) — therefore does not depend on the image store or the registry.
