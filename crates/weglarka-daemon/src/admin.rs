@@ -541,21 +541,34 @@ async fn add_app<P: PodmanClient + 'static>(
         d.engine.deploy(&req.name, false).await?;
     }
     d.changed();
+    let app = view_after_mutation(&d, access, req.name, req.spec).await?;
+    Ok(json(app))
+}
+
+/// The view of an app right after a mutation stored its spec: the state on disk and the container
+/// Podman reports. `add_app` and `update_app` answer with it (`show_app` reads the same three inputs
+/// and adds the config and host-mount views).
+pub(crate) async fn view_after_mutation<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    access: Access,
+    name: InstanceName,
+    spec: AppSpec,
+) -> ApiResult<ShowAppResponse> {
     let st = state::load_state(&d.paths.state.state).map_err(Fail::internal)?;
     let container = d
         .engine
         .podman()
-        .container_inspect(&labels::container_name(&req.name))
+        .container_inspect(&labels::container_name(&name))
         .await
         .ok();
-    let app_state = st.apps.get(&req.name);
-    Ok(json(show_response(
+    let app_state = st.apps.get(&name);
+    Ok(show_response(
         access,
-        req.name,
-        req.spec,
+        name,
+        spec,
         app_state,
         container.as_ref(),
-    )))
+    ))
 }
 
 async fn remove_app<P: PodmanClient + 'static>(
@@ -595,16 +608,24 @@ async fn deploy_app<P: PodmanClient + 'static>(
     let outcome = match &req.image_ref {
         // An image of the same repository: pinned in the state, the spec keeps its tag (issue #109).
         Some(reference) => d.engine.push_reference(&name, reference).await?,
-        None => {
-            let mut outcome = d.engine.deploy(&name, false).await?;
-            if matches!(outcome, CoreOutcome::KnownBad { .. }) {
-                // A manual deploy is the operator's explicit will: retry a known-bad digest.
-                outcome = d.engine.deploy(&name, true).await?;
-            }
-            outcome
-        }
+        None => deploy_forced(&d, &name).await?,
     };
     deploy_response(&d, &name, outcome)
+}
+
+/// A deploy the operator asked for in so many words (`apps deploy` without an image reference, the
+/// deploy that follows an `apps update`): a digest the engine refuses as known bad is retried once
+/// with `force`, because the explicit command is the consent. Holds the engine mutex through pull and
+/// health gate, like any deploy.
+pub(crate) async fn deploy_forced<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    name: &InstanceName,
+) -> Result<CoreOutcome, EngineError> {
+    let mut outcome = d.engine.deploy(name, false).await?;
+    if matches!(outcome, CoreOutcome::KnownBad { .. }) {
+        outcome = d.engine.deploy(name, true).await?;
+    }
+    Ok(outcome)
 }
 
 /// Marks the state as changed and turns the engine's outcome into the `deploy` response; shared by
@@ -624,10 +645,49 @@ pub(crate) fn deploy_result<P: PodmanClient + 'static>(
     outcome: CoreOutcome,
 ) -> ApiResult<DeployResponse> {
     d.changed();
+    deploy_result_with(d, name, outcome, deploy_error)
+}
+
+/// Why a finished deploy has no [`DeployResponse`]. [`Display`](std::fmt::Display) is the reason
+/// itself, so a caller that wraps it in its own sentence reads the same words as the engine.
+pub(crate) enum DeployFailure {
+    /// The engine's reason for a deploy that failed.
+    Failed(String),
+    /// The digest is known bad and a forced retry was not asked for (or did not help).
+    KnownBad,
+}
+
+impl std::fmt::Display for DeployFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(reason) => f.write_str(reason),
+            Self::KnownBad => f.write_str("known bad digest"),
+        }
+    }
+}
+
+/// An explicit deploy answered by the daemon: the failure is a 500 that says why, not a conflict.
+fn deploy_error(failure: DeployFailure) -> Fail {
+    match failure {
+        DeployFailure::Failed(reason) => Fail::internal(format!("deploy failed: {reason}")),
+        DeployFailure::KnownBad => Fail::internal("deploy refused: known bad digest"),
+    }
+}
+
+/// [`DeployResponse`] for a finished outcome, with the generation the state now carries (a deploy
+/// pins a new one). Shared by `apps deploy`, `weglarka push`, `promote` and the deploy that follows
+/// `apps update`; `failed` words the two failures, which differ per caller (`apps update` reports a
+/// spec it stored but did not deploy). Does not touch the changed flag — the caller decides.
+pub(crate) fn deploy_result_with<P: PodmanClient + 'static>(
+    d: &Daemon<P>,
+    name: &InstanceName,
+    outcome: CoreOutcome,
+    failed: impl FnOnce(DeployFailure) -> Fail,
+) -> ApiResult<DeployResponse> {
     let generation = state::load_state(&d.paths.state.state)
         .map(|s| s.apps.get(name).map_or(0, |a| a.generation))
         .map_err(Fail::internal)?;
-    let resp = match outcome {
+    Ok(match outcome {
         CoreOutcome::Deployed { digest, generation } => DeployResponse {
             outcome: DeployOutcome::Deployed,
             generation,
@@ -648,14 +708,9 @@ pub(crate) fn deploy_result<P: PodmanClient + 'static>(
             generation,
             digest: Some(digest),
         },
-        CoreOutcome::Failed { reason, .. } => {
-            return Err(Fail::internal(format!("deploy failed: {reason}")));
-        }
-        CoreOutcome::KnownBad { .. } => {
-            return Err(Fail::internal("deploy refused: known bad digest"));
-        }
-    };
-    Ok(resp)
+        CoreOutcome::Failed { reason, .. } => return Err(failed(DeployFailure::Failed(reason))),
+        CoreOutcome::KnownBad { .. } => return Err(failed(DeployFailure::KnownBad)),
+    })
 }
 
 // ── Reload (issue #118) ─────────────────────────────────────────────────────
