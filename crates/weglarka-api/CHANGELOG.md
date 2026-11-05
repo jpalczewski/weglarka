@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.7...weglarka-api-v0.0.8) - 2026-11-05
+
+### Added
+
+- *(engine)* roll a static site back to its previous release ([#543](https://github.com/jpalczewski/weglarka/pull/543))
+- *(cli)* list image reservations and reclaim stale ones at startup ([#531](https://github.com/jpalczewski/weglarka/pull/531))
+- *(ingress)* retain ingress logs for a configurable number of days
+- *(engine)* add image provenance and retention ([#471](https://github.com/jpalczewski/weglarka/pull/471))
+- *(platform)* add platform update v1 shared contracts and parser ([#465](https://github.com/jpalczewski/weglarka/pull/465))
+- *(panel)* read-only site detail page with the environment promotion chain ([#473](https://github.com/jpalczewski/weglarka/pull/473))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-api-v0.0.6...weglarka-api-v0.0.7) - 2026-10-31
 
 ### Added

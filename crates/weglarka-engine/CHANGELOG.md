@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.6...weglarka-engine-v0.0.7) - 2026-11-05
+
+### Added
+
+- *(engine)* roll a static site back to its previous release ([#543](https://github.com/jpalczewski/weglarka/pull/543))
+- *(engine)* site release store, configurable extraction limits and sites doctor checks ([#541](https://github.com/jpalczewski/weglarka/pull/541))
+- *(engine)* internal_hosts maps served domains to Podman's host-gateway ([#532](https://github.com/jpalczewski/weglarka/pull/532))
+- *(daemon)* report containers whose conmon died ([#537](https://github.com/jpalczewski/weglarka/pull/537))
+- *(cli)* list image reservations and reclaim stale ones at startup ([#531](https://github.com/jpalczewski/weglarka/pull/531))
+- static sites — per-site rendering options ([#104](https://github.com/jpalczewski/weglarka/pull/104)) ([#500](https://github.com/jpalczewski/weglarka/pull/500))
+- *(engine)* add image provenance and retention ([#471](https://github.com/jpalczewski/weglarka/pull/471))
+- *(platform)* add platform update v1 shared contracts and parser ([#465](https://github.com/jpalczewski/weglarka/pull/465))
+
+### Fixed
+
+- *(engine)* roll back to a release on disk without the image or the registry ([#542](https://github.com/jpalczewski/weglarka/pull/542))
+- *(engine)* reload restarts a container whose conmon died ([#534](https://github.com/jpalczewski/weglarka/pull/534))
+- *(engine)* image retention fails closed on provenance errors ([#528](https://github.com/jpalczewski/weglarka/pull/528))
+- *(platform)* OpenRC downgrade and remove clean up the init script and the cron block ([#505](https://github.com/jpalczewski/weglarka/pull/505))
+
+### Other
+
+- *(engine)* one deploy-and-retain path ([#522](https://github.com/jpalczewski/weglarka/pull/522))
+- *(podman)* one contract suite for LibpodClient and FakePodman ([#524](https://github.com/jpalczewski/weglarka/pull/524))
+- *(launcher)* skip rehashing unchanged generation binaries ([#513](https://github.com/jpalczewski/weglarka/pull/513))
+- *(model)* bounded state-file serialization and batched inventory writes ([#507](https://github.com/jpalczewski/weglarka/pull/507))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.5...weglarka-engine-v0.0.6) - 2026-10-31
 
 ### Added

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.1...weglarka-panel-v0.1.2) - 2026-11-05
+
+### Added
+
+- *(cli)* discover the issuer and audience from the host ([#495](https://github.com/jpalczewski/weglarka/pull/495))
+- *(panel)* read-only site detail page with the environment promotion chain ([#473](https://github.com/jpalczewski/weglarka/pull/473))
+
+### Fixed
+
+- *(panel)* end the resources poll when forward auth answers it ([#449](https://github.com/jpalczewski/weglarka/pull/449))
+- *(oidc)* treat a rate-limited token request as transient ([#448](https://github.com/jpalczewski/weglarka/pull/448))
+- *(panel)* send the access-log path filter unencoded ([#440](https://github.com/jpalczewski/weglarka/pull/440))
+- *(cli)* keep polling the device grant through rate limiting ([#438](https://github.com/jpalczewski/weglarka/pull/438))
+- *(panel)* explain a live view that cannot start ([#439](https://github.com/jpalczewski/weglarka/pull/439))
+
+### Other
+
+- *(oidc)* move the code flow's request and exchange into weglarka-oidc ([#494](https://github.com/jpalczewski/weglarka/pull/494))
+- *(deps-dev)* bump @playwright/test in /crates/weglarka-panel/e2e ([#450](https://github.com/jpalczewski/weglarka/pull/450))
+
 ## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.0...weglarka-panel-v0.1.1) - 2026-10-31
 
 ### Added

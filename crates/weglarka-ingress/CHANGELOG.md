@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.6...weglarka-ingress-v0.0.7) - 2026-11-05
+
+### Added
+
+- *(engine)* internal_hosts maps served domains to Podman's host-gateway ([#532](https://github.com/jpalczewski/weglarka/pull/532))
+- *(ingress)* retain ingress logs for a configurable number of days
+- static sites — per-site rendering options ([#104](https://github.com/jpalczewski/weglarka/pull/104)) ([#500](https://github.com/jpalczewski/weglarka/pull/500))
+
+### Fixed
+
+- *(ingress)* close log-retention review gaps
+- *(ingress)* serve static-site files with a real MIME table ([#499](https://github.com/jpalczewski/weglarka/pull/499))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.5...weglarka-ingress-v0.0.6) - 2026-10-31
 
 ### Added
