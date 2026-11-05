@@ -1,5 +1,6 @@
-# Minimal Authelia base config for the `identity-config` CI job: just enough for `authelia config validate`
-# to accept it, next to the files weglarka-identity renders (oidc-clients.yml, access-control.yml). The
+# Minimal Authelia base config for the Authelia validation step of the `check` CI job: just enough for
+# `authelia config validate` to accept it, next to the files weglarka-identity renders (oidc-clients.yml,
+# access-control.yml). The
 # values are placeholders for validation only; nothing here runs a provider. The JWKS key is generated in
 # the job. No `access_control` and no OIDC `clients` here on purpose: Węglarka owns both (docs: #88, #90).
 theme: auto

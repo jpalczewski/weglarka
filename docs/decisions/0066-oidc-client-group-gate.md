@@ -33,8 +33,8 @@ later by the daemon. A gate on the client itself is needed before forward auth i
   not end an existing session at once; the panel's daemon refuses the first access token without a mapped group.
 - An older Węglarka refuses an `apps.toml` that carries `allowed_groups` (`deny_unknown_fields`): remove it before
   downgrading ([identity provider](../guides/identity-provider.md)).
-- Tests: model validation, renderer snapshot and error, daemon integration, `identity-config` CI validation with the
-  pinned Authelia image.
+- Tests: model validation, renderer snapshot and error, daemon integration, and the `check` CI job's validation of
+  the fixtures with the pinned Authelia image.
 
 ## Rejected alternatives
 
