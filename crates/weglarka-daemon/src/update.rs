@@ -24,19 +24,19 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use weglarka_api::{
-    CheckStatus, DeployOutcome, DeployResponse, DoctorCheck, ErrorCode, RuntimeState,
-    UpdateAppRequest, UpdateAppResponse,
+    CheckStatus, DeployResponse, DoctorCheck, ErrorCode, RuntimeState, UpdateAppRequest,
+    UpdateAppResponse,
 };
-use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
 use weglarka_engine::reconcile::EngineError;
 use weglarka_model::app::{AppKind, InstanceName};
-use weglarka_model::labels;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state::{self, AppState};
 
-use crate::admin::Fail;
-use crate::app::{Daemon, MUTATION_TIMEOUT};
-use crate::app_view::{Access, show_response};
+use crate::admin::{
+    Fail, deploy_forced, deploy_result_with, mutating, parse_json, parse_name, view_after_mutation,
+};
+use crate::app::Daemon;
+use crate::app_view::Access;
 use crate::candidate;
 
 /// Runtime state with "waiting for secret" taking the place of `Missing`: there is no container
@@ -58,14 +58,12 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
     Path(raw): Path<String>,
     body: Bytes,
 ) -> Result<Response, Fail> {
-    let invalid = |m: String| Fail(ErrorCode::InvalidRequest, m);
-    let name = InstanceName::new(&raw).map_err(|e| invalid(e.to_string()))?;
-    let req: UpdateAppRequest =
-        serde_json::from_slice(&body).map_err(|e| invalid(format!("invalid JSON body: {e}")))?;
+    let name = parse_name(&raw)?;
+    let req: UpdateAppRequest = parse_json(&body)?;
 
     let (old_image, old_start) = {
         let _g = d.desired_lock.lock().await;
-        let mut apps = state::load_apps(&d.paths.state.apps).map_err(internal)?;
+        let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
         if let Some(origin) = apps.origin(&name) {
             return Err(Fail::from(EngineError::ManagedBySite {
                 instance: name.clone(),
@@ -107,20 +105,7 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
             d.engine.check_served_release(&name, &req.spec)?;
         }
         d.engine.check_range_change(&name, &req.spec).await?;
-        match tokio::time::timeout(
-            MUTATION_TIMEOUT,
-            d.engine.upsert_app(name.clone(), req.spec.clone()),
-        )
-        .await
-        {
-            Ok(r) => r.map_err(internal)?,
-            Err(_) => {
-                return Err(Fail(
-                    ErrorCode::Busy,
-                    "daemon is busy (deploy in progress); retry shortly".into(),
-                ));
-            }
-        }
+        mutating(d.engine.upsert_app(name.clone(), req.spec.clone())).await?;
         (old.image, old.start)
     };
 
@@ -132,15 +117,7 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
     };
     d.changed();
 
-    let st = state::load_state(&d.paths.state.state).map_err(internal)?;
-    let container = d
-        .engine
-        .podman()
-        .container_inspect(&labels::container_name(&name))
-        .await
-        .ok();
-    let app_state = st.apps.get(&name);
-    let app = show_response(access, name, req.spec, app_state, container.as_ref());
+    let app = view_after_mutation(&d, access, name, req.spec).await?;
     Ok(axum::Json(UpdateAppResponse { app, deploy }).into_response())
 }
 
@@ -151,72 +128,33 @@ fn kind_name(kind: AppKind) -> &'static str {
     }
 }
 
-fn internal(e: impl ToString) -> Fail {
-    Fail(ErrorCode::Internal, e.to_string())
-}
-
 /// Deploy after an image change. Like a manual deploy it holds the engine mutex through pull and
-/// health gate. `None` = the app waits for secrets (nothing attempted, not an error).
+/// health gate and retries a known-bad digest (see [`deploy_forced`]). `None` = the app waits for
+/// secrets (nothing attempted, not an error).
 async fn redeploy<P: PodmanClient + 'static>(
     d: &Daemon<P>,
     name: &InstanceName,
 ) -> Result<Option<DeployResponse>, Fail> {
-    let mut outcome = match d.engine.deploy(name, false).await {
-        Ok(o) => o,
+    let outcome = match deploy_forced(d, name).await {
+        Ok(outcome) => outcome,
         Err(EngineError::MissingSecrets(_)) => return Ok(None),
-        Err(e) => return Err(deploy_failed(e)),
+        // An unmet dependency is a conflict (409) with the dependencies listed, not a failed deploy:
+        // the start was never attempted (issue #35).
+        Err(e @ EngineError::DependenciesNotReady { .. }) => return Err(Fail::from(e)),
+        Err(e) => return Err(saved_but_failed(e)),
     };
-    if matches!(outcome, CoreOutcome::KnownBad { .. }) {
-        // An explicit image change is the operator's will: retry a known-bad digest.
-        outcome = d.engine.deploy(name, true).await.map_err(deploy_failed)?;
-    }
-    let generation = state::load_state(&d.paths.state.state)
-        .map_err(internal)?
-        .apps
-        .get(name)
-        .map_or(0, |a| a.generation);
-    Ok(Some(match outcome {
-        CoreOutcome::Deployed { digest, generation } => DeployResponse {
-            outcome: DeployOutcome::Deployed,
-            generation,
-            digest: Some(digest),
-        },
-        CoreOutcome::Unchanged { digest } => DeployResponse {
-            outcome: DeployOutcome::Unchanged,
-            generation,
-            digest: Some(digest),
-        },
-        CoreOutcome::RolledBack { restored, .. } => DeployResponse {
-            outcome: DeployOutcome::RolledBack,
-            generation,
-            digest: Some(restored),
-        },
-        CoreOutcome::Provisioned { digest } => DeployResponse {
-            outcome: DeployOutcome::Provisioned,
-            generation,
-            digest: Some(digest),
-        },
-        CoreOutcome::Failed { reason, .. } => return Err(saved_but_failed(reason)),
-        CoreOutcome::KnownBad { .. } => {
-            return Err(saved_but_failed("known bad digest"));
-        }
-    }))
+    Ok(Some(deploy_result_with(
+        d,
+        name,
+        outcome,
+        saved_but_failed,
+    )?))
 }
 
-fn saved_but_failed(why: impl ToString) -> Fail {
-    internal(format!(
-        "spec saved, but the deploy failed: {}",
-        why.to_string()
-    ))
-}
-
-/// Error of the deploy that follows a spec write. An unmet dependency is a conflict (409) with the
-/// dependencies listed, not a failed deploy: the start was never attempted (issue #35).
-fn deploy_failed(e: EngineError) -> Fail {
-    match e {
-        e @ EngineError::DependenciesNotReady { .. } => Fail::from(e),
-        e => saved_but_failed(e),
-    }
+/// The spec was already written when the deploy ran: the message says both, so the operator knows
+/// the stored spec does not match what is running.
+fn saved_but_failed(why: impl std::fmt::Display) -> Fail {
+    Fail::internal(format!("spec saved, but the deploy failed: {why}"))
 }
 
 /// Doctor: apps waiting for secrets are a warning with the exact command to fix it.
