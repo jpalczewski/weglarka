@@ -1541,6 +1541,7 @@ image = "ghcr.io/example/weglarka:latest"
         assert!(!opts.state_dir.join("self-update.toml.retired").exists());
     }
 
+    #[cfg(target_os = "linux")] // reads /proc (boot id, pid liveness)
     #[tokio::test]
     async fn stale_scratch_directories_are_removed_and_a_missing_parent_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
