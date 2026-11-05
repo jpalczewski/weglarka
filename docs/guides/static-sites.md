@@ -101,6 +101,7 @@ redirects = [
   { from = "/blog", to = "/posts", prefix = true },
 ]
 feeds = [{ path = "/rss.xml", format = "rss" }]
+robots = "noindex"          # X-Robots-Tag: noindex, nofollow on every location
 
 [apps.blog.ingress.static.security_headers]
 preset = "baseline"
@@ -125,6 +126,11 @@ csp = "default-src 'self'"
 - **`feeds`** gives a path a fixed `Content-Type` (`rss`, `atom` or `json` → the JSON Feed type,
   `application/feed+json`) that the ingress's own MIME table cannot assign unambiguously from the extension alone
   (an RSS feed and a sitemap are both `.xml`).
+- **`robots`** sends `X-Robots-Tag: noindex, nofollow` on every location of the site, so nothing it serves (HTML,
+  PDF, images) is indexed (`robots = "noindex"`; the only value today). Unset sends no header. It is an enumerated
+  preset rather than a free-form header string ([ADR
+  0075](../decisions/0075-site-level-static-options.md)); the main use is a preview domain serving the same build as
+  production, see [site environments](site-environments.md) for the per-environment override.
 - **`security_headers`** adds `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and a strict
   `Referrer-Policy` to every location of the site (the `baseline` preset, the only one today), plus an optional
   `Strict-Transport-Security` (`hsts_max_age_secs`, without `includeSubDomains`/`preload` — those apply beyond this
@@ -171,12 +177,13 @@ failed release is reported as blocked until you run `weglarka deploy`.
 
 ## Rollback
 
-`kind` raised the state schema to version 12; `[apps.<x>.ingress.static]` (per-site options, #104) raised it again to
-18 ([state schema](state-schema.md)). `[sites]` in `weglarka.toml` is not part of the state schema, but
+`kind` raised the state schema to version 12; `[apps.<x>.ingress.static]` (per-site options, #104), `robots` and the
+shared `[sites.<site>.ingress.static]` table (#545/#548) raised it to 20 ([state schema](state-schema.md)). `[sites]` in `weglarka.toml` is not part of the state schema, but
 `weglarka.toml` also uses `deny_unknown_fields`: **remove the `[sites]` table before downgrading** to a release that
 does not know it (or restore `weglarka.toml` from before the upgrade). Before downgrading Węglarka below schema 12,
 remove the `kind = "static"` apps from `apps.toml`; before downgrading below schema 18, remove every
-`[apps.<x>.ingress.static]` table — either way, restoring `apps.toml` and `state.toml` from the pre-upgrade backup
-works too. Drop the `schema_version` marker afterwards; an older daemon rejects the unknown field or table. Files
+`[apps.<x>.ingress.static]` table, and before downgrading below schema 20 also remove `robots` and the shared
+`[sites.<site>.ingress]` table — either way, restoring `apps.toml` and `state.toml` from the pre-upgrade backup works
+too. Drop the `schema_version` marker afterwards; an older daemon rejects the unknown field or table. Files
 under `<nginx_conf_dir>/sites/` and the daemon-private `<state dir>/sites-tmp` are ignored by older versions and can
 be deleted by hand.

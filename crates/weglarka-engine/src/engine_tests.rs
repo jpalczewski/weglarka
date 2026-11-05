@@ -5029,10 +5029,30 @@ domains = ["example.com"]
         ])
     }
 
+    /// Sites with a per-environment `robots` on the preview only (#545, ADR 0075).
+    const SITES_WITH_ROBOTS: &str = r#"
+[sites.blog]
+kind = "static"
+image = "registry.example.com/me/blog"
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+robots = "noindex"
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+"#;
+
     fn harness() -> Harness {
+        harness_of(SITES)
+    }
+
+    fn harness_of(sites: &str) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let h = Harness::build(
-            SITES,
+            sites,
             ReconcilerOptions {
                 sites: Some(SitesOptions {
                     root: dir.path().join("sites"),
@@ -5271,6 +5291,38 @@ domains = ["example.com"]
             .unwrap_err();
         assert!(matches!(err, EngineError::PromoteRefused(_)), "{err:?}");
         assert_eq!(h.state("blog-prod").current, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_promotion_does_not_change_the_target_environments_robots() {
+        let h = harness_of(SITES_WITH_ROBOTS);
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        let robots = |instance: &str| {
+            let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+            apps.apps[&name(instance)]
+                .ingress
+                .static_
+                .as_ref()
+                .and_then(|o| o.robots)
+        };
+        assert_eq!(
+            robots("blog-dev"),
+            Some(weglarka_model::app::Robots::Noindex)
+        );
+
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        assert_eq!(served(&h, "blog-prod"), "one");
+        // `robots` comes from the environment's own spec, not from the promoted digest: the
+        // production environment stays indexable while the preview that served the same digest is not.
+        assert_eq!(robots("blog-prod"), None);
+        assert_eq!(
+            robots("blog-dev"),
+            Some(weglarka_model::app::Robots::Noindex)
+        );
     }
 
     #[tokio::test(start_paused = true)]

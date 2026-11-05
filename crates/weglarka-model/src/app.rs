@@ -1046,6 +1046,11 @@ pub struct StaticIngress {
     /// `add_header`s applied to every location of the site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_headers: Option<SecurityHeaders>,
+    /// Search-engine directives, restated in every location of the site like `security_headers`
+    /// (#545, ADR 0075). The main use is a preview environment that must not be indexed while the
+    /// same digest is the production site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robots: Option<Robots>,
 }
 
 /// One entry of [`StaticIngress::redirects`].
@@ -1121,6 +1126,17 @@ pub struct SecurityHeaders {
 pub enum SecurityHeadersPreset {
     #[default]
     Baseline,
+}
+
+/// Search-engine directives for a static site (#545, ADR 0075): an enumerated preset, not a free-form
+/// header, for the same reason as [`SecurityHeadersPreset`] — nothing here is a channel to inject
+/// arbitrary `nginx.conf` directives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Robots {
+    /// `X-Robots-Tag: noindex, nofollow`: the preview's pages are not indexed and the links on them
+    /// are not followed, so a staging domain never ends up in search results.
+    Noindex,
 }
 
 /// What an instance runs (ADR 0049). The default is a container; a `static` instance has no container
@@ -1919,5 +1935,26 @@ image = "x:1"
         let src = format!("{BLOG_SITE}\n[apps.blog-dev]\nimage = \"x:1\"\n");
         let err = toml::from_str::<AppsFile>(&src).unwrap_err().to_string();
         assert!(err.contains("already declared in [apps]"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_shared_static_option_names_the_site_and_environment() {
+        // A shared option is validated on each expanded instance (a redirect must stay inside the
+        // instance's own `paths`), so the error has to name the site and environment the operator
+        // actually edited, not only the derived instance name (#548, ADR 0075).
+        let src =
+            format!("{BLOG_SITE}\n[sites.blog.ingress.static]\nnot_found_page = \"/404.txt\"\n");
+        let parsed: AppsFile = toml::from_str(&src).unwrap();
+        let err = crate::state::validate_apps(&parsed).unwrap_err();
+        assert!(err.starts_with("site blog, environment dev"), "{err}");
+        assert!(err.contains("not_found_page"), "{err}");
+        // A plain `[apps]` entry keeps its own message.
+        let plain: AppsFile = toml::from_str(
+            "[apps.plain]\nkind = \"static\"\nimage = \"x:1\"\n\
+             [apps.plain.ingress.static]\nnot_found_page = \"/404.txt\"\n",
+        )
+        .unwrap();
+        let err = crate::state::validate_apps(&plain).unwrap_err();
+        assert!(err.starts_with("plain: "), "{err}");
     }
 }

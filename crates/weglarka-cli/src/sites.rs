@@ -23,8 +23,9 @@ pub enum SitesCommand {
     List,
     /// Show one site.
     Show { site: String },
-    /// Declare or replace a site from a TOML file (`kind`, `image`, `[env.<name>]` tables — the body
-    /// of `[sites.<site>]` in apps.toml).
+    /// Declare or replace a site from a TOML file (`kind`, `image`, `[env.<name>]` tables and the
+    /// optional `[ingress.static]` options shared by every environment — the body of `[sites.<site>]`
+    /// in apps.toml).
     Declare(DeclareArgs),
     /// Remove a site. Refused while an environment serves a release unless `--purge`.
     Remove(RemoveArgs),
@@ -169,8 +170,9 @@ async fn declare(json: bool, o: &Overrides, a: DeclareArgs) -> Result<i32, CliEr
     };
     let spec: SiteSpec = toml::from_str(&src).map_err(|e| {
         CliError::usage(format!("invalid site: {e}")).with_hint(
-            "format: the body of `[sites.<site>]` — kind = \"static\", image = \"repo\" and \
-             [env.<name>] tables with `track` or `promote_from`",
+            "format: the body of `[sites.<site>]` — kind = \"static\", image = \"repo\", \
+             [env.<name>] tables with `track` or `promote_from`, and optionally \
+             [ingress.static] options plus `robots` per environment",
         )
     })?;
     let req = DeclareSiteRequest { spec };

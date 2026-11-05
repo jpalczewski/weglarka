@@ -492,13 +492,29 @@ env = { B = "2", A = "1" }
                     hsts_max_age_secs: Some(31536000),
                     csp: Some("default-src 'self'".into()),
                 }),
+                robots: Some(crate::app::Robots::Noindex),
             }),
         };
         s.paths = vec!["/api".into()];
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104) only re-render nginx"
+            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104, ADR 0075) only re-render nginx"
+        );
+    }
+
+    #[test]
+    fn static_robots_only_re_renders_nginx() {
+        // `robots` (#545, ADR 0075) is an ingress option: an environment flipping it (a preview
+        // becoming indexable) must not recreate anything.
+        let mut s = spec();
+        s.ingress.static_ = Some(crate::app::StaticIngress {
+            robots: Some(crate::app::Robots::Noindex),
+            ..Default::default()
+        });
+        assert_eq!(
+            spec_hash(&spec(), &digest('a')),
+            spec_hash(&s, &digest('a'))
         );
     }
 

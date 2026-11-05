@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 19**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 19`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 20**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 20`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-model/src/state.rs`); a compile-time assert
@@ -56,6 +56,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 17 | #446 | optional `oidc.allowed_groups` and `[oidc_clients.<id>] allowed_groups` | [0066](../decisions/0066-oidc-client-group-gate.md) | [identity provider](identity-provider.md) |
 | 18 | #104 | optional `[apps.<x>.ingress.static]` (clean URLs, custom 404, cache headers, redirects, feeds, security headers), only on `kind = "static"` | [0069](../decisions/0069-static-site-ingress-options.md) | [static sites](static-sites.md) |
 | 19 | #303 | optional `internal_hosts` in app specs | [0071](../decisions/0071-internal-hosts-host-gateway.md) | [reaching your own domains](internal-hosts.md) |
+| 20 | #545, #548 | optional `[sites.<site>.ingress.static]` (the static options of ADR 0069 shared by every environment) and `robots` per environment | [0075](../decisions/0075-site-level-static-options.md) | [site environments](site-environments.md) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

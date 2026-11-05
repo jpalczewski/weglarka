@@ -81,6 +81,8 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `kind = "static"` | [static sites](static-sites.md) |
 | `apps.toml`, apps | `[apps.X.ingress.static]` (clean URLs, custom 404, cache headers, redirects, feeds, security headers) | [static sites](static-sites.md) |
 | `apps.toml` | the `[sites.<site>]` sections (declare the environments as plain `kind = "static"` apps if the sites must keep running) | [site environments](site-environments.md) |
+| `apps.toml`, sites | `[sites.<site>.ingress.static]` (the options shared by every environment) | [site environments](site-environments.md) |
+| `apps.toml`, sites | `robots` in `[sites.<site>.env.<env>]` and in `[apps.<x>.ingress.static]` | [static sites](static-sites.md) |
 | `apps.toml`, apps | `ingress.auth`, `ingress.auth_exempt_paths` (enforced by nginx since this stage; remove them before downgrading) | [forward auth](forward-auth.md) |
 | `apps.toml`, apps | `oidc` (with `device_flow`, `allowed_groups`); the `[oidc_clients.<id>]` sections (with `device_flow`, `allowed_groups`) | [identity provider](identity-provider.md) |
 | `apps.toml`, apps | `metrics_port`, `metrics_path` (`weglarka apps update <app> --metrics-port none`) | [metrics](metrics.md) |

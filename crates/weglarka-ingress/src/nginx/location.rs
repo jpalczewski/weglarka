@@ -2,7 +2,7 @@
 
 use weglarka_model::admin_auth::{RELAY_MAX_BODY_BYTES, RELAY_PREFIX};
 use weglarka_model::app::{
-    AppIngress, BodySizeLimit, SecurityHeaders, SecurityHeadersPreset, StaticIngress,
+    AppIngress, BodySizeLimit, Robots, SecurityHeaders, SecurityHeadersPreset, StaticIngress,
 };
 
 use super::NginxOptions;
@@ -306,13 +306,13 @@ const STATIC_SITE_TYPES: &[(&str, &[&str])] = &[
 /// A static site's `location` body. `rewrite ... break` runs before `try_files`, which then sees the URI
 /// relative to the site root; nginx has normalized `$uri` (no `..`) before this point. Only GET and HEAD
 /// are allowed, and nothing is listed. `opts` are the site's per-site rendering options (#104, ADR
-/// 0069: `clean_urls`, `not_found_page`, `cache_revalidate`, `security_headers` — `cache_immutable_paths`,
-/// `redirects` and `feeds` add sibling `location`s instead, see [`write_cache_immutable_locations`] and
-/// [`write_redirects_and_feeds`], since nginx cannot define the same `location` twice and a site may be
-/// reached through two locations (an exact `/p` and a prefix `/p/`, ADR 0031)); `site_prefix` is the
-/// public path this site is mounted at ("" for the root), needed to turn `not_found_page` — a path
-/// relative to the release root, like `index.html` — back into a client-facing URI `error_page` can
-/// route through this same location.
+/// 0069: `clean_urls`, `not_found_page`, `cache_revalidate`, `security_headers`; `robots`, ADR 0075).
+/// `cache_immutable_paths`, `redirects` and `feeds` add sibling `location`s instead, see
+/// [`write_site_relative_locations`] and [`write_redirects`], since nginx cannot define the same
+/// `location` twice and a site may be reached through two locations (an exact `/p` and a prefix
+/// `/p/`, ADR 0031); `site_prefix` is the public path this site is mounted at ("" for the root),
+/// needed to turn `not_found_page` — a path relative to the release root, like `index.html` — back
+/// into a client-facing URI `error_page` can route through this same location.
 fn write_directory(
     c: &mut Conf,
     root: &str,
@@ -341,9 +341,10 @@ fn write_directory(
         }
         // `cache_revalidate` alone (no `security_headers`) still emits an unconditional `add_header`
         // above, so `X-Request-Id` must be restated here too — `write_security_headers` only restates
-        // it when `security_headers` is set, which would otherwise silently drop the header.
-        if opts.cache_revalidate || opts.security_headers.is_some() {
+        // it when the site adds a header of its own, which would otherwise silently drop the header.
+        if opts.cache_revalidate || opts.security_headers.is_some() || opts.robots.is_some() {
             write_security_preset_only(c, opts.security_headers.as_ref());
+            write_robots(c, opts);
             c.line("add_header X-Request-Id $request_id always;");
         }
     }
@@ -375,17 +376,27 @@ fn write_security_preset(c: &mut Conf, preset: SecurityHeadersPreset) {
     }
 }
 
-/// `security_headers`' directives, ending with a restated `X-Request-Id` (ADR 0069): the first
+/// `security_headers`, `robots` and a restated `X-Request-Id` (ADR 0069, ADR 0075): the first
 /// `add_header` on a `location` drops every header `server`/`http` would otherwise have set, so a
-/// location that adds any header of its own must repeat the whole set. A no-op when `headers` is
-/// `None` — callers that already emit an unconditional `add_header` of their own (cache locations)
-/// restate `X-Request-Id` themselves instead of going through this function. Delegates the
-/// preset/HSTS/CSP body to [`write_security_preset_only`] instead of duplicating it, so the two never
-/// drift apart.
-fn write_security_headers(c: &mut Conf, headers: Option<&SecurityHeaders>) {
-    write_security_preset_only(c, headers);
-    if headers.is_some() {
+/// location that adds any header of its own must repeat the whole set — including `robots`, which is
+/// why this takes the whole [`StaticIngress`] rather than just `security_headers`. A no-op when the
+/// site adds nothing (callers that already emit an unconditional `add_header` of their own — cache
+/// and feed locations — restate `X-Request-Id` themselves instead of going through this function).
+/// Delegates the preset/HSTS/CSP body to [`write_security_preset_only`] instead of duplicating it, so
+/// the two never drift apart.
+fn write_security_headers(c: &mut Conf, opts: &StaticIngress) {
+    write_security_preset_only(c, opts.security_headers.as_ref());
+    write_robots(c, opts);
+    if opts.security_headers.is_some() || opts.robots.is_some() {
         c.line("add_header X-Request-Id $request_id always;");
+    }
+}
+
+/// `robots` (#545, ADR 0075): an enumerated preset instead of a free-form header, so nothing here is
+/// a channel to inject `nginx.conf` directives. A no-op when unset.
+fn write_robots(c: &mut Conf, opts: &StaticIngress) {
+    if let Some(Robots::Noindex) = opts.robots {
+        c.line("add_header X-Robots-Tag \"noindex, nofollow\" always;");
     }
 }
 
@@ -415,8 +426,9 @@ fn write_site_relative_locations(
             c.line(&format!("root {root};"));
             c.line("add_header Cache-Control \"public, max-age=31536000, immutable\" always;");
             write_security_preset_only(c, opts.security_headers.as_ref());
+            write_robots(c, opts);
             // Cache-Control is unconditional here, so `X-Request-Id` always needs restating
-            // (`write_security_headers` would skip it when `security_headers` is unset).
+            // (`write_security_headers` would skip it when the site adds nothing else).
             c.line("add_header X-Request-Id $request_id always;");
             write_try_files(c, opts.clean_urls);
             c.block("limit_except GET HEAD", |c| c.line("deny all;"));
@@ -434,6 +446,7 @@ fn write_site_relative_locations(
             c.line(&format!("default_type {};", f.format.content_type()));
             c.line("charset utf-8;");
             write_security_preset_only(c, opts.security_headers.as_ref());
+            write_robots(c, opts);
             c.line("add_header X-Request-Id $request_id always;");
             c.block("limit_except GET HEAD", |c| c.line("deny all;"));
         });
@@ -475,14 +488,14 @@ fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
                 if let Some(app) = app {
                     set_app(c, app);
                 }
-                write_security_headers(c, opts.security_headers.as_ref());
+                write_security_headers(c, opts);
                 c.line(&format!("rewrite ^{escaped}/(.*)$ {}/$1 permanent;", r.to));
             });
             c.block(&format!("location = {}", r.from), |c| {
                 if let Some(app) = app {
                     set_app(c, app);
                 }
-                write_security_headers(c, opts.security_headers.as_ref());
+                write_security_headers(c, opts);
                 c.line(&format!("return 301 {}$is_args$args;", r.to));
             });
         } else {
@@ -490,7 +503,7 @@ fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
                 if let Some(app) = app {
                     set_app(c, app);
                 }
-                write_security_headers(c, opts.security_headers.as_ref());
+                write_security_headers(c, opts);
                 c.line(&format!("return 301 {}$is_args$args;", r.to));
             });
         }

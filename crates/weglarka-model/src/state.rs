@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -178,6 +178,15 @@ fn internal_hosts_v19(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v19 → v20: static-site options shared by every environment of a site, and per-environment
+/// `robots` (#545/#548, ADR 0075). `[sites.<site>.ingress.static]` and `[sites.<site>.env.<env>]
+/// robots` are optional and default to unset, so a v19 document needs no data transformation — the
+/// marker records that the file may carry them. A no-op that must accept a hand-edited file which
+/// already has them.
+fn site_static_options_v20(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -200,6 +209,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     oidc_allowed_groups_v17,
     static_ingress_options_v18,
     internal_hosts_v19,
+    site_static_options_v20,
 ];
 
 const _: () = assert!(
@@ -417,7 +427,22 @@ fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
 /// daemon's candidate check cannot drift apart.
 pub fn validate_apps(apps: &AppsFile) -> Result<(), String> {
     for (name, spec) in &apps.apps {
-        validate_app(name, spec)?;
+        if let Err(message) = validate_app(name, spec) {
+            // An expanded instance is named `<site>-<env>`: name the site and environment too, so an
+            // operator editing `[sites.<site>.ingress.static]` (`not_found_page`, `redirects`, …)
+            // knows which table is wrong instead of only seeing the derived instance name.
+            return Err(match apps.origin(name) {
+                Some(origin) => {
+                    let prefix = format!("{name}: ");
+                    let detail = message.strip_prefix(&prefix).unwrap_or(&message);
+                    format!(
+                        "site {}, environment {} (instance {name}): {detail}",
+                        origin.site, origin.env
+                    )
+                }
+                None => message,
+            });
+        }
     }
     validate_apps_file(apps)?;
     crate::depends::validate(apps)?;
@@ -2312,6 +2337,51 @@ csp = "default-src 'self'"
         save_apps(&apps_path, &apps).unwrap();
         assert_eq!(load_apps(&apps_path).unwrap(), apps);
         assert!(!fs::read_to_string(&apps_path).unwrap().contains("static"));
+    }
+
+    #[test]
+    fn schema_v19_file_with_site_static_options_and_robots_round_trips() {
+        // v20 (#545/#548, ADR 0075): `[sites.<site>.ingress.static]` plus a per-environment
+        // `robots`. The step is a no-op, so the file loads unchanged and is stamped with the new
+        // schema version on the first write.
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 19\n\
+             [sites.blog]\nkind = \"static\"\nimage = \"ghcr.io/me/blog\"\n\
+             [sites.blog.ingress.static]\nnot_found_page = \"/404.html\"\n\
+             [sites.blog.env.dev]\ntrack = \"main\"\ndomains = [\"dev.example.com\"]\nrobots = \"noindex\"\n\
+             [sites.blog.env.prod]\npromote_from = \"dev\"\ndomains = [\"example.com\"]\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        let dev = &apps.apps[&name("blog-dev")];
+        let opts = dev
+            .ingress
+            .static_
+            .as_ref()
+            .expect("shared options expanded");
+        assert_eq!(opts.not_found_page.as_deref(), Some("/404.html"));
+        assert_eq!(opts.robots, Some(crate::app::Robots::Noindex));
+        let prod = apps.apps[&name("blog-prod")]
+            .ingress
+            .static_
+            .as_ref()
+            .expect("shared options expanded");
+        assert_eq!(prod.not_found_page.as_deref(), Some("/404.html"));
+        assert_eq!(prod.robots, None, "the preview's robots is not shared");
+        save_apps(&apps_path, &apps).unwrap();
+        let reloaded = load_apps(&apps_path).unwrap();
+        assert_eq!(reloaded, apps);
+        let text = fs::read_to_string(&apps_path).unwrap();
+        assert!(
+            text.contains(&format!("schema_version = {SCHEMA_VERSION}")),
+            "{text}"
+        );
+        assert!(text.contains("[sites.blog.ingress.static]"), "{text}");
+        assert!(!text.contains("[apps.blog-"), "{text}");
     }
 
     #[test]

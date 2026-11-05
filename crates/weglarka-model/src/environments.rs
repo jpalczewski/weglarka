@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppKind, AppSpec, InstanceName};
+use crate::app::{AppKind, AppSpec, InstanceName, Robots, StaticIngress};
 
 /// Defines a lowercase `[a-z0-9-]` name newtype (1–63 chars, no leading/trailing hyphen) — the same
 /// alphabet as [`InstanceName`], because `<site>-<env>` has to be a valid instance name.
@@ -83,7 +83,22 @@ pub struct SiteSpec {
     pub kind: AppKind,
     /// Image repository **without** tag or digest; each environment picks its release.
     pub image: String,
+    /// Static-site options shared by every environment (#548, ADR 0075): each environment's instance
+    /// gets them, so `not_found_page`, cache headers and the rest are declared once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<SiteIngress>,
     pub env: BTreeMap<EnvName, EnvSpec>,
+}
+
+/// `[sites.<site>.ingress]`: the [`StaticIngress`] options every environment of the site shares.
+/// Deliberately not [`crate::app::AppIngress`]: streaming, body limits and auth configure a proxy to a
+/// container, which a site environment never has (the same allowlist rule as ADR 0069).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteIngress {
+    /// `[sites.<site>.ingress.static]`, renamed like `AppIngress::static_` (`static` is a keyword).
+    #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
+    pub static_: Option<StaticIngress>,
 }
 
 /// `[sites.<site>.env.<env>]`: exactly one of `track` and `promote_from`.
@@ -100,6 +115,10 @@ pub struct EnvSpec {
     pub domains: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// The one per-environment override of the site's shared static options (#545, ADR 0075): a
+    /// preview must not be indexed while the same digest is production.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robots: Option<Robots>,
 }
 
 /// Where an expanded instance comes from. Kept next to `apps.toml`'s instances, never serialized.
@@ -246,6 +265,16 @@ fn expanded_spec(site: &SiteSpec, env: &EnvSpec) -> AppSpec {
             spec.auto_update = false;
         }
     }
+    // The site's static options are shared by every environment (#548); `robots` is the only
+    // per-environment override (#545), and an environment that sets it without any shared options
+    // still gets a `StaticIngress` carrying just that one (ADR 0075).
+    spec.ingress.static_ = site.ingress.as_ref().and_then(|i| i.static_.clone());
+    if let Some(robots) = env.robots {
+        spec.ingress
+            .static_
+            .get_or_insert_with(StaticIngress::default)
+            .robots = Some(robots);
+    }
     spec
 }
 
@@ -345,5 +374,148 @@ track = "t"
         )]);
         let err = expand(&sites(BLOG).unwrap(), &apps).unwrap_err();
         assert!(err.contains("[apps]"), "{err}");
+    }
+
+    /// `[sites.<site>.ingress.static]` (shared options) and `robots` per environment (#545/#548,
+    /// ADR 0075).
+    const BLOG_WITH_OPTIONS: &str = r#"
+[sites.blog]
+kind = "static"
+image = "ghcr.io/me/blog"
+
+[sites.blog.ingress.static]
+not_found_page = "/404.html"
+cache_immutable_paths = ["/_astro"]
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+robots = "noindex"
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+"#;
+
+    fn static_ingress(spec: &AppSpec) -> &StaticIngress {
+        spec.ingress
+            .static_
+            .as_ref()
+            .expect("the instance carries static options")
+    }
+
+    #[test]
+    fn the_sites_static_options_are_shared_and_robots_is_per_environment() {
+        let out = expand(&sites(BLOG_WITH_OPTIONS).unwrap(), &BTreeMap::new()).unwrap();
+        let dev = &out[&InstanceName::new("blog-dev").unwrap()].0;
+        let prod = &out[&InstanceName::new("blog-prod").unwrap()].0;
+        for spec in [dev, prod] {
+            assert_eq!(spec.kind, AppKind::Static);
+            assert_eq!(
+                static_ingress(spec).not_found_page.as_deref(),
+                Some("/404.html")
+            );
+            assert_eq!(static_ingress(spec).cache_immutable_paths, ["/_astro"]);
+        }
+        assert_eq!(static_ingress(dev).robots, Some(Robots::Noindex));
+        assert_eq!(static_ingress(prod).robots, None, "not inherited from dev");
+    }
+
+    #[test]
+    fn an_environment_robots_alone_creates_a_static_ingress() {
+        let out = expand(&sites(BLOG_WITH_OPTIONS).unwrap(), &BTreeMap::new()).unwrap();
+        let src = BLOG_WITH_OPTIONS.replace(
+            "[sites.blog.ingress.static]\nnot_found_page = \"/404.html\"\ncache_immutable_paths = [\"/_astro\"]\n",
+            "",
+        );
+        let out_without = expand(&sites(&src).unwrap(), &BTreeMap::new()).unwrap();
+        assert!(!src.contains("[sites.blog.ingress.static]"), "{src}");
+        let dev = &out_without[&InstanceName::new("blog-dev").unwrap()].0;
+        assert_eq!(static_ingress(dev).robots, Some(Robots::Noindex));
+        assert!(!static_ingress(dev).clean_urls);
+        // Nothing shared and no per-environment override: no table at all.
+        assert!(
+            out[&InstanceName::new("blog-prod").unwrap()]
+                .0
+                .ingress
+                .static_
+                .is_some()
+        );
+        assert!(
+            out_without[&InstanceName::new("blog-prod").unwrap()]
+                .0
+                .ingress
+                .static_
+                .is_none(),
+            "a site without shared options and without robots renders nothing"
+        );
+    }
+
+    #[test]
+    fn the_shared_robots_applies_to_an_environment_without_an_override() {
+        let src = BLOG_WITH_OPTIONS.replace(
+            "not_found_page = \"/404.html\"",
+            "not_found_page = \"/404.html\"\nrobots = \"noindex\"",
+        );
+        let out = expand(&sites(&src).unwrap(), &BTreeMap::new()).unwrap();
+        let prod = &out[&InstanceName::new("blog-prod").unwrap()].0;
+        assert_eq!(static_ingress(prod).robots, Some(Robots::Noindex));
+    }
+
+    #[test]
+    fn a_site_with_options_round_trips_through_toml() {
+        #[derive(Serialize, Deserialize)]
+        struct F {
+            sites: BTreeMap<SiteName, SiteSpec>,
+        }
+        let parsed: F = toml::from_str(BLOG_WITH_OPTIONS).unwrap();
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(text.contains("[sites.blog.ingress.static]"), "{text}");
+        assert!(text.contains("robots = \"noindex\""), "{text}");
+        let again: F = toml::from_str(&text).unwrap();
+        assert_eq!(again.sites, parsed.sites);
+        // A site without options stays without them: no empty table is written.
+        let plain: F = toml::from_str(BLOG).unwrap();
+        let text = toml::to_string(&plain).unwrap();
+        assert!(!text.contains("ingress"), "{text}");
+        assert!(!text.contains("robots"), "{text}");
+    }
+
+    #[test]
+    fn unknown_static_option_names_are_rejected() {
+        // `deny_unknown_fields` on `SiteIngress`, `StaticIngress` and `EnvSpec`: a typo is a parse
+        // error, not a silently ignored option.
+        for (src, needle) in [
+            (
+                BLOG_WITH_OPTIONS.replace("robots = \"noindex\"", "robots = \"nofollow\""),
+                "unknown variant",
+            ),
+            (
+                BLOG_WITH_OPTIONS.replace("robots = \"noindex\"", "robot = \"noindex\""),
+                "unknown field",
+            ),
+            (
+                BLOG_WITH_OPTIONS.replace(
+                    "not_found_page = \"/404.html\"",
+                    "not_found_page = \"/404.html\"\nnot_found = \"x\"",
+                ),
+                "unknown field",
+            ),
+            (
+                BLOG_WITH_OPTIONS.replace(
+                    "[sites.blog.ingress.static]",
+                    "[sites.blog.ingress.container]",
+                ),
+                "unknown field",
+            ),
+        ] {
+            #[derive(Debug, Deserialize)]
+            struct F {
+                #[allow(dead_code)]
+                sites: BTreeMap<SiteName, SiteSpec>,
+            }
+            let err = toml::from_str::<F>(&src).unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle:?} not in {err}");
+        }
     }
 }
