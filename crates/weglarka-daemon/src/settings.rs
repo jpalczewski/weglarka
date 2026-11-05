@@ -14,6 +14,12 @@ pub enum SettingsError {
     },
     #[error("invalid {path}: {message}")]
     Parse { path: PathBuf, message: String },
+    /// `[runtime] host_mounts` collides with a writable daemon mount (issue #552).
+    #[error("invalid {path}: {overlap}")]
+    HostMountOverlap {
+        path: PathBuf,
+        overlap: crate::service::HostMountOverlap,
+    },
 }
 
 /// Paths of the files the daemon reads and writes.
@@ -105,7 +111,21 @@ impl Settings {
             path: config_path.clone(),
             message: e.to_string(),
         })?;
-        Ok(Self::from_host(host, config_path))
+        let settings = Self::from_host(host, config_path);
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Checks that need the resolved paths (`HostConfig::validate` does not know the state dir): no
+    /// `[runtime] host_mounts` entry may overlap a path the daemon mounts writable (issue #552).
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        match crate::service::host_mount_overlaps(self).into_iter().next() {
+            Some(overlap) => Err(SettingsError::HostMountOverlap {
+                path: self.config_path.clone(),
+                overlap,
+            }),
+            None => Ok(()),
+        }
     }
 
     pub fn from_host(host: HostConfig, config_path: PathBuf) -> Self {

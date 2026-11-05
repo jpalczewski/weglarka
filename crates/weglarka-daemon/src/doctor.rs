@@ -109,6 +109,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     }
     memory_use(d, &mut checks).await;
     configs(d, &mut checks);
+    host_mounts_daemon_overlap(d, &mut checks);
     host_mounts(d, &mut checks);
     sites(d, &mut checks);
     sites_directory(d, &mut checks);
@@ -1078,6 +1079,45 @@ fn sites_current<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             ),
         )
     });
+}
+
+/// `host_mounts.daemon_overlap` (issue #552): an allowlisted path that overlaps a writable daemon mount
+/// would be mounted read-only over it. Silent when nothing is allowlisted.
+fn host_mounts_daemon_overlap<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let settings = crate::settings::Settings {
+        host: d.host.clone(),
+        config_path: std::path::PathBuf::new(),
+        paths: d.paths.clone(),
+    };
+    out.extend(overlap_check(&settings));
+}
+
+fn overlap_check(settings: &crate::settings::Settings) -> Option<DoctorCheck> {
+    const ID: &str = "host_mounts.daemon_overlap";
+    if settings.host.runtime.host_mounts.is_empty() {
+        return None;
+    }
+    let overlaps = crate::service::host_mount_overlaps(settings);
+    Some(if overlaps.is_empty() {
+        ok(
+            ID,
+            "no `[runtime] host_mounts` entry overlaps a writable daemon mount",
+        )
+    } else {
+        check(
+            ID,
+            CheckStatus::Fail,
+            overlaps
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+            Some(
+                "remove the entry from `[runtime] host_mounts` in weglarka.toml; a path the daemon \
+                 writes cannot also be mounted read-only",
+            ),
+        )
+    })
 }
 
 fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
@@ -3088,6 +3128,36 @@ port = 80
     fn redacted(mut check: DoctorCheck) -> DoctorCheck {
         apply_access(Access::Redacted, std::slice::from_mut(&mut check));
         check
+    }
+
+    #[test]
+    fn a_host_mount_inside_the_state_dir_fails_the_overlap_check() {
+        use weglarka_model::config::HostConfig;
+        let toml = |mounts: &str| {
+            format!(
+                "[runtime]\nhost_mounts = [{mounts}]\n[state]\ndir = \"/var/lib/weglarka\"\n\
+                 [ingress]\nmode = \"behind\"\nbind = \"172.17.0.1:8080\"\n[admin]\n\
+                 socket = \"/run/x/admin.sock\"\n[webhook]\nlisten = \"0.0.0.0:9180\"\n\
+                 domain = \"w.example.eu\"\n"
+            )
+        };
+        let settings = |mounts: &str| {
+            crate::settings::Settings::from_host(
+                HostConfig::from_toml_str(&toml(mounts)).unwrap(),
+                "/etc/weglarka/weglarka.toml".into(),
+            )
+        };
+        assert!(overlap_check(&settings("")).is_none());
+        let ok_check = overlap_check(&settings("\"/var/log/journal\"")).unwrap();
+        assert_eq!(ok_check.status, CheckStatus::Ok);
+        let bad = overlap_check(&settings("\"/var/lib/weglarka/ingress-logs\"")).unwrap();
+        assert_eq!(bad.id, "host_mounts.daemon_overlap");
+        assert_eq!(bad.status, CheckStatus::Fail);
+        assert!(
+            bad.message.contains("/var/lib/weglarka/ingress-logs"),
+            "{}",
+            bad.message
+        );
     }
 
     #[test]

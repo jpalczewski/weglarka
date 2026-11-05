@@ -111,6 +111,20 @@ inode, not on the path.
 
 Changing `host_mounts` or `group_add` of an app recreates its container; changing an allowlist alone recreates nothing.
 
+## Entries must not overlap what the daemon writes
+
+The daemon container mounts every `host_mounts` entry read-only at the same path. An entry that equals, lies
+inside or contains a path the daemon mounts **writable** would put a read-only mount on top of (or around) a
+location the daemon has to write: ingress apply and log rotation then fail with `Read-only file system`. The
+writable daemon mounts are the state directory (so `<state>/ingress-logs` and `<state>/nginx` are covered), the
+directory of the admin socket, the Podman socket, `nginx_conf_dir` when it is outside the state directory and the
+Traefik dynamic file (`[ingress] traefik_dynamic_file`). Paths are compared lexically, by whole components:
+`/var/lib/weglarka2` is a sibling of `/var/lib/weglarka`, not inside it.
+
+Such an entry is refused: the daemon and `weglarka-daemon platform install` fail to load `weglarka.toml` and
+name the entry and the mount it collides with, and `weglarka doctor` reports `host_mounts.daemon_overlap` as a
+failure for a daemon that is already running. Remove the entry and re-run `weglarka platform install`.
+
 ## Rollback
 
 `apps.toml` now carries `schema_version = 8` and `weglarka.toml` has `deny_unknown_fields`. Before downgrading to an older
