@@ -79,9 +79,9 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// Checks the spec's release-file gate ([`check_release_files`]) against the release `instance`
-    /// serves **right now** (issue #501): an `apps update` that only changes `ingress.static`
-    /// deploys nothing, so without this the next nginx reload would reference a page of a release
-    /// that does not have it.
+    /// serves **right now** (issue #501): a change that only touches `ingress.static` deploys
+    /// nothing, so without this the next nginx reload would reference a page of a release that does
+    /// not have it. [`Self::check_static_change`] is the decision of when that applies.
     ///
     /// The spec is the caller's — the update that is about to be persisted — because the check has to
     /// run before anything is written. The served release is resolved like the rest of the site code:
@@ -122,6 +122,31 @@ impl<P: PodmanClient> Reconciler<P> {
                 source,
             }
         })
+    }
+
+    /// The decision whether a spec change has to satisfy the release `instance` serves (issues #501,
+    /// #572), shared by every writer of a desired spec — [`Self::upsert_app`] (`apps add`,
+    /// `apps update`, import, CLI paths) and [`Self::declare_site`] — so there is exactly one place.
+    ///
+    /// Only an `ingress.static` change of an already stored static instance is checked: a change of
+    /// `image`, `start` or `kind` deploys (or rebuilds the release), and that deploy runs the full
+    /// gate itself. `old = None` is a new instance: nothing is served, the first deploy builds it.
+    /// Callers hold the engine mutex, so no deploy can move `current` between the check and the
+    /// write of the spec.
+    pub fn check_static_change(
+        &self,
+        instance: &InstanceName,
+        old: Option<&AppSpec>,
+        new: &AppSpec,
+    ) -> Result<(), EngineError> {
+        let Some(old) = old else {
+            return Ok(());
+        };
+        let redeploys = old.image != new.image || old.start != new.start || old.kind != new.kind;
+        if new.kind == AppKind::Static && !redeploys && old.ingress.static_ != new.ingress.static_ {
+            return self.check_served_release(instance, new);
+        }
+        Ok(())
     }
 
     fn sites(&self) -> Result<&SitesOptions, EngineError> {

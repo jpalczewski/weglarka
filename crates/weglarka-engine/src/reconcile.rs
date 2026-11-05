@@ -156,6 +156,25 @@ pub enum EngineError {
         #[source]
         source: crate::sites::ReleaseError,
     },
+    /// A re-declared site (`weglarka sites declare`) whose shared
+    /// `[sites.<site>.ingress.static]` options the release an environment serves cannot satisfy
+    /// (issue #572): declaring deploys nothing, so the environment needs a release that has the
+    /// files first. It names the site and environment, because the operator edited a shared table,
+    /// not the expanded instance. Nothing was written.
+    #[error(
+        "site {site}, environment {env} (instance {}): {}",
+        expanded_instance(.site, .env),
+        site_static_release_message(.site, .env, *.promote_only, .source)
+    )]
+    SiteServedReleaseUnsatisfied {
+        site: weglarka_model::environments::SiteName,
+        env: weglarka_model::environments::EnvName,
+        /// The environment changes only by promotion, so the message names that command instead of
+        /// a deploy one.
+        promote_only: bool,
+        #[source]
+        source: crate::sites::ReleaseError,
+    },
     /// The spec binds secrets that are not set (not a failure: the instance waits for them).
     #[error("waiting for secrets: {}", .0.join(", "))]
     MissingSecrets(Vec<String>),
@@ -257,6 +276,37 @@ fn join_names(names: &[InstanceName]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The instance a site environment expands into, `<site>-<env>` (ADR 0050): the site expanded
+/// already when this error is built, so the fallback only keeps the message total.
+fn expanded_instance(
+    site: &weglarka_model::environments::SiteName,
+    env: &weglarka_model::environments::EnvName,
+) -> String {
+    weglarka_model::environments::instance_name(site, env)
+        .map(|instance| instance.to_string())
+        .unwrap_or_else(|_| format!("{site}-{env}"))
+}
+
+/// The message of [`EngineError::SiteServedReleaseUnsatisfied`] (issue #572): the shared table the
+/// operator edited, the file the release lacks, and the command that gives the environment a
+/// release that has it.
+fn site_static_release_message(
+    site: &weglarka_model::environments::SiteName,
+    env: &weglarka_model::environments::EnvName,
+    promote_only: bool,
+    source: &crate::sites::ReleaseError,
+) -> String {
+    let fix = if promote_only {
+        format!("weglarka promote {site} {env}")
+    } else {
+        format!("weglarka deploy {}", expanded_instance(site, env))
+    };
+    format!(
+        "the release it currently serves cannot satisfy the shared `[sites.{site}.ingress.static]` \
+         options: {source}; deploy a release that has every file they name first (`{fix}`)"
+    )
 }
 
 /// Operator hint for [`EngineError::RegistryAuth`].
@@ -794,6 +844,11 @@ impl<P: PodmanClient> Reconciler<P> {
         let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
         crate::promote::ensure_unmanaged(&apps, &name)?;
+        // An ingress-only change of a static app deploys nothing, so the release it serves right now
+        // has to satisfy the new spec (issue #501) — checked under the engine mutex, so a deploy
+        // cannot move `current` between the check and the write (issue #572). `old = None` (a new
+        // app) needs no check; nothing is written on refusal.
+        self.check_static_change(&name, apps.apps.get(&name), &spec)?;
         apps.apps.insert(name, spec);
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }

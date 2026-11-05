@@ -655,3 +655,172 @@ async fn an_ingress_only_update_is_accepted_when_the_served_release_has_the_page
     );
     h.running.stop().await;
 }
+
+// ── `sites declare` against the releases the environments serve (issue #572) ──
+
+const DECLARED_BLOG: &str = r#"
+[sites.blog]
+kind = "static"
+image = "registry.example.com/me/blog"
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+"#;
+
+/// The `blog()` declaration as a whole replacement, with the shared table every environment
+/// inherits (#570, ADR 0075).
+fn blog_with_not_found_page() -> Value {
+    let mut site = blog();
+    site["spec"]["ingress"] = json!({ "static": { "not_found_page": "/404.html" } });
+    site
+}
+
+/// A complete release for one site environment (`<sites root>/<instance>/releases/<id>` plus the
+/// relative `current` link), with the `404.html` an added `not_found_page` names when `with_page`.
+fn install_environment_release(root: &std::path::Path, instance: &str, c: char, with_page: bool) {
+    let id = release_id(&Digest::new(blog_digest_for(c)).unwrap());
+    let site = root.join("state/nginx/sites").join(instance);
+    let release = site.join("releases").join(&id);
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("index.html"), "served").unwrap();
+    if with_page {
+        std::fs::write(release.join("404.html"), "not found").unwrap();
+    }
+    std::os::unix::fs::symlink(
+        std::path::Path::new("releases").join(&id),
+        site.join("current"),
+    )
+    .unwrap();
+}
+
+/// `state.toml` for a site whose environments serve `(instance, release digit)` — the pin and the
+/// `current` link have to agree for the release code.
+fn write_environment_state(root: &std::path::Path, served: &[(&str, char)]) {
+    let text: String = served
+        .iter()
+        .map(|(instance, c)| {
+            format!(
+                "[apps.{instance}]\ncurrent = \"{}\"\n\n",
+                blog_digest_for(*c)
+            )
+        })
+        .collect();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(root.join("state/state.toml"), text).unwrap();
+}
+
+/// A declared site whose `dev` serves `b` — a complete release, with `404.html` when `with_page` —
+/// so `current`, `state.toml` and the release on disk agree. `prod` has no release yet.
+async fn declared_site_harness(with_page: bool) -> Harness {
+    let builder = Builder::new().apps(DECLARED_BLOG);
+    let root = builder.root().to_owned();
+    install_environment_release(&root, "blog-dev", 'b', with_page);
+    write_environment_state(&root, &[("blog-dev", 'b')]);
+    builder.build().await
+}
+
+#[tokio::test]
+async fn a_re_declare_adding_a_shared_static_option_the_served_release_lacks_is_refused() {
+    let h = declared_site_harness(false).await;
+    let apps_toml = h.root.join("state/apps.toml");
+    let before = read(&apps_toml);
+
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/sites/blog",
+        Some(blog_with_not_found_page()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    let message = body["message"].as_str().unwrap();
+    // The operator edited a shared table: the message names the site, environment and file, and a
+    // tracking environment is fixed by a deploy.
+    assert!(
+        message.contains("site blog, environment dev (instance blog-dev)"),
+        "{body}"
+    );
+    assert!(message.contains("404.html"), "{body}");
+    assert!(message.contains("weglarka deploy blog-dev"), "{body}");
+
+    // A refused declare writes nothing and leaves the served release alone.
+    assert_eq!(read(&apps_toml), before);
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("state/nginx/sites/blog-dev/current/index.html"))
+            .unwrap(),
+        "served"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn a_re_declare_adding_a_shared_static_option_the_served_release_has_is_accepted() {
+    let h = declared_site_harness(true).await;
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/sites/blog",
+        Some(blog_with_not_found_page()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Persisted once, in the site table; every environment inherits it.
+    let text = read(&h.root.join("state/apps.toml"));
+    assert!(text.contains("[sites.blog.ingress.static]"), "{text}");
+    assert!(text.contains("not_found_page = \"/404.html\""), "{text}");
+    let (status, dev) = admin(&h, "GET", "/v1/apps/blog-dev", None).await;
+    assert_eq!(status, StatusCode::OK, "{dev}");
+    assert_eq!(
+        dev["spec"]["ingress"]["static"]["not_found_page"],
+        "/404.html"
+    );
+
+    // A new environment has no stored spec and serves nothing yet, so it passes the same check
+    // while the unchanged shared options of `dev` are not checked again.
+    let mut added = blog_with_not_found_page();
+    added["spec"]["env"]["staging"] = json!({
+        "track": "main",
+        "domains": ["staging.example.com"],
+    });
+    let (status, body) = admin(&h, "PUT", "/v1/sites/blog", Some(added)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let text = read(&h.root.join("state/apps.toml"));
+    assert!(text.contains("[sites.blog.env.staging]"), "{text}");
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn a_re_declare_names_a_promote_only_environment_and_points_at_promote() {
+    // `dev` already serves a release with the page, `prod` was promoted from an older one without
+    // it: only the promote-only environment fails, and its fix is a promotion, not a deploy.
+    let builder = Builder::new().apps(DECLARED_BLOG);
+    let root = builder.root().to_owned();
+    install_environment_release(&root, "blog-dev", 'b', true);
+    install_environment_release(&root, "blog-prod", 'a', false);
+    write_environment_state(&root, &[("blog-dev", 'b'), ("blog-prod", 'a')]);
+    let h = builder.build().await;
+
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/sites/blog",
+        Some(blog_with_not_found_page()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("site blog, environment prod (instance blog-prod)"),
+        "{body}"
+    );
+    assert!(message.contains("404.html"), "{body}");
+    assert!(message.contains("weglarka promote blog prod"), "{body}");
+    h.running.stop().await;
+}

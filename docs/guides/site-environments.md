@@ -79,8 +79,9 @@ environment means "no header", unless the shared table sets it — then the shar
 - The shared options are validated on each expanded instance, so `redirects[].from` must stay inside that
   environment's own `paths`. A rejected option names the site and environment (`site blog, environment dev (instance
   blog-dev): …`).
-- `not_found_page` is checked against the release being served, as for any static site: an environment whose release
-  lacks the page is refused until you deploy one that contains it.
+- `not_found_page` is checked against the release each environment serves, as for any static site: re-declaring the
+  site with a shared option that an environment's served release lacks is refused with a 400 naming the site,
+  environment and file (nothing is written), until that environment serves a release that contains it.
 - `weglarka sites declare blog --spec blog.toml` takes the same body, shared table and per-environment `robots`
   included.
 

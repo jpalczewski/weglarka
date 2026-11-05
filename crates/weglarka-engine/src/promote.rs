@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use crate::deploy::{AcquisitionSlot, DeployOutcome, DigestSource};
 use crate::images::ImageGuard;
 use crate::reconcile::{EngineError, Reconciler};
-use weglarka_model::app::{AppsFile, Digest, InstanceName};
-use weglarka_model::environments::{EnvName, SiteName, SiteSpec, instance_name};
+use weglarka_model::app::{AppSpec, AppsFile, Digest, InstanceName};
+use weglarka_model::environments::{EnvName, SiteName, SiteOrigin, SiteSpec, instance_name};
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state;
 
@@ -173,6 +173,22 @@ pub(crate) fn ensure_unmanaged(apps: &AppsFile, name: &InstanceName) -> Result<(
     }
 }
 
+/// Names the shared table the operator edited rather than only the expanded instance (issue #572),
+/// the same way the candidate-set validation of a re-declared site does (#570).
+fn with_site_context(error: EngineError, origin: &SiteOrigin) -> EngineError {
+    match error {
+        EngineError::ServedReleaseUnsatisfied { source, .. } => {
+            EngineError::SiteServedReleaseUnsatisfied {
+                site: origin.site.clone(),
+                env: origin.env.clone(),
+                promote_only: origin.promote_from.is_some(),
+                source,
+            }
+        }
+        other => other,
+    }
+}
+
 impl<P: PodmanClient> Reconciler<P> {
     /// Declares or replaces `site` (`PUT /v1/sites/{site}`). Environments that disappear from a
     /// replaced site are dropped from the desired state like a removed app (their releases and state
@@ -180,12 +196,35 @@ impl<P: PodmanClient> Reconciler<P> {
     pub async fn declare_site(&self, site: SiteName, spec: SiteSpec) -> Result<(), EngineError> {
         let _guard = self.acquire().await;
         let mut apps = state::load_apps(&self.paths.apps)?;
+        // The expanded specs of the declaration being replaced: since #570 a site declares its
+        // `ingress.static` options once and every environment inherits them, so a re-declare can add
+        // a file the releases they serve lack (issue #572).
+        let before: BTreeMap<InstanceName, AppSpec> = apps
+            .origins
+            .iter()
+            .filter(|(_, o)| o.site == site)
+            .filter_map(|(name, _)| Some((name.clone(), apps.apps.get(name)?.clone())))
+            .collect();
         let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
-        sites.insert(site, spec);
+        sites.insert(site.clone(), spec);
         apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
         // The whole candidate set, so the same rules as `apps add`/`apps update` apply and an error
         // in a shared site option names the site and environment, not just the expanded instance.
         state::validate_apps(&apps).map_err(EngineError::PromoteInvalid)?;
+        // The same served-release gate as an ingress-only `apps update` (issue #501): declaring
+        // deploys nothing, so an environment whose release lacks a shared option's file would break
+        // the next ingress reload. A new environment has no stored spec and is deployed first. On
+        // refusal nothing is written.
+        for (instance, origin) in &apps.origins {
+            if origin.site != site {
+                continue;
+            }
+            let Some(new) = apps.apps.get(instance) else {
+                continue;
+            };
+            self.check_static_change(instance, before.get(instance), new)
+                .map_err(|e| with_site_context(e, origin))?;
+        }
         Ok(state::save_apps(&self.paths.apps, &apps)?)
     }
 
