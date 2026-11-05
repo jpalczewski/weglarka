@@ -14,7 +14,7 @@ use crate::deploy::{AcquisitionSlot, DeployOutcome, DigestSource, pinned_ref};
 use crate::images::ImageGuard;
 use crate::reconcile::{ActivityKind, EngineError, Reconciler, SitesOptions};
 use crate::sites::{ReleaseError, ReleaseGate, SiteReleases, extract_release, release_id};
-use weglarka_model::app::{AppSpec, Digest, InstanceName};
+use weglarka_model::app::{AppKind, AppSpec, Digest, InstanceName};
 use weglarka_model::events::Event;
 use weglarka_model::podman::{PodmanClient, TarStream};
 use weglarka_model::state::{self, FailedDeploy, StateFile};
@@ -23,6 +23,21 @@ use weglarka_model::state::{self, FailedDeploy, StateFile};
 const KEPT_RELEASES: usize = 2;
 
 impl<P: PodmanClient> Reconciler<P> {
+    /// Whether `digest`'s release of the static site `instance` is complete on disk, so deploying it
+    /// only switches `current` and needs neither the local image nor the registry (ADR 0049).
+    pub(crate) fn has_complete_release(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+    ) -> bool {
+        spec.kind == AppKind::Static
+            && self.options.sites.as_ref().is_some_and(|sites| {
+                SiteReleases::new(sites.root.join(instance.as_str()))
+                    .is_complete(&release_id(digest), &ReleaseGate::for_spec(spec))
+            })
+    }
+
     fn sites(&self) -> Result<&SitesOptions, EngineError> {
         self.options.sites.as_ref().ok_or_else(|| {
             EngineError::Site(

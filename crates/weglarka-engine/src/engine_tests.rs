@@ -4781,6 +4781,51 @@ domains = ["example.com"]
     }
 
     #[tokio::test(start_paused = true)]
+    async fn rollback_to_a_release_on_disk_needs_neither_the_image_nor_the_registry() {
+        let h = harness();
+        publish(&h, 'a', "one");
+        h.rec.reconcile().await.unwrap();
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        publish(&h, 'b', "two");
+        h.rec.deploy(&name("blog-dev"), false).await.unwrap();
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::FromEnv, false)
+            .await
+            .unwrap();
+        assert_eq!(served(&h, "blog-prod"), "two");
+
+        // The previous image is gone from the local store and the registry cannot serve it.
+        for image in h.fake.images() {
+            for reference in image.repo_tags.iter().chain(&image.repo_digests) {
+                h.fake.forget_image_reference(reference);
+            }
+        }
+        let pinned = crate::deploy::pinned_ref("registry.example.com/me/blog", &digest('a'));
+        h.fake.fail_pull(&pinned, "registry unreachable");
+        let (pulled, saved) = (pulls(&h), h.fake.image_save_calls());
+
+        h.rec
+            .promote(&site(), &env("prod"), PromoteSource::Rollback, false)
+            .await
+            .unwrap();
+        assert_eq!(served(&h, "blog-prod"), "one");
+        assert_eq!(h.state("blog-prod").current, Some(digest('a')));
+        assert_eq!(
+            pulls(&h),
+            pulled,
+            "a rollback to a release on disk must not pull"
+        );
+        assert_eq!(
+            h.fake.image_save_calls(),
+            saved,
+            "nor export the image again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_digest_that_failed_in_the_source_cannot_be_promoted() {
         let h = harness();
         publish(&h, 'a', "one");
