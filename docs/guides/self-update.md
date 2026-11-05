@@ -55,6 +55,22 @@ If the new image does not start at all, a manual pin also works:
 - **An unsigned image** (for example a build from before the key was added) is rejected with "no key-based cosign signature …"; nothing is pinned and the previous version keeps running. The registry must be public: the pull is anonymous.
 - Log: `journalctl --user -u weglarka-self-update.service -u weglarka-watchdog.service -n 50`; state: `weglarka doctor` (the `self_update` check).
 
+### Switcher stopped after an upgrade that raised the state schema
+
+A self-update replaces the **image**; the `weglarka-daemon` binary the timers run is host-side and is not replaced with it (that handoff is [ADR 0067](../decisions/0067-managed-images-and-platform-updates.md) work, issue #203). When the new image raises `state::SCHEMA_VERSION`, the older host binaries cannot read `state.toml` any more and stop:
+
+- `weglarka-self-update.service` fails, the journal says "schema version N is newer than this daemon supports (M)";
+- `self-update.toml` records the stop with `host_tools_stale = true` — "the state files are at schema N, but the host binaries support only schema M …";
+- `weglarka doctor` reports the `self_update` check as **fail** with that message and the fix, instead of the misleading "the switcher has not run recently".
+
+A host binary older than this reporting records nothing, so there the journal message is the only trace. Apps keep running either way; only the automatic update is stopped (a stopped switcher must not replace the image while it cannot tell what the state needs — [ADR 0023](../decisions/0023-state-schema-version.md)). Recovery:
+
+1. install the host binaries (`weglarka-daemon`, `weglarka`) from the **same release as the running image** — from the release tarball or by extracting them from the image, see [installation](../install.md#host-binaries) and [verifying the image and binaries](../install.md#verifying-the-image-and-binaries);
+2. make the timers use them: `platform install` on a daemon-only setup, `platform bootstrap` on the launcher setup ([platform updates](platform-updates.md));
+3. check: `weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --check` and `weglarka doctor | grep self_update`.
+
+The recorded error stays until the next successful run (the interval still applies; `--force` retries now) and does not block it.
+
 **6. Trial on the host (optional).** CI has no user systemd, so the watchdog behavior is checked by hand:
 
 1. **a broken image:** `self-update --image <tag> --force` with an image that does not start; after `fallback_timeout_secs` the quadlet returns to the previous digest, `doctor` shows the automatic fallback, and `journalctl --user -u weglarka-watchdog.service` shows the course and the reason;

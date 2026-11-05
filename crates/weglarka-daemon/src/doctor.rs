@@ -320,10 +320,12 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
     if let Some(error) = &state.error {
         let age = now.saturating_sub(error.at);
-        parts.push(format!(
-            "last attempt failed {age}s ago: {}",
-            detail(&error.message)
-        ));
+        let what = if error.host_tools_stale {
+            "self-update stopped"
+        } else {
+            "last attempt failed"
+        };
+        parts.push(format!("{what} {age}s ago: {}", detail(&error.message)));
     }
     // Issue #100: a switch in flight (the watchdog is waiting for the new daemon's health) and the
     // last automatic fallback.
@@ -353,7 +355,19 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let stale = state
         .checked_at
         .is_none_or(|at| now.saturating_sub(at) > stale_after);
-    let (status, hint) = if state.error.is_some() {
+    // Issue #203: the switcher stopped because the host binaries are older than this daemon, which
+    // already raised the state schema. That is not a timer problem and not a warning: nothing will
+    // update itself until the operator refreshes the host binaries, so the check fails and names
+    // the fix instead of leaving "the timer has not run" as the only explanation.
+    let host_tools_stale = state.error.as_ref().is_some_and(|e| e.host_tools_stale);
+    let (status, hint) = if host_tools_stale {
+        (
+            CheckStatus::Fail,
+            Some(
+                "install the host binaries from the same release as the running image (docs/install.md, section `Host binaries`) and re-run `platform install`; `docs/guides/self-update.md` has the step",
+            ),
+        )
+    } else if state.error.is_some() {
         (
             CheckStatus::Warn,
             Some(
@@ -378,7 +392,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         (
             CheckStatus::Warn,
             Some(
-                "the switcher has not run recently — is weglarka-self-update.timer enabled? (re-run `platform install`)",
+                "no completed self-update check is recorded — check weglarka-self-update.timer and the journal (re-run `platform install` if the timer is missing)",
             ),
         )
     } else {

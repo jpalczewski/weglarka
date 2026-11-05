@@ -58,6 +58,17 @@ pub struct SelfUpdateError {
     pub digest: Option<Digest>,
     /// Unix seconds.
     pub at: u64,
+    /// The run stopped because `state.toml` is at a newer schema than this host binary supports
+    /// (issue #203): a newer daemon wrote it and the tools on the host were not refreshed. `doctor`
+    /// reports this as a failure with the re-extraction step, instead of the generic "the timer has
+    /// not run" hint that would point at the wrong thing.
+    #[serde(skip_serializing_if = "is_false")]
+    pub host_tools_stale: bool,
+}
+
+/// `serde` helper: keeps the default `host_tools_stale = false` out of the written file.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What the switcher and the daemon remember about the daemon image.
@@ -232,6 +243,22 @@ pub fn save(state_dir: &Path, state: &SelfUpdateState) -> Result<(), SelfUpdateS
 /// `schema_version` marker, and images that do not carry `io.weglarka.state-schema`.
 pub const IMPLICIT_SCHEMA: u32 = 1;
 
+/// What the switcher records when `state.toml` is newer than the host binaries (issue #203).
+///
+/// This is the ADR 0023 gate seen from the host: the daemon image moved on (and raised the state
+/// schema), the tools the timer runs did not, so the switcher cannot tell what the state needs. The
+/// text names both versions and the recovery step, because the operator reads it in `doctor` and in
+/// `journalctl --user -u weglarka-self-update.service`.
+pub fn stale_host_tools_message(found: u32, supported: u32) -> String {
+    format!(
+        "the state files are at schema {found}, but the host binaries support only schema \
+         {supported}: the running daemon is newer than the tools on this host, so the switcher \
+         cannot tell what the state needs. Install the host binaries from the same release as the \
+         running image (docs/install.md, section `Host binaries`) and re-run `platform install` \
+         (`platform bootstrap` on the launcher setup); see docs/guides/self-update.md"
+    )
+}
+
 impl SelfUpdateState {
     /// The check interval is measured from the last completed check; a missing one is due.
     pub fn is_due(&self, interval: Duration, now: SystemTime) -> bool {
@@ -253,6 +280,28 @@ impl SelfUpdateState {
         self.checked_at = Some(secs(now));
     }
 
+    /// Records a run that stopped because the host binaries are older than the daemon that wrote
+    /// `state.toml` (issue #203), and returns the message.
+    ///
+    /// Stopping is the ADR 0023 gate and stays: a switcher that cannot tell what the state needs
+    /// must not replace the image. The bug was that nothing recorded it — the run left
+    /// `checked_at` alone, so `doctor` blamed the timer. Interval bookkeeping is advanced with the
+    /// error, so the next attempt happens at the next interval, not on every wake-up.
+    pub fn record_stale_host_tools(
+        &mut self,
+        found: u32,
+        supported: u32,
+        digest: Option<Digest>,
+        now: SystemTime,
+    ) -> String {
+        let message = stale_host_tools_message(found, supported);
+        self.record_error(&message, digest, now);
+        if let Some(error) = self.error.as_mut() {
+            error.host_tools_stale = true;
+        }
+        message
+    }
+
     pub fn record_error(
         &mut self,
         message: impl Into<String>,
@@ -263,6 +312,9 @@ impl SelfUpdateState {
             message: message.into(),
             digest,
             at: secs(now),
+            // Every other refusal is about a digest or the configuration; the marker belongs to
+            // `record_stale_host_tools` only.
+            host_tools_stale: false,
         });
         self.record_check(now);
     }
@@ -507,6 +559,7 @@ mod tests {
                 message: "unsigned image".into(),
                 digest: Some(digest('d')),
                 at: 150,
+                host_tools_stale: false,
             }),
             ..SelfUpdateState::default()
         };
@@ -533,6 +586,40 @@ mod tests {
             matches!(&err, SelfUpdateStateError::Parse { path, .. } if path.ends_with(FILE_NAME)),
             "{err}"
         );
+    }
+
+    /// Issue #203: the marker only has to survive one direction (the switcher writes it, `doctor`
+    /// reads it), so it stays out of the file in the normal case and reads as `false` from a file
+    /// written before it existed.
+    #[test]
+    fn a_stale_host_tools_error_is_marked_and_the_marker_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SelfUpdateState::default();
+        let message = state.record_stale_host_tools(99, 18, None, at(1_000));
+        assert_eq!(state.checked_at, Some(1_000), "the check happened");
+        let error = state.error.clone().expect("the stop is recorded");
+        assert!(error.host_tools_stale);
+        assert_eq!(error.message, message);
+        assert!(
+            message.contains("99") && message.contains("18"),
+            "{message}"
+        );
+        save(dir.path(), &state).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), state);
+
+        fs::write(
+            path(dir.path()),
+            "[error]\nmessage = \"unsigned image\"\nat = 1\n",
+        )
+        .unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert!(!loaded.error.expect("an error").host_tools_stale);
+
+        let mut plain = SelfUpdateState::default();
+        plain.record_error("unsigned image", Some(digest('a')), at(5));
+        save(dir.path(), &plain).unwrap();
+        let text = fs::read_to_string(path(dir.path())).unwrap();
+        assert!(!text.contains("host_tools_stale"), "{text}");
     }
 
     #[test]
