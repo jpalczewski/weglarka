@@ -40,6 +40,7 @@ use weglarka_model::state::{self, AppState};
 
 use crate::app::{Daemon, MUTATION_TIMEOUT};
 use crate::app_view::{Access, show_response};
+use crate::candidate;
 use crate::doctor;
 use crate::images;
 use crate::push;
@@ -506,35 +507,6 @@ fn host_mount_views<P: PodmanClient>(d: &Daemon<P>, spec: &AppSpec) -> Option<Ve
     })
 }
 
-/// `apps add`/`apps update`: an app with `configs` needs `config_root` in `weglarka.toml`. The
-/// sources themselves are not checked here — a file that does not exist yet must not block adding
-/// the app; reconcile blocks the instance and `doctor` warns until the source appears. The lexical
-/// rules (`relative`, no `..`, unique `target`) are already enforced by `state::validate_app`.
-pub(crate) fn validate_host_rules<P: PodmanClient>(
-    d: &Daemon<P>,
-    name: &InstanceName,
-    spec: &AppSpec,
-) -> ApiResult<()> {
-    // Host mounts (issue #178): the source must be an exact entry of the operator's allowlist, so a
-    // bad one is a 400 now instead of a blocked app later.
-    weglarka_engine::host_mounts::check_allowed(&d.host.runtime.host_mounts, spec)
-        .map_err(|e| Fail::invalid(e.to_string()))?;
-    weglarka_engine::host_mounts::check_groups(&d.host.runtime.group_add, spec)
-        .map_err(|e| Fail::invalid(e.to_string()))?;
-    // Forward auth needs `[identity]` and domains, and the provider cannot protect itself.
-    weglarka_model::identity::validate_host_app(&d.host, name, spec).map_err(Fail::invalid)?;
-    // The provider's own spec: issuer host, generated config loaded last, no auto-update (#88).
-    weglarka_model::identity::validate_provider(&d.host, name, spec).map_err(Fail::invalid)?;
-    if spec.configs.is_empty() || d.paths.config_root.is_some() {
-        return Ok(());
-    }
-    Err(Fail::invalid(
-        "the app declares `configs`, but weglarka.toml sets no `config_root`; set it to the host \
-         directory with the config files, then re-run `weglarka platform install` so the daemon \
-         container mounts it read-only",
-    ))
-}
-
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 async fn add_app<P: PodmanClient + 'static>(
@@ -543,8 +515,6 @@ async fn add_app<P: PodmanClient + 'static>(
     body: Bytes,
 ) -> ApiResult<Response> {
     let req: AddAppRequest = parse_json(&body)?;
-    state::validate_app(&req.name, &req.spec).map_err(Fail::invalid)?;
-    validate_host_rules(&d, &req.name, &req.spec)?;
     {
         let _g = d.desired_lock.lock().await;
         let mut apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
@@ -555,22 +525,10 @@ async fn add_app<P: PodmanClient + 'static>(
             ));
         }
         apps.apps.insert(req.name.clone(), req.spec.clone());
-        // Every shared-volume mount must name a declared volume (issue #33): a typo would silently
-        // create a second empty volume. Cross-app rule, so it sees the candidate app set.
-        weglarka_model::shared_volumes::validate(&apps).map_err(Fail::invalid)?;
-        // Same for a shared-network membership (issue #128), plus the alias rules.
-        weglarka_model::shared_networks::validate(&apps).map_err(Fail::invalid)?;
-        // Host-wide `host_ports` rules first (privileged ports, another app on the same socket, the
-        // ingress bind), then domains/ports must be renderable. Both see the candidate app set.
-        weglarka_model::host_ports::validate(&d.host, &apps)
-            .map_err(|e| Fail::invalid(e.to_string()))?;
-        // And an `internal_hosts` entry may only name a domain this host serves (issue #303).
-        weglarka_model::internal_hosts::validate(&d.host, &apps)
-            .map_err(|e| Fail::invalid(e.to_string()))?;
-        // `depends_on`: a target must exist and the graph must stay acyclic (issue #35).
-        weglarka_model::depends::validate(&apps).map_err(Fail::invalid)?;
-        weglarka_ingress::Plan::build(&d.host, &apps.apps)
-            .map_err(|e| Fail::invalid(e.to_string()))?;
+        // Every rule of the candidate `apps.toml` (the changed app, then the whole set: identity
+        // clients, shared volumes and networks, `depends_on`, host ports, `internal_hosts`, ingress)
+        // in one place, so no mutation path can miss a cross-app rule.
+        candidate::validate_app(&d, &req.name, &req.spec, &apps)?;
         mutating(d.engine.upsert_app(req.name.clone(), req.spec.clone())).await?;
     }
     // `start = false`: provision synchronously (pin the digest, create the network, uid range and

@@ -411,6 +411,21 @@ fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
     crate::identity::validate_file(apps)
 }
 
+/// Every invariant of a whole `apps.toml`: each instance on its own ([`validate_app`]), then the
+/// rules that span the file (identity clients) and across instances (`depends_on`, shared volumes,
+/// shared networks). One list, so a reader ([`parse_apps`]), a writer ([`save_apps`]) and the
+/// daemon's candidate check cannot drift apart.
+pub fn validate_apps(apps: &AppsFile) -> Result<(), String> {
+    for (name, spec) in &apps.apps {
+        validate_app(name, spec)?;
+    }
+    validate_apps_file(apps)?;
+    crate::depends::validate(apps)?;
+    crate::shared_volumes::validate(apps)?;
+    crate::shared_networks::validate(apps)?;
+    Ok(())
+}
+
 /// A mounted secret's owner is a numeric id in the container's space; Podman maps it through
 /// the instance's uid/gid range, which is exactly `DEFAULT_RANGE_SIZE` ids wide (ADR 0009), so
 /// an id outside `0..DEFAULT_RANGE_SIZE` cannot be mapped. The bound is derived from the range
@@ -1090,13 +1105,7 @@ fn load_versioned<T: DeserializeOwned + Default>(path: &Path, src: &str) -> Resu
 /// an unknown field.
 pub fn parse_apps(path: &Path, src: &str) -> Result<AppsFile, StateError> {
     let apps: AppsFile = load_versioned(path, src)?;
-    for (name, spec) in &apps.apps {
-        validate_app(name, spec).map_err(|r| invalid(path, r))?;
-    }
-    validate_apps_file(&apps).map_err(|r| invalid(path, r))?;
-    crate::depends::validate(&apps).map_err(|r| invalid(path, r))?;
-    crate::shared_volumes::validate(&apps).map_err(|r| invalid(path, r))?;
-    crate::shared_networks::validate(&apps).map_err(|r| invalid(path, r))?;
+    validate_apps(&apps).map_err(|r| invalid(path, r))?;
     Ok(apps)
 }
 
@@ -1108,13 +1117,7 @@ pub fn load_apps(path: &Path) -> Result<AppsFile, StateError> {
 }
 
 pub fn save_apps(path: &Path, apps: &AppsFile) -> Result<(), StateError> {
-    for (name, spec) in &apps.apps {
-        validate_app(name, spec).map_err(|r| invalid(path, r))?;
-    }
-    validate_apps_file(apps).map_err(|r| invalid(path, r))?;
-    crate::depends::validate(apps).map_err(|r| invalid(path, r))?;
-    crate::shared_volumes::validate(apps).map_err(|r| invalid(path, r))?;
-    crate::shared_networks::validate(apps).map_err(|r| invalid(path, r))?;
+    validate_apps(apps).map_err(|r| invalid(path, r))?;
     let text = toml::to_string(apps).map_err(|e| invalid(path, e.to_string()))?;
     write_atomic(path, text.as_bytes(), 0o644).map_err(io_err(path))
 }
@@ -1178,6 +1181,41 @@ pub fn save_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one list every reader, writer and the daemon's candidate check share (#461): a rule that
+    /// spans the file or the instance set cannot be missing from one of them.
+    #[test]
+    fn validate_apps_covers_the_file_and_the_instance_set() {
+        let mut apps = AppsFile::default();
+        let spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        apps.apps.insert(name("a"), spec);
+        assert!(validate_apps(&apps).is_ok());
+
+        // A cross-instance rule: a mount of an undeclared shared volume.
+        let mut apps = AppsFile::default();
+        let spec: AppSpec = toml::from_str(
+            "image = \"i\"\nshared_volumes = [{ name = \"data\", target = \"/data\" }]",
+        )
+        .unwrap();
+        apps.apps.insert(name("a"), spec);
+        assert!(
+            validate_apps(&apps)
+                .unwrap_err()
+                .contains("undeclared shared volume")
+        );
+
+        // A file-level rule: an `[oidc_clients.<id>]` id equal to the instance name.
+        let mut apps = AppsFile::default();
+        let spec: AppSpec = toml::from_str("image = \"i\"").unwrap();
+        apps.apps.insert(name("a"), spec);
+        let client: crate::identity::ExternalClientSpec = toml::from_str(
+            "name = \"A\"\npublic = true\nredirect_uris = [\"https://a.example.com/cb\"]",
+        )
+        .unwrap();
+        apps.oidc_clients
+            .insert(crate::identity::ClientId::new("a").unwrap(), client);
+        assert!(validate_apps(&apps).unwrap_err().contains("would shadow"));
+    }
 
     fn digest(c: char) -> Digest {
         Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()

@@ -11,6 +11,7 @@ pub mod admin_token;
 pub mod app;
 mod app_view;
 pub mod bootstrap;
+mod candidate;
 pub mod cdn;
 pub mod certificates;
 pub mod config_view;
