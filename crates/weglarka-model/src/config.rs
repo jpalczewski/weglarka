@@ -243,6 +243,20 @@ impl LogRetention {
     pub fn is_unlimited(self) -> bool {
         matches!(self, Self::Unlimited(_))
     }
+
+    /// The app's own period, or the host default.
+    pub fn effective(app: Option<LogRetention>, host: LogRetention) -> LogRetention {
+        app.unwrap_or(host)
+    }
+
+    /// The shortest period (`Days(n) < Unlimited`); `None` for an empty input. For files shared by
+    /// several apps, which must not outlive the strictest of them.
+    pub fn shortest(it: impl IntoIterator<Item = LogRetention>) -> Option<LogRetention> {
+        it.into_iter().min_by_key(|r| match r {
+            Self::Days(days) => (0, *days),
+            Self::Unlimited(_) => (1, 0),
+        })
+    }
 }
 
 impl Default for LogRetention {
@@ -1312,6 +1326,25 @@ kind = "systemd"
         assert_eq!(
             LogRetention::Unlimited(Unlimited::Unlimited).to_string(),
             "unlimited"
+        );
+    }
+
+    #[test]
+    fn log_retention_effective_and_shortest() {
+        let unlimited = LogRetention::Unlimited(Unlimited::Unlimited);
+        let (d7, d30) = (LogRetention::Days(7), LogRetention::Days(30));
+        assert_eq!(LogRetention::effective(None, d30), d30);
+        assert_eq!(LogRetention::effective(Some(d7), d30), d7);
+        assert_eq!(LogRetention::effective(Some(unlimited), d30), unlimited);
+        assert_eq!(LogRetention::effective(None, unlimited), unlimited);
+
+        assert_eq!(LogRetention::shortest([]), None);
+        assert_eq!(LogRetention::shortest([unlimited]), Some(unlimited));
+        assert_eq!(LogRetention::shortest([d30, d7]), Some(d7));
+        assert_eq!(LogRetention::shortest([unlimited, d30]), Some(d30));
+        assert_eq!(
+            LogRetention::shortest([d30, unlimited, d7, unlimited]),
+            Some(d7)
         );
     }
 

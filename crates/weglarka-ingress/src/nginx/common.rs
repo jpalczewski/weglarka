@@ -5,8 +5,17 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use super::conf::Conf;
-use super::{LOG_CONTAINER_DIR, NginxOptions, PLAIN_SOCKET, TLS_SOCKET};
+use super::{NginxOptions, PLAIN_SOCKET, TLS_SOCKET};
 use crate::plan::{Cidr, Domain, IdentityRoute, Plan, WEBHOOK_UPSTREAM_HOST};
+use weglarka_model::ingress_logs::{self, LogKind, NGINX_DIR};
+
+/// Path of the current log file inside the nginx container.
+fn log_path(kind: LogKind) -> String {
+    std::path::Path::new(NGINX_DIR)
+        .join(ingress_logs::shared().current(kind))
+        .display()
+        .to_string()
+}
 
 /// The three expressions the shared proxy headers are built from. `behind` reuses the trust maps
 /// (ADR 0007/0032); `edge` has no trusted peer, so the values are nginx's own.
@@ -59,7 +68,7 @@ pub(super) fn write_preamble(c: &mut Conf, tls_fingerprint: Option<&str>) {
     // Daemon-owned file, not stderr: the daemon rotates it and deletes it after `[logs] retention`
     // (issue #502). `error_log` paths cannot contain variables; the daemon renames both this file and
     // `access.log` (see `write_log`) and reopens them with SIGHUP.
-    c.line(&format!("error_log {LOG_CONTAINER_DIR}/error.log warn;"));
+    c.line(&format!("error_log {} warn;", log_path(LogKind::Error)));
     c.blank();
     c.block("events", |c| c.line("worker_connections 1024;"));
     c.blank();
@@ -214,11 +223,13 @@ pub(super) fn write_log(c: &mut Conf, client: ClientAddr, plan: &Plan<'_>) {
     c.line(&format!("    '{format}';"));
     if write_log_skip_maps(c, plan) {
         c.line(&format!(
-            "access_log {LOG_CONTAINER_DIR}/access.log weglarka if=$weglarka_loggable;"
+            "access_log {} weglarka if=$weglarka_loggable;",
+            log_path(LogKind::Access)
         ));
     } else {
         c.line(&format!(
-            "access_log {LOG_CONTAINER_DIR}/access.log weglarka;"
+            "access_log {} weglarka;",
+            log_path(LogKind::Access)
         ));
     }
 }

@@ -21,6 +21,7 @@ pub mod host_ports;
 pub mod identity;
 pub mod image_inventory;
 pub mod image_ref;
+pub mod ingress_logs;
 pub mod internal_hosts;
 pub mod labels;
 pub mod limits;
