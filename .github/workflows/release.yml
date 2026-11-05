@@ -121,6 +121,11 @@ jobs:
             type=sha,prefix=sha-,format=short
             type=raw,value=${{ steps.crate.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          # The version label is the crate version on every channel. Without this the action derives it
+          # from the ref (`main` on a branch build), and the release set, which names the crate
+          # version, then refuses to verify the image.
+          labels: |
+            org.opencontainers.image.version=${{ steps.crate.outputs.version }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -222,6 +227,11 @@ jobs:
             type=sha,prefix=sha-,format=short
             type=raw,value=${{ steps.crate.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+          # The version label is the crate version on every channel. Without this the action derives it
+          # from the ref (`main` on a branch build), and the release set, which names the crate
+          # version, then refuses to verify the image.
+          labels: |
+            org.opencontainers.image.version=${{ steps.crate.outputs.version }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
