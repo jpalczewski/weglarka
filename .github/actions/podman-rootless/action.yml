@@ -1,7 +1,8 @@
 name: Rootless Podman 6
 description: >-
-  Podman from OBS home:alvistack on ubuntu-24.04 (mirror of the host), configured rootless, with a larger
-  subuid pool and the libpod service listening on a unix socket. Decision: docs/decisions/0002-podman-in-ci.md.
+  Pinned Podman from OBS home:alvistack on ubuntu-24.04 (mirror of the host), installed from a cache of .debs
+  (no OBS request on a hit), configured rootless, with a larger subuid pool and the libpod service listening on
+  a unix socket. Decision: docs/decisions/0002-podman-in-ci.md.
 outputs:
   socket:
     description: Path of the rootless Podman socket (also exported as WEGLARKA_PODMAN_SOCKET).
@@ -9,7 +10,86 @@ outputs:
 runs:
   using: composite
   steps:
-  - name: Add the alvistack repository
+  # The versions are pinned here, like on the production host, and the cache key is built from these strings:
+  # a bump is an explicit edit and lands as a cache miss (ADR 0002). `podman-netavark`/`podman-aardvark-dns` are
+  # the OBS names of Netavark and its DNS server (Podman 6 needs 2.x); the old apt line's `netavark` resolved to
+  # the Ubuntu archive's 1.4, which Podman 6 never runs, so it is gone.
+  - name: Pin the Podman stack
+    id: pin
+    shell: bash
+    run: |
+      set -euo pipefail
+      packages=(
+        "podman=100:6.1.3-1"
+        "podman-netavark=100:2.1.0-1"
+        "podman-aardvark-dns=100:2.1.0-1"
+        "passt=100:0.0+20261002.cba35706-1"
+      )
+      printf '%s\n' "${packages[@]}" > "$RUNNER_TEMP/podman-packages"
+      key="podman-debs-ubuntu2404"
+      for package in "${packages[@]}"; do
+        version="${package#*=}"     # 100:6.1.3-1
+        key="$key-${version#*:}"    # ... -> 6.1.3-1: the Debian epoch never reaches the key
+      done
+      # `podman --version` prints the upstream version only: 100:6.1.3-1 -> 6.1.3.
+      podman_version="${packages[0]#*=}"
+      podman_version="${podman_version#*:}"
+      {
+        echo "key=$key"
+        echo "podman-version=${podman_version%%-*}"
+      } >> "$GITHUB_OUTPUT"
+  # Only `main` writes the cache (a pull request cannot poison it), and a hit is used from any ref.
+  - name: Restore the cached .debs
+    id: debs
+    uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    with:
+      path: ${{ runner.temp }}/podman-debs
+      key: ${{ steps.pin.outputs.key }}
+  # Both paths start from the same slate. The runner ships Podman 4.9 from Ubuntu; its
+  # golang-github-containers-common collides on files (/etc/containers/policy.json) with containers-common from
+  # alvistack. Purging before the install also keeps crun/conmon/buildah/skopeo out of the "already installed"
+  # state, so apt puts them in the cached set.
+  - name: Purge the Ubuntu Podman stack
+    shell: bash
+    run: |
+      set -euo pipefail
+      # Only what is installed: `apt-get purge` rejects the whole request ("Unable to locate package") when a name
+      # is neither installed nor in the package index, and the hit path never runs `apt-get update`.
+      installed=()
+      for package in podman buildah skopeo crun conmon \
+        golang-github-containers-common golang-github-containers-image; do
+        if dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^i'; then
+          installed+=("$package")
+        fi
+      done
+      if [ "${#installed[@]}" -eq 0 ]; then
+        echo "the Ubuntu Podman stack is not installed"
+        exit 0
+      fi
+      echo "purging ${installed[*]}"
+      sudo apt-get purge -y "${installed[@]}"
+  # The acceptance of #579: a hit installs the cached .debs with no network at all, so neither the OBS repository
+  # nor its variance reaches the critical path.
+  - name: Install the cached .debs (no network)
+    if: steps.debs.outputs.cache-hit == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+      debs="$RUNNER_TEMP/podman-debs"
+      shopt -s nullglob
+      files=("$debs"/*.deb)
+      if [ "${#files[@]}" -eq 0 ]; then
+        echo "::error::$debs holds no .deb although the cache matched"
+        exit 1
+      fi
+      echo "installing ${#files[@]} cached packages"
+      # One dpkg call for the whole set so dependencies inside it are unpacked before they are configured; the
+      # second pass configures whatever a later argument left behind. --force-confold keeps an existing conffile
+      # instead of asking (there is no tty in CI).
+      sudo env DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold "${files[@]}" \
+        || sudo env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+  - name: Install Podman from OBS (cache miss)
+    if: steps.debs.outputs.cache-hit != 'true'
     shell: bash
     run: |
       set -euo pipefail
@@ -23,10 +103,6 @@ runs:
       Pin: origin downloadcontent.opensuse.org
       Pin-Priority: 1001
       PIN
-      # The runner ships Podman 4.9 from Ubuntu; its golang-github-containers-common collides on files
-      # (/etc/containers/policy.json) with containers-common from alvistack.
-      sudo apt-get purge -y podman buildah skopeo crun conmon \
-        golang-github-containers-common golang-github-containers-image || true
       # download.opensuse.org redirects to mirrors with stale files ("unexpected size");
       # downloadcontent.opensuse.org has no mirrors. Retries just in case.
       for attempt in 1 2 3 4; do
@@ -34,34 +110,39 @@ runs:
         [ "$attempt" = 4 ] && exit 1
         sleep 15
       done
-  # The cache key is the candidate versions of the packages we install, so a new alvistack build
-  # misses the cache and downloads fresh .debs; an empty/missing cache just means a normal install.
-  - name: Resolve Podman package versions
-    id: podman-ver
-    shell: bash
-    run: |
-      ver=$(apt-cache policy podman netavark passt | awk '/Candidate:/{print $2}' | tr '\n' '_')
-      echo "key=podman-debs-ubuntu2404-$ver" >> "$GITHUB_OUTPUT"
-  - uses: actions/cache@v4
-    with:
-      path: ${{ runner.temp }}/podman-debs
-      key: ${{ steps.podman-ver.outputs.key }}
-  - name: Install Podman 6
-    shell: bash
-    run: |
-      set -euo pipefail
       debs="$RUNNER_TEMP/podman-debs"
+      mapfile -t packages < "$RUNNER_TEMP/podman-packages"
       sudo mkdir -p "$debs/partial"
       for attempt in 1 2 3 4; do
         sudo apt-get install -y -o Acquire::Retries=3 -o "Dir::Cache::archives=$debs" \
-          podman netavark passt uidmap && break
+          "${packages[@]}" uidmap && break
         [ "$attempt" = 4 ] && exit 1
         sleep 15
       done
+      # `uidmap` (newuidmap/newgidmap, needed by rootless Podman) comes from the Ubuntu archive and is usually
+      # already installed, so apt leaves it out of the cache; the hit path has no network and needs the .deb.
+      ( cd "$debs" && sudo apt-get download -q uidmap )
       # Keep only the .debs in the cached directory (no lock/partial, readable by the cache action).
       sudo rm -rf "$debs/partial" "$debs/lock"
       sudo chmod -R a+rX "$debs"
-      podman --version
+  - name: Check the pinned version
+    shell: bash
+    env:
+      WANT: ${{ steps.pin.outputs.podman-version }}
+    run: |
+      set -euo pipefail
+      got=$(podman --version)
+      echo "$got"
+      if [ "$got" != "podman version $WANT" ]; then
+        echo "::error::'$got' is not the pinned 'podman version $WANT'"
+        exit 1
+      fi
+  - name: Save the .debs (main only)
+    if: steps.debs.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+    uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    with:
+      path: ${{ runner.temp }}/podman-debs
+      key: ${{ steps.pin.outputs.key }}
   - name: Configure rootless containers
     shell: bash
     run: |

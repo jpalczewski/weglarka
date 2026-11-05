@@ -37,7 +37,8 @@ for its own toolchain install and cache.
 4. **Jobs and caches.** `shellcheck`, `fmt`, `clippy`, `test` and `nginx -t` are one `check` job (fmt → clippy →
    test → nginx), sharing one toolchain install and one debug `target/` (`shared-key: check`). `rust-cache` writes
    only on `main`; PRs restore read-only. `musl` uses separate keys per profile. Podman `.deb`s are cached
-   (`actions/cache`, key = candidate versions of `podman`, `netavark`, `passt`); an empty cache is a normal install.
+   (`actions/cache/restore`, key = the versions pinned in the action); a hit installs them with `dpkg -i` and no
+   OBS request, and only `main` fills the cache (`actions/cache/save`) — a miss is a normal install from OBS (#579).
 5. **Fewer dependencies.** `tracing-subscriber` without `env-filter` (removes `regex`, `regex-automata`,
    `regex-syntax`, `matchers`, … — 39 crates from `Cargo.lock`). **Behaviour change:** `RUST_LOG` is now a plain
    level (`error|warn|info|debug|trace|off`); per-target directives (`weglarka=debug,hyper=warn`) are no longer
