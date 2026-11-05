@@ -52,13 +52,19 @@ request (`time`, `host`, `remote_addr`, `peer` behind a CDN, `method`, `path`, `
 `user_agent`). Paths, hosts and user agents are chosen by the visitor, so on a terminal control characters are
 replaced and a path can never start a line of its own.
 
-The `upstream_*` fields describe the app behind nginx. `upstream_header_time` is the latency a visitor feels — the time
-to the upstream's response headers — also for long-lived responses (SSE, websockets, ntfy subscriptions) where
-`request_time` is the whole connection. `upstream_status` tells two `502`s apart: when nginx could not reach the app
-(the container is being recreated) it logs `502` itself while `upstream_header_time` is `-`, because no headers ever
-arrived; when the app answered `502`, `upstream_header_time` is a number. A static site has no upstream, so its
-`upstream_*` fields are `-`. `upstream_addr` (the internal container address) stays in the raw `access.log` only and is
-deliberately not part of the API, the CLI or the panel.
+The `upstream_*` fields describe the app behind nginx and are strings, as nginx prints them: a number of seconds or a
+status, a list when nginx retried (`502, 200`, first attempt first), `-` for an attempt that got no response, and
+empty when nginx tried no upstream at all. `upstream_header_time` is the latency a visitor feels — the time to the
+app's response headers — also for long-lived responses (SSE, websockets, ntfy subscriptions) where `request_time` is
+the whole connection.
+
+A `502` is the app's own answer exactly when `upstream_header_time` is a number. Otherwise nginx produced it:
+`upstream_header_time` is `-` when the connection to the app was refused (`upstream_status` is then `502` too, as
+nginx records it), and both are empty when the app's name did not resolve — the usual case while its container is
+being recreated, because nginx looks the name up per request. A static site has no upstream, so its `upstream_*`
+fields are empty. `upstream_addr` (the internal container address) stays in the raw `access.log` only and is
+deliberately not part of the API, the CLI or the panel. Lines logged before these fields existed have them empty and
+`request_length` `null`.
 
 The ingress error log (`error.log`) is a separate stream in the same directory, rotated and deleted by the same
 retention; see [log retention](log-retention.md).

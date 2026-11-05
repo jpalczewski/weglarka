@@ -49,9 +49,10 @@ pub(super) use crate::plan::AUTHZ_PATH as AUTHZ_LOCATION;
 
 /// JSON access log format. `path` is `$uri` (no query string, so tokens in URLs do not
 /// end up in logs); `upstream_response_time`, `upstream_status`, `upstream_addr` and
-/// `upstream_header_time` are strings (`-`, or a list on retry for the ones nginx repeats per
-/// attempt); `request_length` is numeric. `upstream_addr` is the internal container address, so it
-/// stays in the file log and is deliberately not part of `weglarka_api::AccessEntry`.
+/// `upstream_header_time` are strings (a list on retry, `-` for an attempt without a response, empty
+/// when no upstream was tried); `request_length` is numeric and always set. `upstream_addr` is the
+/// internal container address, so it stays in the file log and is deliberately not part of
+/// `weglarka_api::AccessEntry`.
 pub const LOG_FORMAT: &str = concat!(
     "{\"time\":\"$time_iso8601\",\"app\":\"$app\",\"host\":\"$host\",",
     "\"remote_addr\":\"$remote_addr\",\"method\":\"$request_method\",\"path\":\"$uri\",",

@@ -867,7 +867,7 @@ mod tests {
                     entry.request_time,
                     entry.request_length
                 ),
-                (200, 1234, 0.005, 321),
+                (200, 1234, 0.005, Some(321)),
                 "{line}"
             );
             for (got, want) in [

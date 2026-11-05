@@ -143,7 +143,6 @@ fn json_line(entry: &AccessEntry, terminal: bool) -> String {
         upstream_status: clean(&entry.upstream_status),
         upstream_header_time: clean(&entry.upstream_header_time),
         server_protocol: clean(&entry.server_protocol),
-        request_length: entry.request_length,
         request_id: clean(&entry.request_id),
         user_agent: clean(&entry.user_agent),
         ..entry.clone()
@@ -284,7 +283,7 @@ mod tests {
             upstream_status: "200".into(),
             upstream_header_time: "0.003".into(),
             server_protocol: "HTTP/1.1".into(),
-            request_length: 321,
+            request_length: Some(321),
             request_id: "abc".into(),
             user_agent: "curl/8".into(),
             ..Default::default()
