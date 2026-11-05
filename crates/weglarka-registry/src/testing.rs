@@ -461,6 +461,20 @@ impl ReleaseRegistry for FakeReleaseRegistry {
 
     async fn tags(&self, repository: &Repository) -> Result<Vec<String>, RegistryError> {
         self.record(repository, "tags/list");
+        // Like GHCR and `distribution` (`NAME_UNKNOWN`): a repository that has never received a
+        // push has no tag list at all, which is a `404`, not an empty list.
+        let known = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let repo = repository.as_str();
+            state.manifests.keys().any(|(r, _)| r == repo)
+                || state.blobs.keys().any(|(r, _)| r == repo)
+        };
+        if !known {
+            return Err(RegistryError::Status {
+                status: 404,
+                what: "tag list",
+            });
+        }
         Ok(self.tags_of(repository))
     }
 
