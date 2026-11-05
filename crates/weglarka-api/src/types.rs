@@ -116,6 +116,10 @@ pub struct ShowAppResponse {
     /// absent when the app declares none. Only `GET /v1/apps/{name}` fills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_mounts: Option<Vec<HostMountView>>,
+    /// `Some(true)` when the app reads the ingress logs (`ingress_logs`, issue #552, ADR 0072): the
+    /// log root is mounted read-only at `/var/log/weglarka-ingress`. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_logs: Option<bool>,
     /// Times Podman restarted the container (restart policy); absent when there is no container.
     /// Runtime detail, only `GET /v1/apps/{name}` fills it (add/update answer without a probe).
     #[serde(default, skip_serializing_if = "Option::is_none")]

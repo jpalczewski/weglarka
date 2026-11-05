@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 /// Podman) owns their retention.
 pub const NGINX_DIR: &str = "/var/log/weglarka";
 
+/// Where the log root is mounted read-only inside the one reader app (issue #552, ADR 0072). The
+/// root, not a single directory, so per-app subdirectories are covered without a new mount.
+pub const READER_DIR: &str = "/var/log/weglarka-ingress";
+
 /// Length of a `YYYY-MM-DD` date.
 const DATE_LEN: usize = 10;
 

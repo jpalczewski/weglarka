@@ -70,6 +70,7 @@ pub fn app_with(domains: &[&str], port: Option<u16>) -> BTreeMap<InstanceName, A
         configs: vec![],
         host_mounts: vec![],
         group_add: vec![],
+        ingress_logs: false,
         reload_signal: None,
         strategy: Default::default(),
         oidc: None,

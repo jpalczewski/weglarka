@@ -1265,6 +1265,11 @@ pub struct AppSpec {
     /// Part of the spec hash only when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_add: Vec<String>,
+    /// Mount the ingress request logs read-only at [`crate::ingress_logs::READER_DIR`] and keep the
+    /// runtime user's groups (issue #552, ADR 0072). Only the app named in `[logs] reader` may set it.
+    /// Part of the spec hash only when `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ingress_logs: bool,
     /// How a deploy replaces the running container (issue #39, `docs/decisions/0046-blue-green-deploy.md`).
     /// Not part of the spec hash: it decides how a container is swapped, never what it is made of.
     #[serde(default, skip_serializing_if = "Strategy::is_default")]

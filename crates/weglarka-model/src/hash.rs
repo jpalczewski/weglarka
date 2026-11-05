@@ -94,6 +94,10 @@ struct HashInput<'a> {
     /// Requested supplementary groups (issue #178); sorted, skipped while empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_add: Vec<&'a str>,
+    /// Ingress log reader (issue #552): adds a read-only mount and keep-groups, so it recreates the
+    /// container once. Skipped while `false`, so an app that never opts in hashes exactly as before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ingress_logs: bool,
     /// Metrics opt-in (issue #364): it adds the container to `metrics-<instance>`, so setting or
     /// changing it recreates the container once, like a shared-network change. Skipped while unset,
     /// so an app that does not opt in hashes exactly as before. `metrics_path` stays outside: only the
@@ -210,6 +214,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         configs,
         host_mounts,
         group_add,
+        ingress_logs: spec.ingress_logs,
         metrics_port: spec.metrics_port,
         internal_hosts,
     };
@@ -756,6 +761,20 @@ env = { B = "2", A = "1" }
             "the source is part of the mount"
         );
         assert_ne!(with("/etc/machine-id", "/a"), with("/etc/machine-id", "/b"));
+    }
+
+    #[test]
+    fn ingress_logs_recreates_only_when_set() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let mut s = spec();
+        s.ingress_logs = false;
+        assert_eq!(
+            base,
+            spec_hash(&s, &digest('a')),
+            "false must not change the hash"
+        );
+        s.ingress_logs = true;
+        assert_ne!(base, spec_hash(&s, &digest('a')));
     }
 
     #[test]

@@ -367,6 +367,12 @@ pub async fn start_with<P: PodmanClient + 'static>(
         config_root: paths.config_root.clone(),
         host_mounts: host.runtime.host_mounts.clone(),
         group_add: host.runtime.group_add.clone(),
+        ingress_log_reader: host.logs.reader.clone().map(|instance| {
+            weglarka_engine::reconcile::IngressLogReader {
+                instance,
+                root: paths.ingress_logs.clone(),
+            }
+        }),
         container_log: host.logs.container_log(),
         sites: Some(sites),
         // The token admin API socket, mounted into the `[admin.http] clients` only (ADR 0056).

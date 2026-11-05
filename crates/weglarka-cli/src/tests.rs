@@ -829,6 +829,7 @@ fn show_app(start: bool) -> ShowAppResponse {
         },
         configs: None,
         host_mounts: None,
+        ingress_logs: None,
         restarts: None,
         health: None,
         started_at: None,

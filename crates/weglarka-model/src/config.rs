@@ -124,7 +124,7 @@ impl HostConfig {
 /// by the daemon (not to the nginx container's stdout), rotated once a day in UTC and deleted after
 /// the configured retention. This is a host setting, not an app setting: nginx writes one shared log
 /// for every app, so per-app retention would need separate files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogsConfig {
     /// `30` (days) by default; `"unlimited"` keeps the rotated files forever.
@@ -137,6 +137,10 @@ pub struct LogsConfig {
     /// Size bound of one container's `k8s-file` log (`"10m"`); invalid with `journald`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_max_size: Option<ByteSize>,
+    /// The one app that may read the ingress log files (issue #552, ADR 0072): it gets the log root
+    /// mounted read-only when its spec sets `ingress_logs = true`. Absent = no app may read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader: Option<InstanceName>,
 }
 
 impl LogsConfig {
@@ -196,6 +200,7 @@ impl Default for LogsConfig {
             retention: Self::default_retention(),
             container_driver: None,
             container_max_size: None,
+            reader: None,
         }
     }
 }

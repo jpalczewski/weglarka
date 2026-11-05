@@ -120,6 +120,14 @@ pub struct SpecFlags {
     /// groups of the runtime user, which must be a member of the named group.
     #[arg(long = "group-add", value_name = "GROUP|none", value_parser = parse_group, conflicts_with = "spec")]
     pub group_add: Vec<GroupFlag>,
+    /// Mount the ingress request logs read-only at /var/log/weglarka-ingress (ADR 0072). Only the
+    /// app named in `[logs] reader` in weglarka.toml may use it; it makes the container keep the
+    /// runtime user's groups.
+    #[arg(long, conflicts_with_all = ["spec", "no_ingress_logs"])]
+    pub ingress_logs: bool,
+    /// Stop reading the ingress logs (clears `ingress_logs`).
+    #[arg(long, conflicts_with = "spec")]
+    pub no_ingress_logs: bool,
     /// Signal `apps reload` sends to the container, e.g. SIGHUP (`none` removes it). Without it
     /// `apps reload` restarts the container instead. Not part of the spec hash.
     #[arg(long = "reload-signal", value_name = "SIG|none", value_parser = parse_reload_signal, conflicts_with = "spec")]
@@ -183,6 +191,8 @@ impl SpecFlags {
             && self.configs.is_empty()
             && self.host_mounts.is_empty()
             && self.group_add.is_empty()
+            && !self.ingress_logs
+            && !self.no_ingress_logs
             && self.reload_signal.is_none()
             && self.strategy.is_none()
             && self.shared_network.is_none()
@@ -232,6 +242,11 @@ impl SpecFlags {
                     }
                 }
             }
+        }
+        if self.ingress_logs {
+            spec.ingress_logs = true;
+        } else if self.no_ingress_logs {
+            spec.ingress_logs = false;
         }
         for flag in &self.host_mounts {
             match flag {
@@ -1036,6 +1051,25 @@ mod hardening_tests {
 
     fn spec() -> AppSpec {
         toml::from_str("image = \"i\"").unwrap()
+    }
+
+    #[test]
+    fn ingress_logs_flags_set_and_clear() {
+        let mut s = spec();
+        assert!(SpecFlags::default().is_empty());
+        let on = SpecFlags {
+            ingress_logs: true,
+            ..SpecFlags::default()
+        };
+        assert!(!on.is_empty());
+        on.apply(&mut s);
+        assert!(s.ingress_logs);
+        SpecFlags {
+            no_ingress_logs: true,
+            ..SpecFlags::default()
+        }
+        .apply(&mut s);
+        assert!(!s.ingress_logs);
     }
 
     #[test]

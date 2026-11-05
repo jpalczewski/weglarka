@@ -44,6 +44,10 @@ pub struct ConfigView {
     /// `[metrics]`; absent = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsView>,
+    /// `[logs] reader`: the one app that may read the ingress logs (`ingress_logs`, ADR 0072);
+    /// absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_reader: Option<InstanceName>,
 }
 
 /// `[metrics]`: where the opt-in metrics listener is and which network reaches it.

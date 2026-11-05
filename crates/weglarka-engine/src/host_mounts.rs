@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config_mounts::Resolved;
-use weglarka_model::app::{AppSpec, HostMount};
+use weglarka_model::app::{AppSpec, HostMount, InstanceName};
 
 /// A host mount that cannot be mounted.
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +87,37 @@ pub fn check_groups(allowlist: &[String], spec: &AppSpec) -> Result<(), GroupNot
         Some(group) => Err(GroupNotAllowed {
             group: group.clone(),
         }),
+    }
+}
+
+/// An app asked for `ingress_logs` without being the configured reader (issue #552, ADR 0072).
+#[derive(Debug, thiserror::Error)]
+pub enum IngressLogsError {
+    #[error("`ingress_logs` needs `[logs] reader = \"{instance}\"` in weglarka.toml")]
+    NoReader { instance: InstanceName },
+    #[error(
+        "`ingress_logs` is reserved for the app named in `[logs] reader` (\"{reader}\"), not \"{instance}\""
+    )]
+    NotReader {
+        instance: InstanceName,
+        reader: InstanceName,
+    },
+}
+
+/// Pure check of the one-reader gate; returns the host log root the reader gets mounted.
+pub fn check_ingress_logs<'a>(
+    reader: Option<&'a crate::reconcile::IngressLogReader>,
+    instance: &InstanceName,
+) -> Result<&'a Path, IngressLogsError> {
+    match reader {
+        None => Err(IngressLogsError::NoReader {
+            instance: instance.clone(),
+        }),
+        Some(r) if &r.instance != instance => Err(IngressLogsError::NotReader {
+            instance: instance.clone(),
+            reader: r.instance.clone(),
+        }),
+        Some(r) => Ok(&r.root),
     }
 }
 

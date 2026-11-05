@@ -765,6 +765,13 @@ pub fn config_sections(config: &ConfigView) -> Vec<ConfigSection> {
             ),
             field("Group add", join_or_dash(&rt.group_add)),
             field("Host configs", yes_no(config.host_configs)),
+            field(
+                "Ingress log reader",
+                config
+                    .logs_reader
+                    .as_ref()
+                    .map_or(NONE.to_owned(), ToString::to_string),
+            ),
         ],
     });
     let ing = &config.ingress;

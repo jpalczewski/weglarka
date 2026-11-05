@@ -79,6 +79,22 @@ pub(crate) fn validate_host_rules<P: PodmanClient>(
         .map_err(|e| Fail::invalid(e.to_string()))?;
     weglarka_engine::host_mounts::check_groups(&d.host.runtime.group_add, spec)
         .map_err(|e| Fail::invalid(e.to_string()))?;
+    // The ingress log reader (issue #552, ADR 0072): only the app named in `[logs] reader`.
+    if spec.ingress_logs {
+        weglarka_engine::host_mounts::check_ingress_logs(
+            d.host
+                .logs
+                .reader
+                .as_ref()
+                .map(|instance| weglarka_engine::reconcile::IngressLogReader {
+                    instance: instance.clone(),
+                    root: d.paths.ingress_logs.clone(),
+                })
+                .as_ref(),
+            name,
+        )
+        .map_err(|e| Fail::invalid(e.to_string()))?;
+    }
     // Forward auth needs `[identity]` and domains, and the provider cannot protect itself.
     weglarka_model::identity::validate_host_app(&d.host, name, spec).map_err(Fail::invalid)?;
     // The provider's own spec: issuer host, generated config loaded last, no auto-update (#88).
