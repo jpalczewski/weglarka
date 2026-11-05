@@ -1174,6 +1174,7 @@ mod tests {
             published_ports: vec![],
             memory_limit: None,
             oom_killed: false,
+            conmon_pid: None,
         }
     }
     fn target(inst: &str, pinned: Option<char>) -> (Target, SpecHash) {

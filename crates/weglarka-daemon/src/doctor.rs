@@ -101,6 +101,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
         format!("weglarka-daemon {}", env!("CARGO_PKG_VERSION")),
     ));
     podman(d, &mut checks).await;
+    conmon(d, &mut checks);
     if desired_state(d, &mut checks).await.is_some() {
         image_retention(d, &mut checks).await;
     }
@@ -424,6 +425,16 @@ async fn podman<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some("check the runtime user's `podman.socket` and that the socket is mounted into the container"),
         ),
     });
+}
+
+/// `podman.conmon` (issue #470): the last conmon check of the host-side watchdog.
+///
+/// The decision is pure ([`crate::conmon::doctor_check`]); this is only the file read and the clock.
+fn conmon<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let path = crate::conmon::path(&d.paths.state_dir);
+    let report = crate::conmon::load(&d.paths.state_dir);
+    let now = weglarka_model::self_update::secs(std::time::SystemTime::now());
+    out.push(crate::conmon::doctor_check(report.as_ref(), &path, now));
 }
 
 /// Loads and checks the desired state; `Some(())` once Podman's containers were observed too, so

@@ -378,6 +378,10 @@ pub struct ContainerInfo {
     /// sets it on exit and does not clear it on restart, so it reads "killed for memory at least once
     /// since this container was created". There is no cumulative counter.
     pub oom_killed: bool,
+    /// Host PID of the container's conmon (libpod `State.ConmonPid`), `None` when libpod reports no
+    /// PID. libpod keeps reporting `running` with this stale value after conmon dies (issue #470), so
+    /// only a check on the host — where that PID lives — can tell the two apart.
+    pub conmon_pid: Option<u32>,
 }
 
 /// One running container's resource use as `PodmanClient::container_stats` reports it. Only the fields a

@@ -28,6 +28,14 @@ paths:
   180 s), the watchdog does `reset-failed` + pins `switch_from` in the quadlet and restarts, and the daemon emits
   `SelfUpdateFellBack` after the start and leaves the broken digest in `error` (no re-pin until the tag moves). One
   attempt: an exhausted budget is a report (`doctor`, journal, the watchdog unit "failed"), not a restart loop.
+- **Dead conmon (#470):** libpod keeps reporting a container as `running` with a stale `State.ConmonPid` after its
+  conmon dies, and the health status freezes at its last value, so no libpod state can see it — and the daemon runs in a
+  container, so it cannot reach the host's PIDs. The same `supervise` wake-up checks it: for every running container that
+  carries `weglarka.instance`, `/proc/<ConmonPid>/comm` must read `conmon` (a live PID alone would accept a recycled
+  one). The result goes to `<state dir>/conmon-check.toml` (0600, atomic, tolerant, no schema marker — like the dedup
+  file: host-side bookkeeping the next run rewrites) and `doctor`'s `podman.conmon` reads it: `fail` with the reload
+  command, `warn` when the report is older than 5 minutes (the timer stopped), `info` when there is none. Report only —
+  an automatic repair is a follow-up, and the check runs even without `[self_update]`.
 - **Webhook dedup survives a restart (ADR 0035, #41):** delivery ids are kept in `<state dir>/webhook-deliveries.toml`
   (`model/src/delivery.rs`; 0600, 256 entries, oldest drop out), written atomically by `fsutil::write_atomic` under the
   dedup mutex, only for a new id and **before** the fan-out. The file is deliberately outside `state.toml` (a new field
@@ -41,3 +49,4 @@ paths:
 |---|---|
 | notifications | `crates/weglarka-notify/src/{message,dedup,outbox,worker,ntfy,endpoint,settings}.rs`; the `[notify]` section: `crates/weglarka-model/src/config.rs`; `Severity`: `crates/weglarka-model/src/events.rs`; wiring: `crates/weglarka-daemon/src/lib.rs` (`Notifier::build`, sink, worker), route: `crates/weglarka-api/src/endpoints.rs` → `crates/weglarka-daemon/src/admin.rs` |
 | Węglarka self-update | `crates/weglarka-model/src/self_update.rs` (state + pure `decide()`/`supervise()`), `crates/weglarka-registry/src/` (cosign signature and key verification), `crates/weglarka-daemon/src/self_update.rs` (host-side switcher + fallback action), `crates/weglarka-daemon/src/supervise.rs` (host-side watchdog: `GET /v1/health` probe, state lock), `crates/weglarka-daemon/src/service.rs` (spec shared with `platform install`), `crates/weglarka-daemon/src/platform.rs` (timers, `install_user_units`, `restart_service`, `reset_failed`), the `[self_update]` section in `crates/weglarka-model/src/config.rs`, check `self_update` in `crates/weglarka-daemon/src/doctor.rs` (ADR 0027, ADR 0034) |
+| Dead conmon (#470) | `crates/weglarka-daemon/src/conmon.rs` (the host-side probe of `/proc/<ConmonPid>/comm`, `<state dir>/conmon-check.toml`, and the pure `doctor` line), called from `crates/weglarka-daemon/src/supervise.rs`, exposed as check `podman.conmon` in `crates/weglarka-daemon/src/doctor.rs`, `ContainerInfo::conmon_pid` in `crates/weglarka-model/src/podman.rs` (from libpod `State.ConmonPid` in `crates/weglarka-podman/src/wire.rs`) |

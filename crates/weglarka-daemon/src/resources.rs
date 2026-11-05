@@ -391,6 +391,7 @@ mod tests {
             published_ports: Vec::new(),
             memory_limit: None,
             oom_killed: false,
+            conmon_pid: None,
         }
     }
 
