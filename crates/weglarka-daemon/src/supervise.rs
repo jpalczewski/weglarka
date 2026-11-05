@@ -14,6 +14,10 @@
 //! runs from here, independently of `[self_update]`, and records what it found for `doctor`
 //! ([`crate::conmon`]).
 //!
+//! It also records whether the systemd user manager holds every group `/etc/group` gives the runtime
+//! user (issue #191, [`record_user_groups`]): `group_add` containers inherit the manager's credentials,
+//! and only the host can read them.
+//!
 //! Everything that needs a decision is in `weglarka-model` (`self_update`; pure, injected clock) and
 //! in [`crate::conmon`]; this module is the thin host-side I/O around them: lock, probe and the two
 //! commands the fallback needs.
@@ -25,6 +29,7 @@ use weglarka_api::endpoints;
 use weglarka_engine::platform::Platform;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::self_update::secs;
+use weglarka_model::user_groups::{self, UserGroupsState};
 
 use crate::conmon;
 use crate::self_update::{self, WatchReport};
@@ -143,6 +148,59 @@ where
         "self-update watchdog probe"
     );
     self_update::watch(podman, platform, settings, healthy, now).await
+}
+
+/// Host files of the group check (issue #191).
+const PASSWD_FILE: &str = "/etc/passwd";
+const GROUP_FILE: &str = "/etc/group";
+
+/// Records the supplementary groups the runtime user is in according to `/etc/group` but that the user
+/// manager's credentials lack (issue #191, `weglarka_model::user_groups`).
+///
+/// Synchronous local file I/O that needs neither Podman nor `[self_update]`, so `main` runs it before
+/// anything that can fail; it never fails itself (a failed write is logged). The user manager is the
+/// process systemd names in `MANAGERPID` when it starts the watchdog unit; without it (a manual run,
+/// cron) the check records nothing, so it cannot overwrite a real finding with the fresh credentials
+/// of a login. Returns the finding it recorded, `None` when the host cannot answer the question.
+pub fn record_user_groups(settings: &Settings, now: SystemTime) -> Option<UserGroupsState> {
+    let manager = manager_status_path(std::env::var("MANAGERPID").ok().as_deref())?;
+    let observed = inspect_host_files(&manager, &settings.host.runtime.user, now)?;
+    let previous = user_groups::load(&settings.paths.state_dir).ok().flatten();
+    let next = observed.after(previous.as_ref());
+    let changed = previous
+        .as_ref()
+        .is_none_or(|previous| previous.since != next.since);
+    if let Err(e) = user_groups::save(&settings.paths.state_dir, &next) {
+        tracing::warn!(error = %e, "cannot record the user manager group check");
+    } else if changed && next.is_stale() {
+        tracing::warn!(
+            uid = next.uid,
+            missing = %next.names().join(","),
+            "the user manager does not hold every group of the runtime user; restart user@<uid>"
+        );
+    } else if changed {
+        tracing::info!("the user manager holds every group of the runtime user");
+    }
+    Some(next)
+}
+
+/// `/proc/<MANAGERPID>/status`; `None` for an unset or non-numeric value.
+fn manager_status_path(manager_pid: Option<&str>) -> Option<std::path::PathBuf> {
+    let pid: u32 = manager_pid?.trim().parse().ok()?;
+    Some(Path::new("/proc").join(pid.to_string()).join("status"))
+}
+
+/// Reads the three host files and hands them to the pure comparison.
+fn inspect_host_files(manager: &Path, user: &str, now: SystemTime) -> Option<UserGroupsState> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .map_err(|e| tracing::debug!(path = %path.display(), error = %e, "skipping the user manager group check"))
+            .ok()
+    };
+    let passwd = read(Path::new(PASSWD_FILE))?;
+    let group_file = read(Path::new(GROUP_FILE))?;
+    let status = read(manager)?;
+    user_groups::inspect(&passwd, &group_file, &status, user, secs(now))
 }
 
 /// Asks the admin API for `GET /v1/health` over its unix socket.
@@ -289,6 +347,46 @@ mod tests {
         assert!(
             lock_state(dir.path()).unwrap().is_some(),
             "the lock is released with the run"
+        );
+    }
+
+    #[test]
+    fn only_a_numeric_manager_pid_names_a_status_file() {
+        assert_eq!(
+            manager_status_path(Some("1234")),
+            Some(std::path::PathBuf::from("/proc/1234/status"))
+        );
+        assert_eq!(manager_status_path(None), None, "not started by systemd");
+        assert_eq!(manager_status_path(Some("")), None);
+        assert_eq!(manager_status_path(Some("../self")), None);
+    }
+
+    /// Issue #191 on this machine: the status of this test process is not a user manager's file, but
+    /// its uid decides whether the comparison runs at all.
+    #[test]
+    fn a_status_of_another_uid_is_not_compared() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("status");
+        std::fs::write(&status, "Name:\tsystemd\nUid:\t0\t0\t0\t0\nGroups:\t\n").unwrap();
+        assert_eq!(
+            inspect_host_files(&status, "root", SystemTime::UNIX_EPOCH).map(|s| s.uid),
+            Some(0),
+            "root's own manager is compared"
+        );
+        // Every host has a `nobody`-like user that is not root; pick the first non-root entry.
+        let passwd = std::fs::read_to_string(PASSWD_FILE).unwrap();
+        let other = passwd
+            .lines()
+            .find_map(|line| {
+                let mut f = line.split(':');
+                let name = f.next()?;
+                let uid: u32 = f.nth(1)?.parse().ok()?;
+                (uid != 0).then(|| name.to_owned())
+            })
+            .expect("a non-root user in /etc/passwd");
+        assert_eq!(
+            inspect_host_files(&status, &other, SystemTime::UNIX_EPOCH),
+            None
         );
     }
 

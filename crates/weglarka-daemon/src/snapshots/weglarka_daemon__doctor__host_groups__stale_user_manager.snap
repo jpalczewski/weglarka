@@ -1,0 +1,10 @@
+---
+source: crates/weglarka-daemon/src/doctor.rs
+expression: warning
+---
+{
+  "id": "host_mounts.groups",
+  "status": "warn",
+  "message": "user manager credentials are stale: restart user@1001 — `group_add` cannot work until it holds the group (missing for 120s): alloy: systemd-journal",
+  "hint": "`sudo systemctl restart user@$(id -u <runtime user>)` (systemd; it stops every container of the runtime user, and with `podman.socket` enabled the daemon comes back and its next reconcile starts them) or reboot, then check `grep Groups /proc/$(pgrep -u <runtime user> -x systemd)/status`"
+}

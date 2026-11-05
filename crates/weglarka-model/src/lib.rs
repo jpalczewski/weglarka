@@ -42,4 +42,5 @@ pub mod size_limit;
 pub mod state;
 pub mod uid_range;
 pub mod units;
+pub mod user_groups;
 pub mod webhook;

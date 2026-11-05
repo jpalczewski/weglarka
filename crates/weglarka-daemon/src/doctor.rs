@@ -17,6 +17,7 @@ use weglarka_model::shared_networks;
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
 use weglarka_model::units::human_bytes;
+use weglarka_model::user_groups::{MissingGroup, UserGroupsState};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::app_view::Access;
@@ -936,6 +937,92 @@ fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             ),
         )
     });
+    // Issue #191: `group_add` cannot be verified from the container (a private user namespace maps a
+    // missing supplementary gid to the overflow gid), so the host-side watchdog records what the user
+    // manager's credentials lack and this is only the report.
+    let finding = weglarka_model::user_groups::load(&d.paths.state_dir);
+    // Bookkeeping from the host: a missing or unreadable file is not a doctor finding (a host without
+    // systemd never writes one; the next watchdog run rewrites a broken one).
+    if let Ok(Some(finding)) = finding
+        && let Some(warning) = user_manager_groups(
+            &apps,
+            &finding,
+            weglarka_model::self_update::secs(std::time::SystemTime::now()),
+        )
+    {
+        out.push(warning);
+    }
+}
+
+/// Pure (issue #191): the `app: group` pairs whose `group_add` the user manager's credentials cannot
+/// satisfy yet, in `apps.toml` order.
+fn stale_group_add(apps: &AppsFile, missing: &[MissingGroup]) -> Vec<String> {
+    let mut affected = Vec::new();
+    for (name, spec) in &apps.apps {
+        for group in &spec.group_add {
+            if missing.iter().any(|entry| &entry.name == group) {
+                affected.push(format!("{name}: {group}"));
+            }
+        }
+    }
+    affected
+}
+
+/// The `host_mounts.groups` check for a recorded user manager finding (issue #191); `None` when no
+/// app requests a group the credentials lack.
+///
+/// Units inherit their credentials from the user manager, so a group added with `usermod -aG` reaches
+/// `podman.service` and the containers only after `sudo systemctl restart user@<uid>` (measured on
+/// rootless Podman 6.1.3; restarting `podman.socket`/`podman.service` is not enough) or a reboot.
+///
+/// Only the groups an app requests are named: the report is also served at the `read` scope, and the
+/// runtime user's other memberships are none of its business. The uid is [`detail`] text for the
+/// same reason. A finding the watchdog stopped refreshing says nothing about now, so it turns into
+/// an `info` that points at the timer instead of a warning that may be long fixed.
+fn user_manager_groups(
+    apps: &AppsFile,
+    finding: &UserGroupsState,
+    now: u64,
+) -> Option<DoctorCheck> {
+    const ID: &str = "host_mounts.groups";
+    const RESTART: &str = "`sudo systemctl restart user@$(id -u <runtime user>)` (systemd; it stops \
+        every container of the runtime user, and with `podman.socket` enabled the daemon comes back \
+        and its next reconcile starts them) or reboot, then check `grep Groups /proc/$(pgrep -u \
+        <runtime user> -x systemd)/status`";
+    let affected = stale_group_add(apps, &finding.missing);
+    if !finding.is_current(now) {
+        let uses_groups = apps.apps.values().any(|spec| !spec.group_add.is_empty());
+        return uses_groups.then(|| {
+            check(
+                ID,
+                CheckStatus::Info,
+                format!(
+                    "cannot tell whether the user manager holds the `group_add` groups: the \
+                     host-side check last ran {}s ago",
+                    now.saturating_sub(finding.checked_at)
+                ),
+                Some(
+                    "the check runs from the host-side watchdog; `platform install` installs \
+                     weglarka-watchdog.timer",
+                ),
+            )
+        });
+    }
+    if affected.is_empty() {
+        return None;
+    }
+    Some(check(
+        ID,
+        CheckStatus::Warn,
+        format!(
+            "user manager credentials are stale: restart user@{} — `group_add` cannot work until \
+             it holds the group (missing for {}s): {}",
+            detail(finding.uid),
+            now.saturating_sub(finding.since),
+            affected.join(", ")
+        ),
+        Some(RESTART),
+    ))
 }
 
 fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
@@ -2770,5 +2857,117 @@ mod access_tests {
         let mut checks = msg("plain".into());
         apply_access(Access::Redacted, &mut checks);
         assert_eq!(checks[0].message, "plain");
+    }
+}
+
+#[cfg(test)]
+mod host_groups {
+    use super::*;
+
+    /// Two apps, one of them asking for the journal group (issue #191).
+    const APPS: &str = r#"
+[apps.alloy]
+image = "ghcr.io/example/alloy:1"
+port = 12345
+group_add = ["systemd-journal"]
+
+[apps.web]
+image = "ghcr.io/example/web:1"
+port = 80
+"#;
+
+    fn finding(missing: &[(&str, u32)], since: u64, checked_at: u64) -> UserGroupsState {
+        UserGroupsState {
+            user: "weglarka".to_owned(),
+            uid: 1001,
+            missing: missing
+                .iter()
+                .map(|(name, gid)| MissingGroup {
+                    name: (*name).to_owned(),
+                    gid: *gid,
+                })
+                .collect(),
+            since,
+            checked_at,
+        }
+    }
+
+    fn redacted(mut check: DoctorCheck) -> DoctorCheck {
+        apply_access(Access::Redacted, std::slice::from_mut(&mut check));
+        check
+    }
+
+    #[test]
+    fn a_group_the_user_manager_lacks_is_a_warning_for_the_apps_that_ask_for_it() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let mut warning = user_manager_groups(
+            &apps,
+            &finding(&[("systemd-journal", 999)], 1_770_000_000, 1_770_000_100),
+            1_770_000_120,
+        )
+        .expect("the app that requests the group is affected");
+        assert_eq!(
+            warning.id, "host_mounts.groups",
+            "not the host_mounts.apps id"
+        );
+        assert_eq!(warning.status, CheckStatus::Warn);
+        // The age is the age of the problem, not of the last wake-up.
+        assert!(
+            warning.message.contains("missing for 120s"),
+            "{}",
+            warning.message
+        );
+        assert!(warning.message.contains("alloy: systemd-journal"));
+        assert!(!warning.message.contains("web:"), "{}", warning.message);
+        apply_access(Access::Full, std::slice::from_mut(&mut warning));
+        insta::assert_json_snapshot!("stale_user_manager", warning);
+    }
+
+    #[test]
+    fn the_read_scope_sees_neither_other_groups_nor_the_uid() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let found = finding(&[("systemd-journal", 999), ("docker", 998)], 1, 1);
+        let warning = redacted(user_manager_groups(&apps, &found, 1).unwrap());
+        assert!(!warning.message.contains("docker"), "{}", warning.message);
+        assert!(!warning.message.contains("1001"), "{}", warning.message);
+        assert!(!warning.hint.unwrap_or_default().contains("weglarka"));
+    }
+
+    #[test]
+    fn a_missing_group_no_app_requests_is_not_a_doctor_finding() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let now = 1_770_000_000;
+        assert!(user_manager_groups(&apps, &finding(&[("docker", 998)], now, now), now).is_none());
+        assert!(user_manager_groups(&apps, &finding(&[], now, now), now).is_none());
+    }
+
+    #[test]
+    fn a_finding_the_watchdog_stopped_refreshing_is_unknown() {
+        use weglarka_model::user_groups::STALE_AFTER_SECS;
+
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let old = finding(&[("systemd-journal", 999)], 0, 1_000);
+        let check = user_manager_groups(&apps, &old, 1_001 + STALE_AFTER_SECS).unwrap();
+        assert_eq!(check.status, CheckStatus::Info, "{}", check.message);
+        assert!(check.message.contains("cannot tell"), "{}", check.message);
+        // A clean but stale record is unknown too, but only where an app depends on it.
+        let clean = finding(&[], 0, 1_000);
+        assert_eq!(
+            user_manager_groups(&apps, &clean, 1_001 + STALE_AFTER_SECS).map(|c| c.status),
+            Some(CheckStatus::Info)
+        );
+        let without: AppsFile =
+            toml::from_str("[apps.web]\nimage = \"ghcr.io/example/web:1\"\nport = 80\n").unwrap();
+        assert!(user_manager_groups(&without, &clean, 1_001 + STALE_AFTER_SECS).is_none());
+    }
+
+    #[test]
+    fn only_the_groups_an_app_requests_are_reported() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let found = finding(&[("systemd-journal", 999), ("docker", 998)], 1, 1);
+        assert_eq!(
+            stale_group_add(&apps, &found.missing),
+            vec!["alloy: systemd-journal".to_owned()]
+        );
     }
 }
