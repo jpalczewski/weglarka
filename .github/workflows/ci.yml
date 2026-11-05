@@ -144,26 +144,41 @@ jobs:
   # The panel's client-side scripts (crates/weglarka-panel/assets/app.js) in a real browser: Playwright
   # on the Bun runtime against a fixture server that serves the real template section, app.js and the
   # vendored htmx under the panel's CSP (crates/weglarka-panel/e2e). No Rust build, so it runs in parallel.
+  # The job runs in the official Playwright image (#561): browsers and their system libraries come with it, so there
+  # is no `playwright install --with-deps` (apt-get against the Ubuntu mirrors) and no browser cache. The tag must
+  # match the `playwright` package in bun.lock (check-playwright-image.sh); a bump moves the tag and the digest.
   panel-e2e:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
     defaults:
       run:
+        # A `container:` job defaults to `sh`, not bash.
+        shell: bash
         working-directory: crates/weglarka-panel/e2e
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
+      - name: Playwright image matches bun.lock
+        run: ../../../.github/scripts/check-playwright-image.sh
+      # The image has no `unzip`, which oven-sh/setup-bun needs: fetch the release zip, verify its checksum and
+      # unpack it with Python's zipfile (in the image).
+      - name: Install Bun
+        timeout-minutes: 2
+        env:
+          BUN_VERSION: 1.4.4
+          BUN_SHA256: bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/bun.zip"
+          curl -fsSL -o "$zip" "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"
+          echo "$BUN_SHA256  $zip" | sha256sum -c -
+          python3 -I -m zipfile -e "$zip" "$RUNNER_TEMP/bun"
+          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" /usr/local/bin/bun
+          bun --version
       - run: bun install --frozen-lockfile
-      - name: Cache the Playwright browser
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/weglarka-panel/e2e/bun.lock') }}
-      # The browser itself is cached; its system libraries are installed on every run.
-      - run: bun --bun playwright install --with-deps chromium
       - run: bun run test
         env:
           CI: "true"

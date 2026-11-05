@@ -47,6 +47,8 @@ paths:
   a change to `app.js` or the polled markup needs a browser test there; the Rust side of a fragment stays in
   `tests/it/`. In agent containers the preinstalled Chromium is found through `PLAYWRIGHT_BROWSERS_PATH`; this is the
   only JavaScript tooling in the repo (Cargo's `[workspace.dependencies]` rule is about Rust crates).
+  CI runs the job in the official `mcr.microsoft.com/playwright` image pinned by digest; its tag must equal the
+  `playwright` version in `bun.lock` (`.github/scripts/check-playwright-image.sh`), so a bump moves both.
 - Static build: `cargo build --release --target x86_64-unknown-linux-musl` (CI: job `musl`).
 - **Tests run in CI the way production does:** the smoke test starts the daemon from the quadlet's arguments (no
   `/etc/passwd`, no `/etc/subuid` in the `scratch` image).
