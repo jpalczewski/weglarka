@@ -298,6 +298,9 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy,
         auth_groups,
         auth_exempt_paths,
+        // #215, ADR 0078: `paths` syntax, so the list carries no credential either; S3 of #215 adds
+        // it to the CLI and the docs, the projection already carries it.
+        oauth_resources,
         static_,
         security_headers,
     } = ingress;
@@ -314,6 +317,7 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy: auth_policy.map(read_authorization_policy),
         auth_groups,
         auth_exempt_paths,
+        oauth_resources,
         static_: static_.map(read_static_ingress),
         // Same type, same reasoning as the static table: a rendering setting, never a credential,
         // and `csp` is the app's own policy text, so it is passed through like the static one.

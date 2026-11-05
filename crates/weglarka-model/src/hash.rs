@@ -478,6 +478,7 @@ env = { B = "2", A = "1" }
             auth_policy: Some(crate::identity::AuthorizationPolicy::OneFactor),
             auth_groups: vec!["admins".into()],
             auth_exempt_paths: vec!["/mcp/".into()],
+            oauth_resources: vec!["/rpc".into()],
             static_: Some(crate::app::StaticIngress {
                 clean_urls: true,
                 not_found_page: Some("/404.html".into()),
@@ -509,7 +510,7 @@ env = { B = "2", A = "1" }
         assert_eq!(
             base,
             spec_hash(&s, &digest('a')),
-            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104, ADR 0075, #497) only re-render nginx"
+            "ingress options and paths (issues #64, #130, #181, ADR 0033, #104, ADR 0075, #497, #215) only re-render nginx"
         );
     }
 

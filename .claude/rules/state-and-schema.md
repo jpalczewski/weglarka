@@ -29,7 +29,7 @@ paths:
 - Per-feature schema bumps recorded elsewhere: configs (ADR 0028) → `apps.toml` `schema_version = 2` (no-op step), mounted
   secret owner (ADR 0037) → `schema_version = 7` (no-op step), identity (ADR 0051/0052) → schema 14, OIDC `device_flow` (ADR 0060) → schema 15, per-app
   `metrics_port`/`metrics_path` (#364) → schema 16, per-app `internal_hosts` (#303, ADR 0071) → schema 19, site static
-  options/`robots` (#548/#545, ADR 0075) → schema 20, container security headers (#497, ADR 0076) → schema 21, ingress log reader (#552, ADR 0072) → schema 22; see the
+  options/`robots` (#548/#545, ADR 0075) → schema 20, container security headers (#497, ADR 0076) → schema 21, ingress log reader (#552, ADR 0072) → schema 22, oauth resources (#215, ADR 0078) → schema 23; see the
   matching rules ([engine-and-deploy.md](engine-and-deploy.md), [identity-and-admin-tokens.md](identity-and-admin-tokens.md)).
 
 ## Entry points
