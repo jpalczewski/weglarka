@@ -897,7 +897,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 // (`KnownBad` would skip it anyway; this reports it instead of retrying silently).
                 let blocked = match (&pinned, app_state.and_then(|s| s.failed.as_ref())) {
                     (None, failed) => failed.is_some(),
-                    (Some(d), Some(f)) => !released && f.digest == *d,
+                    // Not served and the last deploy failed (possibly for a newer digest than the
+                    // pin, e.g. after a `kind` flip): wait for `deploy` instead of resolving the tag
+                    // on every pass.
+                    (Some(_), Some(_)) => !released,
                     (Some(_), None) => false,
                 };
                 // A promote-only environment waits for its first promotion: reconcile never

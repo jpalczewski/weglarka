@@ -4752,9 +4752,11 @@ port = 8080
         h.rec.reconcile().await.unwrap();
 
         h.set_apps(SITE);
-        // The image has no usable archive: the extraction fails.
+        // The tag now resolves to a newer digest than the stale pin, and its archive is unusable:
+        // the extraction fails.
+        h.fake.set_pull_digest(SITE_IMAGE, digest('b'));
         h.fake
-            .script_image_archive(&digest('a'), b"not a tar".to_vec());
+            .script_image_archive(&digest('b'), b"not a tar".to_vec());
         let report = h.rec.reconcile().await.unwrap();
         assert!(
             matches!(
@@ -4764,7 +4766,8 @@ port = 8080
             "{:?}",
             report.actions
         );
-        assert_eq!(h.state("blog").failed.map(|f| f.digest), Some(digest('a')));
+        assert_eq!(h.state("blog").failed.map(|f| f.digest), Some(digest('b')));
+        assert_eq!(h.state("blog").current, Some(digest('a')));
 
         let pulls_before = pulls(&h);
         let report = h.rec.reconcile().await.unwrap();
@@ -4773,6 +4776,17 @@ port = 8080
         assert_eq!(pulls(&h), pulls_before);
         assert_eq!(h.fake.containers().len(), 1);
         assert!(!reconciled(&h).await);
+    }
+
+    /// Without a sites root a pinned site plans no deploy: it would fail with a site error on every pass.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_sites_directory_a_pinned_site_plans_nothing() {
+        let h = Harness::new(SITE);
+        let mut st = weglarka_model::state::load_state(&h.rec.paths().state).unwrap();
+        st.apps.entry(name("blog")).or_default().current = Some(digest('a'));
+        weglarka_model::state::save_state(&h.rec.paths().state, &st).unwrap();
+        assert!(h.rec.reconcile().await.unwrap().actions.is_empty());
+        assert!(reconciled(&h).await);
     }
 
     #[tokio::test(start_paused = true)]
