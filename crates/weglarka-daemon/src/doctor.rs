@@ -2557,11 +2557,11 @@ fn logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         hint = Some("check the ingress log directory permissions and the daemon log");
     }
     if let Ok(meta) = std::fs::metadata(dir)
-        && meta.permissions().mode() & 0o077 != 0
+        && meta.permissions().mode() & 0o027 != 0
     {
         status = CheckStatus::Warn;
         message.push_str("; the directory is readable by other local users");
-        hint = Some("chmod 0700 the ingress log directory");
+        hint = Some("chmod 0750 the ingress log directory (the daemon resets it on the next pass)");
     }
     if let Some(last) = d.logs.last() {
         message.push_str(&format!(

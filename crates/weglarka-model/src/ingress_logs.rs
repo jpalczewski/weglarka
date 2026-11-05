@@ -134,16 +134,35 @@ pub fn parse_date(date: &str) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
-/// Creates a log directory (and parents) with mode `0700`. The one permission helper: the ingress
-/// apply and the retention worker both call it, so the mode cannot drift between them. Only the
-/// daemon user (container uid 0 of nginx, mapped to the same host user) opens the files; the nginx
-/// worker inherits their descriptors, so it needs no permission on the directory itself.
+/// Mode of every log directory: owner full access, the owner's group may read and list, nobody else
+/// has any access (ADR 0072).
+pub const DIR_MODE: u32 = 0o750;
+
+/// The mode `ensure_dir` must set on a directory that currently has `current`, or `None` when it is
+/// already right. Anything that is not exactly [`DIR_MODE`] is replaced: `0700` (every install before
+/// ADR 0072) is widened once, `o` bits and `g+w` are tightened. A correct directory is left alone
+/// because `chmod` resets a POSIX ACL mask, which would undo an administrator's deliberate ACL.
+pub fn mode_change(current: u32) -> Option<u32> {
+    (current & 0o7777 != DIR_MODE).then_some(DIR_MODE)
+}
+
+/// Creates a log directory (and parents) and makes sure it has mode [`DIR_MODE`] (`0750`). The one
+/// permission helper: the ingress apply and the retention worker both call it, so the mode cannot
+/// drift between them; it takes any path, so per-app subdirectories use it as well.
+///
+/// The daemon's user owns the directory and the files in it (container uid 0 of nginx, mapped to
+/// the same host user). The group is the runtime user's primary group, which a log reader reaches
+/// with `keep-groups` (ADR 0072); nginx's worker (uid 101) has no access, because it inherits the
+/// descriptors the master opened.
 pub fn ensure_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let current = fs::metadata(path)?.permissions().mode();
+        if let Some(mode) = mode_change(current) {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
     }
     Ok(())
 }
@@ -219,18 +238,67 @@ mod tests {
         assert!(shared().completed(&tmp.path().join("missing")).is_err());
     }
 
+    #[test]
+    fn mode_decision() {
+        assert_eq!(
+            mode_change(0o040_700 & 0o7777),
+            Some(0o750),
+            "0700 is widened once"
+        );
+        assert_eq!(mode_change(0o755), Some(0o750), "world bits are cleared");
+        assert_eq!(mode_change(0o770), Some(0o750), "group write is cleared");
+        assert_eq!(mode_change(0o777), Some(0o750));
+        assert_eq!(
+            mode_change(0o2750),
+            Some(0o750),
+            "setgid is not part of the mode"
+        );
+        assert_eq!(
+            mode_change(0o750),
+            None,
+            "a correct directory is left alone"
+        );
+        assert_eq!(mode_change(0o040_750), None, "file type bits are ignored");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
     #[cfg(unix)]
     #[test]
-    fn ensure_dir_sets_0700_and_is_idempotent() {
+    fn ensure_dir_creates_0750_and_normalises_others() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("a").join("logs");
         ensure_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&dir), 0o750);
+        for old in [0o700, 0o755, 0o770] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(old)).unwrap();
+            ensure_dir(&dir).unwrap();
+            assert_eq!(mode_of(&dir), 0o750, "from {old:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_does_not_touch_a_correct_directory() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
         ensure_dir(&dir).unwrap();
+        let before = fs::metadata(&dir).unwrap();
+        // `chmod` updates ctime even when the mode is unchanged, so an untouched ctime shows that no
+        // `chmod` ran (which would also reset an ACL mask).
+        std::thread::sleep(Duration::from_millis(20));
+        ensure_dir(&dir).unwrap();
+        let after = fs::metadata(&dir).unwrap();
         assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
         );
     }
 }
