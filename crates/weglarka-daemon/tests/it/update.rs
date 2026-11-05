@@ -487,3 +487,64 @@ async fn paths_share_a_domain_reload_nginx_and_never_touch_containers() {
     assert_eq!(creates_of(&h.fake, "mcp"), creates);
     h.running.stop().await;
 }
+
+/// Issue #546: `kind` is fixed after `add`. An update that flips it is refused before anything is
+/// persisted, so the old container (or site) keeps serving.
+#[tokio::test]
+async fn kind_change_is_refused_and_leaves_everything_untouched() {
+    let h = harness().await;
+    add(&h, "site", spec("site.example.eu")).await;
+    deployed(&h, "site").await;
+    let apps_toml = read(&h.root.join("state/apps.toml"));
+    let state_toml = read(&h.root.join("state/state.toml"));
+    let creates = creates_of(&h.fake, "site");
+
+    let flipped = json!({ "kind": "static", "image": IMAGE, "domains": ["site.example.eu"] });
+    let (s, v) = admin(&h, "PUT", "/v1/apps/site", Some(json!({ "spec": flipped }))).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("conflict"))
+    );
+    let msg = v["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("from container to static") && msg.contains("remove the app"),
+        "{v}"
+    );
+    assert_eq!(read(&h.root.join("state/apps.toml")), apps_toml);
+    assert_eq!(read(&h.root.join("state/state.toml")), state_toml);
+    assert_eq!(creates_of(&h.fake, "site"), creates);
+    assert!(
+        h.fake
+            .containers()
+            .iter()
+            .any(|c| c.name == "site" && c.state == ContainerState::Running)
+    );
+    h.running.stop().await;
+
+    // The other direction: a static site cannot become a container either.
+    let builder = Builder::new().apps(
+        "[apps.site]\nkind = \"static\"\nimage = \"registry.example.com/me/site:latest\"\ndomains = [\"site.example.eu\"]\n",
+    );
+    let h = builder.build().await;
+    let apps_toml = read(&h.root.join("state/apps.toml"));
+    let (s, v) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/site",
+        Some(json!({ "spec": spec("site.example.eu") })),
+    )
+    .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("conflict"))
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from static to container"),
+        "{v}"
+    );
+    assert_eq!(read(&h.root.join("state/apps.toml")), apps_toml);
+    h.running.stop().await;
+}

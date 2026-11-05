@@ -49,6 +49,22 @@ impl<P: PodmanClient> Reconciler<P> {
             })
     }
 
+    /// Whether `digest` is the release `current` actually serves for the static site `instance`: the
+    /// pin in `state.toml` alone says nothing (after a `kind` flip it can be a container image digest).
+    /// `false` without a sites root — the deploy then fails with a clear error instead of looping,
+    /// because a failed deploy marks the digest `failed` and reconcile reports it as blocked.
+    pub(crate) fn serves_release(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+    ) -> bool {
+        self.options.sites.as_ref().is_some_and(|sites| {
+            SiteReleases::new(sites.root.join(instance.as_str()))
+                .serves(&release_id(digest), &ReleaseGate::for_spec(spec))
+        })
+    }
+
     fn sites(&self) -> Result<&SitesOptions, EngineError> {
         self.options.sites.as_ref().ok_or_else(|| {
             EngineError::Site(

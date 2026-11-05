@@ -367,6 +367,9 @@ pub struct Target {
     /// `kind = "static"` (ADR 0049): the instance has no container, so [`plan`] only deploys it once and
     /// removes any container that carries its label.
     pub is_static: bool,
+    /// Static sites only: the pinned digest's release is the one `current` serves (not just pinned in
+    /// `state.toml`, which after a `kind` flip can be a container image digest). Irrelevant for containers.
+    pub released: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,13 +449,16 @@ pub fn plan(targets: &[Target], observed: &[ContainerInfo]) -> Vec<Action> {
             });
         }
         if t.is_static {
-            // A kind flip leaves a container behind; a site has none.
-            if let Some(c) = main {
+            // A kind flip leaves a container behind; a site has none. It goes only once the site is
+            // served, so a hand-edited flip never takes the old container down before the new one is up.
+            if t.released
+                && let Some(c) = main
+            {
                 actions.push(Action::Remove {
                     container: c.name.clone(),
                 });
             }
-            if !t.blocked && t.pinned.is_none() {
+            if !t.blocked && (t.pinned.is_none() || !t.released) {
                 actions.push(Action::Deploy {
                     instance: t.instance.clone(),
                 });
@@ -787,7 +793,7 @@ impl<P: PodmanClient> Reconciler<P> {
     ) -> bool {
         let pinned = app_state.and_then(|s| s.current.as_ref());
         if spec.kind == AppKind::Static {
-            return pinned.is_some();
+            return pinned.is_some_and(|d| self.serves_release(name, spec, d));
         }
         if !spec.start {
             return pinned.is_some() && container.is_none();
@@ -884,16 +890,24 @@ impl<P: PodmanClient> Reconciler<P> {
                 let app_state = st.apps.get(name);
                 let pinned = app_state.and_then(|s| s.current.clone());
                 // A failed first deploy waits for `deploy`, as for containers.
-                let blocked = pinned.is_none() && app_state.is_some_and(|s| s.failed.is_some());
+                let released = pinned
+                    .as_ref()
+                    .is_some_and(|d| self.serves_release(name, spec, d));
+                // A pinned digest that is not served and whose deploy failed waits for `deploy` too
+                // (`KnownBad` would skip it anyway; this reports it instead of retrying silently).
+                let blocked = match (&pinned, app_state.and_then(|s| s.failed.as_ref())) {
+                    (None, failed) => failed.is_some(),
+                    (Some(d), Some(f)) => !released && f.digest == *d,
+                    (Some(_), None) => false,
+                };
                 // A promote-only environment waits for its first promotion: reconcile never
                 // resolves a tag for it (issue #205). Not reported as blocked — that would warn on
                 // every pass; `doctor` carries the signal.
-                let awaiting = pinned.is_none() && apps.is_promote_only(name);
+                let awaiting = (pinned.is_none() || !released) && apps.is_promote_only(name);
                 if blocked {
-                    report.blocked.push((
-                        name.clone(),
-                        "first deploy failed; run deploy manually".into(),
-                    ));
+                    report
+                        .blocked
+                        .push((name.clone(), "deploy failed; run deploy manually".into()));
                 }
                 targets.push(Target {
                     instance: name.clone(),
@@ -904,6 +918,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     start: true,
                     depends_on: Vec::new(),
                     is_static: true,
+                    released,
                 });
                 continue;
             }
@@ -972,6 +987,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 start: spec.start,
                 depends_on: self.effective(name, spec).depends_on.clone(),
                 is_static: false,
+                released: false,
             });
         }
 
@@ -1212,6 +1228,7 @@ mod tests {
                 start: true,
                 depends_on: vec![],
                 is_static: false,
+                released: false,
             },
             h,
         )
@@ -1286,6 +1303,37 @@ mod tests {
             plan(&[running], &[c]),
             vec![Action::Provision {
                 instance: name("a")
+            }]
+        );
+    }
+
+    #[test]
+    fn a_static_site_pinned_but_not_served_is_deployed_and_keeps_the_old_container() {
+        // A kind flip: the pin is the old container's digest, no release is served yet.
+        let (mut t, h) = target("a", Some('a'));
+        t.is_static = true;
+        let c = container("a", "a", &h, ContainerState::Running);
+        assert_eq!(
+            plan(std::slice::from_ref(&t), std::slice::from_ref(&c)),
+            vec![Action::Deploy {
+                instance: name("a")
+            }]
+        );
+        // Blocked (failed deploy): nothing is planned and the container stays.
+        t.blocked = true;
+        assert!(plan(&[t], &[c]).is_empty());
+    }
+
+    #[test]
+    fn a_served_static_site_drops_its_leftover_container_and_deploys_nothing() {
+        let (mut t, h) = target("a", Some('a'));
+        t.is_static = true;
+        t.released = true;
+        let c = container("a", "a", &h, ContainerState::Running);
+        assert_eq!(
+            plan(&[t], &[c]),
+            vec![Action::Remove {
+                container: "a".into()
             }]
         );
     }

@@ -29,7 +29,7 @@ use weglarka_api::{
 };
 use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
 use weglarka_engine::reconcile::EngineError;
-use weglarka_model::app::InstanceName;
+use weglarka_model::app::{AppKind, InstanceName};
 use weglarka_model::labels;
 use weglarka_model::podman::PodmanClient;
 use weglarka_model::state::{self, AppState};
@@ -72,6 +72,22 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
                 instance: name.clone(),
                 site: origin.site.to_string(),
             }));
+        }
+        // `kind` is fixed after `add`: a flip would orphan the old runtime (container or release) and
+        // leave the app unserved until a manual deploy (issue #546). Refused before anything is persisted.
+        let current = apps
+            .apps
+            .get(&name)
+            .ok_or_else(|| Fail(ErrorCode::NotFound, format!("unknown app: {name}")))?;
+        if current.kind != req.spec.kind {
+            return Err(Fail(
+                ErrorCode::Conflict,
+                format!(
+                    "changing `kind` from {} to {} is not supported by update; remove the app and add it again with the new spec",
+                    kind_name(current.kind),
+                    kind_name(req.spec.kind)
+                ),
+            ));
         }
         let old = apps
             .apps
@@ -126,6 +142,13 @@ pub(crate) async fn update_app<P: PodmanClient + 'static>(
     let app_state = st.apps.get(&name);
     let app = show_response(access, name, req.spec, app_state, container.as_ref());
     Ok(axum::Json(UpdateAppResponse { app, deploy }).into_response())
+}
+
+fn kind_name(kind: AppKind) -> &'static str {
+    match kind {
+        AppKind::Container => "container",
+        AppKind::Static => "static",
+    }
 }
 
 fn internal(e: impl ToString) -> Fail {

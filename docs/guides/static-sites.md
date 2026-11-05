@@ -148,6 +148,13 @@ The command applies to a `kind = "static"` site that is not owned by a site envi
 [verification and rollback](verify-and-rollback.md)). An environment of a `[sites]` site is also refused (400) with
 the hint `weglarka promote <site> <env> --rollback` (see [site environments](site-environments.md)).
 
+## Changing `kind`
+
+`kind` is fixed when the app is added: `weglarka apps update` refuses to switch between `container` and `static`
+(409) and changes nothing. To switch, remove the app and add it again with the new spec. If you edit `kind` in
+`apps.toml` by hand, reconcile deploys the site first and removes the old container only once the site is served; a
+failed release is reported as blocked until you run `weglarka deploy`.
+
 ## Limits of this release
 
 - HTTP Basic auth, and forward auth, for static sites are tracked in #169.
