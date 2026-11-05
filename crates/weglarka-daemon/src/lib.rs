@@ -350,7 +350,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
     // Static sites live in the one directory nginx mounts (ADR 0049, ADR 0036). The exported image
     // archive is untrusted and goes to the daemon's own state directory instead; older releases kept
     // it under `<nginx_conf_dir>/sites/.tmp`, so remove that leftover once, best effort.
-    let sites_root = paths.nginx_conf_dir.join("sites");
+    let sites_root = paths.sites_root();
     let _ = std::fs::remove_dir_all(sites_root.join(".tmp"));
     let sites = SitesOptions {
         root: sites_root,

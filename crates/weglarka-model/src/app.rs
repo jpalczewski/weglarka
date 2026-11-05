@@ -210,6 +210,13 @@ impl HealthGate {
     fn default_window_secs() -> u64 {
         30
     }
+
+    /// Whether this is the untouched default gate: `attempts = 5`, `window_secs = 30` and no probe.
+    /// The default is not written to a spec ([`AppSpec::health`] skips it): it is what an absent
+    /// field means, and a static site rejects `health` outright (issue #547).
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl Default for HealthGate {
@@ -1172,7 +1179,10 @@ pub struct AppSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secrets: Vec<SecretBinding>,
-    #[serde(default)]
+    /// Post-deploy health gate ([`HealthGate`]); omitted while it is the default, which is what an
+    /// absent field means (`apps show` of a default-gated app therefore has no `health` key, and a
+    /// static site — where `health` is rejected — never reports one, issue #547).
+    #[serde(default, skip_serializing_if = "HealthGate::is_default")]
     pub health: HealthGate,
     /// Named volumes (iteration 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

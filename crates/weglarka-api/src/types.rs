@@ -59,6 +59,15 @@ pub enum RuntimeState {
     /// No container by design: the spec has `start = false`, so the app is provisioned only (image
     /// digest pinned, network, uid range and volumes ready). `apps start` brings it up.
     NotStarted,
+    /// No container by design either: a `kind = "static"` app (ADR 0049) whose `current` release is
+    /// the release of its pinned digest, i.e. the ingress serves exactly what was deployed
+    /// (issue #547). A static app that is pinned but does not serve its release is `Missing`.
+    Serving,
+    /// A state this client does not know, produced by a newer daemon than the one it expects. The
+    /// daemon never sends it: it only keeps a client parsing an answer it cannot name instead of
+    /// failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// App summary in a list.
@@ -1023,6 +1032,34 @@ mod tests {
             .map(|e| format!("{:?} {}", e.method, e.path))
             .collect();
         insta::assert_json_snapshot!(list);
+    }
+
+    #[test]
+    fn a_runtime_state_from_a_newer_daemon_deserializes_to_unknown() {
+        // The daemon never sends `unknown`: it is the fallback for a variant this client does not
+        // know yet, so a newer daemon's answer parses instead of failing the whole response.
+        assert_eq!(
+            serde_json::from_str::<RuntimeState>("\"created_by_a_newer_daemon\"").unwrap(),
+            RuntimeState::Unknown
+        );
+        for (wire, state) in [
+            ("running", RuntimeState::Running),
+            ("stopped", RuntimeState::Stopped),
+            ("missing", RuntimeState::Missing),
+            ("unhealthy", RuntimeState::Unhealthy),
+            ("waiting_for_secret", RuntimeState::WaitingForSecret),
+            ("not_started", RuntimeState::NotStarted),
+            ("serving", RuntimeState::Serving),
+        ] {
+            let parsed: RuntimeState = serde_json::from_value(wire.into()).unwrap();
+            assert_eq!(parsed, state, "{wire}");
+            assert_eq!(serde_json::to_value(state).unwrap(), wire);
+        }
+        // The daemon never produces the fallback variant; it still has a name of its own on the wire.
+        assert_eq!(
+            serde_json::to_value(RuntimeState::Unknown).unwrap(),
+            "unknown"
+        );
     }
 }
 

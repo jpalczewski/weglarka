@@ -9,10 +9,6 @@ expression: parsed
       "domains": [],
       "env": {},
       "secrets": [],
-      "health": {
-        "attempts": 5,
-        "window_secs": 30
-      },
       "host_ports": [
         {
           "host": 2222,

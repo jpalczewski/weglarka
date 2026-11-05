@@ -970,14 +970,21 @@ pub async fn apps_stop(json: bool, o: &Overrides, a: StartStopArgs) -> Result<i3
 
 // ---------- "waiting for secret" rendering ----------
 
-/// Runtime label for tables and `show` (`WaitingForSecret` → `waiting-for-secret`,
-/// `NotStarted` → `not-started`).
+/// Runtime label for tables and `show`: the serde name with dashes (`WaitingForSecret` →
+/// `waiting-for-secret`). A `kind = "static"` site that serves its release is `serving` (issue
+/// #547); `unknown` is a state only a newer daemon reports.
 pub fn runtime_label(r: RuntimeState) -> String {
-    match r {
-        RuntimeState::WaitingForSecret => "waiting-for-secret".to_owned(),
-        RuntimeState::NotStarted => "not-started".to_owned(),
-        other => format!("{other:?}").to_lowercase(),
-    }
+    let label = match r {
+        RuntimeState::Running => "running",
+        RuntimeState::Stopped => "stopped",
+        RuntimeState::Missing => "missing",
+        RuntimeState::Unhealthy => "unhealthy",
+        RuntimeState::WaitingForSecret => "waiting-for-secret",
+        RuntimeState::NotStarted => "not-started",
+        RuntimeState::Serving => "serving",
+        RuntimeState::Unknown => "unknown",
+    };
+    label.to_owned()
 }
 
 /// Extra lines for `apps show` when the app waits for secrets (empty otherwise).

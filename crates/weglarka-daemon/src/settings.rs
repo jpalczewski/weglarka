@@ -58,6 +58,13 @@ impl Paths {
             .join(weglarka_model::admin_auth::SOCKET_NAME)
     }
 
+    /// Static-site releases (`<nginx_conf_dir>/sites`, ADR 0049): the one directory the ingress mounts
+    /// to serve them. Doctor and the API read a site's `current` link from here, so the deploy, the
+    /// checks and `runtime` cannot disagree about where a site lives.
+    pub fn sites_root(&self) -> PathBuf {
+        self.nginx_conf_dir.join("sites")
+    }
+
     pub fn resolve(host: &HostConfig, config_path: &Path) -> Self {
         let config_dir = config_path
             .parent()

@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use weglarka_model::app::{AppSpec, Digest};
+use weglarka_model::app::{AppSpec, Digest, InstanceName};
 
 use super::extract::SiteError;
 
@@ -126,9 +126,22 @@ impl SiteReleases {
         release.is_dir() && gate.check(&release).is_ok()
     }
 
+    /// How `current` relates to the release `id` — the one comparison behind [`Self::serves`] and
+    /// [`served_release`].
+    pub fn current_release(&self, id: &str, gate: &ReleaseGate) -> ServedRelease {
+        match self.current_id() {
+            Some(link) if link == id => match gate.check(&self.release_dir(id)) {
+                Ok(()) => ServedRelease::Served,
+                Err(e) => ServedRelease::Incomplete(e),
+            },
+            Some(link) => ServedRelease::Other(link),
+            None => ServedRelease::NoCurrent,
+        }
+    }
+
     /// `current` points at `id` and `is_complete`.
     pub fn serves(&self, id: &str, gate: &ReleaseGate) -> bool {
-        self.current_id().as_deref() == Some(id) && self.is_complete(id, gate)
+        self.current_release(id, gate).is_served()
     }
 
     /// Moves `<id>.partial` into `releases/<id>` (keeping an existing complete one, as before) and
@@ -190,6 +203,44 @@ impl SiteReleases {
             };
         }
     }
+}
+
+/// How the `current` link of one static site relates to the release it is pinned to.
+#[derive(Debug)]
+pub enum ServedRelease {
+    /// `current` points at the release of the pinned digest and that release passes the gate.
+    Served,
+    /// `current` points at another release (`releases/<id>`): the switch never happened or lagged
+    /// behind `state.toml`.
+    Other(String),
+    /// `current` is missing or is not a `releases/<id>` link.
+    NoCurrent,
+    /// `current` points at the pinned release, which is incomplete: the gate's reason.
+    Incomplete(ReleaseError),
+}
+
+impl ServedRelease {
+    /// Whether the site serves the release it is pinned to.
+    pub fn is_served(&self) -> bool {
+        matches!(self, Self::Served)
+    }
+}
+
+/// The one definition of "this static site serves its pinned release" (ADR 0049, issue #547):
+/// `<sites_root>/<instance>/current` points at `releases/<release_id(digest)>` and that release
+/// passes `spec`'s file gate. Doctor's `sites.current` and `state.drift`, the API's
+/// `RuntimeState::Serving` and the engine's own pre-checks all resolve it here, so they cannot
+/// disagree about what a deploy produced.
+///
+/// Synchronous, and it only reads the site directory — the same `current` symlink nginx follows.
+pub fn served_release(
+    sites_root: &Path,
+    instance: &InstanceName,
+    spec: &AppSpec,
+    digest: &Digest,
+) -> ServedRelease {
+    SiteReleases::new(sites_root.join(instance.as_str()))
+        .current_release(&release_id(digest), &ReleaseGate::for_spec(spec))
 }
 
 /// Directory name of a release: the leading hex of its digest.

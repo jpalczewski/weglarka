@@ -578,16 +578,21 @@ fn container_health(health: HealthStatus) -> ContainerHealth {
 }
 
 /// The show response of one app. `configs` and `host_mounts` stay `None`: only
-/// `GET /v1/apps/{name}` resolves them and sets them on the result.
+/// `GET /v1/apps/{name}` resolves them and sets them on the result. `served` is the
+/// `kind = "static"` served-release flag (`crate::admin::served_flag`, issue #547).
 pub(crate) fn show_response(
     access: Access,
     name: InstanceName,
     spec: AppSpec,
     app_state: Option<&AppState>,
     container: Option<&ContainerInfo>,
+    served: Option<bool>,
 ) -> ShowAppResponse {
     ShowAppResponse {
-        runtime: with_waiting(runtime_state_for(&spec, app_state, container), app_state),
+        runtime: with_waiting(
+            runtime_state_for(&spec, app_state, container, served),
+            app_state,
+        ),
         state: redact_state(access, app_state.cloned().unwrap_or_default()),
         configs: None,
         host_mounts: None,
@@ -644,9 +649,9 @@ mod tests {
 
     #[test]
     fn redaction_blanks_values_and_keeps_keys() {
-        let full = show_response(Access::Full, name(), spec(), None, None);
+        let full = show_response(Access::Full, name(), spec(), None, None, None);
         assert_eq!(full.spec.env["DATABASE_URL"], "postgres://u:p@h/db");
-        let redacted = show_response(Access::Redacted, name(), spec(), None, None);
+        let redacted = show_response(Access::Redacted, name(), spec(), None, None, None);
         let keys: Vec<_> = redacted.spec.env.keys().map(String::as_str).collect();
         assert_eq!(keys, ["DATABASE_URL", "MODE"]);
         assert!(redacted.spec.env.values().all(String::is_empty));
@@ -671,14 +676,14 @@ mod tests {
 
     #[test]
     fn redaction_keeps_only_the_argument_count() {
-        let full = show_response(Access::Full, name(), leaky_spec(), None, None);
+        let full = show_response(Access::Full, name(), leaky_spec(), None, None, None);
         assert_eq!(full.spec.command[1], "--password=hunter2");
         assert_eq!(
             full.spec.health.command.as_deref().unwrap()[1],
             "--token=t0k3n"
         );
 
-        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None);
+        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None, None);
         let r = REDACTED_ARG.to_owned();
         assert_eq!(shown.spec.command, [REDACTED_ARG; 4]);
         assert_eq!(shown.spec.health.command, Some(vec![r.clone(), r]));
@@ -696,7 +701,7 @@ mod tests {
             let mut spec = spec();
             spec.command = vec![secret.into(), "x".into()];
             spec.health.command = Some(vec![secret.into()]);
-            let shown = show_response(Access::Redacted, name(), spec, None, None);
+            let shown = show_response(Access::Redacted, name(), spec, None, None, None);
             assert_eq!(shown.spec.command, [REDACTED_ARG, REDACTED_ARG]);
             assert_eq!(shown.spec.health.command, Some(vec![REDACTED_ARG.into()]));
             assert!(!format!("{shown:?}").contains(secret), "{secret}");
@@ -705,9 +710,9 @@ mod tests {
 
     #[test]
     fn redaction_strips_the_probe_query_and_keeps_the_path() {
-        let full = show_response(Access::Full, name(), leaky_spec(), None, None);
+        let full = show_response(Access::Full, name(), leaky_spec(), None, None, None);
         assert_eq!(full.spec.health.http.unwrap().path, "/ready?key=s3cret");
-        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None);
+        let shown = show_response(Access::Redacted, name(), leaky_spec(), None, None, None);
         let http = shown.spec.health.http.unwrap();
         assert_eq!(http.path, "/ready");
         assert_eq!(http.expect_status, 200);
@@ -733,9 +738,9 @@ mod tests {
             expect_status: 204,
             timeout_secs: 3,
         });
-        let full = show_response(Access::Full, name(), spec.clone(), None, None);
+        let full = show_response(Access::Full, name(), spec.clone(), None, None, None);
         assert_eq!(full.spec.health.http.unwrap().path, "/hooks/t0k3n/ready");
-        let http = show_response(Access::Redacted, name(), spec, None, None)
+        let http = show_response(Access::Redacted, name(), spec, None, None, None)
             .spec
             .health
             .http
@@ -810,7 +815,7 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
 "#,
         )
         .expect("spec");
-        let full = show_response(Access::Full, name(), spec.clone(), None, None);
+        let full = show_response(Access::Full, name(), spec.clone(), None, None, None);
         assert_eq!(full.spec, spec);
         assert!(!full.redacted);
         let json = serde_json::to_value(&full).unwrap();
@@ -824,7 +829,14 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             }),
             ..Default::default()
         };
-        let shown = show_response(Access::Redacted, name(), spec.clone(), Some(&state), None);
+        let shown = show_response(
+            Access::Redacted,
+            name(),
+            spec.clone(),
+            Some(&state),
+            None,
+            None,
+        );
         assert!(shown.redacted);
         assert_eq!(serde_json::to_value(&shown).unwrap()["redacted"], true);
         // Everything the policy does not touch equals the stored spec; the rest is spelled out.
@@ -860,7 +872,7 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
 "#,
         )
         .expect("spec");
-        let shown = show_response(Access::Redacted, name(), spec, None, None);
+        let shown = show_response(Access::Redacted, name(), spec, None, None, None);
         assert_eq!(
             shown.spec.oidc.unwrap().allowed_groups,
             ["viewers", "admins"]
@@ -878,9 +890,9 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             }),
             ..Default::default()
         };
-        let full = show_response(Access::Full, name(), spec(), Some(&state), None);
+        let full = show_response(Access::Full, name(), spec(), Some(&state), None, None);
         assert!(full.state.failed.unwrap().reason.contains("hunter2"));
-        let shown = show_response(Access::Redacted, name(), spec(), Some(&state), None);
+        let shown = show_response(Access::Redacted, name(), spec(), Some(&state), None, None);
         let failed = shown.state.failed.unwrap();
         assert_eq!(failed.digest, digest);
         assert_eq!(failed.reason, REDACTED_REASON);
@@ -889,25 +901,25 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             ..Default::default()
         };
         assert!(
-            show_response(Access::Full, name(), spec(), Some(&hashed), None)
+            show_response(Access::Full, name(), spec(), Some(&hashed), None, None)
                 .state
                 .spec_hash
                 .is_some()
         );
         assert!(
-            show_response(Access::Redacted, name(), spec(), Some(&hashed), None)
+            show_response(Access::Redacted, name(), spec(), Some(&hashed), None, None)
                 .state
                 .spec_hash
                 .is_none()
         );
         // No failure, nothing invented.
-        let none = show_response(Access::Redacted, name(), spec(), None, None);
+        let none = show_response(Access::Redacted, name(), spec(), None, None, None);
         assert!(none.state.failed.is_none());
     }
 
     #[test]
     fn runtime_detail_comes_from_the_container() {
-        let none = show_response(Access::Full, name(), spec(), None, None);
+        let none = show_response(Access::Full, name(), spec(), None, None, None);
         assert_eq!(
             (none.restarts, none.health, none.started_at),
             (None, None, None)
@@ -932,7 +944,7 @@ client_secret = { kind = "env", var = "OIDC_SECRET" }
             conmon_pid: None,
             log_driver: None,
         };
-        let shown = show_response(Access::Full, name(), spec(), None, Some(&container));
+        let shown = show_response(Access::Full, name(), spec(), None, Some(&container), None);
         assert_eq!(shown.restarts, Some(2));
         assert_eq!(shown.health, Some(ContainerHealth::Starting));
         assert_eq!(shown.started_at.as_deref(), Some("2026-10-29T08:15:30Z"));
