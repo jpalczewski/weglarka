@@ -6,9 +6,10 @@
 #   test-forward-auth.sh <nginx-conf>
 #
 # The config comes from `cargo run -p weglarka-ingress --example dump -- nginx-forward 127.0.0.11 172.16.0.0/12`:
-# `panel.example.eu` is protected with `/mcp/` exempt, `open.example.eu` has no auth, both are whoami
-# upstreams on port 3000; the issuer is https://auth.example.eu. The published port's peer is the Docker
-# bridge, which the config trusts, so `X-Forwarded-Proto: https` is honoured like behind Traefik.
+# `panel.example.eu` is protected with `/health` exempt and `/mcp` an OAuth-protected resource (#215,
+# ADR 0078), `open.example.eu` has no auth and `/v1/rpc` as a resource, both are whoami upstreams on port
+# 3000; the issuer is https://auth.example.eu. The published port's peer is the Docker bridge, which the
+# config trusts, so `X-Forwarded-Proto: https` is honoured like behind Traefik.
 set -euo pipefail
 
 conf=$1
@@ -132,18 +133,26 @@ expect 'session' "$out" 'X-Forwarded-For: 203.0.113.9'
 expect 'session' "$out" 'X-Real-Ip: 203.0.113.9'
 expect 'session' "$out" 'Host: panel.example.eu'
 
-# Exempt paths: no `auth_request` (200 without a session), the exact path and everything below, and still
-# no identity header a client could inject. The sibling `/mcpx` is not exempt.
+# The panel's OAuth-protected resource `/mcp` (#215, ADR 0078): no `auth_request` (200 without a session,
+# the app checks the bearer token itself), the exact path and everything below, no redirect between
+# `/mcp` and `/mcp/` (an MCP client treats one as a hard failure), no authz subrequest, and still no
+# identity header a client could inject. The sibling `/mcpx` is not the resource.
+before=$(docker logs wg-auth-idp 2>&1 | grep -c '^AUTHZ' || true)
 for path in /mcp /mcp/ /mcp/tools/list; do
   out=$(call panel.example.eu "$path" "${forged[@]}")
-  expect "exempt $path" "$(status_line "$out")" '200 '
-  reject "exempt $path" "$out" 'Remote-'
-  expect "exempt $path" "$out" 'X-Forwarded-Proto: https'
-  expect "exempt $path" "$out" 'X-Forwarded-For: 203.0.113.9'
+  expect "resource $path" "$(status_line "$out")" '200 '
+  reject "resource $path" "$(status_line "$out")" '30'
+  reject "resource $path" "$out" 'Remote-'
+  reject "resource $path" "$out" 'Mallory'
+  expect "resource $path" "$out" 'X-Forwarded-Proto: https'
+  expect "resource $path" "$out" 'X-Forwarded-For: 203.0.113.9'
 done
-# An upstream may read `;` or `\` as path syntax (`/mcp/..;/admin`) while nginx matched the exempt prefix.
+after=$(docker logs wg-auth-idp 2>&1 | grep -c '^AUTHZ' || true)
+if [ "$before" = "$after" ]; then echo "ok   resource: the provider was not asked"; else echo "FAIL resource: provider asked"; fail=1; fi
+# An upstream may read `;` or `\` as path syntax (`/mcp/..;/admin`) while nginx matched the resource
+# location: the same raw-URI guard as an exempt path refuses it.
 for path in '/mcp/..;/admin' '/mcp/%3b/x' '/mcp/%5cx' '/mcp/%252e%252e/admin'; do
-  expect "exempt $path refused" "$(status_line "$(call panel.example.eu "$path")")" '400 '
+  expect "resource $path refused" "$(status_line "$(call panel.example.eu "$path")")" '400 '
 done
 # Protected locations: the provider judges the raw URI while nginx routes on the normalized path, so dot-segments
 # and encoded dots/slashes are refused before any authz request (curl must not normalize them away).
@@ -154,13 +163,46 @@ done
 expect 'protected, dotted name' "$(status_line "$(call panel.example.eu '/a.b/c..d' --path-as-is)")" '302 '
 expect 'protected, query with dots' "$(status_line "$(call panel.example.eu '/a?next=../b' --path-as-is)")" '302 '
 # The guard looks at the path only: a query string with `%25` or `;` is an ordinary OAuth/MCP request.
-expect 'exempt, query with %25' "$(status_line "$(call panel.example.eu '/mcp/x?a=100%25&b=c;d')")" '200 '
+expect 'resource, query with %25' "$(status_line "$(call panel.example.eu '/mcp/x?a=100%25&b=c;d')")" '200 '
 out=$(call panel.example.eu /mcpx)
-expect 'sibling of an exempt path' "$(status_line "$out")" '302 '
+expect 'sibling of a resource path' "$(status_line "$out")" '302 '
 
 # A body-carrying request is guarded like a GET: no session, no upstream.
 expect 'POST, no session' "$(status_line "$(call panel.example.eu /api -X POST -d x=1)")" '302 '
-expect 'POST, exempt' "$(status_line "$(call panel.example.eu /mcp/x -X POST -d x=1)")" '200 '
+expect 'POST, resource' "$(status_line "$(call panel.example.eu /mcp/x -X POST -d x=1)")" '200 '
+
+# An ordinary `auth_exempt_paths` entry still works next to a resource (#215, ADR 0078).
+out=$(call panel.example.eu /health "${forged[@]}")
+expect 'exempt' "$(status_line "$out")" '200 '
+reject 'exempt' "$out" 'Remote-'
+
+# The discovery documents of a resource (#215, ADR 0078) need no session either.
+# The metadata (RFC 9728) names the app's own origin — never a byte the client sent — and the issuer.
+metadata=$(call panel.example.eu /.well-known/oauth-protected-resource/mcp)
+expect 'metadata status' "$(status_line "$metadata")" '200 '
+body=$(head -n -1 <<<"$metadata")
+expected='{"resource":"https://panel.example.eu/mcp","authorization_servers":["https://auth.example.eu"],"bearer_methods_supported":["header"]}'
+if [ "$body" = "$expected" ]; then echo "ok   metadata: exact body"; else echo "FAIL metadata: body $body"; fail=1; fi
+# The same document on the app that has no forward auth, and its own origin.
+out=$(call open.example.eu /.well-known/oauth-protected-resource/v1/rpc)
+expect 'metadata, no forward auth' "$(status_line "$out")" '200 '
+expect 'metadata, no forward auth' "$out" '"resource":"https://open.example.eu/v1/rpc"'
+# A preflight needs no session either.
+expect 'metadata OPTIONS' "$(status_line "$(call panel.example.eu /.well-known/oauth-protected-resource/mcp -X OPTIONS)")" '204 '
+# A `Host` the map does not know gets no document about somebody else's resource: the metadata
+# location itself answers a 404 for an empty origin, and a host no `server` serves never reaches it
+# (nginx's default server closes the connection, ADR 0005/0036), so either way nothing is served.
+unknown=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: unknown.example.eu' \
+  "http://127.0.0.1:18096/.well-known/oauth-protected-resource/mcp" 2>&1 || true)
+if grep -qE '^(000|444)$|444' <<<"$unknown"; then
+  echo "ok   metadata, unknown Host: no document"
+else
+  echo "FAIL metadata, unknown Host: $unknown"; fail=1
+fi
+# A legacy client asks the app host for the authorization server discovery: a redirect to the issuer.
+expect 'authorization server discovery' \
+  "$(status_line "$(call panel.example.eu /.well-known/oauth-authorization-server)")" \
+  '302 https://auth.example.eu/.well-known/oauth-authorization-server'
 
 # An app without forward auth never asks and never passes an injected identity on.
 out=$(call open.example.eu / "${forged[@]}")
@@ -185,7 +227,7 @@ reject 'probe socket' "$probe" 'Remote-'
 after=$(docker logs wg-auth-idp 2>&1 | grep -c '^AUTHZ' || true)
 if [ "$before" = "$after" ]; then echo "ok   probe socket: the provider was not asked"; else echo "FAIL probe socket: provider asked"; fail=1; fi
 
-# Fail closed: no provider, no access (500), while exempt paths and unprotected apps keep working.
+# Fail closed: no provider, no access (500), while the resource paths and unprotected apps keep working.
 docker rm -f wg-auth-idp >/dev/null
 out=$(call panel.example.eu / -H 'Cookie: session=alice')
 expect 'provider down' "$(status_line "$out")" '500 '

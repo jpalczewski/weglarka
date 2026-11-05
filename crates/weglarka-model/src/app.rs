@@ -876,8 +876,7 @@ pub struct AppIngress {
     /// OAuth-protected resources (#215, ADR 0078): paths (public URL space, `paths` syntax) whose
     /// tokens the app checks itself, e.g. `["/mcp"]`. Each entry gets a location without
     /// `auth_request` and generated discovery documents (RFC 9728) at the host root. Ingress-only,
-    /// like the rest of `AppIngress`. Not enabled yet: a non-empty list is rejected by validation
-    /// until the ingress side renders it.
+    /// like the rest of `AppIngress`; needs `[identity]` and `kind = "container"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth_resources: Vec<String>,
     /// Per-site rendering options (#104, ADR 0069), only for `kind = "static"`. `static` is a Rust

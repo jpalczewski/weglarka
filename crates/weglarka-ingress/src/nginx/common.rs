@@ -311,6 +311,42 @@ pub(super) fn write_auth_maps(c: &mut Conf, plan: &Plan<'_>) {
     c.blank();
 }
 
+/// `http {}` pieces of OAuth-protected resources (#215, ADR 0078): one `map $host` from every domain that
+/// serves a resource to the literal `https://<domain>` origin, so the generated metadata document never
+/// contains a byte the client sent; a `Host` outside the map has no origin, and the metadata location
+/// refuses an empty one with `404` (a `Host` no `server` serves never gets that far — the default server
+/// answers `444`, ADR 0005/0036). Emitted only when some active app declares resources, so a config
+/// without them is byte for byte unchanged. Both modes and both entrypoints call this, so there is one
+/// rendering of the map.
+pub(super) fn write_oauth_maps(c: &mut Conf, plan: &Plan<'_>) {
+    let domains = plan.oauth_domains();
+    if domains.is_empty() {
+        return;
+    }
+    c.line(
+        "# OAuth-protected resources (#215, ADR 0078): the origin each resource's metadata names.",
+    );
+    c.block("map $host $wg_oauth_origin", |c| {
+        for domain in domains {
+            assert_no_escaping_needed(domain.as_str());
+            c.line(&format!("{domain} \"https://{domain}\";"));
+        }
+        c.line("default \"\";");
+    });
+    c.blank();
+}
+
+/// A domain, a resource path and the issuer land verbatim in an nginx string and in a JSON document, so
+/// the generator asserts that they need no escaping instead of escaping them (ADR 0078): they are already
+/// restricted upstream to `[a-z0-9.-]` (`check_domain`), `paths` syntax (`check_path_prefix`) and
+/// `check_issuer`.
+pub(super) fn assert_no_escaping_needed(value: &str) {
+    debug_assert!(
+        !value.contains(['\'', '"', '\\', '$']) && !value.chars().any(char::is_whitespace),
+        "{value:?} would need escaping in a generated document (ADR 0078)"
+    );
+}
+
 /// The `auth_request` of a protected location and what it reads from the answer. A 401 goes to the
 /// provider's login (its `Location`, else the portal); 403 and a failed subrequest (500) stay errors.
 pub(super) fn write_auth_request(c: &mut Conf) {

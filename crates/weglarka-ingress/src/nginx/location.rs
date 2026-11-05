@@ -7,11 +7,15 @@ use weglarka_model::app::{
 
 use super::NginxOptions;
 use super::common::{
-    AuthVars, Forwarded, set_app, write_auth_request, write_authz_location, write_proxy_headers,
+    AuthVars, Forwarded, assert_no_escaping_needed, set_app, write_auth_request,
+    write_authz_location, write_proxy_headers,
 };
 use super::conf::Conf;
 use super::security;
-use crate::plan::{AppRoute, ExemptPath, PathPrefix, Plan, RouteBackend};
+use crate::plan::{
+    AppRoute, ExemptPath, OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_PROTECTED_RESOURCE_PREFIX,
+    PathPrefix, Plan, RouteBackend,
+};
 
 /// Where nginx sends traffic: a container (`proxy_pass`) or a static site's directory (ADR 0049).
 enum Backend<'a> {
@@ -185,6 +189,68 @@ fn relay_locations(app: Option<&str>) -> Vec<Location<'_>> {
         relay: true,
     })
     .collect()
+}
+
+/// `oauth_resources` (#215, ADR 0078): for each `/p` the exact path and everything below it, rendered with
+/// the long-lived stream directives and **without** `auth_request` — the app checks the tokens itself. In a
+/// forward app they also carry the `;`/`\\`/`%25` guard of an exempt path: nginx routes on the normalized
+/// path while the upstream gets the raw URI, so `/mcp/..;/admin` must not slip into a guarded location.
+/// A resource path is a public path, so this does not depend on the app's `paths`.
+fn oauth_locations<'a>(
+    route: &AppRoute<'_>,
+    app: Option<&'a str>,
+) -> impl Iterator<Item = Location<'a>> {
+    let exempt = route.forward_auth();
+    route.oauth_resources.iter().flat_map(move |p| {
+        [format!("location = {p}"), format!("location ^~ {p}/")]
+            .into_iter()
+            .map(move |header| Location {
+                header,
+                strip: None,
+                app,
+                long_lived: true,
+                auth: false,
+                exempt,
+                relay: false,
+            })
+    })
+}
+
+/// The protected resource metadata of `/p` (RFC 9728, #215, ADR 0078), rendered once per server. The
+/// document names `$wg_oauth_origin` (an http-level `map $host`, see [`write_oauth_maps`]) instead of
+/// `$host`, so a client cannot put a byte of its own request into it; a `Host` without an origin in the
+/// map gets `404` instead of a document about somebody else's resource. The scheme is always `https`, in
+/// `behind` too: TLS ends at the edge either way.
+fn write_oauth_metadata(c: &mut Conf, resource: &PathPrefix, issuer: &str) {
+    let path = format!("{OAUTH_PROTECTED_RESOURCE_PREFIX}{resource}");
+    assert_no_escaping_needed(&path);
+    assert_no_escaping_needed(issuer);
+    c.block(&format!("location = {path}"), |c| {
+        c.line("if ($wg_oauth_origin = \"\") { return 404; }");
+        c.line("default_type application/json;");
+        c.line("add_header Cache-Control \"public, max-age=300\" always;");
+        c.line("add_header Access-Control-Allow-Origin \"*\" always;");
+        c.line("add_header Access-Control-Allow-Methods \"GET, OPTIONS\" always;");
+        c.line("add_header Access-Control-Allow-Headers \"*\" always;");
+        c.line("if ($request_method = OPTIONS) { return 204; }");
+        c.line(&format!(
+            "return 200 '{{\"resource\":\"$wg_oauth_origin{resource}\",\"authorization_servers\":[\"{issuer}\"],\"bearer_methods_supported\":[\"header\"]}}';"
+        ));
+    });
+}
+
+/// The legacy authorization server discovery of a server that serves at least one resource (#215, ADR
+/// 0078): a redirect to the issuer, never a proxy — the app host does not relay the provider's document,
+/// so this needs no second upstream and no `Host`/`X-Forwarded-*` rewriting.
+fn write_oauth_authorization_server(c: &mut Conf, issuer: &str) {
+    c.block(
+        &format!("location = {OAUTH_AUTHORIZATION_SERVER_PATH}"),
+        |c| {
+            c.line(&format!(
+                "return 302 {issuer}{OAUTH_AUTHORIZATION_SERVER_PATH};"
+            ));
+        },
+    );
 }
 
 impl Backend<'_> {
@@ -631,4 +697,49 @@ pub(super) fn write_app_locations(
         let name = shared.then(|| app.instance.as_str());
         write_redirects(c, opts, name);
     }
+    write_oauth_server(c, plan, forwarded, apps, shared);
+}
+
+/// OAuth-protected resources of a `server` (#215, ADR 0078): first the app's own locations for each `/p`
+/// (a resource is a public path, so this is once per app, not once per `(path, app)` pair), then the
+/// generated discovery documents — one metadata location per resource and the legacy authorization
+/// server redirect once, both naming the provider's issuer. Renders nothing for a server without
+/// resources, so such a config stays byte for byte as before.
+fn write_oauth_server(
+    c: &mut Conf,
+    plan: &Plan<'_>,
+    forwarded: &Forwarded,
+    apps: &[&AppRoute<'_>],
+    shared: bool,
+) {
+    let Some(identity) = plan.oauth_resources() else {
+        return;
+    };
+    let serving: Vec<&AppRoute<'_>> = apps
+        .iter()
+        .copied()
+        .filter(|app| app.has_oauth_resources())
+        .collect();
+    if serving.is_empty() {
+        return;
+    }
+    for app in &serving {
+        let name = shared.then(|| app.instance.as_str());
+        for location in oauth_locations(app, name) {
+            let backend = match &app.backend {
+                RouteBackend::Upstream { port } => Backend::Container {
+                    host: app.instance.as_str(),
+                    port: *port,
+                },
+                RouteBackend::Directory { root } => Backend::Directory { root },
+            };
+            backend.write_location(c, &location, &app.ingress, app.instance, forwarded, "");
+        }
+    }
+    for app in &serving {
+        for resource in &app.oauth_resources {
+            write_oauth_metadata(c, resource, &identity.issuer);
+        }
+    }
+    write_oauth_authorization_server(c, &identity.issuer);
 }

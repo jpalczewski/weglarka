@@ -976,10 +976,7 @@ fn validate_oauth_resources(name: &InstanceName, spec: &AppSpec) -> Result<(), S
             }
         }
     }
-    // Gate (ADR 0078): lifted by the ingress PR of #215.
-    Err(format!(
-        "{name}: ingress.oauth_resources is not enabled in this release"
-    ))
+    Ok(())
 }
 
 /// Hardening values end up in the container spec verbatim, so they are checked strictly.
@@ -1591,9 +1588,9 @@ mod tests {
         }
     }
 
-    /// #215, ADR 0078: the lexical rules of `ingress.oauth_resources`, and the gate that refuses any
-    /// non-empty list until the ingress PR renders it. Every accepted case stops at the gate, so a
-    /// lexical error is distinguishable from "not enabled yet".
+    /// #215, ADR 0078: the lexical rules of `ingress.oauth_resources`. The ingress plan does the
+    /// host-aware checks (identity, overlaps, the well-known claims), so every accepted case here
+    /// passes validation.
     #[test]
     fn oauth_resources_are_validated() {
         let check = |extra: &str| -> Result<(), String> {
@@ -1603,18 +1600,14 @@ mod tests {
             .unwrap();
             validate_app(&name("a"), &spec)
         };
-        // Lexically fine: the only complaint left is the gate.
+        // Lexically fine.
         let sixteen: Vec<String> = (0..16).map(|i| format!("/r{i}")).collect();
         for extra in [
             "ingress = { oauth_resources = [\"/mcp\"] }".to_owned(),
             "ingress = { oauth_resources = [\"/mcp\", \"/mcpx\", \"/a/b-c_d.e\"] }".to_owned(),
             format!("ingress = {{ oauth_resources = {sixteen:?} }}"),
         ] {
-            let err = check(&extra).unwrap_err();
-            assert!(
-                err.contains("ingress.oauth_resources is not enabled in this release"),
-                "{extra}: {err}"
-            );
+            assert_eq!(check(&extra), Ok(()), "{extra}");
         }
         let seventeen: Vec<String> = (0..17).map(|i| format!("/r{i}")).collect();
         let long = format!("/{}", "a".repeat(200));
