@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.1...weglarka-cli-v0.1.2) - 2026-11-05
+
+### Added
+
+- *(engine)* roll a static site back to its previous release ([#543](https://github.com/jpalczewski/weglarka/pull/543))
+- *(engine)* internal_hosts maps served domains to Podman's host-gateway ([#532](https://github.com/jpalczewski/weglarka/pull/532))
+- *(cli)* list image reservations and reclaim stale ones at startup ([#531](https://github.com/jpalczewski/weglarka/pull/531))
+- *(ingress)* retain ingress logs for a configurable number of days
+- static sites — per-site rendering options ([#104](https://github.com/jpalczewski/weglarka/pull/104)) ([#500](https://github.com/jpalczewski/weglarka/pull/500))
+- *(cli)* weglarka login --browser ([#496](https://github.com/jpalczewski/weglarka/pull/496))
+- *(cli)* discover the issuer and audience from the host ([#495](https://github.com/jpalczewski/weglarka/pull/495))
+- *(engine)* add image provenance and retention ([#471](https://github.com/jpalczewski/weglarka/pull/471))
+
+### Fixed
+
+- *(oidc)* treat a rate-limited token request as transient ([#448](https://github.com/jpalczewski/weglarka/pull/448))
+- *(cli)* keep polling the device grant through rate limiting ([#438](https://github.com/jpalczewski/weglarka/pull/438))
+
 ## [0.1.1](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.0...weglarka-cli-v0.1.1) - 2026-10-31
 
 ### Added

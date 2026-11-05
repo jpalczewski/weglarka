@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-registry-v0.0.3...weglarka-registry-v0.0.4) - 2026-11-05
+
+### Added
+
+- *(release)* publish signed per-channel release sets ([#466](https://github.com/jpalczewski/weglarka/pull/466))
+- *(platform)* add platform update v1 shared contracts and parser ([#465](https://github.com/jpalczewski/weglarka/pull/465))
+
+### Fixed
+
+- *(registry)* treat a missing signature tag as not found ([#506](https://github.com/jpalczewski/weglarka/pull/506))
+
+### Other
+
+- *(registry)* one contract suite for the registry adapters ([#525](https://github.com/jpalczewski/weglarka/pull/525))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-registry-v0.0.2...weglarka-registry-v0.0.3) - 2026-10-29
 
 ### Other

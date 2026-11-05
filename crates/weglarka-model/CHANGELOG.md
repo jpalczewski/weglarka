@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.6...weglarka-model-v0.0.7) - 2026-11-05
+
+### Added
+
+- *(engine)* site release store, configurable extraction limits and sites doctor checks ([#541](https://github.com/jpalczewski/weglarka/pull/541))
+- *(engine)* internal_hosts maps served domains to Podman's host-gateway ([#532](https://github.com/jpalczewski/weglarka/pull/532))
+- *(daemon)* report containers whose conmon died ([#537](https://github.com/jpalczewski/weglarka/pull/537))
+- *(ingress)* retain ingress logs for a configurable number of days
+- static sites — per-site rendering options ([#104](https://github.com/jpalczewski/weglarka/pull/104)) ([#500](https://github.com/jpalczewski/weglarka/pull/500))
+- *(cli)* weglarka login --browser ([#496](https://github.com/jpalczewski/weglarka/pull/496))
+- *(cli)* discover the issuer and audience from the host ([#495](https://github.com/jpalczewski/weglarka/pull/495))
+- *(engine)* add image provenance and retention ([#471](https://github.com/jpalczewski/weglarka/pull/471))
+- *(platform)* add platform update v1 shared contracts and parser ([#465](https://github.com/jpalczewski/weglarka/pull/465))
+- *(identity)* gate an OIDC client on groups through Authelia authorization policies ([#456](https://github.com/jpalczewski/weglarka/pull/456))
+
+### Fixed
+
+- *(daemon)* record and report a switcher stopped by a newer state schema ([#536](https://github.com/jpalczewski/weglarka/pull/536))
+- *(daemon)* detect a user manager that misses a newly added group ([#538](https://github.com/jpalczewski/weglarka/pull/538))
+
+### Other
+
+- *(podman)* one contract suite for LibpodClient and FakePodman ([#524](https://github.com/jpalczewski/weglarka/pull/524))
+- *(launcher)* skip rehashing unchanged generation binaries ([#513](https://github.com/jpalczewski/weglarka/pull/513))
+- *(model)* bounded state-file serialization and batched inventory writes ([#507](https://github.com/jpalczewski/weglarka/pull/507))
+
 ## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-model-v0.0.5...weglarka-model-v0.0.6) - 2026-10-31
 
 ### Added

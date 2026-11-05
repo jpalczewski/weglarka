@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/v0.0.7...v0.0.8) - 2026-11-05
+
+### Added
+
+- *(engine)* roll a static site back to its previous release ([#543](https://github.com/jpalczewski/weglarka/pull/543))
+- *(engine)* site release store, configurable extraction limits and sites doctor checks ([#541](https://github.com/jpalczewski/weglarka/pull/541))
+- *(engine)* internal_hosts maps served domains to Podman's host-gateway ([#532](https://github.com/jpalczewski/weglarka/pull/532))
+- *(daemon)* report containers whose conmon died ([#537](https://github.com/jpalczewski/weglarka/pull/537))
+- *(cli)* list image reservations and reclaim stale ones at startup ([#531](https://github.com/jpalczewski/weglarka/pull/531))
+- *(ingress)* retain ingress logs for a configurable number of days
+- static sites — per-site rendering options ([#104](https://github.com/jpalczewski/weglarka/pull/104)) ([#500](https://github.com/jpalczewski/weglarka/pull/500))
+- *(platform)* add host launcher and systemd/OpenRC adapters ([#467](https://github.com/jpalczewski/weglarka/pull/467))
+- *(engine)* add image provenance and retention ([#471](https://github.com/jpalczewski/weglarka/pull/471))
+- *(identity)* gate an OIDC client on groups through Authelia authorization policies ([#456](https://github.com/jpalczewski/weglarka/pull/456))
+
+### Fixed
+
+- *(engine)* roll back to a release on disk without the image or the registry ([#542](https://github.com/jpalczewski/weglarka/pull/542))
+- *(daemon)* record and report a switcher stopped by a newer state schema ([#536](https://github.com/jpalczewski/weglarka/pull/536))
+- *(daemon)* detect a user manager that misses a newly added group ([#538](https://github.com/jpalczewski/weglarka/pull/538))
+- *(engine)* image retention fails closed on provenance errors ([#528](https://github.com/jpalczewski/weglarka/pull/528))
+- *(daemon)* self-update treats a missing signature tag as unsigned ([#527](https://github.com/jpalczewski/weglarka/pull/527))
+- *(platform)* OpenRC downgrade and remove clean up the init script and the cron block ([#505](https://github.com/jpalczewski/weglarka/pull/505))
+- *(ingress)* close log-retention review gaps
+
+### Other
+
+- *(daemon)* pin the log date marker in the retention prune test ([#533](https://github.com/jpalczewski/weglarka/pull/533))
+- *(platform)* OpenRC activation starts from a previous-epoch container ([#523](https://github.com/jpalczewski/weglarka/pull/523))
+- *(daemon)* split platform bootstrap into a side-effect-free plan and an apply step ([#519](https://github.com/jpalczewski/weglarka/pull/519))
+- *(platform)* one podman inspect shared by the launcher, systemd and OpenRC ([#510](https://github.com/jpalczewski/weglarka/pull/510))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/v0.0.6...v0.0.7) - 2026-10-31
 
 ### Added
