@@ -125,6 +125,9 @@ where
     P: PodmanClient,
     Pl: Platform,
 {
+    // Issue #191: independent of `[self_update]` (the timer is installed regardless) and never fatal —
+    // a failed bookkeeping write must not take the fallback decision down with it.
+    record_user_groups(settings, now);
     let Some(config) = settings.host.self_update.as_ref() else {
         return Ok(WatchReport::Disabled);
     };
@@ -201,6 +204,70 @@ fn status_is_ok(response: &[u8]) -> bool {
         .split_whitespace()
         .nth(1)
         .is_some_and(|code| code == "200")
+}
+
+/// Records the supplementary groups the runtime user is in according to `/etc/group` but that the user
+/// manager's credentials lack (issue #191, `weglarka_model::user_groups`).
+///
+/// This runs on the host, from the user timer, so `/etc/passwd`, `/etc/group` and `/proc/self/status`
+/// are the real thing; the daemon container is `scratch` and cannot see any of them. It returns the
+/// finding it recorded (or found recorded), `None` when the host cannot answer the question.
+pub fn record_user_groups(settings: &Settings, now: SystemTime) -> Option<UserGroupsState> {
+    let state = inspect_host_files(&settings.host.runtime.user, now)?;
+    match persist(&settings.paths.state_dir, &state) {
+        Ok(false) => {}
+        Ok(true) if state.is_stale() => tracing::warn!(
+            user = %state.user,
+            uid = state.uid,
+            missing = %state.names().join(","),
+            "the user manager does not hold every group of the runtime user; restart user@<uid>"
+        ),
+        Ok(true) => tracing::info!(
+            user = %state.user,
+            "the user manager holds every group of the runtime user"
+        ),
+        Err(e) => tracing::warn!(error = %e, "cannot record the user manager group check"),
+    }
+    Some(state)
+}
+
+/// Reads the three host files and hands them to the pure comparison.
+fn inspect_host_files(user: &str, now: SystemTime) -> Option<UserGroupsState> {
+    let read =
+        |path: &str| std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"));
+    let (passwd, group_file, status) =
+        match (read(PASSWD_FILE), read(GROUP_FILE), read(SELF_STATUS)) {
+            (Ok(passwd), Ok(group_file), Ok(status)) => (passwd, group_file, status),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                tracing::debug!(error = %e, "skipping the user manager group check");
+                return None;
+            }
+        };
+    user_groups::inspect(
+        &passwd,
+        &group_file,
+        &status,
+        user,
+        weglarka_model::self_update::secs(now),
+    )
+}
+
+/// Writes the finding only when it changed: the watchdog wakes every minute, and a fresh
+/// `checked_at` on every wake-up would make a standing warning look new. An unreadable file is
+/// replaced (bookkeeping, not state).
+fn persist(state_dir: &Path, next: &UserGroupsState) -> Result<bool, user_groups::UserGroupsError> {
+    let unchanged = matches!(
+        user_groups::load(state_dir),
+        Ok(Some(previous))
+            if previous.user == next.user
+                && previous.uid == next.uid
+                && previous.missing == next.missing
+    );
+    if unchanged {
+        return Ok(false);
+    }
+    user_groups::save(state_dir, next)?;
+    Ok(true)
 }
 
 #[cfg(test)]

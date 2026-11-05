@@ -44,15 +44,51 @@ group_add = ["systemd-journal"]
 ```
 
 ```sh
-sudo usermod -aG systemd-journal weglarka          # the runtime user must be a member
-systemctl --user -M weglarka@ restart podman.socket weglarka.service   # long-lived user services keep their old groups
+sudo usermod -aG systemd-journal weglarka            # the runtime user must be a member
+sudo systemctl restart user@<uid>                    # `id -u weglarka`; see below why this and not podman.service
 weglarka apps update alloy --group-add systemd-journal
 ```
 
+A restart of `podman.socket`/`podman.service` is **not** enough. Every unit of a user inherits its credentials from the
+systemd **user manager** (`systemd --user`), and that process keeps the groups it was started with: after `usermod -aG`
+a restarted `podman.service` still lacks the new group, and so does a `keep-groups` container (measured on rootless
+Podman 6.1.3). Only a restart of `user@<uid>` — or a reboot — gives the user manager, `podman.service` and the units
+the new credential set. A fresh login (`sudo -u weglarka id -G`) is not a proof either: PAM applies the new group
+there, not to the running user manager.
+
+Verify the credential set of the user manager itself:
+
+```sh
+getent group systemd-journal                                   # the gid the runtime user must hold
+grep Groups /proc/$(pgrep -u weglarka -x systemd)/status       # must list it
+```
+
+Restarting `user@<uid>` stops **every** container of that user, the Węglarka daemon included. Its own unit is enabled
+with the user manager, so it comes back on its own, and its next reconcile starts the app containers that are down
+(they are started, not recreated). Apps with `start = false` ([stopped apps](stopped-apps.md)) stay stopped.
+
 `group_add` makes the container keep **all** supplementary groups of the runtime user (crun `keep-groups`); the name
 list is a gate, not a selector. Keep the runtime user out of groups apps do not need. Inside the container the group
-shows as `nobody`, which is expected. A numeric gid does not work in a mapped user namespace, hence names only. The
-daemon image has no `/etc/group`, so `doctor` cannot verify the membership: check `id weglarka`.
+shows as `nobody`, which is expected. A numeric gid does not work in a mapped user namespace, hence names only.
+
+The daemon container has no `/etc/passwd`, `/etc/group` or user manager, so it cannot check this itself — and checking
+inside the container is misleading, because an unmapped supplementary gid shows up as the overflow gid there. Instead
+the host-side watchdog (`weglarka-daemon supervise`, the `weglarka-watchdog.timer` that `platform install` sets up)
+compares the groups `/etc/group` records for the runtime user with the credentials the user manager really holds, once
+a minute, and `weglarka doctor` reports `host_mounts.apps` as a warning (`user manager credentials are stale: restart
+user@<uid>`) while a `group_add` group is missing. It clears on its own after the restart.
+
+**Alternative without a new group.** If the files are only for one app and you would rather not change group
+membership, give the runtime user's **primary** group read access with a POSIX ACL: the primary group is already in
+every credential set, so no restart is needed.
+
+```sh
+sudo setfacl -R  -m g:$(id -gn weglarka):rX /var/log/journal   # existing files and directories
+sudo setfacl -dR -m g:$(id -gn weglarka):rX /var/log/journal   # default ACL for new (rotated) files
+```
+
+Re-apply the first command if the directory itself is replaced (a new mount, a fresh machine): an ACL lives on the
+inode, not on the path.
 
 Changing `host_mounts` or `group_add` of an app recreates its container; changing an allowlist alone recreates nothing.
 

@@ -17,6 +17,7 @@ use weglarka_model::shared_networks;
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
 use weglarka_model::units::human_bytes;
+use weglarka_model::user_groups::{MissingGroup, UserGroupsState};
 
 use crate::app::{Daemon, WEBHOOK_SECRET};
 use crate::app_view::Access;
@@ -936,6 +937,68 @@ fn host_mounts<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             ),
         )
     });
+    // Issue #191: `group_add` cannot be verified from the container (a private user namespace maps a
+    // missing supplementary gid to the overflow gid), so the host-side watchdog records what the user
+    // manager's credentials lack and this is only the report.
+    let finding = weglarka_model::user_groups::load(&d.paths.state_dir);
+    // Bookkeeping from the host: a missing or unreadable file is not a doctor finding (the next
+    // watchdog run rewrites it).
+    if let Ok(Some(finding)) = finding
+        && let Some(warning) = stale_user_manager(
+            &apps,
+            &finding,
+            weglarka_model::self_update::secs(std::time::SystemTime::now()),
+        )
+    {
+        out.push(warning);
+    }
+}
+
+/// Pure (issue #191): the `app: group` pairs whose `group_add` the user manager's credentials cannot
+/// satisfy yet, in `apps.toml` order.
+fn stale_group_add(apps: &AppsFile, missing: &[MissingGroup]) -> Vec<String> {
+    let mut affected = Vec::new();
+    for (name, spec) in &apps.apps {
+        for group in &spec.group_add {
+            if missing.iter().any(|entry| &entry.name == group) {
+                affected.push(format!("{name}: {group}"));
+            }
+        }
+    }
+    affected
+}
+
+/// The `host_mounts.apps` warning for a recorded stale user manager (issue #191), `None` when no app
+/// requests a group the credentials lack.
+///
+/// Units inherit their credentials from the user manager, so a group added with `usermod -aG` reaches
+/// `podman.service` and the containers only after `sudo systemctl restart user@<uid>` (measured on
+/// rootless Podman 6.1.3; restarting `podman.socket`/`podman.service` is not enough) or a reboot.
+fn stale_user_manager(apps: &AppsFile, finding: &UserGroupsState, now: u64) -> Option<DoctorCheck> {
+    let affected = stale_group_add(apps, &finding.missing);
+    if affected.is_empty() {
+        return None;
+    }
+    let age = now.saturating_sub(finding.checked_at);
+    Some(check(
+        "host_mounts.apps",
+        CheckStatus::Warn,
+        format!(
+            "user manager credentials are stale: restart user@{} — {} recorded in /etc/group for \
+             {} but not held by the user manager's processes (checked {age}s ago), so `group_add` \
+             cannot work: {}",
+            finding.uid,
+            finding.names().join(", "),
+            finding.user,
+            affected.join(", ")
+        ),
+        Some(&format!(
+            "`sudo systemctl restart user@{}` (it stops every container of the runtime user; they \
+             come back through the daemon's next reconcile) or reboot, then check `grep Groups \
+             /proc/$(pgrep -u {} -x systemd)/status`",
+            finding.uid, finding.user
+        )),
+    ))
 }
 
 fn configs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
@@ -2770,5 +2833,85 @@ mod access_tests {
         let mut checks = msg("plain".into());
         apply_access(Access::Redacted, &mut checks);
         assert_eq!(checks[0].message, "plain");
+    }
+}
+
+#[cfg(test)]
+mod host_groups {
+    use super::*;
+
+    /// Two apps, one of them asking for the journal group (issue #191).
+    const APPS: &str = r#"
+[apps.alloy]
+image = "ghcr.io/example/alloy:1"
+port = 12345
+group_add = ["systemd-journal"]
+
+[apps.web]
+image = "ghcr.io/example/web:1"
+port = 80
+"#;
+
+    fn finding(missing: &[(&str, u32)], checked_at: u64) -> UserGroupsState {
+        UserGroupsState {
+            user: "weglarka".to_owned(),
+            uid: 1001,
+            missing: missing
+                .iter()
+                .map(|(name, gid)| MissingGroup {
+                    name: (*name).to_owned(),
+                    gid: *gid,
+                })
+                .collect(),
+            checked_at,
+        }
+    }
+
+    #[test]
+    fn a_group_the_user_manager_lacks_is_a_warning_for_the_apps_that_ask_for_it() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let warning = stale_user_manager(
+            &apps,
+            &finding(&[("systemd-journal", 999)], 1_770_000_060),
+            1_770_000_120,
+        )
+        .expect("the app that requests the group is affected");
+        assert_eq!(warning.id, "host_mounts.apps");
+        assert_eq!(warning.status, CheckStatus::Warn);
+        assert!(
+            warning
+                .message
+                .starts_with("user manager credentials are stale: restart user@1001"),
+            "{}",
+            warning.message
+        );
+        // The warning names only the app that asks for the missing group.
+        assert!(warning.message.contains("alloy: systemd-journal"));
+        assert!(!warning.message.contains("web:"), "{}", warning.message);
+        insta::assert_json_snapshot!("stale_user_manager", warning);
+    }
+
+    #[test]
+    fn a_missing_group_no_app_requests_is_not_a_doctor_finding() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        assert!(
+            stale_user_manager(
+                &apps,
+                &finding(&[("docker", 998)], 1_770_000_000),
+                1_770_000_000
+            )
+            .is_none()
+        );
+        assert!(stale_user_manager(&apps, &finding(&[], 1_770_000_000), 1_770_000_000).is_none());
+    }
+
+    #[test]
+    fn only_the_groups_an_app_requests_are_reported() {
+        let apps: AppsFile = toml::from_str(APPS).unwrap();
+        let found = finding(&[("systemd-journal", 999), ("docker", 998)], 1_770_000_000);
+        assert_eq!(
+            stale_group_add(&apps, &found.missing),
+            vec!["alloy: systemd-journal".to_owned()]
+        );
     }
 }
