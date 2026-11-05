@@ -242,19 +242,19 @@ jobs:
           fi
 
   # The nginx end-to-end tests, in parallel with `check`: they need only the `dump` example (weglarka-model +
-  # weglarka-ingress) and Docker. The debug cache is `check`'s, restored read-only; the example is built once up
-  # front so the steps below (which call `cargo run`) only reuse it.
+  # weglarka-ingress) and Docker. Its dependency graph is a fraction of the workspace's, so the job has its own small
+  # debug cache (written on main) instead of restoring `check`'s; the example is built once up front so the steps
+  # below (which call `cargo run`) only reuse it.
   nginx-e2e:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      # Read-only restore of the cache `check` writes (same environment, so the same key).
       - uses: ./.github/actions/rust-debug-toolchain
         with:
-          shared-key: check
-          save-if: false
+          shared-key: nginx-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build -q -p weglarka-ingress --example dump
       # The generated nginx config must pass `nginx -t` on the image the daemon runs by default
       # (IngressConfig::default_nginx_image; docs/decisions/0006). Every config listens on the probe socket
@@ -345,10 +345,9 @@ jobs:
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/security-headers.conf"
           .github/scripts/test-security-headers.sh "$RUNNER_TEMP/security-headers.conf"
       # Forward auth (#89, docs/decisions/0052): both modes must pass `nginx -t` without the identity provider
-      # running (its upstream is a variable resolved per request), and in `behind` a stub provider drives every
-      # outcome of the `auth_request` contract — redirect, deny, identity headers, exempt paths, the probe
-      # socket and fail-closed behaviour.
-      - name: Forward auth through nginx
+      # running (its upstream is a variable resolved per request). The `behind` end-to-end test runs in the
+      # concurrent step below.
+      - name: Forward auth configs pass nginx -t
         run: |
           set -euo pipefail
           cargo run -q -p weglarka-ingress --example dump -- nginx-forward 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/forward.conf"
@@ -367,17 +366,21 @@ jobs:
           docker run --rm -i -v "$RUNNER_TEMP/forward-certs:/etc/nginx/tls:ro" -v "$RUNNER_TEMP/forward-run:/run/wg-ingress" \
             -v /run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka docker.io/library/nginx:1-alpine \
             sh -c 'cat > /tmp/n.conf && nginx -t -c /tmp/n.conf' < "$RUNNER_TEMP/edge-forward.conf"
-          .github/scripts/test-forward-auth.sh "$RUNNER_TEMP/forward.conf"
-      # The two long nginx end-to-end tests run concurrently: they share nothing (own Docker network,
+      # The three long nginx end-to-end tests run concurrently: they share nothing (own Docker network,
       # container names, host port and temp dir each), and each is dominated by an intentional wait.
+      #  - Forward auth (#89, docs/decisions/0052): in `behind` a stub provider drives every outcome of the
+      #    `auth_request` contract — redirect, deny, identity headers, exempt paths, the probe socket and
+      #    fail-closed behaviour.
       #  - Streaming responses (issue #64): with `ingress.streaming = true` an event written by the upstream
       #    reaches the client immediately and an idle stream survives the 60 s default read timeout; the same
       #    upstream without the option is held back by nginx (the negative control in the script).
       #  - Per-app request body limit (ADR 0033): 413 above the limit, success above the 64 MiB default, nothing
       #    spooled to the read-only ingress container's tmpfs, and a ~76 s upload survives the 60 s defaults.
-      - name: Streaming and request body limit through nginx (concurrent)
+      - name: Forward auth, streaming and request body limit through nginx (concurrent)
         run: |
           set -euo pipefail
+          .github/scripts/test-forward-auth.sh "$RUNNER_TEMP/forward.conf" > "$RUNNER_TEMP/forward-auth.log" 2>&1 &
+          auth_pid=$!
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/streaming.conf"
           cargo run -q -p weglarka-ingress --example dump -- nginx 127.0.0.11 172.16.0.0/12 > "$RUNNER_TEMP/body-size.conf"
           .github/scripts/test-streaming.sh "$RUNNER_TEMP/streaming.conf" > "$RUNNER_TEMP/streaming.log" 2>&1 &
@@ -385,8 +388,10 @@ jobs:
           .github/scripts/test-body-size.sh "$RUNNER_TEMP/body-size.conf" > "$RUNNER_TEMP/body-size.log" 2>&1 &
           body_pid=$!
           failed=0
+          if wait "$auth_pid"; then :; else failed=1; echo "::error::test-forward-auth.sh failed"; fi
           if wait "$stream_pid"; then :; else failed=1; echo "::error::test-streaming.sh failed"; fi
           if wait "$body_pid"; then :; else failed=1; echo "::error::test-body-size.sh failed"; fi
+          echo "::group::test-forward-auth.sh"; cat "$RUNNER_TEMP/forward-auth.log"; echo "::endgroup::"
           echo "::group::test-streaming.sh"; cat "$RUNNER_TEMP/streaming.log"; echo "::endgroup::"
           echo "::group::test-body-size.sh"; cat "$RUNNER_TEMP/body-size.log"; echo "::endgroup::"
           exit "$failed"
