@@ -7,7 +7,7 @@ mod tests {
     use weglarka_model::app::Resources;
     use weglarka_model::podman::*;
 
-    use crate::testing::FakePodman;
+    use crate::testing::{DEAD_CONMON_MESSAGE, FakePodman, StopFailure};
 
     fn spec(name: &str, image: &str) -> ContainerSpec {
         ContainerSpec {
@@ -84,6 +84,49 @@ mod tests {
             fake.healthcheck_run("app").await.unwrap(),
             HealthStatus::Healthy
         );
+    }
+
+    /// The scripted stop failures of a container whose conmon died (issue #470): the call answers
+    /// HTTP 500 and leaves the container `exited`, or a stop that failed with it still running.
+    #[tokio::test]
+    async fn a_dead_conmon_makes_stop_fail_and_leaves_the_container_exited() {
+        let fake = FakePodman::new();
+        let _: Vec<_> = fake.image_pull("ghcr.io/x/y:latest").collect().await;
+        fake.container_create(&spec("app", "ghcr.io/x/y:latest"))
+            .await
+            .unwrap();
+        fake.container_start("app").await.unwrap();
+
+        fake.script_next_stop_failure(StopFailure::DeadConmon);
+        let stopped = fake.container_stop("app", 10).await;
+        assert!(
+            matches!(
+                &stopped,
+                Err(PodmanError::Api {
+                    status: 500,
+                    message
+                }) if message == DEAD_CONMON_MESSAGE
+            ),
+            "{stopped:?}"
+        );
+        let info = fake.container_inspect("app").await.unwrap();
+        assert_eq!(
+            (info.state, info.exit_code),
+            (ContainerState::Exited, Some(-1))
+        );
+
+        fake.container_start("app").await.unwrap();
+        fake.script_next_stop_failure(StopFailure::LeftRunning);
+        assert!(fake.container_stop("app", 10).await.is_err());
+        let info = fake.container_inspect("app").await.unwrap();
+        assert_eq!(info.state, ContainerState::Running);
+
+        // A stop of a missing container is `NotFound`, scripted failure or not.
+        fake.script_next_stop_failure(StopFailure::DeadConmon);
+        assert!(matches!(
+            fake.container_stop("gone", 10).await,
+            Err(PodmanError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

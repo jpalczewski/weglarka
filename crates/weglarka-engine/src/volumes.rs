@@ -819,9 +819,9 @@ impl<P: PodmanClient> Reconciler<P> {
             .await
             .is_ok_and(|c| c.state == ContainerState::Running);
         if was_running {
-            self.podman
-                .container_stop(&app_container, self.options.stop_timeout_secs)
-                .await?;
+            // An import stops the app and starts it again below, so a stop that fails because the
+            // conmon already died must not abort it (issue #470).
+            self.stop_for_restart(&app_container).await?;
         }
         if replace {
             self.podman
@@ -973,7 +973,7 @@ mod tests {
 
     use super::*;
     use crate::reconcile::{Action, ActionOutcome, ReconcilerOptions, RecreateReason};
-    use crate::testing::{Call, FakePodman};
+    use crate::testing::{Call, FakePodman, StopFailure};
     use weglarka_model::app::Digest;
     use weglarka_model::podman::ContainerState;
     use weglarka_model::secret_store::SecretStore;
@@ -1521,6 +1521,21 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
             .import_volume(&name("szklana"), "data", ImportMode::Own, broken, WAIT)
             .await;
         assert!(err.is_err());
+        assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
+    }
+
+    /// A conmon that died under the running app does not abort the import: the stop error is
+    /// tolerated because the container is not running any more, the import runs and the app is
+    /// started again (issue #470).
+    #[tokio::test(start_paused = true)]
+    async fn import_survives_a_stop_of_a_container_whose_conmon_died() {
+        let e = env(APP);
+        e.rec.reconcile().await.unwrap();
+        e.fake.script_next_stop_failure(StopFailure::DeadConmon);
+        e.rec
+            .import_volume(&name("szklana"), "data", ImportMode::Own, tar(), WAIT)
+            .await
+            .unwrap();
         assert_eq!(e.fake.containers()[0].state, ContainerState::Running);
     }
 
