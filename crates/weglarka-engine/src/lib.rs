@@ -22,7 +22,7 @@ pub mod scraper;
 pub mod secrets;
 pub mod shared_networks;
 mod site_deploy;
-pub use site_deploy::RollbackReport;
+pub use site_deploy::{RollbackReport, check_release_files};
 pub mod sites;
 pub mod volumes;
 pub mod waiting;

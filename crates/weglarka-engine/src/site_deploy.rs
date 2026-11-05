@@ -22,6 +22,19 @@ use weglarka_model::state::{self, FailedDeploy, StateFile};
 /// Releases kept per site: the one being served and the previous one (retention 1, like images).
 const KEPT_RELEASES: usize = 2;
 
+/// The deploy-time file gate of a static site (ADR 0049, ADR 0069) — the one definition the deploy
+/// and the served-release pre-check of `apps update` (issue #501) share: `release_dir` must contain
+/// `index.html` and every release-relative file the spec's `ingress.static` options name, which
+/// today is only `not_found_page`. `cache_immutable_paths` and `feeds` also name release files, but
+/// they need no gate: a file that is not there is an ordinary 404, not a config nginx cannot serve.
+///
+/// The errors and their messages are the deploy gate's own ([`ReleaseError::MissingIndex`],
+/// [`ReleaseError::MissingFile`]); it is exactly what [`ReleaseGate::for_spec`] +
+/// [`ReleaseGate::check`] do, kept as one call so both callers cannot drift apart.
+pub fn check_release_files(spec: &AppSpec, release_dir: &Path) -> Result<(), ReleaseError> {
+    ReleaseGate::for_spec(spec).check(release_dir)
+}
+
 /// What `weglarka apps rollback` did (issue #103): the site now serves `to` instead of `from`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackReport {
@@ -63,6 +76,52 @@ impl<P: PodmanClient> Reconciler<P> {
         self.options.sites.as_ref().is_none_or(|sites| {
             SiteReleases::new(sites.root.join(instance.as_str()))
                 .serves(&release_id(digest), &ReleaseGate::for_spec(spec))
+        })
+    }
+
+    /// Checks the spec's release-file gate ([`check_release_files`]) against the release `instance`
+    /// serves **right now** (issue #501): an `apps update` that only changes `ingress.static`
+    /// deploys nothing, so without this the next nginx reload would reference a page of a release
+    /// that does not have it.
+    ///
+    /// The spec is the caller's — the update that is about to be persisted — because the check has to
+    /// run before anything is written. The served release is resolved like the rest of the site code:
+    /// the pin in `state.toml` says whether the site is deployed at all (nginx answers 503 for a site
+    /// whose state has no `current`), and the `current` symlink — nginx's own root — names the release
+    /// that is really served; doctor's `sites.current` reports it when the two disagree.
+    ///
+    /// `Ok` when there is nothing a reload could break: a `kind = "container"` spec, a daemon
+    /// without a sites root, a site that was never deployed, or a `current` link that is gone or
+    /// dangling (doctor reports that, and the next deploy's own gate covers it).
+    pub fn check_served_release(
+        &self,
+        instance: &InstanceName,
+        spec: &AppSpec,
+    ) -> Result<(), EngineError> {
+        if spec.kind != AppKind::Static {
+            return Ok(());
+        }
+        let Some(sites) = self.options.sites.as_ref() else {
+            return Ok(());
+        };
+        let st = state::load_state(&self.paths.state)?;
+        if st
+            .apps
+            .get(instance)
+            .and_then(|served| served.current.as_ref())
+            .is_none()
+        {
+            return Ok(());
+        }
+        let releases = SiteReleases::new(sites.root.join(instance.as_str()));
+        let Some(id) = releases.current_id() else {
+            return Ok(());
+        };
+        check_release_files(spec, &releases.release_dir(&id)).map_err(|source| {
+            EngineError::ServedReleaseUnsatisfied {
+                instance: instance.clone(),
+                source,
+            }
         })
     }
 
@@ -378,4 +437,89 @@ async fn write_archive(
         source,
     })?;
     export.and(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn spec(toml: &str) -> AppSpec {
+        toml::from_str(toml).unwrap()
+    }
+
+    fn release(files: &[&str]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// `ingress.static.not_found_page` (#104, ADR 0069) is checked against the release directory,
+    /// exactly as the deploy gate checks it.
+    #[test]
+    fn a_release_without_the_named_page_is_rejected_with_the_deploy_message() {
+        let with_page = spec("image = \"i\"\n[ingress.static]\nnot_found_page = \"/404.html\"\n");
+        let err = check_release_files(&with_page, release(&["index.html"]).path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the site has no /404.html at its root (ingress.static.not_found_page)"
+        );
+
+        let ok = check_release_files(&with_page, release(&["index.html", "404.html"]).path());
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// The gate is the deploy gate's list: `index.html` first (ADR 0049), so a release missing both
+    /// still reports the index — a deploy's [`FailedDeploy`] reason does not change.
+    #[test]
+    fn index_html_is_still_checked_first() {
+        let plain = spec("image = \"i\"");
+        let empty = release(&[]);
+        assert_eq!(
+            check_release_files(&plain, empty.path())
+                .unwrap_err()
+                .to_string(),
+            "the site has no index.html at its root"
+        );
+
+        let with_page = spec("image = \"i\"\n[ingress.static]\nnot_found_page = \"/404.html\"\n");
+        assert_eq!(
+            check_release_files(&with_page, release(&["404.html"]).path())
+                .unwrap_err()
+                .to_string(),
+            "the site has no index.html at its root"
+        );
+    }
+
+    /// One definition: [`check_release_files`] is what the deploy path runs through its
+    /// [`ReleaseGate`], so the two can never disagree on a release.
+    #[test]
+    fn the_gate_is_the_one_the_deploy_path_runs() {
+        let cases = [
+            ("image = \"i\"", vec!["index.html"]),
+            ("image = \"i\"", vec![]),
+            (
+                "image = \"i\"\n[ingress.static]\nnot_found_page = \"/404.html\"\n",
+                vec!["404.html"],
+            ),
+            (
+                "image = \"i\"\n[ingress.static]\nnot_found_page = \"/404.html\"\n",
+                vec!["index.html", "404.html"],
+            ),
+        ];
+        for (toml, files) in cases {
+            let app = spec(toml);
+            let dir = release(&files);
+            let direct = check_release_files(&app, dir.path());
+            let deploy = ReleaseGate::for_spec(&app).check(dir.path());
+            match (direct, deploy) {
+                (Ok(()), Ok(())) => {}
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{files:?}"),
+                (a, b) => panic!("{files:?}: {a:?} vs {b:?}"),
+            }
+        }
+    }
 }
