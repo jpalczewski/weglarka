@@ -85,6 +85,94 @@ pub fn service_spec(settings: &Settings, podman_socket: PathBuf, image: String) 
     }
 }
 
+/// One `[runtime] host_mounts` entry that collides with a path the daemon container mounts writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMountOverlap {
+    /// The allowlist entry.
+    pub entry: PathBuf,
+    /// The writable daemon mount it collides with.
+    pub daemon_mount: PathBuf,
+    pub relation: OverlapRelation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlapRelation {
+    Equal,
+    /// The entry is inside the writable mount.
+    Inside,
+    /// The entry contains the writable mount.
+    Ancestor,
+}
+
+impl OverlapRelation {
+    fn of(entry: &std::path::Path, mount: &std::path::Path) -> Option<Self> {
+        // `Path::starts_with` compares whole components, so `/var/lib/weglarka2` is not inside
+        // `/var/lib/weglarka`.
+        if entry == mount {
+            Some(Self::Equal)
+        } else if entry.starts_with(mount) {
+            Some(Self::Inside)
+        } else if mount.starts_with(entry) {
+            Some(Self::Ancestor)
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for HostMountOverlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (entry, mount) = (self.entry.display(), self.daemon_mount.display());
+        let how = match self.relation {
+            OverlapRelation::Equal => format!("is the same path as {mount}"),
+            OverlapRelation::Inside => format!("is inside {mount}"),
+            OverlapRelation::Ancestor => format!("contains {mount}"),
+        };
+        write!(
+            f,
+            "[runtime] host_mounts entry {entry} {how}, which the daemon container mounts writable; a \
+             read-only mount of it would make the daemon's own writes fail with `Read-only file system` \
+             (ingress apply, log rotation). Remove the entry from host_mounts"
+        )
+    }
+}
+
+/// The paths [`service_spec`] mounts writable (everything without `:ro`), derived from `service_spec`
+/// itself so the two cannot drift apart. `host_mounts` are dropped first: they are the thing being
+/// checked. A podman socket that is not configured is left out (it is resolved at install time).
+pub fn daemon_writable_mounts(settings: &Settings) -> Vec<PathBuf> {
+    let mut bare = settings.clone();
+    bare.host.runtime.host_mounts.clear();
+    let socket = settings.host.runtime.socket.clone().unwrap_or_default();
+    service_spec(&bare, socket, String::new())
+        .mounts
+        .into_iter()
+        .filter(|(_, target)| !target.ends_with(":ro"))
+        .map(|(_, target)| PathBuf::from(target))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// Every allowlisted `host_mounts` entry that equals, lies inside or contains a writable daemon mount
+/// (lexical comparison: entries are validated as normalized absolute paths).
+pub fn host_mount_overlaps(settings: &Settings) -> Vec<HostMountOverlap> {
+    let writable = daemon_writable_mounts(settings);
+    let mut out = Vec::new();
+    for entry in &settings.host.runtime.host_mounts {
+        for mount in &writable {
+            if let Some(relation) = OverlapRelation::of(entry, mount) {
+                out.push(HostMountOverlap {
+                    entry: entry.clone(),
+                    daemon_mount: mount.clone(),
+                    relation,
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The libpod socket of the runtime user: `[runtime] socket` when set, otherwise derived from the
 /// platform (a host-side operation: `/etc/passwd` is available there).
 pub async fn host_socket<P: Platform>(settings: &Settings, platform: &P) -> Result<PathBuf> {
@@ -177,5 +265,84 @@ domain = "w.example.eu"
                 spec.mounts
             );
         }
+    }
+
+    fn settings_with(extra: &str) -> Settings {
+        let host = HostConfig::from_toml_str(&format!(
+            "{extra}\n[state]\ndir = \"/var/lib/weglarka\"\n{HOST}"
+        ))
+        .unwrap();
+        Settings::from_host(host, PathBuf::from("/etc/weglarka/weglarka.toml"))
+    }
+
+    fn overlap_of(entry: &str) -> Vec<OverlapRelation> {
+        let settings = settings_with(&format!("[runtime]\nhost_mounts = [{entry:?}]\n"));
+        host_mount_overlaps(&settings)
+            .into_iter()
+            .map(|o| o.relation)
+            .collect()
+    }
+
+    #[test]
+    fn overlap_rule_covers_equal_inside_and_ancestor() {
+        assert_eq!(overlap_of("/var/lib/weglarka"), [OverlapRelation::Equal]);
+        assert_eq!(
+            overlap_of("/var/lib/weglarka/ingress-logs"),
+            [OverlapRelation::Inside]
+        );
+        assert_eq!(overlap_of("/var/lib"), [OverlapRelation::Ancestor]);
+        assert_eq!(
+            overlap_of("/run/user/1001/weglarka"),
+            [OverlapRelation::Equal]
+        );
+    }
+
+    #[test]
+    fn overlap_rule_allows_siblings_with_a_shared_prefix() {
+        assert!(overlap_of("/var/lib/weglarka2").is_empty());
+        assert!(overlap_of("/var/log/journal").is_empty());
+    }
+
+    #[test]
+    fn writable_mounts_come_from_the_service_spec() {
+        let settings = settings_with(
+            "[runtime]\nhost_mounts = [\"/var/log/journal\"]\nsocket = \"/run/user/1001/podman/podman.sock\"\n",
+        );
+        let writable = daemon_writable_mounts(&settings);
+        for p in [
+            "/run/user/1001/podman/podman.sock",
+            "/var/lib/weglarka",
+            "/run/user/1001/weglarka",
+        ] {
+            assert!(writable.contains(&PathBuf::from(p)), "{writable:?}");
+        }
+        assert!(!writable.contains(&PathBuf::from("/var/log/journal")));
+        assert!(!writable.contains(&PathBuf::from("/etc/weglarka/weglarka.toml")));
+    }
+
+    #[test]
+    fn settings_validation_names_the_entry_and_the_mount() {
+        let settings =
+            settings_with("[runtime]\nhost_mounts = [\"/var/lib/weglarka/ingress-logs\"]\n");
+        let message = settings.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("/var/lib/weglarka/ingress-logs"),
+            "{message}"
+        );
+        assert!(message.contains("is inside /var/lib/weglarka"), "{message}");
+        assert!(settings_with("").validate().is_ok());
+    }
+
+    #[test]
+    fn nginx_dir_and_traefik_file_outside_the_state_dir_are_writable() {
+        let mut settings = settings_with("");
+        settings.paths.nginx_conf_dir = PathBuf::from("/srv/nginx");
+        settings.host.ingress.traefik_dynamic_file = Some(PathBuf::from("/etc/traefik/w.yml"));
+        let writable = daemon_writable_mounts(&settings);
+        assert!(
+            writable.contains(&PathBuf::from("/srv/nginx")),
+            "{writable:?}"
+        );
+        assert!(writable.contains(&PathBuf::from("/etc/traefik/w.yml")));
     }
 }
