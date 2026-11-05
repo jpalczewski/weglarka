@@ -73,11 +73,13 @@ podman run -d --pull=missing --name wg-compat-daemon -p 127.0.0.1:19181:19181 \
   -v "$podman_sock:$podman_sock" -v "$dir:$dir" \
   "$daemon" run --config "$dir/weglarka.toml" >/dev/null
 
+# The daemon image is `FROM scratch` (no shell, no coreutils), so the socket is checked from the
+# host: `$dir` is mounted 1:1 and the container's root maps to the runner user (rootless Podman).
 for _ in $(seq 60); do
-  podman exec wg-compat-daemon test -S "$admin_sock" 2>/dev/null && break
+  [ -S "$admin_sock" ] && break
   sleep 1
 done
-podman exec wg-compat-daemon test -S "$admin_sock" ||
+[ -S "$admin_sock" ] ||
   fail "the daemon did not create its admin socket"
 podman exec wg-compat-daemon /usr/local/bin/weglarka --socket "$admin_sock" status >/dev/null ||
   fail "the CLI inside the daemon image cannot query the daemon"
