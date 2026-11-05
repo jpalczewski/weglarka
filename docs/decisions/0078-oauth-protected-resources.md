@@ -113,6 +113,9 @@ never sees these paths, because they make no authz subrequest.
   so a change re-renders nginx (`nginx -t` + reload) and never recreates a container. An empty list renders
   byte for byte as before.
 - New `apps.toml` field: `state::SCHEMA_VERSION` 21 → 22 with a no-op step `oauth_resources_v22` (ADR 0023).
+- The types land before the rendering. Until the ingress PR lifts it, a non-empty `oauth_resources` is rejected
+  ("oauth_resources is not enabled in this release"), because a field that's accepted but not rendered would
+  silently serve nothing (the ADR 0052 P0 rule).
 - `exposure` (#216) is out of scope. It's a separate listener, and the field lands with that issue.
 
 ### Surface
