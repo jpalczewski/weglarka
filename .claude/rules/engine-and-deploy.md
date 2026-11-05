@@ -2,9 +2,9 @@
 paths:
   - "crates/weglarka-engine/**"
   - "crates/weglarka-podman/**"
-  - "crates/weglarka-model/src/{podman,uid_range,shared_volumes,shared_networks,depends,environments,labels,limits,secrets,secret_store,secret_ops,host_ports,history,fsutil}.rs"
+  - "crates/weglarka-model/src/{podman,uid_range,shared_volumes,shared_networks,depends,environments,labels,limits,secrets,secret_store,secret_ops,host_ports,history,fsutil,internal_hosts}.rs"
   - "crates/weglarka-daemon/src/{service,volumes,shared_volumes,shared_networks,images,sites,forward,push,update,settings}.rs"
-  - "docs/guides/{volumes,shared-volumes,shared-networks,host-configs,host-mounts,blue-green,site-environments,crash-detection,image-retention,port-forward,one-off-commands,push-local-images,secrets-cleanup,data-import,dependencies,stopped-apps}.md"
+  - "docs/guides/{volumes,shared-volumes,shared-networks,host-configs,host-mounts,blue-green,site-environments,crash-detection,image-retention,port-forward,one-off-commands,push-local-images,secrets-cleanup,data-import,dependencies,stopped-apps,internal-hosts}.md"
 ---
 
 # Engine, deploy and Podman
