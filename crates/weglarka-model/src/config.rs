@@ -973,6 +973,47 @@ pub fn wildcard_covers(apex: &str, domain: &str) -> bool {
             .is_some_and(|label| !label.is_empty() && !label.contains('.'))
 }
 
+/// Which certificate pair `edge` serves a domain with. The rule lives here so the ingress
+/// (`NginxOptions::certificate_stem`), the ACME worker and the certificate scan cannot drift apart
+/// (issue #210).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertChoice<'a> {
+    /// The domain's own pair, `<domain>.crt|key`.
+    Own,
+    /// The wildcard pair of `apex`, `_wildcard.<apex>.crt|key` ([`wildcard_cert_stem`]).
+    Wildcard(&'a str),
+}
+
+/// The certificate pair `domain` is served with: with `prefer_wildcard` a covering wildcard wins
+/// over the domain's own pair (the pair stays on disk as a fallback), otherwise the own pair wins and
+/// the wildcard of the longest covering apex is the fallback; `None` = no usable pair at all.
+///
+/// `own` says whether a pair for `domain` itself exists; `wildcards` lists the apexes with a usable
+/// wildcard pair ([`wildcard_covers`] decides coverage):
+///
+/// ```text
+/// prefer_wildcard && covered → wildcard; else own → own; else covered → wildcard; else none
+/// ```
+pub fn choose_certificate<'a, S: AsRef<str>>(
+    domain: &str,
+    own: bool,
+    wildcards: &'a [S],
+    prefer_wildcard: bool,
+) -> Option<CertChoice<'a>> {
+    let covering = wildcards
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|apex| wildcard_covers(apex, domain))
+        .max_by_key(|apex| apex.len());
+    if prefer_wildcard && let Some(apex) = covering {
+        return Some(CertChoice::Wildcard(apex));
+    }
+    if own {
+        return Some(CertChoice::Own);
+    }
+    covering.map(CertChoice::Wildcard)
+}
+
 impl AcmeDnsConfig {
     /// Lower-case DNS name of at least two labels (`[a-z0-9-]`, no wildcard, no trailing dot).
     fn valid_apex(apex: &str) -> bool {
@@ -1937,6 +1978,70 @@ domain = "weglarka.example.com"
             assert!(!wildcard_covers("example.eu", no), "{no}");
         }
         assert_eq!(wildcard_cert_stem("example.eu"), "_wildcard.example.eu");
+    }
+
+    #[test]
+    fn a_certificate_choice_prefers_the_own_pair_unless_wildcards_do() {
+        let covered = ["example.com"];
+        let uncovered = ["example.org"];
+        // Own pair only: the knob changes nothing.
+        for prefer in [false, true] {
+            assert_eq!(
+                choose_certificate("app.example.com", true, &uncovered, prefer),
+                Some(CertChoice::Own),
+                "prefer_wildcard = {prefer}"
+            );
+        }
+        // Wildcard only: the knob changes nothing either.
+        for prefer in [false, true] {
+            assert_eq!(
+                choose_certificate("app.example.com", false, &covered, prefer),
+                Some(CertChoice::Wildcard("example.com")),
+                "prefer_wildcard = {prefer}"
+            );
+        }
+        // Both: the knob decides, the own pair stays the default.
+        assert_eq!(
+            choose_certificate("app.example.com", true, &covered, false),
+            Some(CertChoice::Own)
+        );
+        assert_eq!(
+            choose_certificate("app.example.com", true, &covered, true),
+            Some(CertChoice::Wildcard("example.com"))
+        );
+        // Neither: no TLS server (fail closed).
+        assert_eq!(
+            choose_certificate("app.example.net", false, &covered, true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_longest_covering_wildcard_apex_wins() {
+        let wildcards = ["example.com", "a.example.com"];
+        for prefer in [false, true] {
+            assert_eq!(
+                choose_certificate("x.a.example.com", false, &wildcards, prefer),
+                Some(CertChoice::Wildcard("a.example.com")),
+                "prefer_wildcard = {prefer}"
+            );
+            assert_eq!(
+                choose_certificate("a.example.com", false, &wildcards, prefer),
+                Some(CertChoice::Wildcard("a.example.com")),
+                "prefer_wildcard = {prefer}"
+            );
+            // Two labels below the apex are not covered by any wildcard.
+            assert_eq!(
+                choose_certificate("x.y.example.com", false, &wildcards, prefer),
+                None,
+                "prefer_wildcard = {prefer}"
+            );
+        }
+        // An own pair wins when the knob is off, even with a longer covering apex.
+        assert_eq!(
+            choose_certificate("x.a.example.com", true, &wildcards, false),
+            Some(CertChoice::Own)
+        );
     }
 
     #[test]
