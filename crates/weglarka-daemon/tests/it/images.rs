@@ -146,3 +146,140 @@ async fn an_image_used_by_a_container_survives_a_prune() {
     let check = image_check(&h).await;
     assert_eq!(check["status"], "ok", "{check}");
 }
+
+/// `image-reservations.toml` under `root` with `operations` as `(operation id, boot id)`, all
+/// `loading`: what a daemon leaves behind when it stops mid-acquisition.
+fn write_reservations(root: &std::path::Path, operations: &[(String, String)]) {
+    use weglarka_model::image_inventory::{
+        OperationId, RESERVATIONS_FILE_NAME, Reservation, ReservationEntry, ReservationOwner,
+        ReservationPhase, Reservations,
+    };
+    let entries = operations
+        .iter()
+        .enumerate()
+        .map(|(n, (id, boot))| ReservationEntry {
+            operation_id: OperationId::new(id).unwrap(),
+            reservation: Reservation {
+                owner: ReservationOwner::new("engine", 7, boot, 1_700_000_000 + n as u64).unwrap(),
+                phase: ReservationPhase::Loading,
+                protections: Default::default(),
+                journal_ref: None,
+                created_at: 1_700_000_000,
+            },
+        })
+        .collect();
+    let text = Reservations::new(entries).unwrap().to_toml().unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(root.join("state").join(RESERVATIONS_FILE_NAME), text).unwrap();
+}
+
+fn this_boot() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|id| id.trim().to_owned())
+        .unwrap_or_else(|_| "unknown-boot".to_owned())
+}
+
+/// Starting the daemon reclaims the reservations a previous boot left (their `boot_id` differs from
+/// the current one) and leaves one of this boot alone; `GET /v1/images/reservations` shows the rest.
+#[tokio::test]
+async fn startup_reclaims_reservations_of_a_previous_boot() {
+    let builder = Builder::new();
+    write_reservations(
+        builder.root(),
+        &[
+            ("stale-1".into(), "boot-gone".into()),
+            ("live".into(), this_boot()),
+            ("stale-2".into(), "boot-gone".into()),
+        ],
+    );
+    let h = builder.build().await;
+
+    let (status, list) = admin(&h, "GET", "/v1/images/reservations", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let ids: Vec<&str> = list["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["operation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["live"], "{list}");
+    assert_eq!(list["reservations"][0]["phase"], "loading");
+    assert_eq!(list["reservations"][0]["previous_boot"], false);
+    assert_eq!(list["reservations"][0]["component"], "engine");
+    assert_eq!(list["reservations"][0]["pid"], 7);
+    assert_eq!(list["capacity"], 1024);
+    assert!(
+        list["reservations"][0].get("protections").is_some(),
+        "{list}"
+    );
+}
+
+/// With nothing stale there is nothing to reclaim and the list is empty.
+#[tokio::test]
+async fn an_empty_reservation_list_is_an_empty_array() {
+    let h = harness().await;
+    let (status, list) = admin(&h, "GET", "/v1/images/reservations", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["reservations"], json!([]), "{list}");
+}
+
+/// A full reservation file blocks cleanup without failing the request: `POST /v1/images/prune` is a
+/// 200 with `blocked: true` and the reason, nothing is removed, and `doctor` warns. Reservations of
+/// the current boot, so startup does not reclaim them.
+#[tokio::test]
+async fn a_full_reservation_file_answers_prune_as_blocked_and_doctor_warns() {
+    let builder = Builder::new();
+    let boot = this_boot();
+    let operations: Vec<(String, String)> = (0..1024)
+        .map(|n| (format!("stuck-{n}"), boot.clone()))
+        .collect();
+    write_reservations(builder.root(), &operations);
+    let h = builder.build().await;
+    // The ingress image is pulled by the first reconcile; wait for it so the count is stable.
+    eventually("ingress image", || async { !h.fake.images().is_empty() }).await;
+    let before = h.fake.images().len();
+
+    for body in [Some(json!({ "dry_run": true })), None] {
+        let (status, value) = admin(&h, "POST", "/v1/images/prune", body).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["blocked"], true, "{value}");
+        assert!(
+            value["removed"].is_null() || value["removed"] == json!([]),
+            "{value}"
+        );
+        let diagnostics = value["diagnostics"].to_string();
+        assert!(diagnostics.contains("full"), "{value}");
+        assert!(
+            diagnostics.contains("weglarka images reservations abandon"),
+            "{value}"
+        );
+    }
+    assert_eq!(h.fake.images().len(), before, "nothing was removed");
+
+    let check = image_check(&h).await;
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(
+        check["message"].as_str().unwrap().contains("full"),
+        "{check}"
+    );
+    assert!(
+        check["hint"]
+            .as_str()
+            .unwrap()
+            .contains("weglarka images reservations list"),
+        "{check}"
+    );
+
+    // Abandoning one brings the normal pass back.
+    let (status, value) = admin(
+        &h,
+        "POST",
+        "/v1/images/reservations/abandon",
+        Some(json!({ "operation_id": "stuck-0" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (status, value) = admin(&h, "POST", "/v1/images/prune", None).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value.get("blocked").is_none(), "{value}");
+}

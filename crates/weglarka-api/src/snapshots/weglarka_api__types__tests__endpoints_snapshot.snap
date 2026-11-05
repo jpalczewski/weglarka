@@ -42,6 +42,7 @@ expression: list
   "Get /v1/config",
   "Get /v1/doctor",
   "Post /v1/images/prune",
+  "Get /v1/images/reservations",
   "Post /v1/images/reservations/abandon",
   "Get /v1/notifications",
   "Post /v1/notifications/test",

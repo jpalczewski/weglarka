@@ -140,3 +140,8 @@ and previous stay) are unchanged.
   `doctor` use the same input builder.
 - New API surface: `PruneImagesResponse.diagnostics` and `POST /v1/images/reservations/abandon`; new CLI:
   `weglarka images reservations abandon <operation-id> --yes`. No `apps.toml`/`state.toml` schema change.
+- Follow-up (#480): the daemon reclaims reservations of a previous boot once at startup. A full reservation file no
+  longer fails an acquisition: the pull or upload goes on unreserved and retention reports `blocked` (nothing is
+  removed) until capacity is back. A blocked pass is a 200 with the additive `PruneImagesResponse.blocked`, and
+  `GET /v1/images/reservations` (`weglarka images reservations list`, admin scope) lists the operation IDs. No
+  `apps.toml`/`state.toml` schema change.
