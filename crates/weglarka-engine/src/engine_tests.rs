@@ -14,7 +14,7 @@ use crate::reconcile::{
     Action, ActionOutcome, ActivityKind, EngineError, ReconcileReport, Reconciler,
     ReconcilerOptions, RecreateReason, SecretChangePolicy, Trigger,
 };
-use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman};
+use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman, StopFailure};
 use crate::volumes::RemoveAppOptions;
 use weglarka_model::app::{Digest, InstanceName};
 use weglarka_model::events::{Event, VecSink};
@@ -372,6 +372,50 @@ async fn deploy_without_changes_is_unchanged_and_new_digest_moves_pointers() {
     assert!(pos(&Call::ImagePull(IMAGE.into())) < pos(&Call::ContainerStop("ntfy".into())));
     assert!(pos(&Call::ContainerStop("ntfy".into())) < pos(&Call::ContainerCreate("ntfy".into())));
     assert!(pos(&Call::ContainerCreate("ntfy".into())) < pos(&Call::ContainerStart("ntfy".into())));
+}
+
+/// The deploy swap removes the old container on the next step, so a conmon that cannot be stopped
+/// cleanly (issue #470) does not abort the deploy.
+#[tokio::test(start_paused = true)]
+async fn deploy_replaces_a_container_whose_stop_lost_its_conmon() {
+    let h = Harness::new(NTFY);
+    let ntfy = name("ntfy");
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_next_stop_failure(StopFailure::DeadConmon);
+    assert_eq!(
+        h.rec.deploy(&ntfy, false).await.unwrap(),
+        DeployOutcome::Deployed {
+            digest: digest('b'),
+            generation: 2
+        }
+    );
+    assert_eq!(h.state("ntfy").current, Some(digest('b')));
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// A stop that failed with the old container still running aborts the deploy before the old
+/// container is removed (issue #470): only a container that is definitely down is replaced.
+#[tokio::test(start_paused = true)]
+async fn deploy_keeps_the_old_container_when_its_stop_fails_and_it_keeps_running() {
+    let h = Harness::new(NTFY);
+    let ntfy = name("ntfy");
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.set_pull_digest(IMAGE, digest('b'));
+    h.fake.script_next_stop_failure(StopFailure::LeftRunning);
+    let before = h.fake.calls().len();
+    h.rec.deploy(&ntfy, false).await.unwrap_err();
+    let calls = h.fake.calls()[before..].to_vec();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::ContainerRemove(_))),
+        "the old container is not removed: {calls:?}"
+    );
+    assert_eq!(h.state("ntfy").current, Some(digest('a')));
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2210,6 +2254,71 @@ async fn reload_of_a_non_running_app_is_refused() {
     assert!(
         h.fake.calls()[before..].is_empty(),
         "an exited container is neither signalled nor restarted"
+    );
+}
+
+/// A container whose conmon died is still `running` for libpod, and its `stop` answers HTTP 500
+/// (`conmon exited prematurely`) while ending the container as `exited`: the reload restart goes on
+/// and starts it again instead of returning that error (issue #470).
+#[tokio::test(start_paused = true)]
+async fn reload_starts_a_container_whose_stop_lost_its_conmon() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.script_next_stop_failure(StopFailure::DeadConmon);
+    let before = h.fake.calls().len();
+    assert_eq!(
+        h.rec.reload(&name("ntfy")).await.unwrap(),
+        ReloadOutcome::Restarted
+    );
+    let calls = h.fake.calls()[before..].to_vec();
+    let stop = first_call(&calls, Call::ContainerStop("ntfy".into())).expect("stopped");
+    let start = first_call(&calls, Call::ContainerStart("ntfy".into())).expect("started");
+    assert!(stop < start, "{calls:?}");
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// A stop that failed and left the container running stays an error: reload never reports a
+/// restart that did not happen (issue #470).
+#[tokio::test(start_paused = true)]
+async fn reload_returns_the_stop_error_while_the_container_keeps_running() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.script_next_stop_failure(StopFailure::LeftRunning);
+    let before = h.fake.calls().len();
+    let err = h.rec.reload(&name("ntfy")).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("container stop timed out"),
+        "{err:?}"
+    );
+    assert!(
+        !h.fake.calls()[before..]
+            .iter()
+            .any(|c| matches!(c, Call::ContainerStart(_))),
+        "a container that is still running is not started again"
+    );
+    assert_eq!(h.fake.containers()[0].state, ContainerState::Running);
+}
+
+/// A failed stop that leaves a transient libpod state (`stopping` → `Unknown`) is not proof the
+/// container is down: reload returns the stop error and does not start it (issue #470).
+#[tokio::test(start_paused = true)]
+async fn reload_returns_the_stop_error_while_the_container_is_still_stopping() {
+    let h = Harness::new(NTFY);
+    h.fake.set_pull_digest(IMAGE, digest('a'));
+    h.rec.reconcile().await.unwrap();
+
+    h.fake.script_next_stop_failure(StopFailure::LeftStopping);
+    let before = h.fake.calls().len();
+    h.rec.reload(&name("ntfy")).await.unwrap_err();
+    assert!(
+        !h.fake.calls()[before..]
+            .iter()
+            .any(|c| matches!(c, Call::ContainerStart(_))),
+        "a container that may still be running is not started again"
     );
 }
 

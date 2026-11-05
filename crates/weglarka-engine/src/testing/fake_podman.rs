@@ -129,6 +129,25 @@ impl Drop for OpenLogStream {
 /// `ContainerInfo::started_at` of every container the fake has started.
 pub const FAKE_STARTED_AT: &str = "2026-01-01T00:00:00Z";
 
+/// libpod's answer to `stop` for a container whose conmon died (measured with Podman 6.1.3, issue
+/// #470): HTTP 500 with this message, and the container ends `exited` with exit code -1.
+pub const DEAD_CONMON_MESSAGE: &str =
+    "conmon exited prematurely, exit code could not be retrieved: conmon process killed";
+
+/// A `container_stop` that fails; scripted with [`FakePodman::script_next_stop_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopFailure {
+    /// The conmon behind the container died (issue #470): the fake keeps reporting the container
+    /// `running` until the stop, which then fails with HTTP 500 [`DEAD_CONMON_MESSAGE`] and leaves
+    /// it `exited` with exit code -1 — the stop did end it.
+    DeadConmon,
+    /// A stop that failed and left the container running (a timeout, a busy runtime).
+    LeftRunning,
+    /// A stop that failed mid-way: libpod reports a transient state such as `stopping`, which the
+    /// client maps to [`ContainerState::Unknown`] — not proof that the container is down.
+    LeftStopping,
+}
+
 #[derive(Default)]
 struct State {
     /// Scripts waiting for a container to start.
@@ -183,6 +202,8 @@ struct State {
     exec_exit_codes: BTreeMap<String, i32>,
     health_scripts: BTreeMap<String, VecDeque<HealthStatus>>,
     events: Vec<PodmanEvent>,
+    /// The next `container_stop` fails with this (then the queue is empty again).
+    stop_failures: VecDeque<StopFailure>,
     /// Networks whose next `network_disconnect` fails once with this error (race injection).
     disconnect_failures: BTreeMap<String, PodmanError>,
     calls: Vec<Call>,
@@ -380,6 +401,12 @@ impl FakePodman {
     /// (reported by `container_wait`); without a script it exits 0 silently.
     pub fn script_next_run(&self, script: RunScript) {
         self.lock().run_queue.push_back(script);
+    }
+
+    /// The next `container_stop` fails like this; see [`StopFailure`]. The call is still recorded on
+    /// the call log, and the scripted call applies to whichever container is stopped next.
+    pub fn script_next_stop_failure(&self, failure: StopFailure) {
+        self.lock().stop_failures.push_back(failure);
     }
 
     /// What the log of the (running) container `name` holds, for `container_logs`; replaces an earlier
@@ -763,7 +790,33 @@ impl PodmanClient for FakePodman {
     async fn container_stop(&self, name: &str, _timeout_secs: u32) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::ContainerStop(name.to_owned()));
-        s.container_mut(name)?.state = ContainerState::Stopped;
+        // A missing container is `NotFound` whether or not a failure is scripted.
+        s.container_mut(name)?;
+        match s.stop_failures.pop_front() {
+            None => s.container_mut(name)?.state = ContainerState::Stopped,
+            Some(StopFailure::DeadConmon) => {
+                let container = s.container_mut(name)?;
+                container.state = ContainerState::Exited;
+                container.exit_code = Some(-1);
+                return Err(PodmanError::Api {
+                    status: 500,
+                    message: DEAD_CONMON_MESSAGE.into(),
+                });
+            }
+            Some(StopFailure::LeftRunning) => {
+                return Err(PodmanError::Api {
+                    status: 500,
+                    message: "container stop timed out".into(),
+                });
+            }
+            Some(StopFailure::LeftStopping) => {
+                s.container_mut(name)?.state = ContainerState::Unknown;
+                return Err(PodmanError::Api {
+                    status: 500,
+                    message: "container stop timed out".into(),
+                });
+            }
+        }
         Ok(())
     }
 

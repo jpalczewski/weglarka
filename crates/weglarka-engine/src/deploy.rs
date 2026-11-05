@@ -348,12 +348,48 @@ impl<P: PodmanClient> Reconciler<P> {
             tracing::info!(%instance, %signal, "sent the reload signal to the container");
             return Ok(ReloadOutcome::Signalled { signal });
         }
-        self.podman
-            .container_stop(&name, self.options.stop_timeout_secs)
-            .await?;
+        self.stop_for_restart(&name).await?;
         self.podman.container_start(&name).await?;
         tracing::info!(%instance, "restarted the container to reload its config");
         Ok(ReloadOutcome::Restarted)
+    }
+
+    /// Stop for a path that brings the container back up (a reload restart) or replaces it (a
+    /// deploy): a failed stop is not fatal when the container is not running afterwards.
+    ///
+    /// A container whose conmon died is still reported `running` by libpod, and its `stop` answers
+    /// HTTP 500 (`conmon exited prematurely`) while ending the container as `exited` with exit code
+    /// -1 (measured on Podman 6.1.3, issue #470). The state observed after the failed call decides —
+    /// never the error text: definitely down (`exited`, `stopped`, `created`) or gone → `warn` and
+    /// carry on; anything else (`running`, `paused`, a transient libpod state such as `stopping`
+    /// that maps to `unknown`) or not inspectable → the stop error stands. Not for paths that touch
+    /// the container's data while it is down (`volumes import` keeps a strict stop).
+    pub(crate) async fn stop_for_restart(&self, name: &str) -> Result<(), EngineError> {
+        let error = match self
+            .podman
+            .container_stop(name, self.options.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanError::NotFound(_)) => return Ok(()),
+            Err(e) => e,
+        };
+        match self.podman.container_inspect(name).await {
+            Ok(info)
+                if matches!(
+                    info.state,
+                    ContainerState::Exited | ContainerState::Stopped | ContainerState::Created
+                ) =>
+            {
+                tracing::warn!(
+                    container = %name,
+                    state = ?info.state,
+                    error = %error,
+                    "the stop failed but the container is not running: continuing"
+                );
+                Ok(())
+            }
+            _ => Err(error.into()),
+        }
     }
 
     /// "New image" webhook: dedup by `delivery_id`, fan-out to instances with `auto_update`.
@@ -664,10 +700,9 @@ impl<P: PodmanClient> Reconciler<P> {
         self.bootstrap_generated(instance).await?;
         let prepared = self.prepare_instance(instance, spec).await?;
         let name = labels::container_name(instance);
-        self.podman
-            .container_stop(&name, self.options.stop_timeout_secs)
-            .await
-            .ignore_not_found()?;
+        // The old container is removed on the next line either way, so a conmon that cannot be
+        // stopped cleanly must not abort the deploy (issue #470).
+        self.stop_for_restart(&name).await?;
         self.podman
             .container_remove(&name, true)
             .await
