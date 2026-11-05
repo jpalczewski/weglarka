@@ -98,9 +98,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 "{instance} has no current release to roll back from"
             ))
         })?;
-        let gate = ReleaseGate::for_spec(&spec);
-        let releases = SiteReleases::new(self.sites()?.root.join(instance.as_str()));
-        let reused_release = releases.is_complete(&release_id(&previous), &gate);
+        self.sites()?; // a daemon without a sites directory refuses here, before any image work
+        let reused_release = self.has_complete_release(instance, &spec, &previous);
 
         // Same guard/slot/retention sequence as `promote`: `ensure_image` only matters when the
         // release has to be built again, and the deploy itself reuses a complete release.
