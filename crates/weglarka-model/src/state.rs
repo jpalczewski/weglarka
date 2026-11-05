@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -171,6 +171,13 @@ fn static_ingress_options_v18(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v18 → v19: per-app `internal_hosts` (issue #303, ADR 0071). `AppSpec::internal_hosts` is an
+/// optional list (default empty), so a v18 document needs no data transformation — the marker records
+/// that the file may carry it. A no-op that must accept a hand-edited file which already has it.
+fn internal_hosts_v19(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -192,6 +199,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     app_metrics_v16,
     oidc_allowed_groups_v17,
     static_ingress_options_v18,
+    internal_hosts_v19,
 ];
 
 const _: () = assert!(
@@ -458,6 +466,7 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
         ("oidc", spec.oidc.is_some()),
         ("metrics_port", spec.metrics_port.is_some()),
         ("metrics_path", spec.metrics_path.is_some()),
+        ("internal_hosts", !spec.internal_hosts.is_empty()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
         return Err(format!(
@@ -955,6 +964,17 @@ fn validate_iteration2(name: &InstanceName, spec: &AppSpec) -> Result<(), String
         }
     }
     validate_host_ports(name, &spec.host_ports)?;
+    // `internal_hosts` (issue #303): syntax and duplicates only — whether this host serves the domain
+    // is a question for the host config, answered by `crate::internal_hosts::validate`.
+    let mut hosts = BTreeSet::new();
+    for domain in &spec.internal_hosts {
+        crate::app::check_domain(domain).map_err(|reason| {
+            format!("{name}: invalid internal_hosts entry {domain:?}: {reason}")
+        })?;
+        if !hosts.insert(domain) {
+            return Err(format!("{name}: duplicate internal_hosts entry {domain:?}"));
+        }
+    }
     Ok(())
 }
 
@@ -1183,6 +1203,50 @@ mod tests {
                 .contains("duplicate depends_on")
         );
         assert!(validate_app(&name("a"), &spec("\"b\"")).is_ok());
+    }
+
+    /// `internal_hosts` (issue #303): domain syntax and duplicates are the app's own business; whether
+    /// the host serves the domain is `crate::internal_hosts::validate`.
+    #[test]
+    fn internal_hosts_must_be_valid_domains_and_unique() {
+        let spec = |hosts: &str| -> AppSpec {
+            toml::from_str(&format!("image = \"i\"\ninternal_hosts = [{hosts}]")).unwrap()
+        };
+        assert!(validate_app(&name("a"), &spec("\"auth.example.org\"")).is_ok());
+        assert!(
+            validate_app(
+                &name("a"),
+                &spec("\"auth.example.org\", \"auth.example.org\"")
+            )
+            .unwrap_err()
+            .contains("duplicate internal_hosts entry")
+        );
+        for invalid in [
+            "",
+            "localhost",
+            "Auth.example.org",
+            "https://auth.example.org",
+        ] {
+            let err = validate_app(&name("a"), &spec(&format!("{invalid:?}"))).unwrap_err();
+            assert!(
+                err.contains("invalid internal_hosts entry"),
+                "{invalid:?}: {err}"
+            );
+        }
+    }
+
+    /// A static site has no container, so an `internal_hosts` entry there is a typo or a wrong `kind`.
+    #[test]
+    fn internal_hosts_do_not_apply_to_a_static_site() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"i\"\nkind = \"static\"\ninternal_hosts = [\"auth.example.org\"]",
+        )
+        .unwrap();
+        assert!(
+            validate_app(&name("a"), &spec)
+                .unwrap_err()
+                .contains("`internal_hosts` does not apply to kind = \"static\"")
+        );
     }
 
     #[test]

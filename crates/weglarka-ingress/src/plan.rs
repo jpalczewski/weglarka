@@ -75,35 +75,11 @@ impl Domain {
         }
     }
 
+    /// One rule for every domain Węglarka writes down: the ingress route table, a container's
+    /// `/etc/hosts` (`internal_hosts`, ADR 0071) and spec validation share
+    /// [`weglarka_model::app::check_domain`].
     fn check(v: &str) -> Result<(), &'static str> {
-        if v.is_empty() || v.len() > 253 {
-            return Err("length must be 1-253");
-        }
-        let mut labels = 0;
-        let mut last = "";
-        for label in v.split('.') {
-            labels += 1;
-            last = label;
-            if !(1..=63).contains(&label.len()) {
-                return Err("label length must be 1-63");
-            }
-            if !label
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            {
-                return Err("only [a-z0-9-] and '.' allowed");
-            }
-            if label.starts_with('-') || label.ends_with('-') {
-                return Err("label must not start or end with '-'");
-            }
-        }
-        if labels < 2 {
-            return Err("at least two labels required");
-        }
-        if last.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("last label must not be numeric");
-        }
-        Ok(())
+        weglarka_model::app::check_domain(v)
     }
 
     pub fn as_str(&self) -> &str {
