@@ -439,8 +439,9 @@ jobs:
       - run: cargo build --profile ci --locked --target x86_64-unknown-linux-musl -p weglarka-daemon -p weglarka-cli -p weglarka-panel
 
   # Integration tests with a real Podman 6.1 — decision: docs/decisions/0002-podman-in-ci.md.
-  # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host), set up by the local action
-  # `podman-rootless`. The tests read WEGLARKA_PODMAN_SOCKET and skip themselves when it is not set.
+  # Podman from OBS `home:alvistack` on ubuntu-24.04 (mirror of the host), versions pinned and installed from a
+  # .deb cache (no OBS request on a hit) by the local action `podman-rootless`. The tests read
+  # WEGLARKA_PODMAN_SOCKET and skip themselves when it is not set.
   # They need no musl artifact, so this job starts right after `changes` instead of waiting for `musl`.
   podman-tests:
     needs: changes
