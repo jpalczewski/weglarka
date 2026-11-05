@@ -504,14 +504,22 @@ pub async fn networks(req: Req) -> Response {
 }
 
 pub async fn sites(req: Req) -> Response {
-    let list = match req.get::<ListSitesResponse>(Call::new(&SITES_LIST)).await {
+    // The sites list is the page; the apps list only adds the standalone static section, so a
+    // failing call leaves that section out instead of breaking the page (issue #548).
+    let (list, apps) = tokio::join!(
+        req.get::<ListSitesResponse>(Call::new(&SITES_LIST)),
+        req.try_get::<ListAppsResponse>(Call::new(&APPS_LIST)),
+    );
+    let list = match list {
         Ok(l) => l,
         Err(r) => return *r,
     };
+    let apps = apps.map(|l| l.apps).unwrap_or_default();
     respond(
         &SitesPage {
             shell: req.shell("sites"),
             sites: list.sites.iter().map(views::site_row).collect(),
+            standalone: views::standalone_sites(&apps),
         },
         StatusCode::OK,
     )

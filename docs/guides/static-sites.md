@@ -140,6 +140,10 @@ Forward auth (#89) and HTTP Basic auth for static sites are tracked separately i
 [#169](https://github.com/jpalczewski/weglarka/issues/169); `ingress.auth*` stays rejected on a static site until
 that lands.
 
+A standalone static app has no `[sites]` entry. The panel's **Sites** page and `weglarka sites list` still show it,
+in a section after the declared sites (with a link to its app page), so moving a site to a plain `kind = "static"`
+app never looks like the site disappeared.
+
 ## A development and a production version
 
 A site that needs both is declared once with environments, and the production one changes only by an explicit

@@ -1,7 +1,9 @@
 //! Admin API request/response types.
 
 use serde::{Deserialize, Serialize};
-use weglarka_model::app::{AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName};
+use weglarka_model::app::{
+    AppKind, AppSpec, Digest, InstanceName, SharedNetworkName, SharedVolumeName,
+};
 use weglarka_model::config::LogRetention;
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
 use weglarka_model::events::Severity;
@@ -82,6 +84,10 @@ pub struct AppSummary {
     /// `<site>/<env>` when the instance is expanded from a site (issue #205).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
+    /// `container` (default) or `static` (ADR 0049). Absent for a container app, so today's JSON
+    /// stays byte-for-byte what it is; clients that only know containers ignore the field.
+    #[serde(default, skip_serializing_if = "AppKind::is_container")]
+    pub kind: AppKind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

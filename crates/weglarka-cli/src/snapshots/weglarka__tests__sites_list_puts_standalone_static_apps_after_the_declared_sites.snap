@@ -1,0 +1,10 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: "crate::sites::sites_list_text(&sites, &apps)"
+---
+SITE  ENV   SOURCE          DOMAINS           CURRENT              PREVIOUS
+blog  prod  tracks :stable  blog.example.com  sha256:bbbbbbbbbbbb  -
+
+standalone static sites (`kind = "static"`, no declared site):
+NAME  RUNTIME  DOMAINS           DIGEST
+docs  serving  docs.example.com  sha256:aaaaaaaaaaaa

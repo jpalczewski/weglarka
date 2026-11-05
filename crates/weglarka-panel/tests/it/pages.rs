@@ -98,6 +98,8 @@ struct Script {
     /// The containers of `web` in `/v1/apps/web/stats` and `/v1/stats`.
     stats: Vec<Value>,
     stats_available: bool,
+    /// Answers the sites and apps lists with nothing, for the sites page's empty state.
+    empty_declarations: bool,
 }
 
 impl Default for Script {
@@ -113,6 +115,7 @@ impl Default for Script {
             )],
             stats: vec![container_stats("active")],
             stats_available: true,
+            empty_declarations: false,
         }
     }
 }
@@ -190,13 +193,21 @@ async fn fake_daemon(script: Script) -> Mock {
                 "apps": [{ "name": "web", "image": "ghcr.io/example/web:1", "domains": ["web.example.com"], "runtime": "running" },
                          { "name": "db", "image": "ghcr.io/example/db:1", "domains": [], "runtime": "unhealthy" }],
             })),
-            "/v1/apps" => json_reply(json!({"apps": [
+            "/v1/apps" => {
+                if script.empty_declarations {
+                    return json_reply(json!({ "apps": [] }));
+                }
+                json_reply(json!({"apps": [
                 { "name": "web", "image": "ghcr.io/example/web:1", "domains": ["web.example.com"], "runtime": "running",
                   "digest": format!("sha256:{}", "a".repeat(64)) },
+                { "name": "docs", "image": "ghcr.io/example/docs:latest", "kind": "static",
+                  "domains": ["docs.example.com"], "runtime": "serving",
+                  "digest": format!("sha256:{}", "e".repeat(64)) },
                 { "name": "blog-dev", "image": "ghcr.io/example/blog@sha256:aaaa", "domains": ["dev.blog.example.com"],
                   "runtime": "running", "site": "blog/dev" },
                 { "name": "blog-staging", "image": "ghcr.io/example/blog@sha256:bbbb", "domains": [],
-                  "runtime": "stopped", "site": "blog/staging" }]})),
+                  "runtime": "stopped", "site": "blog/staging" }]}))
+            }
             "/v1/apps/web" => json_reply(app_json(token)),
             "/v1/apps/blog-dev" => {
                 let mut app = app_json(token);
@@ -218,7 +229,7 @@ async fn fake_daemon(script: Script) -> Mock {
             })),
             "/v1/apps/web/volumes" => json_reply(json!({"volumes": [
                 { "name": "data", "target": "/data", "podman_name": "web.data", "exists": true }]})),
-            "/v1/apps/blog-dev/volumes" | "/v1/apps/blog-staging/volumes" => {
+            "/v1/apps/blog-dev/volumes" | "/v1/apps/blog-staging/volumes" | "/v1/apps/docs/volumes" => {
                 json_reply(json!({"volumes": []}))
             }
             "/v1/volumes" => json_reply(json!({"volumes": [
@@ -226,9 +237,14 @@ async fn fake_daemon(script: Script) -> Mock {
                   "uid_range": { "start": 100000, "size": 65536 } }]})),
             "/v1/networks" => json_reply(json!({"networks": [
                 { "name": "backend", "podman_name": "net-shared-backend", "members": ["web", "db"], "exists": false }]})),
-            "/v1/sites" => json_reply(json!({"sites": [{ "name": "blog", "image": "ghcr.io/example/blog", "envs": [
+            "/v1/sites" => {
+                if script.empty_declarations {
+                    return json_reply(json!({ "sites": [] }));
+                }
+                json_reply(json!({"sites": [{ "name": "blog", "image": "ghcr.io/example/blog", "envs": [
                 { "env": "prod", "instance": "blog-prod", "track": "stable", "promote_from": null,
-                  "domains": ["blog.example.com"], "current": null, "previous": null }]}]})),
+                  "domains": ["blog.example.com"], "current": null, "previous": null }]}]}))
+            }
             "/v1/notifications" => json_reply(json!({
                 "enabled": true, "channels": [{ "name": "ntfy", "min_severity": "warning", "pending": 1 }],
                 "pending": 1, "dropped": 0, "last_error": "timeout talking to ntfy" })),
@@ -1791,6 +1807,50 @@ async fn sites_list_links_to_the_site_page_and_flags_pending_promotions() {
     let who = login(&site, "tok-read");
     let (_, _, html) = get(&site, Some(&who), "/sites").await;
     assert!(html.contains("href=\"/sites/blog\""), "{html}");
+}
+
+/// An operator who moved a site to a plain `kind = "static"` app finds it on `/sites` too, not
+/// only under Applications (issue #548).
+#[tokio::test]
+async fn the_sites_page_lists_standalone_static_apps() {
+    let site = site(Script::default()).await;
+    let who = login(&site, "tok-read");
+    let (_, headers, html) = get(&site, Some(&who), "/sites").await;
+    assert_page_is_clean("/sites", &headers, &html);
+    assert!(html.contains("Standalone static sites"), "{html}");
+    assert!(html.contains("<a href=\"/apps/docs\">docs</a>"), "{html}");
+    assert!(html.contains("docs.example.com"), "{html}");
+    assert!(
+        html.contains("<td><span class=\"badge badge-ok\">serving</span></td>"),
+        "{html}"
+    );
+    // An environment of a declared site stays in its own section, and a container app is not
+    // listed at all: both live in the declared part of the page, above the standalone section.
+    let standalone = html
+        .split_once("Standalone static sites")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(standalone.contains("docs"), "{html}");
+    assert!(!standalone.contains("blog-dev"), "{html}");
+    assert!(!standalone.contains(">web<"), "{html}");
+    assert!(!html.contains("No sites are declared"), "{html}");
+}
+
+/// Nothing declared and no standalone static app: the empty state stays, and says where a plain
+/// static app would appear.
+#[tokio::test]
+async fn the_sites_page_empty_state_mentions_standalone_static_apps() {
+    let site = site(Script {
+        empty_declarations: true,
+        ..Script::default()
+    })
+    .await;
+    let who = login(&site, "tok-read");
+    let (_, headers, html) = get(&site, Some(&who), "/sites").await;
+    assert_page_is_clean("/sites", &headers, &html);
+    assert!(html.contains("No sites are declared."), "{html}");
+    assert!(html.contains("kind = \"static\""), "{html}");
+    assert!(!html.contains("Standalone static sites"), "{html}");
 }
 
 #[tokio::test]

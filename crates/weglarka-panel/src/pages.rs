@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use crate::session::SessionView;
 use crate::views::{
     AppDetail, AppRow, Badge, CertRow, CheckGroup, ConfigSection, EventRow, Field, NotifyView,
-    SiteDetail, SiteRow, StatsView,
+    SiteDetail, SiteRow, StandaloneSiteRow, StatsView,
 };
 
 /// The navigation: key (for `aria-current`), path, label.
@@ -169,6 +169,8 @@ pub struct NetworksPage {
 pub struct SitesPage {
     pub shell: Shell,
     pub sites: Vec<SiteRow>,
+    /// `kind = "static"` apps that are not environments of a declared site (issue #548).
+    pub standalone: Vec<StandaloneSiteRow>,
 }
 
 #[derive(Template)]

@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use weglarka_api::{
-    DeclareSiteRequest, ListSitesResponse, PromoteRequest, PromoteResponse, SiteSummary, endpoints,
+    AppSummary, DeclareSiteRequest, ListAppsResponse, ListSitesResponse, PromoteRequest,
+    PromoteResponse, SiteSummary, endpoints,
 };
-use weglarka_model::app::Digest;
+use weglarka_model::app::{AppKind, Digest};
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
 
 use crate::commands::{DryRun, client, report_deploy};
@@ -127,11 +128,58 @@ fn sites_table(sites: &[SiteSummary]) -> String {
 }
 
 async fn list(json: bool, o: &Overrides) -> Result<i32, CliError> {
-    let resp: ListSitesResponse = client(o)?
-        .call(endpoints::SITES_LIST, &[], None::<&()>)
-        .await?;
-    emit(json, &resp, || sites_table(&resp.sites));
+    let c = client(o)?;
+    let (sites, apps) = tokio::join!(
+        c.call::<ListSitesResponse>(endpoints::SITES_LIST, &[], None::<&()>),
+        c.call::<ListAppsResponse>(endpoints::APPS_LIST, &[], None::<&()>),
+    );
+    let sites = sites?;
+    // The standalone section is additive: an apps call that fails (or a daemon that cannot answer
+    // it) leaves it out instead of failing the command.
+    let apps = apps.map(|l| l.apps).unwrap_or_default();
+    emit(json, &sites, || sites_list_text(&sites.sites, &apps));
     Ok(exit::OK)
+}
+
+/// `sites list`: the declared sites with their environments, then the `kind = "static"` apps that
+/// belong to no site, so an operator who moved a site to a plain static app still finds it here
+/// (issue #548).
+pub(crate) fn sites_list_text(sites: &[SiteSummary], apps: &[AppSummary]) -> String {
+    let standalone: Vec<AppSummary> = apps
+        .iter()
+        .filter(|a| a.kind == AppKind::Static && a.site.is_none())
+        .cloned()
+        .collect();
+    if sites.is_empty() && standalone.is_empty() {
+        return "no sites declared (see `weglarka sites declare --help`); a standalone `kind = \"static\"` app is listed here too\n"
+            .to_owned();
+    }
+    let mut out = sites_table(sites);
+    if !standalone.is_empty() {
+        out.push('\n');
+        out.push_str("standalone static sites (`kind = \"static\"`, no declared site):\n");
+        out.push_str(&standalone_table(&standalone));
+    }
+    out
+}
+
+fn standalone_table(apps: &[AppSummary]) -> String {
+    let rows: Vec<Vec<String>> = apps
+        .iter()
+        .map(|a| {
+            vec![
+                a.name.to_string(),
+                crate::update::runtime_label(a.runtime),
+                if a.domains.is_empty() {
+                    "-".to_owned()
+                } else {
+                    a.domains.join(",")
+                },
+                short(&a.digest),
+            ]
+        })
+        .collect();
+    table(&["NAME", "RUNTIME", "DOMAINS", "DIGEST"], &rows)
 }
 
 async fn show(json: bool, o: &Overrides, site: &str) -> Result<i32, CliError> {

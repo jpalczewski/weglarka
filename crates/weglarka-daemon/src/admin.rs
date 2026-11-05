@@ -403,6 +403,7 @@ async fn summaries<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<AppSummary>>
                 ),
                 digest: app_state.and_then(|s| s.current.clone()),
                 site: apps.origin(name).map(|o| format!("{}/{}", o.site, o.env)),
+                kind: spec.kind,
             }
         })
         .collect())
