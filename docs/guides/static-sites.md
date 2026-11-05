@@ -106,7 +106,10 @@ csp = "default-src 'self'"
   only `/about/` from `about/index.html`.
 - **`not_found_page`** is a path relative to the release root, like `index.html`; it must end in `.html`. The deploy
   gate rejects a release that does not have this file (fail closed, same rule as `index.html`), so `current` is
-  never switched to a release whose configured 404 page is missing.
+  never switched to a release whose configured 404 page is missing. An ingress-only `weglarka apps update` deploys
+  nothing, so it checks the same files against the release being served: naming a page that release lacks is
+  refused with a 400 (`the release blog currently serves cannot satisfy the new spec: …`) and nothing is written —
+  deploy a release that contains the file first (`weglarka deploy blog`), then add the option.
 - **`cache_immutable_paths`** gets `Cache-Control: public, max-age=31536000, immutable` — for a build's hashed
   asset directory (`_astro/`, `assets/`, …), never for `index.html`. **`cache_revalidate`** sends
   `Cache-Control: no-cache` for the rest of the site instead of nginx's own heuristic.

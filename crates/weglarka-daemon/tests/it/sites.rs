@@ -425,3 +425,84 @@ async fn apps_rollback_maps_every_refusal() {
     );
     h.running.stop().await;
 }
+
+// ── `apps update` against the served release (issue #501) ─────────────────────
+
+/// A static site whose served release is complete for its current spec: `index.html`, plus the
+/// `404.html` an added `not_found_page` names when `with_page` — `current` and `state.toml` agree.
+async fn served_release_harness(with_page: bool) -> Harness {
+    let builder = Builder::new().apps(BLOG_SITE);
+    let root = builder.root().to_owned();
+    let current = install_release_at(&root, 'b', "two");
+    if with_page {
+        let release = root.join("state/nginx/sites/blog/releases").join(&current);
+        std::fs::write(release.join("404.html"), "not found").unwrap();
+    }
+    write_blog_state(&root, Some('b'), None);
+    point_current_at(&root, &current);
+    builder.build().await
+}
+
+/// The `BLOG_SITE` spec as a full replacement (what `apps update` takes) adding `not_found_page`.
+fn blog_update_with_not_found_page() -> Value {
+    json!({ "spec": {
+        "kind": "static",
+        "image": "registry.example.com/me/blog:latest",
+        "domains": ["blog.example.com"],
+        "ingress": { "static": { "not_found_page": "/404.html" } }
+    }})
+}
+
+#[tokio::test]
+async fn an_ingress_only_update_is_refused_when_the_served_release_lacks_the_page() {
+    let h = served_release_harness(false).await;
+    let apps_toml = h.root.join("state/apps.toml");
+    let before = read(&apps_toml);
+
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/blog",
+        Some(blog_update_with_not_found_page()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("404.html"), "{body}");
+    assert!(message.contains("weglarka deploy blog"), "{body}");
+
+    // A refused update persists nothing: the spec is unchanged and the served release is untouched.
+    assert_eq!(read(&apps_toml), before);
+    let apps = state::load_apps(&apps_toml).unwrap();
+    let blog = apps.apps.get(&InstanceName::new("blog").unwrap()).unwrap();
+    assert!(blog.ingress.static_.is_none(), "{:?}", blog.ingress);
+    assert_eq!(
+        std::fs::read_to_string(blog_site(&h).join("current/index.html")).unwrap(),
+        "two"
+    );
+    h.running.stop().await;
+}
+
+#[tokio::test]
+async fn an_ingress_only_update_is_accepted_when_the_served_release_has_the_page() {
+    let h = served_release_harness(true).await;
+    let (status, body) = admin(
+        &h,
+        "PUT",
+        "/v1/apps/blog",
+        Some(blog_update_with_not_found_page()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let apps = state::load_apps(&h.root.join("state/apps.toml")).unwrap();
+    let blog = apps.apps.get(&InstanceName::new("blog").unwrap()).unwrap();
+    assert_eq!(
+        blog.ingress
+            .static_
+            .as_ref()
+            .and_then(|s| s.not_found_page.as_deref()),
+        Some("/404.html")
+    );
+    h.running.stop().await;
+}
