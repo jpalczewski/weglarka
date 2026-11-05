@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use weglarka_model::app::InstanceName;
-use weglarka_model::config::{IngressMode, wildcard_cert_stem, wildcard_covers};
+use weglarka_model::config::{CertChoice, IngressMode, choose_certificate, wildcard_cert_stem};
 
 use super::{ACME_CONTAINER_DIR, CERT_CONTAINER_DIR, PROBE_CONTAINER_DIR, PROBE_SOCKET};
 use crate::cdn::CdnTrust;
@@ -35,8 +35,12 @@ pub struct NginxOptions {
     pub certificates: Vec<Domain>,
     /// `edge`: apex domains with a wildcard pair (`_wildcard.<apex>.crt|key`, issue #97). A routed
     /// domain without a pair of its own is served with the wildcard of the apex that covers it (the
-    /// apex itself or one label below, [`wildcard_covers`]); a domain's own pair always wins.
+    /// apex itself or one label below, [`wildcard_covers`](weglarka_model::config::wildcard_covers));
+    /// a domain's own pair always wins unless [`Self::prefer_wildcard`] says otherwise.
     pub wildcard_certificates: Vec<Domain>,
+    /// `edge`: serve a covered domain with the wildcard pair even when the domain has a pair of its
+    /// own (issue #210). The own pair stays on disk as a fallback; `false` keeps "own pair wins".
+    pub prefer_wildcard: bool,
     /// `edge`: container path of the TLS material, mounted read-only (default [`CERT_CONTAINER_DIR`]).
     pub cert_dir: String,
     /// `edge`: container path of the ACME webroot (default [`ACME_CONTAINER_DIR`]).
@@ -68,17 +72,20 @@ pub struct NginxOptions {
 
 impl NginxOptions {
     /// File stem (`<domain>` or `_wildcard.<apex>`) of the certificate pair `domain` is served with
-    /// in `edge`: its own pair first, else the wildcard of the longest covering apex. `None` = no
-    /// TLS server for the domain (its handshake is refused, fail closed).
+    /// in `edge`: [`choose_certificate`] decides between its own pair, the wildcard of the longest
+    /// covering apex and [`Self::prefer_wildcard`]. `None` = no TLS server for the domain (its
+    /// handshake is refused, fail closed).
     pub fn certificate_stem(&self, domain: &Domain) -> Option<String> {
-        if self.certificates.contains(domain) {
-            return Some(domain.to_string());
-        }
-        self.wildcard_certificates
+        let own = self.certificates.contains(domain);
+        let wildcards: Vec<&str> = self
+            .wildcard_certificates
             .iter()
-            .filter(|apex| wildcard_covers(apex.as_str(), domain.as_str()))
-            .max_by_key(|apex| apex.as_str().len())
-            .map(|apex| wildcard_cert_stem(apex.as_str()))
+            .map(Domain::as_str)
+            .collect();
+        match choose_certificate(domain.as_str(), own, &wildcards, self.prefer_wildcard)? {
+            CertChoice::Own => Some(domain.to_string()),
+            CertChoice::Wildcard(apex) => Some(wildcard_cert_stem(apex)),
+        }
     }
 
     pub fn new(resolvers: Vec<IpAddr>) -> Self {
@@ -92,6 +99,7 @@ impl NginxOptions {
             app_max_body_bytes: 64 * 1024 * 1024,
             certificates: Vec::new(),
             wildcard_certificates: Vec::new(),
+            prefer_wildcard: false,
             cert_dir: CERT_CONTAINER_DIR.to_owned(),
             acme_webroot: ACME_CONTAINER_DIR.to_owned(),
             tls_fingerprint: None,

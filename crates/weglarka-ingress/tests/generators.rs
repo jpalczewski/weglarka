@@ -679,6 +679,16 @@ fn nginx_edge_wildcard_snapshot() {
 }
 
 #[test]
+fn nginx_edge_prefer_wildcard_snapshot() {
+    // The same own pair as above, but the knob lets the covering wildcard win (issue #210): the pair
+    // stays on disk as a fallback and only the served certificate changes.
+    let mut o = edge_wildcard_opts(&["blog.example.eu"], &["example.eu"]);
+    o.prefer_wildcard = true;
+    let conf = nginx::generate(&edge_host(), &apps(MANY_APPS), &o).unwrap();
+    insta::assert_snapshot!("nginx_edge_prefer_wildcard", conf);
+}
+
+#[test]
 fn edge_serves_a_covered_domain_with_the_wildcard_and_prefers_its_own_pair() {
     let conf = nginx::generate(
         &edge_host(),
