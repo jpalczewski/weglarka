@@ -73,19 +73,19 @@ docker run -d --name wg-auth-app --network "$net" --network-alias panel --networ
 docker run -d --name wg-auth-idp --network "$net" --network-alias authelia -v "$work:/srv:ro" \
   docker.io/library/python:3-alpine python3 -u /srv/idp.py >/dev/null
 docker volume create wg-auth-probe >/dev/null
-docker run -d --name wg-auth-nginx --network "$net" -p 127.0.0.1:18097:8080 \
+docker run -d --name wg-auth-nginx --network "$net" -p 127.0.0.1:18096:8080 \
   -v wg-auth-probe:/run/weglarka-probe -v wg-nginx-logs:/var/log/weglarka -v "$conf:/etc/nginx/nginx.conf:ro" docker.io/library/nginx:1-alpine >/dev/null
 
-# `GET http://127.0.0.1:18097<path>` as <host>; extra curl args follow. Prints "<code> <redirect url>" then the body.
+# `GET http://127.0.0.1:18096<path>` as <host>; extra curl args follow. Prints "<code> <redirect url>" then the body.
 call() { # host path extra curl args...
   local host=$1 path=$2; shift 2
   curl -sS -w '\n%{http_code} %{redirect_url}' -H "Host: $host" -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-For: 203.0.113.9' "$@" "http://127.0.0.1:18097$path" | tr -d '\r'
+    -H 'X-Forwarded-For: 203.0.113.9' "$@" "http://127.0.0.1:18096$path" | tr -d '\r'
 }
 status_line() { tail -n1 <<<"$1"; }
 
 for _ in $(seq 30); do
-  curl -fsS -o /dev/null -H 'Host: open.example.eu' http://127.0.0.1:18097/ 2>/dev/null && break
+  curl -fsS -o /dev/null -H 'Host: open.example.eu' http://127.0.0.1:18096/ 2>/dev/null && break
   sleep 1
 done
 
