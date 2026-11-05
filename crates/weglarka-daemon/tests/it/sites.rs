@@ -450,6 +450,30 @@ async fn a_static_site_that_does_not_serve_its_pinned_release_is_missing() {
     h.running.stop().await;
 }
 
+/// `GET /v1/apps` tells a standalone static app from a container app with `kind` (issue #548, the
+/// panel's sites page): a container omits the field, so its JSON is what it always was.
+#[tokio::test]
+async fn the_apps_list_names_a_static_kind_and_omits_it_for_a_container() {
+    let apps_toml = "[apps.web]\nimage = \"registry.example.com/me/web:1\"\ndomains = [\"web.example.com\"]\n\
+                     \n[apps.blog]\nkind = \"static\"\nimage = \"registry.example.com/me/blog:latest\"\n\
+                     domains = [\"blog.example.com\"]\n";
+    let h = Builder::new().apps(apps_toml).build().await;
+    let (status, list) = admin(&h, "GET", "/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let apps = list["apps"].as_array().unwrap();
+    let web = apps
+        .iter()
+        .find(|a| a["name"] == "web")
+        .expect("the container app is listed");
+    let blog = apps
+        .iter()
+        .find(|a| a["name"] == "blog")
+        .expect("the static app is listed");
+    assert!(web.get("kind").is_none(), "{web}");
+    assert_eq!(blog["kind"], "static", "{blog}");
+    h.running.stop().await;
+}
+
 // ── `apps rollback` (issue #103) ─────────────────────────────────────────────────
 
 fn digest_of(c: char) -> Digest {

@@ -2111,3 +2111,46 @@ fn host_is_a_global_flag_that_excludes_an_explicit_socket_flag() {
             .is_ok()
     );
 }
+
+// ---------- `sites list`: standalone `kind = "static"` apps (issue #548) ----------
+
+fn sites_and_apps() -> (
+    Vec<weglarka_api::SiteSummary>,
+    Vec<weglarka_api::AppSummary>,
+) {
+    let sites = serde_json::from_value(serde_json::json!([{
+        "name": "blog",
+        "image": "ghcr.io/example/blog",
+        "envs": [{
+            "env": "prod", "instance": "blog-prod", "track": "stable", "promote_from": null,
+            "domains": ["blog.example.com"], "current": format!("sha256:{}", "b".repeat(64)),
+            "previous": null
+        }]
+    }]))
+    .unwrap();
+    let apps = serde_json::from_value(serde_json::json!([
+        { "name": "web", "image": "ghcr.io/example/web:1", "domains": ["web.example.com"],
+          "runtime": "running" },
+        { "name": "docs", "image": "ghcr.io/example/docs:latest", "kind": "static",
+          "domains": ["docs.example.com"], "runtime": "serving",
+          "digest": format!("sha256:{}", "a".repeat(64)) },
+        { "name": "blog-prod", "image": "ghcr.io/example/blog:latest", "kind": "static",
+          "domains": ["blog.example.com"], "runtime": "serving", "site": "blog/prod" }
+    ]))
+    .unwrap();
+    (sites, apps)
+}
+
+#[test]
+fn sites_list_puts_standalone_static_apps_after_the_declared_sites() {
+    let (sites, apps) = sites_and_apps();
+    insta::assert_snapshot!(crate::sites::sites_list_text(&sites, &apps));
+}
+
+#[test]
+fn sites_list_says_where_a_standalone_static_app_is_when_nothing_is_declared() {
+    let text = crate::sites::sites_list_text(&[], &[]);
+    assert!(text.contains("no sites declared"), "{text}");
+    assert!(text.contains("kind = \"static\""), "{text}");
+    assert!(!text.contains("standalone static sites ("), "{text}");
+}

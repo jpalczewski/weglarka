@@ -2,7 +2,7 @@
 {% block title %}Sites · Węglarka{% endblock %}
 {% block content %}
     <h1>Sites and environments</h1>
-{% if sites.is_empty() %}    <p>No sites are declared.</p>
+{% if sites.is_empty() && standalone.is_empty() %}    <p>No sites are declared. A standalone <code>kind = "static"</code> app is listed here too.</p>
 {% endif %}{% for s in sites %}    <section>
       <h2><a href="/sites/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.image }}</span>{% if let Some(p) = s.pending %} {{ m::badge(p) }}{% endif %}</h2>
       <div class="scroll"><table>
@@ -13,4 +13,15 @@
 {% endfor %}        </tbody>
       </table></div>
     </section>
-{% endfor %}{% endblock %}
+{% endfor %}{% if !standalone.is_empty() %}    <section>
+      <h2>Standalone static sites</h2>
+      <p class="muted">Apps with <code>kind = "static"</code> that are not an environment of a declared site.</p>
+      <div class="scroll"><table>
+        <caption class="sr">Standalone static sites</caption>
+        <thead><tr><th scope="col">Name</th><th scope="col">State</th><th scope="col">Domains</th><th scope="col">Digest</th></tr></thead>
+        <tbody>
+{% for a in standalone %}          <tr><th scope="row"><a href="/apps/{{ a.name }}">{{ a.name }}</a></th><td>{{ m::badge(&a.runtime) }}</td><td>{{ a.domains }}</td><td><code>{{ a.digest }}</code></td></tr>
+{% endfor %}        </tbody>
+      </table></div>
+    </section>
+{% endif %}{% endblock %}

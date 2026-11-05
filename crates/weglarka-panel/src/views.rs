@@ -9,7 +9,7 @@ use weglarka_api::{
     HostMountStatus, NotifyStatusResponse, PromotionStatus, RuntimeState, ShowAppResponse,
     SiteEnvSummary, SiteSummary, StatsResponse, StatsRole,
 };
-use weglarka_model::app::Digest;
+use weglarka_model::app::{AppKind, Digest};
 use weglarka_model::events::Severity;
 use weglarka_model::units::human_bytes;
 
@@ -578,6 +578,30 @@ pub fn site_row(site: &SiteSummary) -> SiteRow {
             })
             .collect(),
     }
+}
+
+/// A `kind = "static"` app that is not an environment of a declared site. The sites page lists it
+/// too, so an operator who moved a site to a plain static app does not read the empty state as "the
+/// site is gone" (issue #548).
+#[derive(Debug)]
+pub struct StandaloneSiteRow {
+    pub name: String,
+    pub domains: String,
+    pub runtime: Badge,
+    pub digest: String,
+}
+
+/// The static apps without a site origin, in the daemon's order.
+pub fn standalone_sites(apps: &[AppSummary]) -> Vec<StandaloneSiteRow> {
+    apps.iter()
+        .filter(|a| a.kind == AppKind::Static && a.site.is_none())
+        .map(|a| StandaloneSiteRow {
+            name: a.name.to_string(),
+            domains: join_or_dash(&a.domains),
+            runtime: runtime_badge(a.runtime),
+            digest: digest_or_none(a.digest.as_ref()),
+        })
+        .collect()
 }
 
 /// One domain of an environment; a wildcard is shown but not linked.
