@@ -358,6 +358,7 @@ async fn self_update_state_appears_only_with_the_section_and_an_unreadable_file_
             message: "DISTINCTIVE signature refused".into(),
             digest: Some(digest('d')),
             at: 1_700_000_200,
+            ..Default::default()
         }),
         ..Default::default()
     };

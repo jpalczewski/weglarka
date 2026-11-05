@@ -184,6 +184,37 @@ async fn a_configured_self_update_without_a_recent_check_warns_about_the_timer()
     running.stop().await;
 }
 
+/// Issue #203: the switcher is a host binary older than this daemon, so it stops on the ADR 0023
+/// gate. That is a failure with a fix, not "the timer has not run recently".
+#[tokio::test]
+async fn a_switcher_stopped_by_a_newer_state_schema_fails_with_the_fix() {
+    let env = Env::new(SELF_UPDATE);
+    let mut state = SelfUpdateState::default();
+    state.record_stale_host_tools(
+        weglarka_model::state::SCHEMA_VERSION + 1,
+        weglarka_model::state::SCHEMA_VERSION,
+        None,
+        std::time::SystemTime::now(),
+    );
+    self_update::save(&env.state_dir(), &state).unwrap();
+
+    let running = env.start().await;
+    let report = doctor(&running).await;
+    let su = check(&report, "self_update");
+    assert_eq!(status(su), "fail", "{su}");
+    let message = su["message"].as_str().unwrap();
+    assert!(message.contains("host binaries"), "{message}");
+    assert!(message.contains("docs/install.md"), "{message}");
+    let hint = su["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("Host binaries"), "{hint}");
+    assert!(hint.contains("self-update.md"), "{hint}");
+    assert!(
+        !hint.contains("has not run recently"),
+        "the timer is not the problem: {hint}"
+    );
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn without_the_section_the_check_says_off() {
     let env = Env::new("");

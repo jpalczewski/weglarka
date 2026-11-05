@@ -21,7 +21,10 @@ paths:
   installed by `platform install`. Order: pull → signature verification (static cosign key from `cosign.pub` in the repo,
   `ring`, no Rekor/TUF) → schema gate (image label `io.weglarka.state-schema` vs `schema_version` in `state.toml`) →
   pin `repo@sha256:…` in the quadlet → `pending` in `<state dir>/self-update.toml` (tolerant, 0600) → restart; the
-  daemon confirms at startup and sets `current`/`previous`. The registry is public only (anonymous GHCR token), and
+  daemon confirms at startup and sets `current`/`previous`. The gate stops the switcher when the *host binaries* are
+  older than the state a newer daemon wrote; the stop is recorded (`host_tools_stale`, issue #203) and fails the
+  `doctor` check with the re-extraction step; the first switcher or watchdog run that reads the state again
+  clears it (`clear_stale_host_tools`). The registry is public only (anonymous GHCR token), and
   `[self_update]` in `weglarka.toml` breaks rollback to an older daemon.
 - **Automatic fallback (ADR 0034, #100):** the timer `weglarka-watchdog.timer` runs `weglarka-daemon supervise` every
   minute; if the new daemon does not answer `GET /v1/health` within `[self_update] fallback_timeout_secs` (default

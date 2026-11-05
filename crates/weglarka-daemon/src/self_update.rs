@@ -202,7 +202,14 @@ where
     let digest = pull_digest(podman, &config.image).await?;
     // Labels of the pulled image: the schema it writes and the state's own version.
     let image_schema = pulled_schema(podman, &config.image).await;
-    let state_schema = state_schema(settings)?;
+    // The ADR 0023 gate: a `state.toml` written by a newer daemon stops the switcher. It keeps
+    // stopping — but since issue #203 it records why (`doctor`, the journal) instead of returning a
+    // bare error that leaves no trace in `self-update.toml`.
+    let state_schema = match state_schema(settings) {
+        Ok(schema) => schema,
+        Err(e) => return refuse_newer_state(&state_dir, &mut st, e, now),
+    };
+    host_tools_fixed(&state_dir, &mut st)?;
 
     // `--force` is the documented override for the schema gate (a deliberate downgrade); it never
     // overrides the signature check.
@@ -346,7 +353,11 @@ where
     };
     // The schema gate only applies when the label is readable: an image that predates the label
     // counts as schema 0, and a downgrade across a bump would lose fields (`docs/decisions/0023`).
-    let state_schema = state_schema(settings)?;
+    let state_schema = match state_schema(settings) {
+        Ok(schema) => schema,
+        Err(e) => return refuse_newer_state(state_dir, st, e, now),
+    };
+    host_tools_fixed(state_dir, st)?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
         && !options.force
@@ -384,6 +395,54 @@ where
 fn state_schema(settings: &Settings) -> Result<u32, Error> {
     let state = state_files::load_state(&settings.paths.state.state)?;
     Ok(state.schema_version.unwrap_or(state_files::SCHEMA_VERSION))
+}
+
+/// The versions an ADR 0023 "written by a newer daemon" refusal carries, when that is what `error`
+/// is (issue #203).
+fn newer_state_schema(error: &Error) -> Option<(u32, u32)> {
+    match error {
+        Error::Store(state_files::StateError::SchemaTooNew {
+            found, supported, ..
+        }) => Some((*found, *supported)),
+        _ => None,
+    }
+}
+
+/// Clears a recorded host-tools stop once this binary reads the state again (issue #203): the
+/// operator refreshed the host binaries, so the `doctor` failure must not outlive the cause. Other
+/// errors stay — they are about a digest and are cleared by the run that resolves them.
+fn host_tools_fixed(state_dir: &Path, st: &mut SelfUpdateState) -> Result<(), Error> {
+    if st.clear_stale_host_tools() {
+        tracing::info!("self-update resumed: the host binaries read the state again");
+        state::save(state_dir, st)?;
+    }
+    Ok(())
+}
+
+/// Turns "`state.toml` is newer than this host binary" into a refusal that is written down
+/// (issue #203), and any other error into itself.
+///
+/// Stopping is the ADR 0023 gate and stays: the switcher is older than the daemon and cannot tell
+/// what the state needs. What was missing is the trace — the run returned before anything reached
+/// `self-update.toml`, so `doctor` blamed the timer. `Report::Refused` is non-zero, so the timer
+/// unit and the journal show the failure too.
+fn refuse_newer_state(
+    state_dir: &Path,
+    st: &mut SelfUpdateState,
+    error: Error,
+    now: SystemTime,
+) -> Result<Report, Error> {
+    let Some((found, supported)) = newer_state_schema(&error) else {
+        return Err(error);
+    };
+    let reason = st.record_stale_host_tools(found, supported, None, now);
+    state::save(state_dir, st)?;
+    tracing::error!(
+        state_schema = found,
+        supported_schema = supported,
+        "self-update stopped: the state is newer than the host binaries"
+    );
+    Ok(Report::Refused { reason })
 }
 
 /// `repo@sha256:…` — the service definition says exactly what runs, so a moving tag cannot change it.
@@ -743,7 +802,30 @@ where
         }
         Err(e) => return Err(Error::Podman(e)),
     };
-    let state_schema = state_schema(settings)?;
+    let state_schema = match state_schema(settings) {
+        Ok(schema) => schema,
+        Err(e) => {
+            let Some((found, supported)) = newer_state_schema(&e) else {
+                return Err(e);
+            };
+            // The fallback is blocked by the same gate as the switch (issue #203): report it where
+            // `doctor` and the watchdog unit can see it, once per distinct reason instead of every
+            // minute the watchdog wakes up.
+            let reason = weglarka_model::self_update::stale_host_tools_message(found, supported);
+            if !st
+                .error
+                .as_ref()
+                .is_some_and(|e| e.host_tools_stale && e.message == reason)
+            {
+                // `None`, like the switcher: the stop is about the host tools, not about
+                // `switch.to`, and a digest here would make `failed_for` refuse that image later.
+                st.record_stale_host_tools(found, supported, None, now);
+                state::save(state_dir, st)?;
+            }
+            return Ok(WatchReport::GivenUp { reason });
+        }
+    };
+    host_tools_fixed(state_dir, st)?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
     {
@@ -1325,22 +1407,144 @@ dir = "{root}/state"
     }
 
     #[tokio::test]
-    async fn a_state_from_a_newer_daemon_stops_the_switcher() {
+    async fn a_state_from_a_newer_daemon_stops_the_switcher_and_says_so() {
         let ctx = Ctx::new(true);
-        // A state.toml written by a newer daemon: this binary must not act on it (ADR 0023).
+        // A state.toml written by a newer daemon: this binary must not act on it (ADR 0023) — and,
+        // since issue #203, the stop is recorded instead of vanishing before `self-update.toml`.
         std::fs::write(&ctx.settings.paths.state.state, "schema_version = 99\n").unwrap();
-        let err = run(
-            &ctx.podman,
-            &ctx.registry,
-            &ctx.platform,
-            &ctx.settings,
-            Options::default(),
-            ctx.now,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("99"), "{err}");
+        let report = ctx.run(Options::default()).await;
+        match &report {
+            Report::Refused { reason } => {
+                assert!(reason.contains("99"), "{reason}");
+                assert!(reason.contains("docs/guides/self-update.md"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            !report.is_success(),
+            "the timer unit must show a failed run"
+        );
+        assert!(ctx.platform.installed_images().is_empty());
         assert_eq!(ctx.platform.restarts(), 0);
+
+        let state = ctx.state();
+        assert_eq!(
+            state.checked_at,
+            Some(state::secs(ctx.now)),
+            "the check happened, so it is no longer `stale`"
+        );
+        let error = state.error.expect("the stop is recorded for doctor");
+        assert!(error.host_tools_stale, "doctor has to tell this apart");
+        assert_eq!(error.at, state::secs(ctx.now));
+        assert_eq!(error.digest, None, "the refusal is about the host tools");
+        assert!(error.message.contains("99"), "{}", error.message);
+        assert!(
+            error
+                .message
+                .contains(&weglarka_model::state::SCHEMA_VERSION.to_string()),
+            "both schema versions are named: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("docs/install.md"),
+            "the remedy is cited: {}",
+            error.message
+        );
+    }
+
+    /// The normal #203 recovery: the operator installs the new host binaries and runs `--check`;
+    /// the image is the one already running (`UpToDate`), and the stop must not outlive its cause.
+    #[tokio::test]
+    async fn a_fixed_host_clears_the_recorded_stop() {
+        let ctx = Ctx::new(true);
+        std::fs::write(&ctx.settings.paths.state.state, "schema_version = 99\n").unwrap();
+        assert!(matches!(
+            ctx.run(Options::default()).await,
+            Report::Refused { .. }
+        ));
+        assert!(ctx.state().error.is_some_and(|e| e.host_tools_stale));
+
+        // New host binaries: the state is readable again. The pulled digest is already `current`.
+        std::fs::remove_file(&ctx.settings.paths.state.state).unwrap();
+        let running = digest_of('a');
+        ctx.pulled_digest(&running);
+        let mut st = ctx.state();
+        st.current = Some(running);
+        ctx.save_state(&st);
+        let report = ctx
+            .run(Options {
+                check: true,
+                ..Options::default()
+            })
+            .await;
+        assert!(matches!(report, Report::UpToDate { .. }), "{report:?}");
+        assert_eq!(
+            ctx.state().error,
+            None,
+            "the stop is cleared by a readable state"
+        );
+    }
+
+    /// A refusal about a digest is not touched by the host-tools clean-up.
+    #[test]
+    fn only_the_host_tools_stop_is_cleared() {
+        let mut st = SelfUpdateState::default();
+        st.record_error(
+            "unsigned image",
+            Some(digest_of('c')),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(!st.clear_stale_host_tools());
+        assert!(st.error.is_some());
+        st.record_stale_host_tools(99, 1, None, SystemTime::UNIX_EPOCH);
+        assert!(st.clear_stale_host_tools());
+        assert_eq!(st.error, None);
+    }
+
+    #[tokio::test]
+    async fn a_newer_state_stops_the_watchdog_fallback_and_reports_it() {
+        let ctx = Ctx::new(true);
+        let before = digest_of('a');
+        let switch_to = digest_of('b');
+        // The fallback target is in the local store, so the run reaches the schema gate.
+        ctx.pull_image(&before).await;
+        let st = switch_state(
+            &ctx,
+            Some(before.clone()),
+            &switch_to,
+            Duration::from_secs(600),
+        );
+        ctx.save_state(&st);
+        std::fs::write(&ctx.settings.paths.state.state, "schema_version = 99\n").unwrap();
+
+        match ctx.watch(false).await {
+            WatchReport::GivenUp { reason } => {
+                assert!(reason.contains("99"), "{reason}");
+                assert!(reason.contains("docs/guides/self-update.md"), "{reason}");
+            }
+            other => panic!("expected a give-up, got {other:?}"),
+        }
+        assert!(ctx.platform.installed_images().is_empty());
+        assert_eq!(ctx.platform.restarts(), 0);
+        let error = ctx.state().error.expect("the stop is recorded");
+        assert!(error.host_tools_stale);
+        assert_eq!(
+            error.digest, None,
+            "the stop is not about the switched-to image"
+        );
+        assert!(!ctx.state().failed_for(&switch_to));
+
+        // The watchdog wakes every minute; a second run must not rewrite the file for the same
+        // reason.
+        let saved = std::fs::read(state::path(&ctx.settings.paths.state_dir)).unwrap();
+        assert!(matches!(
+            ctx.watch(false).await,
+            WatchReport::GivenUp { .. }
+        ));
+        assert_eq!(
+            std::fs::read(state::path(&ctx.settings.paths.state_dir)).unwrap(),
+            saved
+        );
     }
 
     #[tokio::test]
