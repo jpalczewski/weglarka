@@ -67,8 +67,7 @@ audience = ["https://app.example.com/mcp"]
 ```
 
 The comparison is byte for byte and the metadata's `resource` has **no trailing slash**: `…/mcp/` is a different
-resource and does not match. Only one string per resource URL is needed — a client id is shared by every
-resource it may ask for.
+resource and does not match.
 
 ## Validation rules and limits
 
