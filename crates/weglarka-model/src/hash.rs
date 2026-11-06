@@ -76,6 +76,11 @@ struct HashInput<'a> {
     /// outside any group hashes exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shared_networks: Vec<HashSharedNetwork<'a>>,
+    /// Shared-service membership (#590): the member gets the service's network, env and a secret,
+    /// so a change recreates the container. Sorted (the order is not meaningful) and skipped while
+    /// empty, so an app that is no member hashes exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shared_services: Vec<&'a crate::shared_services::ServiceName>,
     /// The container's command (issue #79): arguments to the image's entrypoint, so a change — the
     /// argument order included — recreates the container. Appended last and skipped while empty, so
     /// an app without a command hashes exactly as before (the format version stays v1).
@@ -194,6 +199,10 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         })
         .collect();
     shared_networks.sort_by(|a, b| a.name.cmp(b.name));
+    let mut shared_services: Vec<&crate::shared_services::ServiceName> =
+        spec.shared_services.iter().collect();
+    shared_services.sort_unstable();
+    shared_services.dedup();
     let mut internal_hosts: Vec<&str> = spec.internal_hosts.iter().map(String::as_str).collect();
     internal_hosts.sort_unstable();
     internal_hosts.dedup();
@@ -210,6 +219,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         host_ports,
         shared_volumes,
         shared_networks,
+        shared_services,
         command: &spec.command,
         configs,
         host_mounts,

@@ -116,6 +116,7 @@ mod tests {
             instance: InstanceName::new("auth").unwrap(),
             issuer: "https://auth.example.org:8443".to_owned(),
             upstream: None,
+            session_store: None,
         });
         let apps = apps(&[(
             "git",

@@ -10,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::environments::{SiteName, SiteOrigin, SiteSpec};
+use crate::shared_services::{ServiceName, SharedServiceSpec};
 
 /// Instance name (key in `apps.toml`). Instance ≠ image: one image can have many instances.
 /// Allowed `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen (safe as a container, network and
@@ -1230,6 +1231,12 @@ pub struct AppSpec {
     /// while set, because it changes the container's networks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_networks: Vec<SharedNetworkRef>,
+    /// Shared services this instance is a member of (#590, contract in #593): declared in
+    /// `AppsFile::shared_services`. v1 accepts only the bare name; a table form is reserved. Outside
+    /// the spec hash while empty; a non-empty list changes it (the member gets a network, env and a
+    /// secret). Not enabled yet: a non-empty list is rejected by validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_services: Vec<ServiceName>,
     /// Ports published directly on the host (issue #34); the ingress keeps routing `domains`/`port`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPort>,
@@ -1361,6 +1368,9 @@ pub struct AppsFile {
     /// Networks shared by groups of instances (issue #128), declared once here and joined through
     /// [`AppSpec::shared_networks`].
     pub shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
+    /// Shared services (#590, contract in #593), declared once here and joined through
+    /// [`AppSpec::shared_services`]. Not enabled yet: any declaration is rejected by validation.
+    pub shared_services: BTreeMap<ServiceName, SharedServiceSpec>,
     /// Sites with environments (issue #205). Their environments are also present in `apps`, listed
     /// in `origins`.
     pub sites: BTreeMap<SiteName, SiteSpec>,
@@ -1418,6 +1428,8 @@ pub struct RawAppsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     shared_networks: BTreeMap<SharedNetworkName, SharedNetworkSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    shared_services: BTreeMap<ServiceName, SharedServiceSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     sites: BTreeMap<SiteName, SiteSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     oidc_clients: BTreeMap<ClientId, ExternalClientSpec>,
@@ -1433,6 +1445,7 @@ impl TryFrom<RawAppsFile> for AppsFile {
             schema_version: raw.schema_version,
             shared_volumes: raw.shared_volumes,
             shared_networks: raw.shared_networks,
+            shared_services: raw.shared_services,
             oidc_clients: raw.oidc_clients,
             apps: raw.apps,
             ..AppsFile::default()
@@ -1449,6 +1462,7 @@ impl From<AppsFile> for RawAppsFile {
             schema_version: file.schema_version,
             shared_volumes: file.shared_volumes,
             shared_networks: file.shared_networks,
+            shared_services: file.shared_services,
             sites: file.sites,
             oidc_clients: file.oidc_clients,
             apps,

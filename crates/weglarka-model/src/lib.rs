@@ -38,6 +38,7 @@ pub mod secrets;
 /// Self-update bookkeeping shared by the daemon and the host-side switcher (issue #99).
 pub mod self_update;
 pub mod shared_networks;
+pub mod shared_services;
 pub mod shared_volumes;
 pub mod size_limit;
 pub mod state;

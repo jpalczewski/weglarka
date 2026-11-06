@@ -290,6 +290,8 @@ fn identity_view(identity: &IdentityConfig) -> IdentityView {
         issuer,
         // Internal network topology.
         upstream,
+        // #590: gated; the view gains it with the identity PR of #593.
+        session_store: _,
     } = identity;
     IdentityView {
         provider: *provider,

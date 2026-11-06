@@ -385,6 +385,10 @@ pub struct IdentityConfig {
     /// Address nginx uses to reach the provider on its network (`host:port`); unset = `<instance>:<port>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
+    /// A `[shared_services]` entry of `apps.toml` (a durable Redis) that keeps the provider's
+    /// sessions (#590, contract in #593). Not enabled yet: any value is rejected by validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store: Option<crate::shared_services::ServiceName>,
 }
 
 /// Identity provider adapters.
