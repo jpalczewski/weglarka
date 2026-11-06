@@ -57,7 +57,11 @@ If the new image does not start at all, a manual pin also works:
 
 ### Switcher stopped after an upgrade that raised the state schema
 
-A self-update replaces the **image**; the `weglarka-daemon` binary the timers run is host-side and is not replaced with it (that handoff is [ADR 0067](../decisions/0067-managed-images-and-platform-updates.md) work, issue #203). When the new image raises `state::SCHEMA_VERSION`, the older host binaries cannot read `state.toml` any more and stop:
+A self-update replaces the **image**; the `weglarka-daemon` binary the timers run is host-side and is not replaced with it (that handoff is [ADR 0067](../decisions/0067-managed-images-and-platform-updates.md) work, issue #203).
+
+**Host binaries from this release on keep updating across schema bumps:** the switcher and the watchdog read only the `schema_version` header of `state.toml` and compare it with the image label (issue #616), so a state written by a newer daemon is an ordinary update as long as the new image writes at least that schema; the journal then logs "the state is newer than this host binary; comparing only its schema header". The gate itself is unchanged: an image below the state's schema is still refused as a downgrade. The rest of this section is for hosts whose host binaries **predate** that change — they need one manual refresh, after which this does not recur.
+
+When the new image raises `state::SCHEMA_VERSION`, such older host binaries cannot read `state.toml` any more and stop:
 
 - `weglarka-self-update.service` fails; the journal shows "self-update stopped: the state is newer than the host binaries" and the run's result "refused: the state files are at schema N, but the host binaries support only schema M …" (a host binary from before this reporting prints "schema version N is newer than this daemon supports (M)" instead);
 - `self-update.toml` records the stop with `host_tools_stale = true` — "the state files are at schema N, but the host binaries support only schema M …";
