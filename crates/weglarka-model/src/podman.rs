@@ -325,10 +325,22 @@ pub struct VolumeInfo {
     pub mountpoint: Option<String>,
 }
 
+/// Selects objects carrying every listed label (`k=v`); an empty filter selects everything.
+/// libpod receives it as `filters={"label":["k=v",...]}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VolumeFilter {
+pub struct LabelFilter {
     pub labels: BTreeMap<String, String>,
 }
+
+impl LabelFilter {
+    /// Whether an object with `labels` passes the filter — the rule libpod applies server-side.
+    pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.labels.iter().all(|(k, v)| labels.get(k) == Some(v))
+    }
+}
+
+/// Filter of [`PodmanClient::volume_list`].
+pub type VolumeFilter = LabelFilter;
 
 /// Tar bytes in transit (volume import/export): streamed so a large volume never sits in RAM.
 pub type TarStream = BoxStream<'static, Result<Bytes>>;
@@ -563,10 +575,8 @@ pub struct NetworkInfo {
     pub subnets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ContainerFilter {
-    pub labels: BTreeMap<String, String>,
-}
+/// Filter of [`PodmanClient::container_list`].
+pub type ContainerFilter = LabelFilter;
 
 /// libpod client. `Send + Sync`, cheaply cloned via `Arc` on the caller's side.
 pub trait PodmanClient: Send + Sync {
@@ -771,7 +781,31 @@ impl<T> PodmanResultExt<T> for std::result::Result<T, PodmanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PodmanError, PodmanResultExt, RegistryAuth, image_repo};
+    use std::collections::BTreeMap;
+
+    use super::{LabelFilter, PodmanError, PodmanResultExt, RegistryAuth, image_repo};
+
+    #[test]
+    fn label_filter_needs_every_label_and_empty_matches_all() {
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let object = labels(&[("weglarka.instance", "ntfy"), ("weglarka.role", "app")]);
+        assert!(LabelFilter::default().matches(&object));
+        let filter = LabelFilter {
+            labels: labels(&[("weglarka.instance", "ntfy")]),
+        };
+        assert!(filter.matches(&object));
+        assert!(!filter.matches(&labels(&[("weglarka.instance", "other")])));
+        assert!(!filter.matches(&labels(&[])));
+        let both = LabelFilter {
+            labels: labels(&[("weglarka.instance", "ntfy"), ("weglarka.role", "db")]),
+        };
+        assert!(!both.matches(&object));
+    }
 
     #[test]
     fn registry_auth_parses_user_colon_password_and_hides_the_password() {

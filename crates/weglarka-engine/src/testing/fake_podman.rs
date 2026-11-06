@@ -1042,12 +1042,7 @@ impl PodmanClient for FakePodman {
         s.list_calls += 1;
         Ok(s.containers
             .values()
-            .filter(|c| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(k, v)| c.labels.get(k) == Some(v))
-            })
+            .filter(|c| filter.matches(&c.labels))
             .map(|c| s.with_networks(c))
             .collect())
     }
@@ -1473,12 +1468,7 @@ impl PodmanClient for FakePodman {
             .volumes
             .values()
             .map(|(v, _)| v)
-            .filter(|v| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(k, val)| v.labels.get(k) == Some(val))
-            })
+            .filter(|v| filter.matches(&v.labels))
             .cloned()
             .collect())
     }
