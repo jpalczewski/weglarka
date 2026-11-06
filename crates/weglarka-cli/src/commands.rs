@@ -14,9 +14,7 @@ use weglarka_api::{
     ReloadRequest, ReloadResponse, ReservationView, RollbackResponse, SecretInfo, SetSecretRequest,
     ShowAppResponse, StatusResponse,
 };
-use weglarka_model::app::{
-    AppIngress, AppSpec, Digest, HealthGate, InstanceName, SecretBinding, SecretTarget,
-};
+use weglarka_model::app::{AppIngress, AppSpec, Digest, HealthGate, InstanceName};
 use weglarka_model::secret_store::valid_secret_name;
 use weglarka_model::units::human_bytes;
 
@@ -182,24 +180,6 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
         .image
         .clone()
         .ok_or_else(|| CliError::usage("image is required unless --spec is given"))?;
-    let mut secrets = Vec::new();
-    for (secret, var) in &a.secret_env {
-        secrets.push(SecretBinding {
-            secret: secret.clone(),
-            target: SecretTarget::Env { var: var.clone() },
-        });
-    }
-    for (secret, path) in &a.secret_mount {
-        secrets.push(SecretBinding {
-            secret: secret.clone(),
-            target: SecretTarget::Mount {
-                path: path.clone(),
-                mode: None,
-                uid: None,
-                gid: None,
-            },
-        });
-    }
     let mut spec = AppSpec {
         kind: Default::default(),
         image,
@@ -216,8 +196,8 @@ pub(crate) fn build_spec(a: &AddArgs) -> Result<AppSpec, CliError> {
             oauth_resources: a.oauth_resources.clone(),
             ..Default::default()
         },
-        env: a.env.iter().cloned().collect(),
-        secrets,
+        env: a.env_flags.env.iter().cloned().collect(),
+        secrets: a.env_flags.bindings().collect(),
         health: HealthGate::default(),
         volumes: vec![],
         shared_volumes: vec![],

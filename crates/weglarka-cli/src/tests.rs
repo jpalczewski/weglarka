@@ -1557,21 +1557,24 @@ async fn start_stop_noop_sends_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn start_dry_run_sends_nothing() {
-    let get = serde_json::to_string(&show_app(false)).unwrap();
-    let m = mock(move |_, _| (200, get.clone())).await;
-    let code = apps_start(
-        true,
-        &overrides(&m),
-        StartStopArgs {
-            name: "ntfy".into(),
-            dry_run: true,
-            wait: Default::default(),
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, exit::OK);
-    assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+    // A real flip and a no-op (`apps update`'s order: the dry run comes before the no-op check).
+    for start in [false, true] {
+        let get = serde_json::to_string(&show_app(start)).unwrap();
+        let m = mock(move |_, _| (200, get.clone())).await;
+        let code = apps_start(
+            true,
+            &overrides(&m),
+            StartStopArgs {
+                name: "ntfy".into(),
+                dry_run: true,
+                wait: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, exit::OK);
+        assert!(m.seen.lock().unwrap().iter().all(|s| s.method == "GET"));
+    }
 }
 
 // ---------- apps remove / secrets remove (issue #80) ----------
