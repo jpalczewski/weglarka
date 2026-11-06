@@ -121,6 +121,115 @@ impl fmt::Debug for Pbkdf2Digest {
     }
 }
 
+/// Redis ACL password digest (#591, managed Redis contract in #593): 64 lower-case hex characters of
+/// SHA-256 over the password bytes, written into `users.acl` as `#<hex>`. Unsalted on purpose: the
+/// minted values are high-entropy, and no operator-chosen password ever gets this digest.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedisAclSha256(String);
+
+impl RedisAclSha256 {
+    /// Digest of `password` (known-answer tests, minting).
+    pub fn derive(password: &[u8]) -> Self {
+        let _ = password;
+        todo!("#591: SHA-256, lower-case hex")
+    }
+
+    /// Validates the shape of a stored digest (`name` only labels the error, never the value).
+    pub fn parse(name: &str, s: &str) -> Result<Self, SecretError> {
+        let _ = (name, s);
+        todo!("#591: 64 lower-case hex characters")
+    }
+}
+
+impl fmt::Display for RedisAclSha256 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for RedisAclSha256 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RedisAclSha256(sha256)")
+    }
+}
+
+/// SCRAM iteration count of a [`ScramSha256Verifier`] (Postgres' default, RFC 7677's example).
+pub const SCRAM_ITERATIONS: u32 = 4096;
+/// Salt length of a [`ScramSha256Verifier`].
+pub const SCRAM_SALT_LEN: usize = 16;
+
+/// SCRAM-SHA-256 verifier in the form Postgres stores (#591, managed Postgres contract in #596):
+/// `SCRAM-SHA-256$<iter>:<salt b64>$<StoredKey b64>:<ServerKey b64>` (RFC 5802/7677, standard
+/// base64 with padding). A random salt per mint; the verifier is stored next to the value, so the
+/// same secret renders the same bytes until it is minted again or rotated.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScramSha256Verifier(String);
+
+impl ScramSha256Verifier {
+    /// Derives the verifier of `password` with an explicit salt (known-answer tests, minting).
+    pub fn derive(password: &[u8], salt: &[u8], iterations: u32) -> Self {
+        let _ = (password, salt, iterations);
+        todo!("#591: SaltedPassword = PBKDF2-HMAC-SHA256; ClientKey/StoredKey/ServerKey")
+    }
+
+    /// Validates the shape of a stored verifier (`name` only labels the error, never the value).
+    pub fn parse(name: &str, s: &str) -> Result<Self, SecretError> {
+        let _ = (name, s);
+        todo!("#591: prefix, iterations, 16-byte salt, two 32-byte keys")
+    }
+}
+
+impl fmt::Display for ScramSha256Verifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for ScramSha256Verifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ScramSha256Verifier(scram-sha-256)")
+    }
+}
+
+/// Which digest a consumer stores for a minted secret: one kind per consumer (#591).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestKind {
+    /// Authelia (`$pbkdf2-sha512$…`).
+    Pbkdf2Sha512,
+    /// Redis ACL files (`#<sha256 hex>`).
+    RedisAclSha256,
+    /// Postgres roles (`SCRAM-SHA-256$…`).
+    ScramSha256,
+}
+
+/// A digest of one of the [`DigestKind`]s. `Display` is the stored form; `Debug` names the kind only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Digest {
+    Pbkdf2(Pbkdf2Digest),
+    RedisAcl(RedisAclSha256),
+    Scram(ScramSha256Verifier),
+}
+
+impl Digest {
+    pub fn kind(&self) -> DigestKind {
+        match self {
+            Self::Pbkdf2(_) => DigestKind::Pbkdf2Sha512,
+            Self::RedisAcl(_) => DigestKind::RedisAclSha256,
+            Self::Scram(_) => DigestKind::ScramSha256,
+        }
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pbkdf2(d) => d.fmt(f),
+            Self::RedisAcl(d) => d.fmt(f),
+            Self::Scram(d) => d.fmt(f),
+        }
+    }
+}
+
 /// Operations on secrets that never return the value. Synchronous and dyn-safe, like [`SecretStore`].
 pub trait SecretOps: Send + Sync {
     /// Idempotent: when `name` is absent draws a random value from `spec` and stores it with its
@@ -131,6 +240,24 @@ pub trait SecretOps: Send + Sync {
     /// The stored digest of a minted secret, `None` when it was not minted. Reads the digest entry
     /// only: a digest-only orphan (value removed out of band) still yields `Some`.
     fn digest(&self, name: &str) -> Result<Option<Pbkdf2Digest>, SecretError>;
+    /// [`SecretOps::mint_hashed`] for any [`DigestKind`] (#591). A stored digest of another kind is
+    /// an error, never silently replaced.
+    fn mint_digest(
+        &self,
+        name: &str,
+        spec: &MintSpec,
+        kind: DigestKind,
+    ) -> Result<Digest, SecretError>;
+    /// [`SecretOps::rotate_hashed`] for any [`DigestKind`] (#591).
+    fn rotate_digest(
+        &self,
+        name: &str,
+        spec: &MintSpec,
+        kind: DigestKind,
+    ) -> Result<Digest, SecretError>;
+    /// [`SecretOps::digest`] for any [`DigestKind`] (#591): `None` when not minted, an error when
+    /// the stored digest is of another kind or malformed.
+    fn stored_digest(&self, name: &str, kind: DigestKind) -> Result<Option<Digest>, SecretError>;
 }
 
 /// Where the digest of `name` lives: `<scope>.<stem>-digest` for `<scope>.<stem>-secret`, else
@@ -213,6 +340,31 @@ impl<S: SecretStore + ?Sized> SecretOps for S {
                 Pbkdf2Digest::parse(&dname, s)
             })
             .transpose()
+    }
+
+    fn mint_digest(
+        &self,
+        name: &str,
+        spec: &MintSpec,
+        kind: DigestKind,
+    ) -> Result<Digest, SecretError> {
+        let _ = (name, spec, kind);
+        todo!("#591")
+    }
+
+    fn rotate_digest(
+        &self,
+        name: &str,
+        spec: &MintSpec,
+        kind: DigestKind,
+    ) -> Result<Digest, SecretError> {
+        let _ = (name, spec, kind);
+        todo!("#591")
+    }
+
+    fn stored_digest(&self, name: &str, kind: DigestKind) -> Result<Option<Digest>, SecretError> {
+        let _ = (name, kind);
+        todo!("#591")
     }
 }
 
