@@ -25,6 +25,7 @@ maxmemory = "64mb"
 
 [apps.cache-redis]
 image = "docker.io/library/redis:7.4"
+auto_update = false
 start = false
 
 [apps.worker]
