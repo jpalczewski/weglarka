@@ -68,6 +68,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `apps.toml`, apps | `depends_on` entries | [dependencies](dependencies.md) |
 | `apps.toml`, apps | `shared_volumes` entries; the `[shared_volumes]` section; the `shared_volumes` section in `state.toml` | [shared volumes](shared-volumes.md) |
 | `apps.toml`, apps | `shared_networks` entries; the `[shared_networks.<name>]` declarations | [shared networks](shared-networks.md) |
+| `apps.toml`, apps | `shared_services` entries; the `[shared_services.<name>]` declarations | [state schema version](state-schema.md) |
 | `apps.toml`, apps | `strategy` (`weglarka apps update <app> --strategy recreate`, then remove the key) | [blue-green deploys](blue-green.md) |
 | `apps.toml`, apps | `command` | [container command](container-command.md) |
 | `apps.toml`, apps | `host_ports` | [host ports](host-ports.md) |
@@ -139,5 +140,7 @@ Notes:
   [state schema version](state-schema.md).
 - `weglarka.toml` sections that are not part of the state schema (`[notify]`, `[monitor]`, `[self_update]`,
   `[acme]`, `[acme.dns]`, `[ingress.cdn]`, `[webhook.forgejo]`, `[admin.http]`) are not covered by `schema_version`; they always have to be removed by hand.
+  The same holds for `[identity] session_store` (#590): shared services are gated, so no daemon writes the key, but a
+  hand-edited line has to go before a downgrade.
 - Settings that need no action: webhook delivery dedup (`webhook-deliveries.toml`) is ignored by an older daemon,
   and `weglarka run` ([one-off commands](one-off-commands.md)) writes no state.

@@ -476,6 +476,8 @@ fn read_spec(spec: AppSpec) -> AppSpec {
         volumes,
         shared_volumes,
         shared_networks,
+        // #590: service names the model validates (the instance-name alphabet), never a secret.
+        shared_services,
         host_ports,
         depends_on,
         resources,
@@ -513,6 +515,7 @@ fn read_spec(spec: AppSpec) -> AppSpec {
             .into_iter()
             .map(read_shared_network)
             .collect(),
+        shared_services,
         host_ports: host_ports.into_iter().map(read_host_port).collect(),
         depends_on,
         resources: read_resources(resources),

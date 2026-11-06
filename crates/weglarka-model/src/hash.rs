@@ -76,6 +76,11 @@ struct HashInput<'a> {
     /// outside any group hashes exactly as before (the format version stays v1).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shared_networks: Vec<HashSharedNetwork<'a>>,
+    /// Shared-service membership (#590): the member gets the service's network, env and a secret,
+    /// so a change recreates the container. Sorted (the order is not meaningful) and skipped while
+    /// empty, so an app that is no member hashes exactly as before (the format version stays v1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shared_services: Vec<&'a crate::shared_services::ServiceName>,
     /// The container's command (issue #79): arguments to the image's entrypoint, so a change — the
     /// argument order included — recreates the container. Appended last and skipped while empty, so
     /// an app without a command hashes exactly as before (the format version stays v1).
@@ -194,6 +199,10 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         })
         .collect();
     shared_networks.sort_by(|a, b| a.name.cmp(b.name));
+    let mut shared_services: Vec<&crate::shared_services::ServiceName> =
+        spec.shared_services.iter().collect();
+    shared_services.sort_unstable();
+    shared_services.dedup();
     let mut internal_hosts: Vec<&str> = spec.internal_hosts.iter().map(String::as_str).collect();
     internal_hosts.sort_unstable();
     internal_hosts.dedup();
@@ -210,6 +219,7 @@ pub fn spec_hash(spec: &AppSpec, image_digest: &Digest) -> SpecHash {
         host_ports,
         shared_volumes,
         shared_networks,
+        shared_services,
         command: &spec.command,
         configs,
         host_mounts,
@@ -871,6 +881,74 @@ env = { B = "2", A = "1" }
             hash(Some(1000), Some(1000)),
             hash(Some(1001), Some(1000)),
             "the owner id is part of the container"
+        );
+    }
+
+    /// `shared_services` (#590) is skipped while empty, so an app that is no member of any service
+    /// hashes exactly as before the field existed (the golden value above stays untouched).
+    #[test]
+    fn unset_shared_services_does_not_change_the_hash() {
+        let base = spec_hash(&spec(), &digest('a'));
+        let mut empty = spec();
+        empty.shared_services = Vec::new();
+        assert_eq!(
+            base,
+            spec_hash(&empty, &digest('a')),
+            "an empty list must not change the hash"
+        );
+
+        // An explicitly written empty list means the same spec as an absent field.
+        let absent: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
+        let written: AppSpec = toml::from_str("image = \"x:1\"\nshared_services = []\n").unwrap();
+        assert_eq!(absent, written);
+        assert_eq!(
+            spec_hash(&absent, &digest('a')),
+            spec_hash(&written, &digest('a'))
+        );
+    }
+
+    #[test]
+    fn shared_service_membership_is_a_container_setting() {
+        use crate::shared_services::ServiceName;
+        let base = spec_hash(&spec(), &digest('a'));
+        let hash = |f: &dyn Fn(&mut AppSpec)| {
+            let mut s = spec();
+            f(&mut s);
+            spec_hash(&s, &digest('a'))
+        };
+        let service = |name: &str| ServiceName::new(name).unwrap();
+
+        assert_eq!(base, hash(&|_| {}), "no membership hashes as before");
+        let one = hash(&|s| s.shared_services.push(service("a")));
+        assert_ne!(
+            base, one,
+            "the member gets the service's network, env and a secret"
+        );
+        assert_ne!(
+            one,
+            hash(&|s| s.shared_services.push(service("b"))),
+            "which service the instance is a member of is part of the container"
+        );
+
+        // The order in the spec is not meaningful.
+        let forward = hash(&|s| {
+            s.shared_services.push(service("a"));
+            s.shared_services.push(service("b"));
+        });
+        let backward = hash(&|s| {
+            s.shared_services.push(service("b"));
+            s.shared_services.push(service("a"));
+        });
+        assert_eq!(forward, backward);
+        assert_ne!(one, forward, "a second membership is a different container");
+
+        // A repeated name is the same membership, not a second one.
+        assert_eq!(
+            one,
+            hash(&|s| {
+                s.shared_services.push(service("a"));
+                s.shared_services.push(service("a"));
+            })
         );
     }
 }
