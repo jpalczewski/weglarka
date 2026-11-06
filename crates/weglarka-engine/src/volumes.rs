@@ -210,15 +210,6 @@ pub fn attachments(instance: &InstanceName, spec: &AppSpec) -> Vec<VolumeAttachm
     private.chain(shared).collect()
 }
 
-/// Instance names joined for a user-facing error message.
-fn join_names(names: &[InstanceName]) -> String {
-    names
-        .iter()
-        .map(InstanceName::as_str)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// What `launch` adds to the instance's `ContainerSpec`: ownership and volumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
@@ -514,7 +505,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 if !others.is_empty() {
                     return Err(EngineError::SharedVolumeInUse {
                         volume: mount.name.clone(),
-                        members: join_names(&others),
+                        members: others,
                     });
                 }
             }
@@ -615,7 +606,7 @@ impl<P: PodmanClient> Reconciler<P> {
         if !members.is_empty() {
             return Err(EngineError::SharedVolumeInUse {
                 volume: name.clone(),
-                members: join_names(&members),
+                members,
             });
         }
         let podman_name = labels::shared_volume_name(name);
@@ -805,7 +796,7 @@ impl<P: PodmanClient> Reconciler<P> {
             if !running.is_empty() {
                 return Err(EngineError::SharedVolumeBusy {
                     volume: name.clone(),
-                    members: join_names(&running),
+                    members: running,
                 });
             }
         }
@@ -1852,8 +1843,14 @@ health = { attempts = 2, window_secs = 2 }
             )
             .await
             .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "shared volume kajet-data is still mounted by: kajet-mcp"
+        );
         match err {
-            EngineError::SharedVolumeInUse { members, .. } => assert_eq!(members, "kajet-mcp"),
+            EngineError::SharedVolumeInUse { members, .. } => {
+                assert_eq!(members, [name("kajet-mcp")]);
+            }
             other => panic!("unexpected error: {other:?}"),
         }
         // Nothing was touched: the app is still desired, its container runs and the volume exists.
@@ -2150,10 +2147,7 @@ shared_volumes = [{ name = "kajet-workspaces", target = "/workspaces" }]
             .unwrap_err();
         match err {
             EngineError::SharedVolumeInUse { members, .. } => {
-                assert!(
-                    members.contains("kajet-api") && members.contains("kajet-mcp"),
-                    "{members}"
-                );
+                assert_eq!(members, [name("kajet-api"), name("kajet-mcp")]);
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -2339,8 +2333,15 @@ shared_volumes = [{ name = "kajet-workspaces", target = "/workspaces" }]
             )
             .await
             .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "shared volume kajet-data is used by running instances: kajet-mcp; stop them first \
+             (`weglarka apps stop <app>`)"
+        );
         match err {
-            EngineError::SharedVolumeBusy { members, .. } => assert_eq!(members, "kajet-mcp"),
+            EngineError::SharedVolumeBusy { members, .. } => {
+                assert_eq!(members, [name("kajet-mcp")]);
+            }
             other => panic!("unexpected error: {other:?}"),
         }
 

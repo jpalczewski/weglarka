@@ -208,10 +208,10 @@ pub enum EngineError {
     },
     /// A shared volume is still mounted by other instances (issue #33): purging the instance's
     /// volumes would delete data they use.
-    #[error("shared volume {volume} is still mounted by: {members}")]
+    #[error("shared volume {volume} is still mounted by: {}", join_names(members))]
     SharedVolumeInUse {
         volume: weglarka_model::app::SharedVolumeName,
-        members: String,
+        members: Vec<InstanceName>,
     },
     /// A shared volume still holds data, so its declaration cannot be dropped without purging it.
     #[error("shared volume {volume} still holds data; pass --purge to delete it")]
@@ -220,12 +220,13 @@ pub enum EngineError {
     },
     /// A shared volume is in use by running instances, so it cannot be imported into (or replaced).
     #[error(
-        "shared volume {volume} is used by running instances: {members}; stop them first \
-         (`weglarka apps stop <app>`)"
+        "shared volume {volume} is used by running instances: {}; stop them first \
+         (`weglarka apps stop <app>`)",
+        join_names(members)
     )]
     SharedVolumeBusy {
         volume: weglarka_model::app::SharedVolumeName,
-        members: String,
+        members: Vec<InstanceName>,
     },
     /// A shared volume cannot move to another group while it exists: its files belong to the old
     /// group's uid range (docs/decisions/0029).
@@ -269,8 +270,8 @@ pub enum EngineError {
     SecretInUse { name: InstanceName, secret: String },
 }
 
-/// `a, b` for error messages.
-fn join_names(names: &[InstanceName]) -> String {
+/// Instance names joined for a user-facing error message: `a, b`.
+pub(crate) fn join_names(names: &[InstanceName]) -> String {
     names
         .iter()
         .map(ToString::to_string)
