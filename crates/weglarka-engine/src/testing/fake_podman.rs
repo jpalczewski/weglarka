@@ -632,6 +632,32 @@ impl State {
             .ok_or_else(|| PodmanError::NotFound(name.to_owned()))
     }
 
+    /// Like libpod for exec, kill and healthcheck: `NotFound` for an unknown container, `Conflict`
+    /// for one that is not running.
+    fn running_container(&mut self, name: &str) -> Result<&mut ContainerInfo> {
+        let info = self.container_mut(name)?;
+        if info.state != ContainerState::Running {
+            return Err(PodmanError::Conflict(format!(
+                "container {name} is not running"
+            )));
+        }
+        Ok(info)
+    }
+
+    /// Creates an empty volume unless one with that name exists (labels of an existing one stay).
+    fn ensure_volume(&mut self, name: &str, labels: &BTreeMap<String, String>) {
+        self.volumes.entry(name.to_owned()).or_insert_with(|| {
+            (
+                VolumeInfo {
+                    name: name.to_owned(),
+                    labels: labels.clone(),
+                    mountpoint: Some(format!("/fake/volumes/{name}/_data")),
+                },
+                Vec::new(),
+            )
+        });
+    }
+
     /// Id of the image behind a reference (one of its names or the id itself).
     fn image_id(&self, reference: &str) -> Option<String> {
         self.images
@@ -748,16 +774,7 @@ impl PodmanClient for FakePodman {
         let id = s.next_id();
         // Like Podman, a named volume that does not exist yet is created implicitly (no labels).
         for att in &spec.volumes {
-            s.volumes.entry(att.volume.clone()).or_insert_with(|| {
-                (
-                    VolumeInfo {
-                        name: att.volume.clone(),
-                        labels: BTreeMap::new(),
-                        mountpoint: Some(format!("/fake/volumes/{}/_data", att.volume)),
-                    },
-                    Vec::new(),
-                )
-            });
+            s.ensure_volume(&att.volume, &BTreeMap::new());
         }
         s.container_specs.insert(spec.name.clone(), spec.clone());
         for net in &spec.networks {
@@ -876,11 +893,7 @@ impl PodmanClient for FakePodman {
             name: name.to_owned(),
             signal: signal.to_owned(),
         });
-        if s.container_mut(name)?.state != ContainerState::Running {
-            return Err(PodmanError::Conflict(format!(
-                "container {name} is not running"
-            )));
-        }
+        s.running_container(name)?;
         Ok(())
     }
 
@@ -899,11 +912,7 @@ impl PodmanClient for FakePodman {
             name: name.to_owned(),
             cmd: cmd.to_vec(),
         });
-        if s.container_mut(name)?.state != ContainerState::Running {
-            return Err(PodmanError::Conflict(format!(
-                "container {name} is not running"
-            )));
-        }
+        s.running_container(name)?;
         Ok(s.exec_exit_codes.get(name).copied().unwrap_or(0))
     }
 
@@ -1042,12 +1051,7 @@ impl PodmanClient for FakePodman {
         s.list_calls += 1;
         Ok(s.containers
             .values()
-            .filter(|c| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(k, v)| c.labels.get(k) == Some(v))
-            })
+            .filter(|c| filter.matches(&c.labels))
             .map(|c| s.with_networks(c))
             .collect())
     }
@@ -1446,16 +1450,7 @@ impl PodmanClient for FakePodman {
     async fn volume_create(&self, spec: &VolumeSpec) -> Result<()> {
         let mut s = self.lock();
         s.calls.push(Call::VolumeCreate(spec.name.clone()));
-        s.volumes.entry(spec.name.clone()).or_insert_with(|| {
-            (
-                VolumeInfo {
-                    name: spec.name.clone(),
-                    labels: spec.labels.clone(),
-                    mountpoint: Some(format!("/fake/volumes/{}/_data", spec.name)),
-                },
-                Vec::new(),
-            )
-        });
+        s.ensure_volume(&spec.name, &spec.labels);
         Ok(())
     }
 
@@ -1473,12 +1468,7 @@ impl PodmanClient for FakePodman {
             .volumes
             .values()
             .map(|(v, _)| v)
-            .filter(|v| {
-                filter
-                    .labels
-                    .iter()
-                    .all(|(k, val)| v.labels.get(k) == Some(val))
-            })
+            .filter(|v| filter.matches(&v.labels))
             .cloned()
             .collect())
     }
@@ -1553,12 +1543,7 @@ impl PodmanClient for FakePodman {
     async fn healthcheck_run(&self, container: &str) -> Result<HealthStatus> {
         let mut s = self.lock();
         s.calls.push(Call::HealthcheckRun(container.to_owned()));
-        let info = s.container_mut(container)?;
-        if info.state != ContainerState::Running {
-            return Err(PodmanError::Conflict(format!(
-                "container {container} is not running"
-            )));
-        }
+        s.running_container(container)?;
         let status = s
             .next_health(container)
             .ok_or_else(|| PodmanError::Conflict(format!("{container} has no healthcheck")))?;

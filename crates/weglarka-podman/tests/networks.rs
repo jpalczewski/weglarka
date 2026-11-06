@@ -8,8 +8,7 @@
 //! aardvark DNS of a rootless netavark network — that is what this test pins down.
 
 use std::collections::BTreeMap;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use weglarka_model::app::Resources;
@@ -17,53 +16,10 @@ use weglarka_model::labels;
 use weglarka_model::podman::{ContainerSpec, NetworkSpec, PodmanClient};
 use weglarka_podman::LibpodClient;
 
+mod common;
+use common::{Cleanup, run_id, socket};
+
 const BUSYBOX: &str = "docker.io/library/busybox:latest";
-
-fn socket() -> Option<String> {
-    let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if socket.is_none() {
-        eprintln!("WEGLARKA_PODMAN_SOCKET not set — skipping integration test");
-    }
-    socket
-}
-
-fn run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
-}
-
-fn raw(socket: &str, method: &str, path: &str) {
-    let _ = Command::new("curl")
-        .args(["-sS", "--unix-socket", socket, "-X", method])
-        .arg(format!("http://d/v6.0.0/libpod{path}"))
-        .output();
-}
-
-struct Cleanup {
-    socket: String,
-    containers: Vec<String>,
-    networks: Vec<String>,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for c in &self.containers {
-            raw(
-                &self.socket,
-                "DELETE",
-                &format!("/containers/{c}?force=true&v=true"),
-            );
-        }
-        for n in &self.networks {
-            raw(&self.socket, "DELETE", &format!("/networks/{n}?force=true"));
-        }
-    }
-}
 
 fn spec(
     name: &str,
@@ -121,11 +77,9 @@ async fn group_members_resolve_each_other_and_outsiders_cannot() {
         format!("it-peer-{id}"),
         format!("it-out-{id}"),
     );
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![srv.clone(), peer.clone(), outsider.clone()],
-        networks: vec![group.clone(), own("srv"), own("peer"), own("out")],
-    };
+    let _cleanup = Cleanup::new(&socket)
+        .containers([srv.clone(), peer.clone(), outsider.clone()])
+        .networks([group.clone(), own("srv"), own("peer"), own("out")]);
     let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
     assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
 
@@ -202,11 +156,9 @@ async fn live_join_of_an_internal_network_resolves_by_container_name() {
     let metrics = format!("it-metrics-{id}");
     let own = format!("net-it-daemon-{id}");
     let (daemon, scraper) = (format!("it-daemon-{id}"), format!("it-scraper-{id}"));
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![daemon.clone(), scraper.clone()],
-        networks: vec![metrics.clone(), own.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket)
+        .containers([daemon.clone(), scraper.clone()])
+        .networks([metrics.clone(), own.clone()]);
     let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
     assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
 
@@ -257,11 +209,9 @@ async fn per_app_metrics_networks_isolate_apps_from_each_other() {
     let net_b = labels::metrics_network_name(&instance(&b));
     assert_eq!(net_a.len(), 71);
     let scraper = format!("it-ms-{id}");
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![a.clone(), b.clone(), scraper.clone()],
-        networks: vec![net_a.clone(), net_b.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket)
+        .containers([a.clone(), b.clone(), scraper.clone()])
+        .networks([net_a.clone(), net_b.clone()]);
     let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
     assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
 
@@ -340,16 +290,14 @@ async fn a_published_port_still_answers_next_to_an_internal_network() {
     let instance = |n: &str| weglarka_model::app::InstanceName::new(n).unwrap();
     let metrics_created = labels::metrics_network_name(&instance(&created));
     let metrics_joined = labels::metrics_network_name(&instance(&joined));
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![created.clone(), joined.clone()],
-        networks: vec![
+    let _cleanup = Cleanup::new(&socket)
+        .containers([created.clone(), joined.clone()])
+        .networks([
             own("pc"),
             own("pj"),
             metrics_created.clone(),
             metrics_joined.clone(),
-        ],
-    };
+        ]);
     let events: Vec<_> = client.image_pull(BUSYBOX).collect().await;
     assert!(events.last().is_some_and(Result::is_ok), "{events:?}");
 

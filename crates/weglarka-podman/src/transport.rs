@@ -38,13 +38,15 @@ impl Transport {
         }
     }
 
+    /// Sends the request and checks the status once for every call: 2xx and 304 (already
+    /// started/stopped) count as success, anything else is mapped by [`error_from_status`].
     async fn open(
         &self,
         method: Method,
         path: &str,
         body: Option<(&'static str, UnsyncBoxBody<Bytes, std::io::Error>)>,
         extra_header: Option<(HeaderName, HeaderValue)>,
-    ) -> Result<(StatusCode, Incoming)> {
+    ) -> Result<Incoming> {
         let unreachable = |what: &str, e: &dyn std::fmt::Display| {
             PodmanError::Unreachable(format!("{}: {what}: {e}", self.socket.display()))
         };
@@ -81,10 +83,16 @@ impl Transport {
             .send_request(request)
             .await
             .map_err(|e| unreachable("request", &e))?;
-        Ok((response.status(), response.into_body()))
+        let status = response.status();
+        let incoming = response.into_body();
+        if is_success(status) {
+            Ok(incoming)
+        } else {
+            Err(error_from_response(status, incoming).await)
+        }
     }
 
-    /// Call with a response read whole. 2xx and 304 (already started/stopped) count as success.
+    /// Call with a response read whole.
     pub(crate) async fn call(
         &self,
         method: Method,
@@ -92,12 +100,8 @@ impl Transport {
         body: Option<(&'static str, Bytes)>,
     ) -> Result<Bytes> {
         let body = body.map(|(content_type, bytes)| (content_type, whole(bytes)));
-        let (status, incoming) = self.open(method, path, body, None).await?;
-        if is_success(status) {
-            read_limited(incoming, MAX_BODY).await
-        } else {
-            Err(error_from_response(status, incoming).await)
-        }
+        let incoming = self.open(method, path, body, None).await?;
+        read_limited(incoming, MAX_BODY).await
     }
 
     pub(crate) async fn call_json(
@@ -126,22 +130,15 @@ impl Transport {
                 .map_err(|e| std::io::Error::other(e.to_string()))
         });
         let body = StreamBody::new(frames).boxed_unsync();
-        let (status, incoming) = self
+        let incoming = self
             .open(method, path, Some((content_type, body)), None)
             .await?;
-        if is_success(status) {
-            read_limited(incoming, MAX_BODY).await
-        } else {
-            Err(error_from_response(status, incoming).await)
-        }
+        read_limited(incoming, MAX_BODY).await
     }
 
     /// Call with a raw streamed *response* (volume export): chunks are passed on as they arrive.
     pub(crate) async fn bytes_stream(&self, method: Method, path: &str) -> Result<TarStream> {
-        let (status, incoming) = self.open(method, path, None, None).await?;
-        if !is_success(status) {
-            return Err(error_from_response(status, incoming).await);
-        }
+        let incoming = self.open(method, path, None, None).await?;
         let stream = futures_util::stream::unfold(Some(incoming), |state| async move {
             let mut body = state?;
             loop {
@@ -170,12 +167,8 @@ impl Transport {
         path: &str,
         extra_header: Option<(HeaderName, HeaderValue)>,
     ) -> Result<Lines> {
-        let (status, incoming) = self.open(method, path, None, extra_header).await?;
-        if is_success(status) {
-            Ok(Lines::new(incoming))
-        } else {
-            Err(error_from_response(status, incoming).await)
-        }
+        let incoming = self.open(method, path, None, extra_header).await?;
+        Ok(Lines::new(incoming))
     }
 }
 
