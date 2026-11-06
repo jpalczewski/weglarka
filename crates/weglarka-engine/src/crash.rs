@@ -221,13 +221,10 @@ fn watch_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::name;
     use std::collections::BTreeMap;
 
     const GENERATION: u64 = 3;
-
-    fn name(value: &str) -> InstanceName {
-        InstanceName::new(value).unwrap()
-    }
 
     fn apps(instances: &[&str]) -> AppsFile {
         let mut toml = String::new();

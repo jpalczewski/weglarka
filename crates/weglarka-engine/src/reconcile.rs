@@ -1278,14 +1278,9 @@ fn is_weglarka_network(network_labels: &BTreeMap<String, String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{digest, name};
     use weglarka_model::hash::spec_hash;
 
-    fn digest(c: char) -> Digest {
-        Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-    }
-    fn name(s: &str) -> InstanceName {
-        InstanceName::new(s).unwrap()
-    }
     fn spec() -> AppSpec {
         toml::from_str("image = \"ghcr.io/x/y:latest\"").unwrap()
     }

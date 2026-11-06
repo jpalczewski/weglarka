@@ -976,8 +976,7 @@ mod tests {
 
     use super::*;
     use crate::reconcile::{Action, ActionOutcome, ReconcilerOptions, RecreateReason};
-    use crate::testing::{Call, FakePodman, StopFailure};
-    use weglarka_model::app::Digest;
+    use crate::testing::{Call, FakePodman, StopFailure, digest, name};
     use weglarka_model::podman::ContainerState;
     use weglarka_model::secret_store::SecretStore;
     use weglarka_model::secrets::FileSecretStore;
@@ -1017,14 +1016,6 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         _dir: tempfile::TempDir,
         fake: FakePodman,
         rec: Reconciler<FakePodman>,
-    }
-
-    fn digest(c: char) -> Digest {
-        Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-    }
-
-    fn name(s: &str) -> InstanceName {
-        InstanceName::new(s).unwrap()
     }
 
     fn env(apps: &str) -> Env {
