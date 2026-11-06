@@ -230,6 +230,29 @@ pub const SECRETS_REMOVE: Endpoint = Endpoint {
     scope: Some(Scope::Admin),
     body: Body::NoAppData,
 };
+/// `GET` → [`ListHostSecretsResponse`](crate::ListHostSecretsResponse): host credentials in
+/// `host-secrets.toml` (name, fingerprint, `updated_at`), never values.
+pub const HOST_SECRETS_LIST: Endpoint = Endpoint {
+    method: Method::Get,
+    path: "/v1/host/secrets",
+    scope: Some(Scope::Read),
+    body: Body::NoAppData,
+};
+/// `PUT` [`SetSecretRequest`](crate::SetSecretRequest) → [`HostSecretInfo`](crate::HostSecretInfo).
+/// Overwrite only; there is no endpoint for reading the value back.
+pub const HOST_SECRETS_SET: Endpoint = Endpoint {
+    method: Method::Put,
+    path: "/v1/host/secrets/{name}",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
+/// `DELETE` → 204. 404 when the store has no such host secret.
+pub const HOST_SECRETS_REMOVE: Endpoint = Endpoint {
+    method: Method::Delete,
+    path: "/v1/host/secrets/{name}",
+    scope: Some(Scope::Admin),
+    body: Body::NoAppData,
+};
 /// `GET` → [`ListVolumesResponse`](crate::ListVolumesResponse): volumes declared in the app's spec.
 pub const VOLUMES_LIST: Endpoint = Endpoint {
     method: Method::Get,
@@ -504,6 +527,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
     SECRETS_LIST,
     SECRETS_SET,
     SECRETS_REMOVE,
+    HOST_SECRETS_LIST,
+    HOST_SECRETS_SET,
+    HOST_SECRETS_REMOVE,
     VOLUMES_LIST,
     APP_VOLUMES_LIST,
     VOLUMES_EXPORT,

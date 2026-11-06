@@ -67,7 +67,7 @@ pub enum Command {
     Push(crate::push::PushArgs),
     /// Daemon and app status.
     Status,
-    /// App secrets (set/list/remove). Values are never returned by the API.
+    /// App secrets and host credentials (set/list/remove). Values are never returned by the API.
     #[command(subcommand)]
     Secrets(SecretsCommand),
     /// Self-diagnosis; `--preflight` runs locally, without the daemon.
@@ -362,6 +362,43 @@ pub enum SecretsCommand {
     /// Remove a stored secret. Refused while the app's spec still binds it (use --force); the app
     /// need not exist, so the leftovers of a removed app can be cleaned up.
     Remove(SecretRemoveArgs),
+    /// Host credentials in host-secrets.toml (set/list/remove). Values are never returned.
+    #[command(subcommand)]
+    Host(HostSecretsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostSecretsCommand {
+    /// Set (overwrite) a host credential. Value from stdin or a file — never from an argument.
+    Set(HostSecretSetArgs),
+    /// List host credentials (name, fingerprint, date) — without values.
+    List,
+    /// Remove a host credential.
+    Remove(HostSecretRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HostSecretSetArgs {
+    /// Host secret name ([A-Za-z0-9_-], 1–64 characters).
+    pub name: String,
+    /// Read the value from a file instead of stdin.
+    #[arg(long, value_name = "FILE")]
+    pub from_file: Option<PathBuf>,
+    /// Keep the value byte for byte (by default one trailing newline is stripped).
+    #[arg(long)]
+    pub raw: bool,
+    /// Send nothing; validate the input and show the request (the value is masked).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostSecretRemoveArgs {
+    /// Host secret name ([A-Za-z0-9_-], 1–64 characters).
+    pub name: String,
+    /// Send nothing; validate the names locally and show the request (no server lookup).
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
