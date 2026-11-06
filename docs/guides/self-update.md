@@ -75,6 +75,14 @@ A host binary older than this reporting records nothing, so there the journal me
 
 The first run that can read the state again clears the recorded stop, also when the image is already the running one, so `doctor` returns to `ok` right after step 3 (without `--check`, the next timer run does it once the interval has passed).
 
+**A new `weglarka.toml` key.** The same stop happens without a schema bump when you add a key to `weglarka.toml` that only the running (newer) daemon knows, for example a new `[logs]` option. `weglarka.toml` is parsed strictly (`deny_unknown_fields`, an unknown key is never ignored), so the older host binaries fail before they do anything:
+
+- both `weglarka-self-update.service` and `weglarka-watchdog.service` fail; their journal shows `invalid …/weglarka.toml: TOML parse error at line N …` followed by `unknown field` and the key's name;
+- `self-update.toml` records the stop with `host_tools_stale = true` — "the host binaries cannot parse weglarka.toml (TOML parse error at line N …: unknown field …)" (the key's name and position, never a config value) — once, not on every watchdog wake-up (issue #617; host binaries older than that record nothing, so only the journal shows it);
+- `weglarka doctor` reports the `self_update` check as **fail**, with the hint that the host binaries are older than the running daemon.
+
+The recovery is the same three steps as above. If the key is not new but mistyped, fix `weglarka.toml` instead. Either way, the first switcher or watchdog run that works again clears the record.
+
 **Launcher setup.** There the timers run the active **generation** from the generation store, not `/usr/local/bin`, so installing new binaries changes nothing, and `platform bootstrap` refuses a host that is already bootstrapped with another generation. An in-place refresh of the generation is not implemented yet (ADR 0067, issue #203). The existing commands allow a detour that has not been verified end to end: `platform downgrade` (back to the daemon-only setup, see [platform updates](platform-updates.md); on OpenRC this leaves no daemon running until the next step), then `platform bootstrap --generation sha256:<digest of the running image> --dry-run` with the new binaries, and the same without `--dry-run` once the plan looks right.
 
 **6. Trial on the host (optional).** CI has no user systemd, so the watchdog behavior is checked by hand:

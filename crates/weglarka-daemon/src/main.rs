@@ -487,7 +487,24 @@ async fn main() -> Result<()> {
              budget are installed"
         );
     }
-    let settings = Settings::load(&cli.config).context("loading configuration")?;
+    let settings = match Settings::load(&cli.config) {
+        Ok(settings) => settings,
+        Err(e) => {
+            // Issue #617: the timers run these two from host binaries a self-update does not
+            // replace; leave the stop where `doctor` reads it. The parse itself stays strict.
+            if matches!(
+                cli.command,
+                Some(Command::SelfUpdate(_) | Command::Supervise)
+            ) {
+                weglarka_daemon::config_stop::record_unparsable_config(
+                    &cli.config,
+                    &e,
+                    std::time::SystemTime::now(),
+                );
+            }
+            return Err(e).context("loading configuration");
+        }
+    };
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(settings).await,
         Command::Platform { action } => run_platform_dispatch(settings, action, cli.host_dir).await,
