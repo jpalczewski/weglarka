@@ -431,35 +431,10 @@ pub(crate) fn chunks(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::client::ApiClient;
 
-    type Seen = Arc<Mutex<Vec<weglarka_unix_http::testing::Seen>>>;
-
-    /// Unix-socket daemon answering every request with `status` and `reply`. The returned guard
-    /// derefs to the socket path and removes the socket on drop.
-    async fn mock(
-        _tag: &str,
-        status: u16,
-        reply: &'static [u8],
-    ) -> (weglarka_unix_http::testing::Mock, Seen) {
-        let m = weglarka_unix_http::testing::mock_with(move |_, _| {
-            weglarka_unix_http::testing::Reply::new(status, Bytes::from_static(reply))
-        })
-        .await;
-        let seen = m.seen.clone();
-        (m, seen)
-    }
-
-    fn overrides(socket: &std::path::Path) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(socket.to_owned()),
-            host: None,
-        }
-    }
+    use crate::testing::{mock_fixed, overrides};
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("wgv-{}-{name}", std::process::id()))
@@ -467,7 +442,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn import_streams_a_file_in_foreign_mode_by_default() {
-        let (socket, seen) = mock("imp", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let file = scratch("in.tar");
         let payload: Vec<u8> = (0..CHUNK * 2 + 17).map(|i| (i % 251) as u8).collect();
         std::fs::write(&file, &payload).unwrap();
@@ -511,7 +487,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn export_writes_the_response_body_to_a_file_and_leaves_none_on_error() {
-        let (socket, seen) = mock("exp", 200, b"TAR-BYTES").await;
+        let socket = mock_fixed(200, "TAR-BYTES").await;
+        let seen = socket.seen.clone();
         let out = scratch("out.tar");
         let args = || ExportArgs {
             app: "szklana".into(),
@@ -527,14 +504,15 @@ mod tests {
         let _ = std::fs::remove_file(&out);
 
         let body: &'static [u8] = br#"{"code":"not_found","message":"no such volume"}"#;
-        let (socket, _) = mock("exp404", 404, body).await;
+        let socket = mock_fixed(404, body).await;
         assert!(export(&overrides(&socket), args()).await.is_err());
         assert!(!out.exists(), "no half-written backup");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn purge_flag_goes_into_the_query() {
-        let (socket, seen) = mock("purge", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         ApiClient::new(socket.socket.clone())
             .request_empty(
                 &ApiRequest::new(endpoints::APPS_REMOVE, &[("name", "x")])
@@ -556,12 +534,10 @@ mod tests {
 
     // ---------- shared volumes (issue #33) ----------
 
-    use weglarka_api::{ApiError, ErrorCode, SharedVolumeSummary, VolumeSummary};
-    use weglarka_model::uid_range::UidRange;
+    use weglarka_api::{ErrorCode, SharedVolumeSummary, VolumeSummary};
 
-    fn leaked(s: String) -> &'static [u8] {
-        Box::leak(s.into_bytes().into_boxed_slice())
-    }
+    use crate::testing::api_err;
+    use weglarka_model::uid_range::UidRange;
 
     fn shared_resp() -> ListSharedVolumesResponse {
         let name = |s: &str| SharedVolumeName::new(s).unwrap();
@@ -595,8 +571,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn list_without_an_app_requests_the_shared_volumes() {
-        let body = leaked(serde_json::to_string(&shared_resp()).unwrap());
-        let (socket, seen) = mock("slist", 200, body).await;
+        let body = serde_json::to_string(&shared_resp()).unwrap();
+        let socket = mock_fixed(200, body).await;
+        let seen = socket.seen.clone();
         assert_eq!(
             list(true, &overrides(&socket), None).await.unwrap(),
             exit::OK
@@ -610,8 +587,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn list_with_an_app_requests_its_volumes() {
-        let body = leaked(serde_json::to_string(&ListVolumesResponse { volumes: vec![] }).unwrap());
-        let (socket, seen) = mock("alist", 200, body).await;
+        let body = serde_json::to_string(&ListVolumesResponse { volumes: vec![] }).unwrap();
+        let socket = mock_fixed(200, body).await;
+        let seen = socket.seen.clone();
         assert_eq!(
             list(true, &overrides(&socket), Some("kajet-api"))
                 .await
@@ -679,7 +657,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_declares_a_shared_volume_and_dry_run_sends_nothing() {
-        let (socket, seen) = mock("sadd", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         declare(
             true,
@@ -718,7 +697,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_with_a_group_sends_it_as_a_query_parameter() {
-        let (socket, seen) = mock("sgrp", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         declare(
             true,
@@ -754,7 +734,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_sends_purge_only_when_asked() {
-        let (socket, seen) = mock("srm", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         for purge in [false, true] {
             remove(
@@ -782,7 +763,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_dry_run_shows_the_query_and_sends_nothing() {
-        let (socket, seen) = mock("srmdry", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         remove(
             true,
             &overrides(&socket),
@@ -807,7 +789,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_shared_volume_names_are_usage_errors() {
-        let (socket, seen) = mock("sbad", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         let err = declare(
             true,
@@ -841,7 +824,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_volume_names_are_usage_errors_and_send_nothing() {
-        let (socket, seen) = mock("bvol", 200, b"TAR-BYTES").await;
+        let socket = mock_fixed(200, "TAR-BYTES").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         let out = scratch("bvol.tar");
         let _ = std::fs::remove_file(&out);
@@ -892,14 +876,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refusals_keep_the_daemon_message_and_the_exit_code() {
-        let conflict = leaked(
-            serde_json::to_string(&ApiError {
-                code: ErrorCode::Conflict,
-                message: "shared volume \"kajet-data\" is still mounted by: kajet-mcp".into(),
-            })
-            .unwrap(),
+        let conflict = api_err(
+            ErrorCode::Conflict,
+            "shared volume \"kajet-data\" is still mounted by: kajet-mcp",
         );
-        let (socket, _) = mock("srm409", 409, conflict).await;
+        let socket = mock_fixed(409, conflict).await;
         let err = remove(
             true,
             &overrides(&socket),
@@ -915,14 +896,8 @@ mod tests {
         assert!(err.message.contains("kajet-mcp"), "{}", err.message);
         assert!(err.hint.is_some(), "the refusal carries a hint");
 
-        let missing = leaked(
-            serde_json::to_string(&ApiError {
-                code: ErrorCode::NotFound,
-                message: "no such shared volume".into(),
-            })
-            .unwrap(),
-        );
-        let (socket, _) = mock("srm404", 404, missing).await;
+        let missing = api_err(ErrorCode::NotFound, "no such shared volume");
+        let socket = mock_fixed(404, missing).await;
         let err = remove(
             true,
             &overrides(&socket),

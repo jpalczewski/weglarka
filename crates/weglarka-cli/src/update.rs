@@ -1007,20 +1007,13 @@ pub fn render_waiting(app: &str, state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::mock;
+    use crate::testing::{mock, overrides, show_response, try_update_args};
     use clap::Parser;
     use weglarka_api::DeployResponse;
     use weglarka_model::app::{InstanceName, SecretTarget, SharedVolumeRef, VolumeMount};
 
     fn try_args(extra: &[&str]) -> Result<UpdateArgs, clap::Error> {
-        #[derive(Parser)]
-        struct W {
-            #[command(flatten)]
-            a: UpdateArgs,
-        }
-        let mut argv = vec!["w", "ntfy"];
-        argv.extend_from_slice(extra);
-        W::try_parse_from(argv).map(|w| w.a)
+        try_update_args(extra)
     }
 
     fn args(extra: &[&str]) -> UpdateArgs {
@@ -1740,21 +1733,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     fn show_with(spec: AppSpec, runtime: RuntimeState) -> String {
-        serde_json::to_string(&ShowAppResponse {
-            name: InstanceName::new("ntfy").unwrap(),
-            spec,
-            state: Default::default(),
-            runtime,
-            configs: None,
-            host_mounts: None,
-            ingress_logs: None,
-            restarts: None,
-            health: None,
-            started_at: None,
-            redacted: false,
-            reconciled: None,
-        })
-        .unwrap()
+        serde_json::to_string(&show_response(spec, runtime)).unwrap()
     }
 
     fn show_json() -> String {
@@ -1972,11 +1951,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             ),
         })
         .await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let code = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
             .unwrap();
@@ -2005,11 +1980,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         view["redacted"] = true.into();
         let show = view.to_string();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let err = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
             .unwrap_err();
@@ -2050,11 +2021,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         view["spec"] = serde_json::to_value(&live).unwrap();
         let show = view.to_string();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("spec.toml");
         std::fs::write(&file, toml::to_string(&spec()).unwrap()).unwrap();
@@ -2087,11 +2054,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             _ => (403, r#"{"error":"forbidden"}"#.to_owned()),
         })
         .await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("spec.toml");
         let mut other = spec();
@@ -2116,14 +2079,6 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             v[k] = val.clone();
         }
         v.to_string()
-    }
-
-    fn overrides(m: &crate::tests::Mock) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        }
     }
 
     async fn settle(
@@ -2231,11 +2186,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     async fn dry_run_and_no_change_send_nothing() {
         let show = show_json();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let mut a = args(&["--domain", "new.example.eu"]);
         a.dry_run = true;
         assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);

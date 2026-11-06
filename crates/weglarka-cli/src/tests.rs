@@ -6,11 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
-    ApiError, CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse,
-    DoctorCheck, DoctorReport, ErrorCode, ListReservationsResponse, NotifyStatusResponse,
-    PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse, ReservationView,
-    RollbackResponse, RuntimeState, SetSecretRequest, ShowAppResponse, UpdateAppResponse,
-    endpoints,
+    CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse, DoctorCheck,
+    DoctorReport, ErrorCode, ListReservationsResponse, NotifyStatusResponse, PruneImagesResponse,
+    PrunedImage, ReloadAction, ReloadResponse, ReservationView, RollbackResponse, RuntimeState,
+    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
 };
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::config::HostConfig;
@@ -26,11 +25,9 @@ use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
 use crate::preflight::testing::FakeHost;
 use crate::preflight::{Context, all_checks, render, run_checks};
-use crate::settings::Overrides;
 use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_label};
 
-// The mock unix-socket server lives in `weglarka-unix-http` (feature `testing`).
-pub(crate) use weglarka_unix_http::testing::{Mock, mock};
+use crate::testing::{api_err, mock, overrides, show_response, update_args};
 
 /// A subcommand's own flag with the id of a global one shares its value (`weglarka --host <url> access`
 /// once fed the panel's address to a filter), and nothing refuses that at parse time.
@@ -57,14 +54,6 @@ fn no_subcommand_flag_shadows_a_global_one() {
         .collect();
     assert!(globals.iter().any(|g| g == "host"), "{globals:?}");
     check(&root, &globals, "weglarka");
-}
-
-fn api_err(code: ErrorCode, msg: &str) -> String {
-    serde_json::to_string(&ApiError {
-        code,
-        message: msg.into(),
-    })
-    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -822,18 +811,6 @@ fn add_args(extra: &[&str]) -> AddArgs {
     Add::try_parse_from(argv).unwrap().a
 }
 
-/// `apps update` flags as parsed from the command line.
-fn update_args(extra: &[&str]) -> crate::update::UpdateArgs {
-    #[derive(clap::Parser)]
-    struct Up {
-        #[command(flatten)]
-        a: crate::update::UpdateArgs,
-    }
-    let mut argv = vec!["up", "ntfy"];
-    argv.extend_from_slice(extra);
-    Up::try_parse_from(argv).unwrap().a
-}
-
 fn app_spec(start: bool) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(
         r#"
@@ -849,24 +826,12 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
 }
 
 fn show_app(start: bool) -> ShowAppResponse {
-    ShowAppResponse {
-        name: InstanceName::new("ntfy").unwrap(),
-        spec: app_spec(start),
-        state: Default::default(),
-        runtime: if start {
-            RuntimeState::Running
-        } else {
-            RuntimeState::NotStarted
-        },
-        configs: None,
-        host_mounts: None,
-        ingress_logs: None,
-        restarts: None,
-        health: None,
-        started_at: None,
-        redacted: false,
-        reconciled: None,
-    }
+    let runtime = if start {
+        RuntimeState::Running
+    } else {
+        RuntimeState::NotStarted
+    };
+    show_response(app_spec(start), runtime)
 }
 
 fn update_response(start: bool, outcome: DeployOutcome) -> String {
@@ -879,14 +844,6 @@ fn update_response(start: bool, outcome: DeployOutcome) -> String {
         }),
     })
     .unwrap()
-}
-
-fn overrides(m: &Mock) -> Overrides {
-    Overrides {
-        config: None,
-        socket: Some(m.socket.clone()),
-        host: None,
-    }
 }
 
 #[test]
