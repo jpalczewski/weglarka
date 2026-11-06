@@ -6,11 +6,13 @@
 //! This module holds the types, their lexical rules and the rollout gate: every declaration and
 //! every membership is rejected with [`GATE`] until the PR of each kind lifts it.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppsFile, InstanceName};
+use crate::app::{AppSpec, AppsFile, InstanceName, SharedNetworkName, SharedNetworkRef};
 
 /// The rollout gate message (#590). Later PRs lift it per kind.
 pub const GATE: &str = "shared services are not enabled in this release";
@@ -24,24 +26,38 @@ pub struct ServiceName(String);
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "invalid shared service name {0:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-'"
+    "invalid shared service name {0:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-', \
+     not ending in -digest or -pgpass"
 )]
 pub struct InvalidServiceName(pub String);
 
 impl ServiceName {
     pub fn new(name: impl Into<String>) -> Result<Self, InvalidServiceName> {
         let name = name.into();
-        // The same alphabet as an instance name; reuse it instead of repeating the rule.
+        // The same alphabet as an instance name; reuse it instead of repeating the rule. A name
+        // ending in a reserved suffix would make its derived secret names (`svc-<name>-digest`,
+        // `svc-<name>-pgpass`) collide with another service's `svc-<name>` (ADR 0079).
+        let reserved = RESERVED_SUFFIXES.iter().any(|s| name.ends_with(s));
         match InstanceName::new(name.clone()) {
-            Ok(_) => Ok(Self(name)),
-            Err(_) => Err(InvalidServiceName(name)),
+            Ok(_) if !reserved => Ok(Self(name)),
+            _ => Err(InvalidServiceName(name)),
         }
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The shared network the service and its members join (`net-shared-<name>`, ADR 0030/0079).
+    /// Infallible: a service name is a valid network name (the same alphabet), and the namespace
+    /// is shared on purpose (`NameTaken`).
+    pub fn network(&self) -> SharedNetworkName {
+        SharedNetworkName::new(self.0.clone()).expect("a service name is a valid network name")
+    }
 }
+
+/// Suffixes a service name must not end in (ADR 0079).
+pub const RESERVED_SUFFIXES: [&str; 2] = ["-digest", "-pgpass"];
 
 impl TryFrom<String> for ServiceName {
     type Error = InvalidServiceName;
@@ -175,24 +191,191 @@ pub struct SharedServiceSpec {
     pub maxmemory: Option<Maxmemory>,
 }
 
-/// Checks the shared-service declarations and memberships of `apps.toml`, on every load and save.
-///
-/// Gate (#590): any declaration and any non-empty `AppSpec::shared_services` is rejected with
-/// [`GATE`]. The lexical rules of the declaration itself live in the types (`ServiceName`,
-/// `Maxmemory`), so they apply on parse, before this runs.
-///
-/// The semantic checks (`NameTaken`, `UnknownInstance`, `UnknownService`, `ServiceSpecOwned`,
-/// `ServiceIsMember`, `TooManyServicesOfKind`, the profile rules) arrive with #592.
-pub fn validate(apps: &AppsFile) -> Result<(), String> {
-    if let Some((name, _)) = apps.shared_services.first_key_value() {
-        return Err(format!("[shared_services.{name}]: {GATE}"));
-    }
-    for (instance, spec) in &apps.apps {
-        if !spec.shared_services.is_empty() {
-            return Err(format!("{instance}: shared_services: {GATE}"));
+/// A violated shared-service rule (ADR 0079). The variant names are the rejection names of the
+/// managed Redis and Postgres contracts (#593, #596), so fixtures are checked by name
+/// ([`ServiceRule::name`]); `Display` adds the detail an operator needs.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ServiceRule {
+    /// A `[shared_services]` and a `[shared_networks]` entry with the same name.
+    #[error("[shared_services.{0}]: the name is already a [shared_networks] entry")]
+    NameTaken(ServiceName),
+    /// The declaration names an instance that is not in `apps.toml`.
+    #[error("[shared_services.{service}]: instance {instance} is not in apps.toml")]
+    UnknownInstance {
+        service: ServiceName,
+        instance: InstanceName,
+    },
+    /// A member names an undeclared service.
+    #[error(
+        "{member}: shared_services names {service}, which is not declared in [shared_services]"
+    )]
+    UnknownService {
+        member: InstanceName,
+        service: ServiceName,
+    },
+    /// The service instance sets a field the service owns.
+    #[error("{instance}: {field} is owned by [shared_services.{service}] and must not be set")]
+    ServiceSpecOwned {
+        service: ServiceName,
+        instance: InstanceName,
+        field: &'static str,
+    },
+    /// The service instance is a member of its own service.
+    #[error("{instance}: the instance of [shared_services.{service}] cannot be its member")]
+    ServiceIsMember {
+        service: ServiceName,
+        instance: InstanceName,
+    },
+    /// A member uses more than one service of one kind (v1).
+    #[error("{member}: at most one shared service per kind ({kind:?}): {first}, {second}")]
+    TooManyServicesOfKind {
+        member: InstanceName,
+        kind: ServiceKind,
+        first: ServiceName,
+        second: ServiceName,
+    },
+}
+
+impl ServiceRule {
+    /// The contract's rejection name (`"NameTaken"`, …).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NameTaken(_) => "NameTaken",
+            Self::UnknownInstance { .. } => "UnknownInstance",
+            Self::UnknownService { .. } => "UnknownService",
+            Self::ServiceSpecOwned { .. } => "ServiceSpecOwned",
+            Self::ServiceIsMember { .. } => "ServiceIsMember",
+            Self::TooManyServicesOfKind { .. } => "TooManyServicesOfKind",
         }
     }
+}
+
+/// The kind-independent rules of ADR 0079, in a fixed order (the first violation wins). Pure.
+pub fn check(apps: &AppsFile) -> Result<(), ServiceRule> {
+    // TODO(#592 A): NameTaken, UnknownInstance, ServiceSpecOwned, ServiceIsMember, UnknownService,
+    // TooManyServicesOfKind.
+    let _ = apps;
     Ok(())
+}
+
+/// Whether a kind is released (ADR 0079): a declaration of an unreleased kind is rejected with
+/// [`GATE`]. Each kind's PR flips its own arm (#593 Redis, #596 Postgres).
+pub const fn kind_released(kind: ServiceKind) -> bool {
+    match kind {
+        ServiceKind::Redis => false,
+        ServiceKind::Postgres => false,
+    }
+}
+
+fn kind_enabled(kind: ServiceKind) -> bool {
+    kind_released(kind) || testing::gates_open()
+}
+
+/// Checks the shared-service declarations and memberships of `apps.toml`, on every load and save:
+/// the rules of [`check`] first, then the gate per kind (ADR 0079).
+pub fn validate(apps: &AppsFile) -> Result<(), String> {
+    check(apps).map_err(|rule| rule.to_string())?;
+    if let Some((name, _)) = apps
+        .shared_services
+        .iter()
+        .find(|(_, spec)| !kind_enabled(spec.kind))
+    {
+        return Err(format!("[shared_services.{name}]: {GATE}"));
+    }
+    Ok(())
+}
+
+/// Instances that list `service`, ordered by name. Drives the removal guard, `apps list` and
+/// `doctor`.
+pub fn members(apps: &AppsFile, service: &ServiceName) -> Vec<InstanceName> {
+    apps.apps
+        .iter()
+        .filter(|(_, spec)| spec.shared_services.contains(service))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The service an instance runs, if it is the instance of a declaration.
+pub fn service_of<'a>(apps: &'a AppsFile, instance: &InstanceName) -> Option<&'a ServiceName> {
+    apps.shared_services
+        .iter()
+        .find(|(_, spec)| &spec.instance == instance)
+        .map(|(name, _)| name)
+}
+
+/// Names that own a `net-shared-<name>` network: the `[shared_networks]` and the
+/// `[shared_services]` entries (one namespace, `NameTaken`). Network pruning and `doctor` keep a
+/// group network while its name is in this set.
+pub fn network_groups(apps: &AppsFile) -> std::collections::BTreeSet<SharedNetworkName> {
+    apps.shared_networks
+        .keys()
+        .cloned()
+        .chain(apps.shared_services.keys().map(ServiceName::network))
+        .collect()
+}
+
+/// The service relations of ADR 0079 laid over a spec, after the identity overlay
+/// (`identity::effective_spec`): a member waits for each service instance (`depends_on`) and joins
+/// each service's network; the service instance joins its own. Never written to `apps.toml`.
+/// Borrowed (identical hash) for an instance outside every service.
+pub fn overlay<'a>(
+    instance: &InstanceName,
+    spec: Cow<'a, AppSpec>,
+    services: &BTreeMap<ServiceName, SharedServiceSpec>,
+) -> Cow<'a, AppSpec> {
+    let mut joins: Vec<(&ServiceName, Option<&InstanceName>)> = Vec::new();
+    for (name, decl) in services {
+        if &decl.instance == instance {
+            joins.push((name, None));
+        } else if spec.shared_services.contains(name) {
+            joins.push((name, Some(&decl.instance)));
+        }
+    }
+    if joins.is_empty() {
+        return spec;
+    }
+    let mut out = spec.into_owned();
+    for (name, wait_for) in joins {
+        if let Some(dep) = wait_for
+            && !out.depends_on.contains(dep)
+        {
+            out.depends_on.push(dep.clone());
+        }
+        let network = name.network();
+        if !out.shared_networks.iter().any(|n| n.name == network) {
+            out.shared_networks.push(SharedNetworkRef {
+                name: network,
+                aliases: Vec::new(),
+            });
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Test-only switch for the gate (ADR 0079): the engine and daemon tests of the shared wiring need
+/// declarations that load before any kind is released. Behind the `testing` feature, which only
+/// `[dev-dependencies]` enable, so a production binary has no way to open the gate.
+pub mod testing {
+    #[cfg(feature = "testing")]
+    static OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Opens the gate of every kind for the rest of the process. Never closed again: the gate's
+    /// own tests live in this crate and never call it.
+    #[cfg(feature = "testing")]
+    pub fn open_kind_gates() {
+        OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn gates_open() -> bool {
+        #[cfg(feature = "testing")]
+        {
+            OPEN.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

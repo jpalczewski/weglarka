@@ -131,6 +131,7 @@ impl From<EngineError> for Fail {
             | EngineError::SharedVolumeBusy { .. }
             | EngineError::SharedGroupChange { .. }
             | EngineError::SharedNetworkInUse { .. }
+            | EngineError::SharedServiceInUse { .. }
             | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
             // Config mounts (issue #118): a spec/source problem is the request's fault (400).
             EngineError::Configs(message) => Fail::invalid(message),
@@ -445,6 +446,8 @@ async fn health<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Res
 async fn list_apps<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
     Ok(json(ListAppsResponse {
         apps: summaries(&d).await?,
+        // TODO(#592 D): the declared shared services and their members.
+        shared_services: Vec::new(),
     }))
 }
 

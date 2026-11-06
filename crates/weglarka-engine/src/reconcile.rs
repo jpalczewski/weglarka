@@ -248,6 +248,17 @@ pub enum EngineError {
         network: weglarka_model::app::SharedNetworkName,
         members: String,
     },
+    /// The instance of a shared service cannot be removed (ADR 0079): members still list the
+    /// service, or (`members` empty) the declaration still names the instance.
+    #[error(
+        "{instance} runs [shared_services.{service}]{}",
+        in_use_detail(members)
+    )]
+    SharedServiceInUse {
+        service: weglarka_model::shared_services::ServiceName,
+        instance: InstanceName,
+        members: String,
+    },
     /// Unknown shared network declaration.
     #[error("unknown shared network: {0}")]
     UnknownSharedNetwork(weglarka_model::app::SharedNetworkName),
@@ -267,6 +278,15 @@ pub enum EngineError {
         "secret {secret} is still bound by the spec of {name}; unbind it first or pass --force"
     )]
     SecretInUse { name: InstanceName, secret: String },
+}
+
+/// The tail of [`EngineError::SharedServiceInUse`]: who still uses the service, or what to do first.
+fn in_use_detail(members: &str) -> String {
+    if members.is_empty() {
+        "; remove the declaration from apps.toml first".to_owned()
+    } else {
+        format!(" and is still used by: {members}")
+    }
 }
 
 /// Instance names joined for a user-facing error message: `a, b`.
