@@ -190,12 +190,13 @@ fn notify_view(notify: &NotifyConfig) -> NotifyView {
                 host: _,
                 topic: _,
                 token_file,
-                token_secret: _,
+                token_secret,
                 min_severity,
             } = ntfy;
             NtfyView {
                 min_severity: *min_severity,
-                authenticated: token_file.is_some(),
+                // Either credential form counts (ADR 0079); neither is shown.
+                authenticated: token_file.is_some() || token_secret.is_some(),
             }
         }),
     }
@@ -439,6 +440,21 @@ domain = "hooks.example.com"
         }
         assert_eq!(v["ingress"]["custom_trusted_proxies"], true);
         assert_eq!(view()["ingress"]["custom_trusted_proxies"], false);
+    }
+
+    #[test]
+    fn a_token_secret_counts_as_authenticated_and_stays_hidden() {
+        // The host secret name is a path to a credential too: shown is only that one is set.
+        let toml = FIXTURE.replace(
+            "token_file = \"/SECRET/ntfy-token\"",
+            "token_secret = \"SECRET-ntfy-secret-name\"",
+        );
+        let v = project_toml(&toml);
+        assert_eq!(
+            v["notify"]["ntfy"],
+            serde_json::json!({"min_severity": "warning", "authenticated": true})
+        );
+        assert!(!v.to_string().contains("SECRET"), "{v}");
     }
 
     #[test]

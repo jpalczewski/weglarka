@@ -1,14 +1,12 @@
 //! Validated runtime configuration: the endpoint, the token and the channel list.
 
-use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use weglarka_model::config::{NotifyConfig, NtfyConfig};
-use weglarka_model::credential::{HeaderTokenError, TokenFileError, read_private_token};
+use weglarka_model::credential::CredentialError;
 use weglarka_model::events::Severity;
-use weglarka_model::secret_store::SecretValue;
+use weglarka_model::secret_store::SecretStore;
 
 use crate::channel::Channel;
 use crate::endpoint::Endpoint;
@@ -20,14 +18,14 @@ pub enum NotifySettingsError {
     Url(#[from] crate::endpoint::EndpointError),
     #[error("[notify.ntfy] topic {0:?}: expected [A-Za-z0-9_-]{{1,64}}")]
     Topic(String),
-    #[error("cannot read the ntfy token file {path}: {source}")]
-    TokenRead { path: PathBuf, source: io::Error },
-    #[error("the ntfy token file {0} must not be accessible by group or others (chmod 600)")]
-    TokenPermissions(PathBuf),
-    #[error("the ntfy token file {0} is empty")]
-    TokenEmpty(PathBuf),
-    #[error("the ntfy token file {0} has characters that cannot go into an HTTP header")]
-    TokenInvalid(PathBuf),
+    /// A credential that cannot be read at startup, named by `CredentialSource::describe()` — a path
+    /// or a secret name, never the value (ADR 0079).
+    #[error("cannot read the ntfy token from {origin}: {err}")]
+    Credential {
+        origin: String,
+        #[source]
+        err: CredentialError,
+    },
     #[error("cannot set up the ntfy client: {0}")]
     Client(String),
 }
@@ -58,12 +56,16 @@ pub struct NotifySettings {
 
 impl NotifySettings {
     /// Validates `[notify]`. `Ok(None)` means "nothing to deliver to" (no `[notify.ntfy]`) — the daemon
-    /// then runs without notifications and says so at startup.
-    pub fn load(config: &NotifyConfig) -> Result<Option<Self>, NotifySettingsError> {
+    /// then runs without notifications and says so at startup. `host_store` serves a `token_secret`
+    /// (ADR 0079).
+    pub fn load(
+        config: &NotifyConfig,
+        host_store: &Arc<dyn SecretStore>,
+    ) -> Result<Option<Self>, NotifySettingsError> {
         let Some(ntfy) = &config.ntfy else {
             return Ok(None);
         };
-        let channel = Self::ntfy(ntfy)?;
+        let channel = Self::ntfy(ntfy, host_store)?;
         Ok(Some(Self {
             dedup_window: Duration::from_secs(config.dedup_window_secs),
             channels: vec![ChannelSpec {
@@ -74,18 +76,27 @@ impl NotifySettings {
         }))
     }
 
-    fn ntfy(ntfy: &NtfyConfig) -> Result<NtfyChannel, NotifySettingsError> {
+    fn ntfy(
+        ntfy: &NtfyConfig,
+        host_store: &Arc<dyn SecretStore>,
+    ) -> Result<NtfyChannel, NotifySettingsError> {
         let topic = ntfy.topic.trim();
         if !valid_topic(topic) {
             return Err(NotifySettingsError::Topic(ntfy.topic.clone()));
         }
         let endpoint = Endpoint::parse(&ntfy.url, ntfy.host.as_deref())?;
-        let token = match &ntfy.token_file {
-            // A validated header token is printable ASCII, so it is always UTF-8.
-            Some(path) => Some(String::from_utf8_lossy(read_token(path)?.expose()).into_owned()),
-            None => None,
-        };
-        NtfyChannel::new(endpoint, topic, token)
+        let credential = ntfy.credential(host_store);
+        // One eager read, so a broken token is still a startup error (as it was when the token was
+        // read once at startup). Afterwards the channel reads on use, so rotation needs no restart.
+        if let Some(source) = &credential {
+            source
+                .read()
+                .map_err(|err| NotifySettingsError::Credential {
+                    origin: source.describe(),
+                    err,
+                })?;
+        }
+        NtfyChannel::new(endpoint, topic, credential)
             .map_err(|e| NotifySettingsError::Client(e.to_string()))
     }
 
@@ -109,30 +120,29 @@ fn valid_topic(topic: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Reads the access token: a private file (0600) whose trailing newline is dropped. The value must
-/// be printable ASCII — it becomes an `Authorization` header, and a CR/LF there would be a header
-/// injection.
-fn read_token(path: &Path) -> Result<SecretValue, NotifySettingsError> {
-    read_private_token(path).map_err(|err| match err {
-        TokenFileError::Io(source) => NotifySettingsError::TokenRead {
-            path: path.to_owned(),
-            source,
-        },
-        TokenFileError::TooOpen => NotifySettingsError::TokenPermissions(path.to_owned()),
-        TokenFileError::Header(HeaderTokenError::Empty) => {
-            NotifySettingsError::TokenEmpty(path.to_owned())
-        }
-        TokenFileError::Header(HeaderTokenError::Invalid) => {
-            NotifySettingsError::TokenInvalid(path.to_owned())
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     use super::*;
+    use weglarka_model::secret_store::SecretValue;
+    use weglarka_model::secrets::FileSecretStore;
+
+    /// A host secret store in its own temporary directory; the caller keeps the `TempDir` alive.
+    fn host_store() -> (tempfile::TempDir, Arc<dyn SecretStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileSecretStore::host(dir.path().join("host-secrets.toml")));
+        (dir, store)
+    }
+
+    /// `[notify.ntfy]` whose `token_file` is `path`, loaded against an empty host store.
+    fn load_token_file(path: &Path) -> Result<Option<NotifySettings>, NotifySettingsError> {
+        let mut ntfy = ntfy();
+        ntfy.token_file = Some(path.to_owned());
+        let (_dir, store) = host_store();
+        NotifySettings::load(&config(Some(ntfy)), &store)
+    }
 
     fn ntfy() -> NtfyConfig {
         NtfyConfig {
@@ -154,12 +164,18 @@ mod tests {
 
     #[test]
     fn no_channel_means_notifications_are_off() {
-        assert!(NotifySettings::load(&config(None)).unwrap().is_none());
+        let (_dir, store) = host_store();
+        assert!(
+            NotifySettings::load(&config(None), &store)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn a_valid_configuration_yields_the_ntfy_channel() {
-        let settings = NotifySettings::load(&config(Some(ntfy())))
+        let (_dir, store) = host_store();
+        let settings = NotifySettings::load(&config(Some(ntfy())), &store)
             .unwrap()
             .unwrap();
         assert_eq!(settings.dedup_window, Duration::from_secs(60));
@@ -174,7 +190,10 @@ mod tests {
     fn severity_routing_filters_channels() {
         let mut ntfy = ntfy();
         ntfy.min_severity = Severity::Warning;
-        let settings = NotifySettings::load(&config(Some(ntfy))).unwrap().unwrap();
+        let (_dir, store) = host_store();
+        let settings = NotifySettings::load(&config(Some(ntfy)), &store)
+            .unwrap()
+            .unwrap();
         assert_eq!(settings.accepting(Severity::Debug).count(), 0);
         assert_eq!(settings.accepting(Severity::Info).count(), 0);
         assert_eq!(settings.accepting(Severity::Warning).count(), 1);
@@ -183,12 +202,13 @@ mod tests {
 
     #[test]
     fn invalid_topics_and_urls_are_rejected() {
+        let (_dir, store) = host_store();
         for topic in ["", "with space", "dots.not", &"x".repeat(65)] {
             let mut ntfy = ntfy();
             ntfy.topic = topic.to_owned();
             assert!(
                 matches!(
-                    NotifySettings::load(&config(Some(ntfy))),
+                    NotifySettings::load(&config(Some(ntfy)), &store),
                     Err(NotifySettingsError::Topic(_))
                 ),
                 "{topic:?}"
@@ -197,7 +217,7 @@ mod tests {
         let mut ntfy = ntfy();
         ntfy.url = "ntfy.example.com".into();
         assert!(matches!(
-            NotifySettings::load(&config(Some(ntfy))),
+            NotifySettings::load(&config(Some(ntfy)), &store),
             Err(NotifySettingsError::Url(_))
         ));
     }
@@ -208,7 +228,7 @@ mod tests {
         let path = dir.path().join("ntfy-token");
         std::fs::write(&path, "tk_secret\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_token(&path).unwrap().expose(), b"tk_secret");
+        assert!(load_token_file(&path).unwrap().is_some());
     }
 
     #[test]
@@ -217,10 +237,14 @@ mod tests {
         let path = dir.path().join("ntfy-token");
         std::fs::write(&path, "tk_secret").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            read_token(&path),
-            Err(NotifySettingsError::TokenPermissions(_))
-        ));
+        let err = load_token_file(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, NotifySettingsError::Credential { .. }),
+            "{text}"
+        );
+        assert!(text.contains("chmod 600"), "{text}");
+        assert!(!text.contains("tk_secret"), "{text}");
     }
 
     #[test]
@@ -230,9 +254,45 @@ mod tests {
         for content in ["\n", "bad\r\nHeader: x", "tk_ok\t"] {
             std::fs::write(&path, content).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            assert!(read_token(&path).is_err(), "{content:?} was accepted");
+            let err = load_token_file(&path).unwrap_err();
+            assert!(
+                matches!(err, NotifySettingsError::Credential { .. }),
+                "{content:?}: {err}"
+            );
+            // No value reaches the message.
+            let text = err.to_string();
+            assert!(!text.contains("bad") && !text.contains("tk_ok"), "{text}");
         }
         // A missing file is an error too (the operator pointed at the wrong path).
-        assert!(read_token(&dir.path().join("nope")).is_err());
+        assert!(load_token_file(&dir.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn a_token_secret_is_read_from_the_host_store() {
+        let (_dir, store) = host_store();
+        store
+            .set("ntfy-token", SecretValue::new("tk_secret\n"))
+            .unwrap();
+        let mut ntfy = ntfy();
+        ntfy.token_secret = Some("ntfy-token".into());
+        assert!(
+            NotifySettings::load(&config(Some(ntfy)), &store)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_missing_host_secret_is_a_startup_error_that_names_no_value() {
+        let (_dir, store) = host_store();
+        let mut ntfy = ntfy();
+        ntfy.token_secret = Some("ntfy-token".into());
+        let err = NotifySettings::load(&config(Some(ntfy)), &store).unwrap_err();
+        assert!(
+            matches!(err, NotifySettingsError::Credential { .. }),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("host secret ntfy-token"), "{text}");
     }
 }
