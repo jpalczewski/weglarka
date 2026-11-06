@@ -1003,11 +1003,7 @@ fn validate_security(name: &InstanceName, sec: &crate::app::Security) -> Result<
     }
     let mut seen = BTreeSet::new();
     for path in &sec.tmpfs {
-        let ok = path.starts_with('/')
-            && path.len() > 1
-            && !path.split('/').any(|s| s == "." || s == "..")
-            && !path.chars().any(|c| c.is_control() || c == ',' || c == ':');
-        if !ok {
+        if !valid_mount_target(path) {
             return Err(format!(
                 "{name}: tmpfs path {path:?} must be absolute (no '..', ':' or ',')"
             ));
