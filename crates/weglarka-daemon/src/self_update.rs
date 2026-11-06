@@ -183,6 +183,8 @@ where
 
     let state_dir = settings.paths.state_dir.clone();
     let mut st = state::load(&state_dir)?;
+    // What the timer's interval is measured from; a `--check` run puts it back (issue #605).
+    let interval_mark = st.checked_at;
     let interval = Duration::from_secs(config.interval_secs);
     // `--check` and `--force` are explicitly the operator asking now.
     let explicit = options.check || options.force;
@@ -193,7 +195,15 @@ where
     let image = ImageRef::parse(&config.image).map_err(|e| Error::Config(e.to_string()))?;
     if options.rollback {
         return rollback(
-            podman, platform, settings, &image, &state_dir, &mut st, options, now,
+            podman,
+            platform,
+            settings,
+            &image,
+            &state_dir,
+            &mut st,
+            options,
+            interval_mark,
+            now,
         )
         .await;
     }
@@ -205,7 +215,9 @@ where
     // The ADR 0023 gate compares the state header with the image label; a header newer than this
     // binary is only a number to compare (issue #616), not a reason to stop.
     let state_schema = state_schema(settings)?;
-    host_tools_fixed(&state_dir, &mut st)?;
+    host_tools_fixed(&mut st, |st| {
+        save_run(&state_dir, st, options, interval_mark)
+    })?;
 
     // `--force` is the documented override for the schema gate (a deliberate downgrade); it never
     // overrides the signature check.
@@ -213,12 +225,12 @@ where
     let (from, to) = match decision {
         Decision::UpToDate => {
             st.record_check(now);
-            state::save(&state_dir, &st)?;
+            save_run(&state_dir, &mut st, options, interval_mark)?;
             return Ok(Report::UpToDate { digest });
         }
         Decision::Refused(reason) if !options.force => {
             st.record_error(&reason, Some(digest), now);
-            state::save(&state_dir, &st)?;
+            save_run(&state_dir, &mut st, options, interval_mark)?;
             return Ok(Report::Refused { reason });
         }
         Decision::Refused(reason) => {
@@ -235,19 +247,19 @@ where
         // tag to move instead of hitting the registry every wake-up.
         let reason = error.message.clone();
         st.record_check(now);
-        state::save(&state_dir, &st)?;
+        save_run(&state_dir, &mut st, options, interval_mark)?;
         return Ok(Report::Refused { reason });
     }
     // 2. The signature, before anything is written.
     if let Err(reason) = check_signature(registry, config, &image, &to).await {
         st.record_error(&reason, Some(to), now);
-        state::save(&state_dir, &st)?;
+        save_run(&state_dir, &mut st, options, interval_mark)?;
         return Ok(Report::Refused { reason });
     }
     if options.check {
         st.clear_error();
         st.record_check(now);
-        state::save(&state_dir, &st)?;
+        save_run(&state_dir, &mut st, options, interval_mark)?;
         return Ok(Report::Available { from, to });
     }
     // 3. Pin the verified digest and restart. The attempt (and `pending`) is written first: if the
@@ -318,6 +330,7 @@ async fn rollback<P, Pl>(
     state_dir: &Path,
     st: &mut SelfUpdateState,
     options: Options,
+    interval_mark: Option<u64>,
     now: SystemTime,
 ) -> Result<Report, Error>
 where
@@ -350,7 +363,7 @@ where
     // The schema gate only applies when the label is readable: an image that predates the label
     // counts as schema 0, and a downgrade across a bump would lose fields (`docs/decisions/0023`).
     let state_schema = state_schema(settings)?;
-    host_tools_fixed(state_dir, st)?;
+    host_tools_fixed(st, |st| save_run(state_dir, st, options, interval_mark))?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
         && !options.force
@@ -361,7 +374,7 @@ where
              --force if you know that image reads it)"
         );
         st.record_error(&reason, Some(previous), now);
-        state::save(state_dir, st)?;
+        save_run(state_dir, st, options, interval_mark)?;
         return Ok(Report::Refused { reason });
     }
     let from = st.current.clone();
@@ -408,11 +421,37 @@ fn state_schema(settings: &Settings) -> Result<u32, Error> {
 /// Clears a recorded host-tools stop once this binary reads the state again (issue #203): the
 /// operator refreshed the host binaries, so the `doctor` failure must not outlive the cause. Other
 /// errors stay — they are about a digest and are cleared by the run that resolves them.
-fn host_tools_fixed(state_dir: &Path, st: &mut SelfUpdateState) -> Result<(), Error> {
+///
+/// `save` is how the caller writes the state: the switcher's [`save_run`] (a `--check` keeps the
+/// interval mark), or a plain save on the watchdog path.
+fn host_tools_fixed(
+    st: &mut SelfUpdateState,
+    save: impl FnOnce(&mut SelfUpdateState) -> Result<(), Error>,
+) -> Result<(), Error> {
     if st.clear_stale_host_tools() {
         tracing::info!("self-update resumed: the host binaries read the state again");
-        state::save(state_dir, st)?;
+        save(st)?;
     }
+    Ok(())
+}
+
+/// Saves the switcher state; a `--check` run never moves the interval mark (issue #605).
+///
+/// `checked_at` is what the timer's interval is measured from (`SelfUpdateState::is_due`), and
+/// `--check` is a question, not an update: whatever it records (an error for a digest, a cleared
+/// error) is kept, but `checked_at` goes back to `interval_mark`, its value when the run loaded the
+/// state, so checking before an update never delays the automatic one. Timer and `--force` runs
+/// keep advancing it (`record_check`/`record_error` are unchanged).
+fn save_run(
+    state_dir: &Path,
+    st: &mut SelfUpdateState,
+    options: Options,
+    interval_mark: Option<u64>,
+) -> Result<(), Error> {
+    if options.check {
+        st.checked_at = interval_mark;
+    }
+    state::save(state_dir, st)?;
     Ok(())
 }
 
@@ -774,7 +813,7 @@ where
         Err(e) => return Err(Error::Podman(e)),
     };
     let state_schema = state_schema(settings)?;
-    host_tools_fixed(state_dir, st)?;
+    host_tools_fixed(st, |st| Ok(state::save(state_dir, st)?))?;
     if let Some(image_schema) = schema_label(&info.labels)
         && image_schema < state_schema
     {
@@ -1299,6 +1338,154 @@ dir = "{root}/state"
         assert!(ctx.platform.installed_images().is_empty());
         assert_eq!(ctx.platform.restarts(), 0);
         assert!(ctx.state().pending.is_none());
+        assert_eq!(
+            ctx.state().checked_at,
+            None,
+            "a question does not move the interval (issue #605)"
+        );
+    }
+
+    fn checking() -> Options {
+        Options {
+            check: true,
+            ..Options::default()
+        }
+    }
+
+    /// The acceptance test of issue #605: a manual `--check` shortly after a timer run does not
+    /// push the next automatic update a whole interval later.
+    #[tokio::test]
+    async fn a_manual_check_does_not_delay_the_next_update() {
+        let mut ctx = Ctx::new(true);
+        let t = state::secs(ctx.now);
+        let interval = 300;
+        ctx.save_state(&SelfUpdateState {
+            checked_at: Some(t),
+            ..SelfUpdateState::default()
+        });
+        let digest = digest_of('a');
+        ctx.pulled_digest(&digest);
+        ctx.signed(&digest);
+
+        ctx.now += Duration::from_secs(10);
+        assert_eq!(
+            ctx.run(checking()).await,
+            Report::Available {
+                from: None,
+                to: digest.clone()
+            }
+        );
+        assert_eq!(ctx.state().checked_at, Some(t));
+
+        ctx.now = SystemTime::UNIX_EPOCH + Duration::from_secs(t + interval);
+        assert_eq!(
+            ctx.run(Options::default()).await,
+            Report::Applied {
+                from: None,
+                to: digest.clone()
+            }
+        );
+        assert_eq!(ctx.state().checked_at, Some(t + interval));
+    }
+
+    #[tokio::test]
+    async fn a_refused_check_records_the_digest_but_keeps_the_interval() {
+        let ctx = Ctx::new(true);
+        let t = state::secs(ctx.now) - 10;
+        ctx.save_state(&SelfUpdateState {
+            checked_at: Some(t),
+            ..SelfUpdateState::default()
+        });
+        // Unsigned: the signature check refuses it.
+        let digest = digest_of('a');
+        ctx.pulled_digest(&digest);
+
+        assert!(matches!(ctx.run(checking()).await, Report::Refused { .. }));
+        let state = ctx.state();
+        assert_eq!(
+            state.error.as_ref().and_then(|e| e.digest.clone()),
+            Some(digest),
+            "doctor and `failed_for` still see it"
+        );
+        assert_eq!(state.checked_at, Some(t));
+    }
+
+    #[tokio::test]
+    async fn an_up_to_date_check_keeps_the_interval() {
+        let ctx = Ctx::new(true);
+        let t = state::secs(ctx.now) - 10;
+        let running = digest_of('a');
+        ctx.save_state(&SelfUpdateState {
+            current: Some(running.clone()),
+            checked_at: Some(t),
+            ..SelfUpdateState::default()
+        });
+        ctx.pulled_digest(&running);
+
+        assert!(matches!(ctx.run(checking()).await, Report::UpToDate { .. }));
+        assert_eq!(ctx.state().checked_at, Some(t));
+    }
+
+    #[tokio::test]
+    async fn a_refused_rollback_check_keeps_the_interval() {
+        let ctx = Ctx::new(true);
+        let t = state::secs(ctx.now) - 10;
+        let old = digest_of('a');
+        let new = digest_of('b');
+        // The previous image writes an older schema than the state: the rollback is refused.
+        ctx.podman.set_pull_labels(IMAGE, &[(SCHEMA_LABEL, "1")]);
+        ctx.pull_image(&old).await;
+        ctx.save_state(&SelfUpdateState {
+            current: Some(new),
+            previous: Some(old.clone()),
+            checked_at: Some(t),
+            ..SelfUpdateState::default()
+        });
+
+        match ctx
+            .run(Options {
+                rollback: true,
+                check: true,
+                ..Options::default()
+            })
+            .await
+        {
+            Report::Refused { reason } => assert!(reason.contains("schema bump"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let state = ctx.state();
+        assert_eq!(
+            state.error.as_ref().and_then(|e| e.digest.clone()),
+            Some(old)
+        );
+        assert_eq!(state.checked_at, Some(t));
+        assert_eq!(ctx.platform.restarts(), 0);
+    }
+
+    /// Guard against over-fixing #605: an explicit update still counts as a check.
+    #[tokio::test]
+    async fn timer_and_forced_runs_still_move_the_interval() {
+        let mut ctx = Ctx::new(true);
+        let digest = digest_of('a');
+        ctx.pulled_digest(&digest);
+        ctx.signed(&digest);
+        assert!(matches!(
+            ctx.run(Options::default()).await,
+            Report::Applied { .. }
+        ));
+        assert_eq!(ctx.state().checked_at, Some(state::secs(ctx.now)));
+
+        // A refusal on a forced run (unsigned digest) advances it too.
+        ctx.now += Duration::from_secs(10);
+        ctx.pulled_digest(&digest_of('b'));
+        assert!(matches!(
+            ctx.run(Options {
+                force: true,
+                ..Options::default()
+            })
+            .await,
+            Report::Refused { .. }
+        ));
         assert_eq!(ctx.state().checked_at, Some(state::secs(ctx.now)));
     }
 
