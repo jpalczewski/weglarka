@@ -2202,32 +2202,35 @@ fn acme_dns(
     certs: Option<&[certificates::Cert]>,
     out: &mut Vec<DoctorCheck>,
 ) {
-    let token = &dns.token_file;
-    match check_private(token) {
-        Ok(()) => out.push(ok(
-            "acme.dns",
-            format!(
-                "{:?}, token {}, wildcards for {}",
-                dns.provider,
-                token.display(),
-                dns.wildcards.join(", ")
-            ),
-        )),
-        Err(PrivateFileError::TooOpen { mode }) => out.push(check(
-            "acme.dns",
-            CheckStatus::Fail,
-            format!("{} has permissions {mode:o}, expected 600", token.display()),
-            Some("chmod 600; the daemon refuses a group/other-accessible DNS token"),
-        )),
-        Err(PrivateFileError::Io(e)) => out.push(check(
-            "acme.dns",
-            CheckStatus::Fail,
-            format!("{}: {}", token.display(), detail(&e)),
-            Some(
-                "put the DNS provider's API token (scoped to the wildcard zones only) in this \
-                 file with mode 600",
-            ),
-        )),
+    // A `token_secret` (the host store, ADR 0079) is checked by the later `host.credentials`
+    // check; only the file form has a permission check here.
+    if let Some(token) = &dns.token_file {
+        match check_private(token) {
+            Ok(()) => out.push(ok(
+                "acme.dns",
+                format!(
+                    "{:?}, token {}, wildcards for {}",
+                    dns.provider,
+                    token.display(),
+                    dns.wildcards.join(", ")
+                ),
+            )),
+            Err(PrivateFileError::TooOpen { mode }) => out.push(check(
+                "acme.dns",
+                CheckStatus::Fail,
+                format!("{} has permissions {mode:o}, expected 600", token.display()),
+                Some("chmod 600; the daemon refuses a group/other-accessible DNS token"),
+            )),
+            Err(PrivateFileError::Io(e)) => out.push(check(
+                "acme.dns",
+                CheckStatus::Fail,
+                format!("{}: {}", token.display(), detail(&e)),
+                Some(
+                    "put the DNS provider's API token (scoped to the wildcard zones only) in this \
+                     file with mode 600",
+                ),
+            )),
+        }
     }
 
     let now = std::time::SystemTime::now();

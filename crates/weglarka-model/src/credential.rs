@@ -1,10 +1,12 @@
 //! Header credentials read from a private file: the one place that decides what may become an
 //! `Authorization` header. Values never reach logs, `Debug` or an error message.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::fsutil::{PrivateFileError, check_private};
-use crate::secret_store::SecretValue;
+use crate::secret_store::{SecretError, SecretStore, SecretValue};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderTokenError {
@@ -56,6 +58,109 @@ impl From<PrivateFileError> for TokenFileError {
             PrivateFileError::Io(e) => Self::Io(e),
             PrivateFileError::TooOpen { .. } => Self::TooOpen,
         }
+    }
+}
+
+/// One read seam for a credential (ADR 0079): a synchronous, dyn-compatible source whose value is
+/// read on every use (never cached by the caller), so rotation needs no restart.
+pub trait CredentialSource: Send + Sync {
+    fn read(&self) -> Result<SecretValue, CredentialError>;
+    /// Human label naming the source (never the value), for errors and `doctor`.
+    fn describe(&self) -> String;
+}
+
+/// Failure of [`CredentialSource::read`]; never carries the value.
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialError {
+    #[error("token file: {0}")]
+    File(#[from] TokenFileError),
+    #[error("host secret: {0}")]
+    Secret(#[from] SecretError),
+    #[error("host secret value {0}")]
+    Header(#[from] HeaderTokenError),
+    #[error("no host secret {0:?}")]
+    Missing(String),
+}
+
+/// A `token_file`-style credential: a 0600 file read and validated on every
+/// [`CredentialSource::read`].
+pub struct FileCredential {
+    path: PathBuf,
+}
+
+impl FileCredential {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl CredentialSource for FileCredential {
+    fn read(&self) -> Result<SecretValue, CredentialError> {
+        Ok(read_private_token(&self.path)?)
+    }
+
+    fn describe(&self) -> String {
+        format!("file {}", self.path.display())
+    }
+}
+
+impl fmt::Debug for FileCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileCredential")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// A named entry in the host secret store (`host-secrets.toml`), read and validated on every
+/// [`CredentialSource::read`].
+pub struct StoreCredential {
+    store: Arc<dyn SecretStore>,
+    name: String,
+}
+
+impl StoreCredential {
+    pub fn new(store: Arc<dyn SecretStore>, name: impl Into<String>) -> Self {
+        Self {
+            store,
+            name: name.into(),
+        }
+    }
+}
+
+impl CredentialSource for StoreCredential {
+    fn read(&self) -> Result<SecretValue, CredentialError> {
+        let value = self
+            .store
+            .get(&self.name)?
+            .ok_or_else(|| CredentialError::Missing(self.name.clone()))?;
+        Ok(parse_header_token(value.expose())?)
+    }
+
+    fn describe(&self) -> String {
+        format!("host secret {}", self.name)
+    }
+}
+
+impl fmt::Debug for StoreCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreCredential")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// The source named by a `token_file` / `token_secret` pair; `None` when neither is set (or both,
+/// which validation rejects first).
+pub fn credential_from(
+    token_file: Option<&Path>,
+    token_secret: Option<&str>,
+    host_store: &Arc<dyn SecretStore>,
+) -> Option<Arc<dyn CredentialSource>> {
+    match (token_file, token_secret) {
+        (Some(path), None) => Some(Arc::new(FileCredential::new(path))),
+        (None, Some(name)) => Some(Arc::new(StoreCredential::new(host_store.clone(), name))),
+        _ => None,
     }
 }
 
@@ -173,5 +278,114 @@ mod tests {
             read_private_token(&path),
             Err(TokenFileError::Header(HeaderTokenError::Invalid))
         ));
+    }
+
+    #[test]
+    fn file_credential_reads_rotates_and_refuses_loose_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        write(&path, b"tk_one\n", 0o600);
+        let src = FileCredential::new(&path);
+        assert_eq!(src.describe(), format!("file {}", path.display()));
+        assert_eq!(src.read().unwrap().expose(), b"tk_one");
+
+        // Rotation: rewriting the file is visible on the next read, no restart needed.
+        write(&path, b"tk_two\n", 0o600);
+        assert_eq!(src.read().unwrap().expose(), b"tk_two");
+
+        write(&path, b"tk_three", 0o644);
+        let err = src.read().unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialError::File(TokenFileError::TooOpen)
+        ));
+        assert!(!format!("{err:?}").contains("tk_three"));
+
+        match FileCredential::new(dir.path().join("nope")).read() {
+            Err(CredentialError::File(TokenFileError::Io(e))) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn store_credential_reads_rotates_and_reports_missing() {
+        use crate::secrets::FileSecretStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::host(dir.path().join("host-secrets.toml"));
+        let store: Arc<dyn SecretStore> = Arc::new(store);
+        let src = StoreCredential::new(store.clone(), "ntfy-token");
+        assert_eq!(src.describe(), "host secret ntfy-token");
+
+        assert!(matches!(
+            src.read(),
+            Err(CredentialError::Missing(n)) if n == "ntfy-token"
+        ));
+
+        store.set("ntfy-token", SecretValue::new("tk_one")).unwrap();
+        assert_eq!(src.read().unwrap().expose(), b"tk_one");
+
+        // Rotation via `set` is visible on the next read.
+        store.set("ntfy-token", SecretValue::new("tk_two")).unwrap();
+        assert_eq!(src.read().unwrap().expose(), b"tk_two");
+    }
+
+    #[test]
+    fn a_cr_or_lf_inside_the_value_is_refused_by_both_adapters() {
+        use crate::secrets::FileSecretStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        write(&path, b"a\nb", 0o600);
+        assert!(matches!(
+            FileCredential::new(&path).read(),
+            Err(CredentialError::File(TokenFileError::Header(
+                HeaderTokenError::Invalid
+            )))
+        ));
+
+        let store = FileSecretStore::host(dir.path().join("host-secrets.toml"));
+        let store: Arc<dyn SecretStore> = Arc::new(store);
+        store.set("ntfy-token", SecretValue::new("a\nb")).unwrap();
+        assert!(matches!(
+            StoreCredential::new(store, "ntfy-token").read(),
+            Err(CredentialError::Header(HeaderTokenError::Invalid))
+        ));
+    }
+
+    #[test]
+    fn debug_and_display_never_reveal_the_value() {
+        use crate::secrets::FileSecretStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        write(&path, b"tk_secret", 0o644);
+        let file = FileCredential::new(&path);
+        let err = file.read().unwrap_err();
+        for text in [format!("{err}"), format!("{err:?}"), format!("{file:?}")] {
+            assert!(!text.contains("tk_secret"), "{text}");
+        }
+
+        let store = FileSecretStore::host(dir.path().join("host-secrets.toml"));
+        let store: Arc<dyn SecretStore> = Arc::new(store);
+        store
+            .set("ntfy-token", SecretValue::new("sup3r_s3cr3t"))
+            .unwrap();
+        let src = StoreCredential::new(store.clone(), "ntfy-token");
+        assert_eq!(
+            format!("{src:?}"),
+            "StoreCredential { name: \"ntfy-token\" }"
+        );
+        assert!(!format!("{src:?}").contains("sup3r_s3cr3t"));
+
+        // A value that fails validation is named by the error but never leaked.
+        store
+            .set("ntfy-token", SecretValue::new("two words"))
+            .unwrap();
+        let err = src.read().unwrap_err();
+        assert!(!format!("{err}").contains("two words"));
+        assert!(!format!("{err:?}").contains("two words"));
     }
 }

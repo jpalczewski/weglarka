@@ -140,6 +140,7 @@ mod tests {
             host: None,
             topic: "weglarka".into(),
             token_file: None,
+            token_secret: None,
             min_severity: Severity::Info,
         }
     }
