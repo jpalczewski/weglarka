@@ -2174,3 +2174,36 @@ fn sites_list_says_where_a_standalone_static_app_is_when_nothing_is_declared() {
     assert!(text.contains("kind = \"static\""), "{text}");
     assert!(!text.contains("standalone static sites ("), "{text}");
 }
+
+/// `apps list` for a host with one app and two shared services (ADR 0079): the table, then the
+/// section — the kind carries the Redis profile and an empty service shows `-`, like a group.
+#[test]
+fn apps_list_adds_a_section_for_the_declared_shared_services() {
+    let resp: weglarka_api::ListAppsResponse = serde_json::from_value(serde_json::json!({
+        "apps": [{
+            "name": "api", "image": "ghcr.io/example/api:1", "domains": ["api.example.com"],
+            "runtime": "running"
+        }],
+        "shared_services": [
+            { "name": "cache", "kind": "redis", "profile": "cache", "instance": "cache-redis",
+              "members": ["api", "worker"] },
+            { "name": "sessions", "kind": "postgres", "instance": "sessions-db", "members": [] }
+        ]
+    }))
+    .unwrap();
+    insta::assert_snapshot!(crate::commands::render_apps_list(&resp));
+}
+
+#[test]
+fn apps_list_has_no_section_when_no_service_is_declared() {
+    let resp: weglarka_api::ListAppsResponse = serde_json::from_value(serde_json::json!({
+        "apps": [{
+            "name": "api", "image": "ghcr.io/example/api:1", "domains": ["api.example.com"],
+            "runtime": "running"
+        }]
+    }))
+    .unwrap();
+    let text = crate::commands::render_apps_list(&resp);
+    assert!(!text.contains("Shared services"), "{text}");
+    assert!(text.contains("api"), "{text}");
+}

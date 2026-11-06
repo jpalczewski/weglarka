@@ -32,6 +32,7 @@ mod secrets;
 mod self_update;
 mod shared_networks;
 mod shared_services;
+mod shared_services_view;
 mod shared_volumes;
 mod sites;
 mod stats;

@@ -12,10 +12,11 @@ use weglarka_api::{
     ListAppsResponse, ListReservationsResponse, ListSecretsResponse, NotifyStatusResponse,
     NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
     ReloadRequest, ReloadResponse, ReservationView, RollbackResponse, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse,
+    SharedServiceSummary, ShowAppResponse, StatusResponse,
 };
 use weglarka_model::app::{AppIngress, AppSpec, Digest, HealthGate, InstanceName};
 use weglarka_model::secret_store::valid_secret_name;
+use weglarka_model::shared_services::{RedisProfile, ServiceKind};
 use weglarka_model::units::human_bytes;
 
 use crate::cli::{
@@ -306,7 +307,7 @@ async fn apps_list(json: bool, o: &Overrides) -> Result<i32, CliError> {
     let resp: ListAppsResponse = client(o)?
         .call(endpoints::APPS_LIST, &[], None::<&()>)
         .await?;
-    emit(json, &resp, || render_apps(&resp.apps));
+    emit(json, &resp, || render_apps_list(&resp));
     Ok(exit::OK)
 }
 
@@ -904,6 +905,60 @@ fn render_apps(apps: &[AppSummary]) -> String {
         })
         .collect::<Vec<_>>();
     table(&["NAME", "RUNTIME", "IMAGE", "DOMAINS", "SITE"], &rows)
+}
+
+/// `apps list`: the app table, then the declared shared services (ADR 0079) when there are any, so
+/// an operator sees who a service serves without opening `apps.toml`.
+pub(crate) fn render_apps_list(r: &ListAppsResponse) -> String {
+    let mut out = render_apps(&r.apps);
+    if r.shared_services.is_empty() {
+        return out;
+    }
+    out.push('\n');
+    out.push_str("Shared services:\n");
+    out.push_str(&render_shared_services(&r.shared_services));
+    out
+}
+
+/// The services section of `apps list`, in the table style of `networks list`. The kind carries its
+/// Redis profile (`redis/cache`); a service without members shows `-`, like an empty group does.
+fn render_shared_services(services: &[SharedServiceSummary]) -> String {
+    let rows: Vec<Vec<String>> = services
+        .iter()
+        .map(|s| {
+            let kind = match (s.kind, s.profile) {
+                (ServiceKind::Redis, Some(profile)) => {
+                    format!("redis/{profile}", profile = redis_profile_label(profile))
+                }
+                (kind, _) => service_kind_label(kind).to_owned(),
+            };
+            let members = if s.members.is_empty() {
+                "-".to_owned()
+            } else {
+                s.members
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            vec![s.name.to_string(), kind, s.instance.to_string(), members]
+        })
+        .collect();
+    table(&["SERVICE", "KIND", "INSTANCE", "MEMBERS"], &rows)
+}
+
+fn service_kind_label(kind: ServiceKind) -> &'static str {
+    match kind {
+        ServiceKind::Redis => "redis",
+        ServiceKind::Postgres => "postgres",
+    }
+}
+
+fn redis_profile_label(profile: RedisProfile) -> &'static str {
+    match profile {
+        RedisProfile::Durable => "durable",
+        RedisProfile::Cache => "cache",
+    }
 }
 
 pub(crate) fn render_show(r: &ShowAppResponse) -> String {

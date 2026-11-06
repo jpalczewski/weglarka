@@ -1,0 +1,11 @@
+---
+source: crates/weglarka-cli/src/tests.rs
+expression: "crate::commands::render_apps_list(&resp)"
+---
+NAME  RUNTIME  IMAGE                  DOMAINS          SITE
+api   running  ghcr.io/example/api:1  api.example.com  -
+
+Shared services:
+SERVICE   KIND         INSTANCE     MEMBERS
+cache     redis/cache  cache-redis  api, worker
+sessions  postgres     sessions-db  -

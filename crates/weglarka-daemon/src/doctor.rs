@@ -118,6 +118,7 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     sites_current(d, &mut checks);
     shared_volume_state(d, &mut checks).await;
     shared_network_state(d, &mut checks).await;
+    shared_service_state(d, &mut checks);
     orphan_networks(d, &mut checks).await;
     secrets(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
@@ -1685,6 +1686,9 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
         .container_list(&ContainerFilter::default())
         .await
         .ok();
+    // A group network belongs to a `[shared_networks]` or a `[shared_services]` entry: both share
+    // the `net-shared-<name>` namespace (ADR 0079), so only a name in neither is undeclared.
+    let declared_groups = weglarka_model::shared_services::network_groups(&apps);
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut hints = Vec::new();
@@ -1695,7 +1699,7 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
         let Some(group) = net.labels.get(labels::SHARED_NETWORK) else {
             continue;
         };
-        if apps.shared_networks.keys().any(|n| n.as_str() == group) {
+        if declared_groups.iter().any(|n| n.as_str() == group) {
             continue;
         }
         warnings.push(format!(
@@ -1762,6 +1766,49 @@ async fn shared_network_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<Doct
         message,
         hint.as_deref(),
     ));
+}
+
+/// `state.shared_services` (ADR 0079): every declared service with its member count, so an
+/// operator sees who a database is shared with without opening `apps.toml`. Nothing here can be
+/// warn-worthy on its own — a declaration is an ordinary instance plus a membership list, and
+/// whether the containers are wired up is [`shared_network_state`]'s business — so every report is
+/// `ok`. The text is ours: no engine or Podman message goes through [`detail`].
+fn shared_service_state<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let Ok(apps) = state::load_apps(&d.paths.state.apps) else {
+        return; // already reported as `state.apps_file`
+    };
+    if apps.shared_services.is_empty() {
+        out.push(ok("state.shared_services", "no shared services declared"));
+        return;
+    }
+    let services: Vec<String> = apps
+        .shared_services
+        .iter()
+        .map(|(name, spec)| {
+            let members = weglarka_model::shared_services::members(&apps, name);
+            format!(
+                "{name} ({kind}) on {instance}: {count} {members}",
+                kind = service_kind_label(spec.kind),
+                instance = spec.instance,
+                count = members.len(),
+                members = if members.len() == 1 {
+                    "member"
+                } else {
+                    "members"
+                },
+            )
+        })
+        .collect();
+    out.push(ok("state.shared_services", services.join("; ")));
+}
+
+/// The TOML spelling of a [`ServiceKind`](weglarka_model::shared_services::ServiceKind).
+fn service_kind_label(kind: weglarka_model::shared_services::ServiceKind) -> &'static str {
+    use weglarka_model::shared_services::ServiceKind;
+    match kind {
+        ServiceKind::Redis => "redis",
+        ServiceKind::Postgres => "postgres",
+    }
 }
 
 /// `state.orphan_networks` (issue #53): Węglarka-labelled `net-<instance>` networks without an app.
