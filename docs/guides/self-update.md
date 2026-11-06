@@ -37,6 +37,8 @@ weglarka-daemon --config /etc/weglarka/weglarka.toml self-update           # sam
 weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --force   # skip the interval / retry a failed digest
 ```
 
+`--check` does not move the interval: the timer measures it from the last real check (`checked_at` in `self-update.toml`), and a `--check` run leaves that value as it was (issue #605), so checking before an update never delays the automatic one. It still records what it found for `doctor` (a refused digest, or clears a stale error). `--force` without `--check` is an update and advances the interval like a timer run.
+
 **4. Automatic fallback (#100) and manual rollback.** The `self-update.toml` state file (0600, in the state directory) carries `current`, `previous`, `pending`, and since #100 also a record of the switch in progress (`switch_from`/`switch_to`/`switch_at`, `switch_attempts`) and the last automatic fallback (`fallback_*`). `weglarka-watchdog.timer` runs `weglarka-daemon supervise` every minute: it probes `GET /v1/health` on the admin socket (an answer means all startup conditions are met), and when the new image does not answer within `fallback_timeout_secs`, it pins `switch_from` in the quadlet (`systemctl --user reset-failed weglarka.service`, because the restart loop exhausts the start limit, then a restart) and records the fallback in the state file. After the restart the daemon confirms it and emits the `SelfUpdateFellBack` event (a notification); the broken digest goes into `error`, so later runs do not pin it again until the tag moves (`--force` is a deliberate override). The budget is **one** automatic attempt per switch: a fallback that itself fails to come up ends in a report (the watchdog unit "failed", `doctor`), not a restart loop. The watchdog and the switcher share a lock (`self-update.lock`), so they do not overlap.
 
 ```sh
@@ -73,7 +75,7 @@ A host binary older than this reporting records nothing, so there the journal me
 2. make the timers use them: `platform install` on a daemon-only setup;
 3. check: `weglarka-daemon --config /etc/weglarka/weglarka.toml self-update --check` and `weglarka doctor | grep self_update`.
 
-The first run that can read the state again clears the recorded stop, also when the image is already the running one, so `doctor` returns to `ok` right after step 3 (without `--check`, the next timer run does it once the interval has passed).
+The first run that can read the state again clears the recorded stop, also when the image is already the running one, so `doctor` returns to `ok` right after step 3 (without `--check`, the next timer run does it once the interval has passed). That `--check` does not delay the next automatic update either.
 
 **A new `weglarka.toml` key.** A similar stop happens without a schema bump, also with host binaries that compare only the schema header, when you add a key to `weglarka.toml` that only the running (newer) daemon knows, for example a new `[logs]` option. `weglarka.toml` is parsed strictly (`deny_unknown_fields`, an unknown key is never ignored), so the older host binaries fail before they do anything:
 
