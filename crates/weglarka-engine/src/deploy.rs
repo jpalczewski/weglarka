@@ -22,6 +22,7 @@ use weglarka_model::podman::{
     BindMount, ContainerInfo, ContainerSpec, ContainerState, HealthStatus, NetworkSpec,
     PodmanClient, PodmanError, PodmanResultExt, PortMapping, PullEvent, RestartPolicy, image_repo,
 };
+use weglarka_model::shared_services::{ServiceName, SharedServiceSpec};
 use weglarka_model::state::{self, AppState, FailedDeploy, StateFile};
 use weglarka_model::uid_range::UidRange;
 use weglarka_model::webhook::WebhookEvent;
@@ -72,16 +73,20 @@ pub enum ReloadOutcome {
 // ── Helpers (pure) ──────────────────────────────────────────────────────
 
 /// The networks an instance's container joins and the extra DNS aliases on them. The instance's own
-/// network stays first (the primary one: egress, ingress); the group network is added next to it,
-/// with the declared aliases on top of the container name.
+/// network stays first (the primary one: egress, ingress); then every shared network of the spec —
+/// its own `[shared_networks]` group and one per shared service (ADR 0079) — with the declared
+/// aliases on top of the container name.
 pub(crate) fn instance_networks(
     instance: &InstanceName,
     spec: &AppSpec,
 ) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
     let mut networks = vec![labels::network_name(instance)];
     let mut aliases = BTreeMap::new();
-    if let Some(net) = weglarka_model::shared_networks::membership(spec) {
+    for net in &spec.shared_networks {
         let shared = labels::shared_network_name(&net.name);
+        if networks.contains(&shared) {
+            continue;
+        }
         if !net.aliases.is_empty() {
             aliases.insert(shared.clone(), net.aliases.clone());
         }
@@ -461,14 +466,17 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))
     }
 
-    /// Expected `spec-hash` according to the secret-change policy.
+    /// Expected `spec-hash` according to the secret-change policy. `services` is the caller's
+    /// already loaded `apps.shared_services` (the shared-service overlay enters the hash, so a member
+    /// is a different container from an app that lists nothing).
     pub(crate) async fn desired_hash(
         &self,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
     ) -> Result<SpecHash, EngineError> {
-        let spec = &*self.effective(instance, spec);
+        let spec = &*self.effective(services, instance, spec);
         let hash = match self.options.secret_change {
             SecretChangePolicy::NextDeploy => spec_hash(spec, digest),
             SecretChangePolicy::Immediate => {
@@ -764,7 +772,9 @@ impl<P: PodmanClient> Reconciler<P> {
                 labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
             })
             .await?;
-        if let Some(net) = weglarka_model::shared_networks::membership(spec) {
+        // Every shared network the spec joins: the app's own `[shared_networks]` group and one per
+        // shared service (ADR 0079). Created lazily by whoever joins first.
+        for net in &spec.shared_networks {
             self.podman
                 .network_create(&NetworkSpec {
                     name: labels::shared_network_name(&net.name),
@@ -816,6 +826,7 @@ impl<P: PodmanClient> Reconciler<P> {
     async fn launch(
         &self,
         guard: &ImageGuard<'_>,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
@@ -823,12 +834,12 @@ impl<P: PodmanClient> Reconciler<P> {
         local_id: Option<&str>,
         slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
-        let spec = &*self.effective(instance, spec);
+        let spec = &*self.effective(services, instance, spec);
         self.ensure_oidc_credential(instance, spec).await?;
         let image = self
             .ensure_image(guard, instance, spec, digest, local_id, slot)
             .await?;
-        let hash = self.desired_hash(instance, spec, digest).await?;
+        let hash = self.desired_hash(services, instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         let (prepared, configs) = self.begin_instance(instance, spec).await?;
         let name = labels::container_name(instance);
@@ -877,9 +888,11 @@ impl<P: PodmanClient> Reconciler<P> {
     }
 
     /// `launch` or, for a blue-green app with a serving container, [`Self::launch_blue_green`].
+    #[allow(clippy::too_many_arguments)]
     async fn launch_with_strategy(
         &self,
         guard: &ImageGuard<'_>,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
@@ -887,11 +900,13 @@ impl<P: PodmanClient> Reconciler<P> {
         slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
         if self.blue_green_applies(instance, spec).await {
-            self.launch_blue_green(guard, instance, spec, digest, generation, slot)
+            self.launch_blue_green(guard, services, instance, spec, digest, generation, slot)
                 .await
         } else {
-            self.launch(guard, instance, spec, digest, generation, None, slot)
-                .await
+            self.launch(
+                guard, services, instance, spec, digest, generation, None, slot,
+            )
+            .await
         }
     }
 
@@ -901,21 +916,23 @@ impl<P: PodmanClient> Reconciler<P> {
     ///
     /// `Err` = failure before anything was created (the old container is untouched). A challenger that
     /// fails its gate is removed and reported as `Launched { old_intact: true, health: Err }`.
+    #[allow(clippy::too_many_arguments)]
     async fn launch_blue_green(
         &self,
         guard: &ImageGuard<'_>,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
         instance: &InstanceName,
         spec: &AppSpec,
         digest: &Digest,
         generation: u64,
         slot: &mut AcquisitionSlot,
     ) -> Result<Launched, EngineError> {
-        let spec = &*self.effective(instance, spec);
+        let spec = &*self.effective(services, instance, spec);
         self.ensure_oidc_credential(instance, spec).await?;
         let image = self
             .ensure_image(guard, instance, spec, digest, None, slot)
             .await?;
-        let hash = self.desired_hash(instance, spec, digest).await?;
+        let hash = self.desired_hash(services, instance, spec, digest).await?;
         let secrets = materialize(&self.podman, &self.secrets, instance, spec).await?;
         // Everything `launch` prepares, **without** touching the serving container.
         self.bootstrap_generated(instance).await?;
@@ -1256,9 +1273,13 @@ impl<P: PodmanClient> Reconciler<P> {
                 .await;
         }
         // A deploy starts a container: every app in `depends_on` has to be running/healthy first
-        // (issue #35). Not a failure — the start is retried once the dependency is up.
-        self.dependency_gate(instance, &self.effective(instance, &spec))
-            .await?;
+        // (issue #35), including the shared service a member belongs to (ADR 0079, through the
+        // overlay). Not a failure — the start is retried once the dependency is up.
+        self.dependency_gate(
+            instance,
+            &self.effective(&apps.shared_services, instance, &spec),
+        )
+        .await?;
         // `state.toml` is written only after the health gate, so until then the instance is
         // "in flight": `doctor` must not read the lagging state as drift.
         let _activity = self.begin_activity(instance, ActivityKind::Deploy);
@@ -1287,7 +1308,9 @@ impl<P: PodmanClient> Reconciler<P> {
                 return Ok(DeployOutcome::KnownBad { digest });
             }
             if cur.current.as_ref() == Some(&digest)
-                && self.is_converged(instance, &spec, &digest).await
+                && self
+                    .is_converged(&apps.shared_services, instance, &spec, &digest)
+                    .await
             {
                 return Ok(DeployOutcome::Unchanged { digest });
             }
@@ -1296,7 +1319,15 @@ impl<P: PodmanClient> Reconciler<P> {
         let generation = cur.generation + 1;
         let prev_image_id = self.running_image_id(instance).await;
         let launched = self
-            .launch_with_strategy(image_guard, instance, &spec, &digest, generation, slot)
+            .launch_with_strategy(
+                image_guard,
+                &apps.shared_services,
+                instance,
+                &spec,
+                &digest,
+                generation,
+                slot,
+            )
             .await;
         let launched = match launched {
             Ok(l) => l,
@@ -1369,6 +1400,7 @@ impl<P: PodmanClient> Reconciler<P> {
         let restore = self
             .launch(
                 image_guard,
+                &apps.shared_services,
                 instance,
                 &spec,
                 &prev,
@@ -1497,8 +1529,14 @@ impl<P: PodmanClient> Reconciler<P> {
         Ok(DeployOutcome::Provisioned { digest })
     }
 
-    async fn is_converged(&self, instance: &InstanceName, spec: &AppSpec, digest: &Digest) -> bool {
-        let Ok(hash) = self.desired_hash(instance, spec, digest).await else {
+    async fn is_converged(
+        &self,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
+        instance: &InstanceName,
+        spec: &AppSpec,
+        digest: &Digest,
+    ) -> bool {
+        let Ok(hash) = self.desired_hash(services, instance, spec, digest).await else {
             return false;
         };
         match self
@@ -1539,12 +1577,22 @@ impl<P: PodmanClient> Reconciler<P> {
         reason: RecreateReason,
         slot: &mut AcquisitionSlot,
     ) -> Result<DeployOutcome, EngineError> {
-        let spec = self.load_spec(instance)?;
+        // `apps` is read once here: the spec (this instance) and the shared-service declarations the
+        // overlay needs both come from the same file.
+        let apps = state::load_apps(&self.paths.apps)?;
+        let spec = apps
+            .apps
+            .get(instance)
+            .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?
+            .clone();
         // Recreating a **missing** container is a start, so the dependencies must be up first.
         // Replacing a container that is already running (`SpecDrift`) is not gated.
         if reason == RecreateReason::Missing {
-            self.dependency_gate(instance, &self.effective(instance, &spec))
-                .await?;
+            self.dependency_gate(
+                instance,
+                &self.effective(&apps.shared_services, instance, &spec),
+            )
+            .await?;
         }
         let _activity = self.begin_activity(instance, ActivityKind::Recreate);
         self.assign_range(instance, &spec).await?; // before `st` is loaded: it writes state.toml
@@ -1556,7 +1604,15 @@ impl<P: PodmanClient> Reconciler<P> {
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         let generation = cur.generation + 1;
         let launched = self
-            .launch_with_strategy(image_guard, instance, &spec, &digest, generation, slot)
+            .launch_with_strategy(
+                image_guard,
+                &apps.shared_services,
+                instance,
+                &spec,
+                &digest,
+                generation,
+                slot,
+            )
             .await?;
 
         let entry = st.apps.entry(instance.clone()).or_default();

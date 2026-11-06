@@ -27,6 +27,7 @@ use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, NetworkSummary, PodmanClient, PodmanError,
 };
 use weglarka_model::secret_store::{SecretError, SecretStore, scoped_name};
+use weglarka_model::shared_services::{ServiceName, SharedServiceSpec};
 use weglarka_model::state::{self, StateError, StatePaths};
 
 #[derive(Debug, thiserror::Error)]
@@ -802,14 +803,19 @@ impl<P: PodmanClient> Reconciler<P> {
         self
     }
 
-    /// `spec` as the container sees it: the injected OIDC env and secret included (#91). Every
-    /// reader of `spec.env`/`spec.secrets` at launch time goes through this one overlay.
+    /// `spec` as the container sees it: the injected OIDC env and secret included (#91) and the
+    /// shared-service relations of `services` on top (ADR 0079: `depends_on` and the service's
+    /// network). Every reader of `spec.env`/`spec.secrets`/`spec.depends_on`/`spec.shared_networks`
+    /// at launch time goes through this one overlay. `services` is the caller's already loaded
+    /// `apps.shared_services`, so one operation never reads `apps.toml` twice.
     pub(crate) fn effective<'a>(
         &self,
+        services: &BTreeMap<ServiceName, SharedServiceSpec>,
         instance: &InstanceName,
         spec: &'a AppSpec,
     ) -> std::borrow::Cow<'a, AppSpec> {
-        weglarka_model::identity::effective_spec(instance, spec, self.identity.as_ref())
+        let spec = weglarka_model::identity::effective_spec(instance, spec, self.identity.as_ref());
+        weglarka_model::shared_services::overlay(instance, spec, services)
     }
 
     /// Mints the OIDC client secret of an `oidc` app when it is absent (#213), so the secret exists
@@ -928,7 +934,16 @@ impl<P: PodmanClient> Reconciler<P> {
         ) {
             return false;
         }
-        match self.desired_hash(name, spec, digest).await {
+        // The declaration map is not in this call's scope (the API's `show` handler holds a single
+        // spec, not the file), so it is read here. A file that does not load means "not reconciled",
+        // exactly like a hash that cannot be computed.
+        let Ok(apps) = state::load_apps(&self.paths.apps) else {
+            return false;
+        };
+        match self
+            .desired_hash(&apps.shared_services, name, spec, digest)
+            .await
+        {
             Ok(h) => c.labels.get(labels::SPEC_HASH).map(String::as_str) == Some(h.as_str()),
             Err(_) => false,
         }
@@ -1045,7 +1060,12 @@ impl<P: PodmanClient> Reconciler<P> {
                 tracing::warn!(instance = %name, %error, "cannot ensure the OIDC client credential");
             }
             let missing = if spec.start {
-                missing_secrets(&self.secrets, name, &self.effective(name, spec)).await?
+                missing_secrets(
+                    &self.secrets,
+                    name,
+                    &self.effective(&apps.shared_services, name, spec),
+                )
+                .await?
             } else {
                 Vec::new()
             };
@@ -1074,7 +1094,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 blocked = true;
                 report.blocked.push((name.clone(), e.to_string()));
             } else if let Some(d) = &pinned {
-                match self.desired_hash(name, spec, d).await {
+                match self
+                    .desired_hash(&apps.shared_services, name, spec, d)
+                    .await
+                {
                     Ok(h) => expected_hash = Some(h),
                     Err(e) => {
                         blocked = true;
@@ -1099,7 +1122,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 blocked,
                 uid_range,
                 start: spec.start,
-                depends_on: self.effective(name, spec).depends_on.clone(),
+                depends_on: self
+                    .effective(&apps.shared_services, name, spec)
+                    .depends_on
+                    .clone(),
                 is_static: false,
                 released: false,
             });
@@ -1164,12 +1190,16 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         // Membership first: a scraper still on an opted-out app's network would keep it in use.
         self.sync_metrics_networks(apps, &networks).await;
+        // The names that own a group network: every `[shared_networks]` and every
+        // `[shared_services]` entry (one namespace, ADR 0079).
+        let groups = weglarka_model::shared_services::network_groups(apps);
         for net in networks {
             // A shared network (issue #128) belongs to its declaration, not to an instance: it
-            // lives as long as `[shared_networks.<name>]` does, whoever is a member right now.
+            // lives as long as `[shared_networks.<name>]` — or a `[shared_services.<name>]` of the
+            // same namespace (ADR 0079) — does, whoever is a member right now.
             if let Some(group) = net.labels.get(labels::SHARED_NETWORK) {
                 let declared = weglarka_model::app::SharedNetworkName::new(group.as_str())
-                    .is_ok_and(|g| apps.shared_networks.contains_key(&g));
+                    .is_ok_and(|g| groups.contains(&g));
                 if !declared {
                     self.remove_network(&net.name, "shared network that is no longer declared")
                         .await;
@@ -1230,8 +1260,11 @@ impl<P: PodmanClient> Reconciler<P> {
                     .apps
                     .get(&instance)
                     .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
-                self.dependency_gate(&instance, &self.effective(&instance, spec))
-                    .await?;
+                self.dependency_gate(
+                    &instance,
+                    &self.effective(&apps.shared_services, &instance, spec),
+                )
+                .await?;
                 self.podman
                     .container_start(&labels::container_name(&instance))
                     .await?;

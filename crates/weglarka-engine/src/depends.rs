@@ -7,6 +7,10 @@
 //! order only** — every app keeps its own `net-<instance>` network, so `depends_on` gives no
 //! connectivity by itself; joining a shared network (issue #128) is what gives it, and the two
 //! compose. The shared-database part of issue #35 is separate.
+//!
+//! The gate reads whatever spec its caller passes: the deploy, recreate and reconcile paths pass the
+//! overlaid one ([`Reconciler::effective`]), which holds the identity provider (ADR 0051) and the
+//! shared-service relations (ADR 0079: a member waits for the instance that runs its service).
 
 use std::time::Duration;
 
