@@ -229,6 +229,63 @@ impl Prepared {
     }
 }
 
+/// Who a uid range in `state.toml` belongs to: an instance, a shared volume group or the ingress
+/// nginx. Every owner gets its range the same way ([`Reconciler::get_or_allocate_range_locked`]).
+#[derive(Debug, Clone, Copy)]
+enum RangeOwner<'a> {
+    Instance(&'a InstanceName),
+    SharedGroup(&'a SharedVolumeName),
+    Ingress,
+}
+
+impl RangeOwner<'_> {
+    fn get(self, st: &StateFile) -> Option<UidRange> {
+        match self {
+            Self::Instance(instance) => st.apps.get(instance).and_then(|s| s.uid_range),
+            Self::SharedGroup(group) => st.shared_volumes.get(group).and_then(|s| s.uid_range),
+            Self::Ingress => st.ingress_uid_range,
+        }
+    }
+
+    fn set(self, st: &mut StateFile, range: UidRange) {
+        match self {
+            Self::Instance(instance) => {
+                st.apps.entry(instance.clone()).or_default().uid_range = Some(range);
+            }
+            Self::SharedGroup(group) => {
+                st.shared_volumes
+                    .entry(group.clone())
+                    .or_default()
+                    .uid_range = Some(range);
+            }
+            Self::Ingress => st.ingress_uid_range = Some(range),
+        }
+    }
+
+    fn size(self) -> u32 {
+        match self {
+            Self::Instance(_) | Self::SharedGroup(_) => DEFAULT_RANGE_SIZE,
+            Self::Ingress => INFRA_RANGE_SIZE,
+        }
+    }
+
+    fn log_assigned(self, range: UidRange) {
+        let (start, size) = (range.start, range.size);
+        match self {
+            Self::Instance(instance) => {
+                tracing::info!(%instance, start, size, "assigned uid range");
+            }
+            Self::SharedGroup(group) => tracing::info!(
+                %group,
+                start,
+                size,
+                "assigned uid range for a shared volume group"
+            ),
+            Self::Ingress => tracing::info!(start, size, "assigned ingress uid range"),
+        }
+    }
+}
+
 /// What `apps remove` deletes besides the desired-state entry. Both are kept by default: data and
 /// credentials survive `remove` + `add` under the same name.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -254,23 +311,21 @@ impl<P: PodmanClient> Reconciler<P> {
         allocate(&used, pool, size).ok_or(EngineError::UidPoolExhausted { pool, size })
     }
 
-    /// Range of a shared volume group; allocated and persisted on first use. Caller holds the engine
-    /// lock and calls this *before* loading the state it is going to modify (it writes `state.toml`
-    /// itself).
-    async fn assign_shared_range(&self, name: &SharedVolumeName) -> Result<UidRange, EngineError> {
+    /// The range `owner` holds in `state.toml`; allocated and persisted on first use. Caller holds
+    /// the engine lock and calls this *before* loading the state it is going to modify (it writes
+    /// `state.toml` itself).
+    async fn get_or_allocate_range_locked(
+        &self,
+        owner: RangeOwner<'_>,
+    ) -> Result<UidRange, EngineError> {
         let mut st = state::load_state(&self.paths.state)?;
-        if let Some(r) = st.shared_volumes.get(name).and_then(|s| s.uid_range) {
+        if let Some(r) = owner.get(&st) {
             return Ok(r);
         }
-        let range = self.allocate_range(&st, DEFAULT_RANGE_SIZE).await?;
-        st.shared_volumes.entry(name.clone()).or_default().uid_range = Some(range);
+        let range = self.allocate_range(&st, owner.size()).await?;
+        owner.set(&mut st, range);
         state::save_state(&self.paths.state, &st)?;
-        tracing::info!(
-            group = %name,
-            start = range.start,
-            size = range.size,
-            "assigned uid range for a shared volume group"
-        );
+        owner.log_assigned(range);
         Ok(range)
     }
 
@@ -284,45 +339,28 @@ impl<P: PodmanClient> Reconciler<P> {
         spec: &AppSpec,
     ) -> Result<UidRange, EngineError> {
         let apps = state::load_apps(&self.paths.apps)?;
-        if let Some(group) = shared_volumes::spec_group(&apps, spec) {
-            return self.assign_shared_range(&group).await;
-        }
-        let mut st = state::load_state(&self.paths.state)?;
-        if let Some(r) = st.apps.get(instance).and_then(|s| s.uid_range) {
-            return Ok(r);
-        }
-        let range = self.allocate_range(&st, DEFAULT_RANGE_SIZE).await?;
-        st.apps.entry(instance.clone()).or_default().uid_range = Some(range);
-        state::save_state(&self.paths.state, &st)?;
-        tracing::info!(%instance, start = range.start, size = range.size, "assigned uid range");
-        Ok(range)
+        let group = shared_volumes::spec_group(&apps, spec);
+        let owner = match &group {
+            Some(group) => RangeOwner::SharedGroup(group),
+            None => RangeOwner::Instance(instance),
+        };
+        self.get_or_allocate_range_locked(owner).await
     }
 
     /// Range of the ingress nginx container; allocated and persisted on first use.
     ///
-    /// Once allocated this is a plain read of `state.toml` and does not take the engine lock: a deploy
-    /// holds that lock through its health gate, and the gate may be probing through the very ingress
-    /// pass that calls this (issue #232). The state file is replaced atomically and the range never
-    /// changes once set, so the unlocked read cannot observe a torn or stale value; only the first
-    /// allocation is a write, and it still goes through the lock (the engine stays the single writer).
+    /// Takes the engine lock itself, unlike [`Self::assign_range`]. Once allocated this is a plain
+    /// read of `state.toml` and does not take the lock at all: a deploy holds that lock through its
+    /// health gate, and the gate may be probing through the very ingress pass that calls this
+    /// (issue #232). The state file is replaced atomically and the range never changes once set, so
+    /// the unlocked read cannot observe a torn or stale value; only the first allocation is a
+    /// write, and it still goes through the lock (the engine stays the single writer).
     pub async fn ensure_ingress_range(&self) -> Result<UidRange, EngineError> {
         if let Some(r) = state::load_state(&self.paths.state)?.ingress_uid_range {
             return Ok(r);
         }
         let _guard = self.acquire().await;
-        let mut st = state::load_state(&self.paths.state)?;
-        if let Some(r) = st.ingress_uid_range {
-            return Ok(r);
-        }
-        let range = self.allocate_range(&st, INFRA_RANGE_SIZE).await?;
-        st.ingress_uid_range = Some(range);
-        state::save_state(&self.paths.state, &st)?;
-        tracing::info!(
-            start = range.start,
-            size = range.size,
-            "assigned ingress uid range"
-        );
-        Ok(range)
+        self.get_or_allocate_range_locked(RangeOwner::Ingress).await
     }
 
     /// Ownership and volumes for a container about to be created. The range must already be assigned
