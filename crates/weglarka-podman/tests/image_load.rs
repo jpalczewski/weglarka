@@ -19,20 +19,13 @@ use futures_util::{StreamExt, stream};
 use weglarka_model::podman::{ImageInfo, LoadedImage, PodmanClient, PodmanError, TarStream};
 use weglarka_podman::LibpodClient;
 
+mod common;
+use common::socket;
+
 const ALPINE: &str = "docker.io/library/alpine:3.20";
 const ALPINE_REPO: &str = "docker.io/library/alpine";
 /// Repository an archive without a name is tagged with, as the daemon will tag it with the app's.
 const APP_REPO: &str = "localhost/wg-spike/app";
-
-fn socket() -> Option<String> {
-    let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if socket.is_none() {
-        eprintln!("WEGLARKA_PODMAN_SOCKET not set — skipping integration test");
-    }
-    socket
-}
 
 /// Raw libpod call for what the client has no method for (`images/{ref}/get`): `out` is a file the
 /// response is written to.

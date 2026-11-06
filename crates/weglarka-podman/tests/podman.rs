@@ -3,7 +3,6 @@
 //! (docs/decisions/0002-podman-in-ci.md).
 
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -16,6 +15,9 @@ use weglarka_model::podman::{
 };
 use weglarka_podman::LibpodClient;
 
+mod common;
+use common::{Cleanup, raw, run_id, socket};
+
 /// A small image that runs forever (no shell, ~300 KB) and has `/pause -v` for the healthcheck.
 const IMAGE: &str = "registry.k8s.io/pause:3.9";
 /// Has a shell, so the test can make a container exit immediately (crash-loop detection).
@@ -23,25 +25,6 @@ const BUSYBOX: &str = "docker.io/library/busybox:latest";
 const STEP: Duration = Duration::from_secs(60);
 /// A crashed container is restarted quickly (the first restart has a short backoff).
 const RESTART_DEADLINE: Duration = Duration::from_secs(30);
-
-fn socket() -> Option<String> {
-    let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if socket.is_none() {
-        eprintln!("WEGLARKA_PODMAN_SOCKET not set — skipping integration test");
-    }
-    socket
-}
-
-/// Unique per-run suffix so that parallel/repeated runs do not collide.
-fn run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
-}
 
 /// A loopback host port that was free a moment ago: bind `127.0.0.1:0`, read the assigned port and
 /// release it again. Only this test publishes ports in the CI job, so the tiny TOCTOU race is
@@ -69,67 +52,6 @@ fn port_bindings(ports: &serde_json::Value, container_port: &str) -> Vec<(String
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Raw API call via `curl` — for things outside the client contract (network cleanup,
-/// a container with a healthcheck that `ContainerSpec` cannot describe).
-fn raw(socket: &str, method: &str, path: &str, body: Option<&str>) -> (bool, String) {
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-sS",
-        "--fail-with-body",
-        "--unix-socket",
-        socket,
-        "-X",
-        method,
-    ]);
-    if let Some(body) = body {
-        cmd.args(["-H", "content-type: application/json", "-d", body]);
-    }
-    cmd.arg(format!("http://d/v6.0.0/libpod{path}"));
-    let out = cmd
-        .output()
-        .expect("curl is required for integration tests");
-    (
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    )
-}
-
-/// Cleans up after the test even on panic (`Drop`).
-struct Cleanup {
-    socket: String,
-    containers: Vec<String>,
-    networks: Vec<String>,
-    secrets: Vec<String>,
-    images: Vec<String>,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for c in &self.containers {
-            raw(
-                &self.socket,
-                "DELETE",
-                &format!("/containers/{c}?force=true&v=true"),
-                None,
-            );
-        }
-        for n in &self.networks {
-            raw(
-                &self.socket,
-                "DELETE",
-                &format!("/networks/{n}?force=true"),
-                None,
-            );
-        }
-        for s in &self.secrets {
-            raw(&self.socket, "DELETE", &format!("/secrets/{s}"), None);
-        }
-        for i in &self.images {
-            raw(&self.socket, "DELETE", &format!("/images/{i}"), None);
-        }
-    }
 }
 
 fn spec(name: &str, labels: BTreeMap<String, String>) -> ContainerSpec {
@@ -203,13 +125,11 @@ async fn full_lifecycle() {
     );
     let tag_repo = "localhost/weglarka-it";
     let tag = format!("rollback-{id}");
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![app.clone(), hc_app.clone()],
-        networks: vec![net_a.clone(), net_b.clone()],
-        secrets: vec![secret_env.clone(), secret_mount.clone()],
-        images: vec![format!("{tag_repo}:{tag}")],
-    };
+    let _cleanup = Cleanup::new(&socket)
+        .containers([app.clone(), hc_app.clone()])
+        .networks([net_a.clone(), net_b.clone()])
+        .secrets([secret_env.clone(), secret_mount.clone()])
+        .images([format!("{tag_repo}:{tag}")]);
     let labels = BTreeMap::from([
         ("weglarka.instance".to_owned(), format!("it-{id}")),
         ("weglarka.generation".to_owned(), "1".to_owned()),
@@ -511,13 +431,7 @@ async fn hardened_container_starts_with_read_only_root_dropped_caps_and_no_new_p
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-hardened-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let mut s = spec(&name, BTreeMap::new());
     s.security = weglarka_model::app::Security {
         read_only: true,
@@ -573,13 +487,7 @@ async fn command_reaches_libpod_as_arguments_to_the_image_entrypoint() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-command-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let events: Vec<_> = timeout(STEP, client.image_pull(IMAGE).collect::<Vec<_>>())
         .await
         .unwrap();
@@ -621,13 +529,7 @@ async fn one_off_container_streams_its_output_and_reports_the_exit_code() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-run-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
         .await
         .unwrap();
@@ -738,13 +640,7 @@ async fn restart_count_is_reported_and_grows_after_a_crash() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-restarts-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
         .await
         .unwrap();
@@ -783,13 +679,7 @@ async fn a_long_log_line_is_several_stamped_records() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-longline-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
         .await
         .unwrap();
@@ -855,13 +745,7 @@ async fn host_aliases_are_written_into_etc_hosts() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(socket.clone());
     let name = format!("wg-it-hosts-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-        networks: vec![],
-        secrets: vec![],
-        images: vec![],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     let events: Vec<_> = timeout(STEP, client.image_pull(BUSYBOX).collect::<Vec<_>>())
         .await
         .unwrap();

@@ -3,9 +3,6 @@
 //! (docs/decisions/0002-podman-in-ci.md). Containers go through the typed client, so the assertions
 //! check what libpod *stored* (`inspect`) — it ignores unknown create-body fields silently.
 
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use futures_util::StreamExt;
 use serde_json::Value;
 use weglarka_model::app::{CpuLimit, MemoryLimit, Resources};
@@ -13,61 +10,11 @@ use weglarka_model::limits::container_healthcheck;
 use weglarka_model::podman::{ContainerSpec, HealthStatus, PodmanClient};
 use weglarka_podman::LibpodClient;
 
+mod common;
+use common::{Cleanup, raw_get, run_id, socket};
+
 /// The pause image has no HEALTHCHECK of its own; `/pause -v` prints its version and exits 0.
 const IMAGE: &str = "registry.k8s.io/pause:3.9";
-
-fn socket() -> Option<String> {
-    let socket = std::env::var("WEGLARKA_PODMAN_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if socket.is_none() {
-        eprintln!("WEGLARKA_PODMAN_SOCKET not set — skipping integration test");
-    }
-    socket
-}
-
-fn run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{}-{}", std::process::id(), nanos % 1_000_000_000)
-}
-
-fn raw(socket: &str, method: &str, path: &str) -> Option<String> {
-    let out = Command::new("curl")
-        .args([
-            "-sS",
-            "--fail-with-body",
-            "--unix-socket",
-            socket,
-            "-X",
-            method,
-        ])
-        .arg(format!("http://d/v6.0.0/libpod{path}"))
-        .output()
-        .expect("curl is required for integration tests");
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-struct Cleanup {
-    socket: String,
-    containers: Vec<String>,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for c in &self.containers {
-            raw(
-                &self.socket,
-                "DELETE",
-                &format!("/containers/{c}?force=true&v=true"),
-            );
-        }
-    }
-}
 
 fn spec(name: &str) -> ContainerSpec {
     ContainerSpec {
@@ -83,7 +30,7 @@ async fn pull(client: &LibpodClient) {
 }
 
 fn inspect(socket: &str, name: &str) -> Value {
-    let body = raw(socket, "GET", &format!("/containers/{name}/json")).expect("inspect");
+    let body = raw_get(socket, &format!("/containers/{name}/json")).expect("inspect");
     serde_json::from_str(&body).unwrap()
 }
 
@@ -92,10 +39,7 @@ async fn limits_reach_inspect_and_the_cgroup() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(&socket);
     let name = format!("weglarka-it-lim-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     pull(&client).await;
 
     let mut s = spec(&name);
@@ -130,10 +74,7 @@ async fn unset_limits_stay_unlimited() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(&socket);
     let name = format!("weglarka-it-nolim-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     pull(&client).await;
     client.container_create(&spec(&name)).await.unwrap();
     let host = inspect(&socket, &name)["HostConfig"].clone();
@@ -152,10 +93,7 @@ async fn health_command_overrides_the_image_and_drives_healthcheck_run() {
         format!("weglarka-it-hcok-{id}"),
         format!("weglarka-it-hcbad-{id}"),
     );
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![good.clone(), bad.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([good.clone(), bad.clone()]);
     pull(&client).await;
 
     for (name, cmd, want_healthy) in [
@@ -209,10 +147,8 @@ async fn stats_report_running_containers_with_usage_and_the_limit_comes_from_ins
         format!("weglarka-it-stf-{id}"),
         format!("weglarka-it-sts-{id}"),
     );
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![limited.clone(), free.clone(), stopped.clone()],
-    };
+    let _cleanup =
+        Cleanup::new(&socket).containers([limited.clone(), free.clone(), stopped.clone()]);
     pull(&client).await;
 
     let mut s = spec(&limited);
@@ -260,10 +196,7 @@ async fn stats_report_cpu_pids_network_and_block_io() {
     let Some(socket) = socket() else { return };
     let client = LibpodClient::new(&socket);
     let name = format!("weglarka-it-stx-{}", run_id());
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        containers: vec![name.clone()],
-    };
+    let _cleanup = Cleanup::new(&socket).containers([name.clone()]);
     pull(&client).await;
     client.container_create(&spec(&name)).await.unwrap();
     client.container_start(&name).await.unwrap();
