@@ -227,9 +227,7 @@ mod tests {
     };
 
     fn store() -> (tempfile::TempDir, FileSecretStore) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = FileSecretStore::new(dir.path().join("secrets.toml"));
-        (dir, s)
+        FileSecretStore::in_tempdir()
     }
 
     /// Salt `00 01 .. 0f`, password `kat-fixed-password`. The expected string was derived with an

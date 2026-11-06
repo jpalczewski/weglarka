@@ -1,13 +1,14 @@
 //! Validated runtime configuration: the endpoint, the token and the channel list.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use weglarka_model::config::{NotifyConfig, NtfyConfig};
+use weglarka_model::credential::{HeaderTokenError, TokenFileError, read_private_token};
 use weglarka_model::events::Severity;
+use weglarka_model::secret_store::SecretValue;
 
 use crate::channel::Channel;
 use crate::endpoint::Endpoint;
@@ -80,7 +81,8 @@ impl NotifySettings {
         }
         let endpoint = Endpoint::parse(&ntfy.url, ntfy.host.as_deref())?;
         let token = match &ntfy.token_file {
-            Some(path) => Some(read_token(path)?),
+            // A validated header token is printable ASCII, so it is always UTF-8.
+            Some(path) => Some(String::from_utf8_lossy(read_token(path)?.expose()).into_owned()),
             None => None,
         };
         NtfyChannel::new(endpoint, topic, token)
@@ -107,32 +109,29 @@ fn valid_topic(topic: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Reads the access token: a 0600 file whose trailing newline is dropped. The value must be printable
-/// ASCII — it becomes an `Authorization` header, and a CR/LF there would be a header injection.
-fn read_token(path: &Path) -> Result<String, NotifySettingsError> {
-    let metadata = std::fs::metadata(path).map_err(|source| NotifySettingsError::TokenRead {
-        path: path.to_owned(),
-        source,
-    })?;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(NotifySettingsError::TokenPermissions(path.to_owned()));
-    }
-    let raw = std::fs::read_to_string(path).map_err(|source| NotifySettingsError::TokenRead {
-        path: path.to_owned(),
-        source,
-    })?;
-    let token = raw.trim_end_matches(['\r', '\n']).to_owned();
-    if token.is_empty() {
-        return Err(NotifySettingsError::TokenEmpty(path.to_owned()));
-    }
-    if !token.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(NotifySettingsError::TokenInvalid(path.to_owned()));
-    }
-    Ok(token)
+/// Reads the access token: a private file (0600) whose trailing newline is dropped. The value must
+/// be printable ASCII — it becomes an `Authorization` header, and a CR/LF there would be a header
+/// injection.
+fn read_token(path: &Path) -> Result<SecretValue, NotifySettingsError> {
+    read_private_token(path).map_err(|err| match err {
+        TokenFileError::Io(source) => NotifySettingsError::TokenRead {
+            path: path.to_owned(),
+            source,
+        },
+        TokenFileError::TooOpen => NotifySettingsError::TokenPermissions(path.to_owned()),
+        TokenFileError::Header(HeaderTokenError::Empty) => {
+            NotifySettingsError::TokenEmpty(path.to_owned())
+        }
+        TokenFileError::Header(HeaderTokenError::Invalid) => {
+            NotifySettingsError::TokenInvalid(path.to_owned())
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn ntfy() -> NtfyConfig {
@@ -208,7 +207,7 @@ mod tests {
         let path = dir.path().join("ntfy-token");
         std::fs::write(&path, "tk_secret\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_token(&path).unwrap(), "tk_secret");
+        assert_eq!(read_token(&path).unwrap().expose(), b"tk_secret");
     }
 
     #[test]

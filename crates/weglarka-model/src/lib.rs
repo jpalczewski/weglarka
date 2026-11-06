@@ -8,6 +8,7 @@
 pub mod admin_auth;
 pub mod app;
 pub mod config;
+pub mod credential;
 pub mod delivery;
 pub mod depends;
 pub mod environments;

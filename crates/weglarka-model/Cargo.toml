@@ -12,9 +12,9 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Token minting (admin_auth::testing) and the PodmanClient contract suite (podman_contract) for tests
-# of this crate and its consumers.
-testing = []
+# Token minting (admin_auth::testing), the PodmanClient contract suite (podman_contract) and
+# `FileSecretStore::in_tempdir` for tests of this crate and its consumers.
+testing = ["dep:tempfile"]
 
 [dependencies]
 bytes.workspace = true
@@ -26,6 +26,8 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Only for `FileSecretStore::in_tempdir`, behind the `testing` feature.
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true

@@ -565,7 +565,7 @@ async fn engine_ranges_volumes_secrets_import_migration_and_purge() {
     };
     let name = InstanceName::new(&instance).unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, store) = FileSecretStore::in_tempdir();
     let paths = StatePaths::in_dir(dir.path());
     fs::write(
         &paths.apps,
@@ -580,7 +580,7 @@ secrets = [{{ secret = "tok", kind = "mount", path = "/run/secrets/tok", mode = 
         ),
     )
     .unwrap();
-    let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+    let store = Arc::new(store);
     store.init().unwrap();
     store
         .set(&format!("{instance}.tok"), SecretValue::new("s3cret"))

@@ -105,8 +105,7 @@ mod tests {
 
     #[test]
     fn ensure_is_stable_and_rotate_changes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSecretStore::new(dir.path().join("secrets.toml"));
+        let (_dir, store) = FileSecretStore::in_tempdir();
         let app = InstanceName::new("blog").unwrap();
         let a = ensure(&store, &app).unwrap();
         assert_eq!(ensure(&store, &app).unwrap(), a);
@@ -125,8 +124,7 @@ mod tests {
 
     #[test]
     fn a_staged_rotation_changes_nothing_until_it_is_promoted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSecretStore::new(dir.path().join("secrets.toml"));
+        let (_dir, store) = FileSecretStore::in_tempdir();
         let app = InstanceName::new("blog").unwrap();
         let live = ensure(&store, &app).unwrap();
         let live_value = store.get("blog.oidc-client-secret").unwrap().unwrap();

@@ -59,11 +59,11 @@ impl Harness {
         monitor: crash::Policy,
         generated: Option<crate::generated::GeneratedWiring>,
     ) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, store) = FileSecretStore::in_tempdir();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, apps_toml).unwrap();
         let fake = FakePodman::new();
-        let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+        let store = Arc::new(store);
         let sink = Arc::new(VecSink::default());
         let secrets: Arc<dyn SecretStore> = store.clone();
         let mut rec = Reconciler::new(fake.clone(), secrets, paths, options)

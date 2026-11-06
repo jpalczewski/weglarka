@@ -10,7 +10,6 @@
 //! served by the wildcard of the apex that covers it (ADR 0039), while a domain with a pair of its own
 //! keeps it — unless `[acme.dns] prefer_wildcard` makes the wildcard win (ADR 0077).
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -25,6 +24,7 @@ use weglarka_model::config::{
     AcmeConfig, AcmeDnsConfig, CertChoice, DnsProviderKind, WILDCARD_CERT_PREFIX,
     choose_certificate, wildcard_covers,
 };
+use weglarka_model::credential::{TokenFileError, read_private_token};
 use weglarka_model::events::{Event, EventSink};
 use weglarka_model::secret_store::SecretValue;
 use weglarka_model::state;
@@ -406,25 +406,17 @@ fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
     )
 }
 
-/// Reads the DNS API token: a 0600 file whose trailing newline is dropped, printable ASCII only (it
-/// becomes an `Authorization` header). The value never appears in an error.
+/// Reads the DNS API token from a private file (0600, trailing newline dropped, printable ASCII
+/// only — it becomes an `Authorization` header). The value never appears in an error.
 fn read_token(path: &Path) -> Result<SecretValue, String> {
-    let fail = |what: &str| format!("[acme.dns] token_file {}: {what}", path.display());
-    let metadata = std::fs::metadata(path).map_err(|e| fail(&e.to_string()))?;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(fail(
-            "must not be accessible by group or others (chmod 600)",
-        ));
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| fail(&e.to_string()))?;
-    let token = raw.trim_end_matches(['\r', '\n']);
-    if token.is_empty() {
-        return Err(fail("is empty"));
-    }
-    if !token.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(fail("has characters that cannot go into an HTTP header"));
-    }
-    Ok(SecretValue::new(token))
+    read_private_token(path).map_err(|err| {
+        // The io error's message is the useful part; the other variants already read as prose.
+        let what = match err {
+            TokenFileError::Io(e) => e.to_string(),
+            other => other.to_string(),
+        };
+        format!("[acme.dns] token_file {}: {what}", path.display())
+    })
 }
 
 /// The provider named by `[acme.dns]`, with its token read from the file.
@@ -499,6 +491,8 @@ mod tests {
     use weglarka_acme::testing::FakeAcme;
     use weglarka_dns::testing::FakeDns;
     use weglarka_model::events::VecSink;
+
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
