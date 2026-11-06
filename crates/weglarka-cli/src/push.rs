@@ -17,6 +17,7 @@ use hyper::body::Bytes;
 use weglarka_api::{DeployResponse, endpoints};
 
 use crate::cli::DeployArgs;
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client, deploy, instance, report_deploy};
 use crate::error::CliError;
 use crate::settings::Overrides;
@@ -80,9 +81,9 @@ pub async fn run(json: bool, o: &Overrides, a: PushArgs) -> Result<i32, CliError
 
 async fn archive(json: bool, o: &Overrides, a: &PushArgs, path: &PathBuf) -> Result<i32, CliError> {
     let name = instance(&a.app)?;
-    let params = [("name", name.as_str())];
+    let req = ApiRequest::new(endpoints::APPS_PUSH_IMAGE, &[("name", name.as_str())]);
     if a.dry_run {
-        DryRun::new(endpoints::APPS_PUSH_IMAGE, &params, None).print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(crate::error::exit::OK);
     }
     let client = client(o)?;
@@ -101,9 +102,7 @@ async fn archive(json: bool, o: &Overrides, a: &PushArgs, path: &PathBuf) -> Res
             .map_err(|e| CliError::usage(format!("cannot open {}: {e}", path.display())))?;
         chunks(file, counter)
     };
-    let resp: DeployResponse = client
-        .upload_json(endpoints::APPS_PUSH_IMAGE, &params, body)
-        .await?;
+    let resp: DeployResponse = client.upload_json(&req, body).await?;
     Ok(report_deploy(json, &name, &resp))
 }
 

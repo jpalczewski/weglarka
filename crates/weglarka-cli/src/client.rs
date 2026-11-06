@@ -9,6 +9,7 @@ use http_body_util::{Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::header::{CONTENT_TYPE, HeaderValue};
 use hyper::{Request, StatusCode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -172,29 +173,101 @@ pub fn expand_path(endpoint: Endpoint, params: &[(&str, &str)]) -> String {
     path
 }
 
-/// The request target for `endpoint`: the expanded path plus `?query` when the query is non-empty
-/// (no dangling `?`). The dry run prints the same string, so the shown request cannot drift from
-/// the one actually sent.
-pub(crate) fn request_path(endpoint: Endpoint, params: &[(&str, &str)], query: &str) -> String {
-    append_query(expand_path(endpoint, params), query)
+/// Characters a query value keeps as they are: the RFC 3986 unreserved set. Everything else is
+/// percent-encoded, so a value can never add a parameter or end the query.
+const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// One admin API request: the endpoint's method, the expanded path and the query string. Every
+/// call — buffered, streamed, uploaded or downloaded — and every `--dry-run` is built from one, so
+/// the request a dry run prints cannot drift from the one actually sent.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiRequest {
+    method: Method,
+    path: String,
+    /// Without the leading `?`; empty = no query.
+    query: String,
 }
 
-/// Appends `?query` to a path unless the query is empty.
-pub(crate) fn append_query(mut path: String, query: &str) -> String {
-    if !query.is_empty() {
-        path.push('?');
-        path.push_str(query);
+impl ApiRequest {
+    pub(crate) fn new(endpoint: Endpoint, params: &[(&str, &str)]) -> Self {
+        Self {
+            method: endpoint.method,
+            path: expand_path(endpoint, params),
+            query: String::new(),
+        }
     }
-    path
+
+    /// Adds `key=value`, the value percent-encoded.
+    pub(crate) fn query(mut self, key: &str, value: &str) -> Self {
+        if !self.query.is_empty() {
+            self.query.push('&');
+        }
+        self.query.push_str(key);
+        self.query.push('=');
+        self.query
+            .extend(utf8_percent_encode(value, QUERY_VALUE).map(|part| part.to_owned()));
+        self
+    }
+
+    /// Adds `key=true` when `on`; an unset flag is not sent at all.
+    pub(crate) fn flag(self, key: &str, on: bool) -> Self {
+        if on { self.query(key, "true") } else { self }
+    }
+
+    /// Adds a query string the API contract builds itself (`LogsQuery::to_query_string`,
+    /// `AccessQuery::to_query_string`); an empty one adds nothing.
+    pub(crate) fn query_string(mut self, query: &str) -> Self {
+        if !query.is_empty() {
+            if !self.query.is_empty() {
+                self.query.push('&');
+            }
+            self.query.push_str(query);
+        }
+        self
+    }
+
+    pub(crate) fn method(&self) -> &'static str {
+        match self.method {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+        }
+    }
+
+    /// The request target: the path plus `?query` when there is one (no dangling `?`).
+    pub(crate) fn target(&self) -> String {
+        if self.query.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}?{}", self.path, self.query)
+        }
+    }
+
+    /// A `hyper` request for this method and target, `content_type` set when given.
+    pub(crate) fn build<B>(
+        &self,
+        content_type: Option<&'static str>,
+        body: B,
+    ) -> Result<Request<B>, CliError> {
+        let mut req = Request::builder().method(self.method()).uri(self.target());
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        req.body(body)
+            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))
+    }
 }
 
-pub(crate) fn method_str(m: Method) -> &'static str {
-    match m {
-        Method::Get => "GET",
-        Method::Post => "POST",
-        Method::Put => "PUT",
-        Method::Delete => "DELETE",
-    }
+/// The JSON encoding of a request body.
+pub(crate) fn json_body(body: &(impl Serialize + ?Sized)) -> Result<Bytes, CliError> {
+    serde_json::to_vec(body)
+        .map(Bytes::from)
+        .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))
 }
 
 impl ApiClient {
@@ -229,11 +302,7 @@ impl ApiClient {
         params: &[(&str, &str)],
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<Res, CliError> {
-        let bytes = self.send(endpoint, params, body).await?;
-        serde_json::from_slice(&bytes).map_err(|e| {
-            CliError::internal(format!("unexpected response from daemon: {e}"))
-                .with_hint("CLI and daemon versions may differ — check `weglarka status`")
-        })
+        self.request(&ApiRequest::new(endpoint, params), body).await
     }
 
     /// Call without a response body (204).
@@ -242,7 +311,8 @@ impl ApiClient {
         endpoint: Endpoint,
         params: &[(&str, &str)],
     ) -> Result<(), CliError> {
-        self.send(endpoint, params, None::<&()>).await.map(drop)
+        self.request_empty(&ApiRequest::new(endpoint, params), None::<&()>)
+            .await
     }
 
     /// Call with a JSON request body and no response body (204).
@@ -252,45 +322,55 @@ impl ApiClient {
         params: &[(&str, &str)],
         body: &(impl Serialize + ?Sized),
     ) -> Result<(), CliError> {
-        self.send(endpoint, params, Some(body)).await.map(drop)
+        self.request_empty(&ApiRequest::new(endpoint, params), Some(body))
+            .await
+    }
+
+    /// Sends `req` (with a query, when it has one) and parses the JSON response body.
+    pub(crate) async fn request<Res: DeserializeOwned>(
+        &self,
+        req: &ApiRequest,
+        body: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<Res, CliError> {
+        let bytes = self.send(req, body).await?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            CliError::internal(format!("unexpected response from daemon: {e}"))
+                .with_hint("CLI and daemon versions may differ — check `weglarka status`")
+        })
+    }
+
+    /// Sends `req` and expects no response body (204).
+    pub(crate) async fn request_empty(
+        &self,
+        req: &ApiRequest,
+        body: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<(), CliError> {
+        self.send(req, body).await.map(drop)
     }
 
     async fn send(
         &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
+        req: &ApiRequest,
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<Vec<u8>, CliError> {
         let payload = match body {
-            Some(b) => Bytes::from(
-                serde_json::to_vec(b)
-                    .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?,
-            ),
+            Some(b) => json_body(b)?,
             None => Bytes::new(),
         };
-        let uri = request_path(endpoint, params, "");
-        let json = body.is_some();
+        let content_type = body.is_some().then_some("application/json");
         retry_while_busy(self.busy_wait, || {
-            self.send_once(endpoint.method, &uri, json, payload.clone())
+            self.send_once(req, content_type, payload.clone())
         })
         .await
     }
 
     async fn send_once(
         &self,
-        method: Method,
-        uri: &str,
-        json: bool,
+        req: &ApiRequest,
+        content_type: Option<&'static str>,
         payload: Bytes,
     ) -> Result<Vec<u8>, CliError> {
-        let mut req = Request::builder().method(method_str(method)).uri(uri);
-        if json {
-            req = req.header(CONTENT_TYPE, "application/json");
-        }
-        let req = req
-            .body(Full::new(payload))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-
+        let req = req.build(content_type, Full::new(payload))?;
         let resp = self
             .backend
             .buffered(req, Some(REQUEST_TIMEOUT), "request to daemon failed")
@@ -303,64 +383,35 @@ impl ApiClient {
         }
     }
 
-    /// Call without a response body (204), with an optional query string (`a=b&c`) appended to the
-    /// path; an empty query leaves the path untouched.
-    pub async fn call_empty_query(
-        &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
-        query: &str,
-    ) -> Result<(), CliError> {
-        let path = request_path(endpoint, params, query);
-        retry_while_busy(self.busy_wait, || {
-            self.send_once(endpoint.method, &path, false, Bytes::new())
-        })
-        .await
-        .map(drop)
-    }
-
     /// Streams `body` as the request body (`application/x-tar`) and expects an empty success
     /// response. No overall timeout: a volume can be large; Ctrl-C aborts.
-    pub async fn upload(
+    pub(crate) async fn upload(
         &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
-        query: &str,
+        req: &ApiRequest,
         body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     ) -> Result<(), CliError> {
-        self.upload_bytes(endpoint, params, query, body)
-            .await
-            .map(drop)
+        self.upload_bytes(req, body).await.map(drop)
     }
 
     /// [`Self::upload`] for an endpoint that answers with JSON (`weglarka push`): the deploy that
     /// follows the upload is part of the same request, so there is no overall timeout here either.
-    pub async fn upload_json<T: DeserializeOwned>(
+    pub(crate) async fn upload_json<T: DeserializeOwned>(
         &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
+        req: &ApiRequest,
         body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     ) -> Result<T, CliError> {
-        let bytes = self.upload_bytes(endpoint, params, "", body).await?;
+        let bytes = self.upload_bytes(req, body).await?;
         serde_json::from_slice(&bytes)
             .map_err(|e| CliError::internal(format!("unexpected response from the daemon: {e}")))
     }
 
     async fn upload_bytes(
         &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
-        query: &str,
+        req: &ApiRequest,
         body: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     ) -> Result<Bytes, CliError> {
-        let path = request_path(endpoint, params, query);
         let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
-        let req = Request::builder()
-            .method(method_str(endpoint.method))
-            .uri(path)
-            .header(CONTENT_TYPE, "application/x-tar")
-            .body(body)
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let req = req.build(Some("application/x-tar"), body)?;
         let resp = self
             .backend
             .buffered(req, None, "upload to daemon failed")
@@ -373,18 +424,12 @@ impl ApiClient {
     }
 
     /// Streams a successful response body into `sink`; returns the number of bytes written.
-    pub async fn download(
+    pub(crate) async fn download(
         &self,
-        endpoint: Endpoint,
-        params: &[(&str, &str)],
+        req: &ApiRequest,
         sink: &mut (impl AsyncWrite + Unpin),
     ) -> Result<u64, CliError> {
-        let req = Request::builder()
-            .method(method_str(endpoint.method))
-            .uri(request_path(endpoint, params, ""))
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
-        let mut resp = self.open(req).await?;
+        let mut resp = self.open(req.build(None, Full::new(Bytes::new()))?).await?;
         if !resp.status.is_success() {
             let status = resp.status;
             return Err(error_from_response(status, &self.read_rest(resp).await?));
@@ -405,14 +450,8 @@ impl ApiClient {
     /// error before the stream is an ordinary API error. Dropping the returned stream closes the
     /// connection, which makes the daemon kill the run.
     pub async fn open_run(&self, name: &str, request: &RunRequest) -> Result<RunStream, CliError> {
-        let payload = serde_json::to_vec(request)
-            .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?;
-        let req = Request::builder()
-            .method(method_str(endpoints::APPS_RUN.method))
-            .uri(request_path(endpoints::APPS_RUN, &[("name", name)], ""))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload)))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let req = ApiRequest::new(endpoints::APPS_RUN, &[("name", name)])
+            .build(Some("application/json"), Full::new(json_body(request)?))?;
         let response = self
             .open_stream(req, RUN_STREAM_CONTENT_TYPE, "run")
             .await?;
@@ -423,15 +462,9 @@ impl ApiClient {
     /// (a followed log is open for as long as the token lives); an error before the stream
     /// (unknown app, no container) is an ordinary API error.
     pub async fn open_logs(&self, name: &str, query: &LogsQuery) -> Result<LogStream, CliError> {
-        let req = Request::builder()
-            .method(method_str(endpoints::APPS_LOGS.method))
-            .uri(request_path(
-                endpoints::APPS_LOGS,
-                &[("name", name)],
-                &query.to_query_string(),
-            ))
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let req = ApiRequest::new(endpoints::APPS_LOGS, &[("name", name)])
+            .query_string(&query.to_query_string())
+            .build(None, Full::new(Bytes::new()))?;
         let response = self
             .open_stream(req, LOGS_STREAM_CONTENT_TYPE, "logs")
             .await?;
@@ -445,15 +478,9 @@ impl ApiClient {
         name: &str,
         query: &AccessQuery,
     ) -> Result<AccessStream, CliError> {
-        let req = Request::builder()
-            .method(method_str(endpoints::APPS_ACCESS.method))
-            .uri(request_path(
-                endpoints::APPS_ACCESS,
-                &[("name", name)],
-                &query.to_query_string(),
-            ))
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let req = ApiRequest::new(endpoints::APPS_ACCESS, &[("name", name)])
+            .query_string(&query.to_query_string())
+            .build(None, Full::new(Bytes::new()))?;
         let response = self
             .open_stream(req, ACCESS_STREAM_CONTENT_TYPE, "access")
             .await?;

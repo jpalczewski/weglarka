@@ -16,12 +16,11 @@ use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::config::HostConfig;
 
 use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, RollbackArgs, SecretRemoveArgs, StartStopArgs};
-use crate::client::{ApiClient, expand_path};
+use crate::client::{ApiClient, ApiRequest, expand_path};
 use crate::commands::{
     apps_reload, apps_remove, apps_rollback, build_spec, notify_status, notify_test,
-    read_secret_value, remove_dry_run, remove_query, remove_suffix, render_notify_status,
-    render_reload, render_rollback, render_show, secret_name, secret_remove_dry_run,
-    secrets_remove,
+    read_secret_value, remove_request, remove_suffix, render_notify_status, render_reload,
+    render_rollback, render_show, secret_name, secret_remove_request, secrets_remove,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -211,6 +210,38 @@ fn expand_path_substitutes() {
     assert_eq!(
         expand_path(endpoints::SECRETS_SET, &[("name", "a"), ("secret", "b")]),
         "/v1/apps/a/secrets/b"
+    );
+}
+
+#[test]
+fn api_request_owns_method_path_and_an_encoded_query() {
+    let req = ApiRequest::new(endpoints::SHARED_VOLUMES_REMOVE, &[("volume", "kajet")]);
+    assert_eq!(
+        (req.method(), req.target().as_str()),
+        ("DELETE", "/v1/volumes/kajet")
+    );
+    // An unset flag is not sent, and no query leaves no dangling `?`.
+    assert_eq!(
+        req.clone().flag("purge", false).target(),
+        "/v1/volumes/kajet"
+    );
+    assert_eq!(
+        req.clone()
+            .flag("purge", true)
+            .query("group", "a-b_c.d~e")
+            .target(),
+        "/v1/volumes/kajet?purge=true&group=a-b_c.d~e"
+    );
+    // A value can never add a parameter or end the query.
+    assert_eq!(
+        req.clone().query("group", "x&y=z #ł").target(),
+        "/v1/volumes/kajet?group=x%26y%3Dz%20%23%C5%82"
+    );
+    assert_eq!(
+        req.query_string("")
+            .query_string("tail=5&follow=true")
+            .target(),
+        "/v1/volumes/kajet?tail=5&follow=true"
     );
 }
 
@@ -1571,18 +1602,20 @@ fn secret_remove_args(extra: &[&str]) -> SecretRemoveArgs {
 
 #[test]
 fn apps_remove_query_joins_the_purge_flags() {
-    assert_eq!(remove_query(&remove_args(&[])), "");
+    // The dry run prints the target of the same request a real run sends.
+    let target = |extra: &[&str]| remove_request("ntfy", &remove_args(extra)).target();
+    assert_eq!(target(&[]), "/v1/apps/ntfy");
     assert_eq!(
-        remove_query(&remove_args(&["--purge-volumes"])),
-        "purge_volumes=true"
+        target(&["--purge-volumes"]),
+        "/v1/apps/ntfy?purge_volumes=true"
     );
     assert_eq!(
-        remove_query(&remove_args(&["--purge-secrets"])),
-        "purge_secrets=true"
+        target(&["--purge-secrets"]),
+        "/v1/apps/ntfy?purge_secrets=true"
     );
     assert_eq!(
-        remove_query(&remove_args(&["--purge-secrets", "--purge-volumes"])),
-        "purge_volumes=true&purge_secrets=true"
+        target(&["--purge-secrets", "--purge-volumes"]),
+        "/v1/apps/ntfy?purge_volumes=true&purge_secrets=true"
     );
     // The human line says what was deleted along with the app.
     assert_eq!(remove_suffix(&remove_args(&[])), "");
@@ -1597,26 +1630,6 @@ fn apps_remove_query_joins_the_purge_flags() {
     assert_eq!(
         remove_suffix(&remove_args(&["--purge-volumes", "--purge-secrets"])),
         " (with its data and secrets)"
-    );
-}
-
-#[test]
-fn apps_remove_dry_run_shows_the_query() {
-    assert_eq!(
-        remove_dry_run("ntfy", &remove_args(&[])).path,
-        "/v1/apps/ntfy"
-    );
-    assert_eq!(
-        remove_dry_run("ntfy", &remove_args(&["--purge-volumes"])).path,
-        "/v1/apps/ntfy?purge_volumes=true"
-    );
-    assert_eq!(
-        remove_dry_run(
-            "ntfy",
-            &remove_args(&["--purge-volumes", "--purge-secrets"])
-        )
-        .path,
-        "/v1/apps/ntfy?purge_volumes=true&purge_secrets=true"
     );
 }
 
@@ -1773,11 +1786,11 @@ async fn secrets_remove_dry_run_sends_nothing_and_shows_force() {
     assert_eq!(code, exit::OK);
     assert!(m.seen.lock().unwrap().is_empty());
     assert_eq!(
-        secret_remove_dry_run("ntfy", "token", false).path,
+        secret_remove_request("ntfy", "token", false).target(),
         "/v1/apps/ntfy/secrets/token"
     );
     assert_eq!(
-        secret_remove_dry_run("ntfy", "token", true).path,
+        secret_remove_request("ntfy", "token", true).target(),
         "/v1/apps/ntfy/secrets/token?force=true"
     );
 }

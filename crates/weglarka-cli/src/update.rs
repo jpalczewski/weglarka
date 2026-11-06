@@ -23,8 +23,8 @@ use weglarka_model::app::{
 use weglarka_model::state::{AppState, FailedDeploy};
 
 use crate::cli::{StartStopArgs, parse_pair};
-use crate::client::{ApiClient, expand_path};
-use crate::commands::{client, instance, render_show};
+use crate::client::{ApiClient, ApiRequest};
+use crate::commands::{DryRunRequest, NOTHING_SENT, client, instance, render_show};
 use crate::error::{CliError, exit};
 use crate::output::emit;
 use crate::settings::Overrides;
@@ -599,9 +599,8 @@ pub fn spec_diff(old: &AppSpec, new: &AppSpec) -> String {
 
 #[derive(Debug, Serialize)]
 struct UpdateDryRun {
-    dry_run: bool,
-    method: &'static str,
-    path: String,
+    #[serde(flatten)]
+    request: DryRunRequest,
     /// `false` = the new spec equals the current one (a real run would send nothing).
     changed: bool,
     /// `--spec` against a redacted view (a `read` token): the diff compares the file with
@@ -698,9 +697,7 @@ fn emit_update_dry_run(
     would_stop: bool,
 ) {
     let out = UpdateDryRun {
-        dry_run: true,
-        method: "PUT",
-        path: expand_path(endpoints::APPS_UPDATE, params),
+        request: DryRunRequest::new(&ApiRequest::new(endpoints::APPS_UPDATE, params)),
         changed: !diff.is_empty(),
         redacted_base,
         removes_env: removed_env_keys(current, &req.spec),
@@ -719,7 +716,7 @@ fn emit_update_dry_run(
 /// Human output of `--dry-run`: the request, the spec diff, and the `start` guard a real run would
 /// apply (issue #462).
 fn render_dry_run(out: &UpdateDryRun, app: &str) -> String {
-    let mut s = format!("dry-run: {} {}\n", out.method, out.path);
+    let mut s = out.request.head();
     if out.redacted_base {
         s.push_str(REDACTED_BASE_NOTE);
     }
@@ -737,7 +734,7 @@ fn render_dry_run(out: &UpdateDryRun, app: &str) -> String {
         s.push_str(app);
         s.push_str(" (start: true -> false): a real run is refused without --allow-stop\n");
     }
-    s.push_str("nothing was sent\n");
+    s.push_str(NOTHING_SENT);
     s
 }
 
@@ -1917,9 +1914,10 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         assert!(!would_stop(&provisioned, &spec()), "false -> true");
 
         let out = UpdateDryRun {
-            dry_run: true,
-            method: "PUT",
-            path: "/v1/apps/ntfy".into(),
+            request: DryRunRequest::new(&ApiRequest::new(
+                endpoints::APPS_UPDATE,
+                &[("name", "ntfy")],
+            )),
             changed: true,
             redacted_base: false,
             removes_env: Vec::new(),

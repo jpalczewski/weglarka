@@ -2069,6 +2069,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "insta",
+ "percent-encoding",
  "rustls",
  "serde",
  "serde_json",

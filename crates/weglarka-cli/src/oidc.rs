@@ -9,6 +9,7 @@ use serde::Serialize;
 use weglarka_api::{ListOidcClientsResponse, OidcRotateResponse, PutOidcClientRequest, endpoints};
 use weglarka_model::identity::{ClientId, ExternalClientSpec};
 
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client, instance};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
@@ -131,7 +132,11 @@ async fn set(json: bool, o: &Overrides, a: SetArgs) -> Result<i32, CliError> {
     let params = [("id", id.as_str())];
     if a.dry_run {
         let body = serde_json::to_value(&req).map_err(|e| CliError::internal(e.to_string()))?;
-        DryRun::new(endpoints::OIDC_CLIENT_PUT, &params, Some(body)).print(json);
+        DryRun::new(
+            &ApiRequest::new(endpoints::OIDC_CLIENT_PUT, &params),
+            Some(body),
+        )
+        .print(json);
         return Ok(exit::OK);
     }
     client(o)?
@@ -155,7 +160,11 @@ async fn remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, CliErro
     let id = client_id(&a.id)?;
     let params = [("id", id.as_str())];
     if a.dry_run {
-        DryRun::new(endpoints::OIDC_CLIENT_REMOVE, &params, None).print(json);
+        DryRun::new(
+            &ApiRequest::new(endpoints::OIDC_CLIENT_REMOVE, &params),
+            None,
+        )
+        .print(json);
         return Ok(exit::OK);
     }
     client(o)?
