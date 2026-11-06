@@ -484,6 +484,8 @@ pub async fn start_with<P: PodmanClient + 'static>(
         &host.webhook.domain,
         events,
         ingress.clone(),
+        // `[acme.dns] token_secret` reads the token from the host store on start and on use (ADR 0079).
+        Arc::clone(&host_secrets) as Arc<dyn SecretStore>,
     )?;
     let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];
     if let Some(forgejo) = &host.webhook.forgejo {
