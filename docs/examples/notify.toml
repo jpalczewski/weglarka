@@ -3,10 +3,14 @@
 # stops the daemon instead of silently disabling notifications).
 #
 # ntfy is expected to run as a normal Węglarka app. Create the topic (`weglarka` below) and, unless the
-# server is public, an access token in its panel; keep the token in a 0600 file, never in this file:
+# server is public, an access token in its panel; keep the token in a host secret (recommended) or in a
+# 0600 file, never in this file:
+#
+#   weglarka secrets host set ntfy-token < ntfy-token.txt          # host-secrets.toml, 0600
 #
 #   umask 077 && printf '%s\n' 'tk_…' | sudo -u weglarka tee /var/lib/weglarka/ntfy-token >/dev/null
-#   sudo -u weglarka chmod 600 /var/lib/weglarka/ntfy-token
+#   sudo -u weglarka chmod 600 /var/lib/weglarka/ntfy-token         # the older form: token_file
+#
 #   systemctl --user restart weglarka
 #   weglarka notify test        # the install-time check: URL, DNS, ingress route and token
 #
@@ -32,8 +36,11 @@ url = "https://nz.example.com"
 # ntfy topic to publish to ([A-Za-z0-9_-], 1–64 characters).
 topic = "weglarka"
 
-# Optional access token file (0600; group/other permissions are refused). Omit it for a public topic.
-token_file = "/var/lib/weglarka/ntfy-token"
+# Optional access token: a host secret (recommended) or a 0600 token file (the older form, still
+# supported). Set at most one of the two; omit both for a public topic. The token is read on every
+# publication, so rotating it needs no restart.
+token_secret = "ntfy-token"
+# token_file = "/var/lib/weglarka/ntfy-token"
 
 # Lowest severity published to this channel: debug | info | warning | critical.
 #   info      deploy ok/failed/rolled back, rollback failed, provisioned, recreated, waiting for secrets

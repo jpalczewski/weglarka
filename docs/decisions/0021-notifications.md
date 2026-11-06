@@ -155,3 +155,5 @@ no connection pooling). The response-head bound moved from 8 KiB to hyper's ~408
 `reqwest` verifies the certificate against the host in the URL, so the former "SNI follows `host`"
 combination over TLS is rejected at configuration time instead of silently verifying a different name.
 The documented internal route (`http://weglarka-nginx:8080` + `host`) is plain HTTP and unaffected.
+
+Addendum (2026-11-06): token sources and read-on-use rotation are superseded by ADR 0079.
