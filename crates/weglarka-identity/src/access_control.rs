@@ -19,6 +19,9 @@ pub struct ForwardApp<'a> {
     pub domains: &'a [String],
     /// `paths` of the app; empty or containing `/` means the whole domain.
     pub paths: &'a [String],
+    /// `ingress.auth_exempt_paths`: an entry `/p/` equal to a prefix exempts it as a whole, so nginx
+    /// never asks the provider about it and it gets no rule (a prefix below `/p` keeps its rule).
+    pub exempt_paths: &'a [String],
     /// `ingress.auth_policy`; `None` is `two_factor`.
     pub policy: Option<AuthorizationPolicy>,
     /// `ingress.auth_groups`: membership of any one is enough.
@@ -82,6 +85,16 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
                 .map_err(|e| RenderError::InvalidPath(name.to_owned(), path.clone(), e))?;
         }
         let whole_domain = app.paths.is_empty() || app.paths.iter().any(|p| p == "/");
+        // Prefixes the ingress serves without asking the provider. `/p` (no slash) exempts only the
+        // exact path, so its subtree keeps the rule.
+        let guarded: Vec<&String> = app
+            .paths
+            .iter()
+            .filter(|p| whole_domain || !app.exempt_paths.iter().any(|e| *e == format!("{p}/")))
+            .collect();
+        if !whole_domain && guarded.is_empty() {
+            continue;
+        }
         let rule = Rule {
             domain: app.domains,
             policy: factor_policy(app.policy.unwrap_or_default()),
@@ -89,13 +102,13 @@ pub fn render_access_control(issuer: &str, apps: &[ForwardApp<'_>]) -> Result<St
             resources: if whole_domain {
                 Vec::new()
             } else {
-                app.paths.iter().map(|p| prefix_regex(p)).collect()
+                guarded.iter().map(|p| prefix_regex(p)).collect()
             },
         };
         if whole_domain {
             whole.push(rule);
         } else {
-            let longest = app.paths.iter().map(String::len).max().unwrap_or(0);
+            let longest = guarded.iter().map(|p| p.len()).max().unwrap_or(0);
             scoped.push((longest, rule));
         }
     }

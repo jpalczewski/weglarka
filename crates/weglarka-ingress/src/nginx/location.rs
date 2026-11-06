@@ -79,7 +79,11 @@ fn path_locations<'a>(
         }]
         .into_iter()
         .chain(streaming_locations(ingress, app, auth))
-        .chain(exempt_locations(&route.auth_exempt, app))
+        .chain(exempt_locations(
+            owned_exempt(route, path).collect(),
+            app,
+            None,
+        ))
         .chain(
             route
                 .admin_relay
@@ -103,26 +107,56 @@ fn path_locations<'a>(
         )
     });
     let below = strip.then(|| (format!("^{escaped}/(.*)$"), "/$1".to_owned()));
-    vec![
+    // `auth_exempt_paths` entries (#612): one equal to the prefix switches `auth_request` off on the
+    // prefix's own locations (`/p/` both, `/p` only the exact one); the rest lie below it and get
+    // top-level locations of their own, carrying the same rewrite as the prefix.
+    let owned: Vec<&ExemptPath> = owned_exempt(route, path).collect();
+    let own = owned.iter().find(|e| e.path == *path);
+    let exact_open = own.is_some();
+    let below_open = own.is_some_and(|e| e.prefix);
+    let nested: Vec<&ExemptPath> = owned.iter().copied().filter(|e| e.path != *path).collect();
+    let mut locations = vec![
         Location {
             header: format!("location = {p}"),
             strip: exact,
             app,
             long_lived: false,
-            auth,
-            exempt: false,
+            auth: auth && !exact_open,
+            exempt: exact_open,
             relay: false,
         },
         Location {
             header: format!("location ^~ {p}/"),
-            strip: below,
+            strip: below.clone(),
             app,
             long_lived: false,
-            auth,
-            exempt: false,
+            auth: auth && !below_open,
+            exempt: below_open,
             relay: false,
         },
-    ]
+    ];
+    locations.extend(exempt_locations(nested, app, below));
+    locations
+}
+
+/// The `auth_exempt_paths` entries rendered next to `path`: those lying in it that no longer prefix
+/// of the same app contains (nginx picks the longest match, so the entry belongs to the most specific
+/// location that can hold it).
+fn owned_exempt<'r, 'p>(
+    route: &'r AppRoute<'_>,
+    path: &'p PathPrefix,
+) -> impl Iterator<Item = &'r ExemptPath> + use<'r, 'p> {
+    let deeper: Vec<PathPrefix> = route
+        .paths
+        .iter()
+        .filter(|q| *q != path && path.contains(q))
+        .cloned()
+        .collect();
+    let path = path.clone();
+    route
+        .auth_exempt
+        .iter()
+        .filter(move |e| path.contains(&e.path) && !deeper.iter().any(|q| q.contains(&e.path)))
 }
 
 /// Issue #180: the long-lived endpoints carved out of the catch-all, each matching itself and
@@ -148,27 +182,30 @@ fn streaming_locations<'a>(
 }
 
 /// `auth_exempt_paths` (#89): the exact path, and for an entry ending in `/` everything below it as
-/// well. Like the streaming carve-outs they are validated only on apps routed at `/` (the model
-/// refuses them next to `paths`, the plan refuses overlaps), and they never carry `auth_request`.
+/// well. They carve out of the location of the prefix they lie in (the catch-all, or since #612 a
+/// prefix of a `paths` app; `strip` is that prefix's rewrite for everything below it) and never carry
+/// `auth_request`.
 fn exempt_locations<'a>(
-    exempt: &[ExemptPath],
+    exempt: Vec<&ExemptPath>,
     app: Option<&'a str>,
+    strip: Option<(String, String)>,
 ) -> impl Iterator<Item = Location<'a>> {
-    exempt.iter().flat_map(move |e| {
-        let exact = format!("location = {}", e.path);
-        let below = e.prefix.then(|| format!("location ^~ {}/", e.path));
-        std::iter::once(exact)
-            .chain(below)
-            .map(move |header| Location {
-                header,
-                strip: None,
-                app,
-                long_lived: false,
-                auth: false,
-                exempt: true,
-                relay: false,
-            })
-    })
+    exempt
+        .into_iter()
+        .flat_map(|e| {
+            let exact = format!("location = {}", e.path);
+            let below = e.prefix.then(|| format!("location ^~ {}/", e.path));
+            std::iter::once(exact).chain(below)
+        })
+        .map(move |header| Location {
+            header,
+            strip: strip.clone(),
+            app,
+            long_lived: false,
+            auth: false,
+            exempt: true,
+            relay: false,
+        })
 }
 
 /// The relay prefix: the exact path and everything below it, never guarded by forward auth. The same

@@ -846,13 +846,26 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
             "ingress.auth = \"forward\" is not supported on `kind = \"static\"` apps".to_owned(),
         );
     }
-    // Like `streaming_paths`, exempt locations are carved out of the app's own catch-all; a prefix app
-    // would need them nested below each of its prefixes. The health probe needs no entry here: it
-    // arrives on the probe socket, which the authz location lets through (docs/decisions/0054).
-    if !ingress.auth_exempt_paths.is_empty() && !spec.paths.is_empty() {
-        return Err(
-            "ingress.auth_exempt_paths cannot be combined with path prefixes in `paths`".to_owned(),
-        );
+    // On a prefix app an exempt location is rendered next to the location of the prefix it lies in
+    // (nginx picks the longest match), so every entry must equal one of the prefixes or lie below
+    // one; an entry outside them would carve a hole in a path the app does not own. The health probe
+    // needs no entry here: it arrives on the probe socket, which the authz location lets through
+    // (docs/decisions/0054).
+    if !spec.paths.is_empty() {
+        for path in &ingress.auth_exempt_paths {
+            let body = path.strip_suffix('/').unwrap_or(path);
+            if !spec
+                .paths
+                .iter()
+                .any(|prefix| crate::app::path_is_within(body, prefix))
+            {
+                return Err(format!(
+                    "ingress.auth_exempt_paths entry {path:?} is outside the app's `paths` ({}); \
+                     it must equal one of them or lie below one",
+                    spec.paths.join(", ")
+                ));
+            }
+        }
     }
     Ok(())
 }

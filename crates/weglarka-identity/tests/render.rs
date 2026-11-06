@@ -320,6 +320,58 @@ fn access_control_nested_prefixes_most_specific_first() {
 }
 
 #[test]
+fn access_control_has_no_rule_for_a_fully_exempt_prefix() {
+    let app = Forward::new(
+        "backend",
+        r#"
+        image = "x"
+        domains = ["t.example.com"]
+        paths = ["/receipts", "/mcp", "/.well-known"]
+        [ingress]
+        auth = "forward"
+        auth_exempt_paths = ["/mcp/", "/.well-known/", "/receipts/public/"]
+        "#,
+    );
+    let text = render_access_control(ISSUER, &[app.forward()]).unwrap();
+    assert!(text.contains("receipts"), "{text}");
+    assert!(
+        !text.contains("mcp") && !text.contains("well-known"),
+        "{text}"
+    );
+    // `/mcp` without the slash exempts the exact path only: the subtree keeps its rule.
+    let exact = Forward::new(
+        "backend",
+        r#"
+        image = "x"
+        domains = ["t.example.com"]
+        paths = ["/receipts", "/mcp"]
+        [ingress]
+        auth = "forward"
+        auth_exempt_paths = ["/mcp"]
+        "#,
+    );
+    let text = render_access_control(ISSUER, &[exact.forward()]).unwrap();
+    assert!(text.contains("mcp"), "{text}");
+    // Every prefix exempt: no rule at all (never a whole-domain one).
+    let all = Forward::new(
+        "backend",
+        r#"
+        image = "x"
+        domains = ["t.example.com"]
+        paths = ["/mcp"]
+        [ingress]
+        auth = "forward"
+        auth_exempt_paths = ["/mcp/"]
+        "#,
+    );
+    let text = render_access_control(ISSUER, &[all.forward()]).unwrap();
+    assert!(
+        !text.contains("mcp") && text.matches("\"policy\"").count() == 1,
+        "{text}"
+    );
+}
+
+#[test]
 fn oidc_device_flow_adds_the_device_grant_and_drops_the_code_grant_without_redirects() {
     let cli = external(
         r#"

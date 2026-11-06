@@ -50,7 +50,32 @@ follow a login redirect. List them in `auth_exempt_paths`:
   does not resolve dot-segments from overlong or non-ASCII input and does not Unicode-normalize paths; exempt only paths
   that the app protects by itself (tokens), never ones that rely on the path layout.
 - An `[admin.http] clients` app (the [admin panel](admin-panel.md)) gets `/_weglarka/api` exempted and streaming by itself; you do not list it, and an entry of yours that overlaps it is refused.
-- `kind = "static"` apps cannot use forward auth. Exempt paths must not overlap `streaming_paths`, and cannot be combined with `paths` (prefix routing).
+- `kind = "static"` apps cannot use forward auth. Exempt paths must not overlap `streaming_paths`.
+
+### Exempt paths on an app routed by `paths`
+
+An app routed by [`paths`](path-routing.md) may use `auth_exempt_paths` too, as long as every entry **equals one of its
+prefixes or lies below one** (`/mcp/` under `/mcp`, `/receipts/public/` under `/receipts`). An entry outside every prefix is
+refused, with the prefix list in the message. Example: one domain, a frontend at `/` and a backend that keeps forward auth on
+`/receipts` while an MCP endpoint with its own OAuth and the discovery documents stay open:
+
+```toml
+[apps.frontend]                       # domain example.com, routed at /
+ingress = { auth = "forward" }
+
+[apps.backend]                        # same domain
+paths = ["/receipts", "/mcp", "/.well-known"]
+ingress = { auth = "forward", auth_exempt_paths = ["/mcp/", "/.well-known/"] }
+```
+
+- An entry **equal to a prefix** (`/mcp/` for the prefix `/mcp`) exempts that prefix's own locations as a whole. `/mcp`
+  without the slash exempts only the exact path `/mcp`; everything below `/mcp/` keeps forward auth.
+- An entry **below a prefix** gets locations of its own, next to the prefix's (nginx picks the longest match). With
+  `strip_prefix = true` they strip the prefix exactly like the prefix's own locations do.
+- The `;`/`\`/`%25` guard from above applies to every exempt location. They also send empty `Remote-User`,
+  `Remote-Groups`, `Remote-Name` and `Remote-Email`, so a client cannot inject an identity on `/mcp` that the backend would
+  trust on `/receipts`.
+- A prefix that is exempt as a whole gets no provider rule; the other prefixes keep their anchored rules.
 
 An OAuth-protected API (an MCP endpoint) needs neither of the two lists: `ingress.oauth_resources` renders its own unguarded, long-lived locations **and** the resource's discovery document — see [OAuth-protected resource paths](oauth-resources.md).
 
@@ -67,7 +92,8 @@ clients; see [identity provider](identity-provider.md) and [generated config](ge
 - `auth_groups` lists group names (`[A-Za-z0-9._-]`); membership of **any one** is enough. Without it every user the
   provider authenticates may enter. Only groups are supported, not individual users: manage membership in the provider's
   user database.
-- Apps routed by `paths` get a rule per prefix, anchored so `/p` does not match `/pp`.
+- Apps routed by `paths` get a rule per prefix, anchored so `/p` does not match `/pp`. A prefix exempted as a whole
+  (`auth_exempt_paths` entry `/p/`) gets none.
 - A rule that names groups is followed by a `deny` for the same domain and paths. The provider skips a group rule for a
   user outside the groups and tries the next one, so without that `deny` another app on the same domain could admit them.
 - Exempt paths need no rule: nginx never asks the provider about them.
@@ -93,3 +119,7 @@ config. A Węglarka from before this stage **refuses to start** while `apps.toml
 The same goes for `ingress.auth_policy` and `ingress.auth_groups` on a release from before access rules. Remove those
 fields from `apps.toml` (the apps are then public, or open to every logged-in user), or restore the files from before the
 upgrade, before downgrading. See [the state schema](state-schema.md) and [verify and rollback](verify-and-rollback.md).
+
+Combining `auth_exempt_paths` with `paths` needs this release: an older daemon refuses the combination at validation (it
+reads the same field, so no state schema changes), and the app is not reconciled. Remove `auth_exempt_paths` from such an
+app (its exempt paths are then guarded, or move them to an app of their own) before downgrading.
