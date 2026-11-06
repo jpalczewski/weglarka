@@ -1992,4 +1992,135 @@ image = "x:1"
         let err = crate::state::validate_apps(&plain).unwrap_err();
         assert!(err.starts_with("plain: "), "{err}");
     }
+
+    /// A file written before `shared_services` existed (a few apps, a network and a volume) must be
+    /// read and written back byte for byte: an upgrade rewrites no operator's `apps.toml` (#590).
+    /// The fixture is the serializer's own output, so equality is exact rather than structural.
+    const APPS_WITHOUT_SHARED_SERVICES: &str = r#"[shared_volumes.data]
+
+[shared_networks.kajet]
+
+[apps.ntfy]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+domains = ["nz.example.eu"]
+port = 8085
+secrets = []
+auto_update = true
+
+[apps.ntfy.env]
+CONFIG_FILE = "/config.json"
+
+[apps.worker]
+image = "ghcr.io/example/worker:1"
+domains = []
+secrets = []
+shared_networks = ["kajet"]
+auto_update = true
+
+[apps.worker.env]
+LOG_LEVEL = "info"
+
+[[apps.worker.shared_volumes]]
+name = "data"
+target = "/data"
+"#;
+
+    #[test]
+    fn a_file_without_shared_services_round_trips_byte_identically() {
+        assert!(
+            !APPS_WITHOUT_SHARED_SERVICES.contains("shared_services"),
+            "the fixture must predate the field"
+        );
+        let parsed: AppsFile = toml::from_str(APPS_WITHOUT_SHARED_SERVICES).unwrap();
+        assert!(parsed.shared_services.is_empty());
+        assert!(
+            parsed
+                .apps
+                .values()
+                .all(|spec| spec.shared_services.is_empty())
+        );
+
+        let once = toml::to_string(&parsed).unwrap();
+        assert_eq!(once, APPS_WITHOUT_SHARED_SERVICES, "byte for byte");
+        assert!(!once.contains("shared_services"), "{once}");
+
+        // And the load/write cycle is a fixed point, not just idempotent once.
+        let twice = toml::to_string(&toml::from_str::<AppsFile>(&once).unwrap()).unwrap();
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn empty_files_and_plain_specs_serialize_without_shared_services() {
+        let empty = toml::to_string(&AppsFile::default()).unwrap();
+        assert!(!empty.contains("shared_services"), "{empty}");
+
+        let plain: AppSpec = toml::from_str("image = \"x:1\"\n").unwrap();
+        assert!(plain.shared_services.is_empty());
+        let text = toml::to_string(&plain).unwrap();
+        assert!(!text.contains("shared_services"), "{text}");
+        // The declaration section stays out of the file while nothing is declared.
+        let apps: AppsFile = toml::from_str("[apps.a]\nimage = \"x:1\"\n").unwrap();
+        let text = toml::to_string(&apps).unwrap();
+        assert!(!text.contains("[shared_services"), "{text}");
+    }
+
+    /// `[shared_services.<name>]` and its members parse and round-trip like any other table (#590).
+    /// Only validation rejects them; loading and saving a file must not.
+    const APPS_WITH_A_SHARED_SERVICE: &str = r#"[shared_services.cache]
+kind = "redis"
+instance = "cache-redis"
+profile = "cache"
+maxmemory = "64mb"
+
+[apps.cache-redis]
+image = "docker.io/library/redis:7.4"
+domains = []
+secrets = []
+auto_update = true
+
+[apps.cache-redis.env]
+
+[apps.worker]
+image = "ghcr.io/example/worker:1"
+domains = []
+secrets = []
+shared_services = ["cache"]
+auto_update = true
+
+[apps.worker.env]
+"#;
+
+    #[test]
+    fn a_shared_service_declaration_and_its_members_roundtrip() {
+        use crate::shared_services::{
+            Maxmemory, RedisProfile, ServiceKind, ServiceName, SharedServiceSpec,
+        };
+
+        let parsed: AppsFile = toml::from_str(APPS_WITH_A_SHARED_SERVICE).unwrap();
+        let cache = ServiceName::new("cache").unwrap();
+        assert_eq!(
+            parsed.shared_services[&cache],
+            SharedServiceSpec {
+                kind: ServiceKind::Redis,
+                instance: InstanceName::new("cache-redis").unwrap(),
+                profile: Some(RedisProfile::Cache),
+                maxmemory: Some(Maxmemory::new("64mb").unwrap()),
+            }
+        );
+        assert_eq!(
+            parsed.apps[&InstanceName::new("worker").unwrap()].shared_services,
+            vec![cache]
+        );
+
+        let text = toml::to_string(&parsed).unwrap();
+        assert_eq!(text, APPS_WITH_A_SHARED_SERVICE, "byte for byte");
+        // TOML wants the declaration before the tables that refer to it, and it is written first.
+        let declaration = text.find("[shared_services.cache]").expect("declaration");
+        let first_app = text.find("[apps.").expect("apps");
+        assert!(declaration < first_app, "{text}");
+
+        let again: AppsFile = toml::from_str(&text).unwrap();
+        assert_eq!(again, parsed);
+        assert_eq!(toml::to_string(&again).unwrap(), text);
+    }
 }
