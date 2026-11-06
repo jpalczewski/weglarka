@@ -1334,6 +1334,20 @@ pub fn load_state(path: &Path) -> Result<StateFile, StateError> {
     parse_state(path, &src)
 }
 
+/// The raw `schema_version` a state file declares, without deserializing or migrating the rest of
+/// the file; `None` when the file does not exist. A file without the marker is the implicit v1.
+///
+/// Unlike [`load_state`] this does **not** refuse a version above [`SCHEMA_VERSION`]
+/// ([`StateError::SchemaTooNew`]): it is for host-side tools that only compare the number (the
+/// self-update switcher against the image label, issue #616) and never read the state's content, so
+/// a newer file is returned as is. An invalid marker is still an error.
+pub fn declared_state_schema(path: &Path) -> Result<Option<u32>, StateError> {
+    let Some(src) = read_optional(path)? else {
+        return Ok(None);
+    };
+    declared_schema_version(path, &src).map(Some)
+}
+
 pub fn save_state(path: &Path, state: &StateFile) -> Result<(), StateError> {
     validate_state(path, state)?;
     let text = toml::to_string(state).map_err(|e| invalid(path, e.to_string()))?;
@@ -2325,6 +2339,44 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
         let loaded = load_state(&p).unwrap();
         assert_eq!(loaded.schema_version, Some(SCHEMA_VERSION));
         assert!(loaded.apps.is_empty());
+    }
+
+    /// Issue #616: the header-only reader returns the declared number, also above
+    /// `SCHEMA_VERSION`, without looking at the rest of the file.
+    #[test]
+    fn the_declared_state_schema_is_read_from_the_header_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        assert_eq!(declared_state_schema(&p).unwrap(), None);
+
+        fs::write(&p, "[apps.a]\ngeneration = 2\n").unwrap();
+        assert_eq!(
+            declared_state_schema(&p).unwrap(),
+            Some(IMPLICIT_SCHEMA_VERSION)
+        );
+
+        fs::write(&p, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
+        assert_eq!(declared_state_schema(&p).unwrap(), Some(SCHEMA_VERSION));
+
+        // A newer file with a field and a table this binary does not know: still just a number.
+        let newer = SCHEMA_VERSION + 5;
+        fs::write(
+            &p,
+            format!("schema_version = {newer}\nbogus = 1\n[unknown_table]\nkey = \"v\"\n"),
+        )
+        .unwrap();
+        assert_eq!(declared_state_schema(&p).unwrap(), Some(newer));
+
+        for bad in ["schema_version = \"x\"", "schema_version = 0"] {
+            fs::write(&p, format!("{bad}\n")).unwrap();
+            let err = declared_state_schema(&p).unwrap_err();
+            assert!(matches!(err, StateError::Invalid { .. }), "{bad}: {err}");
+        }
+        fs::write(&p, "schema_version = \n").unwrap();
+        assert!(matches!(
+            declared_state_schema(&p),
+            Err(StateError::Parse { .. })
+        ));
     }
 
     #[test]

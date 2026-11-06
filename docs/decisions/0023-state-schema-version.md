@@ -99,3 +99,16 @@ only ever written by the daemon, atomically, through `save_apps`/`save_state`.
   continuing could corrupt state (uid ranges, digest retention) rather than fail loudly.
 - **A `weglarka applications migrate` command**: the daemon is the only writer of these files;
   migrating in-process, on load, keeps the atomic-write rule and needs no extra operator step.
+
+## Addendum (2026-11-06): host-side tools read only the header (#616)
+
+The "newer than this binary" refusal protects code that **deserializes** the state: the daemon at
+startup, preflight, anything that acts on the content. The self-update switcher and the watchdog
+fallback (host binaries, not replaced by a self-update) never read the content; they only compare
+the state's `schema_version` with the image label `io.weglarka.state-schema` to refuse a downgrade
+across a bump. They now read the header alone (`state::declared_state_schema`, no migration, no
+strict parse) and do not apply the refusal: a state above their own `SCHEMA_VERSION` is a number to
+compare, so a self-update into an image that raises the schema no longer stops every later
+automatic update (part of #203). A missing, unmarked or older file still counts as the binary's own
+`SCHEMA_VERSION` (what the migrated load returned before), and an invalid header is still an error.
+Every tool that deserializes the state keeps the refusal unchanged.
