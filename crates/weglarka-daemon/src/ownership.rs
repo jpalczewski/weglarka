@@ -204,32 +204,36 @@ mod tests {
 
     use super::*;
 
+    /// Sets `mode` on `path` explicitly, so the fixture never depends on the caller's umask.
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A host directory as the generation store leaves it: code directories `0755`, manifests
+    /// `0644`, binaries `0755`. Every mode is set after creation, never taken from the umask (a
+    /// `0002` umask would make the code tree group-writable, which [`root_tree`] reports).
     fn tree() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let host = dir.path().join("host");
-        std::fs::create_dir_all(host.join(GENERATIONS_DIR).join("g1")).unwrap();
+        let generations = host.join(GENERATIONS_DIR);
+        let g1 = generations.join("g1");
+        std::fs::create_dir_all(&g1).unwrap();
         std::fs::write(host.join(LAUNCHER_FILE), b"launcher").unwrap();
         std::fs::write(host.join("host-tools.toml"), b"x").unwrap();
-        std::fs::write(
-            host.join(GENERATIONS_DIR).join("g1").join("manifest.toml"),
-            b"m",
-        )
-        .unwrap();
-        std::fs::write(
-            host.join(GENERATIONS_DIR)
-                .join("g1")
-                .join("weglarka-daemon"),
-            b"d",
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            host.join(GENERATIONS_DIR)
-                .join("g1")
-                .join("weglarka-daemon"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::write(g1.join("manifest.toml"), b"m").unwrap();
+        std::fs::write(g1.join("weglarka-daemon"), b"d").unwrap();
+        for (path, mode) in [
+            (host.clone(), 0o755),
+            (host.join(LAUNCHER_FILE), 0o755),
+            (host.join("host-tools.toml"), 0o644),
+            (generations, 0o755),
+            (g1.clone(), 0o755),
+            (g1.join("manifest.toml"), 0o644),
+            (g1.join("weglarka-daemon"), 0o755),
+        ] {
+            chmod(&path, mode);
+        }
         (dir, outside, host)
     }
 
@@ -306,7 +310,7 @@ mod tests {
             .join(GENERATIONS_DIR)
             .join("g1")
             .join("weglarka-daemon");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o757)).unwrap();
+        chmod(&binary, 0o757);
         let (_calls, failures) = recorded(&host);
         assert_eq!(failures, Outcome { code: 1, state: 0 });
     }

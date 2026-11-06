@@ -1373,8 +1373,25 @@ mod tests {
         let raw = "status=418&method=BREW&path=/teapot-secret&host=tea.example.com&tail=3";
         let (frames, got) = history_of(raw, vec![out("SECRET-LOG-CONTENT\n")]).await;
         assert_eq!(frames, [AccessFrame::End]);
-        // The audit line is built from these fields only, so none of them may hold a value.
-        let fields = format!("{got:?}");
+        // The audit line is built from these fields only, so none of them may hold a value. No `..`:
+        // a new field is a conscious decision. `started` only yields the duration, and its `Debug`
+        // output is clock digits that may well contain `418`.
+        let Audit {
+            sub,
+            app,
+            follow,
+            tail,
+            since,
+            filtered,
+            started: _,
+            frames: sent,
+            scanned,
+            skipped,
+        } = &got;
+        let fields = format!(
+            "{sub:?} {app} {follow} {tail:?} {} {filtered} {sent} {scanned} {skipped}",
+            unix_secs(*since)
+        );
         for secret in [
             "418",
             "BREW",
