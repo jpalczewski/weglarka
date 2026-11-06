@@ -35,12 +35,11 @@ impl<P: PodmanClient> Reconciler<P> {
 
     /// Removes `[oidc_clients.<id>]`; the provider loses the client at the next apply.
     pub async fn remove_oidc_client(&self, id: &ClientId) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        if apps.oidc_clients.remove(id).is_none() {
-            return Err(EngineError::UnknownOidcClient(id.to_string()));
-        }
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+        let guard = self.acquire().await;
+        self.mutate_apps(&guard, |apps| match apps.oidc_clients.remove(id) {
+            Some(_) => Ok(()),
+            None => Err(EngineError::UnknownOidcClient(id.to_string())),
+        })
     }
 
     /// Rotates the client secret (and its digest) of `instance` without ever leaving the app and the

@@ -17,7 +17,6 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use crate::crash;
 use crate::deploy::{DeployOutcome, DigestSource};
 use crate::sites::ExtractLimits;
-use crate::volumes::RemoveAppOptions;
 use crate::waiting::{apply_waiting, missing_secrets};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, Digest, InstanceName};
 use weglarka_model::delivery::{self, DeliveryDedup};
@@ -720,6 +719,19 @@ impl<P: PodmanClient> Reconciler<P> {
     pub(crate) async fn acquire(&self) -> EngineGuard<'_> {
         EngineGuard(self.lock.lock().await)
     }
+
+    /// Read-modify-write of `apps.toml` under the held engine lock: loads the file, applies `f` and
+    /// saves the result. An error from `f` writes nothing, so a refusal leaves the file untouched.
+    pub(crate) fn mutate_apps<T>(
+        &self,
+        _held: &EngineGuard<'_>,
+        f: impl FnOnce(&mut AppsFile) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let mut apps = state::load_apps(&self.paths.apps)?;
+        let out = f(&mut apps)?;
+        state::save_apps(&self.paths.apps, &apps)?;
+        Ok(out)
+    }
 }
 
 impl<P: PodmanClient> Reconciler<P> {
@@ -853,16 +865,17 @@ impl<P: PodmanClient> Reconciler<P> {
     // Desired-state changes (API → daemon). Send [`Trigger::Changed`] after them.
 
     pub async fn upsert_app(&self, name: InstanceName, spec: AppSpec) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        crate::promote::ensure_unmanaged(&apps, &name)?;
-        // An ingress-only change of a static app deploys nothing, so the release it serves right now
-        // has to satisfy the new spec (issue #501) — checked under the engine mutex, so a deploy
-        // cannot move `current` between the check and the write (issue #572). `old = None` (a new
-        // app) needs no check; nothing is written on refusal.
-        self.check_static_change(&name, apps.apps.get(&name), &spec)?;
-        apps.apps.insert(name, spec);
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+        let guard = self.acquire().await;
+        self.mutate_apps(&guard, |apps| {
+            crate::promote::ensure_unmanaged(apps, &name)?;
+            // An ingress-only change of a static app deploys nothing, so the release it serves right
+            // now has to satisfy the new spec (issue #501) — checked under the engine mutex, so a
+            // deploy cannot move `current` between the check and the write (issue #572). `old =
+            // None` (a new app) needs no check; nothing is written on refusal.
+            self.check_static_change(&name, apps.apps.get(&name), &spec)?;
+            apps.apps.insert(name, spec);
+            Ok(())
+        })
     }
 
     /// Whether the running container already matches the stored spec (`reconciled` in
@@ -898,13 +911,6 @@ impl<P: PodmanClient> Reconciler<P> {
             Ok(h) => c.labels.get(labels::SPEC_HASH).map(String::as_str) == Some(h.as_str()),
             Err(_) => false,
         }
-    }
-
-    /// `apps remove` without purging: the instance's volumes (and their data) and secrets stay, so a
-    /// re-added app finds them again. The lock moves into [`Self::remove_app_with_purges`].
-    pub async fn remove_app(&self, name: &InstanceName) -> Result<(), EngineError> {
-        self.remove_app_with_purges(name, RemoveAppOptions::default())
-            .await
     }
 
     /// Deletes one of the instance's secrets from the store (`secrets remove`, issue #80).

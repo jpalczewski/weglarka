@@ -878,13 +878,18 @@ async fn removed_app_is_pruned_with_its_state() {
     let h = Harness::new(NTFY);
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.rec.reconcile().await.unwrap();
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(single(&report), &ActionOutcome::Removed);
     assert!(h.fake.containers().is_empty());
     assert!(load_state(&h.rec.paths().state).unwrap().apps.is_empty());
     assert!(matches!(
-        h.rec.remove_app(&name("ntfy")).await,
+        h.rec
+            .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+            .await,
         Err(crate::reconcile::EngineError::UnknownInstance(_))
     ));
 }
@@ -913,7 +918,10 @@ async fn removed_app_network_is_cleaned_up_but_other_networks_stay() {
             .unwrap();
     }
 
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     h.rec.reconcile().await.unwrap();
     let nets = h.fake.networks();
     assert!(!nets.contains(&"net-ntfy".to_owned()), "{nets:?}");
@@ -1162,7 +1170,10 @@ async fn remove_secret_works_for_an_app_absent_from_apps_toml() {
     );
 
     // Leftovers of a removed app as well (`apps remove` keeps secrets by default).
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     h.rec
         .remove_secret(&name("ntfy"), "token", false)
         .await
@@ -1787,7 +1798,11 @@ async fn replacing_a_running_container_is_not_blocked_by_its_dependency() {
 #[tokio::test(start_paused = true)]
 async fn removing_a_dependency_is_refused() {
     let h = Harness::new(DEPENDS);
-    let err = h.rec.remove_app(&name("db")).await.unwrap_err();
+    let err = h
+        .rec
+        .remove_app_with_purges(&name("db"), RemoveAppOptions::default())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, EngineError::DependencyInUse { dependents, .. }
             if dependents == &vec![name("api")]),
@@ -1796,8 +1811,14 @@ async fn removing_a_dependency_is_refused() {
     let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
     assert!(apps.apps.contains_key(&name("db")), "nothing was removed");
 
-    h.rec.remove_app(&name("api")).await.unwrap();
-    h.rec.remove_app(&name("db")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("api"), RemoveAppOptions::default())
+        .await
+        .unwrap();
+    h.rec
+        .remove_app_with_purges(&name("db"), RemoveAppOptions::default())
+        .await
+        .unwrap();
 }
 
 /// Retention of 1 (issue #40): with `current` and `previous` saved, a successful deploy removes the
