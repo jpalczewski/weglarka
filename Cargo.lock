@@ -2216,6 +2216,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "hex",
+ "hmac",
  "insta",
  "ring",
  "semver",
