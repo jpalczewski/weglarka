@@ -7,14 +7,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
     CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse, DoctorCheck,
-    DoctorReport, ErrorCode, ListReservationsResponse, NotifyStatusResponse, PruneImagesResponse,
-    PrunedImage, ReloadAction, ReloadResponse, ReservationView, RollbackResponse, RuntimeState,
-    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
+    DoctorReport, ErrorCode, HostSecretInfo, ListHostSecretsResponse, ListReservationsResponse,
+    NotifyStatusResponse, PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse,
+    ReservationView, RollbackResponse, RuntimeState, SetSecretRequest, ShowAppResponse,
+    UpdateAppResponse, endpoints,
 };
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::config::HostConfig;
 
-use crate::cli::{AddArgs, ReloadArgs, RemoveArgs, RollbackArgs, SecretRemoveArgs, StartStopArgs};
+use crate::cli::{
+    AddArgs, HostSecretRemoveArgs, HostSecretSetArgs, HostSecretsCommand, ReloadArgs, RemoveArgs,
+    RollbackArgs, SecretRemoveArgs, StartStopArgs,
+};
 use crate::client::{ApiClient, ApiRequest, expand_path};
 use crate::commands::{
     apps_reload, apps_remove, apps_rollback, build_spec, notify_status, notify_test,
@@ -286,6 +290,162 @@ fn clap_parses_secret_without_value_argument() {
     let cli =
         crate::cli::Cli::try_parse_from(["weglarka", "secrets", "set", "app", "cfg", "hunter2"]);
     assert!(cli.is_err(), "wartość jako argument musi być odrzucona");
+}
+
+#[test]
+fn clap_parses_host_secrets_set_list_remove() {
+    use crate::cli::{Cli, Command, SecretsCommand};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    let cli = Cli::try_parse_from([
+        "weglarka",
+        "secrets",
+        "host",
+        "set",
+        "token",
+        "--from-file",
+        "f",
+        "--dry-run",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::Set(a))) => {
+            assert_eq!(a.name, "token");
+            assert_eq!(a.from_file, Some(PathBuf::from("f")));
+            assert!(!a.raw);
+            assert!(a.dry_run);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["weglarka", "secrets", "host", "list"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::List))
+    ));
+
+    let cli = Cli::try_parse_from(["weglarka", "secrets", "host", "remove", "token"]).unwrap();
+    match cli.command {
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::Remove(a))) => {
+            assert_eq!(a.name, "token");
+            assert!(!a.dry_run);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // A value as an argument is rejected, as for app secrets, and so are app-only flags.
+    assert!(
+        Cli::try_parse_from(["weglarka", "secrets", "host", "set", "token", "hunter2"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "weglarka",
+            "secrets",
+            "host",
+            "set",
+            "token",
+            "--env-file",
+            "f"
+        ])
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_secrets_set_reads_a_file_and_sends_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "s3cr3t\n").unwrap();
+
+    let response = serde_json::to_string(&HostSecretInfo {
+        name: "token".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        fingerprint: "deadbeef".into(),
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    let code = crate::commands::host_secrets_set(
+        true,
+        &overrides(&m),
+        HostSecretSetArgs {
+            name: "token".into(),
+            from_file: Some(token),
+            raw: false,
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("PUT", "/v1/host/secrets/token")
+    );
+    assert_eq!(seen[0].body, r#"{"value":"s3cr3t"}"#);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_secrets_list_and_remove_use_the_contract_paths() {
+    let response = serde_json::to_string(&ListHostSecretsResponse {
+        secrets: vec![HostSecretInfo {
+            name: "token".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            fingerprint: "deadbeef".into(),
+        }],
+    })
+    .unwrap();
+    let m = mock(move |_, _| (200, response.clone())).await;
+    let code = crate::commands::host_secrets_list(true, &overrides(&m))
+        .await
+        .unwrap();
+    assert_eq!(code, exit::OK);
+    {
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("GET", "/v1/host/secrets")
+        );
+    }
+
+    let m = mock(|_, _| (204, String::new())).await;
+    let code = crate::commands::host_secrets_remove(
+        true,
+        &overrides(&m),
+        HostSecretRemoveArgs {
+            name: "token".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, exit::OK);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].path.as_str()),
+        ("DELETE", "/v1/host/secrets/token")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_secrets_remove_validates_names_locally() {
+    let m = mock(|_, _| (204, String::new())).await;
+    let o = overrides(&m);
+    let err = crate::commands::host_secrets_remove(
+        true,
+        &o,
+        HostSecretRemoveArgs {
+            name: "bad name".into(),
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.exit_code(), exit::USAGE);
+    assert!(m.seen.lock().unwrap().is_empty(), "nothing was sent");
 }
 
 // ---------- preflight ----------
