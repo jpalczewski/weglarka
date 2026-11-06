@@ -13,11 +13,11 @@ use axum::routing::post;
 use weglarka_engine::deploy::instances_tracking;
 use weglarka_model::app::InstanceName;
 use weglarka_model::podman::PodmanClient;
-use weglarka_model::secret_store::{SecretStore, scoped_name};
+use weglarka_model::secret_store::{SecretStore, WEBHOOK_HMAC_SECRET, scoped_name};
 use weglarka_model::state;
 use weglarka_model::webhook::{WebhookError, WebhookRequest, WebhookSource};
 
-use crate::app::{Daemon, WEBHOOK_SECRET};
+use crate::app::Daemon;
 
 /// Matches nginx's `webhook_max_body_bytes` (1 MiB).
 pub const BODY_LIMIT: usize = 1024 * 1024;
@@ -74,7 +74,7 @@ async fn receive<P: PodmanClient + 'static>(
         return reject("invalid instance name", StatusCode::UNAUTHORIZED);
     };
     let store = d.secrets.clone();
-    let key = scoped_name(&instance, WEBHOOK_SECRET);
+    let key = scoped_name(&instance, WEBHOOK_HMAC_SECRET);
     let secret = match tokio::task::spawn_blocking(move || store.get(&key)).await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => return reject("no webhook secret for app", StatusCode::UNAUTHORIZED),

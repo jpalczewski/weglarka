@@ -9,18 +9,19 @@ use weglarka_engine::config_mounts::{self, MountStatus};
 use weglarka_engine::sites::{ServedRelease, release_id, served_release};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::{IngressMode, LogRetention};
+use weglarka_model::fsutil::{PrivateFileError, check_private};
 use weglarka_model::labels;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, PodmanClient, VolumeFilter,
 };
-use weglarka_model::secret_store::{SecretStore, scoped_name, split_scoped};
+use weglarka_model::secret_store::{SecretStore, WEBHOOK_HMAC_SECRET, scoped_name, split_scoped};
 use weglarka_model::shared_networks;
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, StateFile};
 use weglarka_model::units::human_bytes;
 use weglarka_model::user_groups::{MissingGroup, UserGroupsState};
 
-use crate::app::{Daemon, WEBHOOK_SECRET};
+use crate::app::Daemon;
 use crate::app_view::Access;
 use crate::certificates::{self, routed_domains};
 use crate::ingress::{FORWARDER_CONTAINER, NGINX_CONTAINER};
@@ -1973,26 +1974,24 @@ fn acme<P: PodmanClient>(
     ));
 
     let key = &d.paths.acme_account_key;
-    match std::fs::metadata(key) {
-        Ok(m) if m.permissions().mode() & 0o077 == 0 => {
+    match check_private(key) {
+        Ok(()) => {
             out.push(ok("acme.account", key.display().to_string()));
         }
-        Ok(m) => out.push(check(
+        Err(PrivateFileError::TooOpen { mode }) => out.push(check(
             "acme.account",
             CheckStatus::Fail,
-            format!(
-                "{} has permissions {:o}, expected 600",
-                key.display(),
-                m.permissions().mode() & 0o777
-            ),
+            format!("{} has permissions {mode:o}, expected 600", key.display()),
             Some("chmod 600; the daemon refuses a group/other-accessible account key"),
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push(check(
-            "acme.account",
-            CheckStatus::Info,
-            "no account yet; it is created at the first issuance",
-            None,
-        )),
+        Err(PrivateFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.push(check(
+                "acme.account",
+                CheckStatus::Info,
+                "no account yet; it is created at the first issuance",
+                None,
+            ))
+        }
         Err(e) => out.push(check(
             "acme.account",
             CheckStatus::Warn,
@@ -2204,8 +2203,8 @@ fn acme_dns(
     out: &mut Vec<DoctorCheck>,
 ) {
     let token = &dns.token_file;
-    match std::fs::metadata(token) {
-        Ok(m) if m.permissions().mode() & 0o077 == 0 => out.push(ok(
+    match check_private(token) {
+        Ok(()) => out.push(ok(
             "acme.dns",
             format!(
                 "{:?}, token {}, wildcards for {}",
@@ -2214,17 +2213,13 @@ fn acme_dns(
                 dns.wildcards.join(", ")
             ),
         )),
-        Ok(m) => out.push(check(
+        Err(PrivateFileError::TooOpen { mode }) => out.push(check(
             "acme.dns",
             CheckStatus::Fail,
-            format!(
-                "{} has permissions {:o}, expected 600",
-                token.display(),
-                m.permissions().mode() & 0o777
-            ),
+            format!("{} has permissions {mode:o}, expected 600", token.display()),
             Some("chmod 600; the daemon refuses a group/other-accessible DNS token"),
         )),
-        Err(e) => out.push(check(
+        Err(PrivateFileError::Io(e)) => out.push(check(
             "acme.dns",
             CheckStatus::Fail,
             format!("{}: {}", token.display(), detail(&e)),
@@ -2651,7 +2646,7 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         .apps
         .iter()
         .filter(|(_, s)| s.auto_update)
-        .filter(|(n, _)| !have.contains(&scoped_name(n, WEBHOOK_SECRET)))
+        .filter(|(n, _)| !have.contains(&scoped_name(n, WEBHOOK_HMAC_SECRET)))
         .map(|(n, _)| n.to_string())
         .collect();
     out.push(if missing.is_empty() {
@@ -2660,7 +2655,10 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         check(
             "state.webhook_secrets",
             CheckStatus::Warn,
-            format!("missing `{WEBHOOK_SECRET}` secret for: {}", missing.join(", ")),
+            format!(
+                "missing `{WEBHOOK_HMAC_SECRET}` secret for: {}",
+                missing.join(", ")
+            ),
             Some("`weglarka secrets set <app> webhook-hmac` (use the same secret in the GitHub webhook)"),
         )
     });

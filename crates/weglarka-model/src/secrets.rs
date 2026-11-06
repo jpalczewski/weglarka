@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::write_atomic;
+use crate::fsutil::{PrivateFileError, check_private, write_atomic};
 use crate::secret_store::{
     SecretError, SecretMeta, SecretStore, SecretValue, fingerprint, split_scoped,
 };
@@ -74,19 +74,28 @@ impl FileSecretStore {
 
     /// Checks the file's permissions (missing file = OK, it will be created with 0600).
     pub fn check_permissions(&self) -> Result<(), SecretError> {
-        match fs::metadata(&self.path) {
-            Ok(m) if m.permissions().mode() & 0o077 != 0 => Err(SecretError::Permissions {
+        match check_private(&self.path) {
+            Ok(()) => Ok(()),
+            // A missing file is created on first write, with 0600.
+            Err(PrivateFileError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(PrivateFileError::Io(e)) => Err(io_err(e)),
+            Err(e @ PrivateFileError::TooOpen { .. }) => Err(SecretError::Permissions {
                 path: self.path.display().to_string(),
-                reason: format!("mode {:o}, expected 600", m.permissions().mode() & 0o777),
+                reason: e.to_string(),
             }),
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(e)),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// An empty store in its own temporary directory; the directory is dropped with the store.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn in_tempdir() -> (tempfile::TempDir, Self) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Self::new(dir.path().join("secrets.toml"));
+        (dir, store)
     }
 
     fn read(&self) -> Result<SecretsFile, SecretError> {

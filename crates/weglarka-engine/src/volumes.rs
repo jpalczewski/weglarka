@@ -1096,13 +1096,12 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
     }
 
     fn env(apps: &str) -> Env {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, store) = FileSecretStore::in_tempdir();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, apps).unwrap();
         let fake = FakePodman::new();
         fake.set_pull_digest(IMAGE, digest('a'));
-        let store: Arc<dyn SecretStore> =
-            Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+        let store: Arc<dyn SecretStore> = Arc::new(store);
         let rec = Reconciler::new(fake.clone(), store, paths, ReconcilerOptions::default());
         Env {
             _dir: dir,

@@ -1779,10 +1779,10 @@ mod tests {
     }
 
     fn reconciler() -> (tempfile::TempDir, Reconciler<FakePodman>) {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, store) = FileSecretStore::in_tempdir();
         let paths = StatePaths::in_dir(dir.path());
         std::fs::write(&paths.apps, "").unwrap();
-        let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+        let store = Arc::new(store);
         let rec = Reconciler::new(
             FakePodman::new(),
             store,

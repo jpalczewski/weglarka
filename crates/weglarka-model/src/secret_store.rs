@@ -81,11 +81,19 @@ pub fn is_oidc_reserved(name: &str) -> bool {
 /// daemon verifies deliveries with it and it is never handed to a container.
 pub const WEBHOOK_HMAC_SECRET: &str = "webhook-hmac";
 
-/// Whether `name` (the `<name>` part) is a secret Węglarka manages for itself — registry
-/// credentials, the webhook key, the OIDC pair. None of them may be handed to a container that
-/// the spec does not already give it (for example by `run --secret`).
+/// Secrets the daemon manages for itself — registry credentials, the webhook key, the OIDC pair.
+/// None of them may be handed to a container that the spec does not already give it (for example
+/// by `run --secret`).
+pub const DAEMON_MANAGED_SECRETS: &[&str] = &[
+    REGISTRY_AUTH_SECRET,
+    WEBHOOK_HMAC_SECRET,
+    OIDC_CLIENT_SECRET,
+    OIDC_CLIENT_DIGEST,
+];
+
+/// Whether `name` (the `<name>` part) is one of [`DAEMON_MANAGED_SECRETS`].
 pub fn is_daemon_managed(name: &str) -> bool {
-    name == REGISTRY_AUTH_SECRET || name == WEBHOOK_HMAC_SECRET || is_oidc_reserved(name)
+    DAEMON_MANAGED_SECRETS.contains(&name)
 }
 
 /// Secret name in Podman and in the store: `<instance>.<name>` (a dot is not allowed in an
@@ -120,4 +128,28 @@ pub trait SecretStore: Send + Sync {
     fn set(&self, name: &str, value: SecretValue) -> Result<(), SecretError>;
     fn remove(&self, name: &str) -> Result<(), SecretError>;
     fn list(&self) -> Result<Vec<SecretMeta>, SecretError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_managed_table_is_what_the_predicate_accepts() {
+        for name in DAEMON_MANAGED_SECRETS {
+            assert!(is_daemon_managed(name), "{name}");
+        }
+        for name in ["secrets", "webhook-secret", "registry", ""] {
+            assert!(!is_daemon_managed(name), "{name}");
+        }
+        assert_eq!(
+            DAEMON_MANAGED_SECRETS,
+            [
+                REGISTRY_AUTH_SECRET,
+                WEBHOOK_HMAC_SECRET,
+                OIDC_CLIENT_SECRET,
+                OIDC_CLIENT_DIGEST
+            ]
+        );
+    }
 }

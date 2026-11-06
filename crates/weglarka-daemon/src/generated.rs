@@ -212,12 +212,11 @@ health = { attempts = 2, window_secs = 2 }
 
     impl Rig {
         async fn start() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let (dir, secrets) = FileSecretStore::in_tempdir();
             let paths = StatePaths::in_dir(dir.path());
             std::fs::write(&paths.apps, APPS).unwrap();
             let fake = FakePodman::new();
-            let secrets: Arc<dyn SecretStore> =
-                Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
+            let secrets: Arc<dyn SecretStore> = Arc::new(secrets);
             let engine = Arc::new(Reconciler::new(
                 fake.clone(),
                 secrets,
