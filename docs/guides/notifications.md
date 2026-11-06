@@ -4,7 +4,13 @@ Failed deploys, rollbacks and events from the reconcile loop reach your phone th
 
 What you receive: `deployed <app>`, `deploy failed: <app>`, `rolled back <app>`, `ROLLBACK FAILED: <app>` (critical), `provisioned <app>`, `recreated <app>` and `waiting for secrets: <app>` (info). If you raise `min_severity` to `debug`, you also get `removed container <name>`, `waiting for dependencies: <app>` and `duplicate webhook <id>`. Restart loops and failing healthchecks are described in [crash detection](crash-detection.md) and [ADR 0022](../decisions/0022-crash-loop-detection.md); a mail fallback is tracked in #113.
 
-**1. Topic and token in ntfy.** Create a topic (for example `weglarka`) and, if the server is not public, an access token in the ntfy panel. Keep the token in a 0600 file next to the configuration; **do not put it in `weglarka.toml`**:
+**1. Topic and token in ntfy.** Create a topic (for example `weglarka`) and, if the server is not public, an access token in the ntfy panel. **The token never goes into `weglarka.toml`.** Recommended: a host secret — a bare name in `host-secrets.toml` (0600, next to `secrets.toml`; see [host secrets](host-secrets.md)):
+
+```sh
+weglarka secrets host set ntfy-token < ntfy-token.txt   # value from stdin, never from an argument
+```
+
+Older form, still supported: a 0600 file next to the configuration:
 
 ```sh
 umask 077 && printf '%s\n' 'tk_…' | sudo -u weglarka tee /var/lib/weglarka/ntfy-token >/dev/null
@@ -20,12 +26,15 @@ dedup_window_secs = 300          # window for merging repeats; 0 = no merging
 [notify.ntfy]
 url = "https://ntfy.example.com" # must be reachable FROM THE WĘGLARKA CONTAINER (see below)
 topic = "weglarka"
-token_file = "/var/lib/weglarka/ntfy-token"   # optional; without it the topic is public
+token_secret = "ntfy-token"                   # recommended: a host secret; omit for a public topic
+# token_file = "/var/lib/weglarka/ntfy-token" # the older form — set at most one of the two
 min_severity = "info"            # debug | info | warning | critical
 ```
 
 - **Address:** if the Węglarka container cannot reach the host's public domain (hairpin NAT / DNS inside the container), use the internal route through the ingress: `url = "http://weglarka-nginx:8080"` together with `host = "ntfy.example.com"` (the `Host` header; nginx routes by `Host`). `host` is only accepted together with an `http://` URL; for `https://` put the real name in `url`. The internal route is plain HTTP on the Podman network, so the token never leaves the host. **This route works in `behind` only.** In `edge` that port answers every routed domain with a `301` to HTTPS, which the notifier does not follow, so use the public `https://` URL there; `health.http` no longer depends on this port (it uses the [probe socket](edge-mode.md)), but notifications do not use the socket yet.
-- **Validation at startup:** a bad URL, a bad topic, or an unreadable or too-permissive token file **stops the daemon** (`notifications: …` in the log). Once enabled, notifications must not silently stop working.
+- **One token form:** `token_file` and `token_secret` are exclusive — setting both is a startup error (`[notify.ntfy] set at most one of token_file / token_secret`); with neither the topic is public. `token_secret` must be a valid host secret name (`[A-Za-z0-9_-]{1,64}`, no dot).
+- **Rotation without a restart:** the token is read on every use (each publication), so replacing the host secret (`weglarka secrets host set ntfy-token < …`) or rewriting the token file takes effect with the next message, in either form. There is no `SIGHUP` and no restart to remember. A source that breaks later is not silently ignored either: a failed read is reported like a failed delivery.
+- **Validation at startup:** a bad URL, a bad topic, or a broken token source — a missing or unreadable file, permissions looser than 0600, contents that cannot go into an HTTP header — **stops the daemon** (`notifications: …` in the log). Once enabled, notifications must not silently stop working. One exception: a host secret that is **not set yet** only logs a warning, because it can be set only through the running daemon; `doctor` reports it as a failure (`host.credentials`).
 - **Test:** after a restart (`systemctl --user restart weglarka`):
 
 ```sh
@@ -46,3 +55,5 @@ A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup
 ## Rollback
 
 `weglarka.toml` has `deny_unknown_fields`, so **an older daemon will not start** with a `[notify]` section. Before a downgrade, remove the section from the configuration (or keep it in a backup) and restart the service. Notifications are not part of app state, so there is nothing else to clean up.
+
+A `[notify.ntfy]` that uses `token_secret` does not parse on a daemon older than ADR 0079: switch it back to `token_file` before downgrading (the host secret itself can stay in `host-secrets.toml`, which an older daemon ignores). The field is in the table in [verification and rollback](verify-and-rollback.md).
