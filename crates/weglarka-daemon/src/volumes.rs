@@ -29,9 +29,8 @@ use weglarka_api::{
     AppVolumeSummary, ErrorCode, ListAppVolumesResponse, ListVolumesResponse, VolumeSummary,
     endpoints,
 };
-use weglarka_engine::volumes::ImportMode;
+use weglarka_engine::volumes::{ImportMode, find_mount, mounts};
 use weglarka_model::app::{AppSpec, InstanceName};
-use weglarka_model::labels;
 use weglarka_model::podman::{PodmanClient, PodmanError, PodmanResultExt, TarStream};
 use weglarka_model::state;
 
@@ -93,30 +92,18 @@ fn declared_volume<P: PodmanClient>(
 ) -> ApiResult<VolumeTarget> {
     let name = parse_name(app)?;
     let spec = load_spec(d, &name)?;
-    if let Some(v) = spec.volumes.iter().find(|v| v.name == volume) {
-        return Ok(VolumeTarget {
-            podman_name: labels::volume_name(&name, &v.name),
-            name: v.name.clone(),
-            instance: name,
-            shared: false,
-        });
-    }
-    if let Some(v) = spec
-        .shared_volumes
-        .iter()
-        .find(|v| v.name.as_str() == volume)
-    {
-        return Ok(VolumeTarget {
-            podman_name: labels::shared_volume_name(&v.name),
-            name: v.name.to_string(),
-            instance: name,
-            shared: true,
-        });
-    }
-    Err(Fail(
-        ErrorCode::NotFound,
-        format!("{name} declares no volume {volume:?}"),
-    ))
+    let Some(mount) = find_mount(&name, &spec, volume) else {
+        return Err(Fail(
+            ErrorCode::NotFound,
+            format!("{name} declares no volume {volume:?}"),
+        ));
+    };
+    Ok(VolumeTarget {
+        name: mount.volume.name().to_owned(),
+        podman_name: mount.volume.podman_name(),
+        shared: mount.volume.is_shared(),
+        instance: name.clone(),
+    })
 }
 
 /// What to tell the operator when the Podman volume does not exist yet (the volume endpoints are
@@ -154,25 +141,16 @@ async fn volume_summaries<P: PodmanClient>(
     spec: &AppSpec,
 ) -> ApiResult<Vec<VolumeSummary>> {
     let mut volumes = Vec::with_capacity(spec.volumes.len() + spec.shared_volumes.len());
-    for v in &spec.volumes {
-        let podman_name = labels::volume_name(name, &v.name);
+    // Shared volumes the app mounts come after its own, marked `shared` and addressed by their
+    // declared name.
+    for mount in mounts(name, spec) {
+        let podman_name = mount.volume.podman_name();
         volumes.push(VolumeSummary {
-            name: v.name.clone(),
-            target: v.target.clone(),
+            name: mount.volume.name().to_owned(),
+            target: mount.target.to_owned(),
             exists: volume_exists(d, &podman_name).await?,
             podman_name,
-            shared: false,
-        });
-    }
-    // Shared volumes the app mounts: same list, marked `shared`, addressed by their declared name.
-    for v in &spec.shared_volumes {
-        let podman_name = labels::shared_volume_name(&v.name);
-        volumes.push(VolumeSummary {
-            name: v.name.to_string(),
-            target: v.target.clone(),
-            exists: volume_exists(d, &podman_name).await?,
-            podman_name,
-            shared: true,
+            shared: mount.volume.is_shared(),
         });
     }
     Ok(volumes)

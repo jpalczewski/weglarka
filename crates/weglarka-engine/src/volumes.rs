@@ -109,37 +109,124 @@ pub fn effective_range_label(
     effective_range(apps, st, instance, spec).map(labels::uid_range_label)
 }
 
-/// Podman volume name and labels for an instance's volume.
-fn volume_spec(instance: &InstanceName, name: &str) -> VolumeSpec {
-    VolumeSpec {
-        name: labels::volume_name(instance, name),
-        labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
+/// One Podman volume an app mounts: a private volume of the instance or a declared shared volume
+/// (issue #33). The one place that maps either kind to its Podman name and labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeRef<'a> {
+    /// `<instance>.<name>`, labelled [`labels::INSTANCE`].
+    Private {
+        instance: &'a InstanceName,
+        name: &'a str,
+    },
+    /// `wg-shared-<name>`, labelled [`labels::SHARED_VOLUME`] and [`labels::SHARED_GROUP`] — never
+    /// [`labels::INSTANCE`], so instance purge and GC do not touch it.
+    Shared(&'a SharedVolumeName),
+}
+
+impl<'a> VolumeRef<'a> {
+    /// The name the app spec and the API address the volume by: the private volume's name within
+    /// the instance, or the shared volume's declared name (`kajet-data`, not `wg-shared-kajet-data`).
+    pub fn name(self) -> &'a str {
+        match self {
+            Self::Private { name, .. } => name,
+            Self::Shared(name) => name.as_str(),
+        }
+    }
+
+    pub fn podman_name(self) -> String {
+        match self {
+            Self::Private { instance, name } => labels::volume_name(instance, name),
+            Self::Shared(name) => labels::shared_volume_name(name),
+        }
+    }
+
+    pub fn is_shared(self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    /// Creates the volume (idempotent); a shared volume goes through [`ensure_shared_volume`] with
+    /// its declared group.
+    pub async fn ensure<P: PodmanClient>(
+        self,
+        podman: &P,
+        apps: &AppsFile,
+    ) -> Result<(), EngineError> {
+        match self {
+            Self::Private { instance, .. } => Ok(podman
+                .volume_create(&VolumeSpec {
+                    name: self.podman_name(),
+                    labels: instance_labels(instance),
+                })
+                .await?),
+            Self::Shared(name) => {
+                let group = shared_volumes::volume_group(apps, name);
+                ensure_shared_volume(podman, name, &group).await
+            }
+        }
     }
 }
 
-/// Podman volume name and labels for a shared volume (no `weglarka.instance` label on purpose).
-fn shared_volume_spec(name: &SharedVolumeName, group: &SharedVolumeName) -> VolumeSpec {
-    VolumeSpec {
-        name: labels::shared_volume_name(name),
-        labels: BTreeMap::from([
-            (labels::SHARED_VOLUME.to_owned(), name.to_string()),
-            (labels::SHARED_GROUP.to_owned(), group.to_string()),
-        ]),
+/// A volume as one app mounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeMount<'a> {
+    pub volume: VolumeRef<'a>,
+    /// Absolute path in the container.
+    pub target: &'a str,
+    pub read_only: bool,
+}
+
+impl VolumeMount<'_> {
+    fn attachment(self) -> VolumeAttachment {
+        VolumeAttachment {
+            volume: self.volume.podman_name(),
+            target: self.target.to_owned(),
+            read_only: self.read_only,
+        }
     }
 }
 
-/// Creates the instance's declared volumes (idempotent, labelled `weglarka.instance`).
-pub async fn ensure_volumes<P: PodmanClient>(
-    podman: &P,
-    instance: &InstanceName,
-    spec: &AppSpec,
-) -> Result<()> {
-    for v in &spec.volumes {
-        podman
-            .volume_create(&volume_spec(instance, &v.name))
-            .await?;
+/// Every volume the spec mounts: its private volumes first, then the shared volumes.
+pub fn mounts<'a>(
+    instance: &'a InstanceName,
+    spec: &'a AppSpec,
+) -> impl Iterator<Item = VolumeMount<'a>> {
+    let private = spec.volumes.iter().map(move |v| VolumeMount {
+        volume: VolumeRef::Private {
+            instance,
+            name: &v.name,
+        },
+        target: &v.target,
+        read_only: v.read_only,
+    });
+    let shared = spec.shared_volumes.iter().map(|v| VolumeMount {
+        volume: VolumeRef::Shared(&v.name),
+        target: &v.target,
+        read_only: v.read_only,
+    });
+    private.chain(shared)
+}
+
+/// The mount the spec addresses as `volume` ([`VolumeRef::name`]); a private volume wins over a
+/// shared volume of the same name.
+pub fn find_mount<'a>(
+    instance: &'a InstanceName,
+    spec: &'a AppSpec,
+    volume: &str,
+) -> Option<VolumeMount<'a>> {
+    mounts(instance, spec).find(|m| m.volume.name() == volume)
+}
+
+/// The `weglarka.instance` label map: on the instance's private volumes and in the filters that
+/// find them.
+fn instance_labels(instance: &InstanceName) -> BTreeMap<String, String> {
+    BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())])
+}
+
+/// Filter for the instance's private volumes (shared volumes never carry the instance label).
+fn instance_volumes(instance: &InstanceName) -> VolumeFilter {
+    VolumeFilter {
+        labels: instance_labels(instance),
     }
-    Ok(())
 }
 
 /// Group recorded on an existing shared volume: the [`labels::SHARED_GROUP`] label, or — for a
@@ -160,10 +247,8 @@ pub async fn ensure_shared_volume<P: PodmanClient>(
     name: &SharedVolumeName,
     group: &SharedVolumeName,
 ) -> Result<(), EngineError> {
-    match podman
-        .volume_inspect(&labels::shared_volume_name(name))
-        .await
-    {
+    let podman_name = VolumeRef::Shared(name).podman_name();
+    match podman.volume_inspect(&podman_name).await {
         Ok(info) => {
             let recorded = recorded_group(name, &info.labels);
             if recorded != *group {
@@ -176,38 +261,23 @@ pub async fn ensure_shared_volume<P: PodmanClient>(
             Ok(())
         }
         Err(PodmanError::NotFound(_)) => Ok(podman
-            .volume_create(&shared_volume_spec(name, group))
+            .volume_create(&VolumeSpec {
+                name: podman_name,
+                labels: BTreeMap::from([
+                    (labels::SHARED_VOLUME.to_owned(), name.to_string()),
+                    (labels::SHARED_GROUP.to_owned(), group.to_string()),
+                ]),
+            })
             .await?),
         Err(e) => Err(e.into()),
     }
 }
 
-/// [`ensure_shared_volume`] for every shared volume the spec mounts.
-pub async fn ensure_shared_volumes<P: PodmanClient>(
-    podman: &P,
-    apps: &AppsFile,
-    spec: &AppSpec,
-) -> Result<(), EngineError> {
-    for mount in &spec.shared_volumes {
-        let group = shared_volumes::volume_group(apps, &mount.name);
-        ensure_shared_volume(podman, &mount.name, &group).await?;
-    }
-    Ok(())
-}
-
 /// Container-side mounts for the instance's declared private volumes and shared volumes.
 pub fn attachments(instance: &InstanceName, spec: &AppSpec) -> Vec<VolumeAttachment> {
-    let private = spec.volumes.iter().map(|v| VolumeAttachment {
-        volume: labels::volume_name(instance, &v.name),
-        target: v.target.clone(),
-        read_only: v.read_only,
-    });
-    let shared = spec.shared_volumes.iter().map(|v| VolumeAttachment {
-        volume: labels::shared_volume_name(&v.name),
-        target: v.target.clone(),
-        read_only: v.read_only,
-    });
-    private.chain(shared).collect()
+    mounts(instance, spec)
+        .map(VolumeMount::attachment)
+        .collect()
 }
 
 /// What `launch` adds to the instance's `ContainerSpec`: ownership and volumes.
@@ -381,8 +451,9 @@ impl<P: PodmanClient> Reconciler<P> {
             spec,
         )
         .ok_or_else(|| EngineError::Volume(format!("{instance}: no uid range assigned")))?;
-        ensure_volumes(&self.podman, instance, spec).await?;
-        ensure_shared_volumes(&self.podman, &apps, spec).await?;
+        for mount in mounts(instance, spec) {
+            mount.volume.ensure(&self.podman, &apps).await?;
+        }
         // The caller persists `Prepared.range` as `AppState::effective_uid_range` together with the
         // rest of the deploy state, so the range-change guard still knows the data owner when the
         // container is gone (issue #75).
@@ -448,13 +519,10 @@ impl<P: PodmanClient> Reconciler<P> {
             let keep = if current.uid_range.is_none() && current.effective_uid_range.is_none() {
                 None
             } else {
-                let filter = VolumeFilter {
-                    labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
-                };
                 // Cannot tell → keep: freeing a range that still owns data is the worse error.
                 let has_volumes = self
                     .podman
-                    .volume_list(&filter)
+                    .volume_list(&instance_volumes(&name))
                     .await
                     .map_or(true, |v| !v.is_empty());
                 has_volumes.then_some(AppState {
@@ -567,10 +635,7 @@ impl<P: PodmanClient> Reconciler<P> {
             .container_remove(&labels::container_name(name), true)
             .await
             .ignore_not_found()?;
-        let filter = VolumeFilter {
-            labels: BTreeMap::from([(labels::INSTANCE.to_owned(), name.to_string())]),
-        };
-        for v in self.podman.volume_list(&filter).await? {
+        for v in self.podman.volume_list(&instance_volumes(name)).await? {
             self.podman
                 .volume_remove(&v.name, true)
                 .await
@@ -578,9 +643,8 @@ impl<P: PodmanClient> Reconciler<P> {
         }
         // The last member's purge deletes the shared volume too (the declaration stays).
         for mount in &spec.shared_volumes {
-            let podman_name = labels::shared_volume_name(&mount.name);
             self.podman
-                .volume_remove(&podman_name, true)
+                .volume_remove(&VolumeRef::Shared(&mount.name).podman_name(), true)
                 .await
                 .ignore_not_found()?;
         }
@@ -647,7 +711,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 members,
             });
         }
-        let podman_name = labels::shared_volume_name(name);
+        let podman_name = VolumeRef::Shared(name).podman_name();
         let exists = self.podman.volume_inspect(&podman_name).await.exists()?;
         if exists && !purge {
             return Err(EngineError::SharedVolumeHasData {
@@ -704,10 +768,12 @@ impl<P: PodmanClient> Reconciler<P> {
         if Some(old_label.as_str()) == new_label {
             return Ok(());
         }
-        let filter = VolumeFilter {
-            labels: BTreeMap::from([(labels::INSTANCE.to_owned(), instance.to_string())]),
-        };
-        if self.podman.volume_list(&filter).await?.is_empty() {
+        if self
+            .podman
+            .volume_list(&instance_volumes(instance))
+            .await?
+            .is_empty()
+        {
             return Ok(()); // no private volume data → a range change is safe
         }
         Err(EngineError::RangeChangeWithData {
@@ -783,29 +849,11 @@ impl<P: PodmanClient> Reconciler<P> {
             .cloned()
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
         // The target is either a private volume of the instance or a shared volume it mounts
-        // (issue #33): `(path in the container, Podman volume name, shared volume)`.
-        let (target_path, podman_name, shared) =
-            if let Some(v) = spec.volumes.iter().find(|v| v.name == volume) {
-                (
-                    v.target.clone(),
-                    labels::volume_name(instance, &v.name),
-                    None,
-                )
-            } else if let Some(v) = spec
-                .shared_volumes
-                .iter()
-                .find(|v| v.name.as_str() == volume)
-            {
-                (
-                    v.target.clone(),
-                    labels::shared_volume_name(&v.name),
-                    Some(v.name.clone()),
-                )
-            } else {
-                return Err(EngineError::Volume(format!(
-                    "{instance} declares no volume {volume:?}"
-                )));
-            };
+        // (issue #33).
+        let mount = find_mount(instance, &spec, volume).ok_or_else(|| {
+            EngineError::Volume(format!("{instance} declares no volume {volume:?}"))
+        })?;
+        let podman_name = mount.volume.podman_name();
         let st = state::load_state(&self.paths.state)?;
         let app = st.apps.get(instance);
         let (Some(digest), Some(range)) = (
@@ -818,7 +866,7 @@ impl<P: PodmanClient> Reconciler<P> {
         };
         // A shared volume has several writers: importing while another member runs would write into
         // a live database, and `--replace` would even remove a volume that is still mounted.
-        if let Some(name) = &shared {
+        if let VolumeRef::Shared(name) = mount.volume {
             let mut running = Vec::new();
             for member in shared_volumes::other_members(&apps, instance, name) {
                 let container = labels::container_name(&member);
@@ -838,7 +886,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
             }
         }
-        self.ensure_import_target(instance, &apps, &spec, shared.as_ref())
+        self.ensure_import_target(instance, &apps, &spec, mount.volume)
             .await?;
 
         let app_container = labels::container_name(instance);
@@ -864,7 +912,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 .volume_remove(&podman_name, false)
                 .await
                 .ignore_not_found()?;
-            self.ensure_import_target(instance, &apps, &spec, shared.as_ref())
+            self.ensure_import_target(instance, &apps, &spec, mount.volume)
                 .await?;
         }
         let result = match mode {
@@ -878,7 +926,7 @@ impl<P: PodmanClient> Reconciler<P> {
                     instance,
                     &spec.image,
                     &ImportTarget {
-                        path: target_path.clone(),
+                        path: mount.target.to_owned(),
                         podman_name: podman_name.clone(),
                     },
                     &digest,
@@ -899,20 +947,20 @@ impl<P: PodmanClient> Reconciler<P> {
         result
     }
 
-    /// Creates the volume an import writes into (private or shared), idempotently.
+    /// Creates the volume an import writes into (private or shared), idempotently. A private
+    /// target creates every private volume of the instance, as the deploy would.
     async fn ensure_import_target(
         &self,
         instance: &InstanceName,
         apps: &AppsFile,
         spec: &AppSpec,
-        shared: Option<&SharedVolumeName>,
+        target: VolumeRef<'_>,
     ) -> Result<(), EngineError> {
-        match shared {
-            Some(name) => {
-                let group = shared_volumes::volume_group(apps, name);
-                ensure_shared_volume(&self.podman, name, &group).await?
-            }
-            None => ensure_volumes(&self.podman, instance, spec).await?,
+        if target.is_shared() {
+            return target.ensure(&self.podman, apps).await;
+        }
+        for mount in mounts(instance, spec).filter(|m| !m.volume.is_shared()) {
+            mount.volume.ensure(&self.podman, apps).await?;
         }
         Ok(())
     }
@@ -1486,7 +1534,7 @@ volumes = [{ name = "data", target = "/data" }, { name = "cache", target = "/cac
         let pos = |want: &Call| calls.iter().position(|c| c == want).expect("call made");
         let removed = pos(&Call::ContainerRemove(app.clone()));
         let vol_removed = pos(&Call::VolumeRemove(vol.clone()));
-        // `ensure_volumes` already ran (idempotently) before the removal; look for the re-creation.
+        // `ensure_import_target` already ran (idempotently) before the removal; look for the re-creation.
         let vol_created = vol_removed
             + calls[vol_removed..]
                 .iter()
@@ -1677,6 +1725,84 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
 
     fn shared_name(s: &str) -> SharedVolumeName {
         SharedVolumeName::new(s).unwrap()
+    }
+
+    /// Podman names, labels and attachments are what existing hosts already have: a change here
+    /// orphans their volumes.
+    #[tokio::test]
+    async fn volume_refs_keep_their_podman_names_and_labels() {
+        let apps: AppsFile = toml::from_str(
+            r#"
+[shared_volumes.kajet-data]
+group = "kajet"
+
+[apps.kajet-api]
+image = "ghcr.io/x/szklana:latest"
+volumes = [{ name = "data", target = "/data" }]
+shared_volumes = [{ name = "kajet-data", target = "/shared", read_only = true }]
+"#,
+        )
+        .unwrap();
+        let instance = name("kajet-api");
+        let spec = &apps.apps[&instance];
+        assert_eq!(
+            attachments(&instance, spec),
+            [
+                VolumeAttachment {
+                    volume: "kajet-api.data".into(),
+                    target: "/data".into(),
+                    read_only: false,
+                },
+                VolumeAttachment {
+                    volume: "wg-shared-kajet-data".into(),
+                    target: "/shared".into(),
+                    read_only: true,
+                },
+            ]
+        );
+
+        let fake = FakePodman::new();
+        for mount in mounts(&instance, spec) {
+            mount.volume.ensure(&fake, &apps).await.unwrap();
+        }
+        let created: BTreeMap<String, BTreeMap<String, String>> = fake
+            .volumes()
+            .into_iter()
+            .map(|v| (v.name, v.labels))
+            .collect();
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            created,
+            BTreeMap::from([
+                (
+                    "kajet-api.data".to_owned(),
+                    labels(&[("weglarka.instance", "kajet-api")])
+                ),
+                (
+                    "wg-shared-kajet-data".to_owned(),
+                    labels(&[
+                        ("weglarka.shared-group", "kajet"),
+                        ("weglarka.shared-volume", "kajet-data"),
+                    ])
+                ),
+            ])
+        );
+
+        let shared = shared_name("kajet-data");
+        assert_eq!(
+            find_mount(&instance, spec, "kajet-data").map(|m| m.volume),
+            Some(VolumeRef::Shared(&shared))
+        );
+        assert_eq!(
+            find_mount(&instance, spec, "data").map(|m| (m.volume.podman_name(), m.target)),
+            Some(("kajet-api.data".to_owned(), "/data"))
+        );
+        assert!(find_mount(&instance, spec, "wg-shared-kajet-data").is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1944,8 +2070,7 @@ health = { attempts = 2, window_secs = 2 }
         assert!(e.apps().shared_volumes.contains_key(&volume));
 
         // The volume exists but no member uses it: dropping the declaration needs --purge.
-        e.fake
-            .volume_create(&shared_volume_spec(&volume, &volume))
+        ensure_shared_volume(&e.fake, &volume, &volume)
             .await
             .unwrap();
         assert!(matches!(
