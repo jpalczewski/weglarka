@@ -23,45 +23,59 @@ pub struct InstanceName(String);
 #[error("invalid instance name {0:?}: expected 1-63 chars of [a-z0-9-], no leading/trailing '-'")]
 pub struct InvalidInstanceName(pub String);
 
-impl InstanceName {
-    pub fn new(name: impl Into<String>) -> Result<Self, InvalidInstanceName> {
-        let name = name.into();
-        let ok = (1..=63).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !name.starts_with('-')
-            && !name.ends_with('-');
-        if ok {
-            Ok(Self(name))
-        } else {
-            Err(InvalidInstanceName(name))
+/// `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen: one DNS label. The rule behind every name
+/// that becomes part of a Podman object or host name ([`InstanceName`], [`SharedVolumeName`],
+/// [`SharedNetworkName`], volume names).
+pub fn is_dns_label(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+/// Constructor, `as_str`, serde conversions and `Display` of a newtype over a [`is_dns_label`]
+/// string, with `$error` as the rejection.
+macro_rules! dns_label_name {
+    ($name:ident, $error:ident) => {
+        impl $name {
+            pub fn new(name: impl Into<String>) -> Result<Self, $error> {
+                let name = name.into();
+                if is_dns_label(&name) {
+                    Ok(Self(name))
+                } else {
+                    Err($error(name))
+                }
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
         }
-    }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+        impl TryFrom<String> for $name {
+            type Error = $error;
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
 }
 
-impl TryFrom<String> for InstanceName {
-    type Error = InvalidInstanceName;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<InstanceName> for String {
-    fn from(value: InstanceName) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for InstanceName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+dns_label_name!(InstanceName, InvalidInstanceName);
 
 /// Image digest in the form `sha256:<64 hex>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -247,7 +261,7 @@ pub struct VolumeMount {
 
 /// Volume name within an instance: `[a-z0-9-]`, 1–63 chars, no leading/trailing hyphen.
 pub fn valid_volume_name(name: &str) -> bool {
-    InstanceName::new(name).is_ok()
+    is_dns_label(name)
 }
 
 /// Mount target in the container: an absolute path without `.`/`..` segments, `:` or `,`
@@ -348,45 +362,7 @@ pub struct SharedVolumeName(String);
 )]
 pub struct InvalidSharedVolumeName(pub String);
 
-impl SharedVolumeName {
-    pub fn new(name: impl Into<String>) -> Result<Self, InvalidSharedVolumeName> {
-        let name = name.into();
-        let ok = (1..=63).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !name.starts_with('-')
-            && !name.ends_with('-');
-        if ok {
-            Ok(Self(name))
-        } else {
-            Err(InvalidSharedVolumeName(name))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for SharedVolumeName {
-    type Error = InvalidSharedVolumeName;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<SharedVolumeName> for String {
-    fn from(value: SharedVolumeName) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for SharedVolumeName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+dns_label_name!(SharedVolumeName, InvalidSharedVolumeName);
 
 /// Declaration of a volume shared between instances (issue #33,
 /// `docs/decisions/0017-shared-volumes.md`). It has no options yet: the declaration itself is the
@@ -427,39 +403,7 @@ pub struct SharedNetworkName(String);
 )]
 pub struct InvalidSharedNetworkName(pub String);
 
-impl SharedNetworkName {
-    pub fn new(name: impl Into<String>) -> Result<Self, InvalidSharedNetworkName> {
-        let name = name.into();
-        // The same alphabet as an instance name; reuse it instead of repeating the rule.
-        match InstanceName::new(name.clone()) {
-            Ok(_) => Ok(Self(name)),
-            Err(_) => Err(InvalidSharedNetworkName(name)),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for SharedNetworkName {
-    type Error = InvalidSharedNetworkName;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<SharedNetworkName> for String {
-    fn from(value: SharedNetworkName) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for SharedNetworkName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+dns_label_name!(SharedNetworkName, InvalidSharedNetworkName);
 
 /// Declaration of a network shared by a group of instances (issue #128,
 /// `docs/decisions/0030-shared-networks.md`). It has no options yet: the declaration is the guard
@@ -1480,6 +1424,45 @@ mod tests {
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"x".repeat(64)] {
             assert!(InstanceName::new(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn dns_label_names_share_one_rule_and_keep_their_messages() {
+        for candidate in [
+            "a",
+            "ntfy-zig",
+            "0",
+            &"x".repeat(63),
+            "",
+            "-a",
+            "a-",
+            "A",
+            "a_b",
+        ] {
+            let ok = is_dns_label(candidate);
+            assert_eq!(InstanceName::new(candidate).is_ok(), ok, "{candidate:?}");
+            assert_eq!(
+                SharedVolumeName::new(candidate).is_ok(),
+                ok,
+                "{candidate:?}"
+            );
+            assert_eq!(
+                SharedNetworkName::new(candidate).is_ok(),
+                ok,
+                "{candidate:?}"
+            );
+            assert_eq!(valid_volume_name(candidate), ok, "{candidate:?}");
+        }
+        assert_eq!(
+            SharedVolumeName::new("A").unwrap_err().to_string(),
+            "invalid shared volume name \"A\": expected 1-63 chars of [a-z0-9-], no leading/trailing '-'"
+        );
+        let name: SharedVolumeName = toml::Value::String("data".into()).try_into().unwrap();
+        assert_eq!(
+            (name.as_str(), name.to_string()),
+            ("data", "data".to_owned())
+        );
+        assert_eq!(String::from(name), "data");
     }
 
     #[test]
