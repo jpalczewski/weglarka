@@ -75,7 +75,7 @@ A host binary older than this reporting records nothing, so there the journal me
 
 The first run that can read the state again clears the recorded stop, also when the image is already the running one, so `doctor` returns to `ok` right after step 3 (without `--check`, the next timer run does it once the interval has passed).
 
-**A new `weglarka.toml` key.** The same stop happens without a schema bump when you add a key to `weglarka.toml` that only the running (newer) daemon knows, for example a new `[logs]` option. `weglarka.toml` is parsed strictly (`deny_unknown_fields`, an unknown key is never ignored), so the older host binaries fail before they do anything:
+**A new `weglarka.toml` key.** A similar stop happens without a schema bump, also with host binaries that compare only the schema header, when you add a key to `weglarka.toml` that only the running (newer) daemon knows, for example a new `[logs]` option. `weglarka.toml` is parsed strictly (`deny_unknown_fields`, an unknown key is never ignored), so the older host binaries fail before they do anything:
 
 - both `weglarka-self-update.service` and `weglarka-watchdog.service` fail; their journal shows `invalid …/weglarka.toml: TOML parse error at line N …` followed by `unknown field` and the key's name;
 - `self-update.toml` records the stop with `host_tools_stale = true` — "the host binaries cannot parse weglarka.toml (TOML parse error at line N …: unknown field …)" (the key's name and position, never a config value) — once, not on every watchdog wake-up (issue #617; host binaries older than that record nothing, so only the journal shows it);
