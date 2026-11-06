@@ -259,6 +259,27 @@ pub fn stale_host_tools_message(found: u32, supported: u32) -> String {
     )
 }
 
+/// What the switcher and the watchdog record when the host binaries cannot parse `weglarka.toml`
+/// (issue #617), typically because the operator added a key that only the newer running daemon
+/// knows (`deny_unknown_fields`).
+///
+/// `error` is the TOML parser's message. Only its first line (the position) and an
+/// "unknown field" line (which names a key, never a value) are kept: the source excerpt the parser
+/// prints, and serde's "invalid type: string \"…\"" text, can quote a config value.
+pub fn unparsable_config_message(error: &str) -> String {
+    let mut lines = error.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut cause = lines.next().unwrap_or("parse error").to_owned();
+    if let Some(unknown) = lines.find(|line| line.starts_with("unknown field")) {
+        cause.push_str(": ");
+        cause.push_str(unknown);
+    }
+    format!(
+        "the host binaries cannot parse weglarka.toml ({cause}): if the key is new, install the \
+         host binaries from the same release as the running image (docs/install.md, section \
+         `Host binaries`) and re-run `platform install`; otherwise fix the config"
+    )
+}
+
 impl SelfUpdateState {
     /// The check interval is measured from the last completed check; a missing one is due.
     pub fn is_due(&self, interval: Duration, now: SystemTime) -> bool {
@@ -296,6 +317,21 @@ impl SelfUpdateState {
     ) -> String {
         let message = stale_host_tools_message(found, supported);
         self.record_error(&message, digest, now);
+        if let Some(error) = self.error.as_mut() {
+            error.host_tools_stale = true;
+        }
+        message
+    }
+
+    /// Records a run that stopped because the host binaries cannot parse `weglarka.toml`
+    /// (issue #617), and returns the message.
+    ///
+    /// It reuses the `host_tools_stale` marker: the cause is the same (host binaries older than the
+    /// daemon), `doctor` already fails on it with the fix, and the first run that works again
+    /// clears it ([`Self::clear_stale_host_tools`]). No new field, so the file format is unchanged.
+    pub fn record_unparsable_config(&mut self, error: &str, now: SystemTime) -> String {
+        let message = unparsable_config_message(error);
+        self.record_error(&message, None, now);
         if let Some(error) = self.error.as_mut() {
             error.host_tools_stale = true;
         }
@@ -630,6 +666,39 @@ mod tests {
         save(dir.path(), &plain).unwrap();
         let text = fs::read_to_string(path(dir.path())).unwrap();
         assert!(!text.contains("host_tools_stale"), "{text}");
+    }
+
+    /// Issue #617: an unparsable host config is recorded like stale host tools, and its message
+    /// keeps the key name but no line of the config itself.
+    #[test]
+    fn an_unparsable_config_is_recorded_with_the_marker() {
+        let mut state = SelfUpdateState {
+            checked_at: Some(10),
+            ..SelfUpdateState::default()
+        };
+        let parser = "TOML parse error at line 32, column 1\n   |\n32 | container_driver = \"journald\"\n   | ^^^^^^^^^^^^^^^^\nunknown field `container_driver`, expected `reader`\n";
+        let message = state.record_unparsable_config(parser, at(1_000));
+        assert_eq!(state.checked_at, Some(1_000), "checked_at advances");
+        let error = state.error.clone().expect("the stop is recorded");
+        assert!(error.host_tools_stale);
+        assert_eq!(error.digest, None);
+        assert_eq!(error.message, message);
+        assert!(!message.contains('\n'), "one line: {message}");
+        assert!(message.contains("line 32"), "{message}");
+        assert!(
+            message.contains("unknown field `container_driver`"),
+            "{message}"
+        );
+        assert!(!message.contains("journald"), "no config value: {message}");
+        assert!(message.contains("docs/install.md"), "{message}");
+        assert!(message.contains("platform install"), "{message}");
+
+        // A type error quotes the value on its last line; only the position is kept.
+        let typed = "TOML parse error at line 3, column 8\n  |\n3 | token = 5\n  |         ^\ninvalid type: string \"hunter2\", expected u16\n";
+        assert!(!unparsable_config_message(typed).contains("hunter2"));
+
+        assert!(state.clear_stale_host_tools());
+        assert_eq!(state.error, None);
     }
 
     #[test]

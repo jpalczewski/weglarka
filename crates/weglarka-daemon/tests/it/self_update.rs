@@ -215,6 +215,36 @@ async fn a_switcher_stopped_by_a_newer_state_schema_fails_with_the_fix() {
     running.stop().await;
 }
 
+/// Issue #617: the host binaries could not parse `weglarka.toml` (a key only this daemon knows);
+/// the switcher recorded it with the same marker, so the check fails with the generic hint.
+#[tokio::test]
+async fn a_switcher_stopped_by_an_unparsable_config_fails_with_the_fix() {
+    let env = Env::new(SELF_UPDATE);
+    let mut state = SelfUpdateState::default();
+    state.record_unparsable_config(
+        "invalid /etc/weglarka/weglarka.toml: TOML parse error at line 32, column 1\n   |\n32 | container_driver = \"journald\"\n   | ^^^^\nunknown field `container_driver`, expected `reader`",
+        std::time::SystemTime::now(),
+    );
+    self_update::save(&env.state_dir(), &state).unwrap();
+
+    let running = env.start().await;
+    let report = doctor(&running).await;
+    let su = check(&report, "self_update");
+    assert_eq!(status(su), "fail", "{su}");
+    let message = su["message"].as_str().unwrap();
+    assert!(message.contains("self-update stopped"), "{message}");
+    assert!(message.contains("cannot parse weglarka.toml"), "{message}");
+    assert!(message.contains("container_driver"), "{message}");
+    assert!(!message.contains("journald"), "{message}");
+    let hint = su["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("the host binaries are older than the running daemon"),
+        "{hint}"
+    );
+    assert!(hint.contains("Host binaries"), "{hint}");
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn without_the_section_the_check_says_off() {
     let env = Env::new("");

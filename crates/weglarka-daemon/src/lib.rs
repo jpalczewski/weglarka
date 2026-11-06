@@ -14,6 +14,8 @@ pub mod bootstrap;
 mod candidate;
 pub mod cdn;
 pub mod certificates;
+/// Records a `weglarka.toml` the host binaries cannot parse for `doctor` (issue #617).
+pub mod config_stop;
 pub mod config_view;
 /// Detection of containers whose conmon died while libpod still calls them running (issue #470):
 /// the host-side watchdog records it, `doctor` reports it.

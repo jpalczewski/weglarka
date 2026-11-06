@@ -362,8 +362,9 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     let stale = state
         .checked_at
         .is_none_or(|at| now.saturating_sub(at) > stale_after);
-    // Issue #203: the switcher stopped because the host binaries are older than this daemon, which
-    // already raised the state schema. That is not a timer problem and not a warning: nothing will
+    // Issues #203/#617: the switcher stopped because the host binaries are older than this daemon
+    // (it raised the state schema, or `weglarka.toml` has a key only this daemon knows; the
+    // recorded message says which). That is not a timer problem and not a warning: nothing will
     // update itself until the operator refreshes the host binaries, so the check fails and names
     // the fix instead of leaving "the timer has not run" as the only explanation.
     let host_tools_stale = state.error.as_ref().is_some_and(|e| e.host_tools_stale);
@@ -371,7 +372,7 @@ fn self_update<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         (
             CheckStatus::Fail,
             Some(
-                "install the host binaries from the same release as the running image (docs/install.md, section `Host binaries`) and re-run `platform install` (the launcher setup has no in-place refresh yet); `docs/guides/self-update.md` has the steps",
+                "the host binaries are older than the running daemon — install them from the same release as the running image (docs/install.md, section `Host binaries`) and re-run `platform install` (the launcher setup has no in-place refresh yet); `docs/guides/self-update.md` has the steps",
             ),
         )
     } else if state.error.is_some() {
