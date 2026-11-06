@@ -14,7 +14,7 @@ use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::depends::dependents_of;
 use weglarka_model::events::Event;
 use weglarka_model::labels;
-use weglarka_model::podman::{ContainerState, HealthStatus, PodmanClient, PodmanError};
+use weglarka_model::podman::{ContainerState, PodmanClient, PodmanError};
 use weglarka_model::state::{self, StateFile};
 
 use crate::reconcile::{EngineError, Reconciler};
@@ -134,14 +134,10 @@ impl<P: PodmanClient> Reconciler<P> {
                 None => format!("not running ({:?})", info.state),
             });
         }
-        // Same rule as the deploy health gate: a healthcheck from the spec (health.command) or from
-        // the image must pass; the daemon-side `health.http` is probed through the ingress.
-        if spec.health.command.is_some() || info.health.is_some() {
-            match self.podman.healthcheck_run(&name).await {
-                Ok(HealthStatus::Healthy) => {}
-                Ok(status) => return Err(format!("healthcheck {status:?}")),
-                Err(e) => return Err(format!("healthcheck error: {e}")),
-            }
+        // The deploy health gate's probes, stopping at the first failure: the container
+        // healthcheck, then the daemon-side `health.http` through the ingress.
+        if let Some(result) = self.probe_container(&name, spec, &info).await {
+            result?;
         }
         if let Some(probe) = &spec.health.http {
             self.http_probe(spec, probe).await?;

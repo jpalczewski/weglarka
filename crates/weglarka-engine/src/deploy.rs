@@ -19,8 +19,8 @@ use weglarka_model::hash::{SpecHash, spec_hash, spec_hash_with_secrets};
 use weglarka_model::image_inventory::{OperationId, Owner};
 use weglarka_model::labels;
 use weglarka_model::podman::{
-    BindMount, ContainerSpec, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PodmanError,
-    PodmanResultExt, PortMapping, PullEvent, RestartPolicy, image_repo,
+    BindMount, ContainerInfo, ContainerSpec, ContainerState, HealthStatus, NetworkSpec,
+    PodmanClient, PodmanError, PodmanResultExt, PortMapping, PullEvent, RestartPolicy, image_repo,
 };
 use weglarka_model::state::{self, AppState, FailedDeploy, StateFile};
 use weglarka_model::uid_range::UidRange;
@@ -1119,12 +1119,8 @@ impl<P: PodmanClient> Reconciler<P> {
                 });
             }
             let mut results = Vec::new();
-            if gate.command.is_some() || info.health.is_some() {
-                results.push(match self.podman.healthcheck_run(name).await {
-                    Ok(HealthStatus::Healthy) => Ok(()),
-                    Ok(s) => Err(format!("healthcheck {s:?}")),
-                    Err(e) => Err(format!("healthcheck error: {e}")),
-                });
+            if let Some(result) = self.probe_container(name, spec, &info).await {
+                results.push(result);
             }
             if let Some(probe) = &gate.http {
                 results.push(self.http_probe(spec, probe).await);
@@ -1142,6 +1138,25 @@ impl<P: PodmanClient> Reconciler<P> {
                 "health gate failed after {attempts} attempts: {last}"
             ))
         }
+    }
+
+    /// The container healthcheck, one rule for the deploy health gate and the `depends_on` gate: the
+    /// spec's `health.command` or, absent that, the image's own `HEALTHCHECK` must report healthy.
+    /// `None` when neither declares one. The daemon-side `health.http` is [`Self::http_probe`].
+    pub(crate) async fn probe_container(
+        &self,
+        name: &str,
+        spec: &AppSpec,
+        info: &ContainerInfo,
+    ) -> Option<Result<(), String>> {
+        if spec.health.command.is_none() && info.health.is_none() {
+            return None;
+        }
+        Some(match self.podman.healthcheck_run(name).await {
+            Ok(HealthStatus::Healthy) => Ok(()),
+            Ok(status) => Err(format!("healthcheck {status:?}")),
+            Err(e) => Err(format!("healthcheck error: {e}")),
+        })
     }
 
     pub(crate) async fn http_probe(
