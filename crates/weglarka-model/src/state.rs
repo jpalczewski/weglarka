@@ -2797,6 +2797,28 @@ csp = "default-src 'self'"
         assert!(!text.contains("oauth_resources"), "{text}");
     }
 
+    /// #590: the shared-services gate is part of [`validate_apps`], so a reader and a writer both
+    /// refuse a declaration and a membership, not only the module's own check.
+    #[test]
+    fn shared_services_are_gated_on_load_and_save() {
+        let path = Path::new("apps.toml");
+        for src in [
+            "[shared_services.cache]\nkind = \"redis\"\ninstance = \"cache-redis\"\n\
+             profile = \"cache\"\nmaxmemory = \"64mb\"\n\
+             [apps.cache-redis]\nimage = \"docker.io/library/redis:7.4\"\nauto_update = false\n",
+            "[apps.api]\nimage = \"ghcr.io/example/api:1\"\nshared_services = [\"cache\"]\n",
+        ] {
+            let err = parse_apps(path, src).unwrap_err().to_string();
+            assert!(err.contains(crate::shared_services::GATE), "{err}");
+            let apps: AppsFile = toml::from_str(src).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let err = save_apps(&dir.path().join("apps.toml"), &apps)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(crate::shared_services::GATE), "{err}");
+        }
+    }
+
     #[test]
     fn schema_v23_file_without_shared_services_is_stamped_v24() {
         // #590: v24 adds the optional `[shared_services.<name>]` declarations and
