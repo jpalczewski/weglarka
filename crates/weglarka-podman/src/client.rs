@@ -1,10 +1,13 @@
 //! `LibpodClient` — `PodmanClient` implementation on the libpod API v6.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use futures_core::Stream;
 use futures_util::stream;
 use hyper::Method;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerSpec, ContainerStats, EventFilter, HealthStatus,
     ImageInfo, LoadedImage, LogOptions, LogStream, NetworkInfo, NetworkSpec, NetworkSummary,
@@ -42,37 +45,61 @@ impl LibpodClient {
         }
     }
 
+    /// `GET` with a JSON response body.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        decode(&self.transport.call(Method::GET, path, None).await?)
+    }
+
+    /// A call whose response body does not matter.
+    async fn send(&self, method: Method, path: &str) -> Result<()> {
+        self.transport.call(method, path, None).await?;
+        Ok(())
+    }
+
+    /// `POST` of a create call where a taken name counts as success (idempotent — the trait contract).
+    async fn create_idempotent(&self, path: &str, body: &impl Serialize) -> Result<()> {
+        match self
+            .transport
+            .call_json(Method::POST, path, body)
+            .await
+            .map_err(name_conflict)
+        {
+            Ok(_) | Err(PodmanError::Conflict(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn inspect_container(&self, name: &str) -> Result<ContainerInfo> {
         let path = format!("/containers/{}/json", path_name(name)?);
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        Ok(decode::<InspectContainer>(&body)?.into_domain())
+        Ok(self.get::<InspectContainer>(&path).await?.into_domain())
     }
 }
 
-fn label_filters(labels: &std::collections::BTreeMap<String, String>) -> Option<String> {
+/// Appends `filters={"label":["k=v",...]}` to `path` as the first (`?`) or a further (`&`) query
+/// parameter; nothing when `labels` is empty.
+fn push_label_filters(path: &mut String, labels: &BTreeMap<String, String>) {
     if labels.is_empty() {
-        return None;
+        return;
     }
     let label: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    Some(encode_component(
+    path.push(if path.contains('?') { '&' } else { '?' });
+    path.push_str("filters=");
+    path.push_str(&encode_component(
         &serde_json::json!({ "label": label }).to_string(),
-    ))
+    ));
 }
 
 impl PodmanClient for LibpodClient {
     async fn version(&self) -> Result<VersionInfo> {
-        let body = self.transport.call(Method::GET, "/version", None).await?;
-        Ok(decode::<Version>(&body)?.into_domain())
+        Ok(self.get::<Version>("/version").await?.into_domain())
     }
 
     async fn subuid_pool(&self) -> Result<u64> {
-        let body = self.transport.call(Method::GET, "/info", None).await?;
-        Ok(decode::<Info>(&body)?.subuid_pool())
+        Ok(self.get::<Info>("/info").await?.subuid_pool())
     }
 
     async fn storage_info(&self) -> Result<StorageInfo> {
-        let body = self.transport.call(Method::GET, "/info", None).await?;
-        Ok(decode::<Info>(&body)?.storage())
+        Ok(self.get::<Info>("/info").await?.storage())
     }
 
     async fn container_create(&self, spec: &ContainerSpec) -> Result<String> {
@@ -90,8 +117,7 @@ impl PodmanClient for LibpodClient {
 
     async fn container_start(&self, name: &str) -> Result<()> {
         let path = format!("/containers/{}/start", path_name(name)?);
-        self.transport.call(Method::POST, &path, None).await?;
-        Ok(())
+        self.send(Method::POST, &path).await
     }
 
     async fn container_stop(&self, name: &str, timeout_secs: u32) -> Result<()> {
@@ -99,14 +125,12 @@ impl PodmanClient for LibpodClient {
             "/containers/{}/stop?timeout={timeout_secs}",
             path_name(name)?
         );
-        self.transport.call(Method::POST, &path, None).await?;
-        Ok(())
+        self.send(Method::POST, &path).await
     }
 
     async fn container_remove(&self, name: &str, force: bool) -> Result<()> {
         let path = format!("/containers/{}?force={force}", path_name(name)?);
-        self.transport.call(Method::DELETE, &path, None).await?;
-        Ok(())
+        self.send(Method::DELETE, &path).await
     }
 
     async fn container_rename(&self, name: &str, new_name: &str) -> Result<()> {
@@ -115,8 +139,7 @@ impl PodmanClient for LibpodClient {
             path_name(name)?,
             encode_component(new_name)
         );
-        self.transport.call(Method::POST, &path, None).await?;
-        Ok(())
+        self.send(Method::POST, &path).await
     }
 
     async fn container_kill(&self, name: &str, signal: &str) -> Result<()> {
@@ -125,8 +148,7 @@ impl PodmanClient for LibpodClient {
             path_name(name)?,
             encode_component(signal)
         );
-        self.transport.call(Method::POST, &path, None).await?;
-        Ok(())
+        self.send(Method::POST, &path).await
     }
 
     async fn container_exec(&self, name: &str, cmd: &[String]) -> Result<i32> {
@@ -146,11 +168,7 @@ impl PodmanClient for LibpodClient {
             )
             .await?;
         for _ in 0..EXEC_POLLS {
-            let body = self
-                .transport
-                .call(Method::GET, &format!("/exec/{id}/json"), None)
-                .await?;
-            let exec = decode::<InspectExec>(&body)?;
+            let exec: InspectExec = self.get(&format!("/exec/{id}/json")).await?;
             if !exec.running {
                 return Ok(exec.exit_code);
             }
@@ -240,12 +258,8 @@ impl PodmanClient for LibpodClient {
 
     async fn container_list(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
         let mut path = String::from("/containers/json?all=true");
-        if let Some(filters) = label_filters(&filter.labels) {
-            path.push_str("&filters=");
-            path.push_str(&filters);
-        }
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        let listed: Vec<ListedContainer> = decode(&body)?;
+        push_label_filters(&mut path, &filter.labels);
+        let listed: Vec<ListedContainer> = self.get(&path).await?;
         // The list carries neither health state nor exit code in a stable form — we fetch them via inspect.
         let mut containers = Vec::with_capacity(listed.len());
         for entry in listed {
@@ -261,11 +275,9 @@ impl PodmanClient for LibpodClient {
 
     async fn container_stats(&self) -> Result<Vec<ContainerStats>> {
         // No `containers=`: libpod answers 404 for the whole call when one named container is unknown.
-        let body = self
-            .transport
-            .call(Method::GET, "/containers/stats?stream=false", None)
-            .await?;
-        decode::<StatsReport>(&body)?.into_domain()
+        self.get::<StatsReport>("/containers/stats?stream=false")
+            .await?
+            .into_domain()
     }
 
     fn image_pull_with(
@@ -289,17 +301,17 @@ impl PodmanClient for LibpodClient {
 
     async fn image_inspect(&self, reference: &str) -> Result<ImageInfo> {
         let path = format!("/images/{}/json", path_name(reference)?);
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        Ok(decode::<InspectImage>(&body)?.into_domain(reference))
+        Ok(self
+            .get::<InspectImage>(&path)
+            .await?
+            .into_domain(reference))
     }
 
     async fn image_list(&self) -> Result<Vec<ImageInfo>> {
         // No `all=true`: intermediate layers are not ours to reason about (docs/decisions/0020).
-        let body = self
-            .transport
-            .call(Method::GET, "/images/json", None)
-            .await?;
-        Ok(decode::<Vec<ListedImage>>(&body)?
+        Ok(self
+            .get::<Vec<ListedImage>>("/images/json")
+            .await?
             .into_iter()
             .map(ListedImage::into_domain)
             .collect())
@@ -312,8 +324,7 @@ impl PodmanClient for LibpodClient {
             encode_component(repo),
             encode_component(tag)
         );
-        self.transport.call(Method::POST, &path, None).await?;
-        Ok(())
+        self.send(Method::POST, &path).await
     }
 
     async fn image_load(&self, tar: TarStream) -> Result<LoadedImage> {
@@ -339,21 +350,12 @@ impl PodmanClient for LibpodClient {
 
     async fn image_remove(&self, reference: &str) -> Result<()> {
         let path = format!("/images/{}", path_name(reference)?);
-        self.transport.call(Method::DELETE, &path, None).await?;
-        Ok(())
+        self.send(Method::DELETE, &path).await
     }
 
     async fn network_create(&self, spec: &NetworkSpec) -> Result<()> {
-        match self
-            .transport
-            .call_json(Method::POST, "/networks/create", &CreateNetwork::new(spec))
+        self.create_idempotent("/networks/create", &CreateNetwork::new(spec))
             .await
-            .map_err(name_conflict)
-        {
-            // Idempotent — the trait contract.
-            Ok(_) | Err(PodmanError::Conflict(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 
     async fn network_connect(&self, network: &str, container: &str) -> Result<()> {
@@ -407,16 +409,13 @@ impl PodmanClient for LibpodClient {
 
     async fn network_inspect(&self, name: &str) -> Result<NetworkInfo> {
         let path = format!("/networks/{}/json", path_name(name)?);
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        Ok(decode::<InspectNetwork>(&body)?.into_domain())
+        Ok(self.get::<InspectNetwork>(&path).await?.into_domain())
     }
 
     async fn network_list(&self) -> Result<Vec<NetworkSummary>> {
-        let body = self
-            .transport
-            .call(Method::GET, "/networks/json", None)
-            .await?;
-        Ok(decode::<Vec<ListedNetwork>>(&body)?
+        Ok(self
+            .get::<Vec<ListedNetwork>>("/networks/json")
+            .await?
             .into_iter()
             .map(ListedNetwork::into_domain)
             .collect())
@@ -455,37 +454,23 @@ impl PodmanClient for LibpodClient {
 
     async fn secret_remove(&self, name: &str) -> Result<()> {
         let path = format!("/secrets/{}", path_name(name)?);
-        self.transport.call(Method::DELETE, &path, None).await?;
-        Ok(())
+        self.send(Method::DELETE, &path).await
     }
 
     async fn volume_create(&self, spec: &VolumeSpec) -> Result<()> {
-        match self
-            .transport
-            .call_json(Method::POST, "/volumes/create", &CreateVolume::new(spec))
+        self.create_idempotent("/volumes/create", &CreateVolume::new(spec))
             .await
-            .map_err(name_conflict)
-        {
-            // Idempotent — the trait contract.
-            Ok(_) | Err(PodmanError::Conflict(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 
     async fn volume_inspect(&self, name: &str) -> Result<VolumeInfo> {
         let path = format!("/volumes/{}/json", path_name(name)?);
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        Ok(decode::<WireVolume>(&body)?.into_domain())
+        Ok(self.get::<WireVolume>(&path).await?.into_domain())
     }
 
     async fn volume_list(&self, filter: &VolumeFilter) -> Result<Vec<VolumeInfo>> {
         let mut path = String::from("/volumes/json");
-        if let Some(filters) = label_filters(&filter.labels) {
-            path.push_str("?filters=");
-            path.push_str(&filters);
-        }
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        let volumes: Vec<WireVolume> = decode(&body)?;
+        push_label_filters(&mut path, &filter.labels);
+        let volumes: Vec<WireVolume> = self.get(&path).await?;
         Ok(volumes.into_iter().map(WireVolume::into_domain).collect())
     }
 
@@ -509,14 +494,12 @@ impl PodmanClient for LibpodClient {
 
     async fn volume_remove(&self, name: &str, force: bool) -> Result<()> {
         let path = format!("/volumes/{}?force={force}", path_name(name)?);
-        self.transport.call(Method::DELETE, &path, None).await?;
-        Ok(())
+        self.send(Method::DELETE, &path).await
     }
 
     async fn healthcheck_run(&self, container: &str) -> Result<HealthStatus> {
         let path = format!("/containers/{}/healthcheck", path_name(container)?);
-        let body = self.transport.call(Method::GET, &path, None).await?;
-        let report: HealthReport = decode(&body)?;
+        let report: HealthReport = self.get(&path).await?;
         health_status(&report.status).ok_or_else(|| {
             PodmanError::Protocol(format!("unknown health status {:?}", report.status))
         })
@@ -524,10 +507,7 @@ impl PodmanClient for LibpodClient {
 
     fn events(&self, filter: &EventFilter) -> impl Stream<Item = Result<PodmanEvent>> + Send {
         let mut path = String::from("/events?stream=true");
-        if let Some(filters) = label_filters(&filter.labels) {
-            path.push_str("&filters=");
-            path.push_str(&filters);
-        }
+        push_label_filters(&mut path, &filter.labels);
         if let Some(since) = filter.since {
             path.push_str(&format!("&since={since}"));
         }
@@ -641,5 +621,33 @@ impl EventsState {
             // The event stream should never end — for the caller that means a lost connection.
             None => Err(PodmanError::Unreachable("event stream closed".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire form of a label filter is pinned byte for byte: `?` opens the query, `&` extends it.
+    #[test]
+    fn label_filters_extend_or_open_the_query() {
+        let labels = BTreeMap::from([
+            ("weglarka.instance".to_owned(), "ntfy".to_owned()),
+            ("weglarka.role".to_owned(), "app".to_owned()),
+        ]);
+        let encoded =
+            "%7B%22label%22%3A%5B%22weglarka.instance%3Dntfy%22%2C%22weglarka.role%3Dapp%22%5D%7D";
+
+        let mut path = String::from("/containers/json?all=true");
+        push_label_filters(&mut path, &labels);
+        assert_eq!(path, format!("/containers/json?all=true&filters={encoded}"));
+
+        let mut path = String::from("/volumes/json");
+        push_label_filters(&mut path, &labels);
+        assert_eq!(path, format!("/volumes/json?filters={encoded}"));
+
+        let mut path = String::from("/volumes/json");
+        push_label_filters(&mut path, &BTreeMap::new());
+        assert_eq!(path, "/volumes/json");
     }
 }
