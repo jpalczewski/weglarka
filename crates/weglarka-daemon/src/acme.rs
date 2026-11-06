@@ -24,6 +24,7 @@ use weglarka_model::config::{
     AcmeConfig, AcmeDnsConfig, CertChoice, DnsProviderKind, WILDCARD_CERT_PREFIX,
     choose_certificate, wildcard_covers,
 };
+use weglarka_model::credential::check_at_startup;
 use weglarka_model::events::{Event, EventSink};
 use weglarka_model::secret_store::SecretStore;
 use weglarka_model::state;
@@ -410,8 +411,9 @@ fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
 /// config names (ADR 0079).
 ///
 /// The credential is read once here so that an unusable one is a startup error (ADR 0039: wildcard
-/// certificates are opt-in, but once configured a silent skip would hide a broken deployment); the
-/// adapter then reads it again on every request, so a rotated token needs no restart.
+/// certificates are opt-in, but once configured a silent skip would hide a broken deployment). A
+/// host secret that is not set yet only warns, since only the running daemon can set it; the
+/// adapter reads on every request, so a rotated token needs no restart.
 fn dns_backend(
     config: &AcmeDnsConfig,
     host_store: &Arc<dyn SecretStore>,
@@ -419,8 +421,7 @@ fn dns_backend(
     let source = config
         .credential(host_store)
         .ok_or_else(|| "[acme.dns] set exactly one of token_file / token_secret".to_owned())?;
-    source
-        .read()
+    check_at_startup(source.as_ref())
         .map_err(|error| format!("[acme.dns] {}: {error}", source.describe()))?;
     match config.provider {
         DnsProviderKind::Cloudflare => Cloudflare::new(source)
@@ -938,11 +939,8 @@ mod tests {
         let store = host_store(dir.path());
         let config = dns_config_secret("cf-token");
 
-        let err = dns_backend(&config, &store).unwrap_err();
-        assert!(
-            err.starts_with("[acme.dns] host secret cf-token: "),
-            "{err}"
-        );
+        // Not set yet: a warning, not a startup error (only the running daemon can set it).
+        assert!(dns_backend(&config, &store).is_ok());
 
         store
             .set("cf-token", SecretValue::new("two words"))

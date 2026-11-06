@@ -2708,7 +2708,7 @@ fn host_secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
         d.host
             .acme
             .as_ref()
-            .filter(|a| a.enabled)
+            // A paused `[acme]` still references its secret.
             .and_then(|a| a.dns.as_ref())
             .and_then(|dns| dns.token_secret.as_deref()),
     ]

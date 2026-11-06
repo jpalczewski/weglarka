@@ -72,13 +72,14 @@ pub trait CredentialSource: Send + Sync {
 /// Failure of [`CredentialSource::read`]; never carries the value.
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    #[error("token file: {0}")]
+    // The caller prefixes `describe()`, so the messages carry no source label of their own.
+    #[error(transparent)]
     File(#[from] TokenFileError),
-    #[error("host secret: {0}")]
+    #[error(transparent)]
     Secret(#[from] SecretError),
-    #[error("host secret value {0}")]
+    #[error(transparent)]
     Header(#[from] HeaderTokenError),
-    #[error("no host secret {0:?}")]
+    #[error("is not set (`weglarka secrets host set {0}`)")]
     Missing(String),
 }
 
@@ -147,6 +148,23 @@ impl fmt::Debug for StoreCredential {
         f.debug_struct("StoreCredential")
             .field("name", &self.name)
             .finish()
+    }
+}
+
+/// The startup read of a configured source. A broken one (permissions, shape, unreadable file) is
+/// an error; a host secret that is not set yet only warns: it can be set only through the running
+/// daemon, and the consumer reads it again on use.
+pub fn check_at_startup(source: &dyn CredentialSource) -> Result<(), CredentialError> {
+    match source.read() {
+        Ok(_) => Ok(()),
+        Err(CredentialError::Missing(name)) => {
+            tracing::warn!(
+                credential = %source.describe(),
+                "host secret {name} is not set yet; set it with `weglarka secrets host set {name}`"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
