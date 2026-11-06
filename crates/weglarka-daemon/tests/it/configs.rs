@@ -37,6 +37,14 @@ async fn harness_with_apps(with_config_root: bool, apps: &str) -> Harness {
         "global:\n  scrape_interval: 30s\n",
     )
     .unwrap();
+    // Modes set explicitly, not taken from the umask: doctor warns about a group-writable root.
+    for (path, mode) in [
+        (config_root.clone(), 0o755),
+        (config_root.join("prometheus"), 0o755),
+        (config_root.join(CONFIG_SOURCE), 0o644),
+    ] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
     builder = builder.top_level(&config_root_line(
         with_config_root.then_some(config_root.as_path()),
     ));
