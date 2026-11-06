@@ -148,20 +148,12 @@ fn percent_of_limit(used: Option<u64>, limit: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use weglarka_api::{ApiError, ErrorCode};
-    use weglarka_unix_http::testing::{Mock, mock};
+    use crate::testing::{api_err, mock, overrides};
+    use weglarka_api::ErrorCode;
 
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
-
-    fn overrides(m: &Mock) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        }
-    }
 
     fn full(role: StatsRole) -> ContainerStatsView {
         ContainerStatsView {
@@ -309,11 +301,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unknown_app_is_the_usual_not_found() {
-        let body = serde_json::to_string(&ApiError {
-            code: ErrorCode::NotFound,
-            message: "no such app: nope".into(),
-        })
-        .unwrap();
+        let body = api_err(ErrorCode::NotFound, "no such app: nope");
         let m = mock(move |_, _| (404, body.clone())).await;
         let err = run(
             false,

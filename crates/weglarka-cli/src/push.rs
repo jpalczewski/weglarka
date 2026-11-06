@@ -17,6 +17,7 @@ use hyper::body::Bytes;
 use weglarka_api::{DeployResponse, endpoints};
 
 use crate::cli::DeployArgs;
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client, deploy, instance, report_deploy};
 use crate::error::CliError;
 use crate::settings::Overrides;
@@ -80,9 +81,9 @@ pub async fn run(json: bool, o: &Overrides, a: PushArgs) -> Result<i32, CliError
 
 async fn archive(json: bool, o: &Overrides, a: &PushArgs, path: &PathBuf) -> Result<i32, CliError> {
     let name = instance(&a.app)?;
-    let params = [("name", name.as_str())];
+    let req = ApiRequest::new(endpoints::APPS_PUSH_IMAGE, &[("name", name.as_str())]);
     if a.dry_run {
-        DryRun::new(endpoints::APPS_PUSH_IMAGE, &params, None).print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(crate::error::exit::OK);
     }
     let client = client(o)?;
@@ -101,16 +102,12 @@ async fn archive(json: bool, o: &Overrides, a: &PushArgs, path: &PathBuf) -> Res
             .map_err(|e| CliError::usage(format!("cannot open {}: {e}", path.display())))?;
         chunks(file, counter)
     };
-    let resp: DeployResponse = client
-        .upload_json(endpoints::APPS_PUSH_IMAGE, &params, body)
-        .await?;
+    let resp: DeployResponse = client.upload_json(&req, body).await?;
     Ok(report_deploy(json, &name, &resp))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use clap::Parser;
 
     use super::*;
@@ -125,30 +122,7 @@ mod tests {
         })
     }
 
-    type Seen = Arc<Mutex<Vec<weglarka_unix_http::testing::Seen>>>;
-
-    /// Unix-socket daemon answering every request with `status` and `reply`. The returned guard
-    /// derefs to the socket path and removes the socket on drop.
-    async fn mock(
-        _tag: &str,
-        status: u16,
-        reply: &'static [u8],
-    ) -> (weglarka_unix_http::testing::Mock, Seen) {
-        let m = weglarka_unix_http::testing::mock_with(move |_, _| {
-            weglarka_unix_http::testing::Reply::new(status, Bytes::from_static(reply))
-        })
-        .await;
-        let seen = m.seen.clone();
-        (m, seen)
-    }
-
-    fn overrides(socket: &std::path::Path) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(socket.to_owned()),
-            host: None,
-        }
-    }
+    use crate::testing::{mock_fixed, overrides};
 
     const DEPLOYED: &[u8] = br#"{"outcome":"deployed","generation":2,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
     const ROLLED_BACK: &[u8] = br#"{"outcome":"rolled_back","generation":3,"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
@@ -168,7 +142,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_archive_is_streamed_intact_and_the_outcome_reported() {
-        let (socket, seen) = mock("arc", 200, DEPLOYED).await;
+        let socket = mock_fixed(200, DEPLOYED).await;
+        let seen = socket.seen.clone();
         let file = std::env::temp_dir().join(format!("wgp-{}-in.tar", std::process::id()));
         let payload: Vec<u8> = (0..crate::volumes::CHUNK * 2 + 5)
             .map(|i| (i % 249) as u8)
@@ -192,7 +167,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_rolled_back_push_exits_with_the_rollback_code() {
-        let (socket, _) = mock("rb", 200, ROLLED_BACK).await;
+        let socket = mock_fixed(200, ROLLED_BACK).await;
         let file = std::env::temp_dir().join(format!("wgp-{}-rb.tar", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
         let code = run(
@@ -210,7 +185,7 @@ mod tests {
     async fn a_daemon_error_is_reported_and_a_missing_file_is_a_usage_error() {
         let body: &'static [u8] =
             br#"{"code":"invalid_request","message":"cannot load the image archive: x"}"#;
-        let (socket, _) = mock("bad", 400, body).await;
+        let socket = mock_fixed(400, body).await;
         let file = std::env::temp_dir().join(format!("wgp-{}-bad.tar", std::process::id()));
         std::fs::write(&file, b"junk").unwrap();
         let args = || parse(&["push", "app", file.to_str().unwrap()]).unwrap();
@@ -230,7 +205,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_image_reference_goes_through_deploy_and_static_is_refused() {
-        let (socket, seen) = mock("img", 200, DEPLOYED).await;
+        let socket = mock_fixed(200, DEPLOYED).await;
+        let seen = socket.seen.clone();
         run(
             true,
             &overrides(&socket),
@@ -263,7 +239,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dry_run_sends_nothing() {
-        let (socket, seen) = mock("dry", 200, DEPLOYED).await;
+        let socket = mock_fixed(200, DEPLOYED).await;
+        let seen = socket.seen.clone();
         let code = run(
             true,
             &overrides(&socket),

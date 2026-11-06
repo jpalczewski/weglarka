@@ -10,15 +10,13 @@ use std::time::Duration;
 
 use clap::Args;
 use http_body_util::Full;
-use hyper::Request;
 use hyper::body::Bytes;
-use hyper::header::CONTENT_TYPE;
 use weglarka_api::{
     FORWARD_STREAM_CONTENT_TYPE, ForwardFrame, ForwardFrameDecoder, ForwardRequest, endpoints,
 };
 use weglarka_unix_http::StreamingResponse;
 
-use crate::client::{ApiClient, method_str, request_path};
+use crate::client::{ApiClient, ApiRequest, json_body};
 use crate::commands::{client, instance};
 use crate::error::CliError;
 use crate::run::parse_timeout;
@@ -146,14 +144,8 @@ impl ApiClient {
         name: &str,
         request: &ForwardRequest,
     ) -> Result<ForwardStream, CliError> {
-        let payload = serde_json::to_vec(request)
-            .map_err(|e| CliError::internal(format!("cannot encode request: {e}")))?;
-        let req = Request::builder()
-            .method(method_str(endpoints::APPS_FORWARD.method))
-            .uri(request_path(endpoints::APPS_FORWARD, &[("name", name)], ""))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload)))
-            .map_err(|e| CliError::internal(format!("cannot build request: {e}")))?;
+        let req = ApiRequest::new(endpoints::APPS_FORWARD, &[("name", name)])
+            .build(Some("application/json"), Full::new(json_body(request)?))?;
         let response = self
             .open_stream(req, FORWARD_STREAM_CONTENT_TYPE, "forward")
             .await?;

@@ -24,6 +24,8 @@ mod user_config;
 mod volumes;
 
 #[cfg(test)]
+mod testing;
+#[cfg(test)]
 mod tests;
 
 use std::process::ExitCode;

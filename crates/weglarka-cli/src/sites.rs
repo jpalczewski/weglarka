@@ -13,6 +13,7 @@ use weglarka_api::{
 use weglarka_model::app::{AppKind, Digest};
 use weglarka_model::environments::{EnvName, SiteName, SiteSpec};
 
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client, report_deploy};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
@@ -227,7 +228,11 @@ async fn declare(json: bool, o: &Overrides, a: DeclareArgs) -> Result<i32, CliEr
     let params = [("site", name.as_str())];
     if a.dry_run {
         let body = serde_json::to_value(&req).map_err(|e| CliError::internal(e.to_string()))?;
-        DryRun::new(endpoints::SITES_DECLARE, &params, Some(body)).print(json);
+        DryRun::new(
+            &ApiRequest::new(endpoints::SITES_DECLARE, &params),
+            Some(body),
+        )
+        .print(json);
         return Ok(exit::OK);
     }
     client(o)?
@@ -250,15 +255,13 @@ async fn declare(json: bool, o: &Overrides, a: DeclareArgs) -> Result<i32, CliEr
 async fn remove(json: bool, o: &Overrides, a: RemoveArgs) -> Result<i32, CliError> {
     let name = site_name(&a.site)?;
     let params = [("site", name.as_str())];
-    let query = if a.purge { "purge=true" } else { "" };
+    let req = ApiRequest::new(endpoints::SITES_REMOVE, &params).flag("purge", a.purge);
     if a.dry_run {
-        DryRun::new(endpoints::SITES_REMOVE, &params, None)
-            .with_query(query)
-            .print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(exit::OK);
     }
     client(o)?
-        .call_empty_query(endpoints::SITES_REMOVE, &params, query)
+        .request_empty(&req, None::<&()>)
         .await
         .map_err(|e| match e.kind {
             Kind::NotFound => e.with_hint("declared sites: `weglarka sites list`"),

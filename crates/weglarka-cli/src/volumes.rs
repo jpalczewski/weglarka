@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use weglarka_api::{ListSharedVolumesResponse, ListVolumesResponse, endpoints};
 use weglarka_model::app::{InstanceName, SharedVolumeName, valid_volume_name};
 
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client, instance};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
@@ -236,32 +237,18 @@ struct Declared {
 async fn declare(json: bool, o: &Overrides, a: DeclareArgs) -> Result<i32, CliError> {
     let name = shared_volume_name(&a.name)?;
     let group = a.group.as_deref().map(shared_volume_name).transpose()?;
-    let params = [("volume", name.as_str())];
+    let mut req = ApiRequest::new(
+        endpoints::SHARED_VOLUMES_DECLARE,
+        &[("volume", name.as_str())],
+    );
+    if let Some(group) = &group {
+        req = req.query("group", group.as_str());
+    }
     if a.dry_run {
-        let mut dry = DryRun::new(endpoints::SHARED_VOLUMES_DECLARE, &params, None);
-        if let Some(group) = &group {
-            dry.path.push_str(&format!("?group={group}"));
-        }
-        dry.print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(exit::OK);
     }
-    let client = client(o)?;
-    match &group {
-        Some(group) => {
-            client
-                .call_empty_query(
-                    endpoints::SHARED_VOLUMES_DECLARE,
-                    &params,
-                    &format!("group={group}"),
-                )
-                .await?
-        }
-        None => {
-            client
-                .call_empty(endpoints::SHARED_VOLUMES_DECLARE, &params)
-                .await?
-        }
-    }
+    client(o)?.request_empty(&req, None::<&()>).await?;
     let out = Declared {
         declared: name.to_string(),
     };
@@ -280,35 +267,22 @@ struct RemovedShared {
     purged: bool,
 }
 
-/// The request `volumes remove --dry-run` shows; `--purge` is a query parameter, so it is part of
-/// the printed path.
-fn remove_dry_run(name: &str, purge: bool) -> DryRun {
-    let params = [("volume", name)];
-    let mut dry = DryRun::new(endpoints::SHARED_VOLUMES_REMOVE, &params, None);
-    if purge {
-        dry.path.push_str("?purge=true");
-    }
-    dry
+/// `DELETE /v1/volumes/{volume}`; `--purge` is a query parameter.
+fn remove_request(name: &str, purge: bool) -> ApiRequest {
+    ApiRequest::new(endpoints::SHARED_VOLUMES_REMOVE, &[("volume", name)]).flag("purge", purge)
 }
 
 async fn remove(json: bool, o: &Overrides, a: SharedRemoveArgs) -> Result<i32, CliError> {
     let name = shared_volume_name(&a.name)?;
+    let req = remove_request(name.as_str(), a.purge);
     if a.dry_run {
-        remove_dry_run(name.as_str(), a.purge).print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(exit::OK);
     }
-    let params = [("volume", name.as_str())];
-    let client = client(o)?;
-    let result = if a.purge {
-        client
-            .call_empty_query(endpoints::SHARED_VOLUMES_REMOVE, &params, "purge=true")
-            .await
-    } else {
-        client
-            .call_empty(endpoints::SHARED_VOLUMES_REMOVE, &params)
-            .await
-    };
-    result.map_err(|e| shared_volume_error(e, a.purge))?;
+    client(o)?
+        .request_empty(&req, None::<&()>)
+        .await
+        .map_err(|e| shared_volume_error(e, a.purge))?;
     let out = RemovedShared {
         removed: name.to_string(),
         purged: a.purge,
@@ -345,7 +319,10 @@ fn shared_volume_error(e: CliError, purge: bool) -> CliError {
 async fn export(o: &Overrides, a: ExportArgs) -> Result<i32, CliError> {
     let app = instance(&a.app)?;
     let volume = volume(&a.volume)?;
-    let params = [("name", app.as_str()), ("volume", volume)];
+    let req = ApiRequest::new(
+        endpoints::VOLUMES_EXPORT,
+        &[("name", app.as_str()), ("volume", volume)],
+    );
     let client = client(o)?;
     let io = |what: &str, e: std::io::Error| CliError::internal(format!("{what}: {e}"));
     let written = match &a.out {
@@ -353,9 +330,7 @@ async fn export(o: &Overrides, a: ExportArgs) -> Result<i32, CliError> {
             let mut file = tokio::fs::File::create(path)
                 .await
                 .map_err(|e| io(&format!("cannot create {}", path.display()), e))?;
-            let n = client
-                .download(endpoints::VOLUMES_EXPORT, &params, &mut file)
-                .await;
+            let n = client.download(&req, &mut file).await;
             if n.is_err() {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await; // no half-written backup left behind
@@ -367,9 +342,7 @@ async fn export(o: &Overrides, a: ExportArgs) -> Result<i32, CliError> {
                 return Err(CliError::usage("refusing to write a tar to the terminal")
                     .with_hint("redirect the output (`> backup.tar`) or use --out FILE"));
             }
-            client
-                .download(endpoints::VOLUMES_EXPORT, &params, &mut tokio::io::stdout())
-                .await?
+            client.download(&req, &mut tokio::io::stdout()).await?
         }
     };
     // Stdout may carry the tar, so the note goes to stderr.
@@ -393,25 +366,15 @@ struct Imported {
 async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliError> {
     let app = instance(&a.app)?;
     let volume = volume(&a.volume)?;
-    let params = [("name", app.as_str()), ("volume", volume)];
-    let (mut query, mode) = if a.own {
-        (String::new(), "own")
-    } else {
-        ("foreign=true".to_owned(), "foreign")
-    };
-    if a.replace {
-        if !query.is_empty() {
-            query.push('&');
-        }
-        query.push_str("replace=true");
-    }
+    let mode = if a.own { "own" } else { "foreign" };
+    let req = ApiRequest::new(
+        endpoints::VOLUMES_IMPORT,
+        &[("name", app.as_str()), ("volume", volume)],
+    )
+    .flag("foreign", !a.own)
+    .flag("replace", a.replace);
     if a.dry_run {
-        let mut dry = DryRun::new(endpoints::VOLUMES_IMPORT, &params, None);
-        if !query.is_empty() {
-            dry.path.push('?');
-            dry.path.push_str(&query);
-        }
-        dry.print(json);
+        DryRun::new(&req, None).print(json);
         return Ok(exit::OK);
     }
     let client = client(o)?;
@@ -431,9 +394,7 @@ async fn import(json: bool, o: &Overrides, a: ImportArgs) -> Result<i32, CliErro
             chunks(tokio::io::stdin(), counter.clone())
         }
     };
-    client
-        .upload(endpoints::VOLUMES_IMPORT, &params, &query, body)
-        .await?;
+    client.upload(&req, body).await?;
     let out = Imported {
         app: app.to_string(),
         volume: a.volume,
@@ -470,35 +431,10 @@ pub(crate) fn chunks(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::client::ApiClient;
 
-    type Seen = Arc<Mutex<Vec<weglarka_unix_http::testing::Seen>>>;
-
-    /// Unix-socket daemon answering every request with `status` and `reply`. The returned guard
-    /// derefs to the socket path and removes the socket on drop.
-    async fn mock(
-        _tag: &str,
-        status: u16,
-        reply: &'static [u8],
-    ) -> (weglarka_unix_http::testing::Mock, Seen) {
-        let m = weglarka_unix_http::testing::mock_with(move |_, _| {
-            weglarka_unix_http::testing::Reply::new(status, Bytes::from_static(reply))
-        })
-        .await;
-        let seen = m.seen.clone();
-        (m, seen)
-    }
-
-    fn overrides(socket: &std::path::Path) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(socket.to_owned()),
-            host: None,
-        }
-    }
+    use crate::testing::{mock_fixed, overrides};
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("wgv-{}-{name}", std::process::id()))
@@ -506,7 +442,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn import_streams_a_file_in_foreign_mode_by_default() {
-        let (socket, seen) = mock("imp", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let file = scratch("in.tar");
         let payload: Vec<u8> = (0..CHUNK * 2 + 17).map(|i| (i % 251) as u8).collect();
         std::fs::write(&file, &payload).unwrap();
@@ -550,7 +487,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn export_writes_the_response_body_to_a_file_and_leaves_none_on_error() {
-        let (socket, seen) = mock("exp", 200, b"TAR-BYTES").await;
+        let socket = mock_fixed(200, "TAR-BYTES").await;
+        let seen = socket.seen.clone();
         let out = scratch("out.tar");
         let args = || ExportArgs {
             app: "szklana".into(),
@@ -566,19 +504,20 @@ mod tests {
         let _ = std::fs::remove_file(&out);
 
         let body: &'static [u8] = br#"{"code":"not_found","message":"no such volume"}"#;
-        let (socket, _) = mock("exp404", 404, body).await;
+        let socket = mock_fixed(404, body).await;
         assert!(export(&overrides(&socket), args()).await.is_err());
         assert!(!out.exists(), "no half-written backup");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn purge_flag_goes_into_the_query() {
-        let (socket, seen) = mock("purge", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         ApiClient::new(socket.socket.clone())
-            .call_empty_query(
-                endpoints::APPS_REMOVE,
-                &[("name", "x")],
-                "purge_volumes=true",
+            .request_empty(
+                &ApiRequest::new(endpoints::APPS_REMOVE, &[("name", "x")])
+                    .flag("purge_volumes", true),
+                None::<&()>,
             )
             .await
             .unwrap();
@@ -595,12 +534,10 @@ mod tests {
 
     // ---------- shared volumes (issue #33) ----------
 
-    use weglarka_api::{ApiError, ErrorCode, SharedVolumeSummary, VolumeSummary};
-    use weglarka_model::uid_range::UidRange;
+    use weglarka_api::{ErrorCode, SharedVolumeSummary, VolumeSummary};
 
-    fn leaked(s: String) -> &'static [u8] {
-        Box::leak(s.into_bytes().into_boxed_slice())
-    }
+    use crate::testing::api_err;
+    use weglarka_model::uid_range::UidRange;
 
     fn shared_resp() -> ListSharedVolumesResponse {
         let name = |s: &str| SharedVolumeName::new(s).unwrap();
@@ -634,8 +571,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn list_without_an_app_requests_the_shared_volumes() {
-        let body = leaked(serde_json::to_string(&shared_resp()).unwrap());
-        let (socket, seen) = mock("slist", 200, body).await;
+        let body = serde_json::to_string(&shared_resp()).unwrap();
+        let socket = mock_fixed(200, body).await;
+        let seen = socket.seen.clone();
         assert_eq!(
             list(true, &overrides(&socket), None).await.unwrap(),
             exit::OK
@@ -649,8 +587,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn list_with_an_app_requests_its_volumes() {
-        let body = leaked(serde_json::to_string(&ListVolumesResponse { volumes: vec![] }).unwrap());
-        let (socket, seen) = mock("alist", 200, body).await;
+        let body = serde_json::to_string(&ListVolumesResponse { volumes: vec![] }).unwrap();
+        let socket = mock_fixed(200, body).await;
+        let seen = socket.seen.clone();
         assert_eq!(
             list(true, &overrides(&socket), Some("kajet-api"))
                 .await
@@ -718,7 +657,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_declares_a_shared_volume_and_dry_run_sends_nothing() {
-        let (socket, seen) = mock("sadd", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         declare(
             true,
@@ -757,7 +697,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_with_a_group_sends_it_as_a_query_parameter() {
-        let (socket, seen) = mock("sgrp", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         declare(
             true,
@@ -793,7 +734,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_sends_purge_only_when_asked() {
-        let (socket, seen) = mock("srm", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         for purge in [false, true] {
             remove(
@@ -821,7 +763,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_dry_run_shows_the_query_and_sends_nothing() {
-        let (socket, seen) = mock("srmdry", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         remove(
             true,
             &overrides(&socket),
@@ -835,18 +778,19 @@ mod tests {
         .unwrap();
         assert!(seen.lock().unwrap().is_empty(), "--dry-run sends nothing");
         assert_eq!(
-            remove_dry_run("kajet-data", false).path,
+            remove_request("kajet-data", false).target(),
             "/v1/volumes/kajet-data"
         );
         assert_eq!(
-            remove_dry_run("kajet-data", true).path,
+            remove_request("kajet-data", true).target(),
             "/v1/volumes/kajet-data?purge=true"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_shared_volume_names_are_usage_errors() {
-        let (socket, seen) = mock("sbad", 204, b"").await;
+        let socket = mock_fixed(204, "").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         let err = declare(
             true,
@@ -880,7 +824,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_volume_names_are_usage_errors_and_send_nothing() {
-        let (socket, seen) = mock("bvol", 200, b"TAR-BYTES").await;
+        let socket = mock_fixed(200, "TAR-BYTES").await;
+        let seen = socket.seen.clone();
         let o = overrides(&socket);
         let out = scratch("bvol.tar");
         let _ = std::fs::remove_file(&out);
@@ -931,14 +876,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refusals_keep_the_daemon_message_and_the_exit_code() {
-        let conflict = leaked(
-            serde_json::to_string(&ApiError {
-                code: ErrorCode::Conflict,
-                message: "shared volume \"kajet-data\" is still mounted by: kajet-mcp".into(),
-            })
-            .unwrap(),
+        let conflict = api_err(
+            ErrorCode::Conflict,
+            "shared volume \"kajet-data\" is still mounted by: kajet-mcp",
         );
-        let (socket, _) = mock("srm409", 409, conflict).await;
+        let socket = mock_fixed(409, conflict).await;
         let err = remove(
             true,
             &overrides(&socket),
@@ -954,14 +896,8 @@ mod tests {
         assert!(err.message.contains("kajet-mcp"), "{}", err.message);
         assert!(err.hint.is_some(), "the refusal carries a hint");
 
-        let missing = leaked(
-            serde_json::to_string(&ApiError {
-                code: ErrorCode::NotFound,
-                message: "no such shared volume".into(),
-            })
-            .unwrap(),
-        );
-        let (socket, _) = mock("srm404", 404, missing).await;
+        let missing = api_err(ErrorCode::NotFound, "no such shared volume");
+        let socket = mock_fixed(404, missing).await;
         let err = remove(
             true,
             &overrides(&socket),

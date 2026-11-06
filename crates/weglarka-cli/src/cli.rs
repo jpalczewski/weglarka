@@ -269,15 +269,8 @@ pub struct AddArgs {
         conflicts_with = "spec"
     )]
     pub access_log_skip_paths: Vec<String>,
-    /// Environment variable KEY=VALUE (plain, not secret; repeatable).
-    #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
-    pub env: Vec<(String, String)>,
-    /// Secret as an environment variable: SECRET=VARIABLE.
-    #[arg(long = "secret-env", value_name = "SECRET=VARIABLE", value_parser = parse_pair, conflicts_with = "spec")]
-    pub secret_env: Vec<(String, String)>,
-    /// Secret as a file in the container: SECRET=PATH.
-    #[arg(long = "secret-mount", value_name = "SECRET=PATH", value_parser = parse_pair, conflicts_with = "spec")]
-    pub secret_mount: Vec<(String, String)>,
+    #[command(flatten)]
+    pub env_flags: crate::spec_flags::EnvFlags,
     /// Disable auto-update (the webhook will not swap the image on its own).
     #[arg(long, conflicts_with = "spec")]
     pub no_auto_update: bool,

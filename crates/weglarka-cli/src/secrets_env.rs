@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn env_file_stores_secrets_then_binds_once() {
-        use crate::tests::mock;
+        use crate::testing::{mock, overrides};
         let live: AppSpec = toml::from_str("image = \"i\"\n").unwrap();
         let show = serde_json::json!({
             "name": "web", "spec": live, "state": {}, "runtime": "running",
@@ -465,11 +465,7 @@ mod tests {
             }
         })
         .await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("prod.env");
         std::fs::write(&file, "A=sekret-one\nB=sekret-two\nLEVEL=debug\n").unwrap();

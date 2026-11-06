@@ -17,14 +17,13 @@ use weglarka_api::{
     UpdateAppResponse,
 };
 use weglarka_model::app::{
-    AppIngress, AppSpec, BodySizeLimit, InstanceName, SecretBinding, SecretTarget,
-    SharedVolumeName, valid_volume_name,
+    AppIngress, AppSpec, BodySizeLimit, InstanceName, SharedVolumeName, valid_volume_name,
 };
 use weglarka_model::state::{AppState, FailedDeploy};
 
-use crate::cli::{StartStopArgs, parse_pair};
-use crate::client::{ApiClient, expand_path};
-use crate::commands::{client, instance, render_show};
+use crate::cli::StartStopArgs;
+use crate::client::{ApiClient, ApiRequest};
+use crate::commands::{DryRunRequest, NOTHING_SENT, client, instance, render_show};
 use crate::error::{CliError, exit};
 use crate::output::emit;
 use crate::settings::Overrides;
@@ -111,18 +110,11 @@ pub struct UpdateArgs {
         conflicts_with = "spec"
     )]
     pub remove_access_log_skip_paths: Vec<String>,
-    /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
-    #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
-    pub env: Vec<(String, String)>,
+    #[command(flatten)]
+    pub env_flags: crate::spec_flags::EnvFlags,
     /// Remove an environment variable (repeatable).
     #[arg(long = "unset-env", value_name = "KEY", conflicts_with = "spec")]
     pub unset_env: Vec<String>,
-    /// Bind a secret as an environment variable: SECRET=VARIABLE (replaces a binding of that secret).
-    #[arg(long = "secret-env", value_name = "SECRET=VARIABLE", value_parser = parse_pair, conflicts_with = "spec")]
-    pub secret_env: Vec<(String, String)>,
-    /// Bind a secret as a file in the container: SECRET=PATH (replaces a binding of that secret).
-    #[arg(long = "secret-mount", value_name = "SECRET=PATH", value_parser = parse_pair, conflicts_with = "spec")]
-    pub secret_mount: Vec<(String, String)>,
     /// Remove the binding of a secret (repeatable). The stored value is kept.
     #[arg(long = "unbind-secret", value_name = "SECRET", conflicts_with = "spec")]
     pub unbind_secrets: Vec<String>,
@@ -337,10 +329,8 @@ impl UpdateArgs {
             || self.unset_max_body_size
             || !self.access_log_skip_paths.is_empty()
             || !self.remove_access_log_skip_paths.is_empty()
-            || !self.env.is_empty()
+            || !self.env_flags.is_empty()
             || !self.unset_env.is_empty()
-            || !self.secret_env.is_empty()
-            || !self.secret_mount.is_empty()
             || !self.unbind_secrets.is_empty()
             || !self.remove_volumes.is_empty()
             || !self.remove_shared_volumes.is_empty()
@@ -470,7 +460,7 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
             return Err(missing("env variable", k));
         }
     }
-    spec.env.extend(a.env.iter().cloned());
+    spec.env.extend(a.env_flags.env.iter().cloned());
     for s in &a.unbind_secrets {
         let before = spec.secrets.len();
         spec.secrets.retain(|b| &b.secret != s);
@@ -480,27 +470,9 @@ pub fn apply_flags(mut spec: AppSpec, a: &UpdateArgs) -> Result<AppSpec, CliErro
     }
     // Re-binding replaces the whole binding, so it also resets the mount options (`mode`, `uid`,
     // `gid`) to their defaults — same as before this flag existed, there is no flag for them.
-    let bindings = a
-        .secret_env
-        .iter()
-        .map(|(s, var)| (s, SecretTarget::Env { var: var.clone() }))
-        .chain(a.secret_mount.iter().map(|(s, path)| {
-            (
-                s,
-                SecretTarget::Mount {
-                    path: path.clone(),
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                },
-            )
-        }));
-    for (secret, target) in bindings {
-        spec.secrets.retain(|b| &b.secret != secret);
-        spec.secrets.push(SecretBinding {
-            secret: secret.clone(),
-            target,
-        });
+    for binding in a.env_flags.bindings() {
+        spec.secrets.retain(|b| b.secret != binding.secret);
+        spec.secrets.push(binding);
     }
     for dep in &a.remove_depends_on {
         let before = spec.depends_on.len();
@@ -599,9 +571,8 @@ pub fn spec_diff(old: &AppSpec, new: &AppSpec) -> String {
 
 #[derive(Debug, Serialize)]
 struct UpdateDryRun {
-    dry_run: bool,
-    method: &'static str,
-    path: String,
+    #[serde(flatten)]
+    request: DryRunRequest,
     /// `false` = the new spec equals the current one (a real run would send nothing).
     changed: bool,
     /// `--spec` against a redacted view (a `read` token): the diff compares the file with
@@ -687,39 +658,98 @@ pub(crate) fn ensure_writable(current: &ShowAppResponse) -> Result<(), CliError>
     Ok(())
 }
 
-/// Prints the `PUT /v1/apps/{name}` a real run would send (`--dry-run` of update/start/stop).
-fn emit_update_dry_run(
+/// How a spec write treats `start` turning off (issue #462).
+enum StopGuard {
+    /// `apps update`: the dry run reports the flip, a real run refuses it without `--allow-stop`.
+    Refuse { allow_stop: bool },
+    /// `apps start`/`apps stop`: flipping `start` is the point of the command.
+    Intended,
+}
+
+/// What differs between the spec writes of `apps update` and `apps start`/`apps stop`.
+struct PutSpec<'a> {
+    dry_run: bool,
+    stop_guard: StopGuard,
+    /// The human line when the new spec equals the current one (after `<name>: `).
+    noop: &'a str,
+    wait: &'a WaitArgs,
+}
+
+/// The write half of every read-modify-write of a spec (`apps update/start/stop`): `current` is
+/// what `GET` returned, `new_spec` the edited spec.
+///
+/// The order is deliberate and the same for every command: `--dry-run` first (it always prints
+/// the request, with `changed: false` when nothing would change), then the `start` guard, then
+/// the no-op check (an identical spec is not sent), then the `PUT`, its output (`render` gets
+/// the response and the diff) and the optional `--wait`.
+async fn put_spec(
     json: bool,
-    params: &[(&str, &str)],
-    redacted_base: bool,
-    current: &AppSpec,
-    diff: String,
-    req: UpdateAppRequest,
-    would_stop: bool,
-) {
-    let out = UpdateDryRun {
-        dry_run: true,
-        method: "PUT",
-        path: expand_path(endpoints::APPS_UPDATE, params),
-        changed: !diff.is_empty(),
-        redacted_base,
-        removes_env: removed_env_keys(current, &req.spec),
-        would_stop,
-        diff,
-        body: req,
+    client: &ApiClient,
+    name: &InstanceName,
+    current: ShowAppResponse,
+    new_spec: AppSpec,
+    opts: PutSpec<'_>,
+    render: impl FnOnce(&UpdateAppResponse, &str) -> String,
+) -> Result<i32, CliError> {
+    let params = [("name", name.as_str())];
+    let diff = spec_diff(&current.spec, &new_spec);
+    let stops = match opts.stop_guard {
+        StopGuard::Refuse { .. } => would_stop(&current, &new_spec),
+        StopGuard::Intended => false,
     };
-    // Every caller puts the app name in `params` (it builds the request path).
-    let app = params
-        .iter()
-        .find(|(k, _)| *k == "name")
-        .map_or("", |(_, v)| v);
-    emit(json, &out, || render_dry_run(&out, app));
+    let req = UpdateAppRequest { spec: new_spec };
+    if opts.dry_run {
+        let out = UpdateDryRun {
+            request: DryRunRequest::new(&ApiRequest::new(endpoints::APPS_UPDATE, &params)),
+            changed: !diff.is_empty(),
+            redacted_base: current.redacted,
+            removes_env: removed_env_keys(&current.spec, &req.spec),
+            would_stop: stops,
+            diff,
+            body: req,
+        };
+        emit(json, &out, || render_dry_run(&out, name.as_str()));
+        return Ok(exit::OK);
+    }
+    // Refuse *before* the write: the daemon replaces the spec as a whole and the flip is not part
+    // of the spec hash, so nothing else would hint at the app going down (issue #462).
+    if stops && matches!(opts.stop_guard, StopGuard::Refuse { allow_stop: false }) {
+        return Err(CliError::usage(format!(
+            "this stops {name}: the new spec sets `start = false`"
+        ))
+        .with_hint(format!(
+            "pass `--allow-stop` if that is intended, or stop the app explicitly with `weglarka \
+             apps stop {name}`"
+        )));
+    }
+    if diff.is_empty() {
+        let out = NoChange {
+            changed: false,
+            app: current,
+        };
+        emit(json, &out, || format!("{name}: {}\n", opts.noop));
+        return Ok(exit::OK);
+    }
+    let resp: UpdateAppResponse = client
+        .call(endpoints::APPS_UPDATE, &params, Some(&req))
+        .await?;
+    emit(json, &resp, || render(&resp, &diff));
+    let baseline = current.state.failed.clone();
+    finish_wait(
+        json,
+        client,
+        &params,
+        opts.wait,
+        baseline,
+        deploy_exit(&resp),
+    )
+    .await
 }
 
 /// Human output of `--dry-run`: the request, the spec diff, and the `start` guard a real run would
 /// apply (issue #462).
 fn render_dry_run(out: &UpdateDryRun, app: &str) -> String {
-    let mut s = format!("dry-run: {} {}\n", out.method, out.path);
+    let mut s = out.request.head();
     if out.redacted_base {
         s.push_str(REDACTED_BASE_NOTE);
     }
@@ -737,7 +767,7 @@ fn render_dry_run(out: &UpdateDryRun, app: &str) -> String {
         s.push_str(app);
         s.push_str(" (start: true -> false): a real run is refused without --allow-stop\n");
     }
-    s.push_str("nothing was sent\n");
+    s.push_str(NOTHING_SENT);
     s
 }
 
@@ -760,54 +790,21 @@ pub async fn apps_update(json: bool, o: &Overrides, a: UpdateArgs) -> Result<i32
             apply_flags(current.spec.clone(), &a)?
         }
     };
-    let diff = spec_diff(&current.spec, &new_spec);
-    let stops = would_stop(&current, &new_spec);
-    let req = UpdateAppRequest { spec: new_spec };
-
-    if a.dry_run {
-        emit_update_dry_run(
-            json,
-            &params,
-            current.redacted,
-            &current.spec,
-            diff,
-            req,
-            stops,
-        );
-        return Ok(exit::OK);
-    }
-    // Refuse *before* the write: the daemon replaces the spec as a whole and the flip is not part
-    // of the spec hash, so nothing else would hint at the app going down (issue #462).
-    if stops && !a.allow_stop {
-        return Err(CliError::usage(format!(
-            "this stops {name}: the new spec sets `start = false`"
-        ))
-        .with_hint(format!(
-            "pass `--allow-stop` if that is intended, or stop the app explicitly with `weglarka \
-             apps stop {name}`"
-        )));
-    }
-    if diff.is_empty() {
-        let out = NoChange {
-            changed: false,
-            app: current,
-        };
-        emit(json, &out, || format!("{name}: no changes to the spec\n"));
-        return Ok(exit::OK);
-    }
-
-    let resp: UpdateAppResponse = client
-        .call(endpoints::APPS_UPDATE, &params, Some(&req))
-        .await?;
-    emit(json, &resp, || render_update(&resp, &diff));
-    let baseline = current.state.failed.clone();
-    finish_wait(
+    put_spec(
         json,
         &client,
-        &params,
-        &a.wait,
-        baseline,
-        deploy_exit(&resp),
+        &name,
+        current,
+        new_spec,
+        PutSpec {
+            dry_run: a.dry_run,
+            stop_guard: StopGuard::Refuse {
+                allow_stop: a.allow_stop,
+            },
+            noop: "no changes to the spec",
+            wait: &a.wait,
+        },
+        render_update,
     )
     .await
 }
@@ -904,6 +901,7 @@ pub(crate) fn render_change(
 /// The flip is a spec change like any other (that is why `start` is a field, not a one-shot flag),
 /// so `--json` reuses the `apps update` shapes: `UpdateDryRun`, `UpdateAppResponse`, and
 /// `{"changed":false,"app":…}` when there is nothing to do (the flag already has the target value).
+/// As in `apps update`, `--dry-run` always prints the request (`changed: false` for a no-op).
 async fn set_start(
     json: bool,
     o: &Overrides,
@@ -917,44 +915,31 @@ async fn set_start(
     let client = client(o)?;
     let current = fetch_app(&client, &params).await?;
     ensure_writable(&current)?;
-    if current.spec.start == start {
-        let out = NoChange {
-            changed: false,
-            app: current,
-        };
-        emit(json, &out, || format!("{name}: {noop}\n"));
-        return Ok(exit::OK);
-    }
     let mut new_spec = current.spec.clone();
     new_spec.start = start;
-    let diff = spec_diff(&current.spec, &new_spec);
-    let req = UpdateAppRequest { spec: new_spec };
-    if a.dry_run {
-        // No guard here: `apps start`/`apps stop` are the explicit way to flip `start`, so the
-        // dry run never claims a real run would be refused (`would_stop: false`).
-        emit_update_dry_run(json, &params, false, &current.spec, diff, req, false);
-        return Ok(exit::OK);
-    }
-    let resp: UpdateAppResponse = client
-        .call(endpoints::APPS_UPDATE, &params, Some(&req))
-        .await?;
-    emit(json, &resp, || {
-        render_change(
-            verb,
-            &resp,
-            &diff,
-            "deploy: none (the flag is saved; the daemon deploys on its next reconcile, e.g. once \
-             the missing secrets are set)\n",
-        )
-    });
-    let baseline = current.state.failed.clone();
-    finish_wait(
+    put_spec(
         json,
         &client,
-        &params,
-        &a.wait,
-        baseline,
-        deploy_exit(&resp),
+        &name,
+        current,
+        new_spec,
+        PutSpec {
+            dry_run: a.dry_run,
+            // `apps start`/`apps stop` are the explicit way to flip `start`: no guard, and the dry
+            // run never claims a real run would be refused (`would_stop: false`).
+            stop_guard: StopGuard::Intended,
+            noop,
+            wait: &a.wait,
+        },
+        |resp, diff| {
+            render_change(
+                verb,
+                resp,
+                diff,
+                "deploy: none (the flag is saved; the daemon deploys on its next reconcile, e.g. \
+                 once the missing secrets are set)\n",
+            )
+        },
     )
     .await
 }
@@ -1022,20 +1007,13 @@ pub fn render_waiting(app: &str, state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::mock;
+    use crate::testing::{mock, overrides, show_response, try_update_args};
     use clap::Parser;
     use weglarka_api::DeployResponse;
-    use weglarka_model::app::{InstanceName, SharedVolumeRef, VolumeMount};
+    use weglarka_model::app::{InstanceName, SecretTarget, SharedVolumeRef, VolumeMount};
 
     fn try_args(extra: &[&str]) -> Result<UpdateArgs, clap::Error> {
-        #[derive(Parser)]
-        struct W {
-            #[command(flatten)]
-            a: UpdateArgs,
-        }
-        let mut argv = vec!["w", "ntfy"];
-        argv.extend_from_slice(extra);
-        W::try_parse_from(argv).map(|w| w.a)
+        try_update_args(extra)
     }
 
     fn args(extra: &[&str]) -> UpdateArgs {
@@ -1755,21 +1733,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     }
 
     fn show_with(spec: AppSpec, runtime: RuntimeState) -> String {
-        serde_json::to_string(&ShowAppResponse {
-            name: InstanceName::new("ntfy").unwrap(),
-            spec,
-            state: Default::default(),
-            runtime,
-            configs: None,
-            host_mounts: None,
-            ingress_logs: None,
-            restarts: None,
-            health: None,
-            started_at: None,
-            redacted: false,
-            reconciled: None,
-        })
-        .unwrap()
+        serde_json::to_string(&show_response(spec, runtime)).unwrap()
     }
 
     fn show_json() -> String {
@@ -1917,9 +1881,10 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         assert!(!would_stop(&provisioned, &spec()), "false -> true");
 
         let out = UpdateDryRun {
-            dry_run: true,
-            method: "PUT",
-            path: "/v1/apps/ntfy".into(),
+            request: DryRunRequest::new(&ApiRequest::new(
+                endpoints::APPS_UPDATE,
+                &[("name", "ntfy")],
+            )),
             changed: true,
             redacted_base: false,
             removes_env: Vec::new(),
@@ -1986,11 +1951,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             ),
         })
         .await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let code = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
             .unwrap();
@@ -2019,11 +1980,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         view["redacted"] = true.into();
         let show = view.to_string();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let err = apps_update(true, &o, args(&["--domain", "new.example.eu"]))
             .await
             .unwrap_err();
@@ -2064,11 +2021,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
         view["spec"] = serde_json::to_value(&live).unwrap();
         let show = view.to_string();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("spec.toml");
         std::fs::write(&file, toml::to_string(&spec()).unwrap()).unwrap();
@@ -2101,11 +2054,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             _ => (403, r#"{"error":"forbidden"}"#.to_owned()),
         })
         .await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("spec.toml");
         let mut other = spec();
@@ -2130,14 +2079,6 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
             v[k] = val.clone();
         }
         v.to_string()
-    }
-
-    fn overrides(m: &crate::tests::Mock) -> Overrides {
-        Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        }
     }
 
     async fn settle(
@@ -2245,11 +2186,7 @@ volumes = [{ name = "data", target = "/var/lib/ntfy" }]
     async fn dry_run_and_no_change_send_nothing() {
         let show = show_json();
         let m = mock(move |_, _| (200, show.clone())).await;
-        let o = Overrides {
-            config: None,
-            socket: Some(m.socket.clone()),
-            host: None,
-        };
+        let o = overrides(&m);
         let mut a = args(&["--domain", "new.example.eu"]);
         a.dry_run = true;
         assert_eq!(apps_update(true, &o, a).await.unwrap(), exit::OK);

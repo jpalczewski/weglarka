@@ -7,6 +7,7 @@ use serde::Serialize;
 use weglarka_api::{ListSharedNetworksResponse, endpoints};
 use weglarka_model::app::SharedNetworkName;
 
+use crate::client::ApiRequest;
 use crate::commands::{DryRun, client};
 use crate::error::{CliError, Kind, exit};
 use crate::output::{emit, table};
@@ -95,7 +96,11 @@ async fn declare(json: bool, o: &Overrides, a: NetworkArgs) -> Result<i32, CliEr
     let name = network_name(&a.name)?;
     let params = [("network", name.as_str())];
     if a.dry_run {
-        DryRun::new(endpoints::SHARED_NETWORKS_DECLARE, &params, None).print(json);
+        DryRun::new(
+            &ApiRequest::new(endpoints::SHARED_NETWORKS_DECLARE, &params),
+            None,
+        )
+        .print(json);
         return Ok(exit::OK);
     }
     client(o)?
@@ -122,7 +127,11 @@ async fn remove(json: bool, o: &Overrides, a: NetworkArgs) -> Result<i32, CliErr
     let name = network_name(&a.name)?;
     let params = [("network", name.as_str())];
     if a.dry_run {
-        DryRun::new(endpoints::SHARED_NETWORKS_REMOVE, &params, None).print(json);
+        DryRun::new(
+            &ApiRequest::new(endpoints::SHARED_NETWORKS_REMOVE, &params),
+            None,
+        )
+        .print(json);
         return Ok(exit::OK);
     }
     client(o)?

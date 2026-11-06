@@ -3,11 +3,13 @@
 //! dependencies. Before these existed, they could only be set through `--spec <file.toml>`.
 
 use clap::Args;
+
+use crate::cli::parse_pair;
 use weglarka_model::app::{
-    AppSpec, ConfigMount, CpuLimit, HostMount, HostPort, InstanceName, MemoryLimit,
-    SharedNetworkName, SharedNetworkRef, SharedVolumeName, SharedVolumeRef, VolumeMount,
-    normalize_signal, valid_config_source, valid_group_name, valid_host_source, valid_mount_target,
-    valid_volume_name,
+    AppSpec, ConfigMount, CpuLimit, HostMount, HostPort, InstanceName, MemoryLimit, SecretBinding,
+    SecretTarget, SharedNetworkName, SharedNetworkRef, SharedVolumeName, SharedVolumeRef,
+    VolumeMount, normalize_signal, valid_config_source, valid_group_name, valid_host_source,
+    valid_mount_target, valid_volume_name,
 };
 
 /// Value of a limit flag: a limit, or `none` to drop it (no limit is the default).
@@ -76,6 +78,51 @@ pub enum StrategyFlag {
 pub enum SharedNetworkFlag {
     Join(SharedNetworkRef),
     Leave,
+}
+
+/// Plain `env` and secret-binding flags shared by `apps add` and `apps update`; flattened into
+/// `AddArgs` and `UpdateArgs`.
+#[derive(Debug, Default, Args)]
+pub struct EnvFlags {
+    /// Set an environment variable KEY=VALUE (plain, not secret; repeatable).
+    #[arg(long = "env", value_name = "K=V", value_parser = parse_pair, conflicts_with = "spec")]
+    pub env: Vec<(String, String)>,
+    /// Bind a secret as an environment variable: SECRET=VARIABLE (`apps update` replaces a binding
+    /// of that secret).
+    #[arg(long = "secret-env", value_name = "SECRET=VARIABLE", value_parser = parse_pair, conflicts_with = "spec")]
+    pub secret_env: Vec<(String, String)>,
+    /// Bind a secret as a file in the container: SECRET=PATH (`apps update` replaces a binding of
+    /// that secret).
+    #[arg(long = "secret-mount", value_name = "SECRET=PATH", value_parser = parse_pair, conflicts_with = "spec")]
+    pub secret_mount: Vec<(String, String)>,
+}
+
+impl EnvFlags {
+    pub fn is_empty(&self) -> bool {
+        self.env.is_empty() && self.secret_env.is_empty() && self.secret_mount.is_empty()
+    }
+
+    /// The bindings the flags ask for: `--secret-env` ones first, then `--secret-mount`. A mount
+    /// gets the default options (`mode`, `uid`, `gid`): there is no flag for them.
+    pub fn bindings(&self) -> impl Iterator<Item = SecretBinding> + '_ {
+        let env = self.secret_env.iter().map(|(secret, var)| SecretBinding {
+            secret: secret.clone(),
+            target: SecretTarget::Env { var: var.clone() },
+        });
+        let mount = self
+            .secret_mount
+            .iter()
+            .map(|(secret, path)| SecretBinding {
+                secret: secret.clone(),
+                target: SecretTarget::Mount {
+                    path: path.clone(),
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                },
+            });
+        env.chain(mount)
+    }
 }
 
 /// Spec flags shared by `apps add` and `apps update`; flattened into `AddArgs` and `UpdateArgs`.
