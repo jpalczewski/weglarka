@@ -293,6 +293,8 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let host_secrets = Arc::new(FileSecretStore::host(&paths.host_secrets));
     host_secrets.init()?;
     host_secrets.check_permissions()?;
+    // The same store through the seam its readers hold: the ntfy channel (`token_secret`) today.
+    let host_store: Arc<dyn SecretStore> = host_secrets.clone();
     // Corrupt TOMLs surface immediately rather than at the first reconcile.
     let apps = state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
@@ -327,6 +329,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
     // stops the daemon instead of failing silently at the first deploy.
     let notifier = weglarka_notify::Notifier::build(
         host.notify.as_ref(),
+        &host_store,
         paths.state.apps.clone(),
         paths.notifications.clone(),
     )?;
