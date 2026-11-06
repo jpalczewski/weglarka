@@ -406,6 +406,14 @@ impl IdentityConfig {
             crate::identity::check_upstream(upstream)
                 .map_err(|r| format!("[identity] upstream {upstream:?}: {r}"))?;
         }
+        // Rollout gate (#590): the identity PR of #593 lifts it once the session store is managed.
+        if let Some(name) = &self.session_store {
+            return Err(format!(
+                "[identity] session_store {:?}: {}",
+                name.as_str(),
+                crate::shared_services::GATE
+            ));
+        }
         Ok(())
     }
 }
@@ -2188,6 +2196,40 @@ domain = "weglarka.example.com"
         };
         let cfg = HostConfig::from_toml_str(&src).map_err(|e| e.to_string())?;
         cfg.validate().map(|()| cfg)
+    }
+
+    fn identity_with_session_store(name: &str) -> Result<HostConfig, String> {
+        let src = format!("{SAMPLE}\n{IDENTITY}session_store = \"{name}\"\n");
+        let cfg = HostConfig::from_toml_str(&src).map_err(|e| e.to_string())?;
+        cfg.validate().map(|()| cfg)
+    }
+
+    #[test]
+    fn identity_session_store_parses_but_is_gated() {
+        let error = identity_with_session_store("sessions").unwrap_err();
+        assert!(error.contains(crate::shared_services::GATE), "{error}");
+        assert!(
+            error.contains("[identity] session_store \"sessions\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_session_store_must_be_a_service_name() {
+        let error = identity_with_session_store("Bad_Name").unwrap_err();
+        assert!(error.contains("invalid shared service name"), "{error}");
+    }
+
+    #[test]
+    fn identity_without_session_store_round_trips() {
+        let cfg = HostConfig::from_toml_str(&format!("{SAMPLE}\n{IDENTITY}")).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.identity.as_ref().unwrap().session_store.is_none());
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            !text.contains("session_store"),
+            "an unset session_store stays out of the serialized config: {text}"
+        );
     }
 
     #[test]
