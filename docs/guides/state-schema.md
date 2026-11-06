@@ -6,8 +6,8 @@ It lets an older daemon refuse a file that is newer than it understands instead 
 ## Rules
 
 - **A file without `schema_version` is version 1** — the shape from before versioning. The daemon does not write
-  `schema_version = 1`; the marker appears from the first real bump. **The current version is 23**: a v1 file loads
-  unchanged, and the first ordinary write stamps `schema_version = 23`.
+  `schema_version = 1`; the marker appears from the first real bump. **The current version is 24**: a v1 file loads
+  unchanged, and the first ordinary write stamps `schema_version = 24`.
 - The marker is introduced only in a release that really changes the schema (adds or changes a field of
   `apps.toml`/`state.toml`). Such a version runs a migration on read, and the first ordinary write stamps the new
   number. Each bump has a matching step in `SCHEMA_STEPS` (`crates/weglarka-model/src/state.rs`); a compile-time assert
@@ -60,6 +60,7 @@ write after upgrading stamps the new number even if you do not use the feature.
 | 21 | #497 | optional `[apps.<x>.ingress.security_headers]` (the static table's type) for `kind = "container"` | [0076](../decisions/0076-security-headers-for-container-apps.md) | [security headers](security-headers.md) |
 | 22 | #552 | optional `ingress_logs` in app specs (and `[logs] reader` in `weglarka.toml`) | [0072](../decisions/0072-ingress-log-reader.md) | [ingress log reader](ingress-log-reader.md) |
 | 23 | #215 | optional `ingress.oauth_resources` | [0078](../decisions/0078-oauth-protected-resources.md) | [OAuth-protected resource paths](oauth-resources.md) |
+| 24 | #590 | optional `[shared_services.<name>]` declarations and `shared_services` in app specs (accepted by the parser, every declaration and membership rejected until a later PR lifts the gate) | — | — (not enabled yet) |
 
 Fields introduced before versioning existed (`start`, `depends_on`, `host_ports`, `command`, `shared_volumes`,
 `streaming`) are part of v1 and are not covered by the marker; remove them by hand before downgrading to a release

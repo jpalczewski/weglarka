@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -211,6 +211,14 @@ fn oauth_resources_v23(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v23 → v24: shared services (#590, Redis contract in #593). `AppsFile::shared_services` and
+/// `AppSpec::shared_services` are optional and default empty, so a v23 document needs no data
+/// transformation — the marker records that the file may carry them. A no-op that accepts a
+/// hand-edited file which already has them.
+fn shared_services_v24(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -237,6 +245,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     container_security_headers_v21,
     ingress_log_reader_v22,
     oauth_resources_v23,
+    shared_services_v24,
 ];
 
 const _: () = assert!(
@@ -450,8 +459,8 @@ fn validate_apps_file(apps: &AppsFile) -> Result<(), String> {
 
 /// Every invariant of a whole `apps.toml`: each instance on its own ([`validate_app`]), then the
 /// rules that span the file (identity clients) and across instances (`depends_on`, shared volumes,
-/// shared networks). One list, so a reader ([`parse_apps`]), a writer ([`save_apps`]) and the
-/// daemon's candidate check cannot drift apart.
+/// shared networks, shared services). One list, so a reader ([`parse_apps`]), a writer
+/// ([`save_apps`]) and the daemon's candidate check cannot drift apart.
 pub fn validate_apps(apps: &AppsFile) -> Result<(), String> {
     for (name, spec) in &apps.apps {
         if let Err(message) = validate_app(name, spec) {
@@ -475,6 +484,7 @@ pub fn validate_apps(apps: &AppsFile) -> Result<(), String> {
     crate::depends::validate(apps)?;
     crate::shared_volumes::validate(apps)?;
     crate::shared_networks::validate(apps)?;
+    crate::shared_services::validate(apps)?;
     Ok(())
 }
 
@@ -2785,6 +2795,60 @@ csp = "default-src 'self'"
             "{text}"
         );
         assert!(!text.contains("oauth_resources"), "{text}");
+    }
+
+    #[test]
+    fn schema_v23_file_without_shared_services_is_stamped_v24() {
+        // #590: v24 adds the optional `[shared_services.<name>]` declarations and
+        // `AppSpec::shared_services`. The step is a no-op, so a v23 document loads unchanged and the
+        // first write stamps v24 — and a file without the fields keeps serialising without them.
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 23\n[apps.a]\nimage = \"x:1\"\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(apps.shared_services.is_empty());
+        assert!(apps.apps[&name("a")].shared_services.is_empty());
+        save_apps(&apps_path, &apps).unwrap();
+        assert_eq!(load_apps(&apps_path).unwrap(), apps);
+        let text = fs::read_to_string(&apps_path).unwrap();
+        assert!(
+            text.contains(&format!("schema_version = {SCHEMA_VERSION}")),
+            "{text}"
+        );
+        assert!(!text.contains("shared_services"), "{text}");
+    }
+
+    #[test]
+    fn schema_v23_file_with_empty_shared_services_shape_round_trips() {
+        // #590: the no-op v24 step must also accept a hand-edited v23 file that already carries the
+        // new shape. Empty tables and an empty membership list are the defaults, so they change
+        // nothing — saving drops them again instead of failing.
+        let dir = tempfile::tempdir().unwrap();
+        let apps_path = dir.path().join("apps.toml");
+        fs::write(
+            &apps_path,
+            "schema_version = 23\n[shared_services]\n\n[apps.a]\nimage = \"x:1\"\n\
+             shared_services = []\n",
+        )
+        .unwrap();
+        let apps = load_apps(&apps_path).unwrap();
+        assert_eq!(apps.schema_version, Some(SCHEMA_VERSION));
+        assert!(apps.shared_services.is_empty());
+        assert!(apps.apps[&name("a")].shared_services.is_empty());
+        save_apps(&apps_path, &apps).unwrap();
+        let reloaded = load_apps(&apps_path).unwrap();
+        assert_eq!(reloaded, apps);
+        let text = fs::read_to_string(&apps_path).unwrap();
+        assert!(
+            text.contains(&format!("schema_version = {SCHEMA_VERSION}")),
+            "{text}"
+        );
+        assert!(!text.contains("shared_services"), "{text}");
     }
 
     #[test]
