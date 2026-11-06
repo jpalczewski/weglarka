@@ -2,6 +2,8 @@
 
 use std::future::Future;
 
+use weglarka_model::credential::CredentialError;
+
 use crate::http::HttpError;
 
 /// Opaque reference to a record this provider created, enough to delete exactly that record later
@@ -38,6 +40,14 @@ pub enum DnsError {
     Response(String),
     #[error("DNS API request failed: {0}")]
     Http(#[from] HttpError),
+    /// The API token could not be read from its source; names the source, never the value.
+    /// (`credential` is `CredentialSource::describe()`, so it cannot be named `source`, which
+    /// `thiserror` reads as the wrapped error.)
+    #[error("cannot read the DNS API token ({credential}): {error}")]
+    Credential {
+        credential: String,
+        error: CredentialError,
+    },
 }
 
 /// A DNS host the ACME solver can write challenge records to.
