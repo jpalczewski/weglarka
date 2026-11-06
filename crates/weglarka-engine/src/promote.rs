@@ -194,74 +194,78 @@ impl<P: PodmanClient> Reconciler<P> {
     /// replaced site are dropped from the desired state like a removed app (their releases and state
     /// entries stay until pruned, as for `apps remove`).
     pub async fn declare_site(&self, site: SiteName, spec: SiteSpec) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        // The expanded specs of the declaration being replaced: since #570 a site declares its
-        // `ingress.static` options once and every environment inherits them, so a re-declare can add
-        // a file the releases they serve lack (issue #572).
-        let before: BTreeMap<InstanceName, AppSpec> = apps
-            .origins
-            .iter()
-            .filter(|(_, o)| o.site == site)
-            .filter_map(|(name, _)| Some((name.clone(), apps.apps.get(name)?.clone())))
-            .collect();
-        let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
-        sites.insert(site.clone(), spec);
-        apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
-        // The whole candidate set, so the same rules as `apps add`/`apps update` apply and an error
-        // in a shared site option names the site and environment, not just the expanded instance.
-        state::validate_apps(&apps).map_err(EngineError::PromoteInvalid)?;
-        // The same served-release gate as an ingress-only `apps update` (issue #501): declaring
-        // deploys nothing, so an environment whose release lacks a shared option's file would break
-        // the next ingress reload. A new environment has no stored spec and is deployed first. On
-        // refusal nothing is written. Unlike `apps update`, a changed `image` (a new `track` tag)
-        // is no exemption here: a declare never deploys, so the served release stays the old one.
-        for (instance, origin) in &apps.origins {
-            if origin.site != site {
-                continue;
+        let guard = self.acquire().await;
+        self.mutate_apps(&guard, |apps| {
+            // The expanded specs of the declaration being replaced: since #570 a site declares
+            // its `ingress.static` options once and every environment inherits them, so a
+            // re-declare can add a file the releases they serve lack (issue #572).
+            let before: BTreeMap<InstanceName, AppSpec> = apps
+                .origins
+                .iter()
+                .filter(|(_, o)| o.site == site)
+                .filter_map(|(name, _)| Some((name.clone(), apps.apps.get(name)?.clone())))
+                .collect();
+            let mut sites: BTreeMap<SiteName, SiteSpec> = apps.sites.clone();
+            sites.insert(site.clone(), spec);
+            apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
+            // The whole candidate set, so the same rules as `apps add`/`apps update` apply and an
+            // error in a shared site option names the site and environment, not just the expanded
+            // instance.
+            state::validate_apps(apps).map_err(EngineError::PromoteInvalid)?;
+            // The same served-release gate as an ingress-only `apps update` (issue #501):
+            // declaring deploys nothing, so an environment whose release lacks a shared option's
+            // file would break the next ingress reload. A new environment has no stored spec and
+            // is deployed first. On refusal nothing is written. Unlike `apps update`, a changed
+            // `image` (a new `track` tag) is no exemption here: a declare never deploys, so the
+            // served release stays the old one.
+            for (instance, origin) in &apps.origins {
+                if origin.site != site {
+                    continue;
+                }
+                let (Some(old), Some(new)) = (before.get(instance), apps.apps.get(instance)) else {
+                    continue;
+                };
+                if old.ingress.static_ != new.ingress.static_ {
+                    self.check_served_release(instance, new)
+                        .map_err(|e| with_site_context(e, origin))?;
+                }
             }
-            let (Some(old), Some(new)) = (before.get(instance), apps.apps.get(instance)) else {
-                continue;
-            };
-            if old.ingress.static_ != new.ingress.static_ {
-                self.check_served_release(instance, new)
-                    .map_err(|e| with_site_context(e, origin))?;
-            }
-        }
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+            Ok(())
+        })
     }
 
     /// Removes `site` (`DELETE /v1/sites/{site}`). Refused while any of its environments has a release
     /// unless `purge`, which also forgets their state entries.
     pub async fn remove_site(&self, site: &SiteName, purge: bool) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        if !apps.sites.contains_key(site) {
-            return Err(EngineError::UnknownSite(site.to_string()));
-        }
-        let members: Vec<InstanceName> = apps
-            .origins
-            .iter()
-            .filter(|(_, o)| &o.site == site)
-            .map(|(n, _)| n.clone())
-            .collect();
-        let mut st = state::load_state(&self.paths.state)?;
-        let pinned: Vec<String> = members
-            .iter()
-            .filter(|n| st.apps.get(*n).is_some_and(|s| s.current.is_some()))
-            .map(ToString::to_string)
-            .collect();
-        if !pinned.is_empty() && !purge {
-            return Err(EngineError::PromoteRefused(format!(
-                "site {site} still serves releases in {}; remove it with --purge to drop them",
-                pinned.join(", ")
-            )));
-        }
-        let mut sites = apps.sites.clone();
-        sites.remove(site);
-        apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
-        weglarka_model::depends::validate(&apps).map_err(EngineError::PromoteInvalid)?;
-        state::save_apps(&self.paths.apps, &apps)?;
+        let guard = self.acquire().await;
+        let (members, mut st) = self.mutate_apps(&guard, |apps| {
+            if !apps.sites.contains_key(site) {
+                return Err(EngineError::UnknownSite(site.to_string()));
+            }
+            let members: Vec<InstanceName> = apps
+                .origins
+                .iter()
+                .filter(|(_, o)| &o.site == site)
+                .map(|(n, _)| n.clone())
+                .collect();
+            let st = state::load_state(&self.paths.state)?;
+            let pinned: Vec<String> = members
+                .iter()
+                .filter(|n| st.apps.get(*n).is_some_and(|s| s.current.is_some()))
+                .map(ToString::to_string)
+                .collect();
+            if !pinned.is_empty() && !purge {
+                return Err(EngineError::PromoteRefused(format!(
+                    "site {site} still serves releases in {}; remove it with --purge to drop them",
+                    pinned.join(", ")
+                )));
+            }
+            let mut sites = apps.sites.clone();
+            sites.remove(site);
+            apps.set_sites(sites).map_err(EngineError::PromoteInvalid)?;
+            weglarka_model::depends::validate(apps).map_err(EngineError::PromoteInvalid)?;
+            Ok((members, st))
+        })?;
         if purge {
             let mut changed = false;
             for n in &members {

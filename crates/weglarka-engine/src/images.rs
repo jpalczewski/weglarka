@@ -1612,15 +1612,11 @@ mod tests {
 
     use super::*;
     use crate::reconcile::ReconcilerOptions;
-    use crate::testing::FakePodman;
+    use crate::testing::{FakePodman, digest};
     use weglarka_model::app::InstanceName;
     use weglarka_model::image_inventory::{FORMAT_VERSION, ImageId};
     use weglarka_model::secrets::FileSecretStore;
     use weglarka_model::state::StatePaths;
-
-    fn digest(c: char) -> Digest {
-        Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-    }
 
     fn instance(name: &str) -> InstanceName {
         InstanceName::new(name).unwrap()

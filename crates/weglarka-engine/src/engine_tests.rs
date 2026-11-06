@@ -15,116 +15,21 @@ use crate::reconcile::{
     ReconcilerOptions, RecreateReason, SecretChangePolicy, SitesOptions, Trigger,
 };
 use crate::sites::ExtractLimits;
-use crate::testing::{Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman, StopFailure};
+use crate::testing::{
+    Call, DEFAULT_IMAGE_SIZE_BYTES, FakePodman, Harness, StopFailure, digest, name,
+};
 use crate::volumes::RemoveAppOptions;
 use weglarka_model::app::{Digest, InstanceName};
-use weglarka_model::events::{Event, VecSink};
+use weglarka_model::events::Event;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerState, HealthStatus, NetworkSpec, PodmanClient, PortMapping, RegistryAuth,
 };
 use weglarka_model::secret_store::{SecretError, SecretStore, SecretValue};
-use weglarka_model::secrets::FileSecretStore;
-use weglarka_model::state::{StatePaths, load_state};
+use weglarka_model::state::load_state;
 use weglarka_model::webhook::WebhookEvent;
 
 const IMAGE: &str = "ghcr.io/jpalczewski/ntfy.zig:latest";
-
-fn digest(c: char) -> Digest {
-    Digest::new(format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-}
-
-fn name(s: &str) -> InstanceName {
-    InstanceName::new(s).unwrap()
-}
-
-struct Harness {
-    dir: tempfile::TempDir,
-    fake: FakePodman,
-    store: Arc<FileSecretStore>,
-    sink: Arc<VecSink>,
-    rec: Arc<Reconciler<FakePodman>>,
-}
-
-impl Harness {
-    fn new(apps_toml: &str) -> Self {
-        Self::with_policy(apps_toml, SecretChangePolicy::Immediate)
-    }
-
-    fn with_policy(apps_toml: &str, policy: SecretChangePolicy) -> Self {
-        Self::with_options(
-            apps_toml,
-            ReconcilerOptions {
-                secret_change: policy,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Harness with failure detection enabled at `monitor` (the crash-loop / health scenarios).
-    fn with_monitor(apps_toml: &str, monitor: crash::Policy) -> Self {
-        Self::build(apps_toml, ReconcilerOptions::default(), monitor)
-    }
-
-    /// Harness with explicit reconciler options (e.g. a `config_root`, issue #118).
-    fn with_options(apps_toml: &str, options: ReconcilerOptions) -> Self {
-        Self::build(apps_toml, options, crash::Policy::disabled())
-    }
-
-    fn build(apps_toml: &str, options: ReconcilerOptions, monitor: crash::Policy) -> Self {
-        Self::build_with(apps_toml, options, monitor, None)
-    }
-
-    fn build_with(
-        apps_toml: &str,
-        options: ReconcilerOptions,
-        monitor: crash::Policy,
-        generated: Option<crate::generated::GeneratedWiring>,
-    ) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = StatePaths::in_dir(dir.path());
-        std::fs::write(&paths.apps, apps_toml).unwrap();
-        let fake = FakePodman::new();
-        let store = Arc::new(FileSecretStore::new(dir.path().join("secrets.toml")));
-        let sink = Arc::new(VecSink::default());
-        let secrets: Arc<dyn SecretStore> = store.clone();
-        let mut rec = Reconciler::new(fake.clone(), secrets, paths, options)
-            .with_events(sink.clone())
-            .with_monitor(monitor);
-        if let Some(wiring) = generated {
-            rec = rec.with_generated(wiring);
-        }
-        let rec = Arc::new(rec);
-        Self {
-            dir,
-            fake,
-            store,
-            sink,
-            rec,
-        }
-    }
-
-    fn set_apps(&self, toml: &str) {
-        std::fs::write(&self.rec.paths().apps, toml).unwrap();
-    }
-
-    fn state(&self, inst: &str) -> weglarka_model::state::AppState {
-        load_state(&self.rec.paths().state)
-            .unwrap()
-            .apps
-            .remove(&name(inst))
-            .unwrap_or_default()
-    }
-
-    fn container_digest_ref(&self, cname: &str) -> String {
-        self.fake
-            .containers()
-            .into_iter()
-            .find(|c| c.name == cname)
-            .unwrap()
-            .image
-    }
-}
 
 fn single(report: &ReconcileReport) -> &ActionOutcome {
     assert_eq!(report.actions.len(), 1, "{:?}", report.actions);
@@ -878,13 +783,18 @@ async fn removed_app_is_pruned_with_its_state() {
     let h = Harness::new(NTFY);
     h.fake.set_pull_digest(IMAGE, digest('a'));
     h.rec.reconcile().await.unwrap();
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     let report = h.rec.reconcile().await.unwrap();
     assert_eq!(single(&report), &ActionOutcome::Removed);
     assert!(h.fake.containers().is_empty());
     assert!(load_state(&h.rec.paths().state).unwrap().apps.is_empty());
     assert!(matches!(
-        h.rec.remove_app(&name("ntfy")).await,
+        h.rec
+            .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+            .await,
         Err(crate::reconcile::EngineError::UnknownInstance(_))
     ));
 }
@@ -913,7 +823,10 @@ async fn removed_app_network_is_cleaned_up_but_other_networks_stay() {
             .unwrap();
     }
 
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     h.rec.reconcile().await.unwrap();
     let nets = h.fake.networks();
     assert!(!nets.contains(&"net-ntfy".to_owned()), "{nets:?}");
@@ -1162,7 +1075,10 @@ async fn remove_secret_works_for_an_app_absent_from_apps_toml() {
     );
 
     // Leftovers of a removed app as well (`apps remove` keeps secrets by default).
-    h.rec.remove_app(&name("ntfy")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("ntfy"), RemoveAppOptions::default())
+        .await
+        .unwrap();
     h.rec
         .remove_secret(&name("ntfy"), "token", false)
         .await
@@ -1787,7 +1703,11 @@ async fn replacing_a_running_container_is_not_blocked_by_its_dependency() {
 #[tokio::test(start_paused = true)]
 async fn removing_a_dependency_is_refused() {
     let h = Harness::new(DEPENDS);
-    let err = h.rec.remove_app(&name("db")).await.unwrap_err();
+    let err = h
+        .rec
+        .remove_app_with_purges(&name("db"), RemoveAppOptions::default())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, EngineError::DependencyInUse { dependents, .. }
             if dependents == &vec![name("api")]),
@@ -1796,8 +1716,14 @@ async fn removing_a_dependency_is_refused() {
     let apps = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
     assert!(apps.apps.contains_key(&name("db")), "nothing was removed");
 
-    h.rec.remove_app(&name("api")).await.unwrap();
-    h.rec.remove_app(&name("db")).await.unwrap();
+    h.rec
+        .remove_app_with_purges(&name("api"), RemoveAppOptions::default())
+        .await
+        .unwrap();
+    h.rec
+        .remove_app_with_purges(&name("db"), RemoveAppOptions::default())
+        .await
+        .unwrap();
 }
 
 /// Retention of 1 (issue #40): with `current` and `previous` saved, a successful deploy removes the

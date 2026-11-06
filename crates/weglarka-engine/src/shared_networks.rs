@@ -28,24 +28,25 @@ impl<P: PodmanClient> Reconciler<P> {
     /// Podman network goes with it when nothing is attached; otherwise reconcile removes the empty
     /// network once the last container is gone (best effort, like per-app networks).
     pub async fn remove_shared_network(&self, name: &SharedNetworkName) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        if !apps.shared_networks.contains_key(name) {
-            return Err(EngineError::UnknownSharedNetwork(name.clone()));
-        }
-        let members = members(&apps, name);
-        if !members.is_empty() {
-            return Err(EngineError::SharedNetworkInUse {
-                network: name.clone(),
-                members: members
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            });
-        }
-        apps.shared_networks.remove(name);
-        state::save_apps(&self.paths.apps, &apps)?;
+        let guard = self.acquire().await;
+        self.mutate_apps(&guard, |apps| {
+            if !apps.shared_networks.contains_key(name) {
+                return Err(EngineError::UnknownSharedNetwork(name.clone()));
+            }
+            let members = members(apps, name);
+            if !members.is_empty() {
+                return Err(EngineError::SharedNetworkInUse {
+                    network: name.clone(),
+                    members: members
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+            apps.shared_networks.remove(name);
+            Ok(())
+        })?;
         // Best effort and idempotent: a network still attached (a stopped member that was removed
         // from the spec but whose container lingers) is picked up by `prune_networks` later.
         if let Err(e) = self
