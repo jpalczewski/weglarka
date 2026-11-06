@@ -85,3 +85,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0076](0076-security-headers-for-container-apps.md) | Security headers for container apps |
 | [0077](0077-wildcard-precedence-over-own-pairs.md) | Opt-in wildcard precedence over a domain's own certificate pair |
 | [0078](0078-oauth-protected-resources.md) | OAuth-protected resource paths and generated discovery routes |
+| [0079](0079-host-credentials.md) | Host credentials behind one secret abstraction |
