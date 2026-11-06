@@ -190,6 +190,7 @@ fn notify_view(notify: &NotifyConfig) -> NotifyView {
                 host: _,
                 topic: _,
                 token_file,
+                token_secret: _,
                 min_severity,
             } = ntfy;
             NtfyView {
@@ -255,6 +256,7 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
                 provider,
                 // Path to the DNS API credential.
                 token_file: _,
+                token_secret: _,
                 wildcards,
                 propagation_secs,
                 prefer_wildcard,

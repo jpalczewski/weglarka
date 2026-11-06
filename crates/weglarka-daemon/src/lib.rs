@@ -288,6 +288,11 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let secrets = Arc::new(FileSecretStore::new(&paths.secrets));
     secrets.init()?;
     secrets.check_permissions()?;
+    // Host credentials (ADR 0079): a separate 0600 file with bare `<name>` keys, created lazily
+    // like `secrets.toml` and held for the consumers that read them on use.
+    let host_secrets = Arc::new(FileSecretStore::host(&paths.host_secrets));
+    host_secrets.init()?;
+    host_secrets.check_permissions()?;
     // Corrupt TOMLs surface immediately rather than at the first reconcile.
     let apps = state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
@@ -490,6 +495,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         paths: paths.clone(),
         engine: engine.clone(),
         secrets,
+        host_secrets,
         ingress: ingress.clone(),
         webhook_sources,
         notify: notify.clone(),

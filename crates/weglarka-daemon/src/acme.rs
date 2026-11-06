@@ -421,7 +421,13 @@ fn read_token(path: &Path) -> Result<SecretValue, String> {
 
 /// The provider named by `[acme.dns]`, with its token read from the file.
 fn dns_backend(config: &AcmeDnsConfig) -> Result<DnsBackend, String> {
-    let token = read_token(&config.token_file)?;
+    // `token_secret` (the host store, ADR 0079) is wired in a later task; today only the file form
+    // is read. Validation guarantees exactly one of the two is set.
+    let path = config
+        .token_file
+        .as_ref()
+        .ok_or_else(|| "[acme.dns] token_secret is not read yet".to_owned())?;
+    let token = read_token(path)?;
     match config.provider {
         DnsProviderKind::Cloudflare => Cloudflare::new(&token)
             .map(DnsBackend::Cloudflare)
