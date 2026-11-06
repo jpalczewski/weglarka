@@ -36,8 +36,10 @@ source (path or secret name), never the value.
 
 **Read on use.** The ntfy channel and the DNS provider hold an `Arc<dyn CredentialSource>` instead of the token and
 read it per publication / per DNS-01 order. Rotation is "replace the file or `secrets set --host`", for either
-adapter, without a restart or `SIGHUP`. A source that fails at use is reported like a failed delivery or order; a
-source that fails at startup is still a startup error for `[acme.dns]` (ADR 0039: opt-in, but never a silent skip).
+adapter, without a restart or `SIGHUP`. A source that fails at use is reported like a failed delivery or order. At
+startup both consumers read once: a broken source (permissions, shape, unreadable file) stays a startup error (ADR
+0039: opt-in, but never a silent skip), while a host secret that is **not set yet** only warns — it can be set only
+through the running daemon, so making it fatal would lock the operator out. `doctor` reports it as a failure.
 
 **Host secrets live in their own file, `host-secrets.toml` (0600)**, served by the same `FileSecretStore` code
 parametrised by scope (`SecretScope::App` keeps `<instance>.<name>`; `SecretScope::Host` takes a bare `<name>`
@@ -49,8 +51,9 @@ secrets down with it. `SecretOps` (value-free operations, #213) works over the h
 (exactly one for `[acme.dns]`, at most one for ntfy). `token_file` stays supported as the file adapter; it is
 documented as the older form, not removed (`deny_unknown_fields` makes removal a breaking change).
 
-**Operator surface.** `weglarka secrets set|list|remove --host <name>` over admin-scope endpoints; the list view is
-an allowlist projection (name, fingerprint, `updated_at`). `doctor` gets one `host.credentials` check that walks the
+**Operator surface.** `weglarka secrets host set|list|remove <name>` (`--host` is the global remote flag) over
+`/v1/host/secrets`: writes need the admin scope, the list the read scope like app secrets; the list view is an
+allowlist projection (name, fingerprint, `updated_at`). `doctor` gets one `host.credentials` check that walks the
 configured sources (file permission or store presence and shape), replacing the token part of `acme.dns`.
 
 **Reserved names.** The reserved app secrets (`registry-auth`, `webhook-hmac`, the OIDC pair) move into one table

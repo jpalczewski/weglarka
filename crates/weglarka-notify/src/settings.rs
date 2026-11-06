@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use weglarka_model::config::{NotifyConfig, NtfyConfig};
-use weglarka_model::credential::CredentialError;
+use weglarka_model::credential::{CredentialError, check_at_startup};
 use weglarka_model::events::Severity;
 use weglarka_model::secret_store::SecretStore;
 
@@ -86,15 +86,13 @@ impl NotifySettings {
         }
         let endpoint = Endpoint::parse(&ntfy.url, ntfy.host.as_deref())?;
         let credential = ntfy.credential(host_store);
-        // One eager read, so a broken token is still a startup error (as it was when the token was
-        // read once at startup). Afterwards the channel reads on use, so rotation needs no restart.
+        // A broken token is still a startup error; afterwards the channel reads on use, so rotation
+        // needs no restart (ADR 0079).
         if let Some(source) = &credential {
-            source
-                .read()
-                .map_err(|err| NotifySettingsError::Credential {
-                    origin: source.describe(),
-                    err,
-                })?;
+            check_at_startup(source.as_ref()).map_err(|err| NotifySettingsError::Credential {
+                origin: source.describe(),
+                err,
+            })?;
         }
         NtfyChannel::new(endpoint, topic, credential)
             .map_err(|e| NotifySettingsError::Client(e.to_string()))
@@ -283,16 +281,29 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_host_secret_is_a_startup_error_that_names_no_value() {
+    fn a_host_secret_that_is_not_set_yet_does_not_stop_the_startup() {
+        // It can only be set through the running daemon (ADR 0079).
         let (_dir, store) = host_store();
         let mut ntfy = ntfy();
         ntfy.token_secret = Some("ntfy-token".into());
-        let err = NotifySettings::load(&config(Some(ntfy)), &store).unwrap_err();
         assert!(
-            matches!(err, NotifySettingsError::Credential { .. }),
-            "{err}"
+            NotifySettings::load(&config(Some(ntfy)), &store)
+                .unwrap()
+                .is_some()
         );
+    }
+
+    #[test]
+    fn a_malformed_host_secret_is_a_startup_error_that_names_no_value() {
+        let (_dir, store) = host_store();
+        store
+            .set("ntfy-token", SecretValue::new("two words"))
+            .unwrap();
+        let mut ntfy = ntfy();
+        ntfy.token_secret = Some("ntfy-token".into());
+        let err = NotifySettings::load(&config(Some(ntfy)), &store).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("host secret ntfy-token"), "{text}");
+        assert!(!text.contains("two words"), "{text}");
     }
 }
