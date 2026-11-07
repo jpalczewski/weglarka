@@ -77,6 +77,8 @@ thiserror = "2"
 tar = { version = "0.4", default-features = false }
 # Query-value encoding in the panel's daemon client; already in the graph via url.
 percent-encoding = { version = "2", default-features = false, features = ["alloc"] }
+# Test-only reference for the SCRAM-SHA-256 verifiers of `SecretOps` (#591); never a normal dependency.
+postgres-protocol = { version = "0.6", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # Only to name `url::ParseError` (the type behind `reqwest::Url`); already in the graph via reqwest.
