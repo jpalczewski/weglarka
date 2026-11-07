@@ -3,7 +3,8 @@
 An app with no login of its own (or one you do not trust) can sit behind the identity provider's login. With
 `ingress.auth = "forward"` Węglarka's nginx asks the provider about every request before proxying it
 ([ADR 0052](../decisions/0052-forward-auth.md)). It works the same in `behind` and `edge` mode; the Traefik file is not
-involved.
+involved. For a shared password instead of a login use [basic auth](basic-auth.md): `auth` holds one mode, so an
+instance uses one or the other, never both.
 
 **Prerequisites:** an `[identity]` section in `weglarka.toml` (`issuer`, the provider's `instance`, optional
 `upstream` as `host:port`; it defaults to `<instance>:<port>`), the provider app routed by ingress, and the app's
