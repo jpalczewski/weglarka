@@ -129,6 +129,7 @@ fn read_ingress_auth(auth: IngressAuth) -> IngressAuth {
     match auth {
         IngressAuth::None => IngressAuth::None,
         IngressAuth::Forward => IngressAuth::Forward,
+        IngressAuth::Basic => IngressAuth::Basic,
     }
 }
 
@@ -298,6 +299,9 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy,
         auth_groups,
         auth_exempt_paths,
+        // A secret **name**: the `user:password` lines live in the instance's secrets (ADR 0081), so
+        // the name is a reference and safe to show, like `secret` in a binding.
+        auth_secret,
         // #215, ADR 0078: `paths` syntax, so the list carries no credential either; S3 of #215 adds
         // it to the CLI and the docs, the projection already carries it.
         oauth_resources,
@@ -317,6 +321,7 @@ fn read_ingress(ingress: AppIngress) -> AppIngress {
         auth_policy: auth_policy.map(read_authorization_policy),
         auth_groups,
         auth_exempt_paths,
+        auth_secret,
         oauth_resources,
         static_: static_.map(read_static_ingress),
         // Same type, same reasoning as the static table: a rendering setting, never a credential,

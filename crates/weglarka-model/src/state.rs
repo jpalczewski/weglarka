@@ -32,7 +32,7 @@ use crate::uid_range::UidRange;
 /// matching entry to [`SCHEMA_STEPS`] — the assertion below refuses to compile until the two agree.
 /// A daemon older than the file refuses to start with [`StateError::SchemaTooNew`] instead of
 /// misreading it as a pile of unknown fields.
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// Version of a file written before versioning. It stays v1 on purpose: stamping
 /// `schema_version = 1` today would make a downgrade to a daemon that predates versioning fail —
@@ -219,6 +219,15 @@ fn shared_services_v24(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// v24 → v25: HTTP Basic auth in the ingress (issue #169, ADR 0081). `AppIngress::auth = "basic"`,
+/// `AppIngress::auth_secret` and the `auth`/`auth_secret`/`auth_exempt_paths` of a site environment
+/// are optional and default unset, so a v24 document needs no data transformation — the marker
+/// records that the file may carry them. A no-op that accepts a hand-edited file which already has
+/// them.
+fn ingress_basic_auth_v25(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// One step per version: `SCHEMA_STEPS[i]` upgrades `IMPLICIT_SCHEMA_VERSION + i` to the next one.
 /// A step must tolerate data that was already migrated (a hand-edited file may carry the fields of
 /// a newer schema without the marker).
@@ -246,6 +255,7 @@ const SCHEMA_STEPS: &[SchemaStep] = &[
     ingress_log_reader_v22,
     oauth_resources_v23,
     shared_services_v24,
+    ingress_basic_auth_v25,
 ];
 
 const _: () = assert!(
@@ -570,7 +580,9 @@ fn validate_static(name: &InstanceName, spec: &AppSpec) -> Result<(), String> {
 }
 
 /// The allowlist of `AppIngress` fields a static site may set (#104, ADR 0069): everything else
-/// configures a proxy to a container, which a directory backend has none of.
+/// configures a proxy to a container, which a directory backend has none of. The one exception is
+/// the auth family (ADR 0081): a directory backend is protected by its own locations, and the
+/// credentials live in a secret, so `auth`, `auth_secret` and `auth_exempt_paths` are allowed.
 fn validate_static_ingress_allowlist(
     name: &InstanceName,
     ingress: &AppIngress,
@@ -587,7 +599,12 @@ fn validate_static_ingress_allowlist(
         auth,
         auth_policy,
         auth_groups,
-        auth_exempt_paths,
+        // Accepted on a static site (ADR 0081): the files themselves are protected, and an exempt
+        // path is a location without auth, exactly as for a container app.
+        auth_exempt_paths: _,
+        // A secret **name**: the credential lines stay in the instance's secrets, and `basic` renders
+        // from them like it does for a container app (ADR 0081).
+        auth_secret: _,
         // A container app's own token checks, which a directory backend has none of (#215, ADR 0078).
         oauth_resources,
         // Validated separately, by `validate_static_ingress_values`.
@@ -604,12 +621,15 @@ fn validate_static_ingress_allowlist(
         ("ingress.strip_prefix", *strip_prefix),
         ("ingress.max_body_size", max_body_size.is_some()),
         ("ingress.streaming_paths", !streaming_paths.is_empty()),
-        // Forward auth on a static site is #169's territory (`identity.rs` already rejects it); this
-        // allowlist rejects it too so the rule holds even if that check ever moved or were removed.
-        ("ingress.auth", *auth != crate::identity::IngressAuth::None),
+        // `basic` is not a proxy feature (ADR 0081); forward auth on a static site is #169/#638's
+        // territory (`identity.rs` already rejects it), and this allowlist rejects it too so the rule
+        // holds even if that check ever moved or were removed.
+        (
+            "ingress.auth = \"forward\"",
+            *auth == crate::identity::IngressAuth::Forward,
+        ),
         ("ingress.auth_policy", auth_policy.is_some()),
         ("ingress.auth_groups", !auth_groups.is_empty()),
-        ("ingress.auth_exempt_paths", !auth_exempt_paths.is_empty()),
         ("ingress.oauth_resources", !oauth_resources.is_empty()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, set)| *set) {
@@ -2436,10 +2456,6 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
                 "ingress.auth_groups",
             ),
             (
-                "ingress = { auth_exempt_paths = [\"/x\"] }",
-                "ingress.auth_exempt_paths",
-            ),
-            (
                 "ingress = { oauth_resources = [\"/mcp\"] }",
                 "ingress.oauth_resources",
             ),
@@ -2467,6 +2483,27 @@ shared_volumes = [{ name = "kajet-data", target = "/data", read_only = true }]
             .is_ok()
         );
         assert!(validate_app(&name("a"), &spec("ingress.static = { clean_urls = true }")).is_ok());
+    }
+
+    /// ADR 0081: a static site takes `auth = "basic"`, `auth_secret` and `auth_exempt_paths` (the
+    /// credentials themselves stay in the instance's secret); only the forward-auth fields stay out.
+    #[test]
+    fn static_sites_accept_basic_auth() {
+        let basic = crate::app::AppIngress {
+            auth: crate::identity::IngressAuth::Basic,
+            auth_secret: Some("basic-auth".to_owned()),
+            auth_exempt_paths: vec!["/robots.txt".to_owned()],
+            ..crate::app::AppIngress::default()
+        };
+        validate_static_ingress_allowlist(&name("a"), &basic).unwrap();
+        // Through the full chain the rollout gate is the remaining error.
+        let spec: AppSpec = toml::from_str(
+            "kind = \"static\"\nimage = \"i\"\ndomains = [\"a.example.com\"]\n\
+             [ingress]\nauth = \"basic\"\nauth_secret = \"basic-auth\"\nauth_exempt_paths = [\"/robots.txt\"]",
+        )
+        .unwrap();
+        let e = validate_app(&name("a"), &spec).unwrap_err();
+        assert!(e.contains(crate::identity::BASIC_AUTH_GATE), "{e}");
     }
 
     #[test]

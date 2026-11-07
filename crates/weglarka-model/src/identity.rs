@@ -84,7 +84,7 @@ impl Pkce {
     }
 }
 
-/// `ingress.auth` of an app (#89).
+/// `ingress.auth` of an app (#89; `basic` in ADR 0081).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IngressAuth {
@@ -93,6 +93,8 @@ pub enum IngressAuth {
     None,
     /// nginx asks the identity provider before proxying (`auth_request`).
     Forward,
+    /// nginx asks for a shared HTTP Basic credential (`auth_secret`, ADR 0081).
+    Basic,
 }
 
 impl IngressAuth {
@@ -813,22 +815,74 @@ fn validate_oidc(spec: &AppSpec, oidc: &OidcClientSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// The rollout gate of ADR 0081: the model accepts the `basic` fields, but nginx enforcement arrives
+/// with the generator and the daemon, so no instance can end up behind a `basic` location that
+/// nothing checks. A later PR removes the constant and its use.
+pub const BASIC_AUTH_GATE: &str = "ingress.auth = \"basic\" is not enabled in this release";
+
 fn validate_auth(spec: &AppSpec) -> Result<(), String> {
     let ingress = &spec.ingress;
-    if ingress.auth.is_none() {
-        let dependent = [
-            ("auth_policy", ingress.auth_policy.is_some()),
-            ("auth_groups", !ingress.auth_groups.is_empty()),
-            ("auth_exempt_paths", !ingress.auth_exempt_paths.is_empty()),
-        ];
-        if let Some((field, _)) = dependent.iter().find(|(_, set)| *set) {
-            return Err(format!(
-                "ingress.{field} requires ingress.auth = \"forward\""
-            ));
+    match ingress.auth {
+        IngressAuth::None => {
+            // `auth_exempt_paths` is the one dependent field both protected modes accept (ADR 0081).
+            if !ingress.auth_exempt_paths.is_empty() {
+                return Err(
+                    "ingress.auth_exempt_paths requires ingress.auth = \"forward\" or \"basic\""
+                        .to_owned(),
+                );
+            }
+            let dependent = [
+                ("auth_policy", ingress.auth_policy.is_some(), "forward"),
+                ("auth_groups", !ingress.auth_groups.is_empty(), "forward"),
+                ("auth_secret", ingress.auth_secret.is_some(), "basic"),
+            ];
+            if let Some((field, _, mode)) = dependent.iter().find(|(_, set, _)| *set) {
+                return Err(format!(
+                    "ingress.{field} requires ingress.auth = \"{mode}\""
+                ));
+            }
+            return Ok(());
         }
-        return Ok(());
+        IngressAuth::Forward => {
+            check_group_list(&ingress.auth_groups, "ingress.auth_groups")?;
+            // A secret of `user:password` lines only means something to `basic`.
+            if let Some(secret) = &ingress.auth_secret {
+                return Err(format!(
+                    "ingress.auth_secret {secret:?} requires ingress.auth = \"basic\""
+                ));
+            }
+        }
+        IngressAuth::Basic => {
+            if !ingress.auth_groups.is_empty() {
+                return Err("ingress.auth_groups requires ingress.auth = \"forward\"".to_owned());
+            }
+            if ingress.auth_policy.is_some() {
+                return Err("ingress.auth_policy requires ingress.auth = \"forward\"".to_owned());
+            }
+            match &ingress.auth_secret {
+                None => {
+                    return Err(
+                        "ingress.auth_secret is required with ingress.auth = \"basic\"".to_owned(),
+                    );
+                }
+                Some(name) if !crate::secret_store::valid_secret_name(name) => {
+                    return Err(format!(
+                        "ingress.auth_secret {name:?} is not a valid secret name: use 1-64 \
+                         characters of [A-Za-z0-9_-]"
+                    ));
+                }
+                Some(_) => {}
+            }
+            // An OAuth resource checks its own tokens in the `Authorization` header, exactly where
+            // the Basic credential sits, so the two cannot protect the same host (ADR 0081).
+            if !ingress.oauth_resources.is_empty() {
+                return Err(
+                    "ingress.oauth_resources cannot be combined with ingress.auth = \"basic\""
+                        .to_owned(),
+                );
+            }
+        }
     }
-    check_group_list(&ingress.auth_groups, "ingress.auth_groups")?;
     let mut seen = BTreeSet::new();
     for path in &ingress.auth_exempt_paths {
         check_skip_path(path)
@@ -841,7 +895,8 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
     }
     // A static site's files are served by nginx itself; there is no upstream to attach identity to
     // and no provider-aware location for it, so the combination is refused rather than half-supported.
-    if spec.kind == crate::app::AppKind::Static {
+    // `basic` needs no provider and is rendered by the site's own locations (ADR 0081).
+    if spec.kind == crate::app::AppKind::Static && ingress.auth == IngressAuth::Forward {
         return Err(
             "ingress.auth = \"forward\" is not supported on `kind = \"static\"` apps".to_owned(),
         );
@@ -866,6 +921,10 @@ fn validate_auth(spec: &AppSpec) -> Result<(), String> {
                 ));
             }
         }
+    }
+    // Last, so every field-level rule above still reports its own error while the feature is gated.
+    if ingress.auth == IngressAuth::Basic {
+        return Err(BASIC_AUTH_GATE.to_owned());
     }
     Ok(())
 }
@@ -942,7 +1001,9 @@ pub fn validate_host_app(
             "{name}: `oidc` needs an `[identity]` section in weglarka.toml"
         ));
     }
-    if spec.ingress.auth.is_none() {
+    // The host-aware rules below are those of forward auth (ADR 0052); `basic` (ADR 0081) needs no
+    // provider and no domain.
+    if spec.ingress.auth != IngressAuth::Forward {
         return Ok(());
     }
     let Some(identity) = &host.identity else {

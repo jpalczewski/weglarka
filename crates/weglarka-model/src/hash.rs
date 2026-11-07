@@ -488,6 +488,7 @@ env = { B = "2", A = "1" }
             auth_policy: Some(crate::identity::AuthorizationPolicy::OneFactor),
             auth_groups: vec!["admins".into()],
             auth_exempt_paths: vec!["/mcp/".into()],
+            auth_secret: Some("basic-auth".into()),
             oauth_resources: vec!["/rpc".into()],
             static_: Some(crate::app::StaticIngress {
                 clean_urls: true,
@@ -553,6 +554,22 @@ env = { B = "2", A = "1" }
             spec_hash(&spec(), &digest('a')),
             spec_hash(&s, &digest('a'))
         );
+    }
+
+    #[test]
+    fn basic_auth_fields_only_re_render_nginx() {
+        // ADR 0081: `AppIngress` stays outside `HashInput`, so protecting (or unprotecting) a site
+        // never recreates the container — it reloads nginx.
+        let base = spec_hash(&spec(), &digest('a'));
+        let mut s = spec();
+        s.ingress.auth = crate::identity::IngressAuth::Basic;
+        s.ingress.auth_secret = Some("basic-auth".into());
+        s.ingress.auth_exempt_paths = vec!["/robots.txt".into()];
+        assert_eq!(base, spec_hash(&s, &digest('a')));
+        // The credential itself is a secret value, never part of a spec at all: renaming the
+        // secret, or replacing its content, changes neither the hash nor the container.
+        s.ingress.auth_secret = Some("other-name".into());
+        assert_eq!(base, spec_hash(&s, &digest('a')));
     }
 
     #[test]
