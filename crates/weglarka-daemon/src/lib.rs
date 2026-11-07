@@ -468,6 +468,8 @@ pub async fn start_with<P: PodmanClient + 'static>(
         host.clone(),
         paths.nginx_conf_dir.clone(),
         paths.ingress_logs.clone(),
+        // The same store the engine holds: the basic auth credentials (ADR 0081) are read here.
+        secrets.clone() as Arc<dyn SecretStore>,
     ));
     // ACME (issue #96): the worker shares the engine's event sink and asks the ingress to apply
     // whenever it wrote a certificate.

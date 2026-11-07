@@ -6,6 +6,7 @@
 mod common;
 
 mod access;
+mod basic_auth;
 mod certificates_config;
 mod configs;
 mod conmon;

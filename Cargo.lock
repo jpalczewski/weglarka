@@ -2219,6 +2219,7 @@ dependencies = [
  "tracing-subscriber",
  "weglarka-acme",
  "weglarka-api",
+ "weglarka-daemon",
  "weglarka-dns",
  "weglarka-engine",
  "weglarka-identity",
