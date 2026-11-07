@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.2...weglarka-cli-v0.1.3) - 2026-11-07
+
+### Added
+
+- *(cli)* manage host secrets and check host credentials in doctor
+- *(daemon)* show shared services in apps list and doctor
+- *(model)* shared service types, membership and identity session store behind a gate ([#621](https://github.com/jpalczewski/weglarka/pull/621))
+- *(cli)* oauth_resources flags, doctor check and guide ([#611](https://github.com/jpalczewski/weglarka/pull/611))
+- *(ingress)* upstream fields in the access log ([#589](https://github.com/jpalczewski/weglarka/pull/589))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+
+### Fixed
+
+- *(api)* tolerate unknown enum variants in daemon responses
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(cli)* refuse an apps update that would stop a running app without --allow-stop ([#565](https://github.com/jpalczewski/weglarka/pull/565))
+
+### Other
+
+- Merge pull request #643 from jpalczewski/api/582-unknown-enum-fallback
+- *(model)* extract the line diff from the CLI spec diff
+- renumber the host credentials ADR to 0080 after the 0079 collision
+- *(cli)* one request object, a shared spec write and shared test helpers ([#628](https://github.com/jpalczewski/weglarka/pull/628))
+
 ## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-cli-v0.1.1...weglarka-cli-v0.1.2) - 2026-11-05
 
 ### Added

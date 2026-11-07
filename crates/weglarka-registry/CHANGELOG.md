@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-registry-v0.0.4...weglarka-registry-v0.0.5) - 2026-11-07
+
+### Fixed
+
+- *(release)* treat a 404 tag list as empty for the first release set ([#562](https://github.com/jpalczewski/weglarka/pull/562))
+
 ## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-registry-v0.0.3...weglarka-registry-v0.0.4) - 2026-11-05
 
 ### Added

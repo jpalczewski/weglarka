@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.2...weglarka-panel-v0.1.3) - 2026-11-07
+
+### Added
+
+- *(panel)* upstream status and header time in the live access log ([#602](https://github.com/jpalczewski/weglarka/pull/602))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+
+### Fixed
+
+- *(api)* tolerate unknown enum variants in daemon responses
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+
 ## [0.1.2](https://github.com/jpalczewski/weglarka/compare/weglarka-panel-v0.1.1...weglarka-panel-v0.1.2) - 2026-11-05
 
 ### Added

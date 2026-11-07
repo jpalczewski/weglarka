@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.7...weglarka-engine-v0.0.8) - 2026-11-07
+
+### Added
+
+- *(daemon)* platform install --check reports installed-unit drift
+- *(engine)* shared service networks and start order through effective_spec
+- *(engine)* refuse removing a shared service instance
+- *(model)* shared service rules, overlay and per-kind gate (skeleton)
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Fixed
+
+- *(engine)* check shared static options against the served releases on sites declare ([#585](https://github.com/jpalczewski/weglarka/pull/585))
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(engine)* refuse kind changes on update and require a served release for static sites ([#549](https://github.com/jpalczewski/weglarka/pull/549))
+
+### Other
+
+- Merge pull request #641 from jpalczewski/refactor/629-mutate-apps-volumes
+- *(engine)* use mutate_apps for the volumes.rs writes
+- *(engine)* SharedServiceInUse carries member names like SharedVolumeInUse
+- *(model)* one private-file check and one header-token validator ([#623](https://github.com/jpalczewski/weglarka/pull/623))
+- *(engine)* deduplicate apps.toml writes, the health probe and test helpers ([#627](https://github.com/jpalczewski/weglarka/pull/627))
+- *(engine)* dedupe volume refs, uid ranges and name validation ([#626](https://github.com/jpalczewski/weglarka/pull/626))
+- *(podman)* deduplicate the Podman client, filters and test helpers ([#625](https://github.com/jpalczewski/weglarka/pull/625))
+- *(engine)* check static ingress options against the served release ([#566](https://github.com/jpalczewski/weglarka/pull/566))
+- gate tests that read /proc to Linux ([#550](https://github.com/jpalczewski/weglarka/pull/550))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-engine-v0.0.6...weglarka-engine-v0.0.7) - 2026-11-05
 
 ### Added

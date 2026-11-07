@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-dns-v0.0.4...weglarka-dns-v0.0.5) - 2026-11-07
+
+### Added
+
+- *(dns)* read the DNS-01 token on use, from a file or a host secret
+
+### Other
+
+- renumber the host credentials ADR to 0080 after the 0079 collision
+
 ## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-dns-v0.0.3...weglarka-dns-v0.0.4) - 2026-10-29
 
 ### Other

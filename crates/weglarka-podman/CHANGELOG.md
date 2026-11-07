@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.7...weglarka-podman-v0.0.8) - 2026-11-07
+
+### Added
+
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Other
+
+- *(podman)* deduplicate the Podman client, filters and test helpers ([#625](https://github.com/jpalczewski/weglarka/pull/625))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-podman-v0.0.6...weglarka-podman-v0.0.7) - 2026-11-05
 
 ### Added
