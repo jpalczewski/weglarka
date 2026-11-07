@@ -150,8 +150,8 @@ WWW-Authenticate: Basic realm="Restricted", charset="UTF-8"
   [`ingress.static.security_headers`](security-headers.md)): the `add_header` of the auth check replaces the inherited
   ones. Fine for an empty error page, but a monitoring check that expects HSTS or `nosniff` on every response will not
   find them on a 401.
-- The comparison is an exact string match, so the client must send the scheme as **`Basic`**, capital `B`, and the
-  header exactly as `Basic <base64 of user:password>`. A `basic` written in lower case, or extra whitespace, gets a
+- The comparison is an exact, case-sensitive match of the whole header, so the client must send the scheme as
+  **`Basic`**, capital `B`, and the header exactly as `Basic <base64 of user:password>`. A `basic` written in lower case, or extra whitespace, gets a
   `401` even though RFC 7617 allows either case. Every common client (browsers, `curl`, the usual HTTP libraries)
   sends `Basic`, and the only effect of the mismatch is that such a client cannot get in.
 
@@ -192,7 +192,8 @@ Revoking one user means overwriting the whole secret for everybody (`secrets set
 ## On disk, in reloads and in backups
 
 - The daemon renders `<nginx_conf_dir>/auth/<instance>.map` (directory `0700`, file `0600`, written atomically), one
-  line per credential: `"Basic <base64 of user:password>" 1;`.
+  line per credential: `"~^Basic <base64 of user:password>$" 1;` — an anchored regex, because nginx compares plain
+  `map` keys ignoring case and would otherwise accept a password that differs only in letter case.
 - The **master** process reads the map at start and at every reload; `nginx.conf` itself never holds the credentials
   (it is `0644`). `<nginx_conf_dir>` is mounted as a whole already, so no new mount appears and the ingress container
   is never recreated.

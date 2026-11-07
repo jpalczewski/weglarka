@@ -166,15 +166,15 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-/// The `"Basic <base64>"` payloads of the map file, i.e. the password-equivalent material that must
-/// never leave it.
+/// The base64 payloads of the map file's `"~^Basic <base64>$"` keys, i.e. the password-equivalent
+/// material that must never leave it.
 fn payloads(map_lines: &str) -> Vec<String> {
     map_lines
         .lines()
         .map(|line| {
-            line.trim_start_matches("\"Basic ")
-                .trim_end_matches("\" 1;")
-                .to_owned()
+            line.trim_start_matches("\"~^Basic ")
+                .trim_end_matches("$\" 1;")
+                .replace("[+]", "+")
         })
         .collect()
 }
