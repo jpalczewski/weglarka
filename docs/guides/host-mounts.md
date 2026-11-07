@@ -110,6 +110,9 @@ Re-apply the first command if the directory itself is replaced (a new mount, a f
 inode, not on the path.
 
 Changing `host_mounts` or `group_add` of an app recreates its container; changing an allowlist alone recreates nothing.
+An allowlist entry also becomes a read-only mount of the **daemon** container, so `[runtime] host_mounts` needs a
+`weglarka platform install` re-run — and `weglarka-daemon platform install --check` exits 1 when one is pending
+(see [install.md](../install.md#checking-the-installed-files)).
 
 ## Entries must not overlap what the daemon writes
 

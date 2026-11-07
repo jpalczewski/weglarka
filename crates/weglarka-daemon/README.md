@@ -46,7 +46,9 @@ Then `weglarka --config ./weglarka.toml status`; app: `weglarka apps add …`, w
 
 `weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --dry-run` prints the files;
 without `--dry-run` it writes them to the runtime user's `~/.config/containers/systemd/` and runs
-`daemon-reload`. Example (`weglarka.container`):
+`daemon-reload`. `platform install --check` compares the files it would write with the installed ones
+(nothing is written, exit code 1 = an install is needed) — for configuration management that cannot see
+a `host_mounts` entry that was removed. Example (`weglarka.container`):
 
 ```ini
 [Unit]

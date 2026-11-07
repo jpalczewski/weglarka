@@ -541,32 +541,7 @@ fn read_spec_from(path: &Path, stdin: &mut impl Read) -> Result<AppSpec, CliErro
 /// Empty string = the specs are identical.
 pub fn spec_diff(old: &AppSpec, new: &AppSpec) -> String {
     let render = |s: &AppSpec| toml::to_string(s).unwrap_or_default();
-    let (a, b) = (render(old), render(new));
-    let (a, b): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
-    // Longest common subsequence; specs are a few dozen lines.
-    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i][j] = if a[i] == b[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-    let (mut i, mut j, mut out) = (0, 0, String::new());
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            (i, j) = (i + 1, j + 1);
-        } else if i < a.len() && (j == b.len() || lcs[i + 1][j] >= lcs[i][j + 1]) {
-            out.push_str(&format!("- {}\n", a[i]));
-            i += 1;
-        } else {
-            out.push_str(&format!("+ {}\n", b[j]));
-            j += 1;
-        }
-    }
-    out
+    weglarka_model::diff::line_diff(&render(old), &render(new))
 }
 
 #[derive(Debug, Serialize)]

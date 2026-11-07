@@ -3,7 +3,7 @@ paths:
   - "crates/weglarka-notify/**"
   - "crates/weglarka-registry/**"
   - "crates/weglarka-model/src/{self_update,delivery,events,webhook}.rs"
-  - "crates/weglarka-daemon/src/{self_update,supervise,platform,webhook,github,forgejo}.rs"
+  - "crates/weglarka-daemon/src/{self_update,supervise,platform,install_check,main,webhook,github,forgejo}.rs"
   - "crates/weglarka-daemon/tests/it/{notify,self_update,forgejo}.rs"
   - "docs/guides/{notifications,self-update,webhooks}.md"
 ---
@@ -46,6 +46,15 @@ paths:
   breaks rollback through `deny_unknown_fields`), has no schema marker, and an older daemon ignores it. Reading is
   tolerant (missing = empty set, corrupt = warn + empty and rewritten at the next delivery), and a write error only
   warns — bookkeeping must not take down a webhook or daemon startup.
+
+- **`platform install --check` (#610):** read-only by construction — it renders with the same `service_spec`/`render`
+  an install uses, reads the installed files and never writes a file, creates a directory or runs a command. Exit `0`
+  matches, `1` an install is needed (`InstallNeeded`, the typed marker `main` downcasts — `1` means only that, which is
+  why every other failure is `2`), `2` the check itself cannot run. The comparison is line-wise and drops exactly two
+  things, never more: the activation labels `platform.rs::activate_service` writes, and `Image=` (dropped unless
+  `--image`, compared by *repository* when self-update pinned a digest and the operator named a tag — the fix line must
+  never reset a verified pin to `:latest`). On a `bootstrap-complete.toml` host the self-update and watchdog units are
+  skipped, because `platform install` would write the retired pair back. OpenRC has no `installed_paths` (`2`).
 
 ## Entry points
 
