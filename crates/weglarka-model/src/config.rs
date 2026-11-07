@@ -3,12 +3,15 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::app::{ByteSize, InstanceName, MemoryLimit};
+use crate::credential::{CredentialSource, credential_from};
 use crate::events::Severity;
 use crate::podman::{ContainerLog, LogDriver};
+use crate::secret_store::{SecretStore, valid_secret_name};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +74,9 @@ impl HostConfig {
         self.ingress.validate()?;
         self.logs.validate()?;
         self.sites.validate()?;
+        if let Some(ntfy) = self.notify.as_ref().and_then(|notify| notify.ntfy.as_ref()) {
+            ntfy.validate()?;
+        }
         validate_host_mount_allowlist(&self.runtime.host_mounts)?;
         validate_group_allowlist(&self.runtime.group_add)?;
         // Public ingress ports below 1024 are rootless Podman's privileged-port problem
@@ -864,12 +870,46 @@ pub struct NtfyConfig {
     pub host: Option<String>,
     /// ntfy topic (`[A-Za-z0-9_-]{1,64}`).
     pub topic: String,
-    /// File with an ntfy access token (mode 0600); read once at startup and never logged.
+    /// File with an ntfy access token (mode 0600); read on use and never logged. The older form;
+    /// prefer `token_secret` (ADR 0080). At most one of the two may be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<PathBuf>,
+    /// Named entry in the host secret store (`host-secrets.toml`) holding the access token.
+    /// Exclusive with `token_file` (ADR 0080).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
     /// Lowest severity published to this channel; lower ones are dropped before dedup.
     #[serde(default)]
     pub min_severity: Severity,
+}
+
+impl NtfyConfig {
+    /// Rejects a channel that cannot work: `token_file` and `token_secret` are mutually exclusive,
+    /// and a `token_secret` must be a valid host secret name.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.token_file, &self.token_secret) {
+            (Some(_), Some(_)) => {
+                Err("[notify.ntfy] set at most one of token_file / token_secret".to_owned())
+            }
+            (None, Some(name)) if !valid_secret_name(name) => Err(format!(
+                "[notify.ntfy] token_secret {name:?} is not a valid host secret name"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The credential this channel authenticates with (`None` = unauthenticated). The one match
+    /// every consumer would otherwise repeat (ADR 0080).
+    pub fn credential(
+        &self,
+        host_store: &Arc<dyn SecretStore>,
+    ) -> Option<Arc<dyn CredentialSource>> {
+        credential_from(
+            self.token_file.as_deref(),
+            self.token_secret.as_deref(),
+            host_store,
+        )
+    }
 }
 
 /// `[monitor]`: which runtime observations become engine events (crash loops, failing healthchecks).
@@ -951,8 +991,14 @@ pub enum DnsProviderKind {
 #[serde(deny_unknown_fields)]
 pub struct AcmeDnsConfig {
     pub provider: DnsProviderKind,
-    /// File with the provider's API token (mode 0600, absolute path); never logged.
-    pub token_file: PathBuf,
+    /// File with the provider's API token (mode 0600, absolute path); never logged. The older
+    /// form; exactly one of `token_file` / `token_secret` is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
+    /// Named entry in the host secret store (`host-secrets.toml`) holding the API token. Exclusive
+    /// with `token_file` (ADR 0080).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
     /// Apex domains that get a wildcard certificate, e.g. `["example.eu"]`.
     pub wildcards: Vec<String>,
     /// Seconds to wait after publishing the TXT records before the CA validates them: Let's Encrypt
@@ -1053,11 +1099,30 @@ impl AcmeDnsConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !self.token_file.is_absolute() {
-            return Err(format!(
-                "[acme.dns] token_file {} must be an absolute path",
-                self.token_file.display()
-            ));
+        match (&self.token_file, &self.token_secret) {
+            (Some(path), None) => {
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "[acme.dns] token_file {} must be an absolute path",
+                        path.display()
+                    ));
+                }
+            }
+            (None, Some(name)) => {
+                if !valid_secret_name(name) {
+                    return Err(format!(
+                        "[acme.dns] token_secret {name:?} is not a valid host secret name"
+                    ));
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err("[acme.dns] set exactly one of token_file / token_secret".to_owned());
+            }
+            (None, None) => {
+                return Err(
+                    "[acme.dns] requires exactly one of token_file / token_secret".to_owned(),
+                );
+            }
         }
         if self.wildcards.is_empty() {
             return Err("[acme.dns] wildcards must list at least one apex domain".to_owned());
@@ -1074,6 +1139,18 @@ impl AcmeDnsConfig {
             }
         }
         Ok(())
+    }
+
+    /// The DNS API credential; exactly one of the two forms is set (enforced by [`Self::validate`]).
+    pub fn credential(
+        &self,
+        host_store: &Arc<dyn SecretStore>,
+    ) -> Option<Arc<dyn CredentialSource>> {
+        credential_from(
+            self.token_file.as_deref(),
+            self.token_secret.as_deref(),
+            host_store,
+        )
     }
 }
 
@@ -1634,6 +1711,88 @@ kind = "systemd"
     }
 
     #[test]
+    fn ntfy_token_file_and_token_secret_are_exclusive() {
+        let ntfy = |extra: &str| {
+            let src = format!(
+                "{SAMPLE}\n[notify.ntfy]\nurl = \"https://ntfy.example.com\"\ntopic = \"wg\"\n{extra}"
+            );
+            HostConfig::from_toml_str(&src).unwrap()
+        };
+        let ok = ntfy("token_file = \"/etc/weglarka/ntfy-token\"\n");
+        ok.validate().unwrap();
+        assert_eq!(
+            ok.notify.unwrap().ntfy.unwrap().token_file.as_deref(),
+            Some(std::path::Path::new("/etc/weglarka/ntfy-token"))
+        );
+
+        let ok = ntfy("token_secret = \"ntfy-token\"\n");
+        ok.validate().unwrap();
+        assert_eq!(
+            ok.notify.unwrap().ntfy.unwrap().token_secret.as_deref(),
+            Some("ntfy-token")
+        );
+
+        for bad in [
+            "token_file = \"/t\"\ntoken_secret = \"ntfy-token\"\n",
+            "token_secret = \"app.x\"\n",
+            "token_secret = \"bad name\"\n",
+        ] {
+            assert!(ntfy(bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn credential_helpers_pick_the_file_or_the_host_store() {
+        use crate::secrets::FileSecretStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host_store: Arc<dyn SecretStore> =
+            Arc::new(FileSecretStore::host(dir.path().join("host-secrets.toml")));
+
+        let ntfy = HostConfig::from_toml_str(&format!(
+            "{SAMPLE}\n[notify.ntfy]\nurl = \"https://ntfy.example.com\"\ntopic = \"wg\"\n\
+             token_file = \"/etc/weglarka/ntfy-token\"\n"
+        ))
+        .unwrap();
+        let src = ntfy
+            .notify
+            .unwrap()
+            .ntfy
+            .unwrap()
+            .credential(&host_store)
+            .unwrap();
+        assert_eq!(src.describe(), "file /etc/weglarka/ntfy-token");
+
+        let ntfy = HostConfig::from_toml_str(&format!(
+            "{SAMPLE}\n[notify.ntfy]\nurl = \"https://ntfy.example.com\"\ntopic = \"wg\"\n\
+             token_secret = \"ntfy-token\"\n"
+        ))
+        .unwrap();
+        let src = ntfy
+            .notify
+            .unwrap()
+            .ntfy
+            .unwrap()
+            .credential(&host_store)
+            .unwrap();
+        assert_eq!(src.describe(), "host secret ntfy-token");
+
+        let acme = HostConfig::from_toml_str(&format!(
+            "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n\
+             token_secret = \"cf-token\"\nwildcards = [\"example.eu\"]\n"
+        ))
+        .unwrap();
+        let src = acme
+            .acme
+            .unwrap()
+            .dns
+            .unwrap()
+            .credential(&host_store)
+            .unwrap();
+        assert_eq!(src.describe(), "host secret cf-token");
+    }
+
+    #[test]
     fn monitor_defaults_apply_when_the_section_is_absent() {
         let monitor = HostConfig::from_toml_str(SAMPLE).unwrap().monitor;
         assert_eq!(monitor.crash_loop_restarts, 3);
@@ -1970,12 +2129,55 @@ domain = "weglarka.example.com"
         let plain = HostConfig::from_toml_str(&plain).unwrap();
         assert!(!toml::to_string(&plain).unwrap().contains("dns"));
 
-        // A token inline, a missing file or an unknown key is a parse error, never a silent default.
+        // A token inline, a missing wildcards list or an unknown key is a parse error.
         assert!(dns_parse_fails(
             "token = \"abc\"\nwildcards = [\"example.eu\"]\n"
         ));
-        assert!(dns_parse_fails("wildcards = [\"example.eu\"]\n"));
         assert!(dns_parse_fails("token_file = \"/t\"\n"));
+
+        // No token at all parses (the fields are optional), but fails validation: exactly one of
+        // `token_file` / `token_secret` is required.
+        let missing = HostConfig::from_toml_str(&format!(
+            "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n\
+             wildcards = [\"example.eu\"]\n"
+        ))
+        .unwrap();
+        assert!(
+            missing
+                .acme
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .contains("token_file / token_secret")
+        );
+    }
+
+    #[test]
+    fn acme_dns_requires_exactly_one_token_and_validates_a_token_secret() {
+        let dns = |extra: &str| {
+            let src = format!(
+                "{EDGE}\n[acme]\naccept_terms = true\n\n[acme.dns]\nprovider = \"cloudflare\"\n{extra}"
+            );
+            HostConfig::from_toml_str(&src).unwrap().acme.unwrap()
+        };
+        let ok = dns("token_file = \"/var/lib/weglarka/cf-token\"\nwildcards = [\"example.eu\"]\n");
+        ok.validate().unwrap();
+        assert!(ok.dns.as_ref().unwrap().token_file.is_some());
+        assert!(ok.dns.as_ref().unwrap().token_secret.is_none());
+
+        let ok = dns("token_secret = \"cf-token\"\nwildcards = [\"example.eu\"]\n");
+        ok.validate().unwrap();
+        assert!(ok.dns.as_ref().unwrap().token_secret.as_deref() == Some("cf-token"));
+
+        for bad in [
+            "wildcards = [\"example.eu\"]\n",
+            "token_file = \"/t\"\ntoken_secret = \"cf-token\"\nwildcards = [\"example.eu\"]\n",
+            "token_file = \"relative/token\"\nwildcards = [\"example.eu\"]\n",
+            "token_secret = \"app.x\"\nwildcards = [\"example.eu\"]\n",
+            "token_secret = \"bad name\"\nwildcards = [\"example.eu\"]\n",
+        ] {
+            assert!(dns(bad).validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

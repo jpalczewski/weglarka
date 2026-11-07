@@ -4,13 +4,17 @@
 //! token can rewrite every record in those zones, so it must not be an account-wide key. The zone of a
 //! record is found by walking the name's suffixes against `GET /zones?name=`: a token only lists the
 //! zones it may see, so a name outside them is `ZoneNotFound` rather than a write to a stranger's zone.
+//!
+//! The token comes from a [`CredentialSource`] and is read on **every** request (ADR 0080), so a rotated
+//! token is used by the next call without a restart.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::json;
+use weglarka_model::credential::CredentialSource;
 use weglarka_model::secret_store::SecretValue;
 
 use weglarka_http::reqwest::Method;
@@ -28,15 +32,17 @@ const MAX_MESSAGE: usize = 300;
 
 pub struct Cloudflare {
     api: Api,
-    token: String,
+    /// The API token: read on every request, so rotation needs no restart (ADR 0080).
+    source: Arc<dyn CredentialSource>,
     /// zone name → zone id; zones do not move, so one lookup per zone per daemon run.
     zones: Mutex<HashMap<String, String>>,
 }
 
 impl fmt::Debug for Cloudflare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The source describes itself by file path or secret name; the value is never rendered.
         f.debug_struct("Cloudflare")
-            .field("token", &"<redacted>")
+            .field("token", &self.source.describe())
             .finish_non_exhaustive()
     }
 }
@@ -83,25 +89,30 @@ fn valid_id(id: &str) -> bool {
 }
 
 impl Cloudflare {
-    /// `token` is the API token; surrounding whitespace (a trailing newline in a secret file) is trimmed.
-    pub fn new(token: &SecretValue) -> Result<Self, DnsError> {
-        Self::with_base_url(token, DEFAULT_BASE_URL)
+    /// `source` holds the API token (a `0600` file or a host secret); the value is validated by every
+    /// [`CredentialSource::read`], never here.
+    pub fn new(source: Arc<dyn CredentialSource>) -> Result<Self, DnsError> {
+        Self::with_base_url(source, DEFAULT_BASE_URL)
     }
 
     /// Adapter against another API root — the tests use a loopback mock (plain `http://` is accepted
     /// for loopback only).
-    pub fn with_base_url(token: &SecretValue, base_url: &str) -> Result<Self, DnsError> {
-        let token = std::str::from_utf8(token.expose())
-            .map_err(|_| HttpError::Token)?
-            .trim()
-            .to_owned();
-        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(HttpError::Token.into());
-        }
+    pub fn with_base_url(
+        source: Arc<dyn CredentialSource>,
+        base_url: &str,
+    ) -> Result<Self, DnsError> {
         Ok(Self {
             api: Api::new(base_url)?,
-            token,
+            source,
             zones: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The current token. A read failure names the source and never carries the value.
+    fn token(&self) -> Result<SecretValue, DnsError> {
+        self.source.read().map_err(|error| DnsError::Credential {
+            credential: self.source.describe(),
+            error,
         })
     }
 
@@ -111,10 +122,9 @@ impl Cloudflare {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Response, DnsError> {
-        Ok(self
-            .api
-            .request(method, path, Some(&self.token), body)
-            .await?)
+        let token = self.token()?;
+        let token = std::str::from_utf8(token.expose()).map_err(|_| HttpError::Token)?;
+        Ok(self.api.request(method, path, Some(token), body).await?)
     }
 
     /// Id of the zone that contains `name`: the longest suffix (at least two labels) the token can see.
@@ -277,6 +287,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use weglarka_model::credential::{CredentialError, CredentialSource, parse_header_token};
 
     use super::*;
 
@@ -284,6 +295,47 @@ mod tests {
     const RECORD: &str = "372e67954025e0ba6aaa6d586b9e0b59";
     const TOKEN: &str = "s3cr3t-token-value";
     const VALUE: &str = "gfj9Xq-Ae1w0lBsJ4M2zQ8Yh7N3uKdR5vTpCoEiLxHk";
+
+    /// A rotatable in-memory [`CredentialSource`] that validates like the real adapters do.
+    struct TestSource {
+        value: Mutex<String>,
+    }
+
+    impl TestSource {
+        fn new(value: &str) -> Arc<Self> {
+            Arc::new(Self {
+                value: Mutex::new(value.to_owned()),
+            })
+        }
+
+        fn rotate(&self, value: &str) {
+            *self.value.lock().unwrap() = value.to_owned();
+        }
+    }
+
+    impl CredentialSource for TestSource {
+        fn read(&self) -> Result<SecretValue, CredentialError> {
+            let value = self.value.lock().unwrap().clone();
+            Ok(parse_header_token(value.as_bytes())?)
+        }
+
+        fn describe(&self) -> String {
+            "host secret cf-token".to_owned()
+        }
+    }
+
+    /// A source that cannot produce a value at all.
+    struct BrokenSource;
+
+    impl CredentialSource for BrokenSource {
+        fn read(&self) -> Result<SecretValue, CredentialError> {
+            Err(CredentialError::Missing("cf-token".to_owned()))
+        }
+
+        fn describe(&self) -> String {
+            "host secret cf-token".to_owned()
+        }
+    }
 
     /// Serves the canned `(status, body)` answers one connection each and records the raw requests.
     struct Mock {
@@ -331,7 +383,8 @@ mod tests {
 
         fn adapter(&self) -> Cloudflare {
             let url = format!("http://{}/client/v4", self.addr);
-            Cloudflare::with_base_url(&SecretValue::new(format!("{TOKEN}\n")), &url).unwrap()
+            let source = TestSource::new(&format!("{TOKEN}\n"));
+            Cloudflare::with_base_url(source, &url).unwrap()
         }
 
         fn requests(&self) -> Vec<String> {
@@ -556,18 +609,60 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_validated_and_redacted() {
+    fn the_base_url_is_validated_and_the_token_never_reaches_debug() {
         let url = "http://127.0.0.1:1";
-        for bad in ["", "  \n", "has space", "\u{e4}"] {
-            assert!(
-                Cloudflare::with_base_url(&SecretValue::new(bad), url).is_err(),
-                "{bad:?}"
-            );
-        }
-        assert!(Cloudflare::with_base_url(&SecretValue::new(vec![0xff]), url).is_err());
-        let cf = Cloudflare::with_base_url(&SecretValue::new(TOKEN), url).unwrap();
-        assert!(!format!("{cf:?}").contains(TOKEN));
-        assert!(Cloudflare::new(&SecretValue::new(TOKEN)).is_ok());
-        assert!(Cloudflare::with_base_url(&SecretValue::new(TOKEN), "http://example.eu").is_err());
+        let cf = Cloudflare::with_base_url(TestSource::new(TOKEN), url).unwrap();
+        let debug = format!("{cf:?}");
+        assert!(!debug.contains(TOKEN), "{debug}");
+        assert!(Cloudflare::new(TestSource::new(TOKEN)).is_ok());
+        assert!(Cloudflare::with_base_url(TestSource::new(TOKEN), "http://example.eu").is_err());
+        assert!(Cloudflare::with_base_url(TestSource::new(TOKEN), "api.example.eu").is_err());
+    }
+
+    /// ADR 0080: the token is read on use, so a rotated one is picked up by the next request.
+    #[tokio::test]
+    async fn a_rotated_token_is_used_by_the_next_request() {
+        let second = "rotated-token-value";
+        let mock = Mock::serve(vec![ok("{}"), ok("{}")]).await;
+        let source = TestSource::new(TOKEN);
+        let cf =
+            Cloudflare::with_base_url(source.clone(), &format!("http://{}/client/v4", mock.addr))
+                .unwrap();
+        let handle = RecordHandle::new(format!("{ZONE}/{RECORD}"));
+        cf.remove_txt(&handle).await.unwrap();
+        source.rotate(second);
+        cf.remove_txt(&handle).await.unwrap();
+
+        let requests = mock.requests();
+        assert!(requests[0].contains(&format!("authorization: Bearer {TOKEN}\r\n")));
+        assert!(requests[1].contains(&format!("authorization: Bearer {second}\r\n")));
+        assert!(!requests[1].contains(&format!("Bearer {TOKEN}\r\n")));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_source_is_an_error_that_names_it_but_not_the_value() {
+        let mock = Mock::serve(vec![]).await;
+        let url = format!("http://{}/client/v4", mock.addr);
+        let cf = Cloudflare::with_base_url(Arc::new(BrokenSource), &url).unwrap();
+        let err = cf.set_txt("example.eu", VALUE).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("host secret cf-token"), "{text}");
+        assert!(
+            matches!(err, DnsError::Credential { ref credential, .. } if credential == "host secret cf-token"),
+            "{err:?}"
+        );
+        assert!(mock.requests().is_empty(), "no request without a token");
+    }
+
+    #[tokio::test]
+    async fn a_source_value_that_is_not_a_header_token_never_reaches_the_network() {
+        let mock = Mock::serve(vec![]).await;
+        let url = format!("http://{}/client/v4", mock.addr);
+        let cf = Cloudflare::with_base_url(TestSource::new("two words"), &url).unwrap();
+        let err = cf.set_txt("example.eu", VALUE).await.unwrap_err();
+        assert!(matches!(err, DnsError::Credential { .. }), "{err:?}");
+        // `HeaderTokenError` names the fault, never the value.
+        assert!(!format!("{err}{err:?}").contains("two words"));
+        assert!(mock.requests().is_empty());
     }
 }

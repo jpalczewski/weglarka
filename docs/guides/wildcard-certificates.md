@@ -12,7 +12,8 @@ accept_terms = true
 
 [acme.dns]
 provider = "cloudflare"
-token_file = "/var/lib/weglarka/cloudflare-token"   # a 0600 file, absolute path
+token_secret = "cloudflare-token"                    # recommended: a host secret (see below)
+# token_file = "/var/lib/weglarka/cloudflare-token" # the older form, a 0600 file — exactly one of the two
 wildcards = ["example.com"]                          # apexes: creates *.example.com + example.com
 propagation_secs = 30                                # optional (default 30): wait after publishing the TXT records
 prefer_wildcard = false                              # optional (default false): the wildcard outranks an own pair
@@ -20,11 +21,22 @@ prefer_wildcard = false                              # optional (default false):
 
 - **Cloudflare token:** create an API token with `Zone → Zone → Read` and `Zone → DNS → Edit` permissions
   **scoped to the zones in `wildcards`** (not the global API key, not an account-wide token). Such a token can
-  rewrite any record in the zone, so a leak is serious: keep it only in this file
-  (`umask 077 && printf '%s\n' '…' | sudo -u weglarka tee /var/lib/weglarka/cloudflare-token >/dev/null`) and use
-  a separate token per installation. The daemon reads the file once at startup and refuses to start when it is
-  readable by group/others (`chmod 600`), empty or contains non-ASCII characters; the value never reaches
-  `weglarka.toml`, logs, events or errors.
+  rewrite any record in the zone, so a leak is serious: keep it out of `weglarka.toml` and use a separate token
+  per installation. `[acme.dns]` needs **exactly one** of the two forms:
+    - **A host secret (recommended).** A bare name in `host-secrets.toml` (0600, next to `secrets.toml`), set
+      with `weglarka secrets host set cloudflare-token < cloudflare-token.txt` and referenced as
+      `token_secret = "cloudflare-token"`. See [host secrets](host-secrets.md).
+    - **A file (the older form, still supported).** `umask 077 && printf '%s\n' '…' | sudo -u weglarka tee
+      /var/lib/weglarka/cloudflare-token >/dev/null` with `chmod 600` and `token_file = "…"` (absolute path).
+  Setting both keys is a startup error (`[acme.dns] set exactly one of token_file / token_secret`); omitting
+  both is one too. In either form the value is validated as a header token — non-empty, printable ASCII, no CR/LF
+  — and never reaches `weglarka.toml`, logs, events or errors.
+- **Rotation without a restart:** the token is read on **every DNS API request**, so replacing the host secret or
+  rewriting the token file takes effect on the next order or renewal, in either form. No restart, no `SIGHUP`.
+- **Startup:** a broken source — a missing or unreadable file, permissions looser than 0600, a value that cannot go
+  into an HTTP header — **stops the daemon** (wildcards are opt-in, but once configured a silent skip would hide a
+  broken deployment). A host secret that is **not set yet** only warns, because it can be set only through the
+  running daemon; `doctor` reports it as a failure.
 - **Flow:** the same pass as in [ACME certificates](acme.md): after the per-domain certificates the worker orders
   the wildcard (if it is missing or `renew_before_days` days or fewer are left), creates the TXT record, waits
   for the CA's validation and **removes the record also after a failure**. A wildcard failure does not hold up
@@ -47,9 +59,10 @@ prefer_wildcard = false                              # optional (default false):
   the own one, so an expired one must not remain); to move it to the wildcard, remove its `tls/<domain>.crt|key`
   and wait for the next pass, or set `[acme.dns] prefer_wildcard` (see below), which leaves the pair on disk. A
   failed or expired wildcard = domains fall back to their own HTTP-01 certificates.
-- **`doctor`:** `acme.dns` (provider, token file mode) and `acme.wildcards` (missing/expired/due for renewal).
-  A missing wildcard before the first pass is a `warn`. `acme.certs` and `ingress.tls` (and `doctor --preflight`)
-  treat a domain covered by a wildcard as served.
+- **`doctor`:** `acme.dns` (provider and apexes), `host.credentials` (the token source — file or host secret —
+  read and validated now) and `acme.wildcards` (missing/expired/due for renewal). A missing wildcard before the
+  first pass is a `warn`. `acme.certs` and `ingress.tls` (and `doctor --preflight`) treat a domain covered by a
+  wildcard as served.
 - **DNS requirements:** the token must see the zone; the zone's CAA record (if any) must allow the CA (Let's
   Encrypt: `letsencrypt.org`). The CA queries the authoritative servers once, and a record it cannot see yet fails the
   whole order (`NXDOMAIN looking up TXT`). The daemon therefore publishes every TXT record first and waits
@@ -69,7 +82,7 @@ issued before `[acme.dns]` existed.
 ```toml
 [acme.dns]
 provider = "cloudflare"
-token_file = "/var/lib/weglarka/cloudflare-token"
+token_secret = "cloudflare-token"
 wildcards = ["example.com"]
 prefer_wildcard = true
 ```
@@ -98,3 +111,8 @@ to start** until you remove it (the same as `[acme]` in [ACME certificates](acme
 restart (this includes `propagation_secs` and `prefer_wildcard`, which an older daemon does not know); issued
 wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
 dashboard. `apps.toml`/`state.toml` did not change (no schema version bump).
+
+A `token_secret` in `[acme.dns]` does not parse on a daemon older than ADR 0080 either: switch back to
+`token_file` before downgrading, and keep the token in the file while the older daemon runs. `host-secrets.toml`
+itself is ignored by an older daemon. The field is in the table in
+[verification and rollback](verify-and-rollback.md).

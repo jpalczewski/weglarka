@@ -17,6 +17,9 @@ pub enum SecretError {
     Corrupt(String),
     #[error("invalid secret name {0:?}: expected <instance>.<name>")]
     InvalidName(String),
+    /// A host-scoped name must be a bare `<name>` (`valid_secret_name`), no `<instance>.` prefix.
+    #[error("invalid host secret name {0:?}: expected [A-Za-z0-9_-]{{1,64}} without a dot")]
+    InvalidHostName(String),
     #[error("secret value for {0} is not valid UTF-8")]
     NotUtf8(String),
     /// A reserved secret whose value has the wrong shape. Never carries the value.
@@ -120,6 +123,27 @@ pub fn split_scoped(scoped: &str) -> Result<(InstanceName, &str), SecretError> {
         return Err(bad());
     }
     Ok((inst, name))
+}
+
+/// Which namespace a store's keys live in. `App` (the default) composes `<instance>.<name>`;
+/// `Host` takes a bare `<name>` with the [`valid_secret_name`] rules (no dot). `secrets.toml` stays
+/// app-scoped; host credentials live in a separate `host-secrets.toml` (ADR 0080).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecretScope {
+    #[default]
+    App,
+    Host,
+}
+
+impl SecretScope {
+    /// Validates `name` against this scope's key rule.
+    pub fn validate_name(self, name: &str) -> Result<(), SecretError> {
+        match self {
+            Self::App => split_scoped(name).map(|_| ()),
+            Self::Host if valid_secret_name(name) => Ok(()),
+            Self::Host => Err(SecretError::InvalidHostName(name.to_owned())),
+        }
+    }
 }
 
 pub trait SecretStore: Send + Sync {

@@ -24,9 +24,9 @@ use weglarka_model::config::{
     AcmeConfig, AcmeDnsConfig, CertChoice, DnsProviderKind, WILDCARD_CERT_PREFIX,
     choose_certificate, wildcard_covers,
 };
-use weglarka_model::credential::{TokenFileError, read_private_token};
+use weglarka_model::credential::check_at_startup;
 use weglarka_model::events::{Event, EventSink};
-use weglarka_model::secret_store::SecretValue;
+use weglarka_model::secret_store::SecretStore;
 use weglarka_model::state;
 
 use crate::StartError;
@@ -91,6 +91,7 @@ pub struct Dirs {
 
 /// The configured DNS host (`[acme.dns] provider`). A new provider is a variant here and in
 /// [`DnsProviderKind`]; the worker only sees [`DnsProvider`].
+#[derive(Debug)]
 pub enum DnsBackend {
     Cloudflare(Cloudflare),
 }
@@ -406,24 +407,24 @@ fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
     )
 }
 
-/// Reads the DNS API token from a private file (0600, trailing newline dropped, printable ASCII
-/// only — it becomes an `Authorization` header). The value never appears in an error.
-fn read_token(path: &Path) -> Result<SecretValue, String> {
-    read_private_token(path).map_err(|err| {
-        // The io error's message is the useful part; the other variants already read as prose.
-        let what = match err {
-            TokenFileError::Io(e) => e.to_string(),
-            other => other.to_string(),
-        };
-        format!("[acme.dns] token_file {}: {what}", path.display())
-    })
-}
-
-/// The provider named by `[acme.dns]`, with its token read from the file.
-fn dns_backend(config: &AcmeDnsConfig) -> Result<DnsBackend, String> {
-    let token = read_token(&config.token_file)?;
+/// The provider named by `[acme.dns]`, with its credential read from the file or the host secret the
+/// config names (ADR 0080).
+///
+/// The credential is read once here so that an unusable one is a startup error (ADR 0039: wildcard
+/// certificates are opt-in, but once configured a silent skip would hide a broken deployment). A
+/// host secret that is not set yet only warns, since only the running daemon can set it; the
+/// adapter reads on every request, so a rotated token needs no restart.
+fn dns_backend(
+    config: &AcmeDnsConfig,
+    host_store: &Arc<dyn SecretStore>,
+) -> Result<DnsBackend, String> {
+    let source = config
+        .credential(host_store)
+        .ok_or_else(|| "[acme.dns] set exactly one of token_file / token_secret".to_owned())?;
+    check_at_startup(source.as_ref())
+        .map_err(|error| format!("[acme.dns] {}: {error}", source.describe()))?;
     match config.provider {
-        DnsProviderKind::Cloudflare => Cloudflare::new(&token)
+        DnsProviderKind::Cloudflare => Cloudflare::new(source)
             .map(DnsBackend::Cloudflare)
             .map_err(|e| format!("[acme.dns] {e}")),
     }
@@ -445,6 +446,7 @@ pub fn build<P: weglarka_model::podman::PodmanClient + 'static>(
     webhook_domain: &str,
     events: Arc<dyn EventSink>,
     ingress: Arc<crate::ingress::IngressManager<P>>,
+    host_secrets: Arc<dyn SecretStore>,
 ) -> Result<Option<AcmeWorker<InstantAcme>>, StartError> {
     let Some(config) = config.filter(|c| c.enabled) else {
         return Ok(None);
@@ -470,7 +472,7 @@ pub fn build<P: weglarka_model::podman::PodmanClient + 'static>(
         Box::new(move || ingress.request_apply()),
     );
     if let Some(dns) = &config.dns {
-        let backend = dns_backend(dns).map_err(StartError::Acme)?;
+        let backend = dns_backend(dns, &host_secrets).map_err(StartError::Acme)?;
         worker = worker
             .with_dns(
                 client(),
@@ -491,12 +493,38 @@ mod tests {
     use weglarka_acme::testing::FakeAcme;
     use weglarka_dns::testing::FakeDns;
     use weglarka_model::events::VecSink;
+    use weglarka_model::secret_store::SecretValue;
+    use weglarka_model::secrets::FileSecretStore;
 
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
     const DAYS: fn(u64) -> Duration = |d| Duration::from_secs(d * 24 * 3600);
+
+    /// The host secret store (`host-secrets.toml`) a `token_secret` names.
+    fn host_store(dir: &Path) -> Arc<dyn SecretStore> {
+        Arc::new(FileSecretStore::host(dir.join("host-secrets.toml")))
+    }
+
+    fn dns_config_file(path: &Path) -> AcmeDnsConfig {
+        AcmeDnsConfig {
+            provider: DnsProviderKind::Cloudflare,
+            token_file: Some(path.to_path_buf()),
+            token_secret: None,
+            wildcards: vec!["example.eu".to_owned()],
+            propagation_secs: 30,
+            prefer_wildcard: false,
+        }
+    }
+
+    fn dns_config_secret(name: &str) -> AcmeDnsConfig {
+        AcmeDnsConfig {
+            token_file: None,
+            token_secret: Some(name.to_owned()),
+            ..dns_config_file(Path::new("/unused"))
+        }
+    }
 
     struct Rig {
         dir: tempfile::TempDir,
@@ -867,28 +895,64 @@ mod tests {
     #[test]
     fn the_token_file_must_be_private_and_clean() {
         let dir = tempfile::tempdir().unwrap();
+        let store = host_store(dir.path());
         let write = |name: &str, content: &[u8], mode: u32| {
             let path = dir.path().join(name);
             std::fs::write(&path, content).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             path
         };
-        let ok = read_token(&write("ok", b"cf-token\n", 0o600)).unwrap();
-        assert_eq!(ok.expose(), b"cf-token");
+        let build = |path: &Path| dns_backend(&dns_config_file(path), &store);
+        assert!(build(&write("ok", b"cf-token\n", 0o600)).is_ok());
         for (name, content, mode, expect) in [
             ("open", &b"cf-token"[..], 0o644, "chmod 600"),
             ("empty", b"\n", 0o600, "is empty"),
             ("spaced", b"two words", 0o600, "HTTP header"),
             ("multiline", b"a\nb", 0o600, "HTTP header"),
         ] {
-            let err = read_token(&write(name, content, mode)).unwrap_err();
+            let path = write(name, content, mode);
+            let err = build(&path).unwrap_err();
+            // ADR 0080: the text names the source (`describe()`), never the value.
+            assert!(
+                err.starts_with(&format!("[acme.dns] file {}: ", path.display())),
+                "{name}: {err}"
+            );
             assert!(err.contains(expect), "{name}: {err}");
             assert!(
-                !err.contains("cf-token") && !err.contains("two words"),
-                "{err}"
+                !err.contains("cf-token") && !err.contains("two words") && !err.contains("a\nb"),
+                "{name}: {err}"
             );
         }
-        assert!(read_token(&dir.path().join("missing")).is_err());
+        let missing = dir.path().join("missing");
+        let err = build(&missing).unwrap_err();
+        assert!(
+            err.starts_with(&format!("[acme.dns] file {}: ", missing.display())),
+            "{err}"
+        );
+    }
+
+    /// `token_secret` (ADR 0080): the token comes from the host store, and a missing or unusable one
+    /// is a startup error whose text names the secret and never carries a value.
+    #[test]
+    fn a_token_secret_builds_the_backend_from_the_host_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = host_store(dir.path());
+        let config = dns_config_secret("cf-token");
+
+        // Not set yet: a warning, not a startup error (only the running daemon can set it).
+        assert!(dns_backend(&config, &store).is_ok());
+
+        store
+            .set("cf-token", SecretValue::new("two words"))
+            .unwrap();
+        let err = dns_backend(&config, &store).unwrap_err();
+        assert!(err.contains("HTTP header"), "{err}");
+        assert!(!err.contains("two words"), "{err}");
+
+        store
+            .set("cf-token", SecretValue::new("cf-token-value"))
+            .unwrap();
+        assert!(dns_backend(&config, &store).is_ok());
     }
 
     #[test]

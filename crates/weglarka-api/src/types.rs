@@ -738,6 +738,20 @@ pub struct ListSecretsResponse {
     pub secrets: Vec<SecretInfo>,
 }
 
+/// One host credential's metadata — never the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSecretInfo {
+    pub name: String,
+    /// RFC 3339.
+    pub updated_at: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListHostSecretsResponse {
+    pub secrets: Vec<HostSecretInfo>,
+}
+
 /// One configured notification channel (`GET /v1/notifications`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyChannelSummary {

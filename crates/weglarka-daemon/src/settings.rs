@@ -28,6 +28,9 @@ pub struct Paths {
     pub state_dir: PathBuf,
     pub state: StatePaths,
     pub secrets: PathBuf,
+    /// Host-level credentials (`host-secrets.toml`, ADR 0080): bare `<name>` keys, 0600, next to
+    /// the app `secrets.toml` but a separate file so a rollback never takes the app secrets down.
+    pub host_secrets: PathBuf,
     /// Host directory with `nginx.conf` (mounted into the nginx container).
     pub nginx_conf_dir: PathBuf,
     /// Durable ingress request logs (issue #502, ADR 0070): access/error files rotated and pruned by
@@ -83,6 +86,7 @@ impl Paths {
         Self {
             state: StatePaths::in_dir(&state_dir),
             secrets: state_dir.join("secrets.toml"),
+            host_secrets: state_dir.join("host-secrets.toml"),
             nginx_conf_dir: host
                 .ingress
                 .nginx_conf_dir

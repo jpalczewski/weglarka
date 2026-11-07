@@ -21,6 +21,7 @@ never renumbers the others; link to a guide by file name. Decisions and their re
 | [Shared volumes](shared-volumes.md) | One volume for several apps, groups, SQLite with several writers |
 | [Importing data](data-import.md) | Importing and exporting volumes, Coolify migration, SQLite lessons |
 | [Secrets cleanup](secrets-cleanup.md) | `secrets remove`, `apps remove --purge-secrets`, orphaned secrets |
+| [Host secrets](host-secrets.md) | `host-secrets.toml`, `weglarka secrets host set/list/remove`, rotation, `doctor` |
 | [Host config files](host-configs.md) | `config_root`, `configs`, `apps reload` |
 | [Read-only host paths](host-mounts.md) | `[runtime] host_mounts`/`group_add` allowlists, `host_mounts` and `group_add` in the spec |
 

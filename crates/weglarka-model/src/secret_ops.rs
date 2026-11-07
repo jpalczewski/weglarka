@@ -369,7 +369,9 @@ pub trait SecretOps: Send + Sync {
 }
 
 /// Where the digest of `name` lives: `<scope>.<stem>-digest` for `<scope>.<stem>-secret`, else
-/// `<name>-digest`.
+/// `<name>-digest`. App-scope only: it validates through [`split_scoped`], so a host-scoped store
+/// ([`SecretScope::Host`](crate::secret_store::SecretScope), ADR 0080) rejects every mint — minting
+/// is an app-secret operation, host credentials are set directly.
 pub fn digest_name(name: &str) -> Result<String, SecretError> {
     split_scoped(name)?;
     let base = name.strip_suffix("-secret").unwrap_or(name);

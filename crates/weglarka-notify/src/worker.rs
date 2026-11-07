@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, watch};
 use weglarka_model::app::AppsFile;
 use weglarka_model::config::NotifyConfig;
 use weglarka_model::events::{Event, EventSink, Severity};
+use weglarka_model::secret_store::SecretStore;
 use weglarka_model::state;
 
 use crate::dedup::Windows;
@@ -148,16 +149,17 @@ pub struct Notifier {
 impl Notifier {
     /// Validates the optional `[notify]` section and builds the worker (`None` = no channel).
     /// Ours is the only sink of the engine, so an invalid configuration is a startup error, not a
-    /// silent no-op.
+    /// silent no-op. `host_store` is where a `token_secret` comes from (ADR 0080).
     pub fn build(
         config: Option<&NotifyConfig>,
+        host_store: &Arc<dyn SecretStore>,
         apps_path: impl Into<PathBuf>,
         outbox_path: impl Into<PathBuf>,
     ) -> Result<Option<Self>, NotifySettingsError> {
         let Some(config) = config else {
             return Ok(None);
         };
-        let Some(settings) = NotifySettings::load(config)? else {
+        let Some(settings) = NotifySettings::load(config, host_store)? else {
             return Ok(None);
         };
         Ok(Some(Self::with_settings(

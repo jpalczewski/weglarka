@@ -3,12 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::sync::Arc;
 
 use weglarka_api::{CertStatus, CheckStatus, DoctorCheck, DoctorReport};
 use weglarka_engine::config_mounts::{self, MountStatus};
 use weglarka_engine::sites::{ServedRelease, release_id, served_release};
 use weglarka_model::app::{AppKind, AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::{IngressMode, LogRetention};
+use weglarka_model::credential::CredentialSource;
 use weglarka_model::fsutil::{PrivateFileError, check_private};
 use weglarka_model::labels;
 use weglarka_model::podman::{
@@ -121,6 +123,8 @@ pub(crate) async fn run<P: PodmanClient + 'static>(d: &Daemon<P>, access: Access
     shared_service_state(d, &mut checks);
     orphan_networks(d, &mut checks).await;
     secrets(d, &mut checks);
+    host_secrets(d, &mut checks);
+    host_credentials(d, &mut checks);
     crate::update::doctor_check(d, &mut checks);
     self_update(d, &mut checks);
     ingress(d, &mut checks).await;
@@ -2249,33 +2253,16 @@ fn acme_dns(
     certs: Option<&[certificates::Cert]>,
     out: &mut Vec<DoctorCheck>,
 ) {
-    let token = &dns.token_file;
-    match check_private(token) {
-        Ok(()) => out.push(ok(
-            "acme.dns",
-            format!(
-                "{:?}, token {}, wildcards for {}",
-                dns.provider,
-                token.display(),
-                dns.wildcards.join(", ")
-            ),
-        )),
-        Err(PrivateFileError::TooOpen { mode }) => out.push(check(
-            "acme.dns",
-            CheckStatus::Fail,
-            format!("{} has permissions {mode:o}, expected 600", token.display()),
-            Some("chmod 600; the daemon refuses a group/other-accessible DNS token"),
-        )),
-        Err(PrivateFileError::Io(e)) => out.push(check(
-            "acme.dns",
-            CheckStatus::Fail,
-            format!("{}: {}", token.display(), detail(&e)),
-            Some(
-                "put the DNS provider's API token (scoped to the wildcard zones only) in this \
-                 file with mode 600",
-            ),
-        )),
-    }
+    // The DNS token (file or `token_secret`) is checked by `host.credentials` (ADR 0080); here only
+    // the provider/wildcards row and the wildcard certificate status.
+    out.push(ok(
+        "acme.dns",
+        format!(
+            "{:?}, wildcards for {}",
+            dns.provider,
+            dns.wildcards.join(", ")
+        ),
+    ));
 
     let now = std::time::SystemTime::now();
     let window = certificates::window(config);
@@ -2737,6 +2724,95 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
                  deletes the whole scope next time",
             ),
         ));
+    }
+}
+
+/// `state.host_secrets_file` and `host.orphan_secrets` (ADR 0080): the host credential store's
+/// permissions and the names no config references.
+fn host_secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    out.push(match d.host_secrets.check_permissions() {
+        Ok(()) => ok(
+            "state.host_secrets_file",
+            "host-secrets.toml: permissions 0600 (or the file does not exist yet)",
+        ),
+        Err(e) => check(
+            "state.host_secrets_file",
+            CheckStatus::Fail,
+            detail(e),
+            Some("chmod 600 host-secrets.toml"),
+        ),
+    });
+
+    let Ok(list) = d.host_secrets.list() else {
+        return; // a malformed file is reported by `state.host_secrets_file`
+    };
+    let referenced: BTreeSet<&str> = [
+        d.host
+            .notify
+            .as_ref()
+            .and_then(|n| n.ntfy.as_ref())
+            .and_then(|n| n.token_secret.as_deref()),
+        d.host
+            .acme
+            .as_ref()
+            // A paused `[acme]` still references its secret.
+            .and_then(|a| a.dns.as_ref())
+            .and_then(|dns| dns.token_secret.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let orphans: Vec<&str> = list
+        .iter()
+        .map(|m| m.name.as_str())
+        .filter(|name| !referenced.contains(name))
+        .collect();
+    if !orphans.is_empty() {
+        out.push(check(
+            "host.orphan_secrets",
+            CheckStatus::Warn,
+            format!(
+                "host secrets not referenced by any config: {}",
+                orphans.join(", ")
+            ),
+            Some(
+                "`weglarka secrets host remove <name>`; a secret is only referenced by a \
+                 `token_secret` in [notify.ntfy] or [acme.dns]",
+            ),
+        ));
+    }
+}
+
+/// `host.credentials` (ADR 0080): every configured credential (the ntfy token and the ACME DNS
+/// token) reads and validates now. A failure names the source and the remedy, never the value.
+fn host_credentials<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    const ID: &str = "host.credentials";
+    let host_store: Arc<dyn SecretStore> = d.host_secrets.clone();
+    let mut sources: Vec<(&'static str, Arc<dyn CredentialSource>)> = Vec::new();
+    if let Some(ntfy) = d.host.notify.as_ref().and_then(|n| n.ntfy.as_ref())
+        && let Some(src) = ntfy.credential(&host_store)
+    {
+        sources.push(("notify.ntfy", src));
+    }
+    if let Some(acme) = d.host.acme.as_ref().filter(|a| a.enabled)
+        && let Some(dns) = &acme.dns
+        && let Some(src) = dns.credential(&host_store)
+    {
+        sources.push(("acme.dns", src));
+    }
+    for (config, src) in sources {
+        match src.read() {
+            Ok(_) => out.push(ok(ID, format!("{config}: {}", src.describe()))),
+            Err(error) => out.push(check(
+                ID,
+                CheckStatus::Fail,
+                format!("{config}: {}: {}", src.describe(), detail(&error)),
+                Some(
+                    "chmod 600 the token file, or `weglarka secrets host set <name>` for a host \
+                     secret (the value never appears here)",
+                ),
+            )),
+        }
     }
 }
 

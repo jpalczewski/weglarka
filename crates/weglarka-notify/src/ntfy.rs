@@ -2,13 +2,15 @@
 //!
 //! The JSON form is used instead of ntfy's header form (`Title:`, `Priority:` …) because header values
 //! must be ASCII and would need escaping for a UTF-8 title; the token, which *is* a header, is validated
-//! by the settings (printable ASCII only).
+//! by the credential source (printable ASCII only).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use weglarka_http::reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 use weglarka_http::{HttpError, Purpose};
+use weglarka_model::credential::CredentialSource;
 
 use crate::channel::{Channel, ChannelError, SendFuture};
 use crate::endpoint::Endpoint;
@@ -35,12 +37,12 @@ fn is_empty(tags: &&[String]) -> bool {
     tags.is_empty()
 }
 
-/// ntfy channel. `Debug` prints whether a token is set, never the token.
+/// ntfy channel. `Debug` prints whether a credential source is set, never its value.
 pub struct NtfyChannel {
     client: weglarka_http::reqwest::Client,
     endpoint: Endpoint,
     topic: String,
-    token: Option<String>,
+    credential: Option<Arc<dyn CredentialSource>>,
 }
 
 impl std::fmt::Debug for NtfyChannel {
@@ -48,7 +50,10 @@ impl std::fmt::Debug for NtfyChannel {
         f.debug_struct("NtfyChannel")
             .field("endpoint", &self.endpoint)
             .field("topic", &self.topic)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -57,13 +62,13 @@ impl NtfyChannel {
     pub fn new(
         endpoint: Endpoint,
         topic: impl Into<String>,
-        token: Option<String>,
+        credential: Option<Arc<dyn CredentialSource>>,
     ) -> Result<Self, HttpError> {
         Ok(Self::with_client(
             weglarka_http::client(Purpose::Notify)?,
             endpoint,
             topic,
-            token,
+            credential,
         ))
     }
 
@@ -72,13 +77,13 @@ impl NtfyChannel {
         client: weglarka_http::reqwest::Client,
         endpoint: Endpoint,
         topic: impl Into<String>,
-        token: Option<String>,
+        credential: Option<Arc<dyn CredentialSource>>,
     ) -> Self {
         Self {
             client,
             endpoint,
             topic: topic.into(),
-            token,
+            credential,
         }
     }
 
@@ -92,9 +97,23 @@ impl NtfyChannel {
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .body(body);
-        if let Some(token) = &self.token {
-            let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
-                ChannelError::Permanent("the ntfy token is not a valid header value".into())
+        if let Some(source) = &self.credential {
+            // Read on use (ADR 0080): a rotated file or host secret is picked up by the next
+            // publication. A source that cannot be read keeps the message in the outbox until the
+            // operator fixes the token, so it is a retryable failure.
+            let token = source.read().map_err(|err| {
+                ChannelError::Retryable(format!(
+                    "cannot read the ntfy token from {}: {err}",
+                    source.describe()
+                ))
+            })?;
+            let mut raw = b"Bearer ".to_vec();
+            raw.extend_from_slice(token.expose());
+            let mut value = HeaderValue::from_bytes(&raw).map_err(|_| {
+                ChannelError::Permanent(format!(
+                    "the ntfy token from {} is not a valid header value",
+                    source.describe()
+                ))
             })?;
             value.set_sensitive(true);
             request = request.header(AUTHORIZATION, value);
@@ -137,7 +156,8 @@ fn verdict(status: u16) -> Result<(), ChannelError> {
     match status {
         200..=299 => Ok(()),
         401 | 403 => Err(ChannelError::Permanent(format!(
-            "ntfy refused the access token (status {status}); check the `token_file` value"
+            "ntfy refused the access token (status {status}); check the `token_file` / `token_secret` \
+             value"
         ))),
         408 | 429 | 500..=599 => Err(ChannelError::Retryable(format!("ntfy answered {status}"))),
         300..=399 => Err(ChannelError::Permanent(format!(
@@ -152,9 +172,13 @@ fn verdict(status: u16) -> Result<(), ChannelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use weglarka_model::credential::{CredentialError, StoreCredential};
     use weglarka_model::events::Severity;
+    use weglarka_model::secret_store::{SecretStore, SecretValue};
+    use weglarka_model::secrets::FileSecretStore;
 
     fn message() -> Message {
         Message {
@@ -168,7 +192,26 @@ mod tests {
         }
     }
 
-    fn channel(addr: &str, token: Option<&str>) -> NtfyChannel {
+    /// A [`CredentialSource`] over one in-memory value, for the tests that do not exercise a real
+    /// source (`StoreCredential` covers rotation below).
+    struct FixedToken(Mutex<Option<String>>);
+
+    impl CredentialSource for FixedToken {
+        fn read(&self) -> Result<SecretValue, CredentialError> {
+            let value = self.0.lock().unwrap();
+            Ok(SecretValue::new(value.clone().unwrap_or_default()))
+        }
+
+        fn describe(&self) -> String {
+            "the test token".into()
+        }
+    }
+
+    fn token(value: &str) -> Option<Arc<dyn CredentialSource>> {
+        Some(Arc::new(FixedToken(Mutex::new(Some(value.to_owned())))))
+    }
+
+    fn channel(addr: &str, credential: Option<Arc<dyn CredentialSource>>) -> NtfyChannel {
         let (connect_host, port) = addr.rsplit_once(':').unwrap();
         let endpoint = Endpoint {
             tls: false,
@@ -177,7 +220,7 @@ mod tests {
             host: "ntfy.example.com".into(),
             path: "/".into(),
         };
-        NtfyChannel::new(endpoint, "weglarka", token.map(ToString::to_string)).unwrap()
+        NtfyChannel::new(endpoint, "weglarka", credential).unwrap()
     }
 
     async fn serve_once(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {
@@ -202,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn publishes_the_json_body_and_reports_success() {
         let (addr, request) = serve_once("HTTP/1.1 200 OK\r\n\r\n").await;
-        channel(&addr, Some("tk_secret"))
+        channel(&addr, token("tk_secret"))
             .send(&message())
             .await
             .unwrap();
@@ -237,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_token_is_permanent_and_a_server_error_is_retryable() {
         let (addr, _) = serve_once("HTTP/1.1 401 Unauthorized\r\n\r\n").await;
-        let err = channel(&addr, Some("tk_wrong"))
+        let err = channel(&addr, token("tk_wrong"))
             .send(&message())
             .await
             .unwrap_err();
@@ -260,12 +303,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_secret_is_read_on_every_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileSecretStore::host(dir.path().join("host-secrets.toml")));
+        store.set("ntfy-token", SecretValue::new("tk_one")).unwrap();
+        let source: Arc<dyn CredentialSource> =
+            Arc::new(StoreCredential::new(store.clone(), "ntfy-token"));
+
+        let (addr, request) = serve_once("HTTP/1.1 200 OK\r\n\r\n").await;
+        channel(&addr, Some(source.clone()))
+            .send(&message())
+            .await
+            .unwrap();
+        let first = request.await.unwrap();
+        assert!(
+            first
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer tk_one\r\n"),
+            "{first}"
+        );
+
+        // Rotation without a restart: the next publication reads the new value.
+        store.set("ntfy-token", SecretValue::new("tk_two")).unwrap();
+        let (addr, request) = serve_once("HTTP/1.1 200 OK\r\n\r\n").await;
+        channel(&addr, Some(source)).send(&message()).await.unwrap();
+        let second = request.await.unwrap();
+        let lower = second.to_ascii_lowercase();
+        assert!(
+            lower.contains("\r\nauthorization: bearer tk_two\r\n"),
+            "{second}"
+        );
+        assert!(!second.contains("tk_one"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_host_secret_is_retryable_and_names_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileSecretStore::host(dir.path().join("host-secrets.toml")));
+        let source: Arc<dyn CredentialSource> = Arc::new(StoreCredential::new(store, "ntfy-token"));
+        // Nothing listens there: the credential fails before anything is sent.
+        let err = channel("127.0.0.1:1", Some(source))
+            .send(&message())
+            .await
+            .unwrap_err();
+        assert!(!err.is_permanent(), "{err}");
+        let text = err.to_string();
+        // The source is named, so the operator can fix it; there is no value to leak.
+        assert!(text.contains("host secret ntfy-token"), "{text}");
+    }
+
+    #[tokio::test]
     async fn a_redirect_is_not_followed_and_is_permanent() {
         let (addr, request) = serve_once(
             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
-        let err = channel(&addr, Some("tk_secret"))
+        let err = channel(&addr, token("tk_secret"))
             .send(&message())
             .await
             .unwrap_err();
@@ -395,7 +488,7 @@ mod tests {
 
         fn trusting(roots: RootCertStore, endpoint: Endpoint) -> NtfyChannel {
             let client = weglarka_http::client_with_roots(Purpose::Notify, roots).unwrap();
-            NtfyChannel::with_client(client, endpoint, "weglarka", Some("tk_secret".into()))
+            NtfyChannel::with_client(client, endpoint, "weglarka", token("tk_secret"))
         }
 
         #[tokio::test]
@@ -475,7 +568,7 @@ mod tests {
         let channel = NtfyChannel::new(
             Endpoint::parse("https://ntfy.example.com", None).unwrap(),
             "weglarka",
-            Some("tk_super_secret".into()),
+            token("tk_super_secret"),
         )
         .unwrap();
         let debug = format!("{channel:?}");
