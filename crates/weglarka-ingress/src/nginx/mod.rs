@@ -81,7 +81,7 @@ pub const TLS_SOCKET: &str = "https.sock";
 pub const PROBE_SOCKET: &str = "probe.sock";
 pub const PROBE_CONTAINER_DIR: &str = "/run/weglarka-probe";
 /// Container directory with the HTTP basic auth `map` files (ADR 0081), `<nginx_conf_dir>/auth`: one
-/// `<instance>.map` per protected instance, holding one `"Basic <base64>" 1;` line per credential.
+/// `<instance>.map` per protected instance, holding one `"~^Basic <base64>$" 1;` line per credential.
 /// The daemon writes them (`0700`/`0600`) and the nginx **master** reads them at load and reload, so no
 /// credential is ever in this `0644` config.
 pub const BASIC_AUTH_CONTAINER_DIR: &str = "/etc/nginx/auth";

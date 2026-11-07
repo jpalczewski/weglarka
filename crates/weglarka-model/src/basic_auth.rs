@@ -73,14 +73,21 @@ impl Credentials {
         self.users.is_empty()
     }
 
-    /// The `include`d `map` body, one line per user: `"Basic <base64(user:password)>" 1;`. The base64
+    /// The `include`d `map` body, one line per user: `"~^Basic <base64(user:password)>$" 1;`. The base64
     /// is password-equivalent material, so this is rendered straight into the `0600` map file and
     /// never logged.
+    ///
+    /// The key is an anchored regex, not a plain string: nginx compares plain `map` keys **ignoring
+    /// case**, which would accept the base64 of a different password whose letters differ only in
+    /// case (and a `basic` scheme). A `~` key is case-sensitive. `+` is the only regex
+    /// metacharacter of the standard base64 alphabet and becomes `[+]`; `/` and `=` match themselves.
     pub fn nginx_map_lines(&self) -> String {
         let mut out = String::new();
         for (user, password) in &self.users {
-            let key = STANDARD.encode(format!("{user}:{password}"));
-            out.push_str(&format!("\"Basic {key}\" 1;\n"));
+            let key = STANDARD
+                .encode(format!("{user}:{password}"))
+                .replace('+', "[+]");
+            out.push_str(&format!("\"~^Basic {key}$\" 1;\n"));
         }
         out
     }
@@ -321,11 +328,22 @@ mod tests {
     fn the_map_lines_encode_user_and_password() {
         let credentials = ok(&format!("{ALICE}\nbob:123456789012\n"));
         let expected = format!(
-            "\"Basic {}\" 1;\n\"Basic {}\" 1;\n",
+            "\"~^Basic {}$\" 1;\n\"~^Basic {}$\" 1;\n",
             STANDARD.encode(ALICE),
             STANDARD.encode("bob:123456789012"),
         );
         assert_eq!(credentials.nginx_map_lines(), expected);
+    }
+
+    #[test]
+    fn a_plus_in_the_base64_is_escaped_for_the_regex_key() {
+        // `alice:p+ss/w=rd-1234>?` encodes to base64 with a `+`, the one regex metacharacter of
+        // the alphabet; nginx was checked to accept exactly this line and reject a case-flipped key.
+        let credentials = ok("alice:p+ss/w=rd-1234>?");
+        assert_eq!(
+            credentials.nginx_map_lines(),
+            "\"~^Basic YWxpY2U6cCtzcy93PXJkLTEyMzQ[+]Pw==$\" 1;\n"
+        );
     }
 
     #[test]

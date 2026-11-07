@@ -83,7 +83,10 @@ protect anything here, because the value the map compares against is password-eq
 ### Rendering
 
 - The daemon writes `<nginx_conf_dir>/auth/<instance>.map` (directory `0700`, file `0600`, atomic write), one line
-  per credential: `"Basic <base64(user:password)>" 1;`. `<nginx_conf_dir>` is already mounted whole, so no new
+  per credential: `"~^Basic <base64(user:password)>$" 1;` — an anchored, case-sensitive regex key, with `+` written
+  as `[+]` (the only regex metacharacter of the base64 alphabet). Plain `map` keys are compared **ignoring case**,
+  which would accept the base64 of a different password whose letters differ only in case; found by the end-to-end
+  test before the feature was enabled (#169). `<nginx_conf_dir>` is already mounted whole, so no new
   mount appears and the ingress hash stays the same (no recreate).
 - The generator renders, per protected instance, in `http {}`:
 
@@ -115,8 +118,8 @@ protect anything here, because the value the map compares against is password-eq
   the inherited ones); that is acceptable for an error page with no content.
 - A protected container location sends `proxy_set_header Authorization "";`, so the upstream never sees the shared
   password. Exempt locations pass `Authorization` through (that is what they are for: clients with their own tokens).
-- The match is an exact string comparison. A client that sends the scheme as `basic` instead of `Basic`, or extra
-  whitespace, gets a 401; RFC 7617 allows either case, but every common client sends `Basic`, and the error only ever
+- The match is an exact, case-sensitive comparison of the whole header (the regex key is anchored at both ends). A
+  client that sends the scheme as `basic` instead of `Basic`, or extra whitespace, gets a 401; RFC 7617 allows either case, but every common client sends `Basic`, and the error only ever
   locks a client out.
 - `NginxOptions` gets `basic_auth: BTreeMap<InstanceName, String>`: protected instances whose map file was written,
   with the container path of the file. A protected instance **without** an entry renders `return 503;` in all of
