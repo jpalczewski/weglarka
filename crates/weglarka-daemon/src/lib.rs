@@ -288,6 +288,13 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let secrets = Arc::new(FileSecretStore::new(&paths.secrets));
     secrets.init()?;
     secrets.check_permissions()?;
+    // Host credentials (ADR 0079): a separate 0600 file with bare `<name>` keys, created lazily
+    // like `secrets.toml` and held for the consumers that read them on use.
+    let host_secrets = Arc::new(FileSecretStore::host(&paths.host_secrets));
+    host_secrets.init()?;
+    host_secrets.check_permissions()?;
+    // The same store through the seam its readers hold: the ntfy channel (`token_secret`) today.
+    let host_store: Arc<dyn SecretStore> = host_secrets.clone();
     // Corrupt TOMLs surface immediately rather than at the first reconcile.
     let apps = state::load_apps(&paths.state.apps)?;
     state::load_state(&paths.state.state)?;
@@ -322,6 +329,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
     // stops the daemon instead of failing silently at the first deploy.
     let notifier = weglarka_notify::Notifier::build(
         host.notify.as_ref(),
+        &host_store,
         paths.state.apps.clone(),
         paths.notifications.clone(),
     )?;
@@ -476,6 +484,8 @@ pub async fn start_with<P: PodmanClient + 'static>(
         &host.webhook.domain,
         events,
         ingress.clone(),
+        // `[acme.dns] token_secret` reads the token from the host store on start and on use (ADR 0079).
+        Arc::clone(&host_secrets) as Arc<dyn SecretStore>,
     )?;
     let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];
     if let Some(forgejo) = &host.webhook.forgejo {
@@ -490,6 +500,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         paths: paths.clone(),
         engine: engine.clone(),
         secrets,
+        host_secrets,
         ingress: ingress.clone(),
         webhook_sources,
         notify: notify.clone(),

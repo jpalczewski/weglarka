@@ -9,10 +9,10 @@ use weglarka_api::endpoints;
 use weglarka_api::{
     AbandonReservationRequest, AbandonReservationResponse, AddAppRequest, AppSummary,
     ConfigMountStatus, ConfigMountView, DeployOutcome, DeployRequest, DeployResponse, DoctorReport,
-    ListAppsResponse, ListReservationsResponse, ListSecretsResponse, NotifyStatusResponse,
-    NotifyTestResponse, PruneImagesRequest, PruneImagesResponse, PrunedImage, ReloadAction,
-    ReloadRequest, ReloadResponse, ReservationView, RollbackResponse, SecretInfo, SetSecretRequest,
-    ShowAppResponse, StatusResponse,
+    HostSecretInfo, ListAppsResponse, ListHostSecretsResponse, ListReservationsResponse,
+    ListSecretsResponse, NotifyStatusResponse, NotifyTestResponse, PruneImagesRequest,
+    PruneImagesResponse, PrunedImage, ReloadAction, ReloadRequest, ReloadResponse, ReservationView,
+    RollbackResponse, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
 };
 use weglarka_model::app::{AppIngress, AppSpec, Digest, HealthGate, InstanceName};
 use weglarka_model::secret_store::valid_secret_name;
@@ -20,8 +20,9 @@ use weglarka_model::units::human_bytes;
 
 use crate::cli::{
     AbandonReservationArgs, AddArgs, AppsCommand, Cli, Command, DeployArgs, DoctorArgs,
-    ImagesCommand, NotifyCommand, PruneImagesArgs, ReloadArgs, RemoveArgs, ReservationsCommand,
-    RollbackArgs, SecretRemoveArgs, SecretSetArgs, SecretsCommand,
+    HostSecretRemoveArgs, HostSecretSetArgs, HostSecretsCommand, ImagesCommand, NotifyCommand,
+    PruneImagesArgs, ReloadArgs, RemoveArgs, ReservationsCommand, RollbackArgs, SecretRemoveArgs,
+    SecretSetArgs, SecretsCommand,
 };
 use crate::client::{ApiClient, ApiRequest};
 use crate::error::{CliError, Kind, exit};
@@ -64,6 +65,15 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
             secrets_list(json, &overrides, &app).await
         }
         Command::Secrets(SecretsCommand::Remove(a)) => secrets_remove(json, &overrides, a).await,
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::Set(a))) => {
+            host_secrets_set(json, &overrides, a).await
+        }
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::List)) => {
+            host_secrets_list(json, &overrides).await
+        }
+        Command::Secrets(SecretsCommand::Host(HostSecretsCommand::Remove(a))) => {
+            host_secrets_remove(json, &overrides, a).await
+        }
         Command::Doctor(a) => doctor(json, &overrides, a).await,
         Command::Volumes(c) => crate::volumes::run(json, &overrides, c).await,
         Command::Networks(c) => crate::networks::run(json, &overrides, c).await,
@@ -664,6 +674,92 @@ pub(crate) async fn secrets_remove(
             );
         }
         s
+    });
+    Ok(exit::OK)
+}
+
+// ---------- host secrets (ADR 0079) ----------
+
+pub(crate) async fn host_secrets_set(
+    json: bool,
+    o: &Overrides,
+    a: HostSecretSetArgs,
+) -> Result<i32, CliError> {
+    let name = secret_name(&a.name)?;
+    let value = read_secret_value(
+        a.from_file.as_deref(),
+        &mut std::io::stdin(),
+        std::io::stdin().is_terminal(),
+        a.raw,
+    )?;
+    let params = [("name", name)];
+    if a.dry_run {
+        DryRun::new(
+            &ApiRequest::new(endpoints::HOST_SECRETS_SET, &params),
+            Some(serde_json::json!({ "value": "<redacted>" })),
+        )
+        .print(json);
+        return Ok(exit::OK);
+    }
+    let info: HostSecretInfo = client(o)?
+        .call(
+            endpoints::HOST_SECRETS_SET,
+            &params,
+            Some(&SetSecretRequest { value }),
+        )
+        .await?;
+    emit(json, &info, || {
+        format!(
+            "set host secret {} (fingerprint {}, updated {})\n",
+            info.name, info.fingerprint, info.updated_at
+        )
+    });
+    Ok(exit::OK)
+}
+
+pub(crate) async fn host_secrets_list(json: bool, o: &Overrides) -> Result<i32, CliError> {
+    let resp: ListHostSecretsResponse = client(o)?
+        .call(endpoints::HOST_SECRETS_LIST, &[], None::<&()>)
+        .await?;
+    emit(json, &resp, || {
+        let rows = resp
+            .secrets
+            .iter()
+            .map(|s| vec![s.name.clone(), s.fingerprint.clone(), s.updated_at.clone()])
+            .collect::<Vec<_>>();
+        table(&["NAME", "FINGERPRINT", "UPDATED"], &rows)
+    });
+    Ok(exit::OK)
+}
+
+/// `secrets host remove` output: which host secret was removed.
+#[derive(Debug, Serialize)]
+struct HostSecretRemoved {
+    removed: String,
+}
+
+pub(crate) async fn host_secrets_remove(
+    json: bool,
+    o: &Overrides,
+    a: HostSecretRemoveArgs,
+) -> Result<i32, CliError> {
+    let name = secret_name(&a.name)?;
+    if a.dry_run {
+        DryRun::new(
+            &ApiRequest::new(endpoints::HOST_SECRETS_REMOVE, &[("name", name)]),
+            None,
+        )
+        .print(json);
+        return Ok(exit::OK);
+    }
+    client(o)?
+        .call_empty(endpoints::HOST_SECRETS_REMOVE, &[("name", name)])
+        .await?;
+    let out = HostSecretRemoved {
+        removed: name.to_owned(),
+    };
+    emit(json, &out, || {
+        format!("removed host secret {}\n", out.removed)
     });
     Ok(exit::OK)
 }

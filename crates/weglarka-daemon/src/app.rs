@@ -24,6 +24,9 @@ pub struct Daemon<P: PodmanClient> {
     pub paths: Paths,
     pub engine: Arc<Reconciler<P>>,
     pub secrets: Arc<FileSecretStore>,
+    /// Host-level credentials (`host-secrets.toml`, ADR 0079); held for the consumers that read
+    /// them on use, not yet read by this process.
+    pub host_secrets: Arc<FileSecretStore>,
     pub ingress: Arc<IngressManager<P>>,
     /// Enabled webhook adapters; `/webhook/{source}/{instance}` picks one by `WebhookSource::name`.
     pub webhook_sources: Vec<Box<dyn WebhookSource>>,

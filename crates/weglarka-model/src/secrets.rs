@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::{PrivateFileError, check_private, write_atomic};
 use crate::secret_store::{
-    SecretError, SecretMeta, SecretStore, SecretValue, fingerprint, split_scoped,
+    SecretError, SecretMeta, SecretScope, SecretStore, SecretValue, fingerprint,
 };
 
 #[derive(Serialize, Deserialize, Default)]
@@ -34,6 +34,7 @@ struct Entry {
 /// A file with looser permissions is rejected on every read ([`SecretError::Permissions`]).
 pub struct FileSecretStore {
     path: PathBuf,
+    scope: SecretScope,
     clock: Box<dyn Fn() -> SystemTime + Send + Sync>,
     /// Serializes the read-modify-write cycle within the process (sole writer: the daemon).
     write_lock: Mutex<()>,
@@ -45,15 +46,33 @@ fn io_err(e: io::Error) -> SecretError {
 
 impl FileSecretStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self::with_clock(path, SystemTime::now)
+        Self::with_scope(path, SecretScope::App)
+    }
+
+    /// A store of host-level credentials: bare `<name>` keys (ADR 0079), no `<instance>.` prefix.
+    pub fn host(path: impl Into<PathBuf>) -> Self {
+        Self::with_scope(path, SecretScope::Host)
+    }
+
+    pub fn with_scope(path: impl Into<PathBuf>, scope: SecretScope) -> Self {
+        Self::with_clock_and_scope(path, scope, SystemTime::now)
     }
 
     pub fn with_clock(
         path: impl Into<PathBuf>,
         clock: impl Fn() -> SystemTime + Send + Sync + 'static,
     ) -> Self {
+        Self::with_clock_and_scope(path, SecretScope::App, clock)
+    }
+
+    fn with_clock_and_scope(
+        path: impl Into<PathBuf>,
+        scope: SecretScope,
+        clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> Self {
         Self {
             path: path.into(),
+            scope,
             clock: Box::new(clock),
             write_lock: Mutex::new(()),
         }
@@ -109,7 +128,9 @@ impl FileSecretStore {
         let file: SecretsFile =
             toml::from_str(&src).map_err(|e| SecretError::Corrupt(e.message().to_owned()))?;
         for name in file.secrets.keys() {
-            split_scoped(name).map_err(|_| SecretError::Corrupt("invalid secret name".into()))?;
+            self.scope
+                .validate_name(name)
+                .map_err(|_| SecretError::Corrupt("invalid secret name".into()))?;
         }
         Ok(file)
     }
@@ -122,7 +143,7 @@ impl FileSecretStore {
 
 impl SecretStore for FileSecretStore {
     fn get(&self, name: &str) -> Result<Option<SecretValue>, SecretError> {
-        split_scoped(name)?;
+        self.scope.validate_name(name)?;
         Ok(self
             .read()?
             .secrets
@@ -131,7 +152,7 @@ impl SecretStore for FileSecretStore {
     }
 
     fn set(&self, name: &str, value: SecretValue) -> Result<(), SecretError> {
-        split_scoped(name)?;
+        self.scope.validate_name(name)?;
         let text = String::from_utf8(value.expose().to_vec())
             .map_err(|_| SecretError::NotUtf8(name.to_owned()))?;
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -147,7 +168,7 @@ impl SecretStore for FileSecretStore {
     }
 
     fn remove(&self, name: &str) -> Result<(), SecretError> {
-        split_scoped(name)?;
+        self.scope.validate_name(name)?;
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = self.read()?;
         file.secrets
@@ -302,5 +323,48 @@ mod tests {
         s.set("a.k", SecretValue::new("v")).unwrap();
         s.init().unwrap();
         assert!(s.get("a.k").unwrap().is_some());
+    }
+
+    #[test]
+    fn host_scope_takes_a_bare_name_and_keeps_the_app_scope_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileSecretStore::host(dir.path().join("host-secrets.toml"));
+        s.set("ntfy-token", SecretValue::new("s3cr3t")).unwrap();
+        assert_eq!(s.get("ntfy-token").unwrap().unwrap().expose(), b"s3cr3t");
+        s.remove("ntfy-token").unwrap();
+        assert!(s.get("ntfy-token").unwrap().is_none());
+
+        // A dot (an app-scoped composition) or other `valid_secret_name` violations are refused.
+        for bad in ["app.x", "bad name", "a.b.c", "", "x.dot"] {
+            assert!(matches!(
+                s.set(bad, SecretValue::new("v")),
+                Err(SecretError::InvalidHostName(_))
+            ));
+        }
+
+        // The app scope still requires `<instance>.<name>`.
+        let app = store(dir.path());
+        assert!(matches!(
+            app.set("ntfy-token", SecretValue::new("v")),
+            Err(SecretError::InvalidName(_))
+        ));
+        app.set("ntfy.token", SecretValue::new("v")).unwrap();
+        assert!(app.get("ntfy.token").unwrap().is_some());
+    }
+
+    #[test]
+    fn host_scope_refuses_a_corrupt_key_and_never_leaks_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileSecretStore::host(dir.path().join("host-secrets.toml"));
+        s.set("ntfy-token", SecretValue::new("TOPSECRET")).unwrap();
+        fs::write(
+            s.path(),
+            "[secrets.\"app.x\"]\nvalue = \"TOPSECRET\"\nupdated_at = \"2026-10-14T17:46:40Z\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(s.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let err = s.list().unwrap_err();
+        assert!(matches!(err, SecretError::Corrupt(_)));
+        assert!(!err.to_string().contains("TOPSECRET"));
     }
 }

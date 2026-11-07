@@ -17,10 +17,11 @@ use tokio::sync::mpsc;
 use weglarka_api::{
     AddAppRequest, ApiError, AppSummary, ConfigMountStatus, ConfigMountView, DeployOutcome,
     DeployRequest, DeployResponse, ErrorCode, HealthResponse,
-    HostMountStatus as ApiHostMountStatus, HostMountView, ListAppsResponse, ListSecretsResponse,
-    NotifyChannelSummary, NotifyStatusResponse, NotifyTestResponse, ReloadAction, ReloadRequest,
-    ReloadResponse, RollbackResponse, RunFrame, RunRequest, RuntimeState, SecretInfo,
-    SetSecretRequest, ShowAppResponse, StatusResponse, endpoints,
+    HostMountStatus as ApiHostMountStatus, HostMountView, HostSecretInfo, ListAppsResponse,
+    ListHostSecretsResponse, ListSecretsResponse, NotifyChannelSummary, NotifyStatusResponse,
+    NotifyTestResponse, ReloadAction, ReloadRequest, ReloadResponse, RollbackResponse, RunFrame,
+    RunRequest, RuntimeState, SecretInfo, SetSecretRequest, ShowAppResponse, StatusResponse,
+    endpoints,
 };
 use weglarka_engine::config_mounts::{self, MountStatus, MountView};
 use weglarka_engine::deploy::DeployOutcome as CoreOutcome;
@@ -35,7 +36,7 @@ use weglarka_model::podman::{
     ContainerFilter, ContainerInfo, ContainerState, HealthStatus, LogChunk, LogSource, PodmanClient,
 };
 use weglarka_model::secret_store::{
-    SecretError, SecretStore, SecretValue, fingerprint, is_oidc_reserved, scoped_name,
+    SecretError, SecretMeta, SecretStore, SecretValue, fingerprint, is_oidc_reserved, scoped_name,
     valid_secret_name,
 };
 use weglarka_model::state::{self, AppState};
@@ -225,6 +226,15 @@ pub(crate) fn api_routes<P: PodmanClient + 'static>() -> Router<Arc<Daemon<P>>> 
         .route(endpoints::SECRETS_LIST.path, get(list_secrets::<P>))
         .route(endpoints::SECRETS_SET.path, put(set_secret::<P>))
         .route(endpoints::SECRETS_REMOVE.path, delete(remove_secret::<P>))
+        .route(
+            endpoints::HOST_SECRETS_LIST.path,
+            get(list_host_secrets::<P>),
+        )
+        .route(endpoints::HOST_SECRETS_SET.path, put(set_host_secret::<P>))
+        .route(
+            endpoints::HOST_SECRETS_REMOVE.path,
+            delete(remove_host_secret::<P>),
+        )
         .route(endpoints::DOCTOR.path, get(run_doctor::<P>))
         .route(
             endpoints::NOTIFICATIONS_STATUS.path,
@@ -1010,6 +1020,92 @@ async fn remove_secret<P: PodmanClient + 'static>(
     let force = volumes::flag(query.as_deref(), "force");
     mutating(d.engine.remove_secret(&name, &secret, force)).await?;
     d.changed();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Host secrets (ADR 0079) ─────────────────────────────────────────────────
+/// The host store's rows as an allowlist projection (name, fingerprint, `updated_at`); the value
+/// is never part of a view.
+fn host_secret_infos<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<HostSecretInfo>> {
+    Ok(d.host_secrets
+        .list()
+        .map_err(Fail::internal)?
+        .into_iter()
+        .map(
+            |SecretMeta {
+                 name,
+                 updated_at,
+                 fingerprint,
+             }| HostSecretInfo {
+                name,
+                updated_at,
+                fingerprint,
+            },
+        )
+        .collect())
+}
+
+async fn list_host_secrets<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    let d2 = d.clone();
+    let secrets = tokio::task::spawn_blocking(move || host_secret_infos(&d2))
+        .await
+        .map_err(Fail::internal)??;
+    Ok(json(ListHostSecretsResponse { secrets }))
+}
+
+async fn set_host_secret<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    if !valid_secret_name(&name) {
+        return Err(Fail::invalid("secret name must match [A-Za-z0-9_-]{1,64}"));
+    }
+    let req: SetSecretRequest = parse_json(&body)?;
+    if req.value.is_empty() {
+        return Err(Fail::invalid("secret value must not be empty"));
+    }
+    let d2 = d.clone();
+    let secret = name.clone();
+    let info = tokio::task::spawn_blocking(move || -> ApiResult<HostSecretInfo> {
+        let value = SecretValue::new(req.value.into_bytes());
+        let fp = fingerprint(&value);
+        d2.host_secrets
+            .set(&secret, value)
+            .map_err(Fail::internal)?;
+        let updated_at = host_secret_infos(&d2)?
+            .into_iter()
+            .find(|i| i.name == secret)
+            .map(|i| i.updated_at)
+            .unwrap_or_default();
+        Ok(HostSecretInfo {
+            name: secret,
+            updated_at,
+            fingerprint: fp,
+        })
+    })
+    .await
+    .map_err(Fail::internal)??;
+    Ok(json(info))
+}
+
+async fn remove_host_secret<P: PodmanClient + 'static>(
+    State(d): Shared<P>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    if !valid_secret_name(&name) {
+        return Err(Fail::invalid("secret name must match [A-Za-z0-9_-]{1,64}"));
+    }
+    let d2 = d.clone();
+    let secret = name.clone();
+    tokio::task::spawn_blocking(move || {
+        d2.host_secrets.remove(&secret).map_err(|e| match e {
+            SecretError::NotFound(_) => Fail::not_found(format!("no host secret {secret}")),
+            other => Fail::internal(other),
+        })
+    })
+    .await
+    .map_err(Fail::internal)??;
     Ok(StatusCode::NO_CONTENT)
 }
 

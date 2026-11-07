@@ -16,6 +16,7 @@ mod forgejo;
 mod forward;
 mod generated;
 mod host_ports;
+mod host_secrets;
 mod identity;
 mod images;
 mod ingress;

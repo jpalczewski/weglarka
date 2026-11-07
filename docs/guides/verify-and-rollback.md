@@ -99,6 +99,7 @@ before the upgrade: it is the only way back across a schema version boundary.
 | `weglarka.toml` | `[metrics]` | [metrics](metrics.md) |
 | `weglarka.toml` | `[metrics] scraper` (the section can stay for a version that has it) | [metrics](metrics.md) |
 | `weglarka.toml` | `[notify]` | [notifications](notifications.md) |
+| `weglarka.toml` | `token_secret` in `[notify.ntfy]` and `[acme.dns]` — put the token back into a `0600` file and switch to `token_file` first (an older daemon rejects the key); `host-secrets.toml` itself is ignored by an older daemon | [host secrets](host-secrets.md) |
 | `weglarka.toml` | `[monitor]` | [crash detection](crash-detection.md) |
 | `weglarka.toml` | `[self_update]`, together with `systemctl --user disable --now weglarka-self-update.timer weglarka-watchdog.timer` | [self-update](self-update.md) |
 | `weglarka.toml` | `[runtime] host_mounts`, `[runtime] group_add` | [host mounts](host-mounts.md) |
