@@ -16,7 +16,7 @@ use weglarka_api::{
 };
 use weglarka_unix_http::StreamingResponse;
 
-use crate::client::{ApiClient, ApiRequest, json_body};
+use crate::client::{ApiClient, ApiRequest, json_body, report_skipped};
 use crate::commands::{client, instance};
 use crate::error::CliError;
 use crate::run::parse_timeout;
@@ -125,11 +125,13 @@ impl ForwardStream {
             };
             let data = chunk
                 .map_err(|e| CliError::internal(format!("forward stream interrupted: {e}")))?;
-            self.ready.extend(
-                self.decoder
-                    .push(&data)
-                    .map_err(|e| CliError::internal(e.to_string()))?,
-            );
+            let seen = self.decoder.skipped().len();
+            let frames = self
+                .decoder
+                .push(&data)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            report_skipped("forward", &self.decoder.skipped()[seen..]);
+            self.ready.extend(frames);
         }
     }
 }

@@ -418,17 +418,24 @@ pub(crate) async fn deploy(json: bool, o: &Overrides, a: DeployArgs) -> Result<i
 pub(crate) fn report_deploy(json: bool, name: &InstanceName, resp: &DeployResponse) -> i32 {
     emit(json, resp, || {
         let digest = resp.digest.as_ref().map(|d| d.as_str()).unwrap_or("-");
-        if resp.outcome == DeployOutcome::Provisioned {
-            format!(
+        match resp.outcome {
+            DeployOutcome::Provisioned => format!(
                 "{name}: provisioned (start = false): no container started (generation {}, digest \
                  {digest}); bring it up with `weglarka apps start {name}`\n",
                 resp.generation
-            )
-        } else {
-            format!(
-                "{}: {:?} (generation {}, digest {digest})\n",
-                name, resp.outcome, resp.generation
-            )
+            ),
+            // An outcome from a newer daemon: named as such instead of a bare `Unknown`, and never
+            // mixed up with a failure — the exit code below stays `OK`, because only a rollback is
+            // reported as one.
+            DeployOutcome::Unknown => format!(
+                "{name}: the daemon reported a deploy outcome this CLI does not know (the daemon is \
+                 newer; upgrade the CLI) (generation {}, digest {digest})\n",
+                resp.generation
+            ),
+            outcome => format!(
+                "{name}: {outcome:?} (generation {}, digest {digest})\n",
+                resp.generation
+            ),
         }
     });
     if resp.outcome == DeployOutcome::RolledBack {
@@ -438,7 +445,7 @@ pub(crate) fn report_deploy(json: bool, name: &InstanceName, resp: &DeployRespon
     }
 }
 
-async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {
+pub(crate) async fn status(json: bool, o: &Overrides) -> Result<i32, CliError> {
     let resp: StatusResponse = client(o)?.call(endpoints::STATUS, &[], None::<&()>).await?;
     emit(json, &resp, || {
         let logs = resp
@@ -1102,6 +1109,8 @@ fn render_host_mounts(mounts: &[weglarka_api::HostMountView]) -> String {
             S::Redirected => "redirected (symlink)",
             S::NotFileOrDir => "not a file or directory",
             S::Unreadable => "unreadable",
+            // A status from a newer daemon: shown, but never as ok.
+            S::Unknown => "unknown",
         };
         out.push_str(&format!("  {} -> {}  [{status}]\n", m.source, m.target));
         if let Some(detail) = &m.detail {
@@ -1122,6 +1131,12 @@ pub(crate) fn render_reload(r: &ReloadResponse) -> String {
         ),
         ReloadAction::Restarted => format!("{}: restarted\n", r.name),
         ReloadAction::Recreated => format!("{}: recreated (same digest)\n", r.name),
+        // A newer daemon did something this CLI has no word for; say so instead of claiming a result.
+        ReloadAction::Unknown => format!(
+            "{}: reloaded, but the daemon reported an action this CLI does not know \
+             (the daemon is newer; upgrade the CLI)\n",
+            r.name
+        ),
     };
     if let Some(configs) = &r.configs
         && !configs.is_empty()
@@ -1185,6 +1200,8 @@ fn config_status_label(status: ConfigMountStatus) -> &'static str {
         ConfigMountStatus::OutsideRoot => "outside-root",
         ConfigMountStatus::NotFileOrDir => "not-file-or-dir",
         ConfigMountStatus::Unreadable => "unreadable",
+        // A status from a newer daemon: never rendered as ok.
+        ConfigMountStatus::Unknown => "unknown",
     }
 }
 

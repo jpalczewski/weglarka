@@ -102,11 +102,29 @@ mod tests {
     }
 
     #[test]
-    fn garbage_and_truncation_are_refused() {
+    fn an_unknown_frame_does_not_end_the_stream() {
+        // A kind a newer daemon added: dropped, remembered, and the stream goes on.
+        let bytes = [
+            encode_frame(9, b"from a newer daemon"),
+            LogFrame::Stdout(b"hello".to_vec()).encode(),
+            LogFrame::End.encode(),
+        ]
+        .concat();
+        let mut d = LogFrameDecoder::default();
         assert_eq!(
-            LogFrameDecoder::default().push(&[9, 0, 0, 0, 0]),
-            Err(FrameError::UnknownKind(9))
+            d.push(&bytes).unwrap(),
+            [LogFrame::Stdout(b"hello".to_vec()), LogFrame::End]
         );
+        assert_eq!(d.skipped(), [9u8]);
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn garbage_and_truncation_are_refused() {
+        // An unknown kind is skipped rather than refused (the daemon may be newer); it is recorded.
+        let mut d = LogFrameDecoder::default();
+        assert_eq!(d.push(&[9, 0, 0, 0, 0]), Ok(Vec::new()));
+        assert_eq!(d.skipped(), [9u8]);
         let mut d = LogFrameDecoder::default();
         let bytes = LogFrame::Stdout(b"abc".to_vec()).encode();
         assert!(d.push(&bytes[..bytes.len() - 1]).unwrap().is_empty());

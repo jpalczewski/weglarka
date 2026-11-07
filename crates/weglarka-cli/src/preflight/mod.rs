@@ -192,6 +192,8 @@ pub fn render(report: &DoctorReport) -> String {
             CheckStatus::Ok => " OK ",
             CheckStatus::Info => "INFO",
             CheckStatus::Warn => "WARN",
+            // A status from a newer daemon: shown as a warning, never as ok (it is counted below).
+            CheckStatus::Unknown => "WARN",
             CheckStatus::Fail => "FAIL",
         };
         out.push_str(&format!("[{tag}] {:<width$}  {}\n", c.id, c.message));
@@ -204,7 +206,8 @@ pub fn render(report: &DoctorReport) -> String {
         match c.status {
             CheckStatus::Ok => ok_n += 1,
             CheckStatus::Info => info_n += 1,
-            CheckStatus::Warn => warn_n += 1,
+            // An unknown status counts as a warning: the totals always add up to the checks shown.
+            CheckStatus::Warn | CheckStatus::Unknown => warn_n += 1,
             CheckStatus::Fail => fail_n += 1,
         }
     }
@@ -212,4 +215,25 @@ pub fn render(report: &DoctorReport) -> String {
         "\n{ok_n} ok, {info_n} info, {warn_n} warn, {fail_n} fail\n"
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_status_from_a_newer_daemon_is_a_warning_and_never_ok() {
+        // The daemon never sends `unknown`: it is the fallback for a status a newer daemon invented,
+        // so it must not read as ok — neither in the tag nor in the totals.
+        let mut unknown = DoctorCheck::ok("runtime.new_probe", "from a newer daemon");
+        unknown.status = CheckStatus::Unknown;
+        let report = DoctorReport {
+            checks: vec![DoctorCheck::ok("state.api", "fine"), unknown],
+        };
+        let text = render(&report);
+        assert!(text.contains("[WARN] runtime.new_probe"), "{text}");
+        assert!(!text.contains("[ OK ] runtime.new_probe"), "{text}");
+        assert!(text.ends_with("1 ok, 0 info, 1 warn, 0 fail\n"), "{text}");
+        assert_eq!(report.exit_code(), 1);
+    }
 }

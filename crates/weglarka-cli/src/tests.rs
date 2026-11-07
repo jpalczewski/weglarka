@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use clap::{CommandFactory as _, Parser as _};
 use weglarka_api::{
     CheckStatus, ConfigMountStatus, ConfigMountView, DeployOutcome, DeployResponse, DoctorCheck,
-    DoctorReport, ErrorCode, HostSecretInfo, ListHostSecretsResponse, ListReservationsResponse,
-    NotifyStatusResponse, PruneImagesResponse, PrunedImage, ReloadAction, ReloadResponse,
-    ReservationView, RollbackResponse, RuntimeState, SetSecretRequest, ShowAppResponse,
-    UpdateAppResponse, endpoints,
+    DoctorReport, ErrorCode, HostMountStatus, HostMountView, HostSecretInfo,
+    ListHostSecretsResponse, ListReservationsResponse, NotifyStatusResponse, PruneImagesResponse,
+    PrunedImage, ReloadAction, ReloadResponse, ReservationView, RollbackResponse, RuntimeState,
+    SetSecretRequest, ShowAppResponse, UpdateAppResponse, endpoints,
 };
 use weglarka_model::app::{AppSpec, Digest, InstanceName};
 use weglarka_model::config::HostConfig;
@@ -23,7 +23,7 @@ use crate::client::{ApiClient, ApiRequest, expand_path};
 use crate::commands::{
     apps_reload, apps_remove, apps_rollback, build_spec, notify_status, notify_test,
     read_secret_value, remove_request, remove_suffix, render_notify_status, render_reload,
-    render_rollback, render_show, secret_name, secret_remove_request, secrets_remove,
+    render_rollback, render_show, secret_name, secret_remove_request, secrets_remove, status,
 };
 use crate::error::{CliError, Kind, exit};
 use crate::preflight::host::{CmdOutput, FileKind};
@@ -31,7 +31,7 @@ use crate::preflight::testing::FakeHost;
 use crate::preflight::{Context, all_checks, render, run_checks};
 use crate::update::{apply_flags, apps_start, apps_stop, render_change, runtime_label};
 
-use crate::testing::{api_err, mock, overrides, show_response, update_args};
+use crate::testing::{api_err, mock, mock_fixed, overrides, show_response, update_args};
 
 /// A subcommand's own flag with the id of a global one shares its value (`weglarka --host <url> access`
 /// once fed the panel's address to a filter), and nothing refuses that at parse time.
@@ -146,6 +146,8 @@ async fn api_errors_map_to_exit_codes() {
         (ErrorCode::InvalidRequest, exit::INVALID_REQUEST),
         (ErrorCode::Busy, exit::CONFLICT),
         (ErrorCode::Internal, exit::INTERNAL),
+        // A code from a newer daemon: a failure of ours to name, so internal (70), never a retry.
+        (ErrorCode::Unknown, exit::INTERNAL),
     ] {
         let m = mock(move |_, _| (code.http_status(), api_err(code, "boom"))).await;
         let err = ApiClient::new(&m.socket)
@@ -2366,4 +2368,95 @@ fn apps_list_has_no_section_when_no_service_is_declared() {
     let text = crate::commands::render_apps_list(&resp);
     assert!(!text.contains("Shared services"), "{text}");
     assert!(text.contains("api"), "{text}");
+}
+
+// ---------- answers from a newer daemon (issue #582) ----------
+
+/// `apps list` reads a runtime this CLI does not know as `unknown` instead of failing the answer.
+#[test]
+fn apps_list_renders_a_runtime_from_a_newer_daemon_as_unknown() {
+    let resp: weglarka_api::ListAppsResponse = serde_json::from_value(serde_json::json!({
+        "apps": [{
+            "name": "api", "image": "ghcr.io/example/api:1", "domains": ["api.example.com"],
+            "runtime": "created_by_a_newer_daemon"
+        }]
+    }))
+    .unwrap();
+    assert_eq!(resp.apps[0].runtime, RuntimeState::Unknown);
+    let text = crate::commands::render_apps_list(&resp);
+    assert!(text.contains("unknown"), "{text}");
+    assert!(!text.contains("created_by_a_newer_daemon"), "{text}");
+}
+
+/// A mount status from a newer daemon is printed as `unknown`, never as ok.
+#[test]
+fn show_renders_mount_statuses_from_a_newer_daemon_as_unknown() {
+    let mut app = show_app(true);
+    app.configs = Some(vec![ConfigMountView {
+        source: "prometheus/prometheus.yml".into(),
+        target: "/etc/prometheus/prometheus.yml".into(),
+        status: ConfigMountStatus::Unknown,
+        fingerprint: None,
+        detail: None,
+    }]);
+    app.host_mounts = Some(vec![HostMountView {
+        source: "/srv/data".into(),
+        target: "/data".into(),
+        status: HostMountStatus::Unknown,
+        detail: None,
+    }]);
+    let out = render_show(&app);
+    assert!(
+        out.contains("prometheus/prometheus.yml -> /etc/prometheus/prometheus.yml  unknown"),
+        "{out}"
+    );
+    assert!(out.contains("/srv/data -> /data  [unknown]"), "{out}");
+}
+
+/// `apps reload` names what it cannot: a newer daemon did something this CLI has no word for.
+#[test]
+fn reload_rendering_names_an_action_from_a_newer_daemon() {
+    let out = render_reload(&reload_response(ReloadAction::Unknown));
+    assert!(
+        out.starts_with(
+            "prometheus: reloaded, but the daemon reported an action this CLI does not know"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("upgrade the CLI"), "{out}");
+}
+
+/// An error code from a newer daemon is an internal error (exit 70), not a parse failure.
+#[tokio::test(flavor = "current_thread")]
+async fn an_error_code_from_a_newer_daemon_is_an_internal_error() {
+    let m = mock_fixed(500, r#"{"code":"teapot","message":"I am a teapot"}"#).await;
+    let err = status(false, &overrides(&m.socket)).await.unwrap_err();
+    assert_eq!(err.kind, Kind::Internal);
+    assert_eq!(err.exit_code(), exit::INTERNAL);
+    assert_eq!(err.message, "I am a teapot");
+    assert!(!err.is_busy());
+    assert!(
+        err.hint.unwrap_or_default().contains("does not know"),
+        "the hint names the newer daemon"
+    );
+}
+
+/// `weglarka status` reads an app state from a newer daemon: exit 0, and the row says `unknown`.
+#[tokio::test(flavor = "current_thread")]
+async fn status_reads_a_runtime_from_a_newer_daemon_as_unknown() {
+    let body = serde_json::json!({
+        "daemon_version": "9.9.9",
+        "api_version": "v1",
+        "podman_version": "6.0.0",
+        "apps": [{
+            "name": "ntfy", "image": "ghcr.io/example/ntfy:1", "domains": ["ntfy.example.com"],
+            "runtime": "created_by_a_newer_daemon"
+        }]
+    });
+    let m = mock_fixed(200, serde_json::to_string(&body).unwrap()).await;
+    let code = status(false, &overrides(&m.socket)).await.unwrap();
+    assert_eq!(code, exit::OK);
+    // The label the table prints for that row, the same one `apps list` uses.
+    let parsed: weglarka_api::StatusResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(runtime_label(parsed.apps[0].runtime), "unknown");
 }

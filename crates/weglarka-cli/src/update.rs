@@ -217,6 +217,8 @@ async fn wait_reconciled(
             return Err(CliError::internal("the daemon does not report reconciliation")
                 .with_hint("--wait needs an `admin` token or the socket, and a daemon of this CLI's version"));
         };
+        // An unknown health state from a newer daemon is not "starting": nothing here can tell it
+        // apart from a settled one, and a `--wait` that never ends is worse than one that returns.
         let starting = app.health == Some(ContainerHealth::Starting);
         if reconciled && !starting {
             return Ok(Settled::Reconciled(Box::new(app)));
@@ -637,7 +639,8 @@ pub(crate) async fn fetch_app(
     client.call(endpoints::APPS_SHOW, params, None::<&()>).await
 }
 
-/// Exit code of a successful `PUT`: a rollback is reported as such, anything else is success.
+/// Exit code of a successful `PUT`: a rollback is reported as such, anything else is success — an
+/// outcome from a newer daemon included, since nothing says the deploy was rolled back.
 pub(crate) fn deploy_exit(resp: &UpdateAppResponse) -> i32 {
     match &resp.deploy {
         Some(d) if d.outcome == DeployOutcome::RolledBack => exit::ROLLED_BACK,
@@ -881,6 +884,11 @@ pub(crate) fn render_change(
     match &r.deploy {
         Some(d) if d.outcome == DeployOutcome::Provisioned => s.push_str(&format!(
             "deploy: provisioned (start = false): no container started (generation {})\n",
+            d.generation
+        )),
+        Some(d) if d.outcome == DeployOutcome::Unknown => s.push_str(&format!(
+            "deploy: the daemon reported an outcome this CLI does not know (the daemon is newer; \
+             upgrade the CLI) (generation {})\n",
             d.generation
         )),
         Some(d) => s.push_str(&format!(

@@ -25,6 +25,11 @@ pub enum ErrorCode {
     /// Token listener only: a valid token whose scopes do not allow the endpoint.
     Forbidden,
     Internal,
+    /// An error code this client does not know, produced by a newer daemon than the one it
+    /// expects. The daemon never sends it: it only keeps a client parsing an answer it cannot
+    /// name instead of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ErrorCode {
@@ -37,6 +42,8 @@ impl ErrorCode {
             Self::Unauthorized => 401,
             Self::Forbidden => 403,
             Self::Internal => 500,
+            // Unreachable: the daemon never constructs `Unknown` (it only deserialises errors).
+            Self::Unknown => 500,
         }
     }
 }
@@ -177,6 +184,11 @@ pub enum ContainerHealth {
     Starting,
     Healthy,
     Unhealthy,
+    /// A health state this client does not know, produced by a newer daemon than the one it
+    /// expects. The daemon never sends it: it only keeps a client parsing an answer it cannot
+    /// name instead of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// State of one declared host mount as the daemon sees it (issue #178).
@@ -195,6 +207,11 @@ pub enum HostMountStatus {
     NotFileOrDir,
     /// The source cannot be statted.
     Unreadable,
+    /// A mount status this client does not know, produced by a newer daemon than the one it
+    /// expects. The daemon never sends it: it only keeps a client parsing an answer it cannot
+    /// name instead of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One host mount of an app: always read-only.
@@ -225,6 +242,11 @@ pub enum ConfigMountStatus {
     NotFileOrDir,
     /// The path is inside `config_root` but cannot be read/statted.
     Unreadable,
+    /// A mount status this client does not know, produced by a newer daemon than the one it
+    /// expects. The daemon never sends it: it only keeps a client parsing an answer it cannot
+    /// name instead of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One config mount of an app: what is declared (`source`, `target`), what the daemon sees now and
@@ -630,6 +652,11 @@ pub enum DeployOutcome {
     /// `start = false`: nothing was started. The image is pinned and the network, uid range and
     /// volumes are ready; `apps start` deploys the app later.
     Provisioned,
+    /// An outcome this client does not know, produced by a newer daemon than the one it expects.
+    /// The daemon never sends it: it only keeps a client parsing an answer it cannot name instead
+    /// of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,6 +686,11 @@ pub enum ReloadAction {
     Restarted,
     /// `recreate = true`: the container was recreated from the pinned digest (forced deploy).
     Recreated,
+    /// An action this client does not know, produced by a newer daemon than the one it expects.
+    /// The daemon never sends it: it only keeps a client parsing an answer it cannot name instead
+    /// of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `POST /v1/apps/{name}/reload` → what happened and what the app now sees.
@@ -1101,6 +1133,106 @@ mod tests {
             serde_json::to_value(RuntimeState::Unknown).unwrap(),
             "unknown"
         );
+    }
+
+    /// The contract of every response enum: a name this client does not know parses to `Unknown`
+    /// instead of failing the whole response, and every known variant still round-trips through its
+    /// exact wire spelling — the second half is what catches a fallback that silently hides a
+    /// daemon-side typo.
+    ///
+    /// `known` must list every variant a daemon may send, with its wire spelling; a new variant
+    /// belongs in the table of the test below.
+    fn assert_unknown_fallback<T>(what: &str, known: &[(&str, T)])
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
+    {
+        for (wire, value) in known {
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                *wire,
+                "{what} serialises {value:?} as {wire}"
+            );
+            let parsed: T = serde_json::from_value(serde_json::Value::String((*wire).to_owned()))
+                .unwrap_or_else(|e| panic!("{what}: {wire} does not parse: {e}"));
+            assert_eq!(parsed, *value, "{what}: {wire} parses back");
+        }
+        let unknown: T = serde_json::from_value(serde_json::Value::String(
+            "made_up_by_a_newer_daemon".to_owned(),
+        ))
+        .unwrap_or_else(|e| panic!("{what}: an unknown variant must not fail the response: {e}"));
+        assert_eq!(serde_json::to_value(unknown).unwrap(), "unknown", "{what}");
+    }
+
+    #[test]
+    fn a_response_enum_from_a_newer_daemon_deserializes_to_unknown() {
+        assert_unknown_fallback(
+            "ErrorCode",
+            &[
+                ("not_found", ErrorCode::NotFound),
+                ("already_exists", ErrorCode::AlreadyExists),
+                ("invalid_request", ErrorCode::InvalidRequest),
+                ("conflict", ErrorCode::Conflict),
+                ("busy", ErrorCode::Busy),
+                ("unauthorized", ErrorCode::Unauthorized),
+                ("forbidden", ErrorCode::Forbidden),
+                ("internal", ErrorCode::Internal),
+            ],
+        );
+        assert_unknown_fallback(
+            "ContainerHealth",
+            &[
+                ("starting", ContainerHealth::Starting),
+                ("healthy", ContainerHealth::Healthy),
+                ("unhealthy", ContainerHealth::Unhealthy),
+            ],
+        );
+        assert_unknown_fallback(
+            "HostMountStatus",
+            &[
+                ("ok", HostMountStatus::Ok),
+                ("not_allowed", HostMountStatus::NotAllowed),
+                ("missing", HostMountStatus::Missing),
+                ("redirected", HostMountStatus::Redirected),
+                ("not_file_or_dir", HostMountStatus::NotFileOrDir),
+                ("unreadable", HostMountStatus::Unreadable),
+            ],
+        );
+        assert_unknown_fallback(
+            "ConfigMountStatus",
+            &[
+                ("ok", ConfigMountStatus::Ok),
+                ("missing", ConfigMountStatus::Missing),
+                ("no_root", ConfigMountStatus::NoRoot),
+                ("outside_root", ConfigMountStatus::OutsideRoot),
+                ("not_file_or_dir", ConfigMountStatus::NotFileOrDir),
+                ("unreadable", ConfigMountStatus::Unreadable),
+            ],
+        );
+        assert_unknown_fallback(
+            "DeployOutcome",
+            &[
+                ("deployed", DeployOutcome::Deployed),
+                ("unchanged", DeployOutcome::Unchanged),
+                ("rolled_back", DeployOutcome::RolledBack),
+                ("provisioned", DeployOutcome::Provisioned),
+            ],
+        );
+        assert_unknown_fallback(
+            "ReloadAction",
+            &[
+                ("signalled", ReloadAction::Signalled),
+                ("restarted", ReloadAction::Restarted),
+                ("recreated", ReloadAction::Recreated),
+            ],
+        );
+
+        // A whole error response from a newer daemon parses too, and its status is a server error:
+        // no client-side rule can turn an unknown code into a 4xx.
+        let err: ApiError =
+            serde_json::from_str(r#"{"code":"teapot","message":"I am a teapot"}"#).unwrap();
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert_eq!(err.message, "I am a teapot");
+        assert_eq!(err.code.http_status(), 500);
     }
 }
 

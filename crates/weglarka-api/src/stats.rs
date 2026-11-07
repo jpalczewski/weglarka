@@ -15,6 +15,11 @@ pub enum StatsRole {
     Challenger,
     /// The old container that a switch is about to remove.
     Retiring,
+    /// A role this client does not know, produced by a newer daemon than the one it expects. The
+    /// daemon never sends it: it only keeps a client parsing an answer it cannot name instead of
+    /// failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Resource use of one container of an app.
@@ -58,4 +63,57 @@ pub struct StatsResponse {
     pub sampled_at: Option<String>,
     pub available: bool,
     pub apps: Vec<AppStatsResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row from a newer daemon: a role this client does not know parses to `Unknown` instead of
+    /// failing the whole `GET /v1/stats` answer.
+    #[test]
+    fn a_stats_role_from_a_newer_daemon_deserializes_to_unknown() {
+        let body = r#"{
+            "sampled_at": "2026-10-31T12:00:00Z",
+            "available": true,
+            "apps": [
+                {
+                    "app": "gitea",
+                    "sampled_at": "2026-10-31T12:00:00Z",
+                    "available": true,
+                    "containers": [
+                        {
+                            "role": "made_up_by_a_newer_daemon",
+                            "restarts": 0,
+                            "oom_killed": false,
+                            "memory_bytes": 1024,
+                            "memory_limit_bytes": null,
+                            "cpu_ratio": 0.5,
+                            "cpu_window_secs": 1.0,
+                            "cpu_seconds_total": 1.0,
+                            "pids": 3,
+                            "block_read_bytes": 0,
+                            "block_write_bytes": 0,
+                            "net_rx_bytes": 0,
+                            "net_tx_bytes": 0
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: StatsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.apps[0].containers[0].role, StatsRole::Unknown);
+        assert_eq!(serde_json::to_value(StatsRole::Unknown).unwrap(), "unknown");
+
+        // Every role a daemon may send still round-trips through its exact wire spelling.
+        for (wire, role) in [
+            ("active", StatsRole::Active),
+            ("challenger", StatsRole::Challenger),
+            ("retiring", StatsRole::Retiring),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), wire);
+            let parsed: StatsRole = serde_json::from_value(wire.into()).unwrap();
+            assert_eq!(parsed, role, "{wire}");
+        }
+    }
 }

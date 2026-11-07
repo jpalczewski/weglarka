@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 /// `Info` does not signal a problem — it reports something that is going on (e.g. a deploy) and
 /// leaves the exit code at 0. It must stay between `Ok` and `Warn`: `worst` then still reports a
 /// real warning when there is one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// The order is written by hand rather than derived, because `Unknown` must sort between `Warn` and
+/// `Fail` (an unknown check is at least a warning, never ok) while serde only accepts
+/// `#[serde(other)]` on the **last** variant of the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Ok,
@@ -15,6 +19,37 @@ pub enum CheckStatus {
     Info,
     Warn,
     Fail,
+    /// A status this client does not know, produced by a newer daemon than the one it expects. The
+    /// daemon never sends it: it only keeps a client parsing an answer it cannot name instead of
+    /// failing the whole response.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CheckStatus {
+    /// Position in the severity order: `Ok < Info < Warn < Unknown < Fail`. An unknown status is a
+    /// verdict of its own — at least a warning, never ok, but a real failure still outranks it.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Ok => 0,
+            Self::Info => 1,
+            Self::Warn => 2,
+            Self::Unknown => 3,
+            Self::Fail => 4,
+        }
+    }
+}
+
+impl PartialOrd for CheckStatus {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CheckStatus {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,11 +113,11 @@ impl DoctorReport {
             .unwrap_or(CheckStatus::Ok)
     }
 
-    /// CLI exit code: 0 = ok/info, 1 = warn, 2 = fail.
+    /// CLI exit code: 0 = ok/info, 1 = warn or a status from a newer daemon, 2 = fail.
     pub fn exit_code(&self) -> i32 {
         match self.worst() {
             CheckStatus::Ok | CheckStatus::Info => 0,
-            CheckStatus::Warn => 1,
+            CheckStatus::Warn | CheckStatus::Unknown => 1,
             CheckStatus::Fail => 2,
         }
     }
@@ -134,5 +169,58 @@ mod tests {
         report.checks[1].status = CheckStatus::Fail;
         assert_eq!(report.worst(), CheckStatus::Fail);
         assert_eq!(report.exit_code(), 2);
+    }
+
+    #[test]
+    fn an_unknown_status_is_at_least_a_warning_never_ok() {
+        // The daemon never sends `unknown`: it is the fallback for a status a newer daemon invented.
+        let parsed: CheckStatus = serde_json::from_str("\"invented_by_a_newer_daemon\"").unwrap();
+        assert_eq!(parsed, CheckStatus::Unknown);
+        assert_eq!(
+            serde_json::to_value(CheckStatus::Unknown).unwrap(),
+            "unknown"
+        );
+
+        // A lone unknown check is a warning, not a failure, and certainly not ok.
+        let unknown = DoctorReport {
+            checks: vec![check("runtime.new_thing", CheckStatus::Unknown)],
+        };
+        assert_eq!(unknown.worst(), CheckStatus::Unknown);
+        assert_eq!(unknown.exit_code(), 1);
+
+        // It outranks the statuses that mean "nothing wrong"...
+        for ok in [CheckStatus::Ok, CheckStatus::Info, CheckStatus::Warn] {
+            let report = DoctorReport {
+                checks: vec![check("a", ok), check("b", CheckStatus::Unknown)],
+            };
+            assert_eq!(report.worst(), CheckStatus::Unknown, "{ok:?}");
+            assert_eq!(report.exit_code(), 1, "{ok:?}");
+        }
+
+        // ...and a real failure still wins over it.
+        let failing = DoctorReport {
+            checks: vec![
+                check("a", CheckStatus::Unknown),
+                check("b", CheckStatus::Fail),
+            ],
+        };
+        assert_eq!(failing.worst(), CheckStatus::Fail);
+        assert_eq!(failing.exit_code(), 2);
+
+        // Every known status still round-trips through its exact wire spelling: the fallback must not
+        // hide a daemon-side typo.
+        for (wire, status) in [
+            ("ok", CheckStatus::Ok),
+            ("info", CheckStatus::Info),
+            ("warn", CheckStatus::Warn),
+            ("fail", CheckStatus::Fail),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<CheckStatus>(wire.into()).unwrap(),
+                status,
+                "{wire}"
+            );
+        }
     }
 }

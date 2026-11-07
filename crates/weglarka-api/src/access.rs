@@ -167,11 +167,29 @@ mod tests {
     }
 
     #[test]
-    fn garbage_is_refused() {
+    fn an_unknown_frame_does_not_end_the_stream() {
+        // A kind a newer daemon added: dropped, remembered, and the stream ends on its own `End`.
+        let bytes = [
+            encode_frame(9, b"from a newer daemon"),
+            AccessFrame::Entry(entry()).encode(),
+            AccessFrame::End.encode(),
+        ]
+        .concat();
+        let mut d = AccessFrameDecoder::default();
         assert_eq!(
-            AccessFrameDecoder::default().push(&[9, 0, 0, 0, 0]),
-            Err(FrameError::UnknownKind(9))
+            d.push(&bytes).unwrap(),
+            [AccessFrame::Entry(entry()), AccessFrame::End]
         );
+        assert_eq!(d.skipped(), [9u8]);
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn garbage_is_refused() {
+        // An unknown kind is skipped rather than refused (the daemon may be newer); it is recorded.
+        let mut d = AccessFrameDecoder::default();
+        assert_eq!(d.push(&[9, 0, 0, 0, 0]), Ok(Vec::new()));
+        assert_eq!(d.skipped(), [9u8]);
         assert_eq!(
             AccessFrameDecoder::default().push(&[1, 0, 0, 0, 2, b'{', b'}']),
             Ok(vec![AccessFrame::Entry(AccessEntry::default())])

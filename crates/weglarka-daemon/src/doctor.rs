@@ -2081,6 +2081,9 @@ fn acme<P: PodmanClient>(
                     due.push(cert.label());
                 }
             }
+            // Unreachable: the daemon computes this status, it never deserialises one, so no
+            // doctor problem follows from it.
+            CertStatus::Unknown => {}
         }
     }
     let status = d.acme.as_ref().map(|s| s.snapshot()).unwrap_or_default();
@@ -2286,6 +2289,8 @@ fn acme_dns(
                     due.push(name);
                 }
             }
+            // Unreachable: the daemon computes this status, it never deserialises one.
+            CertStatus::Unknown => {}
         }
     }
     let mut problems = Vec::new();
