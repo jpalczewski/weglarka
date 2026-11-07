@@ -7,8 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use weglarka_engine::platform::{
-    ActivationEpoch, ActivationReceipt, JobId, ObservedService, Platform, PlatformError, Result,
-    ScheduledJob, ServiceName, ServiceSpec, ServiceStatus,
+    ActivationEpoch, ActivationReceipt, InstalledPaths, JobId, ObservedService, Platform,
+    PlatformError, Result, ScheduledJob, ServiceName, ServiceSpec, ServiceStatus,
 };
 use weglarka_launcher::host::DEFAULT_HOST_DIR;
 use weglarka_launcher::inspect;
@@ -629,6 +629,16 @@ impl<R: CommandRunner> Platform for SystemdPlatform<R> {
             "active" | "activating" | "reloading" => ServiceStatus::Active,
             "failed" => ServiceStatus::Failed,
             _ => ServiceStatus::Inactive,
+        })
+    }
+
+    /// The two directories `install_service`/`install_user_units` write to. Read-only, and it never
+    /// runs a command: `platform install --check` (issue #610) compares files and nothing else.
+    fn installed_paths(&self) -> Result<InstalledPaths> {
+        let entry = self.entry()?;
+        Ok(InstalledPaths {
+            service_dir: self.quadlet_dir(&entry),
+            units_dir: Some(self.units_dir(&entry)),
         })
     }
 
@@ -1600,5 +1610,144 @@ mod tests {
         assert!(err.to_string().contains(WATCHDOG_TIMER), "{err}");
         // Nothing was deleted: a unit that could not be disabled is still there to retry with.
         assert!(units.join(WATCHDOG_TIMER).exists());
+    }
+
+    // ---------- `platform install --check` (issue #610) ----------
+
+    /// Settings whose every path is inside the fake root: the check must not read the real
+    /// `/etc/weglarka/weglarka.toml` or `/var/lib/weglarka`.
+    fn check_settings(dir: &Path, host_mounts: &[&str]) -> crate::settings::Settings {
+        use weglarka_model::config::HostConfig;
+        let list = host_mounts
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let host = HostConfig::from_toml_str(&format!(
+            "[runtime]\nsocket = \"/run/user/1001/podman/podman.sock\"\nhost_mounts = [{list}]\n\
+             [state]\ndir = {:?}\n\
+             [admin]\nsocket = \"/run/user/1001/weglarka/admin.sock\"\n\
+             [ingress]\nmode = \"behind\"\nbind = \"172.17.0.1:8080\"\n\
+             [webhook]\nlisten = \"0.0.0.0:9180\"\ndomain = \"weglarka.example.com\"\n",
+            dir.join("state").display().to_string()
+        ))
+        .unwrap();
+        crate::settings::Settings::from_host(host, dir.join("weglarka.toml"))
+    }
+
+    const CHECK_IMAGE: &str = "ghcr.io/example/weglarka:main";
+    const CHECK_SOCKET: &str = "/run/user/1001/podman/podman.sock";
+
+    type CheckPlatform = SystemdPlatform<Recorder>;
+
+    /// A fake root with the two directories `platform install` writes to and a `host_dir`.
+    fn check_platform(dir: &Path) -> CheckPlatform {
+        SystemdPlatform::with_runner("weglarka", Recorder::default())
+            .with_passwd(passwd_in(dir))
+            .with_quadlet_dir(dir.join("q"))
+            .with_units_dir(dir.join("units"))
+            .with_host_dir(dir.join("host"))
+    }
+
+    /// Writes exactly what `platform install` writes, through the same platform methods.
+    async fn install_for_check(p: &CheckPlatform, settings: &crate::settings::Settings) {
+        let spec = crate::service::service_spec(
+            settings,
+            PathBuf::from(CHECK_SOCKET),
+            CHECK_IMAGE.to_owned(),
+        );
+        p.install_service(&spec).await.unwrap();
+        let mut units = crate::self_update::units(settings).unwrap();
+        units.extend(crate::self_update::watchdog_units(settings).unwrap());
+        p.install_user_units(&units).await.unwrap();
+    }
+
+    fn check(
+        p: &CheckPlatform,
+        settings: &crate::settings::Settings,
+        dir: &Path,
+    ) -> crate::install_check::Report {
+        crate::install_check::run(
+            p,
+            settings,
+            PathBuf::from(CHECK_SOCKET),
+            &dir.join("host"),
+            Some(CHECK_IMAGE.to_owned()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn check_after_install_matches_and_runs_no_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = check_platform(dir.path());
+        let settings = check_settings(dir.path(), &[]);
+        install_for_check(&p, &settings).await;
+        let installed_calls = p.runner.calls();
+        assert_eq!(installed_calls.len(), 2, "{installed_calls:?}");
+
+        let quadlet = dir.path().join("q").join("weglarka.container");
+        let before = std::fs::read_to_string(&quadlet).unwrap();
+        let before_mtime = std::fs::metadata(&quadlet).unwrap().modified().unwrap();
+
+        let report = check(&p, &settings, dir.path());
+
+        assert!(report.is_clean(), "{report}");
+        // Only the two `daemon-reload` of the install: the check runs nothing, `daemon-reload`
+        // included.
+        assert_eq!(p.runner.calls(), installed_calls);
+        assert_eq!(std::fs::read_to_string(&quadlet).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&quadlet).unwrap().modified().unwrap(),
+            before_mtime
+        );
+    }
+
+    #[tokio::test]
+    async fn check_reports_a_host_mounts_entry_added_after_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = check_platform(dir.path());
+        // Installed without the entry, then `weglarka.toml` gains one: the quadlet lacks the mount.
+        install_for_check(&p, &check_settings(dir.path(), &[])).await;
+        let report = check(
+            &p,
+            &check_settings(dir.path(), &["/var/log/journal"]),
+            dir.path(),
+        );
+
+        assert!(!report.is_clean(), "{report}");
+        let container = report
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("weglarka.container"))
+            .unwrap();
+        let crate::install_check::Verdict::Differs(diff) = &container.verdict else {
+            panic!("{report}");
+        };
+        assert!(
+            diff.contains("+ Volume=/var/log/journal:/var/log/journal:ro"),
+            "{diff}"
+        );
+        // The check compares; it never touches the installed file.
+        let installed = std::fs::read_to_string(&container.path).unwrap();
+        assert!(!installed.contains("/var/log/journal"), "{installed}");
+    }
+
+    #[tokio::test]
+    async fn check_only_reads_a_read_only_quadlet_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = check_platform(dir.path());
+        let settings = check_settings(dir.path(), &[]);
+        install_for_check(&p, &settings).await;
+        let quadlets = dir.path().join("q");
+        std::fs::set_permissions(&quadlets, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let report = check(&p, &settings, dir.path());
+
+        // Restore before the tempdir is dropped (remove_dir_all needs to write into it).
+        std::fs::set_permissions(&quadlets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(report.is_clean(), "{report}");
     }
 }

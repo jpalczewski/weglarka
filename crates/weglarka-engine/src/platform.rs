@@ -165,6 +165,18 @@ pub struct UnitFile {
     pub content: String,
 }
 
+/// Absolute locations [`Platform::install_service`] and [`Platform::install_user_units`] write to.
+/// Read-only: the files are named by the callers, the adapter only says where they belong (issue
+/// #610, `platform install --check`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPaths {
+    /// The service definition (systemd: the quadlet directory).
+    pub service_dir: PathBuf,
+    /// Plain user units (systemd: `~/.config/systemd/user`); `None` where the adapter has no such
+    /// directory (OpenRC keeps its periodic work in a cron block).
+    pub units_dir: Option<PathBuf>,
+}
+
 pub trait Platform: Send + Sync {
     fn kind(&self) -> PlatformKind;
 
@@ -182,6 +194,14 @@ pub trait Platform: Send + Sync {
 
     /// Removes user units by file name; missing files are not an error.
     fn remove_user_units(&self, names: &[&str]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Where [`install_service`](Self::install_service) and
+    /// [`install_user_units`](Self::install_user_units) write; read-only and synchronous, so a
+    /// comparison (`platform install --check`, issue #610) needs no write path and no service
+    /// manager. A missing directory is not an error — it means every file is missing.
+    fn installed_paths(&self) -> Result<InstalledPaths> {
+        Err(PlatformError::NotImplemented("installed_paths"))
+    }
 
     /// Restarts the service — the host-side switcher applies a new image this way, so a failed
     /// restart is the switcher's, not the container's, error to report.

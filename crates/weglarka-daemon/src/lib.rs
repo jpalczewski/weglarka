@@ -31,6 +31,9 @@ pub mod health_probe;
 pub mod identity;
 pub mod images;
 pub mod ingress;
+/// `platform install --check`: compare the files an install would write with the installed ones
+/// (issue #610).
+pub mod install_check;
 pub mod log_retention;
 pub mod logs;
 pub mod metrics;

@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
+use weglarka_daemon::install_check;
 use weglarka_daemon::openrc::OpenRcPlatform;
 use weglarka_daemon::platform::{
     SELF_UPDATE_TIMER, SystemdPlatform, WATCHDOG_TIMER, render, run_args,
@@ -96,9 +97,14 @@ enum PlatformAction {
         /// Only print the files, write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Węglarka container image.
-        #[arg(long, default_value = DEFAULT_IMAGE)]
-        image: String,
+        /// Compare the files an install would write with the installed ones: write nothing, run no
+        /// `daemon-reload`, and exit 1 when an install is needed (issue #610).
+        #[arg(long, conflicts_with = "dry_run")]
+        check: bool,
+        /// Węglarka container image (default: `ghcr.io/jpalczewski/weglarka:latest`); with `--check`,
+        /// leaving it out also skips the `Image=` line, which `self-update` pins.
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Prints the `podman run` arguments equivalent to the quadlet (one per line) — for CI tests.
     RunArgs {
@@ -252,9 +258,28 @@ async fn run_platform<P: Platform>(
                 println!("{a}");
             }
         }
-        PlatformAction::Install { dry_run, image } => {
+        PlatformAction::Install {
+            dry_run,
+            check,
+            image,
+        } => {
             let socket = host_socket(&settings, platform).await?;
-            let spec = service_spec(&settings, socket, image);
+            // `--check` renders and compares only; it shares the renderers with the write path below
+            // and never reaches `install_service`/`install_user_units`.
+            if check {
+                let report = install_check::run(platform, &settings, socket, &host_dir, image)?;
+                println!("{report}");
+                if !report.is_clean() {
+                    // Exit code 1: an install is needed, the check itself worked.
+                    return Err(install_check::InstallNeeded.into());
+                }
+                return Ok(());
+            }
+            let spec = service_spec(
+                &settings,
+                socket,
+                image.unwrap_or_else(|| DEFAULT_IMAGE.to_owned()),
+            );
             let mut units = weglarka_daemon::self_update::units(&settings)?;
             units.extend(weglarka_daemon::self_update::watchdog_units(&settings)?);
             if dry_run {
@@ -464,8 +489,36 @@ async fn run_daemon(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    // Single thread: the host-side subcommands need no pool (RAM), and the daemon itself is a tokio
+    // application either way — the same shape as the CLI's `main`.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    std::process::ExitCode::from(exit_code(rt.block_on(run())))
+}
+
+/// The daemon's exit-code ladder (`platform install --check`, issue #610): `0` success, `1` an install
+/// is needed, `2` the command failed.
+///
+/// `1` used to mean "any error" (anyhow's default). It now means one thing only, which is why every
+/// other failure moved to `2` — no docs page documented a daemon exit code before this, and the doctor
+/// report already uses the same 0/1/2 ladder.
+fn exit_code(result: Result<()>) -> u8 {
+    match result {
+        Ok(()) => 0,
+        // Found drift: an install is needed, the check itself worked. The report already said what;
+        // the exit code is the machine-readable half.
+        Err(e) if e.downcast_ref::<install_check::InstallNeeded>().is_some() => 1,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            2
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
     if let Some(Command::Forward { routes }) = cli.command {
@@ -538,5 +591,54 @@ async fn run_platform_dispatch(
                 .with_state_dir(state_dir);
             run_platform(&platform, settings, action, host_dir).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--check` is a sibling of `--dry-run`, and the two contradict each other (issue #610).
+    #[test]
+    fn check_parses_and_conflicts_with_dry_run() {
+        let cli =
+            Cli::try_parse_from(["weglarka-daemon", "platform", "install", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Platform {
+                action: PlatformAction::Install {
+                    check: true,
+                    dry_run: false,
+                    image: None,
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "weglarka-daemon",
+                "platform",
+                "install",
+                "--check",
+                "--dry-run",
+            ])
+            .is_err()
+        );
+    }
+
+    /// The ladder `platform install --check` relies on: drift is 1, a broken command is 2, success is
+    /// 0 — and a `.context()` on the dispatch path would hide the marker and silently turn drift into
+    /// a failure, which is why that call stays unwrapped.
+    #[test]
+    fn the_exit_code_ladder() {
+        assert_eq!(exit_code(Ok(())), 0);
+        let needed: Result<()> = Err(install_check::InstallNeeded.into());
+        assert_eq!(exit_code(needed), 1);
+        let broken: Result<()> = Err(anyhow::anyhow!("podman socket missing"));
+        assert_eq!(exit_code(broken), 2);
+        // `anyhow` downcasts through the context chain, so a `.context(..)` on the dispatch path keeps
+        // the marker reachable; this pins that, because losing it would turn exit 1 into 2.
+        let wrapped: Result<()> =
+            Err(anyhow::Error::from(install_check::InstallNeeded).context("platform command"));
+        assert_eq!(exit_code(wrapped), 1);
     }
 }
