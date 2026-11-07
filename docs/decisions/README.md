@@ -87,3 +87,4 @@ entries are numbered consecutively (`0001`, `0002`, …) and the skeleton is
 | [0078](0078-oauth-protected-resources.md) | OAuth-protected resource paths and generated discovery routes |
 | [0079](0079-managed-shared-services.md) | Managed shared services: model, wiring and per-kind rollout |
 | [0080](0080-host-credentials.md) | Host credentials behind one secret abstraction |
+| [0081](0081-http-basic-auth.md) | HTTP Basic auth in the ingress nginx |
