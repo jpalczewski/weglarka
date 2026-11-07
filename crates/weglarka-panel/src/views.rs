@@ -59,6 +59,8 @@ pub fn health_badge(health: ContainerHealth) -> Badge {
         ContainerHealth::Healthy => "ok",
         ContainerHealth::Starting => "warn",
         ContainerHealth::Unhealthy => "fail",
+        // A health from a newer daemon: not a problem we can name, so no verdict.
+        ContainerHealth::Unknown => "muted",
     };
     Badge::new(class, name_of(&health))
 }
@@ -68,6 +70,8 @@ pub fn check_badge(status: CheckStatus) -> Badge {
         CheckStatus::Ok => ("ok", "OK"),
         CheckStatus::Info => ("info", "Info"),
         CheckStatus::Warn => ("warn", "Warning"),
+        // A status from a newer daemon (it sorts between `Warn` and `Fail`): never shown as ok.
+        CheckStatus::Unknown => ("warn", "Unknown"),
         CheckStatus::Fail => ("fail", "Failing"),
     };
     Badge::new(class, text)
@@ -350,6 +354,8 @@ fn mount_line(name: &str, target: &str, read_only: bool) -> String {
 }
 
 fn config_mount_badge(status: ConfigMountStatus) -> Badge {
+    // Anything that is not `ok` is rendered as not-ok: an unknown status from a newer daemon must
+    // never show up as a healthy mount.
     let class = if status == ConfigMountStatus::Ok {
         "ok"
     } else {
@@ -359,6 +365,7 @@ fn config_mount_badge(status: ConfigMountStatus) -> Badge {
 }
 
 fn host_mount_badge(status: HostMountStatus) -> Badge {
+    // As in `config_mount_badge`: an unknown status from a newer daemon is deliberately not-ok.
     let class = if status == HostMountStatus::Ok {
         "ok"
     } else {
@@ -384,6 +391,10 @@ pub struct CheckGroup {
 pub fn doctor_groups(checks: &[DoctorCheck]) -> Vec<CheckGroup> {
     [
         CheckStatus::Fail,
+        // A status from a newer daemon: it is a real check and must not disappear from the page (the
+        // total counts it), so it gets a group. Worst first, as `CheckStatus`'s `Ord` ranks it: above
+        // `Warn`, below `Fail`.
+        CheckStatus::Unknown,
         CheckStatus::Warn,
         CheckStatus::Info,
         CheckStatus::Ok,
@@ -420,7 +431,8 @@ pub fn doctor_summary(checks: &[DoctorCheck]) -> (Badge, String) {
         format!(
             "{} failing, {} warnings, {} total",
             count(CheckStatus::Fail),
-            count(CheckStatus::Warn),
+            // An unknown status from a newer daemon is counted as a warning, as `check_badge` shows it.
+            count(CheckStatus::Warn) + count(CheckStatus::Unknown),
             checks.len()
         ),
     )
@@ -486,6 +498,8 @@ fn cert_row(c: &CertificateRecord) -> CertRow {
         CertStatus::Expired => ("fail", "expired"),
         CertStatus::Missing => ("fail", "missing key or certificate"),
         CertStatus::Covered => ("info", "covered by wildcard"),
+        // A status from a newer daemon: no verdict to give, and certainly not "valid".
+        CertStatus::Unknown => ("muted", "unknown"),
     };
     let coverage = match (&c.covered_by, c.wildcard) {
         (Some(by), _) => format!("covered by {by}"),
@@ -978,6 +992,7 @@ fn stats_role(role: StatsRole) -> &'static str {
         StatsRole::Active => "active",
         StatsRole::Challenger => "challenger",
         StatsRole::Retiring => "retiring",
+        StatsRole::Unknown => "unknown",
     }
 }
 

@@ -98,6 +98,8 @@ async fn grouped<P: PodmanClient>(
                     StatsRole::Active => 0,
                     StatsRole::Challenger => 1,
                     StatsRole::Retiring => 2,
+                    // Unreachable: the daemon maps a role itself, it never deserialises one.
+                    StatsRole::Unknown => 3,
                 });
             }
             (Some(rfc3339(snapshot.taken_at)), true, apps)

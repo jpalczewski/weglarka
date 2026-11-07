@@ -16,6 +16,11 @@ pub enum CertStatus {
     Missing,
     /// No certificate of its own, served by a valid wildcard (`covered_by`).
     Covered,
+    /// A certificate state this client does not know, produced by a newer daemon than the one it
+    /// expects. The daemon never sends it: it only keeps a client parsing an answer it cannot
+    /// name instead of failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One certificate, or one routed domain served by a wildcard.
@@ -58,4 +63,48 @@ pub struct CertificatesResponse {
     /// unreadable `apps.toml` is not counted.
     pub failures: u32,
     pub certificates: Vec<CertificateRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record from a newer daemon: a status this client does not know parses to `Unknown` instead
+    /// of failing the whole `GET /v1/certificates` answer.
+    #[test]
+    fn a_certificate_status_from_a_newer_daemon_deserializes_to_unknown() {
+        let body = r#"{
+            "acme_enabled": true,
+            "renew_before_days": 14,
+            "failures": 0,
+            "certificates": [
+                {
+                    "id": "app.example.com",
+                    "names": ["app.example.com"],
+                    "wildcard": false,
+                    "status": "made_up_by_a_newer_daemon",
+                    "failed": false
+                }
+            ]
+        }"#;
+        let parsed: CertificatesResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.certificates[0].status, CertStatus::Unknown);
+        assert_eq!(
+            serde_json::to_value(CertStatus::Unknown).unwrap(),
+            "unknown"
+        );
+
+        // Every status a daemon may send still round-trips through its exact wire spelling.
+        for (wire, status) in [
+            ("valid", CertStatus::Valid),
+            ("renewal_due", CertStatus::RenewalDue),
+            ("expired", CertStatus::Expired),
+            ("missing", CertStatus::Missing),
+            ("covered", CertStatus::Covered),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), wire);
+            let parsed: CertStatus = serde_json::from_value(wire.into()).unwrap();
+            assert_eq!(parsed, status, "{wire}");
+        }
+    }
 }

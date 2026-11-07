@@ -257,7 +257,11 @@ async fn fake_daemon(script: Script) -> Mock {
             "/v1/doctor" => json_reply(json!({"checks": [
                 { "id": "runtime.podman", "status": "ok", "message": "podman 6.1" },
                 { "id": "acme.dns", "status": "warn", "message": "no DNS provider", "hint": "set [acme.dns]" },
-                { "id": "state.orphan", "status": "fail", "message": "orphan <b>secret</b>" }]})),
+                { "id": "state.orphan", "status": "fail", "message": "orphan <b>secret</b>" },
+                // A check a newer daemon added (issue #582): it must show up as a warning, not
+                // disappear from the page while the total still counts it.
+                { "id": "runtime.new_probe", "status": "invented_by_a_newer_daemon",
+                  "message": "a check this panel cannot name" }]})),
             "/v1/events" => {
                 let since: u64 = seen
                     .query
@@ -546,6 +550,13 @@ async fn pages_show_status_as_words_and_group_doctor_checks() {
     let ok = doctor.find(">OK<").unwrap();
     assert!(failing < warning && warning < ok, "worst group first");
     assert!(doctor.contains("Hint: set [acme.dns]"));
+    // A status from a newer daemon is its own group, worst first between the failures and the ok
+    // checks — and never in the ok group (that is what dropping it from the grouping would do).
+    let unknown = doctor
+        .find("a check this panel cannot name")
+        .expect("an unknown check still renders");
+    assert!(failing < unknown && unknown < warning, "worst group first");
+    assert!(doctor.contains("Unknown"), "{doctor}");
     let (_, _, certs) = get(&site, Some(&who), "/certificates").await;
     assert!(
         certs.contains("covered by star")

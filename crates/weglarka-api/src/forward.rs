@@ -125,11 +125,32 @@ mod tests {
     }
 
     #[test]
-    fn garbage_and_truncation_are_refused() {
+    fn an_unknown_frame_does_not_end_the_stream() {
+        // A kind a newer daemon added: dropped, remembered, and the stream keeps going.
+        let bytes = [
+            encode_frame(9, b"from a newer daemon"),
+            ForwardFrame::Ready { host_port: 43211 }.encode(),
+            ForwardFrame::Keepalive.encode(),
+        ]
+        .concat();
+        let mut d = ForwardFrameDecoder::default();
         assert_eq!(
-            ForwardFrameDecoder::default().push(&[9, 0, 0, 0, 0]),
-            Err(FrameError::UnknownKind(9))
+            d.push(&bytes).unwrap(),
+            [
+                ForwardFrame::Ready { host_port: 43211 },
+                ForwardFrame::Keepalive
+            ]
         );
+        assert_eq!(d.skipped(), [9u8]);
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn garbage_and_truncation_are_refused() {
+        // An unknown kind is skipped rather than refused (the daemon may be newer); it is recorded.
+        let mut d = ForwardFrameDecoder::default();
+        assert_eq!(d.push(&[9, 0, 0, 0, 0]), Ok(Vec::new()));
+        assert_eq!(d.skipped(), [9u8]);
         assert_eq!(
             ForwardFrameDecoder::default().push(&[1, 0, 0, 0, 1, 7]),
             Err(FrameError::Malformed("ready"))

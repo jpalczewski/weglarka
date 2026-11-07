@@ -133,6 +133,7 @@ fn role(role: StatsRole) -> &'static str {
         StatsRole::Active => "active",
         StatsRole::Challenger => "challenger",
         StatsRole::Retiring => "retiring",
+        StatsRole::Unknown => "unknown",
     }
 }
 

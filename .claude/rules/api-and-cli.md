@@ -30,6 +30,24 @@ paths:
   and `oidc.audience` lose their query (their path stays visible on purpose: public registration data, a credential there is unsupported). A new free-text field needs an explicit decision
   there, not a pass-through. `ShowAppResponse` carries `redacted: true` whenever this applies, and
   the CLI refuses to write such a spec back.
+- **A response enum tolerates a variant it does not know (#582):** every unit-variant enum declared in `weglarka-api`
+  that a client deserialises from a daemon answer ends with `#[serde(other)] Unknown`, documented like
+  `RuntimeState::Unknown` — the fallback for a name a
+  newer daemon invented; the daemon never constructs it (an answer is additive, never a parse failure for an older
+  CLI). Clients render it `unknown`; `doctor` treats an unknown `CheckStatus` as at least a warning, never `ok` (the
+  hand-written `Ord` places it between `Warn` and `Fail`); a panel badge never shows it as `ok`. Every exhaustive
+  match over such an enum gets an explicit arm — that arm is where the decision belongs (an unknown certificate
+  status must not read as `valid`), never a `_` catch-all. This is what makes adding a variant to a response enum
+  additive. Known gap, [#642](https://github.com/jpalczewski/weglarka/issues/642): `weglarka-model` enums travel in answers
+  too (`Severity` in `EventRecord`, `IngressMode` and `min_severity` in `ConfigView`, `AppKind`, …) and have no
+  fallback yet; they also parse our TOML files under `deny_unknown_fields`, so theirs is a separate decision.
+- **A contract test per response enum:** an unknown string parses to `Unknown` **and** every known variant still
+  round-trips through its exact wire spelling (`to_value(v) == wire` and `from_value(wire) == v`) — the second half
+  is what catches a fallback that silently hides a daemon-side typo. A stream frame is not JSON: `FrameDecoder`
+  skips a kind it does not know — it drops that frame, records the kind once through `skipped()` and keeps the
+  stream alive — and the consumer may report it (the CLI prints one line per newly skipped kind, the panel is
+  silent). A skipped kind is not a way around the limit: an oversized length ends the stream whatever the kind
+  (`TooLarge`, checked before the kind is decoded), while `Malformed` can only come from a frame of a known kind.
 - **Doctor free-form text (#272/#276):** `doctor::run` takes the caller's `Access`; a check interpolates any error text it
   does not author itself (engine, Podman, I/O, the first-deploy reason) through `doctor::detail(..)`, and `apply_access`
   keeps it for `Full` callers and replaces it with a marker for `Redacted` ones. A new check follows the same rule. `runtime.memory` (#416) is a projection of `Daemon::resources` (the shared snapshot, never libpod itself).

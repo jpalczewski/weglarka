@@ -1307,8 +1307,10 @@ mod tests {
         Frames(Vec<TestFrame>),
         /// Frames, then the connection breaks.
         Broken(Vec<TestFrame>),
-        /// Garbage that is not a frame.
-        Garbage,
+        /// A frame the decoder refuses: an oversized payload of a kind this feed does know.
+        Refused,
+        /// A frame kind this feed does not know: a newer daemon. The decoder skips it.
+        UnknownKind,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1418,8 +1420,18 @@ mod tests {
         let (frames, broken) = match step {
             Step::Frames(f) => (f, false),
             Step::Broken(f) => (f, true),
-            Step::Garbage => {
-                return TestConn(VecDeque::from([Some(Bytes::from_static(&[9, 0, 0, 0, 0]))]));
+            Step::Refused => {
+                return TestConn(VecDeque::from([Some(Bytes::from_static(&[
+                    1, 0xff, 0xff, 0xff, 0xff,
+                ]))]));
+            }
+            Step::UnknownKind => {
+                let bytes = [
+                    weglarka_api::encode_frame(9, b"from a newer daemon"),
+                    weglarka_api::encode_frame(3, &[]),
+                ]
+                .concat();
+                return TestConn(VecDeque::from([Some(Bytes::from(bytes))]));
             }
         };
         let mut chunks: VecDeque<Option<Bytes>> = frames
@@ -1593,12 +1605,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupted_stream_ends_with_a_notice() {
-        let r = rig(Step::Garbage, vec![]);
+        let r = rig(Step::Refused, vec![]);
         let events = drain(r.driver, 10).await;
         assert!(
             events[0].contains("corrupted") && events[1].contains("done"),
             "{events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_frame_is_skipped_and_the_stream_ends_normally() {
+        // A kind a newer daemon added is not a corruption: the stream goes on to its `End`.
+        let r = rig(Step::UnknownKind, vec![]);
+        let events = drain(r.driver, 10).await;
+        assert!(
+            events[0].contains("ended") && !events[0].contains("corrupted"),
+            "{events:?}"
+        );
+        assert!(events[1].contains("done"), "{events:?}");
     }
 
     #[tokio::test]

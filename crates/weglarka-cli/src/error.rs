@@ -158,6 +158,14 @@ impl CliError {
                 Kind::Internal,
                 Some("details in the daemon logs (`journalctl --user -u weglarka`)"),
             ),
+            // A code from a newer daemon: the request failed, but this CLI cannot say how.
+            ErrorCode::Unknown => (
+                Kind::Internal,
+                Some(
+                    "the daemon reported an error code this CLI does not know (the daemon is newer); \
+                     details in the daemon logs (`journalctl --user -u weglarka`)",
+                ),
+            ),
         };
         let mut err = Self::new(kind, message);
         err.hint = hint.map(str::to_owned);

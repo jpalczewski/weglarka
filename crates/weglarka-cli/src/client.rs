@@ -75,12 +75,25 @@ impl<F: FrameKind> FrameStream<F> {
             let data = chunk.map_err(|e| {
                 CliError::internal(format!("{} stream interrupted: {e}", self.what))
             })?;
-            self.ready.extend(
-                self.decoder
-                    .push(&data)
-                    .map_err(|e| CliError::internal(e.to_string()))?,
-            );
+            let seen = self.decoder.skipped().len();
+            let frames = self
+                .decoder
+                .push(&data)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            report_skipped(self.what, &self.decoder.skipped()[seen..]);
+            self.ready.extend(frames);
         }
+    }
+}
+
+/// Says once per kind, on stderr, that the stream carried frames this CLI does not know: the daemon
+/// is newer (a frame of an unknown kind is skipped by `FrameDecoder`, it does not end the stream).
+pub(crate) fn report_skipped(what: &str, kinds: &[u8]) {
+    for kind in kinds {
+        eprintln!(
+            "weglarka: skipped a {what} frame this CLI does not know (kind {kind}) \
+             — the daemon is newer; upgrade the CLI"
+        );
     }
 }
 

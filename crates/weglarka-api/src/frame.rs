@@ -16,6 +16,9 @@ pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 pub enum FrameError {
     #[error("stream frame of {0} bytes exceeds the limit")]
     TooLarge(usize),
+    /// A kind this frame enum does not define (a newer daemon, an older client).
+    /// [`FrameDecoder`] does not end the stream over it: it drops that frame and records the kind
+    /// (`FrameDecoder::skipped`).
     #[error("stream has an unknown frame kind {0}")]
     UnknownKind(u8),
     #[error("stream has a malformed {0} frame")]
@@ -37,7 +40,9 @@ pub trait FrameKind: Sized {
     /// encoding a log chunk copies it once, into the output buffer.
     fn parts(&self) -> (u8, Cow<'_, [u8]>);
 
-    /// The frame for a kind byte and payload, or [`FrameError`] for an unknown kind or a bad payload.
+    /// The frame for a kind byte and payload, or [`FrameError`] for an unknown kind or a bad
+    /// payload. [`FrameError::UnknownKind`] is not fatal to a decoder: it skips that frame (a newer
+    /// daemon sent a kind this client does not know yet) and keeps the stream alive.
     fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError>;
 }
 
@@ -64,6 +69,9 @@ pub trait ControlFrame {
 #[derive(Debug)]
 pub struct FrameDecoder<F> {
     buf: Vec<u8>,
+    /// Kinds this decoder did not know and skipped, once each: a frame of a newer daemon is dropped
+    /// instead of ending the stream, and the client can say so. Empty until that happens.
+    skipped: Vec<u8>,
     frames: PhantomData<fn() -> F>,
 }
 
@@ -72,6 +80,7 @@ impl<F> Default for FrameDecoder<F> {
     fn default() -> Self {
         Self {
             buf: Vec::new(),
+            skipped: Vec::new(),
             frames: PhantomData,
         }
     }
@@ -91,9 +100,26 @@ impl<F: FrameKind> FrameDecoder<F> {
             }
             let payload = self.buf[5..5 + len].to_vec();
             self.buf.drain(..5 + len);
-            frames.push(F::decode(kind, payload)?);
+            match F::decode(kind, payload) {
+                Ok(frame) => frames.push(frame),
+                // Not ours to read: skip it, keep the stream and remember the kind. An oversized
+                // length ends the stream whatever the kind (it is checked before this decode), but a
+                // `Malformed` payload can only come from a kind we know.
+                Err(FrameError::UnknownKind(kind)) => {
+                    if !self.skipped.contains(&kind) {
+                        self.skipped.push(kind);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(frames)
+    }
+
+    /// The frame kinds this decoder skipped because it does not know them, once each and in the
+    /// order they first arrived (empty for a stream from a daemon this client understands).
+    pub fn skipped(&self) -> &[u8] {
+        &self.skipped
     }
 
     /// The stream did not end inside a frame.
@@ -149,5 +175,82 @@ mod tests {
             FrameDecoder::<Raw>::default().push(&[1, 0xff, 0xff, 0xff, 0xff]),
             Err(FrameError::TooLarge(u32::MAX as usize))
         );
+    }
+
+    /// A frame enum that knows kinds 1 and 2 only, like every real stream does.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Narrow(u8, Vec<u8>);
+
+    impl FrameKind for Narrow {
+        fn parts(&self) -> (u8, Cow<'_, [u8]>) {
+            (self.0, Cow::Borrowed(&self.1))
+        }
+        fn decode(kind: u8, payload: Vec<u8>) -> Result<Self, FrameError> {
+            match kind {
+                1 | 2 if payload.is_empty() => Err(FrameError::Malformed("narrow")),
+                1 | 2 => Ok(Self(kind, payload)),
+                other => Err(FrameError::UnknownKind(other)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_the_client_does_not_know_is_skipped_not_fatal() {
+        let bytes = [
+            encode_frame(9, b"from a newer daemon"),
+            encode_frame(1, b"known"),
+            encode_frame(2, b"known too"),
+        ]
+        .concat();
+        let mut d = FrameDecoder::<Narrow>::default();
+        assert_eq!(
+            d.push(&bytes).unwrap(),
+            [
+                Narrow(1, b"known".to_vec()),
+                Narrow(2, b"known too".to_vec())
+            ]
+        );
+        assert_eq!(d.skipped(), [9u8]);
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn a_skipped_kind_is_recorded_once() {
+        let bytes = [
+            encode_frame(9, b"a"),
+            encode_frame(9, b"b"),
+            encode_frame(10, b"c"),
+        ]
+        .concat();
+        let mut d = FrameDecoder::<Narrow>::default();
+        assert!(d.push(&bytes).unwrap().is_empty());
+        assert_eq!(d.skipped(), [9u8, 10u8]);
+        // A later frame of a kind already recorded adds nothing.
+        assert!(d.push(&encode_frame(9, b"d")).unwrap().is_empty());
+        assert_eq!(d.skipped(), [9u8, 10u8]);
+    }
+
+    #[test]
+    fn an_oversized_length_ends_the_stream_whatever_the_kind() {
+        // The length is checked before the kind is decoded, so a frame from a newer daemon cannot use
+        // a kind this client does not know to get past the limit.
+        let mut d = FrameDecoder::<Narrow>::default();
+        assert_eq!(
+            d.push(&[9, 0xff, 0xff, 0xff, 0xff]),
+            Err(FrameError::TooLarge(u32::MAX as usize))
+        );
+        assert!(d.skipped().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_frame_of_a_known_kind_ends_the_stream() {
+        // It is our frame and we cannot read it: skipping it would hand the caller a stream that
+        // silently lost a chunk.
+        let mut d = FrameDecoder::<Narrow>::default();
+        assert_eq!(
+            d.push(&encode_frame(1, b"")),
+            Err(FrameError::Malformed("narrow"))
+        );
+        assert!(d.skipped().is_empty());
     }
 }
