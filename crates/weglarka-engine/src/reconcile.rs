@@ -258,7 +258,7 @@ pub enum EngineError {
     SharedServiceInUse {
         service: weglarka_model::shared_services::ServiceName,
         instance: InstanceName,
-        members: String,
+        members: Vec<InstanceName>,
     },
     /// Unknown shared network declaration.
     #[error("unknown shared network: {0}")]
@@ -282,11 +282,11 @@ pub enum EngineError {
 }
 
 /// The tail of [`EngineError::SharedServiceInUse`]: who still uses the service, or what to do first.
-fn in_use_detail(members: &str) -> String {
+fn in_use_detail(members: &[InstanceName]) -> String {
     if members.is_empty() {
         "; remove the declaration from apps.toml first".to_owned()
     } else {
-        format!(" and is still used by: {members}")
+        format!(" and is still used by: {}", join_names(members))
     }
 }
 

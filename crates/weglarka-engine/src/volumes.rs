@@ -613,7 +613,7 @@ impl<P: PodmanClient> Reconciler<P> {
             return Err(EngineError::SharedServiceInUse {
                 service: service.clone(),
                 instance: name.clone(),
-                members: join_names(&shared_services::members(&apps, service)),
+                members: shared_services::members(&apps, service),
             });
         }
         let Some(spec) = apps.apps.get(name).cloned() else {
@@ -2270,7 +2270,7 @@ shared_volumes = [{ name = "kajet-workspaces", target = "/workspaces" }]
                 } => {
                     assert_eq!(service.as_str(), "cache");
                     assert_eq!(instance, &name("cache-redis"));
-                    assert_eq!(members, "api, worker");
+                    assert_eq!(members, &[name("api"), name("worker")]);
                 }
                 other => panic!("unexpected error: {other:?}"),
             }
