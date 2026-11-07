@@ -30,8 +30,8 @@ domains = ["blog.example.com"]
 A static site has no process, so the fields that configure one are rejected: `port`, `command`, `env`, `secrets`,
 `health`, `volumes`, `shared_volumes`, `shared_networks`, `host_ports`, `depends_on`, `resources`, `security`,
 `configs`, `reload_signal` and `start = false`. `ingress` itself is allowed, but only its file-serving options
-(below) and `ingress.access_log_skip_paths` — streaming, body-limit and forward-auth options stay rejected, because
-a site has no upstream to apply them to.
+(below), `ingress.access_log_skip_paths` and the basic-auth fields ([basic auth](basic-auth.md)) — streaming,
+body-limit and forward-auth options stay rejected, because a site has no upstream to apply them to.
 
 ## What happens on a deploy
 
@@ -139,9 +139,9 @@ csp = "default-src 'self'"
   An ordinary container app uses the same table as `[apps.<x>.ingress.security_headers]`, where the app's own
   response header wins over the ingress value — see [security headers](security-headers.md).
 
-Forward auth (#89) and HTTP Basic auth for static sites are tracked separately in
-[#169](https://github.com/jpalczewski/weglarka/issues/169); `ingress.auth*` stays rejected on a static site until
-that lands.
+Forward auth on a static site is tracked separately in
+[#638](https://github.com/jpalczewski/weglarka/issues/638); a shared password instead is
+[`ingress.auth = "basic"`](basic-auth.md), which a static site does support.
 
 A standalone static app has no `[sites]` entry. The panel's **Sites** page and `weglarka sites list` still show it,
 in a section after the declared sites (with a link to its app page), so moving a site to a plain `kind = "static"`
@@ -179,7 +179,8 @@ failed release is reported as blocked until you run `weglarka deploy`.
 
 ## Limits of this release
 
-- HTTP Basic auth, and forward auth, for static sites are tracked in #169.
+- Forward auth for static sites is tracked in [#638](https://github.com/jpalczewski/weglarka/issues/638); HTTP Basic
+  auth is available ([basic auth](basic-auth.md)).
 - Static sites are served only by Węglarka's own nginx; the host must run with ingress enabled.
 
 ## Rollback
