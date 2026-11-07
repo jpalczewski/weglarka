@@ -11,6 +11,8 @@ Infrastructure apps (Authelia #88, Prometheus, Grafana, Loki) need configuration
 The directory belongs to the runtime user (usually kept as a git repo: commit changes, `git checkout` is the rollback). The daemon mounts this directory into **its own** container read-only (it needs it for `apps show` and `doctor`), and app containers get their own read-only bind mounts from libpod. Without `config_root` the feature is off; an app with `configs` is rejected on write when `config_root` is empty. If `config_root` is set, it must exist and be a directory, otherwise the daemon does not start.
 
 After upgrading Węglarka, **run `weglarka platform install` again** (the quadlet gets the new mount). Without it the daemon cannot see the directory and `doctor` reports it.
+`weglarka-daemon platform install --check` says whether that is still pending (exit code 1) — see
+[install.md](../install.md#checking-the-installed-files).
 
 **2. App spec.** `source` is always relative to `config_root`; `target` is a path inside the container. The mount is always read-only (there is no rw flag). The `configs` list is part of the `spec-hash`: changing **what** is mounted recreates the container; changing the **content** of the files does not.
 

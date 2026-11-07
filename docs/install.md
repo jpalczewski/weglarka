@@ -248,6 +248,37 @@ Traefik file. Updating Węglarka itself: automatic through the `weglarka-self-up
 is rolled back by the `weglarka-watchdog.timer` watchdog — see [Self-update](guides/self-update.md); manually:
 `platform install --image <image>@<digest>` + `systemctl --user restart weglarka.service`.
 
+### Checking the installed files
+
+Several keys of `weglarka.toml` end up in the quadlet — `config_root`, every `[runtime] host_mounts` entry and an
+`[ingress] traefik_dynamic_file` outside the state directory as mounts (see [Host configs](guides/host-configs.md)
+and [Host mounts](guides/host-mounts.md)), the `[platform]` hardening values as limits — so changing them needs a
+re-install for the daemon to see the change. `platform install --check` renders the files exactly as an install would
+and compares them with the installed ones; it writes nothing and runs no `daemon-reload`:
+
+```sh
+weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --check
+```
+
+One line per file (`matches`, `differs` with the `-`/`+` line diff, `is missing`), then a summary and the command to
+run. Exit codes: `0` — the installed files are up to date; `1` — an install is needed (a file differs or is missing);
+`2` — the check itself cannot run (an unreadable file, no `/etc/passwd` entry for `[runtime] user`, OpenRC). A digest
+pinned by the self-update is **not** reported as drift: the pin belongs to `weglarka-self-update.timer`, and a bare
+install would reset it to `:latest`. Pass `--image <image>` to compare the `Image=` line too — a digest for the same
+repository as the tag you name still counts as a match (it says so on an `[INFO]` line), while another repository, or
+the digest you ask for, must match exactly. Without `--image` the report says `Image= not compared`. On a host that
+`platform bootstrap` took over, the self-update and watchdog units (four files) are skipped — the launcher runs its
+own jobs there, and an install would write the retired pair back.
+
+For configuration management, which cannot see a `host_mounts` entry that was *removed*:
+
+```sh
+if ! weglarka-daemon --config /etc/weglarka/weglarka.toml platform install --check >/dev/null; then
+  weglarka-daemon --config /etc/weglarka/weglarka.toml platform install
+  systemctl --user restart weglarka.service
+fi
+```
+
 ### Verifying the image and binaries
 
 ```sh
