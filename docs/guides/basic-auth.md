@@ -226,8 +226,9 @@ Before downgrading to a release with schema 24:
 - remove `auth = "basic"` and `auth_secret` from every `[apps.<x>.ingress]`; an `auth_exempt_paths` left behind needs
   `auth = "forward"` on that older release, so remove it too (or keep the app on forward auth);
 - remove `auth`, `auth_secret` and `auth_exempt_paths` from every `[sites.<site>.env.<env>]`;
-- drop the `schema_version = 25` marker, or restore `apps.toml` and `state.toml` from the backup taken before the
-  upgrade;
+- restore `apps.toml` and `state.toml` from the backup taken before the upgrade: an older daemon refuses a file stamped
+  `schema_version = 25` even when the fields are gone, so the copies from before the update are the way back
+  ([state schema](state-schema.md));
 - delete `<nginx_conf_dir>/auth/`: an older daemon does not know the directory, does not prune it, and it holds the
   credentials.
 
