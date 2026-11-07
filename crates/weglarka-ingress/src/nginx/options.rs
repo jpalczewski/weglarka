@@ -1,6 +1,6 @@
 //! [`NginxOptions`]: generator settings and their validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use weglarka_model::app::InstanceName;
@@ -68,6 +68,11 @@ pub struct NginxOptions {
     /// environment has not been promoted into, issue #205): their routes answer `503` instead of a
     /// missing `current` directory.
     pub unreleased: BTreeSet<InstanceName>,
+    /// `auth = "basic"` instances whose `map` file the daemon wrote (ADR 0081): instance name → the
+    /// file's container path. A protected instance **missing** here answers `503` in every location,
+    /// exactly like [`Self::unreleased`]: a missing, empty or invalid secret leaves the entry out, so
+    /// no route is ever served without its enforcement.
+    pub basic_auth: BTreeMap<InstanceName, String>,
 }
 
 impl NginxOptions {
@@ -107,6 +112,7 @@ impl NginxOptions {
             probe_socket: format!("{PROBE_CONTAINER_DIR}/{PROBE_SOCKET}"),
             cdn: None,
             unreleased: BTreeSet::new(),
+            basic_auth: BTreeMap::new(),
         }
     }
 
@@ -154,6 +160,11 @@ impl NginxOptions {
             }
         }
         check_container_dir("probe_socket", &self.probe_socket)?;
+        // The paths land verbatim in an `include` of `http {}`, so they carry the same alphabet rule as
+        // the other container paths (ADR 0081: the daemon passes its own constant).
+        for path in self.basic_auth.values() {
+            check_container_dir("basic_auth", path)?;
+        }
         let probe_dir = self
             .probe_socket
             .rsplit_once('/')

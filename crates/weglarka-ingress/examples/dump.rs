@@ -1,4 +1,4 @@
-//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...] [WILDCARD_APEX,...]|nginx-forward [RESOLVER] [TRUSTED,...]|nginx-edge-forward [CERT_DOMAIN,...]|traefik`
+//! `cargo run -p weglarka-ingress --example dump -- nginx [RESOLVER] [TRUSTED,...]|nginx-edge [CERT_DOMAIN,...] [WILDCARD_APEX,...]|nginx-forward [RESOLVER] [TRUSTED,...]|nginx-edge-forward [CERT_DOMAIN,...]|nginx-basic [RESOLVER] [TRUSTED,...]|nginx-edge-basic [CERT_DOMAIN,...]|traefik`
 //! — prints a sample config (used in CI for `nginx -t`, the forwarded-header, streaming, body-size and
 //! edge tests). `nginx-edge` (issue #95) renders the `edge` sample: the domains passed as a comma
 //! list have a certificate under `/etc/nginx/tls`, the rest exercise the plain-HTTP-only branch; an
@@ -20,12 +20,17 @@
 //! custom 404 page, a feed and security headers) for the same script. `secure` (`secure.example.eu`) is a
 //! container app with all three security headers (#497, ADR 0076) for
 //! `.github/scripts/test-security-headers.sh`.
+//! `nginx-basic` / `nginx-edge-basic` (#169, ADR 0081) render the HTTP basic auth sample: the static site
+//! `docs` and the container app `panel` (one exempt path) are both protected, so the config carries the
+//! credential `map`s and a 401 in every one of their locations. The map files are the daemon's, not the
+//! generator's, so `nginx -t` needs them at the container paths the config names (see [`basic_maps`]).
 
 use std::collections::BTreeMap;
 
 use weglarka_ingress::{Domain, nginx, traefik};
-use weglarka_model::app::AppsFile;
+use weglarka_model::app::{AppSpec, AppsFile, InstanceName};
 use weglarka_model::config::HostConfig;
+use weglarka_model::identity::IngressAuth;
 
 const HOST: &str = r#"
 [ingress]
@@ -174,6 +179,32 @@ port = 3000
 ingress = { auth = "forward", strip_prefix = true, auth_exempt_paths = ["/mcp/", "/.well-known/", "/receipts/public/"] }
 "#;
 
+/// HTTP basic auth sample (#169, ADR 0081): a protected static site and a protected container app with
+/// one exempt path.
+const BASIC_APPS: &str = r#"
+[apps.docs]
+kind = "static"
+image = "registry.example.com/x/docs:latest"
+domains = ["docs.example.eu"]
+ingress = { auth = "basic", auth_secret = "basic-auth", auth_exempt_paths = ["/robots.txt"] }
+
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "basic", auth_secret = "basic-auth", auth_exempt_paths = ["/health"] }
+"#;
+
+/// The `basic_auth` entries the daemon would add for `apps`: the container path of each protected
+/// instance's credential `map`. The files themselves are the daemon's, so they are not generated here —
+/// `nginx -t` needs them at exactly these paths, because a `map`'s `include` fails on a missing file.
+fn basic_maps(apps: &BTreeMap<InstanceName, AppSpec>) -> BTreeMap<InstanceName, String> {
+    apps.iter()
+        .filter(|(_, spec)| spec.ingress.auth == IngressAuth::Basic)
+        .map(|(instance, _)| (instance.clone(), nginx::basic_auth_map_path(instance)))
+        .collect()
+}
+
 fn main() {
     let host = HostConfig::from_toml_str(HOST).expect("host");
     let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(APPS).expect("apps").apps;
@@ -252,8 +283,44 @@ fn main() {
             nginx::generate(&host, &apps, &options)
         }
         Some("traefik") => traefik::generate(&host, &apps, &traefik::TraefikOptions::default()),
+        Some("nginx-basic") => {
+            let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(BASIC_APPS).expect("apps").apps;
+            let resolver = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "10.89.0.1".into());
+            let trusted: Vec<String> = std::env::args()
+                .nth(3)
+                .unwrap_or_else(|| "10.89.0.0/24".into())
+                .split(',')
+                .map(str::to_owned)
+                .collect();
+            let mut options = nginx::NginxOptions::new(vec![resolver.parse().expect("resolver")])
+                .with_trusted_proxies(&trusted)
+                .expect("trusted proxies");
+            options.basic_auth = basic_maps(&apps);
+            nginx::generate(&host, &apps, &options)
+        }
+        Some("nginx-edge-basic") => {
+            let host = HostConfig::from_toml_str(EDGE_HOST).expect("edge host");
+            let apps: BTreeMap<_, _> = toml::from_str::<AppsFile>(BASIC_APPS).expect("apps").apps;
+            let mut options =
+                nginx::NginxOptions::new(vec!["10.89.0.1".parse().expect("resolver")]);
+            options.certificates = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "weglarka.example.eu".to_owned())
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(|d| Domain::new(d).expect("cert domain"))
+                .collect();
+            options.tls_fingerprint = Some("1a2b3c4d".to_owned());
+            options.proxy_socket_dir = std::env::var("WEGLARKA_DUMP_PROXY_SOCKET_DIR").ok();
+            options.basic_auth = basic_maps(&apps);
+            nginx::generate(&host, &apps, &options)
+        }
         _ => {
-            eprintln!("usage: dump nginx|nginx-edge|nginx-forward|nginx-edge-forward|traefik");
+            eprintln!(
+                "usage: dump nginx|nginx-edge|nginx-forward|nginx-edge-forward|nginx-basic|nginx-edge-basic|traefik"
+            );
             std::process::exit(2);
         }
     };

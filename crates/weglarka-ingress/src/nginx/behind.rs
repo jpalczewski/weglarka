@@ -31,6 +31,7 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
     let mut c = Conf::default();
     write_preamble(&mut c, None);
     c.block("http", |c| {
+        write_basic_auth_hash_bucket(c, plan, o);
         write_http_scaffolding(c, o);
         behind_prelude(c, o);
         c.blank();
@@ -38,9 +39,10 @@ pub(super) fn render_behind(plan: &Plan<'_>, o: &NginxOptions) -> String {
         c.blank();
         write_log(c, ClientAddr::Direct, plan);
         c.blank();
-        write_proxy_headers(c, &BEHIND_FORWARDED, None);
+        write_proxy_headers(c, &BEHIND_FORWARDED, None, false);
         c.blank();
         write_auth_maps(c, plan);
+        write_basic_auth_maps(c, plan, o);
         write_oauth_maps(c, plan);
         // Security headers of container apps (#497, ADR 0076): http-level `map`s keyed on the
         // upstream response headers, so an app that sets its own keeps it.

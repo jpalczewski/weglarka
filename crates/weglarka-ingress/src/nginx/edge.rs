@@ -57,6 +57,7 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
     let mut c = Conf::default();
     write_preamble(&mut c, o.tls_fingerprint.as_deref());
     c.block("http", |c| {
+        write_basic_auth_hash_bucket(c, plan, o);
         write_http_scaffolding(c, o);
         // TLS defaults for every TLS server. `ssl_reject_handshake` on the default server needs no
         // certificate (nginx >= 1.19.4) and `http2 on` needs nginx >= 1.25.1 — the pinned image is
@@ -97,9 +98,10 @@ pub(super) fn render_edge(plan: &Plan<'_>, o: &NginxOptions) -> String {
         } else {
             &EDGE_FORWARDED
         };
-        write_proxy_headers(c, forwarded, None);
+        write_proxy_headers(c, forwarded, None, false);
         c.blank();
         write_auth_maps(c, plan);
+        write_basic_auth_maps(c, plan, o);
         write_oauth_maps(c, plan);
         // Security headers of container apps (#497, ADR 0076): http-level `map`s keyed on the
         // upstream response headers, so an app that sets its own keeps it.

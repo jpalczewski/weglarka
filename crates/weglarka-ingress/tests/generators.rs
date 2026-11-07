@@ -2695,6 +2695,300 @@ port = 9091
     );
 }
 
+// --- HTTP basic auth (#169, ADR 0081): a credential `map` and a 401 in every protected location -----
+
+/// A protected static site. The credentials themselves are never part of the config: the daemon writes
+/// them to a `0600` file and the plan only names it, so no snapshot can hold a password.
+const BASIC_STATIC: &str = r#"
+[apps.docs]
+kind = "static"
+image = "registry.example.com/x/docs:latest"
+domains = ["docs.example.eu"]
+ingress = { auth = "basic", auth_secret = "basic-auth" }
+"#;
+
+/// A protected container app with one exempt path.
+const BASIC_APP: &str = r#"
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "basic", auth_secret = "basic-auth", auth_exempt_paths = ["/health"] }
+"#;
+
+/// Both shapes on one host: `docs` is index 0 in the plan, `panel` index 1.
+fn basic_apps() -> BTreeMap<InstanceName, AppSpec> {
+    apps(&format!("{BASIC_STATIC}{BASIC_APP}"))
+}
+
+/// `o` with the `map` file of each of `instances` marked as written by the daemon (ADR 0081). Only that
+/// entry makes the generator render the check; without it the instance answers 503.
+fn with_basic_auth(mut o: NginxOptions, instances: &[&str]) -> NginxOptions {
+    for name in instances {
+        let instance = InstanceName::new(*name).unwrap();
+        o.basic_auth
+            .insert(instance.clone(), nginx::basic_auth_map_path(&instance));
+    }
+    o
+}
+
+#[test]
+fn basic_auth_static_site_snapshots_in_both_modes() {
+    let a = apps(BASIC_STATIC);
+    let behind = nginx::generate(&host(), &a, &with_basic_auth(opts(), &["docs"])).unwrap();
+    insta::assert_snapshot!("nginx_basic_auth_static", behind);
+    let edge = nginx::generate(
+        &edge_host(),
+        &a,
+        &with_basic_auth(
+            edge_opts(&["docs.example.eu", "weglarka.example.eu"]),
+            &["docs"],
+        ),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_basic_auth_static", edge);
+}
+
+#[test]
+fn basic_auth_container_app_snapshots_in_both_modes() {
+    let a = apps(BASIC_APP);
+    let behind = nginx::generate(&host(), &a, &with_basic_auth(opts(), &["panel"])).unwrap();
+    insta::assert_snapshot!("nginx_basic_auth_app", behind);
+    let edge = nginx::generate(
+        &edge_host(),
+        &a,
+        &with_basic_auth(
+            edge_opts(&["panel.example.eu", "weglarka.example.eu"]),
+            &["panel"],
+        ),
+    )
+    .unwrap();
+    insta::assert_snapshot!("nginx_edge_basic_auth_app", edge);
+}
+
+#[test]
+fn basic_auth_protects_every_location_except_the_exempt_ones() {
+    let conf = nginx::generate(
+        &host(),
+        &apps(BASIC_APP),
+        &with_basic_auth(opts(), &["panel"]),
+    )
+    .unwrap();
+    let panel = server_block(&conf, "panel.example.eu");
+    let root = location_block(&panel, "location / {");
+    assert!(root.contains("if ($weglarka_basic_ok_0 = 0) {"), "{root}");
+    assert!(
+        root.contains(
+            "add_header WWW-Authenticate 'Basic realm=\"Restricted\", charset=\"UTF-8\"' always;"
+        ),
+        "{root}"
+    );
+    assert!(root.contains("return 401;"), "{root}");
+    // The upstream never sees the shared password, and the whole inherited header set comes back:
+    // the first `proxy_set_header` of a level drops every inherited one.
+    assert!(
+        root.contains("proxy_set_header Authorization \"\";"),
+        "{root}"
+    );
+    assert!(root.contains("proxy_set_header Host $host;"), "{root}");
+    assert!(
+        root.contains("proxy_set_header X-Forwarded-Proto"),
+        "{root}"
+    );
+    assert!(
+        root.contains("proxy_set_header Upgrade $http_upgrade;"),
+        "{root}"
+    );
+    assert!(
+        root.contains("proxy_set_header Remote-User \"\";"),
+        "{root}"
+    );
+    // The exempt path is the app's own location minus the check, and keeps `Authorization`.
+    let exempt = location_block(&panel, "location = /health {");
+    assert!(!exempt.contains("$weglarka_basic"), "{exempt}");
+    assert!(!exempt.contains("Authorization"), "{exempt}");
+    assert!(exempt.contains("proxy_pass $upstream;"), "{exempt}");
+    // The map includes the daemon's file; nothing of the credential is in this config.
+    assert!(
+        conf.contains("include /etc/nginx/auth/panel.map;"),
+        "{conf}"
+    );
+    assert_eq!(
+        conf.matches("map_hash_bucket_size 512;").count(),
+        1,
+        "{conf}"
+    );
+}
+
+/// Every location of a protected static site is guarded, not just its catch-all: the extra locations
+/// `cache_immutable_paths`, `feeds` and `redirects` render are as reachable as `/`.
+#[test]
+fn basic_auth_guards_the_extra_locations_of_a_static_site() {
+    let a = apps(
+        r#"
+[apps.docs]
+kind = "static"
+image = "registry.example.com/x/docs:latest"
+domains = ["docs.example.eu"]
+ingress = { auth = "basic", auth_secret = "basic-auth", auth_exempt_paths = ["/robots.txt"], static = { cache_immutable_paths = ["/assets"], redirects = [{ from = "/old", to = "/new" }] } }
+"#,
+    );
+    let conf = nginx::generate(&host(), &a, &with_basic_auth(opts(), &["docs"])).unwrap();
+    let server = server_block(&conf, "docs.example.eu");
+    for header in [
+        "location / {",
+        "location ^~ /assets/ {",
+        "location = /old {",
+        "location = /robots.txt {",
+    ] {
+        let block = location_block(&server, header);
+        if header.contains("/robots.txt") {
+            assert!(!block.contains("$weglarka_basic"), "{block}");
+        } else {
+            assert!(block.contains("if ($weglarka_basic_ok_0 = 0) {"), "{block}");
+        }
+    }
+}
+
+#[test]
+fn a_protected_instance_without_a_map_file_answers_503() {
+    let a = basic_apps();
+    // No entry at all: fail closed for both apps. The reference to `$weglarka_basic_ok_<n>` must not be
+    // rendered either — `nginx -t` would reject the whole host for an undefined variable.
+    let conf = nginx::generate(&host(), &a, &opts()).unwrap();
+    assert!(!conf.contains("weglarka_basic"), "{conf}");
+    assert!(!conf.contains("include /etc/nginx/auth"), "{conf}");
+    assert!(conf.contains("map $remote_addr $weglarka_probe"), "{conf}");
+    for domain in ["docs.example.eu", "panel.example.eu"] {
+        let server = server_block(&conf, domain);
+        let root = location_block(&server, "location / {");
+        assert!(root.contains("return 503;"), "{root}");
+        assert!(!root.contains("proxy_pass"), "{root}");
+        assert!(!root.contains("root /etc/nginx/sites"), "{root}");
+    }
+    // The exempt path of an app without credentials is closed too: the whole app fails closed.
+    let panel = server_block(&conf, "panel.example.eu");
+    let health = location_block(&panel, "location = /health {");
+    assert!(health.contains("return 503;"), "{health}");
+    // Only the instance with a file fails: the other one keeps serving.
+    let partial = nginx::generate(&host(), &a, &with_basic_auth(opts(), &["panel"])).unwrap();
+    let docs = server_block(&partial, "docs.example.eu");
+    assert!(
+        location_block(&docs, "location / {").contains("return 503;"),
+        "{docs}"
+    );
+    let panel = server_block(&partial, "panel.example.eu");
+    assert!(
+        location_block(&panel, "location / {").contains("if ($weglarka_basic_ok_1 = 0) {"),
+        "{panel}"
+    );
+}
+
+#[test]
+fn two_protected_apps_get_distinct_variables_and_one_bucket_size() {
+    let conf = nginx::generate(
+        &host(),
+        &basic_apps(),
+        &with_basic_auth(opts(), &["docs", "panel"]),
+    )
+    .unwrap();
+    assert_eq!(
+        conf.matches("map_hash_bucket_size 512;").count(),
+        1,
+        "{conf}"
+    );
+    // nginx fixes the map hash bucket size when it parses the first `map` block and then rejects a
+    // later set as a duplicate, so the directive must come before every `map` of `http {}`.
+    let bucket = conf.find("map_hash_bucket_size 512;").unwrap();
+    let first_map = conf.find("\n    map ").expect("a map block");
+    assert!(bucket < first_map, "{conf}");
+    for (index, instance) in [(0, "docs"), (1, "panel")] {
+        assert!(
+            conf.contains(&format!(
+                "map $http_authorization $weglarka_basic_{index} {{"
+            )),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(&format!("include /etc/nginx/auth/{instance}.map;")),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(&format!(
+                "map \"$weglarka_probe:$weglarka_basic_{index}\" $weglarka_basic_ok_{index} {{"
+            )),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(&format!("if ($weglarka_basic_ok_{index} = 0) {{")),
+            "{conf}"
+        );
+    }
+    // The index is the app's position in the plan, not the order of the credential files.
+    assert!(!conf.contains("$weglarka_basic_2"), "{conf}");
+    assert_eq!(
+        conf.matches("map $remote_addr $weglarka_probe {").count(),
+        1,
+        "{conf}"
+    );
+}
+
+/// A forward app and a basic app on one host: the probe socket skips both kinds of check, so the two
+/// share the single `$weglarka_probe` map (ADR 0054, ADR 0081).
+#[test]
+fn forward_auth_and_basic_auth_share_one_probe_map() {
+    let a = apps(
+        r#"
+[apps.authelia]
+image = "ghcr.io/authelia/authelia:latest"
+domains = ["auth.example.eu"]
+port = 9091
+
+[apps.guarded]
+image = "ghcr.io/x/guarded:latest"
+domains = ["guarded.example.eu"]
+port = 3000
+ingress = { auth = "forward" }
+
+[apps.panel]
+image = "ghcr.io/x/panel:latest"
+domains = ["panel.example.eu"]
+port = 3000
+ingress = { auth = "basic", auth_secret = "basic-auth" }
+"#,
+    );
+    let conf = nginx::generate(
+        &identity_host(HOST),
+        &a,
+        &with_basic_auth(opts(), &["panel"]),
+    )
+    .unwrap();
+    assert_eq!(
+        conf.matches("map $remote_addr $weglarka_probe {").count(),
+        1,
+        "{conf}"
+    );
+    // Each mechanism keeps its own maps; the plan order names the credential variable (`authelia` 0,
+    // `guarded` 1, `panel` 2).
+    assert!(
+        conf.contains("map $wg_redirect $wg_redirect_or_portal {"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("map $http_authorization $weglarka_basic_2 {"),
+        "{conf}"
+    );
+    let guarded = server_block(&conf, "guarded.example.eu");
+    assert!(
+        guarded.contains("auth_request /internal/weglarka/authz;"),
+        "{guarded}"
+    );
+    assert!(!guarded.contains("weglarka_basic"), "{guarded}");
+    let panel = server_block(&conf, "panel.example.eu");
+    assert!(panel.contains("if ($weglarka_basic_ok_2 = 0) {"), "{panel}");
+    assert!(!panel.contains("auth_request"), "{panel}");
+}
+
 // --- OAuth-protected resources (#215, ADR 0078) ---------------------------------------------------
 
 /// Three shapes in one config: a forward app with a resource, an app without forward auth with one, and
