@@ -8,8 +8,9 @@
 //! message or a snapshot. For the same reason [`Credentials`] has a hand-written `Debug` that prints
 //! the user names only.
 //!
-//! An empty value parses to zero credentials on purpose: the rendered map then matches nothing, so
-//! every protected request is refused (fail closed) instead of accidentally left open.
+//! A value without a single credential (only empty lines) is an error too, so the daemon treats it
+//! like a missing secret: the instance answers 503 and `doctor` reports it, instead of a map that
+//! silently refuses everyone with 401 (ADR 0081, "missing, empty or invalid").
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -44,6 +45,8 @@ pub enum BasicAuthError {
     DuplicateUser { line: usize },
     #[error("line {line}: at most {max} credentials are allowed")]
     TooManyUsers { line: usize, max: usize },
+    #[error("the secret declares no credential")]
+    Empty,
 }
 
 /// The credentials of one secret: user name → password, sorted by user name, so the rendered map file
@@ -65,7 +68,7 @@ impl Credentials {
         self.users.len()
     }
 
-    /// Whether the secret declares no credential at all; the map then matches nothing.
+    /// Always false for a value returned by [`parse`], which refuses an empty secret.
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
     }
@@ -108,7 +111,7 @@ fn valid_password(password: &str) -> bool {
 }
 
 /// Parses one secret value: `user:password` lines, `\n`-terminated except for the last one, empty
-/// lines ignored. A password may contain `:`; the split is at the first one.
+/// lines ignored, at least one credential. A password may contain `:`; the split is at the first one.
 pub fn parse(value: &[u8]) -> Result<Credentials, BasicAuthError> {
     let text = std::str::from_utf8(value).map_err(|e| BasicAuthError::NotUtf8 {
         line: line_of(value, e.valid_up_to()),
@@ -139,6 +142,9 @@ pub fn parse(value: &[u8]) -> Result<Credentials, BasicAuthError> {
             });
         }
         users.insert(user.to_owned(), password.to_owned());
+    }
+    if users.is_empty() {
+        return Err(BasicAuthError::Empty);
     }
     Ok(Credentials { users })
 }
@@ -185,11 +191,14 @@ mod tests {
     #[test]
     fn the_last_line_needs_no_trailing_newline() {
         assert_eq!(ok(ALICE), ok(&format!("{ALICE}\n")));
-        assert_eq!(
-            ok("").len(),
-            0,
-            "an empty secret parses to nothing, so it protects nothing"
-        );
+    }
+
+    #[test]
+    fn a_secret_without_credentials_is_an_error() {
+        // Treated like a missing secret (503 + doctor), never an empty map that 401s everyone.
+        for empty in ["", "\n", "\n\n\n"] {
+            assert_eq!(err(empty), BasicAuthError::Empty, "{empty:?}");
+        }
     }
 
     #[test]
@@ -317,7 +326,6 @@ mod tests {
             STANDARD.encode("bob:123456789012"),
         );
         assert_eq!(credentials.nginx_map_lines(), expected);
-        assert_eq!(ok("").nginx_map_lines(), "");
     }
 
     #[test]
