@@ -7,6 +7,7 @@
 
 pub mod admin_auth;
 pub mod app;
+pub mod basic_auth;
 pub mod config;
 pub mod credential;
 pub mod delivery;

@@ -805,6 +805,8 @@ pub struct AppIngress {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_paths: Vec<String>,
     /// Forward authentication in front of the app (#89, ADR 0052): `none` (default) or `forward`.
+    /// `basic` (HTTP Basic auth, ADR 0081) is accepted by the parser but refused by validation until
+    /// the generator and the daemon can enforce it.
     /// Changes nginx output only; outside the spec hash.
     #[serde(default, skip_serializing_if = "IngressAuth::is_none")]
     pub auth: IngressAuth,
@@ -814,10 +816,16 @@ pub struct AppIngress {
     /// Groups of which the user must be in at least one. Needs `auth = "forward"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth_groups: Vec<String>,
-    /// Paths that skip forward auth structurally (their location has no `auth_request`), for
-    /// non-browser clients with their own tokens. An entry ending in `/` is a prefix. Needs `auth = "forward"`.
+    /// Paths that skip auth structurally (their location carries no auth at all), for non-browser
+    /// clients with their own tokens. An entry ending in `/` is a prefix. Needs `auth = "forward"`
+    /// or `auth = "basic"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth_exempt_paths: Vec<String>,
+    /// Name of the secret (instance scope, ADR 0024) that holds the `user:password` lines of
+    /// `auth = "basic"` (ADR 0081); a secret **name**, never a value. Required by `basic`, rejected
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_secret: Option<String>,
     /// OAuth-protected resources (#215, ADR 0078): paths (public URL space, `paths` syntax) whose
     /// tokens the app checks itself, e.g. `["/mcp"]`. Each entry gets a location without
     /// `auth_request` and generated discovery documents (RFC 9728) at the host root. Ingress-only,
@@ -851,6 +859,7 @@ impl Default for AppIngress {
             auth_policy: None,
             auth_groups: Vec::new(),
             auth_exempt_paths: Vec::new(),
+            auth_secret: None,
             oauth_resources: Vec::new(),
             static_: None,
             security_headers: None,

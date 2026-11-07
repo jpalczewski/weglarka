@@ -366,6 +366,140 @@ fn forward_auth_needs_identity_domains_and_a_different_instance() {
     );
 }
 
+// --- lexical validation: HTTP basic auth (ADR 0081) --------------------------------------------
+
+/// A `basic` app with a valid secret name, plus `extra` lines of the same table.
+fn basic(extra: &str) -> AppSpec {
+    spec(&format!(
+        "[ingress]\nauth = \"basic\"\nauth_secret = \"basic-auth\"\n{extra}"
+    ))
+}
+
+/// The P1 rollout gate names the field and the release, so an operator is not sent looking for a
+/// typo (ADR 0081).
+fn gated(spec: &AppSpec) -> String {
+    let err = lexical_err(spec);
+    assert_eq!(err, format!("a: {BASIC_AUTH_GATE}"), "{err}");
+    err
+}
+
+#[test]
+fn a_complete_basic_app_hits_only_the_gate() {
+    gated(&basic(""));
+    // The fields around it are validated, and the gate is the last word: this app is complete.
+    gated(&basic(
+        "auth_exempt_paths = [\"/robots.txt\", \"/.well-known/\"]",
+    ));
+    // `kind = "static"` is allowed too (ADR 0081): a directory backend renders basic auth itself.
+    gated(&spec(
+        "kind = \"static\"\n[ingress]\nauth = \"basic\"\nauth_secret = \"basic-auth\"",
+    ));
+}
+
+#[test]
+fn basic_needs_a_secret_name() {
+    let err = lexical_err(&spec("[ingress]\nauth = \"basic\""));
+    assert!(
+        err.contains("ingress.auth_secret is required with ingress.auth = \"basic\""),
+        "{err}"
+    );
+    // The name follows the secret-name syntax: `[A-Za-z0-9_-]{1,64}`.
+    for bad in ["", "has space", "a.b", "a/b", &"x".repeat(65)] {
+        let err = lexical_err(&spec(&format!(
+            "[ingress]\nauth = \"basic\"\nauth_secret = {bad:?}"
+        )));
+        assert!(
+            err.contains("ingress.auth_secret") && err.contains("not a valid secret name"),
+            "{bad:?}: {err}"
+        );
+    }
+    // The longest accepted name is fine (the gate is then the only error).
+    gated(&spec(&format!(
+        "[ingress]\nauth = \"basic\"\nauth_secret = {:?}",
+        "x".repeat(64)
+    )));
+}
+
+#[test]
+fn a_secret_without_basic_is_rejected() {
+    for mode in ["", "auth = \"forward\"\n"] {
+        let err = lexical_err(&spec(&format!(
+            "[ingress]\n{mode}auth_secret = \"basic-auth\""
+        )));
+        assert!(
+            err.contains("requires ingress.auth = \"basic\""),
+            "{mode:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn exempt_paths_fit_both_protected_modes() {
+    let err = lexical_err(&spec("[ingress]\nauth_exempt_paths = [\"/robots.txt\"]"));
+    assert!(
+        err.contains("ingress.auth_exempt_paths requires ingress.auth = \"forward\" or \"basic\""),
+        "{err}"
+    );
+    lexical(&spec(
+        "[ingress]\nauth = \"forward\"\nauth_exempt_paths = [\"/robots.txt\"]",
+    ))
+    .unwrap();
+    // Syntax and duplicates are checked for `basic` too, before the gate.
+    for bad in ["[\"/\"]", "[\"x\"]", "[\"/a\", \"/a\"]"] {
+        let err = lexical_err(&basic(&format!("auth_exempt_paths = {bad}")));
+        assert!(err.contains("auth_exempt_paths"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn basic_rejects_the_forward_only_fields() {
+    for (extra, needle) in [
+        ("auth_policy = \"one_factor\"", "ingress.auth_policy"),
+        ("auth_groups = [\"admins\"]", "ingress.auth_groups"),
+    ] {
+        let err = lexical_err(&basic(extra));
+        assert!(
+            err.contains(needle) && err.contains("requires ingress.auth = \"forward\""),
+            "{extra}: {err}"
+        );
+    }
+}
+
+#[test]
+fn basic_rejects_oauth_resourced_paths() {
+    // An OAuth resource checks its own tokens in `Authorization`, where the Basic credential sits.
+    let err = lexical_err(&basic("oauth_resources = [\"/mcp\"]"));
+    assert!(
+        err.contains("ingress.oauth_resources") && err.contains("cannot be combined"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_static_site_still_rejects_forward_auth() {
+    let err = lexical_err(&spec("kind = \"static\"\n[ingress]\nauth = \"forward\""));
+    assert!(
+        err.contains("ingress.auth = \"forward\" is not supported on `kind = \"static\"` apps"),
+        "{err}"
+    );
+}
+
+#[test]
+fn basic_auth_needs_no_identity_provider() {
+    // The host-aware rules of `validate_host_app` are those of forward auth only: `basic` has no
+    // provider to ask and no `[identity]` section to find (ADR 0081).
+    let host = HostConfig::from_toml_str(
+        "[ingress]\nmode = \"behind\"\nbind = \"127.0.0.1:8080\"\ntraefik_dynamic_file = \"/d.yml\"\n\
+         [admin]\nsocket = \"/a.sock\"\n[webhook]\nlisten = \"127.0.0.1:9180\"\ndomain = \"hook.example.com\"",
+    )
+    .unwrap();
+    validate_host_app(&host, &name("a"), &basic("")).unwrap();
+    // Not even a domain: basic auth protects the whole host, whichever name reaches it.
+    let mut no_domains = basic("");
+    no_domains.domains.clear();
+    validate_host_app(&host, &name("a"), &no_domains).unwrap();
+}
+
 // --- external clients --------------------------------------------------------------------------
 
 fn external() -> ExternalClientSpec {

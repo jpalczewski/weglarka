@@ -13,6 +13,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AppKind, AppSpec, InstanceName, Robots, StaticIngress};
+use crate::identity::IngressAuth;
 
 /// Defines a lowercase `[a-z0-9-]` name newtype (1–63 chars, no leading/trailing hyphen) — the same
 /// alphabet as [`InstanceName`], because `<site>-<env>` has to be a valid instance name.
@@ -119,6 +120,18 @@ pub struct EnvSpec {
     /// preview must not be indexed while the same digest is production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robots: Option<Robots>,
+    /// Auth of this environment (ADR 0081): protection is a property of an environment, not of the
+    /// artifact, so a preview can sit behind a password while production stays open. Unset (default)
+    /// leaves the instance without auth.
+    #[serde(default, skip_serializing_if = "IngressAuth::is_none")]
+    pub auth: IngressAuth,
+    /// Name of the secret (instance scope, `<site>-<env>.<name>`) holding the `user:password` lines.
+    /// Required by `auth = "basic"`, rejected otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_secret: Option<String>,
+    /// Paths that skip auth structurally; needs `auth = "forward"` or `auth = "basic"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_exempt_paths: Vec<String>,
 }
 
 /// Where an expanded instance comes from. Kept next to `apps.toml`'s instances, never serialized.
@@ -275,6 +288,11 @@ fn expanded_spec(site: &SiteSpec, env: &EnvSpec) -> AppSpec {
             .get_or_insert_with(StaticIngress::default)
             .robots = Some(robots);
     }
+    // Auth belongs to the environment (ADR 0081), so the secret is the instance's own
+    // `<site>-<env>.<name>` and a preview can be protected while production is not.
+    spec.ingress.auth = env.auth;
+    spec.ingress.auth_secret = env.auth_secret.clone();
+    spec.ingress.auth_exempt_paths = env.auth_exempt_paths.clone();
     spec
 }
 
@@ -460,6 +478,60 @@ domains = ["example.com"]
         let out = expand(&sites(&src).unwrap(), &BTreeMap::new()).unwrap();
         let prod = &out[&InstanceName::new("blog-prod").unwrap()].0;
         assert_eq!(static_ingress(prod).robots, Some(Robots::Noindex));
+    }
+
+    #[test]
+    fn the_environment_auth_is_copied_into_the_instance() {
+        // ADR 0081: protection belongs to the environment, so a preview can sit behind a password
+        // while production (the same digest) stays open.
+        let src = r#"
+[sites.blog]
+kind = "static"
+image = "ghcr.io/me/blog"
+
+[sites.blog.env.dev]
+track = "main"
+domains = ["dev.example.com"]
+auth = "basic"
+auth_secret = "basic-auth"
+auth_exempt_paths = ["/robots.txt"]
+
+[sites.blog.env.prod]
+promote_from = "dev"
+domains = ["example.com"]
+"#;
+        let out = expand(&sites(src).unwrap(), &BTreeMap::new()).unwrap();
+        let dev = &out[&InstanceName::new("blog-dev").unwrap()].0;
+        assert_eq!(dev.ingress.auth, crate::identity::IngressAuth::Basic);
+        assert_eq!(dev.ingress.auth_secret.as_deref(), Some("basic-auth"));
+        assert_eq!(dev.ingress.auth_exempt_paths, ["/robots.txt"]);
+        let prod = &out[&InstanceName::new("blog-prod").unwrap()].0;
+        assert_eq!(prod.ingress.auth, crate::identity::IngressAuth::None);
+        assert_eq!(prod.ingress.auth_secret, None);
+        assert!(prod.ingress.auth_exempt_paths.is_empty());
+    }
+
+    #[test]
+    fn an_environment_auth_round_trips_through_toml() {
+        #[derive(Serialize, Deserialize)]
+        struct F {
+            sites: BTreeMap<SiteName, SiteSpec>,
+        }
+        let src = BLOG.replace(
+            "domains = [\"dev.example.com\"]",
+            "domains = [\"dev.example.com\"]\nauth = \"basic\"\nauth_secret = \"basic-auth\"",
+        );
+        let parsed: F = toml::from_str(&src).unwrap();
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(text.contains("auth = \"basic\""), "{text}");
+        assert!(text.contains("auth_secret = \"basic-auth\""), "{text}");
+        assert_eq!(toml::from_str::<F>(&text).unwrap().sites, parsed.sites);
+        // An environment without auth writes neither key.
+        assert!(
+            !toml::to_string(&toml::from_str::<F>(BLOG).unwrap())
+                .unwrap()
+                .contains("auth")
+        );
     }
 
     #[test]
