@@ -207,13 +207,17 @@ impl<P: PodmanClient> Reconciler<P> {
         options: &RunOptions,
         slot: &mut AcquisitionSlot,
     ) -> Result<String, EngineError> {
-        let spec = state::load_apps(&self.paths.apps)?
+        let apps = state::load_apps(&self.paths.apps)?;
+        let spec = apps
             .apps
-            .remove(instance)
+            .get(instance)
             .ok_or_else(|| EngineError::UnknownInstance(instance.clone()))?;
-        // A run must see the same injected OIDC env and secret as the serving container.
-        self.ensure_oidc_credential(instance, &spec).await?;
-        let mut spec = self.effective(instance, &spec).into_owned();
+        // A run must see the same injected OIDC env and secret as the serving container — and the
+        // same shared-service relations (ADR 0079), so a one-off command reaches its service.
+        self.ensure_oidc_credential(instance, spec).await?;
+        let mut spec = self
+            .effective(&apps.shared_services, instance, spec)
+            .into_owned();
         // Run-only secrets: bindings on the in-memory copy, so they are materialized like the app's
         // own and never reach the stored spec. One on the same variable replaces the app's.
         for (var, secret) in &options.secrets {

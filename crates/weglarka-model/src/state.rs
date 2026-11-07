@@ -2798,21 +2798,36 @@ csp = "default-src 'self'"
     #[test]
     fn shared_services_are_gated_on_load_and_save() {
         let path = Path::new("apps.toml");
-        for src in [
-            "[shared_services.cache]\nkind = \"redis\"\ninstance = \"cache-redis\"\n\
+        // A valid declaration of a kind whose PR has not landed: every rule passes, the gate
+        // rejects the file on load and on save.
+        let decl = "[shared_services.cache]\nkind = \"redis\"\ninstance = \"cache-redis\"\n\
              profile = \"cache\"\nmaxmemory = \"64mb\"\n\
-             [apps.cache-redis]\nimage = \"docker.io/library/redis:7.4\"\nauto_update = false\n",
-            "[apps.api]\nimage = \"ghcr.io/example/api:1\"\nshared_services = [\"cache\"]\n",
-        ] {
-            let err = parse_apps(path, src).unwrap_err().to_string();
-            assert!(err.contains(crate::shared_services::GATE), "{err}");
-            let apps: AppsFile = toml::from_str(src).unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let err = save_apps(&dir.path().join("apps.toml"), &apps)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(crate::shared_services::GATE), "{err}");
+             [apps.cache-redis]\nimage = \"docker.io/library/redis:7.4\"\nauto_update = false\n";
+        let err = parse_apps(path, decl).unwrap_err().to_string();
+        assert!(err.contains(crate::shared_services::GATE), "{err}");
+        let apps: AppsFile = toml::from_str(decl).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_apps(&dir.path().join("apps.toml"), &apps)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(crate::shared_services::GATE), "{err}");
+
+        // #592: a membership without a declaration is a shared-service rule error, so the load and
+        // the save report it by name instead of the gate.
+        let member =
+            "[apps.api]\nimage = \"ghcr.io/example/api:1\"\nshared_services = [\"cache\"]\n";
+        let expected = crate::shared_services::ServiceRule::UnknownService {
+            member: name("api"),
+            service: crate::shared_services::ServiceName::new("cache").unwrap(),
         }
+        .to_string();
+        let err = parse_apps(path, member).unwrap_err().to_string();
+        assert!(err.contains(&expected), "{err}");
+        let apps: AppsFile = toml::from_str(member).unwrap();
+        let err = save_apps(&dir.path().join("apps.toml"), &apps)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&expected), "{err}");
     }
 
     #[test]

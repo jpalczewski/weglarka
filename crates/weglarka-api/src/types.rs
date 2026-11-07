@@ -93,6 +93,23 @@ pub struct AppSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListAppsResponse {
     pub apps: Vec<AppSummary>,
+    /// Declared shared services with their members (ADR 0079). Absent while none is declared, so
+    /// today's JSON stays byte-for-byte what it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_services: Vec<SharedServiceSummary>,
+}
+
+/// One shared service as `apps list` shows it (ADR 0079). Also the `read` view: an allowlist of
+/// names only — never a digest, never a secret name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedServiceSummary {
+    pub name: weglarka_model::shared_services::ServiceName,
+    pub kind: weglarka_model::shared_services::ServiceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<weglarka_model::shared_services::RedisProfile>,
+    pub instance: InstanceName,
+    /// Instances listing the service, sorted by name.
+    pub members: Vec<InstanceName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -131,6 +131,7 @@ impl From<EngineError> for Fail {
             | EngineError::SharedVolumeBusy { .. }
             | EngineError::SharedGroupChange { .. }
             | EngineError::SharedNetworkInUse { .. }
+            | EngineError::SharedServiceInUse { .. }
             | EngineError::RangeChangeWithData { .. }) => Fail(ErrorCode::Conflict, e.to_string()),
             // Config mounts (issue #118): a spec/source problem is the request's fault (400).
             EngineError::Configs(message) => Fail::invalid(message),
@@ -443,9 +444,43 @@ async fn health<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Res
 }
 
 async fn list_apps<P: PodmanClient + 'static>(State(d): Shared<P>) -> ApiResult<Response> {
+    let apps = state::load_apps(&d.paths.state.apps).map_err(Fail::internal)?;
     Ok(json(ListAppsResponse {
         apps: summaries(&d).await?,
+        // `GET /v1/apps` is a `read` endpoint (ADR 0057), so this *is* the read projection of a
+        // shared service: the allowlist of ADR 0079, names only.
+        shared_services: shared_service_summaries(&apps),
     }))
+}
+
+/// Declared shared services with their members, in name order (ADR 0079).
+///
+/// Both `apps list` and its `read` scope are served from here, so this is a read view: the
+/// declaration is destructured **without `..`**, and a new field does not compile until someone
+/// decides what a `read` caller sees of it. `maxmemory` is a sizing value, not a name — it neither
+/// tells a reader who may reach the service nor how, so it stays out.
+fn shared_service_summaries(
+    apps: &weglarka_model::app::AppsFile,
+) -> Vec<weglarka_api::SharedServiceSummary> {
+    use weglarka_model::shared_services::{self, SharedServiceSpec};
+    apps.shared_services
+        .iter()
+        .map(|(name, spec)| {
+            let SharedServiceSpec {
+                kind,
+                instance,
+                profile,
+                maxmemory: _, // a sizing value, not part of the read view
+            } = spec;
+            weglarka_api::SharedServiceSummary {
+                name: name.clone(),
+                kind: *kind,
+                profile: *profile,
+                instance: instance.clone(),
+                members: shared_services::members(apps, name),
+            }
+        })
+        .collect()
 }
 
 async fn show_app<P: PodmanClient + 'static>(

@@ -5921,7 +5921,7 @@ health = { attempts = 2, window_secs = 2 }
         let other = &apps.apps[&name("other")];
         assert_eq!(
             h.rec
-                .desired_hash(&name("idp"), consumer, &d)
+                .desired_hash(&apps.shared_services, &name("idp"), consumer, &d)
                 .await
                 .unwrap(),
             weglarka_model::hash::spec_hash_with_generated(
@@ -5930,7 +5930,10 @@ health = { attempts = 2, window_secs = 2 }
             )
         );
         assert_eq!(
-            h.rec.desired_hash(&name("other"), other, &d).await.unwrap(),
+            h.rec
+                .desired_hash(&apps.shared_services, &name("other"), other, &d)
+                .await
+                .unwrap(),
             weglarka_model::hash::spec_hash(other, &d),
             "an app that consumes nothing keeps the hash it had"
         );
@@ -6495,14 +6498,20 @@ port = 8086
         let panel = &apps.apps[&name("panel")];
         let other = &apps.apps[&name("other")];
         assert_eq!(
-            h.rec.desired_hash(&name("panel"), panel, &d).await.unwrap(),
+            h.rec
+                .desired_hash(&apps.shared_services, &name("panel"), panel, &d)
+                .await
+                .unwrap(),
             weglarka_model::hash::spec_hash_with_admin_token(
                 weglarka_model::hash::spec_hash(panel, &d),
                 CONTAINER_SOCKET_DIR
             )
         );
         assert_eq!(
-            h.rec.desired_hash(&name("other"), other, &d).await.unwrap(),
+            h.rec
+                .desired_hash(&apps.shared_services, &name("other"), other, &d)
+                .await
+                .unwrap(),
             weglarka_model::hash::spec_hash(other, &d),
             "an app that is not a client keeps the hash it had"
         );
@@ -7786,5 +7795,221 @@ mod retention {
             "{report:?}"
         );
         assert!(!ids(&report.removed).contains(&previous), "{report:?}");
+    }
+}
+
+// ── Shared services: network and start order through `effective` (issue #592, ADR 0079) ──────────
+
+mod shared_services {
+    use super::*;
+
+    /// A Redis-like service, one member and one app outside every service. The service instance is
+    /// an ordinary app otherwise; `auto_update = false` because a service pins its image. No kind is
+    /// released yet, so every test opens the gate first.
+    const SERVICE: &str = r#"
+[shared_services.cache]
+kind = "redis"
+instance = "cache-redis"
+profile = "cache"
+maxmemory = "64mb"
+
+[apps.cache-redis]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+auto_update = false
+
+[apps.api]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+shared_services = ["cache"]
+
+[apps.loner]
+image = "ghcr.io/jpalczewski/ntfy.zig:latest"
+"#;
+
+    /// The rollout gate is process-global and never closed (ADR 0079), so it is opened by every test
+    /// that needs a declaration to load.
+    fn open_gates() {
+        weglarka_model::shared_services::testing::open_kind_gates();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_service_and_its_members_share_the_service_network() {
+        open_gates();
+        let h = Harness::new(SERVICE);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+
+        let shared = "net-shared-cache";
+        let net = h
+            .fake
+            .network_spec(shared)
+            .expect("created lazily by the first deploy");
+        assert!(net.internal, "service traffic gets no route out");
+        assert_eq!(
+            net.labels.get(labels::SHARED_NETWORK).map(String::as_str),
+            Some("cache")
+        );
+        assert!(
+            !net.labels.contains_key(labels::INSTANCE),
+            "instance-keyed cleanup must never see a service network"
+        );
+
+        // The member keeps its own network first, the service network next to it.
+        let api = h.fake.container_spec("api").unwrap();
+        assert_eq!(api.networks, vec!["net-api", shared]);
+        // The service instance joins its own network under the same name (ADR 0079).
+        let redis = h.fake.container_spec("cache-redis").unwrap();
+        assert_eq!(redis.networks, vec!["net-cache-redis", shared]);
+        let mut members = h.fake.network_members(shared);
+        members.sort();
+        assert_eq!(members, vec!["api", "cache-redis"]);
+        // An app outside every service is attached to its own network only.
+        assert_eq!(
+            h.fake.container_spec("loner").unwrap().networks,
+            vec!["net-loner"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_member_starts_after_the_service_instance() {
+        open_gates();
+        let h = Harness::new(SERVICE);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(report.waiting_for_dependencies.is_empty(), "{report:?}");
+
+        let calls = h.fake.calls();
+        let redis = first_call(&calls, Call::ContainerCreate("cache-redis".into()))
+            .expect("service instance created");
+        let api = first_call(&calls, Call::ContainerCreate("api".into())).expect("member created");
+        assert!(redis < api, "the service must be up first: {calls:?}");
+
+        // The relation is derived: `apps.toml` still has no `depends_on` on the member.
+        let stored = weglarka_model::state::load_apps(&h.rec.paths().apps).unwrap();
+        assert!(stored.apps[&name("api")].depends_on.is_empty());
+        assert!(stored.apps[&name("api")].shared_networks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_waits_for_an_unhealthy_service_instance() {
+        open_gates();
+        let waiting = SERVICE.replace(
+            "[apps.cache-redis]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nauto_update = false\n",
+            "[apps.cache-redis]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nauto_update = false\nhealth = { attempts = 1, window_secs = 1 }\n",
+        );
+        let h = Harness::new(&waiting);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.fake
+            .script_health("cache-redis", [HealthStatus::Unhealthy]);
+        let report = h.rec.reconcile().await.unwrap();
+        assert_eq!(
+            report.waiting_for_dependencies,
+            vec![(name("api"), vec![name("cache-redis")])],
+            "{report:?}"
+        );
+        assert!(
+            h.state("api").failed.is_none(),
+            "a service that is not ready is not the member's failed deploy"
+        );
+        assert!(h.state("api").current.is_none());
+        assert!(h.fake.containers().iter().all(|c| c.name != "api"));
+
+        // Once the service is healthy, the member follows on the next pass.
+        h.fake.script_health("cache-redis", [HealthStatus::Healthy]);
+        h.rec.deploy(&name("cache-redis"), true).await.unwrap();
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(h.state("api").current.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_member_of_a_group_and_a_service_joins_both_networks() {
+        open_gates();
+        let both = SERVICE
+            .replace(
+                "[apps.api]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nshared_services = [\"cache\"]\n",
+                "[apps.api]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n\
+                 shared_networks = [\"kajet\"]\nshared_services = [\"cache\"]\n",
+            )
+            .replace(
+                "[shared_services.cache]",
+                "[shared_networks.kajet]\n\n[shared_services.cache]",
+            );
+        let h = Harness::new(&both);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+
+        let api = h.fake.container_spec("api").unwrap();
+        assert_eq!(
+            api.networks,
+            vec!["net-api", "net-shared-kajet", "net-shared-cache"]
+        );
+        for group in ["kajet", "cache"] {
+            let net = h
+                .fake
+                .network_spec(&format!("net-shared-{group}"))
+                .unwrap_or_else(|| panic!("{group} network created"));
+            assert!(net.internal);
+            assert_eq!(
+                net.labels.get(labels::SHARED_NETWORK).map(String::as_str),
+                Some(group)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_service_network_lives_as_long_as_its_declaration() {
+        open_gates();
+        let h = Harness::new(SERVICE);
+        h.fake.set_pull_digest(IMAGE, digest('a'));
+        h.rec.reconcile().await.unwrap();
+        assert!(h.fake.networks().contains(&"net-shared-cache".to_owned()));
+
+        // Declared and used: a later pass keeps it.
+        h.rec.reconcile().await.unwrap();
+        assert!(h.fake.networks().contains(&"net-shared-cache".to_owned()));
+
+        // The declaration and its member are gone. The service instance is recreated without the
+        // network, and the now-empty group network is pruned in the same pass.
+        h.set_apps(
+            "[apps.cache-redis]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\nauto_update = false\n\
+             \n[apps.loner]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n",
+        );
+        let report = h.rec.reconcile().await.unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        let nets = h.fake.networks();
+        assert!(!nets.contains(&"net-shared-cache".to_owned()), "{nets:?}");
+        assert_eq!(
+            h.fake.container_spec("cache-redis").unwrap().networks,
+            vec!["net-cache-redis"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_app_outside_every_service_keeps_its_container_and_hash() {
+        open_gates();
+        let with = Harness::new(SERVICE);
+        let without =
+            Harness::new("[apps.loner]\nimage = \"ghcr.io/jpalczewski/ntfy.zig:latest\"\n");
+        for h in [&with, &without] {
+            h.fake.set_pull_digest(IMAGE, digest('a'));
+            h.rec.reconcile().await.unwrap();
+        }
+        assert_eq!(
+            with.state("loner").spec_hash,
+            without.state("loner").spec_hash,
+            "a declaration elsewhere changes nothing for an app outside it"
+        );
+        // The whole libpod spec, including the hash label and the networks. Only the uid range of
+        // the two harnesses differs: it is allocated per state directory.
+        let normalized = |h: &Harness| {
+            let mut spec = h.fake.container_spec("loner").unwrap();
+            spec.labels.remove(labels::UID_RANGE);
+            spec.id_mapping = None;
+            spec
+        };
+        assert_eq!(normalized(&with), normalized(&without));
     }
 }

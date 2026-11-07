@@ -38,6 +38,7 @@ use weglarka_model::podman::{
     ContainerSpec, ContainerState, IdMapping, IdRange, PodmanClient, PodmanError, PodmanResultExt,
     Result, TarStream, VolumeAttachment, VolumeFilter, VolumeSpec,
 };
+use weglarka_model::shared_services;
 use weglarka_model::shared_volumes;
 use weglarka_model::state::{self, AppState, StateFile};
 use weglarka_model::uid_range::{DEFAULT_RANGE_SIZE, INFRA_RANGE_SIZE, UidRange, allocate};
@@ -588,6 +589,10 @@ impl<P: PodmanClient> Reconciler<P> {
     ///
     /// A member of a shared volume is refused (nothing is touched) while other members exist: their
     /// data lives in the same volume (issue #33).
+    ///
+    /// The instance of a `[shared_services.<name>]` declaration is refused as well (ADR 0079): while
+    /// any member lists the service, and also with no members, because the declaration still names
+    /// it — it has to be removed from `apps.toml` first. Nothing is touched either way.
     pub async fn remove_app_with_purges(
         &self,
         name: &InstanceName,
@@ -601,6 +606,15 @@ impl<P: PodmanClient> Reconciler<P> {
         crate::depends::ensure_not_depended_on(&apps, name)?;
         if self.identity.as_ref().is_some_and(|i| &i.instance == name) {
             return Err(EngineError::IdentityProviderInUse(name.clone()));
+        }
+        // A shared service instance outlives its members' removal only through its declaration, so
+        // the declaration is the thing to remove — not the instance (ADR 0079).
+        if let Some(service) = shared_services::service_of(&apps, name) {
+            return Err(EngineError::SharedServiceInUse {
+                service: service.clone(),
+                instance: name.clone(),
+                members: shared_services::members(&apps, service),
+            });
         }
         let Some(spec) = apps.apps.get(name).cloned() else {
             return Err(EngineError::UnknownInstance(name.clone()));
@@ -1080,6 +1094,27 @@ health = { attempts = 2, window_secs = 2 }
 image = "ghcr.io/x/szklana:latest"
 start = false
 volumes = [{ name = "data", target = "/data" }]
+"#;
+    /// The `service-has-members` fixture of the managed-Redis contract (#593, ADR 0079): one
+    /// declaration, the instance that runs it and two members.
+    const SERVICE_APPS: &str = r#"
+[shared_services.cache]
+kind = "redis"
+instance = "cache-redis"
+profile = "cache"
+maxmemory = "64mb"
+
+[apps.cache-redis]
+image = "ghcr.io/x/szklana:latest"
+auto_update = false
+
+[apps.api]
+image = "ghcr.io/x/szklana:latest"
+shared_services = ["cache"]
+
+[apps.worker]
+image = "ghcr.io/x/szklana:latest"
+shared_services = ["cache"]
 "#;
     /// The same app as [`APP`], but provisioned only: the container is removed, the data stays.
     const STOPPED_WITH_VOLUMES: &str = r#"
@@ -2203,6 +2238,91 @@ shared_volumes = [{ name = "kajet-workspaces", target = "/workspaces" }]
         );
         assert_eq!(e.fake.volumes().len(), 2);
         assert!(e.apps().apps.contains_key(&name("kajet-api")));
+    }
+
+    /// The instance of a `[shared_services.<name>]` declaration cannot be removed (ADR 0079): the
+    /// members still list the service, whatever the options. Nothing is touched.
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_instance_of_a_shared_service_is_refused_while_it_has_members() {
+        weglarka_model::shared_services::testing::open_kind_gates();
+        let e = env(SERVICE_APPS);
+        e.rec.reconcile().await.unwrap();
+
+        // A plain remove and both purge variants are refused the same way.
+        for options in [
+            RemoveAppOptions::default(),
+            purge(),
+            RemoveAppOptions {
+                purge_volumes: false,
+                purge_secrets: true,
+            },
+        ] {
+            let err = e
+                .rec
+                .remove_app_with_purges(&name("cache-redis"), options)
+                .await
+                .unwrap_err();
+            match &err {
+                EngineError::SharedServiceInUse {
+                    service,
+                    instance,
+                    members,
+                } => {
+                    assert_eq!(service.as_str(), "cache");
+                    assert_eq!(instance, &name("cache-redis"));
+                    assert_eq!(members, &[name("api"), name("worker")]);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert!(
+                err.to_string().contains("still used by: api, worker"),
+                "{err}"
+            );
+        }
+
+        assert!(
+            e.apps().apps.contains_key(&name("cache-redis")),
+            "the instance stays desired state"
+        );
+        assert!(
+            e.fake.containers().iter().any(|c| c.name == "cache-redis"),
+            "the service container is untouched"
+        );
+    }
+
+    /// With no members the refusal stays: the declaration still names the instance, so the
+    /// declaration is what has to be removed first (ADR 0079).
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_instance_of_a_shared_service_is_refused_without_members() {
+        weglarka_model::shared_services::testing::open_kind_gates();
+        let e = env(r#"
+[shared_services.cache]
+kind = "redis"
+instance = "cache-redis"
+profile = "cache"
+maxmemory = "64mb"
+
+[apps.cache-redis]
+image = "ghcr.io/x/szklana:latest"
+auto_update = false
+"#);
+        let err = e
+            .rec
+            .remove_app_with_purges(&name("cache-redis"), RemoveAppOptions::default())
+            .await
+            .unwrap_err();
+        match &err {
+            EngineError::SharedServiceInUse { members, .. } => {
+                assert!(members.is_empty(), "no members: {members:?}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("remove the declaration from apps.toml first"),
+            "{err}"
+        );
+        assert!(e.apps().apps.contains_key(&name("cache-redis")));
     }
 
     #[tokio::test(start_paused = true)]
