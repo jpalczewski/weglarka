@@ -598,8 +598,13 @@ impl<P: PodmanClient> Reconciler<P> {
         name: &InstanceName,
         options: RemoveAppOptions,
     ) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
+        let guard = self.acquire().await;
+        // Read-only pass: every refusal below leaves the files untouched, and the secret purge has
+        // to finish *before* `apps.toml` is written (ADR 0024, issue #80). An `await` cannot live
+        // inside `mutate_apps`'s synchronous closure, so the write is the only part it wraps; `spec`
+        // below therefore comes from this read while `apps_before` comes from the helper's — equal
+        // as long as the daemon is the sole state writer, which the engine lock guarantees.
+        let apps = state::load_apps(&self.paths.apps)?;
         crate::promote::ensure_unmanaged(&apps, name)?;
         // An app another app depends on cannot be removed (its `depends_on` would dangle, and with
         // `--purge-volumes` its data may still be in use). Nothing is modified on refusal.
@@ -638,9 +643,11 @@ impl<P: PodmanClient> Reconciler<P> {
                 "removed the instance's secrets"
             );
         }
-        let apps_before = apps.clone();
-        apps.apps.remove(name);
-        state::save_apps(&self.paths.apps, &apps)?;
+        let (apps_before, apps) = self.mutate_apps(&guard, |apps| {
+            let before = AppsFile::clone(apps);
+            apps.apps.remove(name);
+            Ok((before, AppsFile::clone(apps)))
+        })?;
         if !options.purge_volumes {
             return Ok(());
         }
@@ -687,22 +694,26 @@ impl<P: PodmanClient> Reconciler<P> {
         name: SharedVolumeName,
         group: Option<SharedVolumeName>,
     ) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
+        let guard = self.acquire().await;
         // A group equal to the volume's own name is the default, kept implicit in the file.
         let group = group.filter(|g| *g != name);
-        if let Some(existing) = apps.shared_volumes.get(&name) {
-            if existing.group == group {
-                return Ok(());
+        // `mutate_apps` always saves, so an idempotent re-declare rewrites `apps.toml` with
+        // identical bytes instead of leaving it untouched (accepted delta, issue #629).
+        self.mutate_apps(&guard, |apps| {
+            if let Some(existing) = apps.shared_volumes.get(&name) {
+                if existing.group == group {
+                    return Ok(());
+                }
+                return Err(EngineError::SharedGroupChange {
+                    volume: name.clone(),
+                    from: shared_volumes::volume_group(apps, &name),
+                    to: group.clone().unwrap_or_else(|| name.clone()),
+                });
             }
-            return Err(EngineError::SharedGroupChange {
-                volume: name.clone(),
-                from: shared_volumes::volume_group(&apps, &name),
-                to: group.unwrap_or_else(|| name.clone()),
-            });
-        }
-        apps.shared_volumes.insert(name, SharedVolumeSpec { group });
-        Ok(state::save_apps(&self.paths.apps, &apps)?)
+            apps.shared_volumes
+                .insert(name.clone(), SharedVolumeSpec { group });
+            Ok(())
+        })
     }
 
     /// Removes a shared volume declaration (issue #33). Refused while any app mounts it; without
@@ -713,28 +724,34 @@ impl<P: PodmanClient> Reconciler<P> {
         name: &SharedVolumeName,
         purge: bool,
     ) -> Result<(), EngineError> {
-        let _guard = self.acquire().await;
-        let mut apps = state::load_apps(&self.paths.apps)?;
-        if !apps.shared_volumes.contains_key(name) {
-            return Err(EngineError::UnknownSharedVolume(name.clone()));
-        }
-        let members = shared_volumes::members(&apps, name);
-        if !members.is_empty() {
-            return Err(EngineError::SharedVolumeInUse {
-                volume: name.clone(),
-                members,
-            });
-        }
+        let guard = self.acquire().await;
         let podman_name = VolumeRef::Shared(name).podman_name();
+        // The existence probe is an `await`, so it cannot live inside `mutate_apps`'s synchronous
+        // closure: it stays a read, under the guard, and takes place before the declaration and
+        // membership refusals — so with a broken Podman those refusals surface as a Podman error.
         let exists = self.podman.volume_inspect(&podman_name).await.exists()?;
-        if exists && !purge {
-            return Err(EngineError::SharedVolumeHasData {
-                volume: name.clone(),
-            });
-        }
-        let group = shared_volumes::volume_group(&apps, name);
-        apps.shared_volumes.remove(name);
-        state::save_apps(&self.paths.apps, &apps)?;
+        let (group, group_has_members) = self.mutate_apps(&guard, |apps| {
+            if !apps.shared_volumes.contains_key(name) {
+                return Err(EngineError::UnknownSharedVolume(name.clone()));
+            }
+            let members = shared_volumes::members(apps, name);
+            if !members.is_empty() {
+                return Err(EngineError::SharedVolumeInUse {
+                    volume: name.clone(),
+                    members,
+                });
+            }
+            if exists && !purge {
+                return Err(EngineError::SharedVolumeHasData {
+                    volume: name.clone(),
+                });
+            }
+            let group = shared_volumes::volume_group(apps, name);
+            apps.shared_volumes.remove(name);
+            // Evaluated on the file *after* the removal, exactly like the removed save implied.
+            let has_members = !shared_volumes::group_members(apps, &group).is_empty();
+            Ok((group, has_members))
+        })?;
         if exists {
             self.podman
                 .volume_remove(&podman_name, true)
@@ -742,9 +759,7 @@ impl<P: PodmanClient> Reconciler<P> {
                 .ignore_not_found()?;
         }
         // The range goes with the group's last volume: siblings may still hold data in it.
-        if shared_volumes::group_members(&apps, &group).is_empty()
-            && !self.group_has_volumes(&group).await
-        {
+        if !group_has_members && !self.group_has_volumes(&group).await {
             let mut st = state::load_state(&self.paths.state)?;
             if st.shared_volumes.remove(&group).is_some() {
                 state::save_state(&self.paths.state, &st)?;
