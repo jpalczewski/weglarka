@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.3...weglarka-identity-v0.0.4) - 2026-11-07
+
+### Added
+
+- *(ingress)* allow auth_exempt_paths on apps routed by paths ([#614](https://github.com/jpalczewski/weglarka/pull/614))
+
 ## [0.0.3](https://github.com/jpalczewski/weglarka/compare/weglarka-identity-v0.0.2...weglarka-identity-v0.0.3) - 2026-11-05
 
 ### Added

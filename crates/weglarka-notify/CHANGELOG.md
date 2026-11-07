@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/jpalczewski/weglarka/compare/weglarka-notify-v0.0.5...weglarka-notify-v0.0.6) - 2026-11-07
+
+### Added
+
+- *(notify)* read the ntfy token on use, from a file or a host secret
+- *(model)* host credential sources and a host-scoped secret store
+
+### Fixed
+
+- *(model)* a host secret that is not set yet does not stop the startup
+
+### Other
+
+- renumber the host credentials ADR to 0080 after the 0079 collision
+- *(model)* one private-file check and one header-token validator ([#623](https://github.com/jpalczewski/weglarka/pull/623))
+
 ## [0.0.5](https://github.com/jpalczewski/weglarka/compare/weglarka-notify-v0.0.4...weglarka-notify-v0.0.5) - 2026-10-29
 
 ### Added
