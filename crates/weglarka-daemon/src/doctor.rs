@@ -2886,6 +2886,50 @@ fn logs<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     });
 }
 
+/// `ingress.basic_auth` (issue #169, ADR 0081): the shared HTTP Basic credentials nginx enforces. The
+/// check is **absent** when no active app uses `auth = "basic"`; `ok` when every protected instance got
+/// its credential `map` file on the last `apply` (`nginx -t` + SIGHUP included); otherwise `fail`,
+/// naming each instance with its secret **name** and the reason. nginx answers `503` on a protected
+/// route without a map file, so a failure here means the app is not being served.
+fn ingress_basic_auth<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
+    let status = d.ingress.basic_auth_status();
+    if status.protected.is_empty() {
+        return;
+    }
+    if status.problems.is_empty() {
+        let instances: Vec<&str> = status.protected.iter().map(InstanceName::as_str).collect();
+        out.push(ok(
+            "ingress.basic_auth",
+            format!(
+                "nginx asks for a shared credential on: {}",
+                instances.join(", ")
+            ),
+        ));
+        return;
+    }
+    let lines: Vec<String> = status
+        .problems
+        .iter()
+        .map(|(instance, problem)| {
+            // The reason is a store or parse error; `detail` decides whether a `read` caller sees it.
+            format!(
+                "{instance} (secret {}): {}",
+                problem.secret,
+                detail(&problem.reason)
+            )
+        })
+        .collect();
+    out.push(check(
+        "ingress.basic_auth",
+        CheckStatus::Fail,
+        lines.join("; "),
+        Some(
+            "set the secret with `weglarka secrets set <instance> <name>` (one `user:password` per \
+             line); until then nginx answers 503 on that app",
+        ),
+    ));
+}
+
 async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     if d.host.ingress.mode == IngressMode::Behind
         && let Some(path) = &d.host.ingress.traefik_dynamic_file
@@ -2929,6 +2973,7 @@ async fn ingress<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
             Some("it is created on the first ingress recompute"),
         ));
     }
+    ingress_basic_auth(d, out);
     ingress_routes(d, out);
     ingress_internal_hosts(d, out);
     if d.host.ingress.mode == IngressMode::Edge {

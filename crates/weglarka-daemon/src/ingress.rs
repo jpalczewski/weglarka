@@ -25,14 +25,17 @@ use weglarka_engine::reconcile::Reconciler;
 use weglarka_engine::volumes;
 use weglarka_ingress::{Domain, nginx, traefik};
 use weglarka_model::app::{AppKind, AppSpec, InstanceName, Security};
+use weglarka_model::basic_auth;
 use weglarka_model::config::{HostConfig, IngressMode, WILDCARD_CERT_PREFIX};
 use weglarka_model::fsutil::write_atomic;
+use weglarka_model::identity::IngressAuth;
 use weglarka_model::ingress_logs;
 use weglarka_model::labels;
 use weglarka_model::podman::{
     BindMount, ContainerFilter, ContainerSpec, ContainerState, NetworkSpec, PodmanClient,
     PodmanError, PodmanResultExt, PortMapping, RestartPolicy,
 };
+use weglarka_model::secret_store::{self, SecretStore};
 use weglarka_model::state;
 use weglarka_model::uid_range::UidRange;
 
@@ -71,6 +74,12 @@ const PROBE_SUBDIR: &str = "probe";
 /// for mounts: the nginx container already sees them.
 const TLS_SUBDIR: &str = "tls";
 const ACME_SUBDIR: &str = "acme";
+/// `<nginx_conf_dir>/auth` (`0700`): the HTTP basic auth `map` files (issue #169, ADR 0081), one
+/// `<instance>.map` per protected instance. The nginx **master** (container uid 0, the runtime user under
+/// the ingress uid map) reads them at load and reload, so no credential ends up in the `0644`
+/// `nginx.conf`; the directory keeps every other host user out. `<nginx_conf_dir>` is mounted whole,
+/// so the files need no mount of their own and the ingress hash does not change.
+const AUTH_SUBDIR: &str = "auth";
 /// Delay before re-running `apply` after a best-effort network operation failed.
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
@@ -141,6 +150,11 @@ pub struct IngressManager<P: PodmanClient> {
     apply_lock: tokio::sync::Mutex<()>,
     notify: Notify,
     last_error: Mutex<Option<String>>,
+    /// The daemon's secret store: the HTTP basic auth credentials of the protected instances are read
+    /// through it on every `apply` (ADR 0081). The engine holds its own copy, not reachable from here.
+    secrets: Arc<dyn SecretStore>,
+    /// What the last `apply` found out about HTTP basic auth, for `doctor` (ADR 0081).
+    basic_auth: Mutex<BasicAuthStatus>,
     /// Set when a best-effort step (detaching a stale network) failed: `run` retries soon.
     retry_soon: AtomicBool,
     /// The refreshed CDN range list (`[ingress.cdn]` without a pin); `None` = bundled or pinned.
@@ -153,6 +167,7 @@ impl<P: PodmanClient> IngressManager<P> {
         host: HostConfig,
         conf_dir: PathBuf,
         logs_dir: PathBuf,
+        secrets: Arc<dyn SecretStore>,
     ) -> Self {
         let apps_path = engine.paths().apps.clone();
         Self {
@@ -164,6 +179,8 @@ impl<P: PodmanClient> IngressManager<P> {
             apply_lock: tokio::sync::Mutex::new(()),
             notify: Notify::new(),
             last_error: Mutex::new(None),
+            secrets,
+            basic_auth: Mutex::new(BasicAuthStatus::default()),
             retry_soon: AtomicBool::new(false),
             cdn_ranges: std::sync::OnceLock::new(),
         }
@@ -220,16 +237,46 @@ impl<P: PodmanClient> IngressManager<P> {
     }
 
     pub async fn apply(&self) -> Result<ApplyReport, IngressApplyError> {
+        let apps: BTreeMap<InstanceName, AppSpec> = state::load_apps(&self.apps_path)?.apps;
+        self.apply_set(apps).await
+    }
+
+    /// [`Self::apply`] with an explicit app set instead of the one in `apps.toml`. The integration tests
+    /// need it: `state::load_apps` still refuses `ingress.auth = "basic"` (the ADR 0081 rollout gate),
+    /// so a protected app cannot be written to `apps.toml` before that gate lifts.
+    #[cfg(feature = "testing")]
+    pub async fn apply_apps(
+        &self,
+        apps: BTreeMap<InstanceName, AppSpec>,
+    ) -> Result<ApplyReport, IngressApplyError> {
+        self.apply_set(apps).await
+    }
+
+    async fn apply_set(
+        &self,
+        apps: BTreeMap<InstanceName, AppSpec>,
+    ) -> Result<ApplyReport, IngressApplyError> {
         let _g = self.apply_lock.lock().await;
         self.retry_soon.store(false, Ordering::Relaxed);
-        let result = self.apply_locked().await;
+        let result = self.apply_locked(apps).await;
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
             result.as_ref().err().map(ToString::to_string);
         result
     }
 
-    async fn apply_locked(&self) -> Result<ApplyReport, IngressApplyError> {
-        let apps: BTreeMap<InstanceName, AppSpec> = state::load_apps(&self.apps_path)?.apps;
+    /// What the last `apply` found out about HTTP basic auth (ADR 0081), for `doctor`: the instances
+    /// it found protected and the ones that got no credential `map` file, with the reason.
+    pub fn basic_auth_status(&self) -> BasicAuthStatus {
+        self.basic_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    async fn apply_locked(
+        &self,
+        apps: BTreeMap<InstanceName, AppSpec>,
+    ) -> Result<ApplyReport, IngressApplyError> {
         // A static site (ADR 0049) has no container, hence no network for nginx to join.
         let routed: Vec<&InstanceName> = apps
             .iter()
@@ -295,6 +342,9 @@ impl<P: PodmanClient> IngressManager<P> {
         // The logs directory exists before the container starts: nginx opens both files while it
         // parses the config, and a missing directory would make `nginx -t`/the start fail.
         ingress_logs::ensure_dir(&self.logs_dir).map_err(io_err(&self.logs_dir))?;
+        // HTTP basic auth (ADR 0081): the credential `map` files of the protected instances, before the
+        // config that `include`s them is rendered.
+        let basic_auth = self.sync_basic_auth(&apps)?;
 
         // Default trust: nginx's own addresses (docs/decisions/0032), unless the operator pinned a list.
         // Only `behind` trusts anybody: in `edge` nginx terminates TLS and direct clients are untrusted.
@@ -308,6 +358,8 @@ impl<P: PodmanClient> IngressManager<P> {
             certificates: &certificates,
             wildcards: &wildcards,
             tls_fingerprint: tls_fingerprint.as_deref(),
+            basic_auth: &basic_auth.maps,
+            basic_auth_changed: basic_auth.changed,
         };
         let mut own_addresses = if behind {
             self.nginx_addresses().await?
@@ -386,6 +438,8 @@ impl<P: PodmanClient> IngressManager<P> {
             options.cdn = cdn_trust(&self.host, self.cdn_ranges.get().map(|r| &**r))?;
         }
         options.unreleased = self.unreleased_sites(r.apps);
+        // Protected instances whose credential file this pass wrote (ADR 0081); the others render 503.
+        options.basic_auth = r.basic_auth.clone();
         let conf = nginx::generate(&self.host, r.apps, &options)?;
 
         let previous = fs::read(self.conf_path()).ok();
@@ -395,7 +449,9 @@ impl<P: PodmanClient> IngressManager<P> {
                 r.networks,
                 options.listen_port,
                 options.https_listen_port,
-                conf_written,
+                // A changed credential reloads nginx even when `nginx.conf` is byte-identical: the
+                // map file is not fingerprinted into the config (it is 0644, ADR 0081).
+                conf_written || r.basic_auth_changed,
             )
             .await
         {
@@ -818,6 +874,128 @@ impl<P: PodmanClient> IngressManager<P> {
         self.conf_dir.join(ACME_SUBDIR)
     }
 
+    /// The HTTP basic auth `map` directory (`<nginx_conf_dir>/auth`, `0700`; ADR 0081).
+    pub fn auth_dir(&self) -> PathBuf {
+        self.conf_dir.join(AUTH_SUBDIR)
+    }
+
+    /// Writes the credential `map` file of every active instance with `auth = "basic"` (issue #169,
+    /// ADR 0081) and deletes the ones that belong to no such instance. Returns the entries for
+    /// [`nginx::NginxOptions::basic_auth`] and whether any file was created, changed or deleted — the
+    /// apply must then run `nginx -t` + SIGHUP even when `nginx.conf` is byte-identical.
+    ///
+    /// A missing, empty or unparsable secret leaves its instance **out** of the map: the generator then
+    /// renders `return 503;` for it, so no route is ever served without enforcement. The reason is
+    /// recorded for `doctor` and logged with the secret **name** only (`SecretError` and
+    /// [`weglarka_model::basic_auth::BasicAuthError`] never carry a value, the latter only a line
+    /// number), and an old file of that instance is deleted so stale credentials never survive.
+    fn sync_basic_auth(
+        &self,
+        apps: &BTreeMap<InstanceName, AppSpec>,
+    ) -> Result<BasicAuthMaterial, IngressApplyError> {
+        let dir = self.auth_dir();
+        // `active` is `spec.start`: an app provisioned without a container renders no route at all.
+        let protected: Vec<(&InstanceName, &AppSpec)> = apps
+            .iter()
+            .filter(|(_, spec)| spec.start && spec.ingress.auth == IngressAuth::Basic)
+            .collect();
+        let mut status = BasicAuthStatus {
+            protected: protected.iter().map(|(name, _)| (*name).clone()).collect(),
+            problems: BTreeMap::new(),
+        };
+        let mut material = BasicAuthMaterial::default();
+        if !protected.is_empty() || dir.is_dir() {
+            fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(io_err(&dir))?;
+        }
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        for (instance, spec) in protected {
+            // Validation refuses `basic` without `auth_secret`; a spec that predates the rule keeps
+            // the instance unprotected (503) rather than rendering a map for an empty name.
+            let Some(name) = spec.ingress.auth_secret.as_deref() else {
+                status.problems.insert(
+                    instance.clone(),
+                    BasicAuthProblem {
+                        secret: String::new(),
+                        reason: "the spec has no ingress.auth_secret".to_owned(),
+                    },
+                );
+                continue;
+            };
+            let scoped = secret_store::scoped_name(instance, name);
+            let credentials = match self.credentials(&scoped) {
+                Ok(credentials) => credentials,
+                Err(reason) => {
+                    // Instance and secret name only: a credential never reaches a log line.
+                    tracing::warn!(
+                        %instance,
+                        secret = %scoped,
+                        error = %reason,
+                        "no basic auth credentials for the instance: its routes answer 503"
+                    );
+                    status.problems.insert(
+                        instance.clone(),
+                        BasicAuthProblem {
+                            secret: name.to_owned(),
+                            reason,
+                        },
+                    );
+                    continue;
+                }
+            };
+            let lines = credentials.nginx_map_lines();
+            let file = format!("{instance}.map");
+            let path = dir.join(&file);
+            // The bytes on disk are what decides about the reload: the credentials are deliberately
+            // not fingerprinted into the `0644` nginx.conf (an unkeyed hash of a password can be
+            // attacked offline), so the map file itself is the change detector.
+            if !fs::read(&path).is_ok_and(|old| old == lines.as_bytes()) {
+                write_atomic(&path, lines.as_bytes(), 0o600).map_err(io_err(&path))?;
+                material.changed = true;
+            }
+            // Re-applied on every pass, like the TLS keys: a file that already existed with wider bits
+            // is narrowed to what only the master may read.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(io_err(&path))?;
+            wanted.insert(file);
+            material
+                .maps
+                .insert(instance.clone(), nginx::basic_auth_map_path(instance));
+        }
+        // Credentials of an instance that is gone, unprotected or no longer started must not outlive
+        // the protection: delete every map file this pass did not want.
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(io_err(&dir))?;
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    if !name.ends_with(".map") || wanted.contains(name) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    fs::remove_file(&path).map_err(io_err(&path))?;
+                    material.changed = true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&dir)(e)),
+        }
+        *self.basic_auth.lock().unwrap_or_else(|e| e.into_inner()) = status;
+        Ok(material)
+    }
+
+    /// The parsed credentials of the secret `scoped` (`<instance>.<name>`). A store error, a missing
+    /// secret and a value that does not parse all become one reason string that names no credential.
+    fn credentials(&self, scoped: &str) -> Result<basic_auth::Credentials, String> {
+        match self.secrets.get(scoped) {
+            Ok(Some(value)) => basic_auth::parse(value.expose()).map_err(|e| e.to_string()),
+            Ok(None) => Err("the secret is not set".to_owned()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     async fn ensure_nginx(
         &self,
         networks: &[String],
@@ -1074,6 +1252,34 @@ struct TlsMaterial {
     fingerprint: Option<String>,
 }
 
+/// What one `apply` did with the HTTP basic auth `map` files (ADR 0081).
+#[derive(Default)]
+struct BasicAuthMaterial {
+    /// Instance → the container path of its `map` file, for [`nginx::NginxOptions::basic_auth`].
+    maps: BTreeMap<InstanceName, String>,
+    /// A file was created, changed or deleted: nginx reloads even when `nginx.conf` is identical.
+    changed: bool,
+}
+
+/// An active instance that uses `auth = "basic"` and got **no** credential `map` file (ADR 0081), so
+/// its routes answer `503`. For `doctor` and the log: the secret name and the reason, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicAuthProblem {
+    /// The secret name from the spec (`ingress.auth_secret`), not the secret of that name.
+    pub secret: String,
+    /// Why there is no map file: a store error, a missing secret or a parse error naming a line.
+    pub reason: String,
+}
+
+/// What the last ingress `apply` found out about HTTP basic auth (ADR 0081), for `doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BasicAuthStatus {
+    /// The active instances with `auth = "basic"`: nginx enforces a credential for each of them.
+    pub protected: BTreeSet<InstanceName>,
+    /// The protected instances without a map file, with the reason. Their routes answer `503`.
+    pub problems: BTreeMap<InstanceName, BasicAuthProblem>,
+}
+
 /// Inputs of one `nginx.conf` rendering that do not depend on nginx's addresses.
 struct Render<'a> {
     apps: &'a BTreeMap<InstanceName, AppSpec>,
@@ -1088,6 +1294,11 @@ struct Render<'a> {
     /// certificate re-renders the config and goes through the usual `nginx -t` + SIGHUP path
     /// (never a recreate). `None` in `behind`.
     tls_fingerprint: Option<&'a str>,
+    /// Instances whose credential `map` file this pass wrote, with its container path (ADR 0081).
+    basic_auth: &'a BTreeMap<InstanceName, String>,
+    /// A `map` file was created, changed or deleted: nginx reloads even when `nginx.conf` is
+    /// byte-identical, because the credentials are not fingerprinted into it.
+    basic_auth_changed: bool,
 }
 
 /// Peers whose `X-Forwarded-*` nginx trusts by default (docs/decisions/0032): nginx's **own**

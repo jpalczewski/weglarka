@@ -15,6 +15,12 @@ workspace = true
 name = "weglarka_daemon"
 path = "src/lib.rs"
 
+[features]
+# `IngressManager::apply_apps`: lets the integration tests hand the ingress an app set directly,
+# because `state::load_apps` still refuses `ingress.auth = "basic"` (the ADR 0081 rollout gate).
+# Enabled for tests only, by the self dev-dependency below — exactly like `weglarka-engine`.
+testing = []
+
 [[bin]]
 name = "weglarka-daemon"
 path = "src/main.rs"
@@ -55,6 +61,8 @@ insta.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 weglarka-acme = { workspace = true, features = ["testing"] }
+# The crate itself, to turn on `testing` for the integration tests (never for the binaries).
+weglarka-daemon = { path = ".", features = ["testing"] }
 weglarka-dns = { workspace = true, features = ["testing"] }
 weglarka-engine = { workspace = true, features = ["testing"] }
 weglarka-model = { workspace = true, features = ["testing"] }

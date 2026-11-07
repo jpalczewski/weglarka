@@ -68,7 +68,13 @@ async fn reopening_rotated_logs_tests_the_config_and_sends_hup() {
         StatePaths::in_dir(root),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     manager.apply().await.unwrap();
     let before = fake.calls().len();
 
@@ -121,7 +127,13 @@ async fn nginx_lifecycle() {
         paths.clone(),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let set_apps = |apps: &[(&str, &str)]| {
         let mut file = state::load_apps(&paths.apps).unwrap();
         file.apps.clear();
@@ -291,6 +303,7 @@ async fn nginx_lifecycle() {
         host2,
         root.join("nginx"),
         root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
     );
     assert_eq!(
         nginx_action(manager2.apply().await),
@@ -334,7 +347,13 @@ async fn failed_network_detach_does_not_block_traefik_file() {
         paths.clone(),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let mut file = state::load_apps(&paths.apps).unwrap();
     file.apps
         .insert(InstanceName::new("blog").unwrap(), spec("blog.example.eu"));
@@ -405,7 +424,13 @@ async fn trusts_nginx_own_addresses_on_app_networks_but_not_app_containers() {
         paths.clone(),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let mut file = state::load_apps(&paths.apps).unwrap();
     file.apps
         .insert(InstanceName::new("blog").unwrap(), spec("blog.example.eu"));
@@ -475,7 +500,13 @@ async fn edge_publishes_tls_and_reloads_on_a_certificate_change() {
         paths.clone(),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let action = |r: Result<ApplyReport, _>| match r.unwrap() {
         ApplyReport::Changed { nginx, .. } => Some(nginx),
         ApplyReport::Unchanged => None,
@@ -637,7 +668,13 @@ async fn edge_serves_covered_domains_with_a_wildcard_pair() {
         paths.clone(),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let reloaded = |r: Result<ApplyReport, _>| {
         matches!(
             r.unwrap(),
@@ -749,7 +786,13 @@ async fn edge_cdn_ranges_refresh_reloads_and_never_recreates() {
         StatePaths::in_dir(root),
         ReconcilerOptions::default(),
     ));
-    let manager = IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"));
+    let manager = IngressManager::new(
+        engine,
+        host,
+        root.join("nginx"),
+        root.join("ingress-logs"),
+        Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+    );
     let ranges = Arc::new(CdnRanges::load(
         weglarka_model::config::CdnProvider::Cloudflare,
         root.join("cdn-ranges.toml"),
@@ -821,7 +864,13 @@ async fn edge_self_update_keeps_the_forwarder_and_a_changed_publish_replaces_it(
             StatePaths::in_dir(root),
             ReconcilerOptions::default(),
         ));
-        IngressManager::new(engine, host, root.join("nginx"), root.join("ingress-logs"))
+        IngressManager::new(
+            engine,
+            host,
+            root.join("nginx"),
+            root.join("ingress-logs"),
+            Arc::new(FileSecretStore::new(root.join("secrets.toml"))),
+        )
     };
     let manager = manager_for(host_for("127.0.0.1:18443"));
     manager.apply().await.unwrap();
