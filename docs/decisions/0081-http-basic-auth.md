@@ -96,7 +96,8 @@ protect anything here, because the value the map compares against is password-eq
 
   where `<n>` is the instance's index in the plan (nginx variable names cannot contain `-`). When any such map
   exists, `http {}` also sets `map_hash_bucket_size 512;`, because a key can be up to about 270 bytes and the default
-  bucket makes `nginx -t` fail.
+  bucket makes `nginx -t` fail. It is the **first** directive of `http {}`: nginx rejects it as a duplicate once any
+  `map` block has been parsed (found while implementing the generator, #647).
 - Every location of a protected app, except `auth_exempt_paths` and the admin relay carve-out (ADR 0060, unguarded as
   it is under forward auth), answers a request that does not match with:
 

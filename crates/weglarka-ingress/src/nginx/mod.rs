@@ -80,6 +80,18 @@ pub const TLS_SOCKET: &str = "https.sock";
 /// modes, in a directory mounted into nginx only. Its file name and the container directory it lives in.
 pub const PROBE_SOCKET: &str = "probe.sock";
 pub const PROBE_CONTAINER_DIR: &str = "/run/weglarka-probe";
+/// Container directory with the HTTP basic auth `map` files (ADR 0081), `<nginx_conf_dir>/auth`: one
+/// `<instance>.map` per protected instance, holding one `"Basic <base64>" 1;` line per credential.
+/// The daemon writes them (`0700`/`0600`) and the nginx **master** reads them at load and reload, so no
+/// credential is ever in this `0644` config.
+pub const BASIC_AUTH_CONTAINER_DIR: &str = "/etc/nginx/auth";
+
+/// Container path of the basic auth `map` file of `instance` (ADR 0081): the `include` of the
+/// instance's `map` block, and an entry of [`NginxOptions::basic_auth`].
+pub fn basic_auth_map_path(instance: &InstanceName) -> String {
+    format!("{BASIC_AUTH_CONTAINER_DIR}/{instance}.map")
+}
+
 /// ACME HTTP-01 prefix, reserved on the plain-HTTP listener and exempt from the HTTPS redirect.
 pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 

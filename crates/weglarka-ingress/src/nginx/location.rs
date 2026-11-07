@@ -8,7 +8,7 @@ use weglarka_model::app::{
 use super::NginxOptions;
 use super::common::{
     AuthVars, Forwarded, assert_no_escaping_needed, set_app, write_auth_request,
-    write_authz_location, write_proxy_headers,
+    write_authz_location, write_basic_auth_guard, write_proxy_headers,
 };
 use super::conf::Conf;
 use super::security;
@@ -47,6 +47,10 @@ struct Location<'a> {
     /// without forward auth and for its `auth_exempt_paths` — those locations are the app's own
     /// minus the `auth_request`, so the exemption is structural, never a rule that could be misread.
     auth: bool,
+    /// HTTP basic auth (ADR 0081): `Some(n)` when this location is protected by the credential `map`
+    /// of the instance at index `n` in the plan. `None` for an app without basic auth and for its
+    /// `auth_exempt_paths` and admin relay locations, which are structurally unguarded like `auth`'s.
+    basic: Option<usize>,
     /// An `auth_exempt_paths` location: nginx matches on the normalized path while the upstream
     /// gets the raw request URI, so a request that only an upstream treating `;` or `\` as path
     /// syntax would resolve elsewhere (`/mcp/..;/admin`) is refused instead of passed on unguarded.
@@ -64,6 +68,7 @@ fn path_locations<'a>(
     path: &PathPrefix,
     app: Option<&'a str>,
     directory: bool,
+    basic: Option<usize>,
 ) -> Vec<Location<'a>> {
     let ingress = &route.ingress;
     let auth = route.forward_auth();
@@ -74,11 +79,12 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth,
+            basic,
             exempt: false,
             relay: false,
         }]
         .into_iter()
-        .chain(streaming_locations(ingress, app, auth))
+        .chain(streaming_locations(ingress, app, auth, basic))
         .chain(exempt_locations(
             owned_exempt(route, path).collect(),
             app,
@@ -122,6 +128,7 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth: auth && !exact_open,
+            basic: basic.filter(|_| !exact_open),
             exempt: exact_open,
             relay: false,
         },
@@ -131,6 +138,7 @@ fn path_locations<'a>(
             app,
             long_lived: false,
             auth: auth && !below_open,
+            basic: basic.filter(|_| !below_open),
             exempt: below_open,
             relay: false,
         },
@@ -165,6 +173,7 @@ fn streaming_locations<'a>(
     ingress: &AppIngress,
     app: Option<&'a str>,
     auth: bool,
+    basic: Option<usize>,
 ) -> impl Iterator<Item = Location<'a>> {
     ingress.streaming_paths.iter().flat_map(move |p| {
         [format!("location = {p}"), format!("location ^~ {p}/")]
@@ -175,6 +184,7 @@ fn streaming_locations<'a>(
                 app,
                 long_lived: true,
                 auth,
+                basic,
                 exempt: false,
                 relay: false,
             })
@@ -203,6 +213,7 @@ fn exempt_locations<'a>(
             app,
             long_lived: false,
             auth: false,
+            basic: None,
             exempt: true,
             relay: false,
         })
@@ -222,6 +233,7 @@ fn relay_locations(app: Option<&str>) -> Vec<Location<'_>> {
         app,
         long_lived: false,
         auth: false,
+        basic: None,
         exempt: true,
         relay: true,
     })
@@ -247,6 +259,9 @@ fn oauth_locations<'a>(
                 app,
                 long_lived: true,
                 auth: false,
+                // `oauth_resources` and `auth = "basic"` exclude each other (ADR 0081), so a
+                // resource location never carries the credential check.
+                basic: None,
                 exempt,
                 relay: false,
             })
@@ -342,6 +357,13 @@ impl Backend<'_> {
                 );
                 write_auth_request(c);
             }
+            // ADR 0081: the basic auth check of this location, in the same place forward auth puts
+            // its `auth_request`. It refuses with 401 before nginx chooses a content handler.
+            if let Some(index) = location.basic
+                && !matches!(self, Backend::Unreleased)
+            {
+                write_basic_auth_guard(c, index);
+            }
             match self {
                 Backend::Directory { root } => {
                     write_directory(c, root, location.strip.as_ref(), site_prefix, ingress.static_.as_ref());
@@ -359,16 +381,25 @@ impl Backend<'_> {
             if location.auth {
                 // The first `proxy_set_header` of a level drops every inherited one: repeat the
                 // whole set, this time with `Remote-*` from the authz answer.
-                write_proxy_headers(c, forwarded, Some(AuthVars));
+                write_proxy_headers(c, forwarded, Some(AuthVars), false);
+            } else if location.basic.is_some() {
+                // Same rule, and the upstream never sees the shared password: `Authorization` is
+                // cleared here, while an exempt location inherits the http-level set unchanged.
+                write_proxy_headers(c, forwarded, None, true);
             }
             // Security headers (#497, ADR 0076) go next to `X-Request-Id` so an `add_header` of
             // this location cannot drop either; the `authz` subrequest location is a different
-            // function and never carries them. A location without forward auth has no `add_header`
-            // of its own yet, so the variable set restates `X-Request-Id` for it.
+            // function and never carries them. A location with neither forward nor basic auth has no
+            // `add_header` of its own yet, so the variable set restates `X-Request-Id` for it.
             if let (Backend::Container { .. }, Some(headers)) =
                 (self, ingress.security_headers.as_ref())
             {
-                security::write_headers(c, instance, headers, location.auth);
+                security::write_headers(
+                    c,
+                    instance,
+                    headers,
+                    location.auth || location.basic.is_some(),
+                );
             }
         });
     }
@@ -528,6 +559,7 @@ fn write_site_relative_locations(
     site_prefix: &str,
     opts: &StaticIngress,
     app: Option<&str>,
+    basic: Option<usize>,
 ) {
     for p in &opts.cache_immutable_paths {
         // The trailing `/` is a segment boundary (ADR 0031's own convention): without it, `^~` would
@@ -536,6 +568,11 @@ fn write_site_relative_locations(
         c.block(&format!("location ^~ {site_prefix}{p}/"), |c| {
             if let Some(app) = app {
                 set_app(c, app);
+            }
+            // A protected site guards these locations too (ADR 0081: every location of the app,
+            // except its exempt paths and the admin relay).
+            if let Some(index) = basic {
+                write_basic_auth_guard(c, index);
             }
             c.line(&format!("root {root};"));
             c.line("add_header Cache-Control \"public, max-age=31536000, immutable\" always;");
@@ -552,6 +589,9 @@ fn write_site_relative_locations(
         c.block(&format!("location = {site_prefix}{}", f.path), |c| {
             if let Some(app) = app {
                 set_app(c, app);
+            }
+            if let Some(index) = basic {
+                write_basic_auth_guard(c, index);
             }
             c.line(&format!("root {root};"));
             // An empty `types {}` turns off extension sniffing for this one location, so the forced
@@ -588,8 +628,9 @@ fn write_security_preset_only(c: &mut Conf, headers: Option<&SecurityHeaders>) {
 /// `redirects` (#104): already-absolute client paths, validated against the site's own `paths` in
 /// `weglarka-model` (unlike `cache_immutable_paths`/`feeds`, which are release-relative). Rendered once
 /// per app rather than once per `(path, app)` pair — a multi-`paths` site would otherwise define the
-/// same `location` twice.
-fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
+/// same `location` twice. A redirect is a location of the app like any other, so a protected site
+/// answers a request without credentials with 401 before the redirect (ADR 0081).
+fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>, basic: Option<usize>) {
     for r in &opts.redirects {
         if r.prefix {
             // `.` is the only regex metacharacter the path alphabet allows (`check_path_prefix`).
@@ -602,12 +643,18 @@ fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
                 if let Some(app) = app {
                     set_app(c, app);
                 }
+                if let Some(index) = basic {
+                    write_basic_auth_guard(c, index);
+                }
                 write_security_headers(c, opts);
                 c.line(&format!("rewrite ^{escaped}/(.*)$ {}/$1 permanent;", r.to));
             });
             c.block(&format!("location = {}", r.from), |c| {
                 if let Some(app) = app {
                     set_app(c, app);
+                }
+                if let Some(index) = basic {
+                    write_basic_auth_guard(c, index);
                 }
                 write_security_headers(c, opts);
                 c.line(&format!("return 301 {}$is_args$args;", r.to));
@@ -616,6 +663,9 @@ fn write_redirects(c: &mut Conf, opts: &StaticIngress, app: Option<&str>) {
             c.block(&format!("location = {}", r.from), |c| {
                 if let Some(app) = app {
                     set_app(c, app);
+                }
+                if let Some(index) = basic {
+                    write_basic_auth_guard(c, index);
                 }
                 write_security_headers(c, opts);
                 c.line(&format!("return 301 {}$is_args$args;", r.to));
@@ -678,16 +728,30 @@ pub(super) fn write_app_locations(
         .flat_map(|app| app.paths.iter().map(move |p| (p, *app)))
         .collect();
     locations.sort_by(|a, b| a.0.cmp(b.0));
+    // ADR 0081: a protected instance whose credential `map` file the daemon did not write answers 503
+    // in every location, exactly like an unreleased site (fail closed). Nothing of that instance
+    // renders a real location, so no config ever names an undefined `$weglarka_basic_ok_<n>` — which
+    // `nginx -t` would reject for the whole host, taking every other app down with it.
+    let fails_closed = |app: &AppRoute<'_>| {
+        o.unreleased.contains(app.instance)
+            || (app.basic_auth() && !o.basic_auth.contains_key(app.instance))
+    };
     for (path, app) in &locations {
-        let backend = match &app.backend {
-            RouteBackend::Upstream { port } => Backend::Container {
-                host: app.instance.as_str(),
-                port: *port,
-            },
-            RouteBackend::Directory { .. } if o.unreleased.contains(app.instance) => {
-                Backend::Unreleased
+        let basic = if app.basic_auth() && !fails_closed(app) {
+            plan.index_of(app.instance)
+        } else {
+            None
+        };
+        let backend = if fails_closed(app) {
+            Backend::Unreleased
+        } else {
+            match &app.backend {
+                RouteBackend::Upstream { port } => Backend::Container {
+                    host: app.instance.as_str(),
+                    port: *port,
+                },
+                RouteBackend::Directory { root } => Backend::Directory { root },
             }
-            RouteBackend::Directory { root } => Backend::Directory { root },
         };
         let directory = matches!(backend, Backend::Directory { .. } | Backend::Unreleased);
         let name = shared.then(|| app.instance.as_str());
@@ -699,7 +763,7 @@ pub(super) fn write_app_locations(
         } else {
             path.as_str().to_owned()
         };
-        for location in path_locations(app, path, name, directory) {
+        for location in path_locations(app, path, name, directory, basic) {
             backend.write_location(
                 c,
                 &location,
@@ -712,7 +776,7 @@ pub(super) fn write_app_locations(
         if let Backend::Directory { root } = &backend
             && let Some(opts) = app.ingress.static_.as_ref()
         {
-            write_site_relative_locations(c, root, &site_prefix, opts, name);
+            write_site_relative_locations(c, root, &site_prefix, opts, name, basic);
         }
     }
     // `redirects` are already-absolute client paths, independent of path-prefix routing, so they are
@@ -722,7 +786,9 @@ pub(super) fn write_app_locations(
         if !redirects_done.insert(app.instance) {
             continue;
         }
-        if o.unreleased.contains(app.instance) {
+        // An app that answers 503 renders none of them: its own catch-all already fails closed, and a
+        // redirect location would answer without the credential check otherwise.
+        if fails_closed(app) {
             continue;
         }
         let Some(opts) = app.ingress.static_.as_ref() else {
@@ -732,7 +798,12 @@ pub(super) fn write_app_locations(
             continue;
         }
         let name = shared.then(|| app.instance.as_str());
-        write_redirects(c, opts, name);
+        let basic = if app.basic_auth() {
+            plan.index_of(app.instance)
+        } else {
+            None
+        };
+        write_redirects(c, opts, name, basic);
     }
     write_oauth_server(c, plan, forwarded, apps, shared);
 }

@@ -260,8 +260,15 @@ pub(super) fn write_probe_proto_map(c: &mut Conf, fallback: &str) {
 /// set to the empty string, which removes whatever a client sent (same discipline as `X-Forwarded-*`,
 /// ADR 0007) in every location, static sites and the webhook included. nginx's `proxy_set_header`
 /// replaces *all* inherited headers at the first use on a level, so a protected location calls this
-/// again with `Some(AuthVars)` and gets the whole set back, `Remote-*` taken from the authz result.
-pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded, auth: Option<AuthVars>) {
+/// again and gets the whole set back: with `Some(AuthVars)` and `Remote-*` taken from the authz result
+/// (`auth_request`, ADR 0052), or with `strip_authorization` and the client's `Authorization` removed
+/// (HTTP basic auth, ADR 0081 — the upstream must never see the shared password).
+pub(super) fn write_proxy_headers(
+    c: &mut Conf,
+    forwarded: &Forwarded,
+    auth: Option<AuthVars>,
+    strip_authorization: bool,
+) {
     c.line("proxy_http_version 1.1;");
     c.line("proxy_set_header Host $host;");
     c.line(&format!(
@@ -283,6 +290,9 @@ pub(super) fn write_proxy_headers(c: &mut Conf, forwarded: &Forwarded, auth: Opt
     c.line("proxy_set_header X-Request-Id $request_id;");
     c.line("proxy_set_header Upgrade $http_upgrade;");
     c.line("proxy_set_header Connection $connection_upgrade;");
+    if strip_authorization {
+        c.line("proxy_set_header Authorization \"\";");
+    }
     for (header, variable) in AuthVars::HEADERS {
         let value = if auth.is_some() { variable } else { "\"\"" };
         c.line(&format!("proxy_set_header {header} {value};"));
@@ -300,15 +310,108 @@ pub(super) fn write_auth_maps(c: &mut Conf, plan: &Plan<'_>) {
     c.line("# Forward auth (docs/decisions/0052).");
     // The probe socket is the only listener without PROXY header or real_ip, so `$remote_addr` stays
     // `unix:` there and nowhere else: the daemon is exempt structurally, with no address list.
-    c.block("map $remote_addr $weglarka_probe", |c| {
-        c.line("\"unix:\" 1;");
-        c.line("default 0;");
-    });
+    write_probe_map(c);
     c.block("map $wg_redirect $wg_redirect_or_portal", |c| {
         c.line(&format!("\"\" \"{}/\";", identity.issuer));
         c.line("default $wg_redirect;");
     });
     c.blank();
+}
+
+/// Whether a request came in on the daemon's probe socket (ADR 0054): `$remote_addr` is the literal
+/// `unix:` there and nowhere else. Rendered with forward auth and with HTTP basic auth, because both
+/// skip their check for the daemon's health probe.
+fn write_probe_map(c: &mut Conf) {
+    c.block("map $remote_addr $weglarka_probe", |c| {
+        c.line("\"unix:\" 1;");
+        c.line("default 0;");
+    });
+}
+
+/// The protected instances whose credential `map` file the daemon wrote (ADR 0081), with the index that
+/// names their `$weglarka_basic_<n>` variables. A protected instance **without** a file is not here: it
+/// answers `503` instead (see `location`).
+fn basic_auth_maps<'o>(plan: &Plan<'_>, o: &'o NginxOptions) -> Vec<(usize, &'o str)> {
+    let mut maps = Vec::new();
+    for app in plan
+        .apps
+        .iter()
+        .filter(|app| app.active && app.basic_auth())
+    {
+        let (Some(path), Some(index)) =
+            (o.basic_auth.get(app.instance), plan.index_of(app.instance))
+        else {
+            continue;
+        };
+        maps.push((index, path.as_str()));
+    }
+    maps
+}
+
+/// `map_hash_bucket_size`, raised for the basic auth maps (ADR 0081): a key is a whole `Authorization`
+/// header, ~270 bytes for the longest accepted credential, and the default 64-byte bucket makes
+/// `nginx -t` fail with `could not build map_hash`. It has to be the **first** directive of `http {}` —
+/// nginx fixes the size when it parses the first `map` block and then rejects a later set as a duplicate
+/// — and it is rendered only when such a map exists, so a config without basic auth stays byte for byte
+/// unchanged.
+pub(super) fn write_basic_auth_hash_bucket(c: &mut Conf, plan: &Plan<'_>, o: &NginxOptions) {
+    if basic_auth_maps(plan, o).is_empty() {
+        return;
+    }
+    c.line("# HTTP basic auth (docs/decisions/0081): a map key is a whole Authorization header.");
+    c.line("map_hash_bucket_size 512;");
+    c.blank();
+}
+
+/// `http {}` pieces of HTTP basic auth (ADR 0081), present only when an active app uses it: the probe
+/// map (unless forward auth rendered it already) and, per protected instance whose credential `map`
+/// file the daemon wrote, the pair of `map`s the locations test.
+pub(super) fn write_basic_auth_maps(c: &mut Conf, plan: &Plan<'_>, o: &NginxOptions) {
+    if !plan.basic_auth() {
+        return;
+    }
+    let maps = basic_auth_maps(plan, o);
+    c.line("# HTTP basic auth (docs/decisions/0081).");
+    if plan.forward_auth().is_none() {
+        write_probe_map(c);
+    }
+    for (index, path) in maps {
+        // The credentials themselves live in the daemon's `0600` file: this `0644` config only
+        // includes it, so the nginx master loads the keys and no password is ever rendered here.
+        assert_no_escaping_needed(path);
+        c.block(
+            &format!("map $http_authorization $weglarka_basic_{index}"),
+            |c| {
+                c.line("default 0;");
+                c.line(&format!("include {path};"));
+            },
+        );
+        // 1 with a matching credential or on the probe socket, 0 otherwise; one lookup over the
+        // concatenation instead of nested `if`s, and no regex (exact keys keep a hash map).
+        c.block(
+            &format!("map \"$weglarka_probe:$weglarka_basic_{index}\" $weglarka_basic_ok_{index}"),
+            |c| {
+                c.line("default 0;");
+                c.line("\"1:0\" 1;");
+                c.line("\"0:1\" 1;");
+                c.line("\"1:1\" 1;");
+            },
+        );
+    }
+    c.blank();
+}
+
+/// ADR 0081: the one `if` of a protected location. `index` is the instance's index in the plan
+/// ([`Plan::index_of`]), which names its `$weglarka_basic_ok_<n>` variable. The 401 carries its
+/// `WWW-Authenticate` and nothing else: the site's security headers are lost to the `if`, which is
+/// fine for an error page without content.
+pub(super) fn write_basic_auth_guard(c: &mut Conf, index: usize) {
+    c.block(&format!("if ($weglarka_basic_ok_{index} = 0)"), |c| {
+        c.line(
+            "add_header WWW-Authenticate 'Basic realm=\"Restricted\", charset=\"UTF-8\"' always;",
+        );
+        c.line("return 401;");
+    });
 }
 
 /// `http {}` pieces of OAuth-protected resources (#215, ADR 0078): one `map $host` from every domain that

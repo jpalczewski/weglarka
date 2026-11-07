@@ -329,6 +329,12 @@ impl AppRoute<'_> {
         self.ingress.auth == IngressAuth::Forward
     }
 
+    /// Whether nginx enforces a shared HTTP Basic credential in front of this app (ADR 0081). The
+    /// credential itself is a `map` file the daemon writes; the generator only renders the check.
+    pub fn basic_auth(&self) -> bool {
+        self.ingress.auth == IngressAuth::Basic
+    }
+
     /// Whether this app declares OAuth-protected resources that nginx must render (#215, ADR 0078).
     /// A `start = false` app renders no route at all, so its resources render nothing either.
     pub fn has_oauth_resources(&self) -> bool {
@@ -404,6 +410,19 @@ impl<'a> Plan<'a> {
         self.identity
             .as_ref()
             .filter(|_| self.apps.iter().any(|app| app.has_oauth_resources()))
+    }
+
+    /// `true` when an *active* app enforces HTTP Basic auth (ADR 0081): the config then needs the
+    /// probe map, and each instance whose `map` file was written gets its pair of `map` blocks.
+    pub fn basic_auth(&self) -> bool {
+        self.apps.iter().any(|app| app.active && app.basic_auth())
+    }
+
+    /// Stable index of the app's instance in the plan: the `<n>` of the `$weglarka_basic_<n>` variables
+    /// (ADR 0081). nginx variable names cannot contain `-`, so the instance name itself cannot be used;
+    /// every rendered occurrence goes through here, so both the `map` blocks and their uses agree.
+    pub fn index_of(&self, instance: &InstanceName) -> Option<usize> {
+        self.apps.iter().position(|app| app.instance == instance)
     }
 
     /// Domains serving at least one OAuth-protected resource, sorted and without duplicates: the keys
@@ -649,16 +668,18 @@ impl<'a> Plan<'a> {
     }
 }
 
-/// Normalized `auth_exempt_paths` of an app that uses forward auth, checked against its `paths` (an
-/// entry must equal a prefix or lie below one) and its streaming paths: both render `location = p` and `location ^~ p/`, so any overlap is a duplicate location or
-/// an ambiguous carve-out. Empty for an app without forward auth (the model rejects the field there).
+/// Normalized `auth_exempt_paths` of an app that uses forward auth (ADR 0052) or HTTP Basic auth
+/// (ADR 0081), checked against its `paths` (an entry must equal a prefix or lie below one) and its
+/// streaming paths: both render `location = p` and `location ^~ p/`, so any overlap is a duplicate
+/// location or an ambiguous carve-out. Empty for an app without either (the model rejects the field
+/// there).
 fn exempt_paths(
     instance: &InstanceName,
     ingress: &AppIngress,
     streaming: &[PathPrefix],
     paths: &[PathPrefix],
 ) -> Result<Vec<ExemptPath>, IngressError> {
-    if ingress.auth != IngressAuth::Forward {
+    if !matches!(ingress.auth, IngressAuth::Forward | IngressAuth::Basic) {
         return Ok(Vec::new());
     }
     let mut by_path: BTreeMap<PathPrefix, bool> = BTreeMap::new();
