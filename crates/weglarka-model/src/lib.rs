@@ -11,6 +11,8 @@ pub mod config;
 pub mod credential;
 pub mod delivery;
 pub mod depends;
+/// Line diff shared by the CLI (`update --dry-run`) and `platform install --check`.
+pub mod diff;
 pub mod environments;
 pub mod events;
 pub mod fsutil;
