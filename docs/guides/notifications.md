@@ -56,4 +56,4 @@ A `[notify.ntfy]` with `host` **and** an `https://` `url` is rejected at startup
 
 `weglarka.toml` has `deny_unknown_fields`, so **an older daemon will not start** with a `[notify]` section. Before a downgrade, remove the section from the configuration (or keep it in a backup) and restart the service. Notifications are not part of app state, so there is nothing else to clean up.
 
-A `[notify.ntfy]` that uses `token_secret` does not parse on a daemon older than ADR 0079: switch it back to `token_file` before downgrading (the host secret itself can stay in `host-secrets.toml`, which an older daemon ignores). The field is in the table in [verification and rollback](verify-and-rollback.md).
+A `[notify.ntfy]` that uses `token_secret` does not parse on a daemon older than ADR 0080: switch it back to `token_file` before downgrading (the host secret itself can stay in `host-secrets.toml`, which an older daemon ignores). The field is in the table in [verification and rollback](verify-and-rollback.md).

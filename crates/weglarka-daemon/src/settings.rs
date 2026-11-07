@@ -28,7 +28,7 @@ pub struct Paths {
     pub state_dir: PathBuf,
     pub state: StatePaths,
     pub secrets: PathBuf,
-    /// Host-level credentials (`host-secrets.toml`, ADR 0079): bare `<name>` keys, 0600, next to
+    /// Host-level credentials (`host-secrets.toml`, ADR 0080): bare `<name>` keys, 0600, next to
     /// the app `secrets.toml` but a separate file so a rollback never takes the app secrets down.
     pub host_secrets: PathBuf,
     /// Host directory with `nginx.conf` (mounted into the nginx container).

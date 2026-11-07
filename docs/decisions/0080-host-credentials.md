@@ -1,4 +1,4 @@
-# 0079 — Host credentials behind one secret abstraction
+# 0080 — Host credentials behind one secret abstraction
 
 Status: proposed (2026-11-06, issue #199)
 

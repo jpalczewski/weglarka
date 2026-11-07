@@ -5,7 +5,7 @@
 //! record is found by walking the name's suffixes against `GET /zones?name=`: a token only lists the
 //! zones it may see, so a name outside them is `ZoneNotFound` rather than a write to a stranger's zone.
 //!
-//! The token comes from a [`CredentialSource`] and is read on **every** request (ADR 0079), so a rotated
+//! The token comes from a [`CredentialSource`] and is read on **every** request (ADR 0080), so a rotated
 //! token is used by the next call without a restart.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ const MAX_MESSAGE: usize = 300;
 
 pub struct Cloudflare {
     api: Api,
-    /// The API token: read on every request, so rotation needs no restart (ADR 0079).
+    /// The API token: read on every request, so rotation needs no restart (ADR 0080).
     source: Arc<dyn CredentialSource>,
     /// zone name → zone id; zones do not move, so one lookup per zone per daemon run.
     zones: Mutex<HashMap<String, String>>,
@@ -619,7 +619,7 @@ mod tests {
         assert!(Cloudflare::with_base_url(TestSource::new(TOKEN), "api.example.eu").is_err());
     }
 
-    /// ADR 0079: the token is read on use, so a rotated one is picked up by the next request.
+    /// ADR 0080: the token is read on use, so a rotated one is picked up by the next request.
     #[tokio::test]
     async fn a_rotated_token_is_used_by_the_next_request() {
         let second = "rotated-token-value";

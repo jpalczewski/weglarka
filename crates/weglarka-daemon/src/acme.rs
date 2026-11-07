@@ -408,7 +408,7 @@ fn wildcard_spec(apex: &str) -> Result<CertSpec, AcmeError> {
 }
 
 /// The provider named by `[acme.dns]`, with its credential read from the file or the host secret the
-/// config names (ADR 0079).
+/// config names (ADR 0080).
 ///
 /// The credential is read once here so that an unusable one is a startup error (ADR 0039: wildcard
 /// certificates are opt-in, but once configured a silent skip would hide a broken deployment). A
@@ -912,7 +912,7 @@ mod tests {
         ] {
             let path = write(name, content, mode);
             let err = build(&path).unwrap_err();
-            // ADR 0079: the text names the source (`describe()`), never the value.
+            // ADR 0080: the text names the source (`describe()`), never the value.
             assert!(
                 err.starts_with(&format!("[acme.dns] file {}: ", path.display())),
                 "{name}: {err}"
@@ -931,7 +931,7 @@ mod tests {
         );
     }
 
-    /// `token_secret` (ADR 0079): the token comes from the host store, and a missing or unusable one
+    /// `token_secret` (ADR 0080): the token comes from the host store, and a missing or unusable one
     /// is a startup error whose text names the secret and never carries a value.
     #[test]
     fn a_token_secret_builds_the_backend_from_the_host_store() {

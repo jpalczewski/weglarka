@@ -1058,7 +1058,7 @@ async fn remove_secret<P: PodmanClient + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── Host secrets (ADR 0079) ─────────────────────────────────────────────────
+// ── Host secrets (ADR 0080) ─────────────────────────────────────────────────
 /// The host store's rows as an allowlist projection (name, fingerprint, `updated_at`); the value
 /// is never part of a view.
 fn host_secret_infos<P: PodmanClient>(d: &Daemon<P>) -> ApiResult<Vec<HostSecretInfo>> {

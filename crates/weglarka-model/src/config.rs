@@ -871,11 +871,11 @@ pub struct NtfyConfig {
     /// ntfy topic (`[A-Za-z0-9_-]{1,64}`).
     pub topic: String,
     /// File with an ntfy access token (mode 0600); read on use and never logged. The older form;
-    /// prefer `token_secret` (ADR 0079). At most one of the two may be set.
+    /// prefer `token_secret` (ADR 0080). At most one of the two may be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<PathBuf>,
     /// Named entry in the host secret store (`host-secrets.toml`) holding the access token.
-    /// Exclusive with `token_file` (ADR 0079).
+    /// Exclusive with `token_file` (ADR 0080).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_secret: Option<String>,
     /// Lowest severity published to this channel; lower ones are dropped before dedup.
@@ -899,7 +899,7 @@ impl NtfyConfig {
     }
 
     /// The credential this channel authenticates with (`None` = unauthenticated). The one match
-    /// every consumer would otherwise repeat (ADR 0079).
+    /// every consumer would otherwise repeat (ADR 0080).
     pub fn credential(
         &self,
         host_store: &Arc<dyn SecretStore>,
@@ -996,7 +996,7 @@ pub struct AcmeDnsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<PathBuf>,
     /// Named entry in the host secret store (`host-secrets.toml`) holding the API token. Exclusive
-    /// with `token_file` (ADR 0079).
+    /// with `token_file` (ADR 0080).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_secret: Option<String>,
     /// Apex domains that get a wildcard certificate, e.g. `["example.eu"]`.

@@ -195,7 +195,7 @@ fn notify_view(notify: &NotifyConfig) -> NotifyView {
             } = ntfy;
             NtfyView {
                 min_severity: *min_severity,
-                // Either credential form counts (ADR 0079); neither is shown.
+                // Either credential form counts (ADR 0080); neither is shown.
                 authenticated: token_file.is_some() || token_secret.is_some(),
             }
         }),

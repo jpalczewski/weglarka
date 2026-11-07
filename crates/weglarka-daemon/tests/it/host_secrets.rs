@@ -1,6 +1,6 @@
 //! Host credentials through the admin API (real unix socket, FakePodman): set/list/remove, the
 //! allowlist list view, scope enforcement on the token listener, and the `host.credentials` /
-//! `host.orphan_secrets` doctor checks (ADR 0079).
+//! `host.orphan_secrets` doctor checks (ADR 0080).
 
 use crate::common::*;
 use crate::token_api;

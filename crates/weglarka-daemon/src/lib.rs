@@ -288,7 +288,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
     let secrets = Arc::new(FileSecretStore::new(&paths.secrets));
     secrets.init()?;
     secrets.check_permissions()?;
-    // Host credentials (ADR 0079): a separate 0600 file with bare `<name>` keys, created lazily
+    // Host credentials (ADR 0080): a separate 0600 file with bare `<name>` keys, created lazily
     // like `secrets.toml` and held for the consumers that read them on use.
     let host_secrets = Arc::new(FileSecretStore::host(&paths.host_secrets));
     host_secrets.init()?;
@@ -484,7 +484,7 @@ pub async fn start_with<P: PodmanClient + 'static>(
         &host.webhook.domain,
         events,
         ingress.clone(),
-        // `[acme.dns] token_secret` reads the token from the host store on start and on use (ADR 0079).
+        // `[acme.dns] token_secret` reads the token from the host store on start and on use (ADR 0080).
         Arc::clone(&host_secrets) as Arc<dyn SecretStore>,
     )?;
     let mut webhook_sources: Vec<Box<dyn WebhookSource>> = vec![Box::new(github::GitHub)];

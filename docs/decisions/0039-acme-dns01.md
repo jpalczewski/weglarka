@@ -140,4 +140,4 @@ convention `tls/_wildcard.<apex>.crt|key`.
 - **Creating the A/CNAME records too.** Certificates are the daemon's job; address records stay with
   whatever manages the zone today, so the token needs no more than TXT edits.
 
-Addendum (2026-11-06): token sources and read-on-use rotation are superseded by ADR 0079.
+Addendum (2026-11-06): token sources and read-on-use rotation are superseded by ADR 0080.

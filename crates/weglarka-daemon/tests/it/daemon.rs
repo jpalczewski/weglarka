@@ -946,7 +946,7 @@ async fn acme_dns_refuses_to_start_with_a_world_readable_or_missing_token() {
     .await
     .err()
     .expect("a missing token file must stop the daemon");
-    // ADR 0079: the text names the source (`describe()`), never the value.
+    // ADR 0080: the text names the source (`describe()`), never the value.
     assert!(
         err.to_string()
             .contains(&format!("[acme.dns] file {}", missing.display())),

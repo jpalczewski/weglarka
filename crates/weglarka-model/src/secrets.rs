@@ -49,7 +49,7 @@ impl FileSecretStore {
         Self::with_scope(path, SecretScope::App)
     }
 
-    /// A store of host-level credentials: bare `<name>` keys (ADR 0079), no `<instance>.` prefix.
+    /// A store of host-level credentials: bare `<name>` keys (ADR 0080), no `<instance>.` prefix.
     pub fn host(path: impl Into<PathBuf>) -> Self {
         Self::with_scope(path, SecretScope::Host)
     }

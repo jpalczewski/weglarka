@@ -127,7 +127,7 @@ pub fn split_scoped(scoped: &str) -> Result<(InstanceName, &str), SecretError> {
 
 /// Which namespace a store's keys live in. `App` (the default) composes `<instance>.<name>`;
 /// `Host` takes a bare `<name>` with the [`valid_secret_name`] rules (no dot). `secrets.toml` stays
-/// app-scoped; host credentials live in a separate `host-secrets.toml` (ADR 0079).
+/// app-scoped; host credentials live in a separate `host-secrets.toml` (ADR 0080).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecretScope {
     #[default]

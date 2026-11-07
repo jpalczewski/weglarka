@@ -112,7 +112,7 @@ restart (this includes `propagation_secs` and `prefer_wildcard`, which an older 
 wildcards in `tls/` stay but will not be renewed. You can also revoke the Cloudflare token in the
 dashboard. `apps.toml`/`state.toml` did not change (no schema version bump).
 
-A `token_secret` in `[acme.dns]` does not parse on a daemon older than ADR 0079 either: switch back to
+A `token_secret` in `[acme.dns]` does not parse on a daemon older than ADR 0080 either: switch back to
 `token_file` before downgrading, and keep the token in the file while the older daemon runs. `host-secrets.toml`
 itself is ignored by an older daemon. The field is in the table in
 [verification and rollback](verify-and-rollback.md).

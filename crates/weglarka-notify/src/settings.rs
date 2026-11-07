@@ -19,7 +19,7 @@ pub enum NotifySettingsError {
     #[error("[notify.ntfy] topic {0:?}: expected [A-Za-z0-9_-]{{1,64}}")]
     Topic(String),
     /// A credential that cannot be read at startup, named by `CredentialSource::describe()` — a path
-    /// or a secret name, never the value (ADR 0079).
+    /// or a secret name, never the value (ADR 0080).
     #[error("cannot read the ntfy token from {origin}: {err}")]
     Credential {
         origin: String,
@@ -57,7 +57,7 @@ pub struct NotifySettings {
 impl NotifySettings {
     /// Validates `[notify]`. `Ok(None)` means "nothing to deliver to" (no `[notify.ntfy]`) — the daemon
     /// then runs without notifications and says so at startup. `host_store` serves a `token_secret`
-    /// (ADR 0079).
+    /// (ADR 0080).
     pub fn load(
         config: &NotifyConfig,
         host_store: &Arc<dyn SecretStore>,
@@ -87,7 +87,7 @@ impl NotifySettings {
         let endpoint = Endpoint::parse(&ntfy.url, ntfy.host.as_deref())?;
         let credential = ntfy.credential(host_store);
         // A broken token is still a startup error; afterwards the channel reads on use, so rotation
-        // needs no restart (ADR 0079).
+        // needs no restart (ADR 0080).
         if let Some(source) = &credential {
             check_at_startup(source.as_ref()).map_err(|err| NotifySettingsError::Credential {
                 origin: source.describe(),
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn a_host_secret_that_is_not_set_yet_does_not_stop_the_startup() {
-        // It can only be set through the running daemon (ADR 0079).
+        // It can only be set through the running daemon (ADR 0080).
         let (_dir, store) = host_store();
         let mut ntfy = ntfy();
         ntfy.token_secret = Some("ntfy-token".into());

@@ -2253,7 +2253,7 @@ fn acme_dns(
     certs: Option<&[certificates::Cert]>,
     out: &mut Vec<DoctorCheck>,
 ) {
-    // The DNS token (file or `token_secret`) is checked by `host.credentials` (ADR 0079); here only
+    // The DNS token (file or `token_secret`) is checked by `host.credentials` (ADR 0080); here only
     // the provider/wildcards row and the wildcard certificate status.
     out.push(ok(
         "acme.dns",
@@ -2727,7 +2727,7 @@ fn secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
 }
 
-/// `state.host_secrets_file` and `host.orphan_secrets` (ADR 0079): the host credential store's
+/// `state.host_secrets_file` and `host.orphan_secrets` (ADR 0080): the host credential store's
 /// permissions and the names no config references.
 fn host_secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     out.push(match d.host_secrets.check_permissions() {
@@ -2783,7 +2783,7 @@ fn host_secrets<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     }
 }
 
-/// `host.credentials` (ADR 0079): every configured credential (the ntfy token and the ACME DNS
+/// `host.credentials` (ADR 0080): every configured credential (the ntfy token and the ACME DNS
 /// token) reads and validates now. A failure names the source and the remedy, never the value.
 fn host_credentials<P: PodmanClient>(d: &Daemon<P>, out: &mut Vec<DoctorCheck>) {
     const ID: &str = "host.credentials";

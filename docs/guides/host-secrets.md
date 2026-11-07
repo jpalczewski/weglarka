@@ -3,7 +3,7 @@
 Host secrets are the daemon's own credentials, as opposed to an app's secrets: today the ntfy access token
 (`[notify.ntfy]`) and the Cloudflare API token of `[acme.dns]`. They live in `host-secrets.toml` — next to
 `secrets.toml` in the state directory, mode `0600` — and are referenced from `weglarka.toml` by name
-(`token_secret = "<name>"`), never by value. Decision: [ADR 0079](../decisions/0079-host-credentials.md).
+(`token_secret = "<name>"`), never by value. Decision: [ADR 0080](../decisions/0080-host-credentials.md).
 
 The file is separate from `secrets.toml` on purpose: an older daemon validates every key of `secrets.toml` and
 would treat a store holding host keys as corrupt after a rollback, taking the app secrets down with it.
@@ -68,7 +68,7 @@ itself). Revoking the old token at the provider is the operator's step; the daem
 
 ## Rollback
 
-`host-secrets.toml` is **ignored** by a daemon older than ADR 0079: it does not read the file, does not mind it
+`host-secrets.toml` is **ignored** by a daemon older than ADR 0080: it does not read the file, does not mind it
 staying on disk, and app secrets in `secrets.toml` are unaffected.
 
 What does break is `weglarka.toml`, which has `deny_unknown_fields`: `token_secret` in `[notify.ntfy]` or

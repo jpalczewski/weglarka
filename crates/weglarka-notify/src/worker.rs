@@ -149,7 +149,7 @@ pub struct Notifier {
 impl Notifier {
     /// Validates the optional `[notify]` section and builds the worker (`None` = no channel).
     /// Ours is the only sink of the engine, so an invalid configuration is a startup error, not a
-    /// silent no-op. `host_store` is where a `token_secret` comes from (ADR 0079).
+    /// silent no-op. `host_store` is where a `token_secret` comes from (ADR 0080).
     pub fn build(
         config: Option<&NotifyConfig>,
         host_store: &Arc<dyn SecretStore>,

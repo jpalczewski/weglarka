@@ -98,7 +98,7 @@ impl NtfyChannel {
             .header(ACCEPT, "application/json")
             .body(body);
         if let Some(source) = &self.credential {
-            // Read on use (ADR 0079): a rotated file or host secret is picked up by the next
+            // Read on use (ADR 0080): a rotated file or host secret is picked up by the next
             // publication. A source that cannot be read keeps the message in the outbox until the
             // operator fixes the token, so it is a retryable failure.
             let token = source.read().map_err(|err| {

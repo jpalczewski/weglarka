@@ -680,7 +680,7 @@ pub(crate) async fn secrets_remove(
     Ok(exit::OK)
 }
 
-// ---------- host secrets (ADR 0079) ----------
+// ---------- host secrets (ADR 0080) ----------
 
 pub(crate) async fn host_secrets_set(
     json: bool,

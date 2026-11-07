@@ -61,7 +61,7 @@ impl From<PrivateFileError> for TokenFileError {
     }
 }
 
-/// One read seam for a credential (ADR 0079): a synchronous, dyn-compatible source whose value is
+/// One read seam for a credential (ADR 0080): a synchronous, dyn-compatible source whose value is
 /// read on every use (never cached by the caller), so rotation needs no restart.
 pub trait CredentialSource: Send + Sync {
     fn read(&self) -> Result<SecretValue, CredentialError>;
