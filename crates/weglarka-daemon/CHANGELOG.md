@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/jpalczewski/weglarka/compare/v0.0.8...v0.0.9) - 2026-11-10
+
+### Added
+
+- *(daemon)* write basic auth credentials for the ingress ([#649](https://github.com/jpalczewski/weglarka/pull/649))
+- *(model)* basic auth fields, credential parser and schema v25 ([#640](https://github.com/jpalczewski/weglarka/pull/640))
+- *(daemon)* platform install --check reports installed-unit drift
+- *(cli)* manage host secrets and check host credentials in doctor
+- *(dns)* read the DNS-01 token on use, from a file or a host secret
+- *(notify)* read the ntfy token on use, from a file or a host secret
+- *(model)* host credential sources and a host-scoped secret store
+- *(daemon)* show shared services in apps list and doctor
+- *(engine)* refuse removing a shared service instance
+- *(model)* shared service rules, overlay and per-kind gate (skeleton)
+- *(model)* shared service types, membership and identity session store behind a gate ([#621](https://github.com/jpalczewski/weglarka/pull/621))
+- *(cli)* oauth_resources flags, doctor check and guide ([#611](https://github.com/jpalczewski/weglarka/pull/611))
+- *(ingress)* upstream fields in the access log ([#589](https://github.com/jpalczewski/weglarka/pull/589))
+- *(model)* oauth_resources field behind a gate ([#609](https://github.com/jpalczewski/weglarka/pull/609))
+- *(acme)* prefer_wildcard serves covered domains with the wildcard ([#604](https://github.com/jpalczewski/weglarka/pull/604))
+- *(daemon)* doctor hint for own certificate pairs shadowing a wildcard ([#601](https://github.com/jpalczewski/weglarka/pull/601))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(ingress)* security headers for container apps ([#574](https://github.com/jpalczewski/weglarka/pull/574))
+- *(daemon)* group-readable ingress log directory ([#573](https://github.com/jpalczewski/weglarka/pull/573))
+- *(panel)* list standalone static sites on the sites page ([#571](https://github.com/jpalczewski/weglarka/pull/571))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+- *(engine)* explicit log driver and size bound for containers ([#557](https://github.com/jpalczewski/weglarka/pull/557))
+
+### Fixed
+
+- *(model)* case-sensitive basic auth map keys
+- *(api)* tolerate unknown enum variants in daemon responses
+- *(model)* a host secret that is not set yet does not stop the startup
+- *(daemon)* a manual self-update --check does not delay the next update ([#620](https://github.com/jpalczewski/weglarka/pull/620))
+- *(daemon)* record a host config the host binaries cannot parse ([#619](https://github.com/jpalczewski/weglarka/pull/619))
+- *(daemon)* the self-update switcher reads only the state schema header ([#618](https://github.com/jpalczewski/weglarka/pull/618))
+- *(engine)* check shared static options against the served releases on sites declare ([#585](https://github.com/jpalczewski/weglarka/pull/585))
+- *(daemon)* report a served static site as serving, not missing ([#569](https://github.com/jpalczewski/weglarka/pull/569))
+- *(daemon)* gate ingress-only static updates on the served release ([#567](https://github.com/jpalczewski/weglarka/pull/567))
+- *(daemon)* validate the candidate apps.toml once for add, update and sites ([#564](https://github.com/jpalczewski/weglarka/pull/564))
+- *(daemon)* refuse host_mounts entries that overlap daemon-writable mounts ([#559](https://github.com/jpalczewski/weglarka/pull/559))
+- *(engine)* refuse kind changes on update and require a served release for static sites ([#549](https://github.com/jpalczewski/weglarka/pull/549))
+
+### Other
+
+- Merge pull request #643 from jpalczewski/api/582-unknown-enum-fallback
+- *(daemon)* document platform install --check
+- renumber the host credentials ADR to 0080 after the 0079 collision
+- *(daemon)* the shared services view fixture follows the owned fields; rules entry
+- *(model)* one private-file check and one header-token validator ([#623](https://github.com/jpalczewski/weglarka/pull/623))
+- *(engine)* dedupe volume refs, uid ranges and name validation ([#626](https://github.com/jpalczewski/weglarka/pull/626))
+- *(daemon)* make the access audit and ownership/config-doctor tests deterministic ([#624](https://github.com/jpalczewski/weglarka/pull/624))
+- *(daemon)* share the deploy mapping and app view between add and update ([#568](https://github.com/jpalczewski/weglarka/pull/568))
+- *(model)* one module for the ingress log layout and retention helpers ([#558](https://github.com/jpalczewski/weglarka/pull/558))
+- gate tests that read /proc to Linux ([#550](https://github.com/jpalczewski/weglarka/pull/550))
+
 ## [0.0.8](https://github.com/jpalczewski/weglarka/compare/v0.0.7...v0.0.8) - 2026-11-05
 
 ### Added
