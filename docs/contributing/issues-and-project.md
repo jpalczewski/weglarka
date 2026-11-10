@@ -37,6 +37,10 @@ Labels added for the admin panel work. They combine with the ones above (a leak 
 | Priority | Relative urgency within an Area |
 
 `Next` means picked for the near term, and there are at most ten items in it, so the column stays a real shortlist.
+Only work that can start tomorrow without a design discussion goes into `Next`: a concrete bug, or an issue that is
+🤖 `agent-ready` or close to it. An epic never sits in `Next`; its next concrete sub-issue does. An issue that waits
+for a decision gets ❓ `needs-decision` and stays in `Todo` until the decision is made (it can come back as "write the
+ADR"), and one that needs a real host gets `needs-host`.
 A `Blocked` item says what it waits for, either in a comment on the issue or by linking a parent issue; "blocked"
 with no reason is not allowed.
 
