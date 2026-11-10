@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.7...weglarka-ingress-v0.0.8) - 2026-11-10
+
+### Added
+
+- *(ingress)* render basic auth in nginx ([#647](https://github.com/jpalczewski/weglarka/pull/647))
+- *(model)* shared service types, membership and identity session store behind a gate ([#621](https://github.com/jpalczewski/weglarka/pull/621))
+- *(ingress)* allow auth_exempt_paths on apps routed by paths ([#614](https://github.com/jpalczewski/weglarka/pull/614))
+- *(ingress)* render oauth_resources and their discovery routes ([#613](https://github.com/jpalczewski/weglarka/pull/613))
+- *(ingress)* upstream fields in the access log ([#589](https://github.com/jpalczewski/weglarka/pull/589))
+- *(ingress)* shared certificate choice with an optional wildcard preference ([#600](https://github.com/jpalczewski/weglarka/pull/600))
+- *(engine)* mount ingress logs read-only into the configured reader ([#587](https://github.com/jpalczewski/weglarka/pull/587))
+- *(ingress)* security headers for container apps ([#574](https://github.com/jpalczewski/weglarka/pull/574))
+- *(model)* site-level static options and a robots preset ([#570](https://github.com/jpalczewski/weglarka/pull/570))
+
+### Fixed
+
+- *(model)* case-sensitive basic auth map keys
+
+### Other
+
+- *(model)* one module for the ingress log layout and retention helpers ([#558](https://github.com/jpalczewski/weglarka/pull/558))
+
 ## [0.0.7](https://github.com/jpalczewski/weglarka/compare/weglarka-ingress-v0.0.6...weglarka-ingress-v0.0.7) - 2026-11-05
 
 ### Added
