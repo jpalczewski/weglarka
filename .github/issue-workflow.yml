@@ -1,0 +1,112 @@
+standard: 1
+language: en
+type_mode: label
+contracts: false
+label_style: emoji
+
+project:
+  owner: jpalczewski
+  number: 12
+
+next_limit: 10
+
+# Describes the board as it is today (Project 12). Changing the options of a single-select field clears it on every item,
+# so Inbox/Backlog and P0-P3 are deliberately not introduced.
+statuses: [Todo, Next, In Progress, Blocked, Done]
+priorities: [High, Medium, Low]
+
+areas:
+  - emoji: "⚙️"
+    name: core
+    description: "weglarka-core: model, engine, state"
+    color: 5ebeff
+  - emoji: "🌐"
+    name: ingress
+    description: "nginx, Traefik, edge mode"
+    color: 5ebeff
+  - emoji: "🐳"
+    name: podman
+    description: "weglarka-podman: libpod client"
+    color: 5ebeff
+  - emoji: "📜"
+    name: acme
+    description: "ACME issuance and renewal"
+    color: 5ebeff
+  - emoji: "📡"
+    name: dns
+    description: "DNS-01 provider adapters"
+    color: 5ebeff
+  - emoji: "📦"
+    name: registry
+    description: "Registry and webhook sources"
+    color: 5ebeff
+  - emoji: "🔔"
+    name: notify
+    description: "Notifications"
+    color: 5ebeff
+  - emoji: "🔌"
+    name: api
+    description: "weglarka-api: admin API contract"
+    color: 5ebeff
+  - emoji: "🛠️"
+    name: daemon
+    description: "weglarka-daemon"
+    color: 5ebeff
+  - emoji: "⌨️"
+    name: cli
+    description: "weglarka-cli"
+    color: 5ebeff
+  - emoji: "📚"
+    name: docs
+    description: "Operator docs, ADRs, guides"
+    color: 5ebeff
+  - emoji: "🚦"
+    name: ci
+    description: "CI, release, build"
+    color: 5ebeff
+  - emoji: "🪟"
+    name: panel
+    description: "Admin panel"
+    color: 5ebeff
+  - emoji: "🔑"
+    name: identity
+    description: "Identity provider config, OIDC clients, access control, sessions"
+    color: 5ebeff
+  - emoji: "🏗️"
+    name: platform
+    description: "Bootstrap, OpenRC/systemd adapters, quadlet, self-update, watchdog, host tooling"
+    color: 5ebeff
+
+extended_labels: true
+
+milestones:
+  - name: "Host operational bugs"
+    description: "Bugs that only show up on a real host: image pruning, self-update after a schema bump, supplementary groups, and measured memory use of Węglarka containers."
+  - name: "Release, CI and tooling"
+    description: "Release pipeline and contributor tooling: panel image publishing, CI build duplication, and collisions between parallel branches (ADR numbers, schema versions)."
+  - name: "Panel, identity and read scope"
+    description: "Finish container observability in the panel (epic #404), harden panel and identity-provider sessions, and close the read-scope projection and redaction follow-ups."
+  - name: "Edge production readiness"
+    description: "Make edge mode safe and complete: root-owned domain allowlist, wildcard certificates, apps reaching their own public domains."
+  - name: "Secrets"
+    description: "One secret abstraction for host credentials, an encrypted store at rest, and keyed fingerprints — batched because they touch the schema and spec_hash."
+  - name: "CLI login v2"
+    description: "Simpler and broader CLI login: issuer discovery from the host, browser login with PKCE, and run/push/forward through the panel relay (epic #43)."
+  - name: "Platform and bootstrap hardening"
+    description: "OpenRC parity with the systemd adapter and safe root-run bootstrap paths: runtime-user switching, service removal, generation selector trust, async-safe bootstrap steps."
+  - name: "Spec and API correctness"
+    description: "Small, concrete defects in the apps add/update paths: desired-state handling, deploy-time gates on every update, clear errors instead of 500s."
+  - name: "Metrics and logs"
+    description: "Prometheus export (epic #331), opt-in log shipping, richer ingress access logs and accurate metrics docs."
+  - name: "Static sites"
+    description: "Finish kind = \"static\" (epic #48): shared sites volume, safe OCI artifact extraction, atomic deploy and rollback, optional Basic auth."
+  - name: "Ingress policy"
+    description: "Per-route policy for ingress: security headers for container apps, per-path auth and exposure, a private (VPN) listener."
+  - name: "Backups and SQLite replication"
+    description: "Continuous SQLite backup with Litestream (epic #37): per-volume replication, restore from replica, lag monitoring."
+  - name: "Developer workflow"
+    description: "Developer commands (epic #49): PR preview instances, production data in previews, interactive run, hold."
+  - name: "Infra integrations"
+    description: "Host-level platform services (epic #81) and their shared plumbing (epic #211): config generation, per-app credentials, per-function networks, shared services, MCP hosting."
+  - name: "Managed Postgres and Redis"
+    description: "Managed shared services v1 (#69): Redis with ACL users and the identity provider's session store first, then Postgres with roles applied by exec. Full contracts in #593 (Redis, shared model) and #596 (Postgres)."
