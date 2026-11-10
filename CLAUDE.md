@@ -65,6 +65,9 @@ Priorities for every decision: **security → elegant, extensible code (traits/a
 - [notify-and-selfupdate](.claude/rules/notify-and-selfupdate.md) — notifications, self-update, watchdog, webhook dedup.
 - [crate-map](.claude/rules/crate-map.md) — dependency graph and the crate table.
 
+Tasks follow the `labels`, `taxonomy`, `idea`, `triage`, `decompose` and `consolidate` skills of `issue-rzucam-w-tlum`;
+configuration in `.github/issue-workflow.yml`.
+
 Contributor docs: [`docs/contributing/agent-workflow.md`](docs/contributing/agent-workflow.md) (parallel sessions, briefs,
 reviews), [`docs/contributing/issues-and-project.md`](docs/contributing/issues-and-project.md) (labels, project) and
 [`docs/contributing/releasing.md`](docs/contributing/releasing.md) (manual release steps).
