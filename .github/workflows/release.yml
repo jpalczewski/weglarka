@@ -140,7 +140,7 @@ jobs:
             VERSION=${{ steps.crate.outputs.version }}
             REVISION=${{ github.sha }}
           provenance: false
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Podpis obrazu (keyless)
         run: cosign sign --yes "${{ env.DAEMON_IMAGE }}@${{ steps.build.outputs.digest }}"
       # Second signature, with the long-lived key the daemon can verify offline (`cosign.pub` in the
@@ -246,7 +246,7 @@ jobs:
             VERSION=${{ steps.crate.outputs.version }}
             REVISION=${{ github.sha }}
           provenance: false
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Podpis obrazu (keyless)
         run: cosign sign --yes "${{ env.PANEL_IMAGE }}@${{ steps.build.outputs.digest }}"
       - name: Podpis obrazu kluczem statycznym (samoaktualizacja)
@@ -507,7 +507,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: "Read the current channel pointer (first release: none)"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -676,7 +676,7 @@ jobs:
       - name: Sumy SHA-256
         working-directory: dist
         run: sha256sum ./*.tar.gz | tee SHA256SUMS
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Podpis SHA256SUMS (keyless)
         working-directory: dist
         run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
