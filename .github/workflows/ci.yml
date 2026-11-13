@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: zizmor
       # Not in install-action's manifest: fetch the release tarball and verify its checksum.
@@ -146,7 +146,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # nextest runs every test in its own process, in parallel across binaries; it does not run doc tests,
       # so those keep their own step (all empty today, but a future doc test must not be skipped silently).
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
       # The Authelia files weglarka-identity renders (#42 P3) must pass the provider's own validator: a renamed or
